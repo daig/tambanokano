@@ -20,6 +20,7 @@
 //! equation table stays borrowed — without changing the driver loop.
 
 use crate::acu::{AcuLhs, AcuSubproblem};
+use crate::au::{AuLhs, AuSubproblem};
 use crate::dag::DagId;
 use crate::engine::{Runtime, Signature};
 use crate::symbol::Theory;
@@ -38,6 +39,8 @@ pub(crate) enum LhsAutomaton {
     Free(Term),
     /// ACU theory (`assoc comm [id:]`): multiset matching, genuinely multi-solution.
     Acu(AcuLhs),
+    /// AU theory (`assoc [id:]`, not commutative): ordered-sequence matching with extension.
+    Au(AuLhs),
 }
 
 impl LhsAutomaton {
@@ -45,6 +48,7 @@ impl LhsAutomaton {
     pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
         match lhs.top_symbol().map(|s| sig.symbol(s).theory()) {
             Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
+            Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             _ => LhsAutomaton::Free(lhs),
         }
     }
@@ -72,6 +76,7 @@ impl LhsAutomaton {
             LhsAutomaton::Acu(lhs) => {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
             }
+            LhsAutomaton::Au(lhs) => lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Au),
         }
     }
 }
@@ -90,11 +95,13 @@ pub(crate) enum Subproblem {
     FreeOnce { pending: bool },
     /// ACU theory: a resumable multiset-distribution enumerator (see [`AcuSubproblem`]).
     Acu(AcuSubproblem),
+    /// AU theory: a resumable ordered-sequence enumerator (see [`AuSubproblem`]).
+    Au(AuSubproblem),
 }
 
 impl Subproblem {
     /// Advance to the next solution, binding it into `subst`; `false` when exhausted. Takes
-    /// `&mut Runtime` because a multi-solution arm (ACU) builds fresh binding/residue nodes between
+    /// `&mut Runtime` because a multi-solution arm (ACU/AU) builds fresh binding/residue nodes between
     /// solutions (audit F-3 widening); the free arm ignores `rt`/`sig`/`subst` (its single solution
     /// was bound during `match_`).
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
@@ -102,24 +109,19 @@ impl Subproblem {
             // Yield the already-bound solution exactly once.
             Subproblem::FreeOnce { pending } => core::mem::replace(pending, false),
             Subproblem::Acu(sp) => sp.next(rt, sig, subst),
+            Subproblem::Au(sp) => sp.next(rt, sig, subst),
         }
     }
 
-    /// Whether the most recent solution matched the whole subject (no extension residue). Always
-    /// `true` for the free theory.
-    pub(crate) fn matched_whole(&self) -> bool {
+    /// Build the rewrite result by splicing the instantiated `rhs` into the matched position: a whole
+    /// match (the free theory, or an extension match with no residue) is just `rhs`; an extension
+    /// match re-assembles the residue around it in the theory's normal form — an ACU multiset, or an
+    /// AU ordered prefix/suffix (Maude's `partialConstruct`). Needs `&mut Runtime` to build the node.
+    pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
         match self {
-            Subproblem::FreeOnce { .. } => true,
-            Subproblem::Acu(sp) => sp.matched_whole(),
-        }
-    }
-
-    /// The unmatched residue (extension) of the most recent solution — empty for the free theory.
-    /// An AC rewrite splices these elements back around the instantiated right-hand side.
-    pub(crate) fn residue(&self) -> &[(DagId, u32)] {
-        match self {
-            Subproblem::FreeOnce { .. } => &[],
-            Subproblem::Acu(sp) => sp.residue(),
+            Subproblem::FreeOnce { .. } => rhs,
+            Subproblem::Acu(sp) => sp.build_result(rt, sig, rhs),
+            Subproblem::Au(sp) => sp.build_result(rt, sig, rhs),
         }
     }
 }

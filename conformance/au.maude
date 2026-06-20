@@ -1,0 +1,24 @@
+*** AU (associative, not commutative, [id:]) conformance (Stage B1) vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/au.maude < /dev/null
+*** Mirrors crates/tnk-core/src/{au.rs,engine.rs} AU tests.
+
+fmod AU-MATCH is
+  sort E .
+  ops a b c nil : -> E .
+  op __ : E E -> E [assoc id: nil] .
+  vars X Y : E .
+endfm
+*** 4 matchers — ordered prefix/suffix splits (incl. nil via the identity):
+match X Y <=? a b c .
+
+fmod AU-GROUND is               *** extension on both ends
+  sort E . ops a b c d : -> E . op __ : E E -> E [assoc] .
+  eq b c = a .
+endfm
+red d b c d .                   *** => d a d   (1 rewrite)
+
+fmod AU-VAR is                  *** lone variable absorbs the ordered tail
+  sort E . ops a b c : -> E . op __ : E E -> E [assoc] . var X : E .
+  eq a X = b .
+endfm
+red a c c .                     *** => b   (1 rewrite)

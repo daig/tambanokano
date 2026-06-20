@@ -22,4 +22,5 @@ pub mod term;
 // yet (review: keep the closed LhsAutomaton/Subproblem enums crate-private until a cross-crate
 // consumer exists).
 pub(crate) mod acu;
+pub(crate) mod au;
 pub(crate) mod theory;

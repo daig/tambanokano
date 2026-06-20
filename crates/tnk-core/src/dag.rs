@@ -41,6 +41,13 @@ pub(crate) enum NodeTerm {
     /// perf step). Built only by `make_acu` (decision **D3**: a pure additive arm — GC, equality, and
     /// reduction traverse it through the [`children`](DagNode::children) visitor unchanged).
     Acu { symbol: SymbolId, args: Vec<(DagId, u32)> },
+    /// An **AU** application (`assoc`, optionally `id:`; **not** commutative): the operator's
+    /// arguments as a canonical **ordered sequence** — nested same-symbol applications flattened and
+    /// identity elements dropped, but **not** sorted or multiplicity-merged (order is significant). A
+    /// canonical AU node always holds ≥ 2 arguments (a lone argument collapses to the element itself,
+    /// the empty sequence to the identity). Built only by `make_au`. Traversal is the same slice-based
+    /// form as [`Free`](NodeTerm::Free).
+    Au { symbol: SymbolId, args: Vec<DagId> },
 }
 
 impl DagNode {
@@ -53,7 +60,10 @@ impl DagNode {
     /// free rep; both are equivalent traversals through this seam.)
     pub fn for_each_child(&self, mut f: impl FnMut(DagId)) {
         match &self.term {
-            NodeTerm::Free { args, .. } => args.iter().for_each(|&c| f(c)),
+            // Free and AU are both an ordered `Vec<DagId>` (AU just allows a variable arg count).
+            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } => {
+                args.iter().for_each(|&c| f(c))
+            }
             // The ACU multiset: each distinct element is visited `multiplicity` times, in canonical
             // order — the same sequence [`children`](Self::children) yields (the equality/GC contract
             // of review R3 H3 / `07` §1.3).
@@ -75,15 +85,16 @@ impl DagNode {
     /// [`crate::engine::Runtime::deep_equal`] relies on.
     pub fn children(&self) -> ChildIter<'_> {
         match &self.term {
-            NodeTerm::Free { args, .. } => ChildIter::Free(args.iter()),
+            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } => ChildIter::Free(args.iter()),
             NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
         }
     }
 
     pub fn symbol(&self) -> SymbolId {
         match &self.term {
-            NodeTerm::Free { symbol, .. } => *symbol,
-            NodeTerm::Acu { symbol, .. } => *symbol,
+            NodeTerm::Free { symbol, .. }
+            | NodeTerm::Acu { symbol, .. }
+            | NodeTerm::Au { symbol, .. } => *symbol,
         }
     }
 

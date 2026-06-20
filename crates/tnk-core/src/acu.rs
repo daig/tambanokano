@@ -334,12 +334,20 @@ impl AcuSubproblem {
         false
     }
 
-    /// Whether the most recent solution matched the whole subject (no residue/extension).
-    pub(crate) fn matched_whole(&self) -> bool {
-        self.matched_whole
+    /// Splice the instantiated `rhs` into the matched position: a whole match is just `rhs`; an
+    /// extension match re-canonicalizes `rhs ⊎ residue` as a fresh ACU node (order-free).
+    pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
+        if self.matched_whole {
+            return rhs;
+        }
+        let mut parts: Vec<(DagId, u32)> = Vec::with_capacity(self.residue.len() + 1);
+        parts.push((rhs, 1));
+        parts.extend_from_slice(&self.residue);
+        rt.make_acu(sig, self.symbol, parts)
     }
-    /// The unmatched residue (extension) of the most recent solution — the elements an AC rewrite
-    /// splices back around the instantiated right-hand side.
+
+    /// The unmatched residue (extension) of the most recent solution (tests / `xmatch` reporting).
+    #[cfg(test)]
     pub(crate) fn residue(&self) -> &[(DagId, u32)] {
         &self.residue
     }

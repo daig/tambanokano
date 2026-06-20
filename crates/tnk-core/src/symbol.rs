@@ -25,14 +25,17 @@ pub(crate) struct Axioms {
 
 /// Which equational theory an operator belongs to — selects its `DagNode` representation and its
 /// matching automaton (decision **D3**: a closed enum, enum-dispatched). This slice implements
-/// [`Free`](Theory::Free) and [`Acu`](Theory::Acu); `Au`/`Cui`/`S`/`Na` arms are later additions.
+/// [`Free`](Theory::Free), [`Acu`](Theory::Acu), and [`Au`](Theory::Au); `Cui`/`S`/`Na` are later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Theory {
     /// No structural axioms: `symbol(args...)` matched by direct structural recursion.
     Free,
-    /// Associative + commutative (with an optional two-sided identity): a flattened multiset of
+    /// Associative + commutative (with an optional two-sided identity): a flattened **multiset** of
     /// arguments, matched modulo AC(+U).
     Acu,
+    /// Associative (with an optional two-sided identity), **not** commutative: a flattened **ordered
+    /// sequence** of arguments, matched modulo A(+U) — e.g. lists, string concatenation.
+    Au,
 }
 
 #[derive(Debug, Clone)]
@@ -58,11 +61,15 @@ impl Symbol {
     }
 
     /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
-    /// `assoc & comm` → [`Acu`](Theory::Acu), else [`Free`](Theory::Free). (Assoc-only/comm-only are
-    /// their own theories — `Au`/`Cui` — and are not yet implemented, so they classify as `Free`
-    /// here; `add_op_ac` only sets the `assoc comm` combination.)
+    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); else
+    /// [`Free`](Theory::Free). (Comm-only is the `Cui` theory — not yet implemented, so it classifies
+    /// as `Free` here; the `add_op_*` constructors only set the supported combinations.)
     pub(crate) fn theory(&self) -> Theory {
-        if self.axioms.assoc && self.axioms.comm { Theory::Acu } else { Theory::Free }
+        match (self.axioms.assoc, self.axioms.comm) {
+            (true, true) => Theory::Acu,
+            (true, false) => Theory::Au,
+            _ => Theory::Free,
+        }
     }
 
     /// The identity constant symbol, if this operator was declared with `id:`.

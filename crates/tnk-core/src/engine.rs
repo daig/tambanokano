@@ -161,6 +161,26 @@ impl Signature {
             identity,
         })
     }
+
+    /// Register an **AU** operator (`assoc`, not commutative, optionally with a two-sided `id:`). Must
+    /// be binary; its arguments are stored as a flattened ordered sequence and matched modulo
+    /// associativity (with extension).
+    pub(crate) fn add_op_au(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        assert_eq!(domain.len(), 2, "an `assoc` operator must be binary");
+        self.symbols.alloc(Symbol {
+            name: name.into(),
+            domain,
+            range,
+            axioms: Axioms { assoc: true, comm: false },
+            identity,
+        })
+    }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
     }
@@ -303,14 +323,60 @@ impl Runtime {
         }
     }
 
+    /// Build a canonical **AU** node for `symbol` from `raw_args` (an ordered argument list). Mirrors
+    /// [`make_acu`](Self::make_acu) for the associative-only theory: flatten arguments that are
+    /// themselves `symbol`-rooted AU nodes (preserving order), drop identity elements, then collapse —
+    /// empty → the identity, a single argument → that argument, else an [`NodeTerm::Au`] node. Order is
+    /// significant, so there is **no** sorting or multiplicity merging.
+    pub(crate) fn make_au(&mut self, sig: &Signature, symbol: SymbolId, raw_args: Vec<DagId>) -> DagId {
+        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Au, "make_au on a non-AU symbol");
+        let identity = sig.symbol(symbol).identity();
+        let mut args: Vec<DagId> = Vec::with_capacity(raw_args.len());
+        for arg in raw_args {
+            if identity.is_some_and(|id_sym| self.is_constant(arg, id_sym)) {
+                continue; // an identity argument vanishes
+            }
+            match &self.dags.get(arg).term {
+                NodeTerm::Au { symbol: inner, args: inner_args } if *inner == symbol => {
+                    args.extend_from_slice(inner_args);
+                }
+                _ => args.push(arg),
+            }
+        }
+        match args.len() {
+            0 => {
+                let id_sym = identity.expect("an empty AU sequence requires an identity element");
+                self.make_const(sig, id_sym)
+            }
+            1 => args[0],
+            _ => {
+                let sort = self.compute_au_sort(sig, symbol, &args);
+                self.alloc_node(sort, NodeTerm::Au { symbol, args })
+            }
+        }
+    }
+
+    /// Sort of an AU node (first cut, mirroring [`compute_acu_sort`](Self::compute_acu_sort)).
+    fn compute_au_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
+        let sym = sig.symbols.get(symbol);
+        let dom = sym.domain[0];
+        let well_sorted = args.iter().all(|&e| sig.sorts.leq(self.dags.get(e).sort, dom));
+        if well_sorted {
+            sym.range
+        } else {
+            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
+        }
+    }
+
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
-    /// operator's theory: a free node directly, or a canonical ACU node (re-merging/sorting the
-    /// children as a multiset). Used by `reduce` when a child changed and by `instantiate`, so neither
-    /// hard-codes the free constructor (which rejects ACU symbols).
+    /// operator's theory: a free node directly, or a canonical ACU/AU node. Used by `reduce` when a
+    /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
+    /// theory symbols).
     pub(crate) fn rebuild(&mut self, sig: &Signature, symbol: SymbolId, children: Vec<DagId>) -> DagId {
         match sig.symbol(symbol).theory() {
             Theory::Free => self.make_free(sig, symbol, children),
             Theory::Acu => self.make_acu(sig, symbol, children.into_iter().map(|d| (d, 1)).collect()),
+            Theory::Au => self.make_au(sig, symbol, children),
         }
     }
 
@@ -376,6 +442,15 @@ impl Runtime {
                     }
                 }
                 xa.len().cmp(&ya.len()) // a proper prefix orders before the longer sequence
+            }
+            (NodeTerm::Au { args: xa, .. }, NodeTerm::Au { args: ya, .. }) => {
+                for (&x, &y) in xa.iter().zip(ya.iter()) {
+                    match self.dag_compare(x, y) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
+                xa.len().cmp(&ya.len()) // ordered sequence: lexicographic, then by length
             }
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
@@ -596,9 +671,10 @@ impl Runtime {
     /// instantiated straight out of the still-borrowed equation table.
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
-        // ACU rewriting matches *modulo* the axioms with extension: a pattern may match a sub-multiset
-        // of the subject, leaving a residue to splice back. The free theory matches the whole node.
-        let ext_allowed = sig.symbol(symbol).theory() == Theory::Acu;
+        // ACU/AU rewriting matches *modulo* the axioms with extension: a pattern may match a
+        // sub-multiset (ACU) or contiguous sub-sequence (AU) of the subject, leaving a residue to
+        // splice back. The free theory matches the whole node.
+        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au);
         let mut subst = Subst::new();
         // Shared borrow of `sig` held across the loop; `self` (the runtime) is disjoint, so the
         // matched `&eq.rhs` is instantiated in place without a defensive clone.
@@ -615,17 +691,11 @@ impl Runtime {
             #[allow(clippy::never_loop)]
             while sp.next(self, sig, &mut subst) {
                 let rhs = self.instantiate(sig, &eq.rhs, &subst);
-                // Whole match → the rhs is the result; extension match (AC) → splice the unmatched
-                // residue back around the rhs and re-canonicalize (Maude's `partialConstruct`).
-                let result = if sp.matched_whole() {
-                    rhs
-                } else {
-                    let mut parts: Vec<(DagId, u32)> = Vec::with_capacity(sp.residue().len() + 1);
-                    parts.push((rhs, 1));
-                    parts.extend_from_slice(sp.residue());
-                    self.make_acu(sig, symbol, parts)
-                };
-                return Some(result);
+                // The subproblem splices the rhs into the matched position — for a whole match that is
+                // just the rhs; for an extension match it re-assembles the residue around it in the
+                // theory's normal form (ACU multiset, AU ordered prefix/suffix — Maude's
+                // `partialConstruct`).
+                return Some(sp.build_result(self, sig, rhs));
             }
         }
         None
@@ -699,6 +769,18 @@ impl Engine {
     ) -> SymbolId {
         self.sig.add_op_ac(name, domain, range, identity)
     }
+
+    /// Register an **AU** operator (`assoc`, not commutative, optionally with a two-sided `id:`). Must
+    /// be binary; arguments are stored as a flattened ordered sequence and matched modulo associativity.
+    pub fn add_op_au(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        self.sig.add_op_au(name, domain, range, identity)
+    }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
     }
@@ -725,6 +807,13 @@ impl Engine {
     /// `make_ac(plus, vec![a, b, c])` builds the canonical `a + b + c`.
     pub fn make_ac(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
         self.rt.make_acu(&self.sig, symbol, elements.into_iter().map(|e| (e, 1)).collect())
+    }
+
+    /// Build a canonical **AU** node for an `assoc [id:]` operator from an ordered element list (see
+    /// [`Runtime::make_au`]): `make_au(concat, vec![a, b, c])` builds the canonical `a b c`. Flattened
+    /// and identity-dropped, order preserved; may collapse to a single element or the identity.
+    pub fn make_au(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
+        self.rt.make_au(&self.sig, symbol, elements)
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -1175,6 +1264,56 @@ mod tests {
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 1, "a + X = b fires once");
         assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c + c), not b + c");
+    }
+
+    /// Engine with constants `a`,`b`,`c`,`d` and an `assoc` (not comm) `__` over sort `E`.
+    fn au_ctx() -> (Engine, SortId, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+        let mut e = Engine::new();
+        let s = e.add_sort("E");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let d = e.add_op("d", vec![], s);
+        let cat = e.add_op_au("__", vec![s, s], s, None);
+        (e, s, a, b, c, d, cat)
+    }
+
+    /// B1 AU reduce lock (extension on both ends, == reference binary): `op __ [assoc]`, `eq b c = a`;
+    /// `red d b c d` → `d a d` in 1 rewrite (the contiguous `b c` is matched, prefix `d` and suffix
+    /// `d` are spliced back around the rhs — order preserved).
+    #[test]
+    fn au_reduce_ground_pattern_extension_both_ends() {
+        let (mut e, _s, a, b, c, d, cat) = au_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(cat, vec![Term::constant(b), Term::constant(c)]), // b c
+            rhs: Term::constant(a),
+            nr_vars: 0,
+        });
+        let (d0, b0, c0, d1) =
+            (e.make_const(d), e.make_const(b), e.make_const(c), e.make_const(d));
+        let subject = e.make_au(cat, vec![d0, b0, c0, d1]); // d b c d
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "b c = a fires once");
+        let kids: Vec<_> = e.node(r).children().map(|k| e.node(k).symbol()).collect();
+        assert_eq!(kids, vec![d, a, d], "result is the ordered sequence d a d");
+    }
+
+    /// B1 AU reduce lock (lone-variable collector, == reference binary): `eq a X = b` on `a c c` → `b`
+    /// in 1 rewrite (X absorbs the ordered tail `c c`; not `b c` from a minimal binding).
+    #[test]
+    fn au_reduce_lone_variable_absorbs() {
+        let (mut e, s, a, b, c, _d, cat) = au_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(cat, vec![Term::constant(a), Term::var(0, s)]), // a X
+            rhs: Term::constant(b),
+            nr_vars: 1,
+        });
+        let (a0, c0, c1) = (e.make_const(a), e.make_const(c), e.make_const(c));
+        let subject = e.make_au(cat, vec![a0, c0, c1]); // a c c
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "a X = b fires once");
+        assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c c)");
     }
 
     #[test]
