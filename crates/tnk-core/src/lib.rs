@@ -16,3 +16,4 @@ pub mod engine;
 pub mod id;
 pub mod sort;
 pub mod symbol;
+pub mod term;
