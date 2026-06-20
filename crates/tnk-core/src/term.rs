@@ -6,7 +6,7 @@
 //! discrimination-net `LhsAutomaton` (A2) is a Phase-1 performance optimization.
 
 use crate::dag::{DagId, NodeTerm};
-use crate::engine::Engine;
+use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 
@@ -77,10 +77,11 @@ impl Subst {
     }
 }
 
-impl Engine {
+impl Runtime {
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
     /// [`Subst::reset`] to the pattern's variable count). Returns `true` on success. On failure
-    /// `subst` may hold partial bindings, so callers reset before each attempt.
+    /// `subst` may hold partial bindings, so callers reset before each attempt. Sort checks consult
+    /// the (shared) signature; binding/equality walk the runtime's DAG arena — the A4 split.
     ///
     /// Recurses on *pattern* depth only (the `Op` arm descends `pat.args`; a `Var` binds without
     /// descending, and the non-linear case defers to the iterative [`Engine::deep_equal`]). Pattern
@@ -89,14 +90,20 @@ impl Engine {
     /// machine-generated equation with a pathologically deep lhs would still recurse; that path is
     /// superseded by A3's compiled, iterative `LhsAutomaton`.
     #[must_use]
-    pub fn match_pattern(&self, pat: &Term, subject: DagId, subst: &mut Subst) -> bool {
+    pub(crate) fn match_pattern(
+        &self,
+        sig: &Signature,
+        pat: &Term,
+        subject: DagId,
+        subst: &mut Subst,
+    ) -> bool {
         match pat {
             Term::Var(v) => match subst.get(v.index) {
                 // Repeated (non-linear) variable: must bind to a structurally equal subterm.
                 Some(bound) => self.deep_equal(bound, subject),
                 // Fresh variable: bind iff the subject's sort fits the variable's sort.
                 None => {
-                    if self.sorts().leq(self.sort_of(subject), v.sort) {
+                    if sig.sorts().leq(self.sort_of(subject), v.sort) {
                         subst.set(v.index, subject);
                         true
                     } else {
@@ -111,7 +118,7 @@ impl Engine {
                         && args
                             .iter()
                             .zip(sargs.iter())
-                            .all(|(p, &s)| self.match_pattern(p, s, subst))
+                            .all(|(p, &s)| self.match_pattern(sig, p, s, subst))
                 }
             },
         }
@@ -123,7 +130,7 @@ impl Engine {
     /// descended on *subject* depth and overflowed on deep terms (e.g. a non-linear pattern over a
     /// million-deep chain — review R2 C1).
     #[must_use]
-    pub fn deep_equal(&self, a: DagId, b: DagId) -> bool {
+    pub(crate) fn deep_equal(&self, a: DagId, b: DagId) -> bool {
         let mut stack: Vec<(DagId, DagId)> = vec![(a, b)];
         while let Some((x, y)) = stack.pop() {
             if x == y {
@@ -149,13 +156,15 @@ impl Engine {
     /// Recurses on *rhs* depth only (author-controlled, small), so like [`Engine::match_pattern`] it
     /// is not exposed to the deep-subject overflow A1 fixed. Note its freshly built children live in
     /// the native-stack `arg_ids` local, so it must not be a GC safe point (see the `ReduceFrame`
-    /// safe-point contract in `engine`).
-    pub fn instantiate(&mut self, term: &Term, subst: &Subst) -> DagId {
+    /// safe-point contract in `engine`). Allocates into the runtime's arena while the (shared)
+    /// signature stays borrowed — the A4 split that lets a rewrite instantiate without cloning the rhs.
+    pub(crate) fn instantiate(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
         match term {
             Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
             Term::Op { symbol, args } => {
-                let arg_ids: Vec<DagId> = args.iter().map(|a| self.instantiate(a, subst)).collect();
-                self.make_free(*symbol, arg_ids)
+                let arg_ids: Vec<DagId> =
+                    args.iter().map(|a| self.instantiate(sig, a, subst)).collect();
+                self.make_free(sig, *symbol, arg_ids)
             }
         }
     }

@@ -1,9 +1,15 @@
 //! The [`Engine`] — the instantiable owner of all runtime state (decision **D1**: no globals,
 //! so several engines can coexist, e.g. for meta-interpreters).
 //!
-//! It owns the sort signature, the symbol table, and the DAG arena; computes each node's least
-//! sort at construction; and runs garbage collection (decision **D2**: non-moving mark-sweep)
-//! over the DAG from an explicit root set.
+//! Internally it is split (Stage A4 / review R3 H1) into an immutable-during-reduction `Signature`
+//! (sorts, symbols, compiled equations) and a mutable `Runtime` (the GC'd DAG arena, roots, and
+//! rewrite statistics): matching and instantiation hold a *shared* borrow of the signature while
+//! mutating the runtime, so a rewrite instantiates an equation's right-hand side straight out of
+//! the still-borrowed equation table — no defensive clone. [`Engine`] is a thin facade that
+//! re-exposes the same public API over the two halves.
+//!
+//! It computes each node's least sort at construction and runs garbage collection (decision **D2**:
+//! non-moving mark-sweep) over the DAG from an explicit root set.
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeTerm};
@@ -51,68 +57,75 @@ struct ReduceFrame {
     next: usize,
 }
 
-pub struct Engine {
+/// The immutable-during-reduction half of the engine: the sort poset, the symbol table, and the
+/// compiled equation set. Matching, instantiation, and reduction take this by shared reference, so
+/// the [`Runtime`] can mutate the DAG arena while the equation table stays borrowed.
+pub(crate) struct Signature {
     sorts: Sorts,
     symbols: Arena<Symbol>,
-    dags: Arena<DagNode>,
     /// Unconditional equations (LHS compiled to a theory automaton), indexed by lhs top symbol.
     equations: HashMap<SymbolId, Vec<CompiledEquation>>,
+    /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
+    /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
+    /// reduced" sentinel stored on nodes, so this starts at `1`.
+    eq_epoch: u32,
+}
+
+/// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
+/// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
+/// `&Signature`; everything else is pure arena work.
+#[derive(Default)]
+pub(crate) struct Runtime {
+    dags: Arena<DagNode>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic).
     rewrite_count: u64,
-    /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
-    /// so `add_equation` invalidates stale "reduced" results (review R2 H2).
-    eq_epoch: u32,
     /// Persistent GC roots held by live [`RootGuard`]s (decision D2 amendment). `gc` always marks
     /// from here; the shared `Rc<RefCell<…>>` lets a guard outlive a `&mut self` call.
     roots: Roots,
-    /// If `Some(n)`, [`reduce`](Self::reduce) collects at its loop head once this many DAG nodes have
-    /// been allocated since the last collection — letting one large reduction run in bounded memory.
-    /// `None` (default) disables in-reduction GC (callers collect between reductions).
+    /// If `Some(n)`, [`reduce`](Engine::reduce) collects at its loop head once this many DAG nodes
+    /// have been allocated since the last collection — letting one large reduction run in bounded
+    /// memory. `None` (default) disables in-reduction GC (callers collect between reductions).
     gc_interval: Option<u64>,
     /// DAG nodes allocated since the last collection (drives `gc_interval`).
     allocs_since_gc: u64,
 }
 
-impl Default for Engine {
+#[derive(Default)]
+pub struct Engine {
+    sig: Signature,
+    rt: Runtime,
+}
+
+impl Default for Signature {
     fn default() -> Self {
-        Engine {
+        Signature {
             sorts: Sorts::default(),
             symbols: Arena::default(),
-            dags: Arena::default(),
             equations: HashMap::default(),
-            rewrite_count: 0,
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
-            roots: Roots::default(),
-            gc_interval: None,
-            allocs_since_gc: 0,
         }
     }
 }
 
-impl Engine {
-    pub fn new() -> Self {
-        Self::default()
-    }
+// ======================================================================================
+// Signature: sorts, symbols, equations (immutable during a reduction)
+// ======================================================================================
 
-    // ---- sort signature ----
-
-    pub fn add_sort(&mut self, name: impl Into<String>) -> SortId {
+impl Signature {
+    pub(crate) fn add_sort(&mut self, name: impl Into<String>) -> SortId {
         self.sorts.add_sort(name)
     }
-    pub fn add_subsort(&mut self, sub: SortId, sup: SortId) {
+    pub(crate) fn add_subsort(&mut self, sub: SortId, sup: SortId) {
         self.sorts.add_subsort(sub, sup);
     }
-    /// Finish the sort poset (compute kinds + subsort closure). Call before building DAG nodes.
-    pub fn close_sorts(&mut self) {
+    pub(crate) fn close_sorts(&mut self) {
         self.sorts.close();
     }
-    pub fn sorts(&self) -> &Sorts {
+    pub(crate) fn sorts(&self) -> &Sorts {
         &self.sorts
     }
 
-    // ---- symbols ----
-
-    pub fn add_op(
+    pub(crate) fn add_op(
         &mut self,
         name: impl Into<String>,
         domain: Vec<SortId>,
@@ -120,15 +133,46 @@ impl Engine {
     ) -> SymbolId {
         self.symbols.alloc(Symbol { name: name.into(), domain, range })
     }
-    pub fn symbol(&self, id: SymbolId) -> &Symbol {
+    pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
     }
 
+    /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
+    /// advance the equation epoch (see [`Engine::add_equation`]).
+    pub(crate) fn add_equation(&mut self, eq: Equation) {
+        let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
+        let compiled = CompiledEquation {
+            lhs: LhsAutomaton::compile(eq.lhs),
+            rhs: eq.rhs,
+            nr_vars: eq.nr_vars,
+        };
+        self.equations.entry(top).or_default().push(compiled);
+        // A term canonical under the old equation set may now be reducible: invalidate every
+        // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
+        self.eq_epoch += 1;
+    }
+
+    /// The current equation-set epoch (stamped into nodes proved canonical; see [`DagNode`]).
+    pub(crate) fn eq_epoch(&self) -> u32 {
+        self.eq_epoch
+    }
+}
+
+// ======================================================================================
+// Runtime: the DAG arena, GC, and the reduction subsystem (mutates; borrows the Signature)
+// ======================================================================================
+
+impl Runtime {
     // ---- DAG construction ----
 
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
-    pub fn make_free(&mut self, symbol: SymbolId, args: Vec<DagId>) -> DagId {
-        let sort = self.compute_free_sort(symbol, &args);
+    pub(crate) fn make_free(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        args: Vec<DagId>,
+    ) -> DagId {
+        let sort = self.compute_free_sort(sig, symbol, &args);
         // Drives safe-point GC; only meaningful when enabled, so the default path skips it entirely.
         // Reset by `safe_point_gc`, so it can't overflow between collections.
         if self.gc_interval.is_some() {
@@ -137,63 +181,53 @@ impl Engine {
         self.dags.alloc(DagNode { sort, reduced_epoch: 0, term: NodeTerm::Free { symbol, args } })
     }
     /// Convenience for a constant (an arity-0 symbol).
-    pub fn make_const(&mut self, symbol: SymbolId) -> DagId {
-        self.make_free(symbol, Vec::new())
+    pub(crate) fn make_const(&mut self, sig: &Signature, symbol: SymbolId) -> DagId {
+        self.make_free(sig, symbol, Vec::new())
     }
 
     /// Phase-0 sort computation for a free node: if every argument's sort is `<=` the declared
     /// domain sort the node gets the operator's `range`; otherwise it lands in the error/top sort
     /// of `range`'s kind. (Overloaded least-sort via a sort diagram arrives in Phase 1.)
-    fn compute_free_sort(&self, symbol: SymbolId, args: &[DagId]) -> SortId {
-        let sym = self.symbols.get(symbol);
+    fn compute_free_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
+        let sym = sig.symbols.get(symbol);
         assert_eq!(sym.arity(), args.len(), "arity mismatch building `{}`", sym.name);
         let well_sorted = sym
             .domain
             .iter()
             .zip(args)
-            .all(|(&dom, &arg)| self.sorts.leq(self.dags.get(arg).sort, dom));
+            .all(|(&dom, &arg)| sig.sorts.leq(self.dags.get(arg).sort, dom));
         if well_sorted {
             sym.range
         } else {
-            self.sorts.error_sort(self.sorts.kind_of(sym.range))
+            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
         }
     }
 
-    pub fn node(&self, id: DagId) -> &DagNode {
+    pub(crate) fn node(&self, id: DagId) -> &DagNode {
         self.dags.get(id)
     }
-    pub fn sort_of(&self, id: DagId) -> SortId {
+    pub(crate) fn sort_of(&self, id: DagId) -> SortId {
         self.dags.get(id).sort
     }
     /// Number of live DAG nodes (post-GC this is the reachable set).
-    pub fn live_nodes(&self) -> usize {
+    pub(crate) fn live_nodes(&self) -> usize {
         self.dags.len()
     }
     /// Peak DAG-arena capacity (high-water mark of allocated slots; stays bounded when GC runs).
-    pub fn node_capacity(&self) -> usize {
+    pub(crate) fn node_capacity(&self) -> usize {
         self.dags.capacity()
     }
 
     // ---- garbage collection (D2) ----
 
-    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (decision D2 amendment).
-    /// The guard registers the root on construction and releases it on `Drop`; it holds a shared
-    /// handle to the registry rather than borrowing the engine, so the caller can keep it alive
-    /// across `&mut self` calls like [`reduce`](Self::reduce).
-    ///
-    /// Bind the guard to a named local (`let _g = engine.root(id);`). `let _ = engine.root(id)` drops
-    /// it immediately, releasing the root on the same line — and `#[must_use]` does *not* flag the
-    /// discarding `let _` form. `id` is not validated here; a stale or cross-engine handle surfaces at
-    /// the next collection, not at this call.
-    pub fn root(&self, id: DagId) -> RootGuard {
+    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (see [`Engine::root`]).
+    pub(crate) fn root(&self, id: DagId) -> RootGuard {
         RootGuard::new(&self.roots, id)
     }
 
-    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`; returns
-    /// the number reclaimed. Roots pinned by guards are *always* included, so callers normally pass
-    /// `[]`; `extra_roots` is the advanced entry point for roots not (yet) held by a guard — e.g. the
-    /// `examples/peano` benchmark, which roots a term inline.
-    pub fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
+    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`
+    /// (see [`Engine::gc`]); returns the number reclaimed.
+    pub(crate) fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
         self.dags.clear_marks();
         self.mark_registered_roots();
         for root in extra_roots {
@@ -211,16 +245,9 @@ impl Engine {
         }
     }
 
-    /// Enable (or disable) safe-point GC during [`reduce`](Self::reduce). `Some(interval)` collects
-    /// at the reduce loop head once `interval` DAG nodes have been allocated since the last
-    /// collection; `None` (default) disables it, so callers collect between reductions instead.
-    ///
-    /// **Rooting contract.** Once this is enabled, a collection can run *during* `reduce`. Any `DagId`
-    /// you keep across a later allocation or `reduce` call — including the result of an *earlier*
-    /// `reduce` — must be pinned with [`root`](Self::root), or that collection may reclaim it (it is
-    /// not reachable from the in-progress reduction's working set). Using an unrooted, reclaimed
-    /// handle panics in debug (the generational check) and is a silent wrong answer in release.
-    pub fn set_gc_interval(&mut self, interval: Option<u64>) {
+    /// Enable (or disable) safe-point GC during [`reduce`](Engine::reduce) (see
+    /// [`Engine::set_gc_interval`] for the rooting contract).
+    pub(crate) fn set_gc_interval(&mut self, interval: Option<u64>) {
         self.gc_interval = interval;
     }
 
@@ -264,45 +291,24 @@ impl Engine {
         }
     }
 
-    // ---- equations + reduction ----
-
-    /// Register an unconditional equation, indexed by its left-hand side's top symbol. The lhs is
-    /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once.
-    pub fn add_equation(&mut self, eq: Equation) {
-        let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
-        let compiled = CompiledEquation {
-            lhs: LhsAutomaton::compile(eq.lhs),
-            rhs: eq.rhs,
-            nr_vars: eq.nr_vars,
-        };
-        self.equations.entry(top).or_default().push(compiled);
-        // A term canonical under the old equation set may now be reducible: invalidate every
-        // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
-        self.eq_epoch += 1;
-    }
+    // ---- statistics ----
 
     /// Total equational rewrites applied so far.
-    pub fn rewrites(&self) -> u64 {
+    pub(crate) fn rewrites(&self) -> u64 {
         self.rewrite_count
     }
-    pub fn reset_rewrites(&mut self) {
+    pub(crate) fn reset_rewrites(&mut self) {
         self.rewrite_count = 0;
     }
 
-    /// Reduce `root` to canonical form by innermost, eager equational simplification (Phase 0:
-    /// unconditional free-theory equations). A node already stamped canonical at the current epoch is
-    /// returned unchanged, so a *shared, already-reduced* subterm is never re-normalized. (A shared
-    /// subterm that is still *reducible* is normalized once per occurrence — Phase 0 has no
-    /// hash-consing/forwarding — exactly as the recursive reducer did.)
-    ///
-    /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
-    /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
-    /// the process on deep terms (review R2 C1). This is a faithful simulation: children are reduced
-    /// left-to-right before the top is rewritten, and each rewrite result is itself re-reduced, so
-    /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
+    // ---- reduction ----
+
+    /// The reduction core; see [`Engine::reduce`] for the contract and the iterative-vs-recursive
+    /// rationale. Reads `sig.eq_epoch()`, builds nodes via `self.make_free(sig, ..)`, and rewrites
+    /// the top via `self.try_rewrite_top(sig, ..)` — all while holding only a shared borrow of `sig`.
     #[must_use]
-    pub fn reduce(&mut self, root: DagId) -> DagId {
-        if self.node(root).reduced_epoch == self.eq_epoch {
+    pub(crate) fn reduce(&mut self, sig: &Signature, root: DagId) -> DagId {
+        if self.node(root).reduced_epoch == sig.eq_epoch() {
             return root;
         }
 
@@ -339,7 +345,7 @@ impl Engine {
                 let f = stack.last().expect("empty reduce stack");
                 if f.next < f.orig.len() {
                     let child = f.orig[f.next];
-                    if self.node(child).reduced_epoch == self.eq_epoch {
+                    if self.node(child).reduced_epoch == sig.eq_epoch() {
                         child_result = Some(child);
                     } else {
                         let frame = self.new_reduce_frame(child);
@@ -358,11 +364,11 @@ impl Engine {
                 let reduced = if changed { std::mem::take(&mut f.reduced) } else { Vec::new() };
                 (f.symbol, f.original, reduced, changed)
             };
-            let rebuilt = if changed { self.make_free(symbol, reduced) } else { original };
+            let rebuilt = if changed { self.make_free(sig, symbol, reduced) } else { original };
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
-            if let Some(next) = self.try_rewrite_top(rebuilt) {
+            if let Some(next) = self.try_rewrite_top(sig, rebuilt) {
                 self.rewrite_count += 1;
                 let frame = self.new_reduce_frame(next);
                 *stack.last_mut().expect("empty reduce stack") = frame;
@@ -370,7 +376,7 @@ impl Engine {
             }
 
             // `rebuilt` is a normal form: stamp it canonical and hand it up (or return it as root).
-            self.dags.get_mut(rebuilt).reduced_epoch = self.eq_epoch;
+            self.dags.get_mut(rebuilt).reduced_epoch = sig.eq_epoch();
             stack.pop();
             if stack.is_empty() {
                 return rebuilt;
@@ -401,27 +407,196 @@ impl Engine {
     /// first matching equation wins; the `while sp.next(..)` loop is where a conditional equation will
     /// evaluate its condition and, on failure, fall through to the next solution — and where an AC
     /// subproblem will surface its several solutions. (Free matching yields exactly one.)
-    fn try_rewrite_top(&mut self, id: DagId) -> Option<DagId> {
+    ///
+    /// The A4 borrow split is what lets this avoid cloning the rhs: `eqs` (and thus `&eq.rhs`) is a
+    /// shared borrow of `sig`, disjoint from the `&mut self` runtime, so the matched rhs is
+    /// instantiated straight out of the still-borrowed equation table.
+    fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         let mut subst = Subst::new();
-        let rhs: Term = {
-            let eqs = self.equations.get(&symbol)?;
-            let mut chosen = None;
-            'search: for eq in eqs {
-                subst.reset(eq.nr_vars);
-                let Some(mut sp) = eq.lhs.match_(self, id, &mut subst) else { continue };
-                // The solution stream. Phase 1 equations are unconditional, so it accepts the first
-                // solution and breaks; conditional equations / AC will iterate it (check the
-                // condition, `continue` to the next solution on failure), which is why it is a loop.
-                #[allow(clippy::never_loop)]
-                while sp.next(self, &mut subst) {
-                    chosen = Some(eq.rhs.clone());
-                    break 'search;
-                }
+        // Shared borrow of `sig` held across the loop; `self` (the runtime) is disjoint, so the
+        // matched `&eq.rhs` is instantiated in place without a defensive clone.
+        let eqs = sig.equations.get(&symbol)?;
+        for eq in eqs {
+            subst.reset(eq.nr_vars);
+            let Some(mut sp) = eq.lhs.match_(self, sig, id, &mut subst) else { continue };
+            // The solution stream. Phase 1 equations are unconditional, so it accepts the first
+            // solution and returns; conditional equations / AC will iterate it (check the
+            // condition, `continue` to the next solution on failure), which is why it is a loop.
+            #[allow(clippy::never_loop)]
+            while sp.next(self, &mut subst) {
+                return Some(self.instantiate(sig, &eq.rhs, &subst));
             }
-            chosen?
-        };
-        Some(self.instantiate(&rhs, &subst))
+        }
+        None
+    }
+}
+
+// ======================================================================================
+// Engine: the thin public facade over Signature + Runtime
+// ======================================================================================
+
+impl Engine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shared access to the immutable signature half (sorts/symbols/equations). Used by the matcher
+    /// seam's tests to drive [`LhsAutomaton`](crate::theory) directly over the two halves.
+    #[cfg(test)]
+    pub(crate) fn signature(&self) -> &Signature {
+        &self.sig
+    }
+    /// Shared access to the mutable runtime half (DAG arena/GC/statistics). Test-only counterpart of
+    /// [`signature`](Self::signature).
+    #[cfg(test)]
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.rt
+    }
+
+    // ---- sort signature ----
+
+    pub fn add_sort(&mut self, name: impl Into<String>) -> SortId {
+        self.sig.add_sort(name)
+    }
+    pub fn add_subsort(&mut self, sub: SortId, sup: SortId) {
+        self.sig.add_subsort(sub, sup);
+    }
+    /// Finish the sort poset (compute kinds + subsort closure). Call before building DAG nodes.
+    pub fn close_sorts(&mut self) {
+        self.sig.close_sorts();
+    }
+    pub fn sorts(&self) -> &Sorts {
+        self.sig.sorts()
+    }
+
+    // ---- symbols ----
+
+    pub fn add_op(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+    ) -> SymbolId {
+        self.sig.add_op(name, domain, range)
+    }
+    pub fn symbol(&self, id: SymbolId) -> &Symbol {
+        self.sig.symbol(id)
+    }
+
+    // ---- DAG construction ----
+
+    /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
+    pub fn make_free(&mut self, symbol: SymbolId, args: Vec<DagId>) -> DagId {
+        self.rt.make_free(&self.sig, symbol, args)
+    }
+    /// Convenience for a constant (an arity-0 symbol).
+    pub fn make_const(&mut self, symbol: SymbolId) -> DagId {
+        self.rt.make_const(&self.sig, symbol)
+    }
+
+    pub fn node(&self, id: DagId) -> &DagNode {
+        self.rt.node(id)
+    }
+    pub fn sort_of(&self, id: DagId) -> SortId {
+        self.rt.sort_of(id)
+    }
+    /// Number of live DAG nodes (post-GC this is the reachable set).
+    pub fn live_nodes(&self) -> usize {
+        self.rt.live_nodes()
+    }
+    /// Peak DAG-arena capacity (high-water mark of allocated slots; stays bounded when GC runs).
+    pub fn node_capacity(&self) -> usize {
+        self.rt.node_capacity()
+    }
+
+    // ---- garbage collection (D2) ----
+
+    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (decision D2 amendment).
+    /// The guard registers the root on construction and releases it on `Drop`; it holds a shared
+    /// handle to the registry rather than borrowing the engine, so the caller can keep it alive
+    /// across `&mut self` calls like [`reduce`](Self::reduce).
+    ///
+    /// Bind the guard to a named local (`let _g = engine.root(id);`). `let _ = engine.root(id)` drops
+    /// it immediately, releasing the root on the same line — and `#[must_use]` does *not* flag the
+    /// discarding `let _` form. `id` is not validated here; a stale or cross-engine handle surfaces at
+    /// the next collection, not at this call.
+    pub fn root(&self, id: DagId) -> RootGuard {
+        self.rt.root(id)
+    }
+
+    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`; returns
+    /// the number reclaimed. Roots pinned by guards are *always* included, so callers normally pass
+    /// `[]`; `extra_roots` is the advanced entry point for roots not (yet) held by a guard — e.g. the
+    /// `examples/peano` benchmark, which roots a term inline.
+    pub fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
+        self.rt.gc(extra_roots)
+    }
+
+    /// Enable (or disable) safe-point GC during [`reduce`](Self::reduce). `Some(interval)` collects
+    /// at the reduce loop head once `interval` DAG nodes have been allocated since the last
+    /// collection; `None` (default) disables it, so callers collect between reductions instead.
+    ///
+    /// **Rooting contract.** Once this is enabled, a collection can run *during* `reduce`. Any `DagId`
+    /// you keep across a later allocation or `reduce` call — including the result of an *earlier*
+    /// `reduce` — must be pinned with [`root`](Self::root), or that collection may reclaim it (it is
+    /// not reachable from the in-progress reduction's working set). Using an unrooted, reclaimed
+    /// handle panics in debug (the generational check) and is a silent wrong answer in release.
+    pub fn set_gc_interval(&mut self, interval: Option<u64>) {
+        self.rt.set_gc_interval(interval);
+    }
+
+    // ---- equations + reduction ----
+
+    /// Register an unconditional equation, indexed by its left-hand side's top symbol. The lhs is
+    /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once. A term canonical under
+    /// the old equation set may now be reducible, so this advances the equation epoch, invalidating
+    /// every node's cached "reduced" stamp (review R2 H2).
+    pub fn add_equation(&mut self, eq: Equation) {
+        self.sig.add_equation(eq);
+    }
+
+    /// Total equational rewrites applied so far.
+    pub fn rewrites(&self) -> u64 {
+        self.rt.rewrites()
+    }
+    pub fn reset_rewrites(&mut self) {
+        self.rt.reset_rewrites();
+    }
+
+    /// Reduce `root` to canonical form by innermost, eager equational simplification (Phase 0:
+    /// unconditional free-theory equations). A node already stamped canonical at the current epoch is
+    /// returned unchanged, so a *shared, already-reduced* subterm is never re-normalized. (A shared
+    /// subterm that is still *reducible* is normalized once per occurrence — Phase 0 has no
+    /// hash-consing/forwarding — exactly as the recursive reducer did.)
+    ///
+    /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
+    /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
+    /// the process on deep terms (review R2 C1). This is a faithful simulation: children are reduced
+    /// left-to-right before the top is rewritten, and each rewrite result is itself re-reduced, so
+    /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
+    #[must_use]
+    pub fn reduce(&mut self, root: DagId) -> DagId {
+        self.rt.reduce(&self.sig, root)
+    }
+
+    /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
+    /// [`Subst::reset`] to the pattern's variable count). Returns `true` on success; on failure
+    /// `subst` may hold partial bindings, so callers reset before each attempt.
+    #[must_use]
+    pub fn match_pattern(&self, pat: &Term, subject: DagId, subst: &mut Subst) -> bool {
+        self.rt.match_pattern(&self.sig, pat, subject, subst)
+    }
+
+    /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
+    #[must_use]
+    pub fn deep_equal(&self, a: DagId, b: DagId) -> bool {
+        self.rt.deep_equal(a, b)
+    }
+
+    /// Build a DAG instance of `term` under `subst` (the rhs of a matched equation).
+    pub fn instantiate(&mut self, term: &Term, subst: &Subst) -> DagId {
+        self.rt.instantiate(&self.sig, term, subst)
     }
 }
 

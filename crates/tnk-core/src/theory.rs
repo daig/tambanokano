@@ -14,13 +14,13 @@
 //! [`Engine::match_pattern`]; the compiled discrimination net is a later performance step behind this
 //! same seam and does not change the driver.
 //!
-//! The `&Engine` parameters on [`LhsAutomaton::match_`]/[`Subproblem::next`] are **provisional**: the
-//! A4 signature/runtime split retargets them at an immutable `Signature` + a mutable runtime, so a
-//! conditional equation can `reduce` its condition (needs `&mut` runtime) and an AC subproblem can
-//! allocate residue nodes while the equation table stays borrowed — without changing the driver loop.
+//! Since the A4 signature/runtime split, [`LhsAutomaton::match_`]/[`Subproblem::next`] take the
+//! immutable `Signature` and the mutable `Runtime` separately: a conditional equation can `reduce`
+//! its condition (needs `&mut` runtime) and an AC subproblem can allocate residue nodes while the
+//! equation table stays borrowed — without changing the driver loop.
 
 use crate::dag::DagId;
-use crate::engine::Engine;
+use crate::engine::{Runtime, Signature};
 use crate::term::{Subst, Term};
 
 /// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); Phase 1 has
@@ -49,13 +49,14 @@ impl LhsAutomaton {
     /// exactly the one solution already bound in `subst`.
     pub(crate) fn match_(
         &self,
-        engine: &Engine,
+        rt: &Runtime,
+        sig: &Signature,
         subject: DagId,
         subst: &mut Subst,
     ) -> Option<Subproblem> {
         match self {
-            LhsAutomaton::Free(pat) => engine
-                .match_pattern(pat, subject, subst)
+            LhsAutomaton::Free(pat) => rt
+                .match_pattern(sig, pat, subject, subst)
                 .then_some(Subproblem::FreeOnce { pending: true }),
         }
     }
@@ -77,10 +78,10 @@ pub(crate) enum Subproblem {
 }
 
 impl Subproblem {
-    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. `engine`/`subst`
+    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. `rt`/`subst`
     /// are unused for the free arm (its single solution was bound during `match_`) but are the inputs
     /// a multi-solution arm needs.
-    pub(crate) fn next(&mut self, _engine: &Engine, _subst: &mut Subst) -> bool {
+    pub(crate) fn next(&mut self, _rt: &Runtime, _subst: &mut Subst) -> bool {
         match self {
             // Yield the already-bound solution exactly once.
             Subproblem::FreeOnce { pending } => core::mem::replace(pending, false),
@@ -109,11 +110,13 @@ mod tests {
         let lhs = LhsAutomaton::compile(Term::op(f, vec![Term::var(0, nat), Term::constant(a)])); // f(X, a)
         let mut subst = Subst::new();
         subst.reset(1);
-        let mut sp = lhs.match_(&e, subject, &mut subst).expect("f(a,a) matches f(X,a)");
-        assert!(sp.next(&e, &mut subst), "the one solution");
+        let mut sp = lhs
+            .match_(e.runtime(), e.signature(), subject, &mut subst)
+            .expect("f(a,a) matches f(X,a)");
+        assert!(sp.next(e.runtime(), &mut subst), "the one solution");
         assert_eq!(subst.get(0), Some(a0), "X bound to the first argument");
-        assert!(!sp.next(&e, &mut subst), "free theory has a single solution");
-        assert!(!sp.next(&e, &mut subst), "an exhausted subproblem stays exhausted");
+        assert!(!sp.next(e.runtime(), &mut subst), "free theory has a single solution");
+        assert!(!sp.next(e.runtime(), &mut subst), "an exhausted subproblem stays exhausted");
     }
 
     /// A non-matching subject yields `None` from `match_` (no subproblem to drive).
@@ -132,6 +135,9 @@ mod tests {
         let lhs = LhsAutomaton::compile(Term::op(f, vec![Term::var(0, nat), Term::constant(a)])); // f(X, a)
         let mut subst = Subst::new();
         subst.reset(1);
-        assert!(lhs.match_(&e, subject, &mut subst).is_none(), "f(b,b) does not match f(X,a)");
+        assert!(
+            lhs.match_(e.runtime(), e.signature(), subject, &mut subst).is_none(),
+            "f(b,b) does not match f(X,a)"
+        );
     }
 }
