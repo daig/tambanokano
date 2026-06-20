@@ -32,6 +32,15 @@ GC would invalidate raw indices and force a relocation/indirection layer.
 **Impact.** Arena = `Vec`-backed slots + free list + mark bitset; roots registered/unregistered via guards.
 **Revisit:** **Phase 0** — this is the central **go/no-go benchmark** (must approach C++ throughput).
 
+**Amendment (Phase-0 review, 2026-06-20).** The review found that "stable ids + non-moving slot reuse"
+is sound only if the root discipline is airtight, yet (a) no `RootGuard` exists — `gc` trusts a hand-passed
+root list, and (b) slot reuse is *silently* undetectable (a recycled `DagId` reads a valid-but-wrong node).
+Decision: at **Phase-1 opening**, implement the `RootGuard`/root registry **and** add a slot generation tag
++ per-arena engine id, checked under `cfg(debug_assertions)` (turning silent reuse / cross-engine misuse
+into immediate panics in dev/test at ~zero release cost). The **release-mode** generational default stays
+open, to be decided by benchmarking an 8-byte handle vs `examples/peano.rs`. Co-design this with the
+iterative reducer (its explicit work-stack *is* the discoverable root set for safe-point GC).
+
 ## D3 — Dispatch boundary: enums for the closed hot set, `dyn` at open seams
 **Decision.** `Symbol`/`DagNode`/`Term` and the fixed theory set (Free/ACU/AU/CUI/S/NA/Var/BuiltIn) are
 **enums with composed data** (sort/equation/rule/strategy/memo tables as fields), giving monomorphized hot

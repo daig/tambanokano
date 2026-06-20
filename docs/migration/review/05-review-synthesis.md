@@ -28,7 +28,8 @@ in exactly the incremental/REPL flow we target.
 
 ---
 
-## Tier 1 — Fix now (cheap, high-confidence, low-risk; apply this pass)
+## Tier 1 — Fix now (cheap, high-confidence, low-risk) — **APPLIED 2026-06-20**
+*(commits `64bf364`, `223faa7`, `783590d`; 22 tests green, clippy clean. Item 6 deferred to Tier 2.D.)*
 1. **Mark-on-push in `mark_reachable`** (`engine.rs:119`) — currently pushes children unconditionally and
    marks on pop, so a node shared by *k* parents is pushed *k* times → GC mark stack is O(edges), not
    O(nodes). One-line fix using the "newly-marked" bool `Arena::mark` already returns. *(R1 M2)*
@@ -44,10 +45,8 @@ in exactly the incremental/REPL flow we target.
    builds a malformed node. *(R0 F4, R3 H2)*
 5. **Subsort-cycle detection in `Sorts::close`** (`sort.rs`) — `a<b<a` is silently accepted as mutual
    `leq`; Maude rejects it. *(R0 F5, R3 M3)*
-6. **Debug-gated generation + engine-id checks** on `Arena` handles (`id.rs`/`arena.rs`) — add a slot
-   generation (bumped on free) and a per-arena id, mirrored into `Id` and validated in `get`/`get_mut`
-   under `cfg(debug_assertions)`. Turns the entire silent-reuse / cross-engine bug class (C1/H1/H2) into
-   immediate panics in dev/test at ~zero release cost. *(R1 M1, R3 C2/L1, R0 F1/F6)*
+6. **(deferred → Tier 2.D)** Debug-gated generation + engine-id checks — moved to the Phase-1 arena-safety
+   work so they are co-designed with the `RootGuard`/root registry (they are one change). *(R1 M1, R3 C2/L1, R0 F1/F6)*
 7. **`#[must_use]`** on `match_pattern`/`deep_equal`/`reduce`/`gc`. *(R3 L2)*
 8. **`marks.fill(false)`** instead of the per-element loop in `clear_marks`. *(R1 L3)*
 9. **Tests:** error-sort propagation *through* `reduce`; subsort-cycle rejection; a bounded deep-term
@@ -75,8 +74,10 @@ These are the "rewrite the core twice if deferred" items. Order matters: do A–
   (GC) and `children() -> impl Iterator<Item=DagId>` (equality/reduce) so ACU `(term,mult)` / red-black
   tree / S-successor reps fit without editing GC + equality + reduce. *(R3 H3)*
 - **D. Arena-safety pair.** Implement the D2 `RootGuard`/root registry (register on construct, unregister
-  on `Drop`) and decide the *release* generational-id default by **benchmarking** an 8-byte handle vs
-  `examples/peano.rs` — before turning on safe-point GC. *(R1 C1/H1, R3 C2/M5, R0 F1)*
+  on `Drop`); add a **slot generation + per-arena engine id checked under `cfg(debug_assertions)`** (turns
+  silent slot-reuse / cross-engine handle bugs into immediate panics in dev/test, ~zero release cost); and
+  decide the *release* generational-id default by **benchmarking** an 8-byte handle vs `examples/peano.rs` —
+  all before turning on safe-point GC. *(R1 C1/H1/M1, R3 C2/L1/M5, R0 F1/F6)*
 - **E. Iterative reduce/match (explicit work-stack) — CRITICAL, do first.** `reduce`/`reduce_args`/
   `deep_equal` recurse on *subject* depth and hard-crash (process `SIGABRT`) at ≈`fib(25)` release /
   `fib(24)` debug — `fib(22)` (our benchmark) is 1–3 steps under the cliff. Convert to explicit work-stacks
