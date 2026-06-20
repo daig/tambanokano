@@ -1,30 +1,79 @@
 //! Engine-relative typed indices (decision **D1**).
 //!
 //! An [`Id<T>`] indexes into an [`crate::arena::Arena<T>`] owned by a single `Engine`. Ids from
-//! different engines must not be mixed; this is an invariant enforced by convention (we do not
-//! expose arithmetic on ids). `Id<T>` is `Copy` and as small as a `u32` regardless of `T`.
+//! different engines must not be mixed, and a stable id must not outlive the slot it names. In
+//! **release** builds `Id<T>` is a bare `u32` and both invariants are unenforced (decision **D2**:
+//! stable ids + non-moving slot reuse trade detection for size). In **debug** builds the id also
+//! carries the arena's identity and the slot's *generation* at mint time (decision **D2 amendment**,
+//! Stage A2): [`Arena`](crate::arena::Arena) bumps a slot's generation when it frees it, so a stale
+//! handle (slot reused since the id was minted — a logical use-after-free) or a cross-arena/
+//! cross-engine handle **panics at access** instead of silently aliasing the wrong node.
+//!
+//! Equality/ordering/hashing are **raw-only in both profiles**, so program behavior is identical
+//! across debug and release: the debug metadata only powers access-time assertions, it is never part
+//! of a node's identity (a recycled slot's new id still compares equal to the old raw index).
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
+/// Debug-only provenance carried inside an [`Id<T>`]: the minting arena's id and the slot's
+/// generation at mint time. Absent (zero-sized) in release builds.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+struct IdMeta {
+    /// Slot generation at mint time; [`Arena`](crate::arena::Arena) bumps it on free.
+    generation: u32,
+    /// Identity of the minting arena (a process-global counter); catches cross-engine id misuse.
+    arena: u32,
+}
+
 /// A stable handle to a `T` stored in an `Arena<T>`. Valid for the lifetime of that node
 /// (decision **D2**: the GC only frees unreachable nodes, so a live id never dangles).
 pub struct Id<T> {
     raw: u32,
+    // Debug-only provenance for stale/cross-arena detection; compiled out in release so `Id<T>`
+    // is a bare `u32`.
+    #[cfg(debug_assertions)]
+    meta: IdMeta,
     // `fn() -> T` makes `Id<T>` unconditionally `Send`/`Sync`/`Copy` and covariant in `T`,
     // without implying ownership of a `T`.
     _t: PhantomData<fn() -> T>,
 }
 
 impl<T> Id<T> {
+    /// Construct from a bare index, with no arena provenance (the debug `arena`/`generation` are the
+    /// `0` sentinel). Used for indices that do not live in a GC'd [`Arena`](crate::arena::Arena)
+    /// (e.g. sorts/kinds, which are never freed and are accessed by direct `Vec` indexing, not
+    /// `Arena::get`). Arena handles are minted by `Arena::alloc` and then [`stamp`](Self::stamp)ed.
     #[inline]
     pub(crate) const fn from_raw(raw: u32) -> Self {
-        Self { raw, _t: PhantomData }
+        Self {
+            raw,
+            #[cfg(debug_assertions)]
+            meta: IdMeta { generation: 0, arena: 0 },
+            _t: PhantomData,
+        }
     }
     #[inline]
     pub(crate) const fn index(self) -> usize {
         self.raw as usize
+    }
+
+    /// Record the minting arena's id and the slot generation. Debug-only: the call site in
+    /// `Arena::alloc` is itself `cfg(debug_assertions)`-gated, so release never references this.
+    #[cfg(debug_assertions)]
+    #[inline]
+    pub(crate) fn stamp(mut self, generation: u32, arena: u32) -> Self {
+        self.meta = IdMeta { generation, arena };
+        self
+    }
+
+    /// `(generation, arena)` recorded at mint time (debug only).
+    #[cfg(debug_assertions)]
+    #[inline]
+    pub(crate) fn meta(self) -> (u32, u32) {
+        (self.meta.generation, self.meta.arena)
     }
 }
 

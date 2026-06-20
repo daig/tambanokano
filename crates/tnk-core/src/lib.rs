@@ -14,6 +14,7 @@ pub mod arena;
 pub mod dag;
 pub mod engine;
 pub mod id;
+pub mod root;
 pub mod sort;
 pub mod symbol;
 pub mod term;

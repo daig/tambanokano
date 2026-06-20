@@ -7,6 +7,7 @@
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeTerm};
+use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Symbol, SymbolId};
 use crate::term::{Equation, Subst, Term};
@@ -51,6 +52,15 @@ pub struct Engine {
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
     /// so `add_equation` invalidates stale "reduced" results (review R2 H2).
     eq_epoch: u32,
+    /// Persistent GC roots held by live [`RootGuard`]s (decision D2 amendment). `gc` always marks
+    /// from here; the shared `Rc<RefCell<…>>` lets a guard outlive a `&mut self` call.
+    roots: Roots,
+    /// If `Some(n)`, [`reduce`](Self::reduce) collects at its loop head once this many DAG nodes have
+    /// been allocated since the last collection — letting one large reduction run in bounded memory.
+    /// `None` (default) disables in-reduction GC (callers collect between reductions).
+    gc_interval: Option<u64>,
+    /// DAG nodes allocated since the last collection (drives `gc_interval`).
+    allocs_since_gc: u64,
 }
 
 impl Default for Engine {
@@ -62,6 +72,9 @@ impl Default for Engine {
             equations: HashMap::default(),
             rewrite_count: 0,
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
+            roots: Roots::default(),
+            gc_interval: None,
+            allocs_since_gc: 0,
         }
     }
 }
@@ -106,6 +119,11 @@ impl Engine {
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
     pub fn make_free(&mut self, symbol: SymbolId, args: Vec<DagId>) -> DagId {
         let sort = self.compute_free_sort(symbol, &args);
+        // Drives safe-point GC; only meaningful when enabled, so the default path skips it entirely.
+        // Reset by `safe_point_gc`, so it can't overflow between collections.
+        if self.gc_interval.is_some() {
+            self.allocs_since_gc += 1;
+        }
         self.dags.alloc(DagNode { sort, reduced_epoch: 0, term: NodeTerm::Free { symbol, args } })
     }
     /// Convenience for a constant (an arity-0 symbol).
@@ -148,13 +166,72 @@ impl Engine {
 
     // ---- garbage collection (D2) ----
 
-    /// Collect every DAG node not reachable from `roots`. Returns the number reclaimed.
-    pub fn gc(&mut self, roots: impl IntoIterator<Item = DagId>) -> usize {
+    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (decision D2 amendment).
+    /// The guard registers the root on construction and releases it on `Drop`; it holds a shared
+    /// handle to the registry rather than borrowing the engine, so the caller can keep it alive
+    /// across `&mut self` calls like [`reduce`](Self::reduce).
+    ///
+    /// Bind the guard to a named local (`let _g = engine.root(id);`). `let _ = engine.root(id)` drops
+    /// it immediately, releasing the root on the same line — and `#[must_use]` does *not* flag the
+    /// discarding `let _` form. `id` is not validated here; a stale or cross-engine handle surfaces at
+    /// the next collection, not at this call.
+    pub fn root(&self, id: DagId) -> RootGuard {
+        RootGuard::new(&self.roots, id)
+    }
+
+    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`; returns
+    /// the number reclaimed. Roots pinned by guards are *always* included, so callers normally pass
+    /// `[]`; `extra_roots` is the advanced entry point for roots not (yet) held by a guard — e.g. the
+    /// `examples/peano` benchmark, which roots a term inline.
+    pub fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
         self.dags.clear_marks();
-        for root in roots {
+        self.mark_registered_roots();
+        for root in extra_roots {
             self.mark_reachable(root);
         }
         self.dags.sweep(|_| {})
+    }
+
+    /// Mark (transitively) every root currently pinned by a [`RootGuard`].
+    fn mark_registered_roots(&mut self) {
+        // Collect first so the registry borrow is released before the `&mut self` mark walk.
+        let pinned: Vec<DagId> = self.roots.borrow().live_roots().collect();
+        for r in pinned {
+            self.mark_reachable(r);
+        }
+    }
+
+    /// Enable (or disable) safe-point GC during [`reduce`](Self::reduce). `Some(interval)` collects
+    /// at the reduce loop head once `interval` DAG nodes have been allocated since the last
+    /// collection; `None` (default) disables it, so callers collect between reductions instead.
+    ///
+    /// **Rooting contract.** Once this is enabled, a collection can run *during* `reduce`. Any `DagId`
+    /// you keep across a later allocation or `reduce` call — including the result of an *earlier*
+    /// `reduce` — must be pinned with [`root`](Self::root), or that collection may reclaim it (it is
+    /// not reachable from the in-progress reduction's working set). Using an unrooted, reclaimed
+    /// handle panics in debug (the generational check) and is a silent wrong answer in release.
+    pub fn set_gc_interval(&mut self, interval: Option<u64>) {
+        self.gc_interval = interval;
+    }
+
+    /// Collect at a `reduce` safe point, rooting the in-flight working set: the registry, plus every
+    /// frame's term (`original`, which transitively covers its `orig` children) and its already-
+    /// `reduced` children, plus the `child_result` not yet delivered into a frame. This is the
+    /// complete loop-head root set (see the [`ReduceFrame`] safe-point contract); collecting anywhere
+    /// else would miss fresh nodes living only in native-stack locals.
+    fn safe_point_gc(&mut self, frames: &[ReduceFrame], child_result: Option<DagId>) {
+        self.dags.clear_marks();
+        self.mark_registered_roots();
+        for frame in frames {
+            self.mark_reachable(frame.original);
+            for &r in &frame.reduced {
+                self.mark_reachable(r);
+            }
+        }
+        if let Some(r) = child_result {
+            self.mark_reachable(r);
+        }
+        self.dags.sweep(|_| {});
     }
 
     /// Iterative (stack-based) transitive marker. Marks each node **on push** (using the
@@ -222,6 +299,16 @@ impl Engine {
             // Invariant: `stack` is non-empty throughout the body. It starts with the root frame and
             // the only `pop` (below) is immediately followed by a `return` when it empties, so the
             // loop never re-enters with an empty stack — the `expect`s below are therefore unreachable.
+
+            // Safe-point GC (A2): the loop head is the *only* point during a reduction where every
+            // in-flight node is discoverable (the frame stack + `child_result`); collect here when
+            // allocation pressure crosses the configured interval so a large reduction stays bounded.
+            if let Some(interval) = self.gc_interval
+                && self.allocs_since_gc >= interval
+            {
+                self.safe_point_gc(&stack, child_result);
+                self.allocs_since_gc = 0;
+            }
 
             // Deliver a completed child to the current (top) frame and advance its cursor.
             if let Some(r) = child_result.take() {
@@ -657,5 +744,127 @@ mod tests {
         // f(s 0, s 0): each occurrence of the shared C fired `N + 0 = N` once.
         assert_eq!(e.node(r).symbol(), f);
         assert_eq!(e.rewrites(), 2, "shared reducible redex counted once per occurrence (no hash-consing)");
+    }
+
+    /// A [`RootGuard`] pins its node across `gc`; dropping it releases the root (D2 amendment).
+    #[test]
+    fn root_guard_keeps_node_alive_then_releases_on_drop() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], nat);
+        let node = e.make_const(a);
+        {
+            let _g = e.root(node);
+            assert_eq!(e.gc(Vec::new()), 0, "a guarded node survives gc with no extra roots");
+            assert_eq!(e.live_nodes(), 1);
+        } // guard dropped here
+        assert_eq!(e.gc(Vec::new()), 1, "after the guard drops, the node is collected");
+        assert_eq!(e.live_nodes(), 0);
+    }
+
+    /// `RootGuard::set` retargets the root — e.g. to follow a term as a reduction rewrites it.
+    #[test]
+    fn root_guard_set_retargets() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], nat);
+        let b = e.add_op("b", vec![], nat);
+        let na = e.make_const(a);
+        let nb = e.make_const(b);
+        let g = e.root(na);
+        g.set(nb); // now protecting nb instead of na
+        assert_eq!(e.gc(Vec::new()), 1, "na is no longer rooted and is collected");
+        assert_eq!(e.live_nodes(), 1);
+        assert_eq!(e.node(g.get()).symbol(), b, "the guard now protects nb");
+    }
+
+    /// Done-when: safe-point GC during *one* reduction keeps memory bounded. The same `fib`
+    /// reduction is run with GC off (capacity grows to the full allocation high-water) and with a
+    /// short GC interval (capacity stays near the live working set); the result is unchanged. Roots
+    /// in flight (the work-stack + child_result) are kept, so the answer is still correct.
+    #[test]
+    fn safe_point_gc_bounds_memory_within_one_reduction() {
+        fn run(interval: Option<u64>) -> (u32, u64, usize) {
+            let mut e = Engine::new();
+            let nat = e.add_sort("Nat");
+            e.close_sorts();
+            let zero = e.add_op("0", vec![], nat);
+            let s = e.add_op("s", vec![nat], nat);
+            let plus = e.add_op("+", vec![nat, nat], nat);
+            let fib = e.add_op("fib", vec![nat], nat);
+            let v = |i| Term::var(i, nat);
+            let s_of = |t| Term::op(s, vec![t]);
+            let zero_t = || Term::constant(zero);
+            e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), zero_t()]), rhs: v(0), nr_vars: 1 });
+            e.add_equation(Equation {
+                lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
+                rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
+                nr_vars: 2,
+            });
+            e.add_equation(Equation { lhs: Term::op(fib, vec![zero_t()]), rhs: zero_t(), nr_vars: 0 });
+            e.add_equation(Equation { lhs: Term::op(fib, vec![s_of(zero_t())]), rhs: s_of(zero_t()), nr_vars: 0 });
+            e.add_equation(Equation {
+                lhs: Term::op(fib, vec![s_of(s_of(v(0)))]),
+                rhs: Term::op(plus, vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])]),
+                nr_vars: 1,
+            });
+            e.set_gc_interval(interval);
+            let n = numeral(&mut e, zero, s, 20);
+            let q = e.make_free(fib, vec![n]);
+            let r = e.reduce(q);
+            (decode(&e, r, zero, s), e.rewrites(), e.node_capacity())
+        }
+
+        let (val_off, rw_off, cap_off) = run(None);
+        let (val_on, rw_on, cap_on) = run(Some(20_000));
+        assert_eq!(val_off, 6765, "fib(20) = 6765");
+        assert_eq!(val_on, 6765, "safe-point GC does not change the result");
+        assert_eq!(rw_on, rw_off, "safe-point GC does not change the rewrite count");
+        assert!(
+            cap_on < cap_off,
+            "safe-point GC bounds the arena high-water: {cap_on} (on) vs {cap_off} (off)"
+        );
+    }
+
+    /// Locks the `set_gc_interval` rooting contract (review finding): with safe-point GC enabled, a
+    /// result held across a later reduction survives *iff* it is pinned by a [`RootGuard`]. Here the
+    /// rooted result of `2 + 2` is still `s^4 0` after a second, allocation-heavy reduction triggers
+    /// collection. (Without the guard the second reduction would reclaim it — a debug stale-handle
+    /// panic / release silent error — which is the documented footgun, not tested here.)
+    #[test]
+    fn safe_point_gc_preserves_a_rooted_result_across_reductions() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+        e.set_gc_interval(Some(100)); // collect several times during a reduction
+
+        let two_a = numeral(&mut e, zero, s, 2);
+        let two_b = numeral(&mut e, zero, s, 2);
+        let sum = e.make_free(plus, vec![two_a, two_b]);
+        let four = e.reduce(sum); // s^4 0
+        let g = e.root(four); // pin it across the next reduction
+
+        // A second, disjoint reduction whose collections (every ~100 allocs) must not reclaim `four`.
+        let big_a = numeral(&mut e, zero, s, 600);
+        let big_b = numeral(&mut e, zero, s, 600);
+        let big_sum = e.make_free(plus, vec![big_a, big_b]);
+        let _ = e.reduce(big_sum);
+
+        assert_eq!(decode(&e, g.get(), zero, s), 4, "the rooted result survives intact");
     }
 }
