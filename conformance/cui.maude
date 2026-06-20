@@ -1,0 +1,27 @@
+*** CUI (commutative, not associative, [idem] [id:]) conformance (Stage B1) vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/cui.maude < /dev/null
+*** Mirrors crates/tnk-core/src/{cui.rs,engine.rs} CUI tests.
+
+fmod CUI-MATCH is
+  sort E . ops a b : -> E .
+  op f : E E -> E [comm] .
+  vars X Y : E .
+endfm
+*** 2 matchers — the commutative pairings:
+match f(X, Y) <=? f(a, b) .
+
+fmod CUI-REDUCE is              *** matching modulo commutativity
+  sort E . ops a b c : -> E . op f : E E -> E [comm] .
+  eq f(a, b) = c .
+endfm
+red f(b, a) .                   *** => c   (1 rewrite)
+
+fmod CUI-IDEM is                *** idempotence collapses at construction
+  sort E . op a : -> E . op g : E E -> E [comm idem] .
+endfm
+red g(a, a) .                   *** => a   (0 rewrites)
+
+fmod CUI-ID is                  *** identity collapses at construction
+  sort E . ops a e : -> E . op h : E E -> E [comm id: e] .
+endfm
+red h(a, e) .                   *** => a   (0 rewrites)

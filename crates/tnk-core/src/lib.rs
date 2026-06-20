@@ -23,4 +23,5 @@ pub mod term;
 // consumer exists).
 pub(crate) mod acu;
 pub(crate) mod au;
+pub(crate) mod cui;
 pub(crate) mod theory;

@@ -157,7 +157,7 @@ impl Signature {
             name: name.into(),
             domain,
             range,
-            axioms: Axioms { assoc: true, comm: true },
+            axioms: Axioms { assoc: true, comm: true, idem: false },
             identity,
         })
     }
@@ -177,7 +177,28 @@ impl Signature {
             name: name.into(),
             domain,
             range,
-            axioms: Axioms { assoc: true, comm: false },
+            axioms: Axioms { assoc: true, comm: false, idem: false },
+            identity,
+        })
+    }
+
+    /// Register a **CUI** operator (`comm`, not associative, optionally `idem` and/or `id:`). Must be
+    /// binary; its two arguments are stored in canonical order and matched modulo commutativity
+    /// (idempotence and identity collapse `f(a,a)`/`f(a,e)` to a single element at construction).
+    pub(crate) fn add_op_cui(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        idem: bool,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        assert_eq!(domain.len(), 2, "a `comm` operator must be binary");
+        self.symbols.alloc(Symbol {
+            name: name.into(),
+            domain,
+            range,
+            axioms: Axioms { assoc: false, comm: true, idem },
             identity,
         })
     }
@@ -368,8 +389,54 @@ impl Runtime {
         }
     }
 
+    /// Build a canonical **CUI** node for `symbol` from its two arguments. Applies the collapse axioms
+    /// at construction (Maude keeps CUI terms in normal form): an identity argument (`id:`) drops the
+    /// node to the other argument; idempotence (`idem`) drops `f(a, a)` to `a`; otherwise the two
+    /// arguments are placed in canonical (sorted) order for commutativity. So `f(b, a)` and `f(a, b)`
+    /// are the same node, and `f(a, a)`/`f(a, e)` collapse away for free (0 rewrites).
+    pub(crate) fn make_cui(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        mut x: DagId,
+        mut y: DagId,
+    ) -> DagId {
+        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Cui, "make_cui on a non-CUI symbol");
+        let identity = sig.symbol(symbol).identity;
+        let idem = sig.symbol(symbol).axioms.idem;
+        if let Some(id_sym) = identity {
+            if self.is_constant(x, id_sym) {
+                return y;
+            }
+            if self.is_constant(y, id_sym) {
+                return x;
+            }
+        }
+        if idem && self.dag_compare(x, y) == Ordering::Equal {
+            return x;
+        }
+        if self.dag_compare(x, y) == Ordering::Greater {
+            std::mem::swap(&mut x, &mut y); // canonical order for commutativity
+        }
+        let sort = self.compute_cui_sort(sig, symbol, x, y);
+        self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
+    }
+
+    /// Sort of a CUI node (first cut, mirroring [`compute_acu_sort`](Self::compute_acu_sort)).
+    fn compute_cui_sort(&self, sig: &Signature, symbol: SymbolId, x: DagId, y: DagId) -> SortId {
+        let sym = sig.symbols.get(symbol);
+        let dom = sym.domain[0];
+        let well_sorted = sig.sorts.leq(self.dags.get(x).sort, dom)
+            && sig.sorts.leq(self.dags.get(y).sort, dom);
+        if well_sorted {
+            sym.range
+        } else {
+            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
+        }
+    }
+
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
-    /// operator's theory: a free node directly, or a canonical ACU/AU node. Used by `reduce` when a
+    /// operator's theory: a free node directly, or a canonical ACU/AU/CUI node. Used by `reduce` when a
     /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
     /// theory symbols).
     pub(crate) fn rebuild(&mut self, sig: &Signature, symbol: SymbolId, children: Vec<DagId>) -> DagId {
@@ -377,6 +444,10 @@ impl Runtime {
             Theory::Free => self.make_free(sig, symbol, children),
             Theory::Acu => self.make_acu(sig, symbol, children.into_iter().map(|d| (d, 1)).collect()),
             Theory::Au => self.make_au(sig, symbol, children),
+            Theory::Cui => {
+                debug_assert_eq!(children.len(), 2, "a CUI node is binary");
+                self.make_cui(sig, symbol, children[0], children[1])
+            }
         }
     }
 
@@ -443,14 +514,17 @@ impl Runtime {
                 }
                 xa.len().cmp(&ya.len()) // a proper prefix orders before the longer sequence
             }
-            (NodeTerm::Au { args: xa, .. }, NodeTerm::Au { args: ya, .. }) => {
+            // AU (ordered sequence) and CUI (canonically-ordered pair) compare the same way: an equal
+            // top symbol means the same arm, so the cross cases can't arise.
+            (NodeTerm::Au { args: xa, .. }, NodeTerm::Au { args: ya, .. })
+            | (NodeTerm::Cui { args: xa, .. }, NodeTerm::Cui { args: ya, .. }) => {
                 for (&x, &y) in xa.iter().zip(ya.iter()) {
                     match self.dag_compare(x, y) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
                 }
-                xa.len().cmp(&ya.len()) // ordered sequence: lexicographic, then by length
+                xa.len().cmp(&ya.len()) // lexicographic, then by length
             }
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
@@ -781,6 +855,20 @@ impl Engine {
     ) -> SymbolId {
         self.sig.add_op_au(name, domain, range, identity)
     }
+
+    /// Register a **CUI** operator (`comm`, not associative, optionally `idem` and/or `id:`). Must be
+    /// binary; the two arguments are stored in canonical order, and `idem`/`id:` collapse `f(a,a)` /
+    /// `f(a,e)` to a single element at construction.
+    pub fn add_op_cui(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        idem: bool,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        self.sig.add_op_cui(name, domain, range, idem, identity)
+    }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
     }
@@ -814,6 +902,12 @@ impl Engine {
     /// and identity-dropped, order preserved; may collapse to a single element or the identity.
     pub fn make_au(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
         self.rt.make_au(&self.sig, symbol, elements)
+    }
+
+    /// Build a canonical **CUI** node for a `comm [idem] [id:]` operator from its two arguments (see
+    /// [`Runtime::make_cui`]): commutatively ordered, with `f(a,a)`/`f(a,e)` collapsed.
+    pub fn make_cui(&mut self, symbol: SymbolId, x: DagId, y: DagId) -> DagId {
+        self.rt.make_cui(&self.sig, symbol, x, y)
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -1314,6 +1408,68 @@ mod tests {
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 1, "a X = b fires once");
         assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c c)");
+    }
+
+    /// B1 CUI canonicalization (== reference binary): `comm` orders the pair (`f(b,a) == f(a,b)`);
+    /// `idem` collapses `g(a,a)` to `a`; `id:` collapses `h(a,e)` to `a` — all at construction.
+    #[test]
+    fn cui_canonical_comm_idem_identity() {
+        let mut e = Engine::new();
+        let s = e.add_sort("E");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let unit = e.add_op("e", vec![], s);
+        let f = e.add_op_cui("f", vec![s, s], s, false, None);
+        let g = e.add_op_cui("g", vec![s, s], s, true, None); // idem
+        let h = e.add_op_cui("h", vec![s, s], s, false, Some(unit)); // id: e
+
+        let fab = {
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            e.make_cui(f, x, y)
+        };
+        let fba = {
+            let (x, y) = (e.make_const(b), e.make_const(a));
+            e.make_cui(f, x, y) // f(b, a) → canonical f(a, b)
+        };
+        assert!(e.deep_equal(fab, fba), "f(a, b) == f(b, a) (comm)");
+
+        let gaa = {
+            let (x, y) = (e.make_const(a), e.make_const(a));
+            e.make_cui(g, x, y)
+        };
+        assert_eq!(e.node(gaa).symbol(), a, "g(a, a) collapses to a (idem)");
+
+        let hae = {
+            let (x, u) = (e.make_const(a), e.make_const(unit));
+            e.make_cui(h, x, u)
+        };
+        assert_eq!(e.node(hae).symbol(), a, "h(a, e) collapses to a (id:)");
+    }
+
+    /// B1 CUI reduce lock (== reference binary): `eq f(a, b) = c` matches `f(b, a)` modulo
+    /// commutativity → `c` in 1 rewrite.
+    #[test]
+    fn cui_reduce_modulo_commutativity() {
+        let mut e = Engine::new();
+        let s = e.add_sort("E");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let f = e.add_op_cui("f", vec![s, s], s, false, None);
+        e.add_equation(Equation {
+            lhs: Term::op(f, vec![Term::constant(a), Term::constant(b)]), // f(a, b)
+            rhs: Term::constant(c),
+            nr_vars: 0,
+        });
+        let fba = {
+            let (x, y) = (e.make_const(b), e.make_const(a));
+            e.make_cui(f, x, y) // f(b, a)
+        };
+        let r = e.reduce(fba);
+        assert_eq!(e.rewrites(), 1, "f(a,b)=c matches f(b,a) modulo comm");
+        assert_eq!(e.node(r).symbol(), c, "result is c");
     }
 
     #[test]

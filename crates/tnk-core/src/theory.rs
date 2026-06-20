@@ -21,6 +21,7 @@
 
 use crate::acu::{AcuLhs, AcuSubproblem};
 use crate::au::{AuLhs, AuSubproblem};
+use crate::cui::{CuiLhs, CuiSubproblem};
 use crate::dag::DagId;
 use crate::engine::{Runtime, Signature};
 use crate::symbol::Theory;
@@ -41,6 +42,8 @@ pub(crate) enum LhsAutomaton {
     Acu(AcuLhs),
     /// AU theory (`assoc [id:]`, not commutative): ordered-sequence matching with extension.
     Au(AuLhs),
+    /// CUI theory (`comm [idem] [id:]`, not associative): commutative binary matching.
+    Cui(CuiLhs),
 }
 
 impl LhsAutomaton {
@@ -49,6 +52,7 @@ impl LhsAutomaton {
         match lhs.top_symbol().map(|s| sig.symbol(s).theory()) {
             Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
+            Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
             _ => LhsAutomaton::Free(lhs),
         }
     }
@@ -77,6 +81,8 @@ impl LhsAutomaton {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
             }
             LhsAutomaton::Au(lhs) => lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Au),
+            // CUI is binary with no extension, so it ignores `ext_allowed`.
+            LhsAutomaton::Cui(lhs) => lhs.match_(rt, sig, subject).map(Subproblem::Cui),
         }
     }
 }
@@ -97,6 +103,8 @@ pub(crate) enum Subproblem {
     Acu(AcuSubproblem),
     /// AU theory: a resumable ordered-sequence enumerator (see [`AuSubproblem`]).
     Au(AuSubproblem),
+    /// CUI theory: the (at most two) commutative pairings (see [`CuiSubproblem`]).
+    Cui(CuiSubproblem),
 }
 
 impl Subproblem {
@@ -110,6 +118,7 @@ impl Subproblem {
             Subproblem::FreeOnce { pending } => core::mem::replace(pending, false),
             Subproblem::Acu(sp) => sp.next(rt, sig, subst),
             Subproblem::Au(sp) => sp.next(rt, sig, subst),
+            Subproblem::Cui(sp) => sp.next(rt, sig, subst),
         }
     }
 
@@ -122,6 +131,7 @@ impl Subproblem {
             Subproblem::FreeOnce { .. } => rhs,
             Subproblem::Acu(sp) => sp.build_result(rt, sig, rhs),
             Subproblem::Au(sp) => sp.build_result(rt, sig, rhs),
+            Subproblem::Cui(sp) => sp.build_result(rt, sig, rhs),
         }
     }
 }

@@ -21,6 +21,9 @@ pub type SymbolId = Id<Symbol>;
 pub(crate) struct Axioms {
     pub assoc: bool,
     pub comm: bool,
+    /// Idempotence (`f(a, a) = a`) — only meaningful for the commutative, non-associative CUI theory
+    /// in this slice (`idem` cannot combine with `assoc`).
+    pub idem: bool,
 }
 
 /// Which equational theory an operator belongs to — selects its `DagNode` representation and its
@@ -36,6 +39,9 @@ pub(crate) enum Theory {
     /// Associative (with an optional two-sided identity), **not** commutative: a flattened **ordered
     /// sequence** of arguments, matched modulo A(+U) — e.g. lists, string concatenation.
     Au,
+    /// Commutative (with optional identity and/or idempotence), **not** associative: a binary node
+    /// with canonically-ordered arguments, matched modulo C(+U+I).
+    Cui,
 }
 
 #[derive(Debug, Clone)]
@@ -61,14 +67,14 @@ impl Symbol {
     }
 
     /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
-    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); else
-    /// [`Free`](Theory::Free). (Comm-only is the `Cui` theory — not yet implemented, so it classifies
-    /// as `Free` here; the `add_op_*` constructors only set the supported combinations.)
+    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm` only →
+    /// [`Cui`](Theory::Cui); else [`Free`](Theory::Free). (`idem` rides along inside CUI.)
     pub(crate) fn theory(&self) -> Theory {
         match (self.axioms.assoc, self.axioms.comm) {
             (true, true) => Theory::Acu,
             (true, false) => Theory::Au,
-            _ => Theory::Free,
+            (false, true) => Theory::Cui,
+            (false, false) => Theory::Free,
         }
     }
 

@@ -135,10 +135,10 @@ impl Runtime {
                             .zip(sargs.iter())
                             .all(|(p, &s)| self.match_pattern(sig, p, s, subst))
                 }
-                // The recursive free matcher never matches an ACU/AU subject: those are matched by
+                // The recursive free matcher never matches a theory subject: those are matched by
                 // their own automata, and a free Op pattern's symbol differs from any theory symbol.
                 // (A *variable* pattern still binds such a subject — that is the `Term::Var` arm.)
-                NodeTerm::Acu { .. } | NodeTerm::Au { .. } => false,
+                NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } => false,
             },
         }
     }

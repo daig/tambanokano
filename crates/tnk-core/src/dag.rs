@@ -48,6 +48,11 @@ pub(crate) enum NodeTerm {
     /// the empty sequence to the identity). Built only by `make_au`. Traversal is the same slice-based
     /// form as [`Free`](NodeTerm::Free).
     Au { symbol: SymbolId, args: Vec<DagId> },
+    /// A **CUI** application (`comm`, optionally `id:`/`idem`; **not** associative): a binary node
+    /// whose two arguments are in canonical (sorted) order. `f(a, a)` (idem) and `f(a, e)` (identity)
+    /// collapse to a single element at construction, so a canonical CUI node always has exactly two
+    /// arguments. Built only by `make_cui`; traversal is the slice-based form.
+    Cui { symbol: SymbolId, args: Vec<DagId> },
 }
 
 impl DagNode {
@@ -60,8 +65,8 @@ impl DagNode {
     /// free rep; both are equivalent traversals through this seam.)
     pub fn for_each_child(&self, mut f: impl FnMut(DagId)) {
         match &self.term {
-            // Free and AU are both an ordered `Vec<DagId>` (AU just allows a variable arg count).
-            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } => {
+            // Free, AU, and CUI are all an ordered `Vec<DagId>` (a contiguous child slice).
+            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } | NodeTerm::Cui { args, .. } => {
                 args.iter().for_each(|&c| f(c))
             }
             // The ACU multiset: each distinct element is visited `multiplicity` times, in canonical
@@ -85,7 +90,9 @@ impl DagNode {
     /// [`crate::engine::Runtime::deep_equal`] relies on.
     pub fn children(&self) -> ChildIter<'_> {
         match &self.term {
-            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } => ChildIter::Free(args.iter()),
+            NodeTerm::Free { args, .. }
+            | NodeTerm::Au { args, .. }
+            | NodeTerm::Cui { args, .. } => ChildIter::Free(args.iter()),
             NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
         }
     }
@@ -94,7 +101,8 @@ impl DagNode {
         match &self.term {
             NodeTerm::Free { symbol, .. }
             | NodeTerm::Acu { symbol, .. }
-            | NodeTerm::Au { symbol, .. } => *symbol,
+            | NodeTerm::Au { symbol, .. }
+            | NodeTerm::Cui { symbol, .. } => *symbol,
         }
     }
 
