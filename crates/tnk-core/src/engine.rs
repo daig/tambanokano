@@ -1158,6 +1158,25 @@ mod tests {
         assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
     }
 
+    /// B1.5 reduce lock (lone-variable collector strategy, == reference binary): `eq a + X = b` on
+    /// `a + c + c` → `b` in 1 rewrite. X absorbs `c + c` (a whole match), NOT a minimal binding that
+    /// would leave `b + c` — the system is non-confluent under extension and Maude takes the collector
+    /// match. (Regression for the latent bug where a lone linear variable bound minimally.)
+    #[test]
+    fn ac_reduce_lone_variable_absorbs() {
+        let (mut e, s, a, b, c, plus) = ac_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::constant(a), Term::var(0, s)]), // a + X
+            rhs: Term::constant(b),
+            nr_vars: 1,
+        });
+        let (a0, c0, c1) = (e.make_const(a), e.make_const(c), e.make_const(c));
+        let subject = e.make_ac(plus, vec![a0, c0, c1]); // a + c + c
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "a + X = b fires once");
+        assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c + c), not b + c");
+    }
+
     #[test]
     fn reduces_peano_addition() {
         // sorts Nat; ops 0, s_, _+_; eqs  N + 0 = N  and  N + s M = s (N + M)

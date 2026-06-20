@@ -109,12 +109,19 @@ impl AcuLhs {
 
         let elements: Vec<DagId> = multiset.iter().map(|&(e, _)| e).collect();
         let coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
+        // A single linear variable is the *collector*: it absorbs the entire remainder (Maude's
+        // LONE_VARIABLE strategy), giving one whole match — not a minimal binding with extension.
+        // This is a correctness rule, not just an ordering one: `eq a + X = b` on `a + c + c` must
+        // give `b` (X → c+c), not `b + c` (the system is non-confluent under extension; Maude's
+        // strategy picks the collector match).
+        let lone_linear = self.vars.len() == 1 && self.vars[0].count == 1;
         let candidates = enumerate_distributions(
             &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
             &coeffs,
             ext_allowed,
             self.identity.is_some(),
             !self.grounds.is_empty(),
+            lone_linear,
         );
 
         Some(AcuSubproblem {
@@ -155,8 +162,18 @@ fn enumerate_distributions(
     ext_allowed: bool,
     identity: bool,
     has_grounds: bool,
+    lone_linear: bool,
 ) -> Vec<Candidate> {
     let r = coeffs.len();
+    // Collector strategy: the one linear variable takes the whole remainder (matched whole).
+    if lone_linear {
+        let to_var: Vec<Vec<u32>> = mults.iter().map(|&m| vec![m]).collect();
+        return vec![Candidate {
+            residue: vec![0; mults.len()],
+            matched: mults.iter().sum(),
+            to_var,
+        }];
+    }
     let per_element: Vec<Vec<Split>> =
         mults.iter().map(|&m| compositions(m, coeffs, ext_allowed)).collect();
     // An element with no valid composition makes the whole match impossible.
