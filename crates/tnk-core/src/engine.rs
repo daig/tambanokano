@@ -11,7 +11,17 @@ use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Symbol, SymbolId};
 use crate::term::{Equation, Subst, Term};
+use crate::theory::LhsAutomaton;
 use std::collections::HashMap;
+
+/// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
+/// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
+/// The public [`Equation`] (lhs as a [`Term`]) is compiled into this by [`Engine::add_equation`].
+struct CompiledEquation {
+    lhs: LhsAutomaton,
+    rhs: Term,
+    nr_vars: u32,
+}
 
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
 ///
@@ -45,8 +55,8 @@ pub struct Engine {
     sorts: Sorts,
     symbols: Arena<Symbol>,
     dags: Arena<DagNode>,
-    /// Unconditional equations indexed by their left-hand side's top symbol.
-    equations: HashMap<SymbolId, Vec<Equation>>,
+    /// Unconditional equations (LHS compiled to a theory automaton), indexed by lhs top symbol.
+    equations: HashMap<SymbolId, Vec<CompiledEquation>>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic).
     rewrite_count: u64,
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
@@ -256,10 +266,16 @@ impl Engine {
 
     // ---- equations + reduction ----
 
-    /// Register an unconditional equation, indexed by its left-hand side's top symbol.
+    /// Register an unconditional equation, indexed by its left-hand side's top symbol. The lhs is
+    /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once.
     pub fn add_equation(&mut self, eq: Equation) {
         let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
-        self.equations.entry(top).or_default().push(eq);
+        let compiled = CompiledEquation {
+            lhs: LhsAutomaton::compile(eq.lhs),
+            rhs: eq.rhs,
+            nr_vars: eq.nr_vars,
+        };
+        self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
         // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
         self.eq_epoch += 1;
@@ -378,17 +394,29 @@ impl Engine {
 
     /// Apply the first matching equation at the top of `id`, returning the instantiated rhs (or
     /// `None` if no equation applies).
+    ///
+    /// Driven as a **solution stream** through the A3 matcher seam: each equation's compiled
+    /// [`LhsAutomaton`] yields a [`Subproblem`](crate::theory::Subproblem) whose `next` enumerates
+    /// solutions into `subst`. Phase 1 equations are unconditional, so the *first* solution of the
+    /// first matching equation wins; the `while sp.next(..)` loop is where a conditional equation will
+    /// evaluate its condition and, on failure, fall through to the next solution — and where an AC
+    /// subproblem will surface its several solutions. (Free matching yields exactly one.)
     fn try_rewrite_top(&mut self, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         let mut subst = Subst::new();
         let rhs: Term = {
             let eqs = self.equations.get(&symbol)?;
             let mut chosen = None;
-            for eq in eqs {
+            'search: for eq in eqs {
                 subst.reset(eq.nr_vars);
-                if self.match_pattern(&eq.lhs, id, &mut subst) {
+                let Some(mut sp) = eq.lhs.match_(self, id, &mut subst) else { continue };
+                // The solution stream. Phase 1 equations are unconditional, so it accepts the first
+                // solution and breaks; conditional equations / AC will iterate it (check the
+                // condition, `continue` to the next solution on failure), which is why it is a loop.
+                #[allow(clippy::never_loop)]
+                while sp.next(self, &mut subst) {
                     chosen = Some(eq.rhs.clone());
-                    break;
+                    break 'search;
                 }
             }
             chosen?
