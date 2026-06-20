@@ -81,6 +81,7 @@ impl Engine {
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
     /// [`Subst::reset`] to the pattern's variable count). Returns `true` on success. On failure
     /// `subst` may hold partial bindings, so callers reset before each attempt.
+    #[must_use]
     pub fn match_pattern(&self, pat: &Term, subject: DagId, subst: &mut Subst) -> bool {
         match pat {
             Term::Var(v) => match subst.get(v.index) {
@@ -110,6 +111,7 @@ impl Engine {
     }
 
     /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
+    #[must_use]
     pub fn deep_equal(&self, a: DagId, b: DagId) -> bool {
         if a == b {
             return true;

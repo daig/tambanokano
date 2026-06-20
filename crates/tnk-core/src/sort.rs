@@ -155,6 +155,21 @@ impl Sorts {
             geq[s] = seen;
         }
 
+        // 4b. Reject subsort cycles: two distinct user sorts that are mutually `<=` (Maude errors
+        // on these; review R2 L6 / R3 M3).
+        for s in 0..n0 {
+            let sid = Id::<Sort>::from_raw(s as u32);
+            for &t in &geq[s] {
+                if t != sid && t.index() < n0 && geq[t.index()].contains(&sid) {
+                    panic!(
+                        "subsort cycle: `{}` and `{}` are mutually <=",
+                        self.sorts[s].name,
+                        self.sorts[t.index()].name
+                    );
+                }
+            }
+        }
+
         // 5. Finalize kind_of including error sorts; error sorts are <= only themselves.
         let mut kind_of_full: Vec<KindId> = vec![Id::from_raw(0); n];
         kind_of_full[..n0].copy_from_slice(&kind_of);
@@ -231,5 +246,16 @@ mod tests {
         assert!(s.leq(a, top), "a <= mid <= top should imply a <= top");
         assert!(s.leq(a, mid));
         assert!(!s.leq(top, a));
+    }
+
+    #[test]
+    #[should_panic(expected = "subsort cycle")]
+    fn subsort_cycle_is_rejected() {
+        let mut s = Sorts::new();
+        let a = s.add_sort("A");
+        let b = s.add_sort("B");
+        s.add_subsort(a, b);
+        s.add_subsort(b, a);
+        s.close();
     }
 }

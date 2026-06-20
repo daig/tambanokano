@@ -171,6 +171,7 @@ impl Engine {
     /// Reduce `id` to canonical form by innermost, eager equational simplification (Phase 0:
     /// unconditional free-theory equations). Already-reduced nodes are returned unchanged, so
     /// shared subterms are normalized at most once.
+    #[must_use]
     pub fn reduce(&mut self, id: DagId) -> DagId {
         if self.node(id).reduced_epoch == self.eq_epoch {
             return id;
@@ -405,5 +406,30 @@ mod tests {
         e.add_equation(Equation { lhs: Term::constant(a), rhs: Term::constant(b), nr_vars: 0 });
         let r2 = e.reduce(a0); // same id; must re-reduce despite the earlier REDUCED stamp
         assert_eq!(e.node(r2).symbol(), b, "after adding a = b, reducing a yields b");
+    }
+
+    #[test]
+    fn ill_sorted_argument_blocks_rewrite_and_lands_in_error_sort() {
+        // f : Nat -> Nat applied to a Bool (a different kind): the node lands in Nat's error sort,
+        // and `eq f(N:Nat) = z` must NOT fire (a Bool can't match a Nat variable). (Review R2 M4
+        // / "error-sort propagation is monotone and safe".)
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let boolean = e.add_sort("Bool"); // separate kind
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let f = e.add_op("f", vec![nat], nat);
+        let t = e.add_op("t", vec![], boolean);
+        e.add_equation(Equation {
+            lhs: Term::op(f, vec![Term::var(0, nat)]),
+            rhs: Term::constant(z),
+            nr_vars: 1,
+        });
+
+        let tb = e.make_const(t);
+        let ft = e.make_free(f, vec![tb]); // f(t): Bool arg not <= Nat
+        assert!(e.sorts().sort(e.sort_of(ft)).is_error, "ill-sorted f(t) is in the error sort");
+        let r = e.reduce(ft);
+        assert_eq!(e.node(r).symbol(), f, "f(t) does not rewrite: N:Nat cannot match a Bool");
     }
 }
