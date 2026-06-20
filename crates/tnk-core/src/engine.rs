@@ -98,6 +98,10 @@ impl Engine {
     pub fn live_nodes(&self) -> usize {
         self.dags.len()
     }
+    /// Peak DAG-arena capacity (high-water mark of allocated slots; stays bounded when GC runs).
+    pub fn node_capacity(&self) -> usize {
+        self.dags.capacity()
+    }
 
     // ---- garbage collection (D2) ----
 
