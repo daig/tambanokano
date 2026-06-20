@@ -19,6 +19,8 @@ pub struct Engine {
     dags: Arena<DagNode>,
     /// Unconditional equations indexed by their left-hand side's top symbol.
     equations: HashMap<SymbolId, Vec<Equation>>,
+    /// Count of equational rewrites applied (Maude's `rewrites` statistic).
+    rewrite_count: u64,
 }
 
 impl Engine {
@@ -127,6 +129,14 @@ impl Engine {
         self.equations.entry(top).or_default().push(eq);
     }
 
+    /// Total equational rewrites applied so far.
+    pub fn rewrites(&self) -> u64 {
+        self.rewrite_count
+    }
+    pub fn reset_rewrites(&mut self) {
+        self.rewrite_count = 0;
+    }
+
     /// Reduce `id` to canonical form by innermost, eager equational simplification (Phase 0:
     /// unconditional free-theory equations). Already-reduced nodes are returned unchanged, so
     /// shared subterms are normalized at most once.
@@ -136,6 +146,7 @@ impl Engine {
         }
         let mut current = self.reduce_args(id);
         while let Some(next) = self.try_rewrite_top(current) {
+            self.rewrite_count += 1;
             current = self.reduce_args(next);
         }
         self.dags.get_mut(current).flags.set_reduced();
@@ -299,5 +310,50 @@ mod tests {
         let result = e.reduce(sum);
         let four = peano(&mut e, zero, s, 4);
         assert!(e.deep_equal(result, four), "2 + 2 should reduce to s s s s 0");
+        assert_eq!(e.rewrites(), 3, "rewrite count matches reference Maude");
+    }
+
+    #[test]
+    fn reduces_peano_multiplication() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        let times = e.add_op("*", vec![nat, nat], nat);
+
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        // N + 0 = N ; N + s M = s (N + M)
+        e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), Term::constant(zero)]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
+            rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
+            nr_vars: 2,
+        });
+        // N * 0 = 0 ; N * s M = (N * M) + N
+        e.add_equation(Equation { lhs: Term::op(times, vec![v(0), Term::constant(zero)]), rhs: Term::constant(zero), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(times, vec![v(0), s_of(v(1))]),
+            rhs: Term::op(plus, vec![Term::op(times, vec![v(0), v(1)]), v(0)]),
+            nr_vars: 2,
+        });
+
+        fn peano(e: &mut Engine, zero: SymbolId, s: SymbolId, n: u32) -> DagId {
+            let mut acc = e.make_const(zero);
+            for _ in 0..n {
+                acc = e.make_free(s, vec![acc]);
+            }
+            acc
+        }
+
+        let three = peano(&mut e, zero, s, 3);
+        let four = peano(&mut e, zero, s, 4);
+        let prod = e.make_free(times, vec![three, four]); // 3 * 4
+        let result = e.reduce(prod);
+        let twelve = peano(&mut e, zero, s, 12);
+        assert!(e.deep_equal(result, twelve), "3 * 4 should reduce to s^12 0");
+        assert_eq!(e.rewrites(), 21, "rewrite count matches reference Maude");
     }
 }
