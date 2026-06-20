@@ -1,0 +1,11 @@
+[package]
+name = "tnk-core"
+description = "tambanokano kernel: terms, GC'd DAG arena, order-sorted types, theories, reduction"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,16 @@
+# tambanokano — a Rust rewrite of Maude (rewriting logic + membership equational logic).
+# See docs/migration/ for the architecture map, phased plan, and decision record (D1–D8).
+[workspace]
+resolver = "3"
+members = ["crates/tnk-core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "warn"        # D1/D2: arena+handles should keep `unsafe` rare and deliberate.
+
+[workspace.lints.clippy]
+# shared lints can be tightened as the codebase grows
