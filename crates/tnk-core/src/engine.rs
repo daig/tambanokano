@@ -9,12 +9,16 @@ use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeFlags, NodeTerm};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Symbol, SymbolId};
+use crate::term::{Equation, Subst, Term};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct Engine {
     sorts: Sorts,
     symbols: Arena<Symbol>,
     dags: Arena<DagNode>,
+    /// Unconditional equations indexed by their left-hand side's top symbol.
+    equations: HashMap<SymbolId, Vec<Equation>>,
 }
 
 impl Engine {
@@ -114,11 +118,78 @@ impl Engine {
             }
         }
     }
+
+    // ---- equations + reduction ----
+
+    /// Register an unconditional equation, indexed by its left-hand side's top symbol.
+    pub fn add_equation(&mut self, eq: Equation) {
+        let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
+        self.equations.entry(top).or_default().push(eq);
+    }
+
+    /// Reduce `id` to canonical form by innermost, eager equational simplification (Phase 0:
+    /// unconditional free-theory equations). Already-reduced nodes are returned unchanged, so
+    /// shared subterms are normalized at most once.
+    pub fn reduce(&mut self, id: DagId) -> DagId {
+        if self.node(id).flags.is_reduced() {
+            return id;
+        }
+        let mut current = self.reduce_args(id);
+        while let Some(next) = self.try_rewrite_top(current) {
+            current = self.reduce_args(next);
+        }
+        self.dags.get_mut(current).flags.set_reduced();
+        current
+    }
+
+    /// Reduce each argument; rebuild the node only if some argument changed.
+    fn reduce_args(&mut self, id: DagId) -> DagId {
+        let (symbol, children) = {
+            let node = self.node(id);
+            (node.symbol(), node.children().to_vec())
+        };
+        if children.is_empty() {
+            return id;
+        }
+        let mut changed = false;
+        let mut reduced = Vec::with_capacity(children.len());
+        for c in children {
+            let rc = self.reduce(c);
+            changed |= rc != c;
+            reduced.push(rc);
+        }
+        if changed {
+            self.make_free(symbol, reduced)
+        } else {
+            id
+        }
+    }
+
+    /// Apply the first matching equation at the top of `id`, returning the instantiated rhs (or
+    /// `None` if no equation applies).
+    fn try_rewrite_top(&mut self, id: DagId) -> Option<DagId> {
+        let symbol = self.node(id).symbol();
+        let mut subst = Subst::new();
+        let rhs: Term = {
+            let eqs = self.equations.get(&symbol)?;
+            let mut chosen = None;
+            for eq in eqs {
+                subst.reset(eq.nr_vars);
+                if self.match_pattern(&eq.lhs, id, &mut subst) {
+                    chosen = Some(eq.rhs.clone());
+                    break;
+                }
+            }
+            chosen?
+        };
+        Some(self.instantiate(&rhs, &subst))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::{Equation, Term};
 
     /// `f(a, g(a))` over a single sort `Nat`, with `a` shared (a true DAG). Returns engine + root.
     fn fixture() -> (Engine, DagId, SortId) {
@@ -189,5 +260,44 @@ mod tests {
         e.close_sorts();
         let f = e.add_op("f", vec![nat, nat], nat);
         let _ = e.make_free(f, Vec::new());
+    }
+
+    #[test]
+    fn reduces_peano_addition() {
+        // sorts Nat; ops 0, s_, _+_; eqs  N + 0 = N  and  N + s M = s (N + M)
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+
+        // peano(n): build s^n(0)
+        fn peano(e: &mut Engine, zero: SymbolId, s: SymbolId, n: u32) -> DagId {
+            let mut acc = e.make_const(zero);
+            for _ in 0..n {
+                acc = e.make_free(s, vec![acc]);
+            }
+            acc
+        }
+
+        let two_a = peano(&mut e, zero, s, 2);
+        let two_b = peano(&mut e, zero, s, 2);
+        let sum = e.make_free(plus, vec![two_a, two_b]); // 2 + 2
+
+        let result = e.reduce(sum);
+        let four = peano(&mut e, zero, s, 4);
+        assert!(e.deep_equal(result, four), "2 + 2 should reduce to s s s s 0");
     }
 }
