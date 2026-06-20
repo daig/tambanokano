@@ -120,6 +120,10 @@ impl Runtime {
                             .zip(sargs.iter())
                             .all(|(p, &s)| self.match_pattern(sig, p, s, subst))
                 }
+                // The recursive free matcher never matches an ACU subject: those are matched by the
+                // ACU automaton (B1.4), and a free Op pattern's symbol differs from any AC symbol. (A
+                // *variable* pattern still binds an ACU subject — that is the `Term::Var` arm above.)
+                NodeTerm::Acu { .. } => false,
             },
         }
     }

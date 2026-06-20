@@ -15,9 +15,10 @@ use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
-use crate::symbol::{Symbol, SymbolId};
+use crate::symbol::{Axioms, Symbol, SymbolId, Theory};
 use crate::term::{Equation, Subst, Term};
 use crate::theory::LhsAutomaton;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
@@ -131,7 +132,34 @@ impl Signature {
         domain: Vec<SortId>,
         range: SortId,
     ) -> SymbolId {
-        self.symbols.alloc(Symbol { name: name.into(), domain, range })
+        self.symbols.alloc(Symbol {
+            name: name.into(),
+            domain,
+            range,
+            axioms: Axioms::default(),
+            identity: None,
+        })
+    }
+
+    /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). The operator
+    /// must be binary (Maude requires associative operators to be binary); its arguments are stored
+    /// flattened as a multiset and matched modulo AC(+U). `identity` is the constant symbol declared
+    /// as `id: <const>`, or `None`.
+    pub(crate) fn add_op_ac(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        assert_eq!(domain.len(), 2, "an `assoc comm` operator must be binary");
+        self.symbols.alloc(Symbol {
+            name: name.into(),
+            domain,
+            range,
+            axioms: Axioms { assoc: true, comm: true },
+            identity,
+        })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
@@ -165,6 +193,16 @@ impl Signature {
 impl Runtime {
     // ---- DAG construction ----
 
+    /// Allocate a node with a precomputed sort, accounting it against the safe-point-GC interval.
+    /// (Shared by `make_free`/`make_acu`; the alloc counter only matters when `gc_interval` is set,
+    /// so the default path is a no-op increment. Reset by `safe_point_gc`, so it can't overflow.)
+    fn alloc_node(&mut self, sort: SortId, term: NodeTerm) -> DagId {
+        if self.gc_interval.is_some() {
+            self.allocs_since_gc += 1;
+        }
+        self.dags.alloc(DagNode { sort, reduced_epoch: 0, term })
+    }
+
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
     pub(crate) fn make_free(
         &mut self,
@@ -173,12 +211,7 @@ impl Runtime {
         args: Vec<DagId>,
     ) -> DagId {
         let sort = self.compute_free_sort(sig, symbol, &args);
-        // Drives safe-point GC; only meaningful when enabled, so the default path skips it entirely.
-        // Reset by `safe_point_gc`, so it can't overflow between collections.
-        if self.gc_interval.is_some() {
-            self.allocs_since_gc += 1;
-        }
-        self.dags.alloc(DagNode { sort, reduced_epoch: 0, term: NodeTerm::Free { symbol, args } })
+        self.alloc_node(sort, NodeTerm::Free { symbol, args })
     }
     /// Convenience for a constant (an arity-0 symbol).
     pub(crate) fn make_const(&mut self, sig: &Signature, symbol: SymbolId) -> DagId {
@@ -187,9 +220,15 @@ impl Runtime {
 
     /// Phase-0 sort computation for a free node: if every argument's sort is `<=` the declared
     /// domain sort the node gets the operator's `range`; otherwise it lands in the error/top sort
-    /// of `range`'s kind. (Overloaded least-sort via a sort diagram arrives in Phase 1.)
+    /// of `range`'s kind. (Overloaded least-sort via a sort diagram arrives in B2.)
     fn compute_free_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
         let sym = sig.symbols.get(symbol);
+        assert_eq!(
+            sym.theory(),
+            Theory::Free,
+            "`{}` is an ACU operator — build it with make_acu/make_ac, not make_free",
+            sym.name
+        );
         assert_eq!(sym.arity(), args.len(), "arity mismatch building `{}`", sym.name);
         let well_sorted = sym
             .domain
@@ -200,6 +239,134 @@ impl Runtime {
             sym.range
         } else {
             sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
+        }
+    }
+
+    /// Build a canonical **ACU** node for `symbol` from `raw_args` (`(element, multiplicity)` pairs).
+    /// Canonicalizes to the AC(+U) normal form (Maude's `normalizeAtTop` → `insertAlien` →
+    /// `sortAndUniquize`): (1) flatten arguments that are themselves `symbol`-rooted ACU nodes (scaling
+    /// their multiplicities), (2) drop identity elements when the operator has `id:`, (3) merge equal
+    /// elements (summing multiplicities) and sort by [`dag_compare`](Self::dag_compare), (4) collapse —
+    /// an empty multiset is the identity element, a single element of multiplicity 1 is that element
+    /// itself, otherwise an [`NodeTerm::Acu`] node. So the result is in normal form and equal ACU terms
+    /// are structurally identical through the [`children`](crate::dag::DagNode::children) visitor.
+    pub(crate) fn make_acu(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        raw_args: Vec<(DagId, u32)>,
+    ) -> DagId {
+        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Acu, "make_acu on a non-ACU symbol");
+        let identity = sig.symbol(symbol).identity();
+
+        // (1) flatten nested same-symbol nodes + (2) drop identity elements.
+        let mut flat: Vec<(DagId, u32)> = Vec::with_capacity(raw_args.len());
+        for (arg, mult) in raw_args {
+            if mult == 0 {
+                continue;
+            }
+            if identity.is_some_and(|id_sym| self.is_constant(arg, id_sym)) {
+                continue; // an identity argument vanishes
+            }
+            match &self.dags.get(arg).term {
+                NodeTerm::Acu { symbol: inner, args } if *inner == symbol => {
+                    for &(e, m) in args {
+                        flat.push((e, m * mult));
+                    }
+                }
+                _ => flat.push((arg, mult)),
+            }
+        }
+
+        // (3) sort by the total order, then merge structurally-equal neighbours (summing mults).
+        flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
+        let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
+        for (e, m) in flat {
+            match args.last_mut() {
+                Some(last) if self.dag_compare(last.0, e) == Ordering::Equal => last.1 += m,
+                _ => args.push((e, m)),
+            }
+        }
+
+        // (4) collapse to the canonical representative.
+        let total: u64 = args.iter().map(|&(_, m)| u64::from(m)).sum();
+        match total {
+            0 => {
+                let id_sym = identity.expect("an empty ACU multiset requires an identity element");
+                self.make_const(sig, id_sym)
+            }
+            1 => args[0].0, // exactly one element, multiplicity 1 — never wrap a lone argument
+            _ => {
+                let sort = self.compute_acu_sort(sig, symbol, &args);
+                self.alloc_node(sort, NodeTerm::Acu { symbol, args })
+            }
+        }
+    }
+
+    /// Whether `arg` is the constant `id_sym()` (an arity-0 free node). Used to recognise identity
+    /// arguments during ACU canonicalization.
+    fn is_constant(&self, arg: DagId, id_sym: SymbolId) -> bool {
+        matches!(
+            &self.dags.get(arg).term,
+            NodeTerm::Free { symbol, args } if *symbol == id_sym && args.is_empty()
+        )
+    }
+
+    /// Sort of an ACU node (first cut, mirroring [`compute_free_sort`](Self::compute_free_sort)): if
+    /// every element's sort is `<=` the operator's argument-sort the node gets the operator's `range`,
+    /// else the error/top sort of `range`'s kind. (Preregularity / least-sort *modulo axioms* is B2.)
+    fn compute_acu_sort(&self, sig: &Signature, symbol: SymbolId, args: &[(DagId, u32)]) -> SortId {
+        let sym = sig.symbols.get(symbol);
+        let dom = sym.domain[0]; // an ACU operator is binary with a single argument sort
+        let well_sorted = args.iter().all(|&(e, _)| sig.sorts.leq(self.dags.get(e).sort, dom));
+        if well_sorted {
+            sym.range
+        } else {
+            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
+        }
+    }
+
+    /// A **total order** on DAG nodes, consistent with structural (modulo-AC) equality — i.e.
+    /// `dag_compare(a, b) == Equal` iff [`deep_equal`](Self::deep_equal)`(a, b)`. Mirrors C++
+    /// `DagNode::compare`: order by top symbol first, then lexicographically by arguments (ACU nodes
+    /// compare their canonical `(element, multiplicity)` sequences). This is the key the ACU
+    /// canonicalizer sorts and uniquizes by. Recurses on *element* depth (like `match_pattern`,
+    /// author-/data-shallow for the canonical subterms it compares); an iterative form is a follow-up
+    /// if deep ACU elements ever appear.
+    pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
+        if a == b {
+            return Ordering::Equal; // same node id — identical, prune
+        }
+        let (na, nb) = (self.dags.get(a), self.dags.get(b));
+        match na.symbol().cmp(&nb.symbol()) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        // Equal top symbols ⇒ the same theory ⇒ the same `NodeTerm` arm.
+        match (&na.term, &nb.term) {
+            (NodeTerm::Free { args: xa, .. }, NodeTerm::Free { args: ya, .. }) => {
+                for (&x, &y) in xa.iter().zip(ya.iter()) {
+                    match self.dag_compare(x, y) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
+                Ordering::Equal // same symbol ⇒ same arity ⇒ all pairs compared
+            }
+            (NodeTerm::Acu { args: xa, .. }, NodeTerm::Acu { args: ya, .. }) => {
+                for (&(xe, xm), &(ye, ym)) in xa.iter().zip(ya.iter()) {
+                    match self.dag_compare(xe, ye) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                    match xm.cmp(&ym) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
+                }
+                xa.len().cmp(&ya.len()) // a proper prefix orders before the longer sequence
+            }
+            _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
     }
 
@@ -485,6 +652,19 @@ impl Engine {
     ) -> SymbolId {
         self.sig.add_op(name, domain, range)
     }
+
+    /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). Must be binary;
+    /// `identity` is the constant symbol declared as `id: <const>`, or `None`. The operator's
+    /// arguments are stored flattened as a canonical multiset and matched/rewritten modulo AC(+U).
+    pub fn add_op_ac(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+        identity: Option<SymbolId>,
+    ) -> SymbolId {
+        self.sig.add_op_ac(name, domain, range, identity)
+    }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
     }
@@ -498,6 +678,19 @@ impl Engine {
     /// Convenience for a constant (an arity-0 symbol).
     pub fn make_const(&mut self, symbol: SymbolId) -> DagId {
         self.rt.make_const(&self.sig, symbol)
+    }
+
+    /// Build a canonical **ACU** node for an `assoc comm [id:]` operator from `(element, multiplicity)`
+    /// pairs (see [`Runtime::make_acu`]). The result is in AC(+U) normal form — flattened, identity
+    /// dropped, equal elements merged, canonically ordered — and may collapse to a single element or
+    /// the identity. `symbol` must be ACU (declared via [`add_op_ac`](Self::add_op_ac)).
+    pub fn make_acu(&mut self, symbol: SymbolId, args: Vec<(DagId, u32)>) -> DagId {
+        self.rt.make_acu(&self.sig, symbol, args)
+    }
+    /// Convenience for [`make_acu`](Self::make_acu) from a flat list of elements (each multiplicity 1):
+    /// `make_ac(plus, vec![a, b, c])` builds the canonical `a + b + c`.
+    pub fn make_ac(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
+        self.rt.make_acu(&self.sig, symbol, elements.into_iter().map(|e| (e, 1)).collect())
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -679,6 +872,162 @@ mod tests {
         e.close_sorts();
         let f = e.add_op("f", vec![nat, nat], nat);
         let _ = e.make_free(f, Vec::new());
+    }
+
+    /// B1.1: an `assoc comm` operator classifies as the ACU theory and carries its axioms +
+    /// identity; a plain operator stays Free. (The free hot path must be untouched by AC ops.)
+    #[test]
+    fn ac_operator_is_classified_acu() {
+        use crate::symbol::Theory;
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let empty = e.add_op("empty", vec![], nat);
+        let union = e.add_op_ac("union", vec![nat, nat], nat, Some(empty));
+        let plus = e.add_op("+", vec![nat, nat], nat); // a free op, for contrast
+
+        let u = e.symbol(union);
+        assert_eq!(u.theory(), Theory::Acu);
+        assert_eq!(u.identity(), Some(empty));
+        assert_eq!(e.symbol(plus).theory(), Theory::Free, "a plain op is free");
+        assert_eq!(e.symbol(empty).theory(), Theory::Free, "a constant is free");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be binary")]
+    fn ac_operator_must_be_binary() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let _ = e.add_op_ac("bad", vec![nat, nat, nat], nat, None);
+    }
+
+    /// Engine with constants `a`,`b`,`c` and an `assoc comm` `+` (no identity) over sort `S`.
+    fn ac_ctx() -> (Engine, SymbolId, SymbolId, SymbolId, SymbolId) {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let plus = e.add_op_ac("+", vec![s, s], s, None);
+        (e, a, b, c, plus)
+    }
+
+    /// B1.2: ACU construction is canonical modulo commutativity and associativity — `a+b == b+a`,
+    /// and `(a+b)+c == a+(b+c) == a+b+c` (flattened to a 3-element multiset).
+    #[test]
+    fn acu_canonical_modulo_ac() {
+        let (mut e, a, b, c, plus) = ac_ctx();
+        let ab = {
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            e.make_ac(plus, vec![x, y])
+        };
+        let ba = {
+            let (x, y) = (e.make_const(b), e.make_const(a));
+            e.make_ac(plus, vec![x, y])
+        };
+        assert!(e.deep_equal(ab, ba), "a+b == b+a");
+        assert_eq!(
+            e.runtime().dag_compare(ab, ba),
+            std::cmp::Ordering::Equal,
+            "and the total order agrees"
+        );
+
+        let abc_left = {
+            // (a+b)+c — the left arg is itself an ACU node, must flatten
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            let ab = e.make_ac(plus, vec![x, y]);
+            let z = e.make_const(c);
+            e.make_ac(plus, vec![ab, z])
+        };
+        let abc_right = {
+            let (y, z) = (e.make_const(b), e.make_const(c));
+            let bc = e.make_ac(plus, vec![y, z]);
+            let x = e.make_const(a);
+            e.make_ac(plus, vec![x, bc])
+        };
+        let abc_flat = {
+            let (x, y, z) = (e.make_const(a), e.make_const(b), e.make_const(c));
+            e.make_ac(plus, vec![x, y, z])
+        };
+        assert!(e.deep_equal(abc_left, abc_right), "(a+b)+c == a+(b+c)");
+        assert!(e.deep_equal(abc_left, abc_flat), "(a+b)+c == a+b+c");
+        assert_eq!(e.node(abc_flat).children().count(), 3, "flattened to 3 children");
+    }
+
+    /// B1.2: identity (`id:`) elements vanish and the multiset collapses — `a+e == a`, `e+e == e`,
+    /// `a+e+b == a+b`.
+    #[test]
+    fn acu_identity_collapses() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let unit = e.add_op("e", vec![], s);
+        let plus = e.add_op_ac("+", vec![s, s], s, Some(unit));
+
+        let a_plus_e = {
+            let (x, u) = (e.make_const(a), e.make_const(unit));
+            e.make_ac(plus, vec![x, u])
+        };
+        assert_eq!(e.node(a_plus_e).symbol(), a, "a + e collapses to a");
+
+        let e_plus_e = {
+            let (u1, u2) = (e.make_const(unit), e.make_const(unit));
+            e.make_ac(plus, vec![u1, u2])
+        };
+        assert_eq!(e.node(e_plus_e).symbol(), unit, "e + e collapses to e");
+
+        let aeb = {
+            let (x, u, y) = (e.make_const(a), e.make_const(unit), e.make_const(b));
+            e.make_ac(plus, vec![x, u, y])
+        };
+        assert_eq!(e.node(aeb).children().count(), 2, "a + e + b == a + b (2 children)");
+    }
+
+    /// B1.2: equal elements merge into a multiplicity (`a+a` keeps two children via one `(a,2)` pair),
+    /// and a lone element never gets wrapped (`make_ac` of one element is that element).
+    #[test]
+    fn acu_merges_multiplicity_and_never_wraps_singleton() {
+        let (mut e, a, _b, _c, plus) = ac_ctx();
+        let aa = {
+            let (x, y) = (e.make_const(a), e.make_const(a)); // distinct ids, structurally equal
+            e.make_ac(plus, vec![x, y])
+        };
+        assert_eq!(e.node(aa).children().count(), 2, "a + a has two children (multiplicity 2)");
+        assert_eq!(e.node(aa).symbol(), plus, "a + a is an ACU node");
+
+        let lone = e.make_const(a);
+        let wrapped = e.make_ac(plus, vec![lone]);
+        assert_eq!(wrapped, lone, "make_ac of a single element collapses to it");
+    }
+
+    /// B1.2: GC traces an ACU DAG through the visitor (reachable kept, rest reclaimed) and `deep_equal`
+    /// is modulo-AC across *distinct* element ids.
+    #[test]
+    fn acu_gc_and_modulo_equality() {
+        let (mut e, a, b, _c, plus) = ac_ctx();
+        let ab = {
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            e.make_ac(plus, vec![x, y])
+        }; // ab + a0 + b0 = 3 nodes
+        let _garbage = {
+            let (x, y) = (e.make_const(b), e.make_const(a));
+            e.make_ac(plus, vec![x, y]) // structurally equal to ab but distinct ids
+        };
+        assert!(e.deep_equal(ab, _garbage), "b+a == a+b across distinct ids");
+        assert_eq!(e.gc([ab]), 3, "the unreachable b+a subgraph (3 nodes) is reclaimed");
+        assert_eq!(e.node(ab).children().count(), 2, "ab survives intact");
+    }
+
+    #[test]
+    #[should_panic(expected = "make_acu")]
+    fn make_free_on_ac_operator_panics() {
+        let (mut e, a, _b, _c, plus) = ac_ctx();
+        let a0 = e.make_const(a);
+        let _ = e.make_free(plus, vec![a0, a0]); // building an ACU op as a free node is a bug
     }
 
     #[test]
