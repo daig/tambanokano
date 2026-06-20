@@ -277,13 +277,18 @@ impl Runtime {
     /// structure.
     fn mark_reachable(&mut self, root: DagId) {
         let mut stack = Vec::new();
+        // Children are collected (via the `children()` visitor) into this reused scratch buffer, then
+        // marked: enumerating borrows the node (hence the arena) immutably, while marking needs the
+        // arena mutably, so the two phases can't overlap. `extend` from the iterator hits a slice
+        // fast-path for the free rep; a non-slice arm still works, just without the memcpy.
+        let mut kids: Vec<DagId> = Vec::new();
         if self.dags.mark(root) {
             stack.push(root);
         }
         while let Some(id) = stack.pop() {
-            let len = self.dags.get(id).children().len();
-            for i in 0..len {
-                let child = self.dags.get(id).children()[i];
+            kids.clear();
+            kids.extend(self.dags.get(id).children());
+            for &child in &kids {
                 if self.dags.mark(child) {
                     stack.push(child);
                 }
@@ -388,7 +393,7 @@ impl Runtime {
     /// Build a fresh [`ReduceFrame`] positioned at the start of `id`'s children.
     fn new_reduce_frame(&self, id: DagId) -> ReduceFrame {
         let node = self.node(id);
-        let orig = node.children().to_vec();
+        let orig: Vec<DagId> = node.children().collect();
         ReduceFrame {
             original: id,
             symbol: node.symbol(),
@@ -823,7 +828,7 @@ mod tests {
                 return k;
             }
             assert_eq!(sym, s, "not a Peano numeral");
-            id = e.node(id).children()[0];
+            id = e.node(id).children().next().expect("successor has one child");
             k += 1;
         }
     }

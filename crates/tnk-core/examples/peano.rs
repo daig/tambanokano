@@ -67,7 +67,7 @@ fn decode(e: &Engine, mut id: DagId, p: &Peano) -> u64 {
             return n;
         } else if sym == p.s {
             n += 1;
-            id = node.children()[0];
+            id = node.children().next().expect("successor has one child");
         } else {
             panic!("not a Peano numeral");
         }

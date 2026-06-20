@@ -129,6 +129,15 @@ impl Runtime {
     /// Iterative (explicit pair-stack) for the same reason as [`Engine::reduce`]: the recursive form
     /// descended on *subject* depth and overflowed on deep terms (e.g. a non-linear pattern over a
     /// million-deep chain — review R2 C1).
+    ///
+    /// Compares top symbols and walks children through the [`DagNode::children`] visitor rather than
+    /// matching a specific `NodeTerm` arm (review R3 H3): same-symbol + pairwise-equal-children is the
+    /// free-theory equality. It also serves the canonically-ordered representations whose identity is
+    /// fully carried by the child sequence (ACU, *provided* `children` yields the whole ordered
+    /// multiset, repeats included). A theory whose node carries scalar payload that is *not* a child
+    /// id — e.g. the S-theory's successor `count` — will need theory-specific equality here, exactly
+    /// as matching stays per-theory ([`match_pattern`](Self::match_pattern) keeps its own `NodeTerm`
+    /// arm).
     #[must_use]
     pub(crate) fn deep_equal(&self, a: DagId, b: DagId) -> bool {
         let mut stack: Vec<(DagId, DagId)> = vec![(a, b)];
@@ -136,15 +145,17 @@ impl Runtime {
             if x == y {
                 continue; // same node (shared structure): trivially equal, prune the subtree
             }
-            match (&self.node(x).term, &self.node(y).term) {
-                (
-                    NodeTerm::Free { symbol: sx, args: ax },
-                    NodeTerm::Free { symbol: sy, args: ay },
-                ) => {
-                    if sx != sy || ax.len() != ay.len() {
-                        return false;
-                    }
-                    stack.extend(ax.iter().zip(ay).map(|(&x, &y)| (x, y)));
+            let (nx, ny) = (self.node(x), self.node(y));
+            if nx.symbol() != ny.symbol() {
+                return false;
+            }
+            // Enqueue children pairwise; a length mismatch (different arity) is inequality.
+            let (mut cx, mut cy) = (nx.children(), ny.children());
+            loop {
+                match (cx.next(), cy.next()) {
+                    (Some(cx), Some(cy)) => stack.push((cx, cy)),
+                    (None, None) => break,
+                    _ => return false,
                 }
             }
         }
