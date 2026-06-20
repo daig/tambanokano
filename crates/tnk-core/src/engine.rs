@@ -6,13 +6,12 @@
 //! over the DAG from an explicit root set.
 
 use crate::arena::Arena;
-use crate::dag::{DagId, DagNode, NodeFlags, NodeTerm};
+use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Symbol, SymbolId};
 use crate::term::{Equation, Subst, Term};
 use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct Engine {
     sorts: Sorts,
     symbols: Arena<Symbol>,
@@ -21,6 +20,22 @@ pub struct Engine {
     equations: HashMap<SymbolId, Vec<Equation>>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic).
     rewrite_count: u64,
+    /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
+    /// so `add_equation` invalidates stale "reduced" results (review R2 H2).
+    eq_epoch: u32,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Engine {
+            sorts: Sorts::default(),
+            symbols: Arena::default(),
+            dags: Arena::default(),
+            equations: HashMap::default(),
+            rewrite_count: 0,
+            eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
+        }
+    }
 }
 
 impl Engine {
@@ -63,7 +78,7 @@ impl Engine {
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
     pub fn make_free(&mut self, symbol: SymbolId, args: Vec<DagId>) -> DagId {
         let sort = self.compute_free_sort(symbol, &args);
-        self.dags.alloc(DagNode { sort, flags: NodeFlags::default(), term: NodeTerm::Free { symbol, args } })
+        self.dags.alloc(DagNode { sort, reduced_epoch: 0, term: NodeTerm::Free { symbol, args } })
     }
     /// Convenience for a constant (an arity-0 symbol).
     pub fn make_const(&mut self, symbol: SymbolId) -> DagId {
@@ -75,7 +90,7 @@ impl Engine {
     /// of `range`'s kind. (Overloaded least-sort via a sort diagram arrives in Phase 1.)
     fn compute_free_sort(&self, symbol: SymbolId, args: &[DagId]) -> SortId {
         let sym = self.symbols.get(symbol);
-        debug_assert_eq!(sym.arity(), args.len(), "arity mismatch building `{}`", sym.name);
+        assert_eq!(sym.arity(), args.len(), "arity mismatch building `{}`", sym.name);
         let well_sorted = sym
             .domain
             .iter()
@@ -140,6 +155,9 @@ impl Engine {
     pub fn add_equation(&mut self, eq: Equation) {
         let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
         self.equations.entry(top).or_default().push(eq);
+        // A term canonical under the old equation set may now be reducible: invalidate every
+        // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
+        self.eq_epoch += 1;
     }
 
     /// Total equational rewrites applied so far.
@@ -154,7 +172,7 @@ impl Engine {
     /// unconditional free-theory equations). Already-reduced nodes are returned unchanged, so
     /// shared subterms are normalized at most once.
     pub fn reduce(&mut self, id: DagId) -> DagId {
-        if self.node(id).flags.is_reduced() {
+        if self.node(id).reduced_epoch == self.eq_epoch {
             return id;
         }
         let mut current = self.reduce_args(id);
@@ -162,7 +180,7 @@ impl Engine {
             self.rewrite_count += 1;
             current = self.reduce_args(next);
         }
-        self.dags.get_mut(current).flags.set_reduced();
+        self.dags.get_mut(current).reduced_epoch = self.eq_epoch;
         current
     }
 
@@ -368,5 +386,24 @@ mod tests {
         let twelve = peano(&mut e, zero, s, 12);
         assert!(e.deep_equal(result, twelve), "3 * 4 should reduce to s^12 0");
         assert_eq!(e.rewrites(), 21, "rewrite count matches reference Maude");
+    }
+
+    #[test]
+    fn reduced_flag_invalidated_by_new_equation() {
+        // Regression for review R2 H2: a node reduced before an equation is added must not stay
+        // cached as canonical. Reduce `a` (no equations) → a; add `a = b`; reduce `a` → b.
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+
+        let a0 = e.make_const(a);
+        let r1 = e.reduce(a0);
+        assert_eq!(e.node(r1).symbol(), a, "no equations yet: a is its own normal form");
+
+        e.add_equation(Equation { lhs: Term::constant(a), rhs: Term::constant(b), nr_vars: 0 });
+        let r2 = e.reduce(a0); // same id; must re-reduce despite the earlier REDUCED stamp
+        assert_eq!(e.node(r2).symbol(), b, "after adding a = b, reducing a yields b");
     }
 }
