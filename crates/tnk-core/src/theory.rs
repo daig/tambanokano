@@ -19,14 +19,15 @@
 //! its condition (needs `&mut` runtime) and an AC subproblem can allocate residue nodes while the
 //! equation table stays borrowed — without changing the driver loop.
 
+use crate::acu::{AcuLhs, AcuSubproblem};
 use crate::dag::DagId;
 use crate::engine::{Runtime, Signature};
+use crate::symbol::Theory;
 use crate::term::{Subst, Term};
 
-/// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); Phase 1 has
-/// only the free arm. Future arms (`Acu`, `Au`, `Cui`, `S`, …) carry their compiled per-theory
+/// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); this slice has
+/// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
 /// automata and are pure additions behind this type.
-#[derive(Debug)]
 pub(crate) enum LhsAutomaton {
     /// Free theory: matched by direct structural recursion ([`Engine::match_pattern`]). The pattern
     /// is stored as-is; compiling it to a discrimination net is a later performance optimization that
@@ -35,29 +36,42 @@ pub(crate) enum LhsAutomaton {
     /// and composes the children's subproblems (a future `Sequence` arm) instead of always returning
     /// [`Subproblem::FreeOnce`].
     Free(Term),
+    /// ACU theory (`assoc comm [id:]`): multiset matching, genuinely multi-solution.
+    Acu(AcuLhs),
 }
 
 impl LhsAutomaton {
-    /// Compile a pattern `lhs` into an automaton for its theory. (Free theory: keep the term.)
-    pub(crate) fn compile(lhs: Term) -> Self {
-        LhsAutomaton::Free(lhs)
+    /// Compile a pattern `lhs` into an automaton for its theory, chosen from the top symbol's theory.
+    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+        match lhs.top_symbol().map(|s| sig.symbol(s).theory()) {
+            Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
+            _ => LhsAutomaton::Free(lhs),
+        }
     }
 
     /// First (deterministic) match phase: bind the forced part of the match into `subst` and return a
     /// residual [`Subproblem`] enumerating the solutions, or `None` if the subject cannot match at
     /// all. For the free theory the match is fully determined here, so the returned subproblem yields
     /// exactly the one solution already bound in `subst`.
+    ///
+    /// `ext_allowed` enables *extension* (matching a sub-multiset of an AC subject and leaving a
+    /// residue) — the free theory ignores it; ACU uses it for top-level rewriting and `xmatch`
+    /// (audit F-3).
     pub(crate) fn match_(
         &self,
         rt: &Runtime,
         sig: &Signature,
         subject: DagId,
         subst: &mut Subst,
+        ext_allowed: bool,
     ) -> Option<Subproblem> {
         match self {
             LhsAutomaton::Free(pat) => rt
                 .match_pattern(sig, pat, subject, subst)
                 .then_some(Subproblem::FreeOnce { pending: true }),
+            LhsAutomaton::Acu(lhs) => {
+                lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
+            }
         }
     }
 }
@@ -66,25 +80,46 @@ impl LhsAutomaton {
 /// [`LhsAutomaton`] against a subject. [`Subproblem::next`] binds the next solution into the shared
 /// `Subst` and returns `true`, or returns `false` once the solutions are exhausted.
 ///
-/// This is the stream the reduce driver consumes; AC matching will populate it with the several
-/// solutions of an associative-commutative match, and conditional equations will `next()` again when
-/// a solution fails its condition. Closed set (decision **D3**); solution *combinators* (sequence /
-/// disjunction over sub-matches) are the heterogeneous case that may later use boxed recursion.
-#[derive(Debug)]
+/// This is the stream the reduce driver consumes: ACU matching populates it with the several
+/// solutions of an associative-commutative match, and conditional equations (B2) will `next()` again
+/// when a solution fails its condition. Closed set (decision **D3**); solution *combinators*
+/// (sequence / disjunction over sub-matches) are the heterogeneous case that may later use boxing.
 pub(crate) enum Subproblem {
     /// The free theory has at most one solution (a deterministic structural match), already bound in
     /// `subst` by [`LhsAutomaton::match_`]; `pending` yields it exactly once.
     FreeOnce { pending: bool },
+    /// ACU theory: a resumable multiset-distribution enumerator (see [`AcuSubproblem`]).
+    Acu(AcuSubproblem),
 }
 
 impl Subproblem {
-    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. `rt`/`subst`
-    /// are unused for the free arm (its single solution was bound during `match_`) but are the inputs
-    /// a multi-solution arm needs.
-    pub(crate) fn next(&mut self, _rt: &Runtime, _subst: &mut Subst) -> bool {
+    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. Takes
+    /// `&mut Runtime` because a multi-solution arm (ACU) builds fresh binding/residue nodes between
+    /// solutions (audit F-3 widening); the free arm ignores `rt`/`sig`/`subst` (its single solution
+    /// was bound during `match_`).
+    pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         match self {
             // Yield the already-bound solution exactly once.
             Subproblem::FreeOnce { pending } => core::mem::replace(pending, false),
+            Subproblem::Acu(sp) => sp.next(rt, sig, subst),
+        }
+    }
+
+    /// Whether the most recent solution matched the whole subject (no extension residue). Always
+    /// `true` for the free theory.
+    pub(crate) fn matched_whole(&self) -> bool {
+        match self {
+            Subproblem::FreeOnce { .. } => true,
+            Subproblem::Acu(sp) => sp.matched_whole(),
+        }
+    }
+
+    /// The unmatched residue (extension) of the most recent solution — empty for the free theory.
+    /// An AC rewrite splices these elements back around the instantiated right-hand side.
+    pub(crate) fn residue(&self) -> &[(DagId, u32)] {
+        match self {
+            Subproblem::FreeOnce { .. } => &[],
+            Subproblem::Acu(sp) => sp.residue(),
         }
     }
 }
@@ -107,16 +142,18 @@ mod tests {
         let a1 = e.make_const(a);
         let subject = e.make_free(f, vec![a0, a1]); // f(a, a)
 
-        let lhs = LhsAutomaton::compile(Term::op(f, vec![Term::var(0, nat), Term::constant(a)])); // f(X, a)
+        let lhs = LhsAutomaton::compile(
+            Term::op(f, vec![Term::var(0, nat), Term::constant(a)]),
+            e.signature(),
+        ); // f(X, a)
         let mut subst = Subst::new();
         subst.reset(1);
-        let mut sp = lhs
-            .match_(e.runtime(), e.signature(), subject, &mut subst)
-            .expect("f(a,a) matches f(X,a)");
-        assert!(sp.next(e.runtime(), &mut subst), "the one solution");
+        let (sig, rt) = e.parts_mut();
+        let mut sp = lhs.match_(rt, sig, subject, &mut subst, false).expect("f(a,a) matches f(X,a)");
+        assert!(sp.next(rt, sig, &mut subst), "the one solution");
         assert_eq!(subst.get(0), Some(a0), "X bound to the first argument");
-        assert!(!sp.next(e.runtime(), &mut subst), "free theory has a single solution");
-        assert!(!sp.next(e.runtime(), &mut subst), "an exhausted subproblem stays exhausted");
+        assert!(!sp.next(rt, sig, &mut subst), "free theory has a single solution");
+        assert!(!sp.next(rt, sig, &mut subst), "an exhausted subproblem stays exhausted");
     }
 
     /// A non-matching subject yields `None` from `match_` (no subproblem to drive).
@@ -132,11 +169,14 @@ mod tests {
         let b1 = e.make_const(b);
         let subject = e.make_free(f, vec![b0, b1]); // f(b, b)
 
-        let lhs = LhsAutomaton::compile(Term::op(f, vec![Term::var(0, nat), Term::constant(a)])); // f(X, a)
+        let lhs = LhsAutomaton::compile(
+            Term::op(f, vec![Term::var(0, nat), Term::constant(a)]),
+            e.signature(),
+        ); // f(X, a)
         let mut subst = Subst::new();
         subst.reset(1);
         assert!(
-            lhs.match_(e.runtime(), e.signature(), subject, &mut subst).is_none(),
+            lhs.match_(e.runtime(), e.signature(), subject, &mut subst, false).is_none(),
             "f(b,b) does not match f(X,a)"
         );
     }

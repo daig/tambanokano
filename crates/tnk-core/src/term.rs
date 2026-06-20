@@ -42,6 +42,15 @@ impl Term {
             Term::Var(_) => None,
         }
     }
+
+    /// True if this term contains no variables. The ACU compiler classifies pattern arguments into
+    /// ground subterms (matched against an equal subject element), variables, and aliens.
+    pub(crate) fn is_ground(&self) -> bool {
+        match self {
+            Term::Var(_) => false,
+            Term::Op { args, .. } => args.iter().all(Term::is_ground),
+        }
+    }
 }
 
 /// An unconditional (Phase-0) equation `lhs = rhs` with `nr_vars` distinct variables.
@@ -72,8 +81,14 @@ impl Subst {
     pub fn get(&self, index: u32) -> Option<DagId> {
         self.bindings[index as usize]
     }
-    fn set(&mut self, index: u32, id: DagId) {
+    /// Bind variable `index` to `id` (overwriting any previous binding).
+    pub(crate) fn bind(&mut self, index: u32, id: DagId) {
         self.bindings[index as usize] = Some(id);
+    }
+    /// Clear variable `index`. A multi-solution matcher (ACU) unbinds the variables it set before
+    /// computing the next solution, so a stale binding from a prior solution can't leak (F-4).
+    pub(crate) fn unbind(&mut self, index: u32) {
+        self.bindings[index as usize] = None;
     }
 }
 
@@ -104,7 +119,7 @@ impl Runtime {
                 // Fresh variable: bind iff the subject's sort fits the variable's sort.
                 None => {
                     if sig.sorts().leq(self.sort_of(subject), v.sort) {
-                        subst.set(v.index, subject);
+                        subst.bind(v.index, subject);
                         true
                     } else {
                         false
@@ -179,7 +194,9 @@ impl Runtime {
             Term::Op { symbol, args } => {
                 let arg_ids: Vec<DagId> =
                     args.iter().map(|a| self.instantiate(sig, a, subst)).collect();
-                self.make_free(sig, *symbol, arg_ids)
+                // Dispatch on the operator's theory (an AC rhs builds a canonical multiset node, not a
+                // free node) — `rebuild` rejects neither.
+                self.rebuild(sig, *symbol, arg_ids)
             }
         }
     }

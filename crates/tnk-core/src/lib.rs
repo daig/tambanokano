@@ -18,6 +18,8 @@ pub mod root;
 pub mod sort;
 pub mod symbol;
 pub mod term;
-// The matcher seam (A3) is engine-internal for now — no public API surface yet (review: keep the
-// closed LhsAutomaton/Subproblem enums crate-private until a cross-crate consumer exists).
+// The matcher seam (A3) and the ACU theory (B1) are engine-internal for now — no public API surface
+// yet (review: keep the closed LhsAutomaton/Subproblem enums crate-private until a cross-crate
+// consumer exists).
+pub(crate) mod acu;
 pub(crate) mod theory;

@@ -1,0 +1,28 @@
+*** ACU reduce conformance (Stage B1) — exact rewrite counts vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-reduce.maude < /dev/null
+*** Each module mirrors a `crates/tnk-core/src/engine.rs` `ac_reduce_*` test.
+
+fmod ACU-GROUND is                  *** ground element consumed with extension
+  sort N . op 0 : -> N . op s_ : N -> N . op _+_ : N N -> N [assoc comm] . var X : N .
+  eq X + 0 = X .
+endfm
+red s 0 + 0 + s 0 + s 0 .           *** => s 0 + s 0 + s 0   (1 rewrite)
+
+fmod ACU-GROUND-IDEM is             *** ground pattern + residue splice
+  sort E . ops a b : -> E . op _+_ : E E -> E [assoc comm] .
+  eq a + a = a .
+endfm
+red a + a + b .                     *** => a + b   (1 rewrite)
+
+fmod ACU-SET is                     *** non-linear variable + identity (the subtle count)
+  sort E . ops 0 empty : -> E . op s_ : E -> E .
+  op _;_ : E E -> E [assoc comm id: empty] . var N : E .
+  eq N ; N = N .
+endfm
+red 0 ; s 0 ; 0 ; s 0 .             *** => 0 ; s 0   (2 rewrites)
+
+fmod ACU-IDEM is                    *** non-linear pure-AC idempotency: minimal binding each step
+  sort E . op a : -> E . op _+_ : E E -> E [assoc comm] . var X : E .
+  eq X + X = X .
+endfm
+red a + a + a + a .                 *** => a   (3 rewrites)

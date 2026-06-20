@@ -1,0 +1,20 @@
+*** ACU matching conformance (Stage B1) — solution SETS vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-match.maude < /dev/null
+*** Mirrors the solution-set tests in `crates/tnk-core/src/acu.rs`.
+
+fmod ACU-MATCH is
+  sort E .
+  ops a b c e : -> E .
+  op _+_ : E E -> E [assoc comm] .          *** no identity
+  op _#_ : E E -> E [assoc comm id: e] .    *** two-sided identity e
+  vars X Y : E .
+endfm
+
+*** 6 matchers — every split of {a,b,c} into two non-empty ordered parts:
+match X + Y <=? a + b + c .
+
+*** 4 matchers — variables may bind the identity e:
+match X # Y <=? a # b .
+
+*** 1 matcher with extension — matched portion a + b, residue c, empty substitution:
+xmatch a + b <=? a + b + c .

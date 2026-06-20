@@ -170,7 +170,7 @@ impl Signature {
     pub(crate) fn add_equation(&mut self, eq: Equation) {
         let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
         let compiled = CompiledEquation {
-            lhs: LhsAutomaton::compile(eq.lhs),
+            lhs: LhsAutomaton::compile(eq.lhs, self),
             rhs: eq.rhs,
             nr_vars: eq.nr_vars,
         };
@@ -300,6 +300,17 @@ impl Runtime {
                 let sort = self.compute_acu_sort(sig, symbol, &args);
                 self.alloc_node(sort, NodeTerm::Acu { symbol, args })
             }
+        }
+    }
+
+    /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
+    /// operator's theory: a free node directly, or a canonical ACU node (re-merging/sorting the
+    /// children as a multiset). Used by `reduce` when a child changed and by `instantiate`, so neither
+    /// hard-codes the free constructor (which rejects ACU symbols).
+    pub(crate) fn rebuild(&mut self, sig: &Signature, symbol: SymbolId, children: Vec<DagId>) -> DagId {
+        match sig.symbol(symbol).theory() {
+            Theory::Free => self.make_free(sig, symbol, children),
+            Theory::Acu => self.make_acu(sig, symbol, children.into_iter().map(|d| (d, 1)).collect()),
         }
     }
 
@@ -536,7 +547,7 @@ impl Runtime {
                 let reduced = if changed { std::mem::take(&mut f.reduced) } else { Vec::new() };
                 (f.symbol, f.original, reduced, changed)
             };
-            let rebuilt = if changed { self.make_free(sig, symbol, reduced) } else { original };
+            let rebuilt = if changed { self.rebuild(sig, symbol, reduced) } else { original };
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
@@ -585,19 +596,36 @@ impl Runtime {
     /// instantiated straight out of the still-borrowed equation table.
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
+        // ACU rewriting matches *modulo* the axioms with extension: a pattern may match a sub-multiset
+        // of the subject, leaving a residue to splice back. The free theory matches the whole node.
+        let ext_allowed = sig.symbol(symbol).theory() == Theory::Acu;
         let mut subst = Subst::new();
         // Shared borrow of `sig` held across the loop; `self` (the runtime) is disjoint, so the
         // matched `&eq.rhs` is instantiated in place without a defensive clone.
         let eqs = sig.equations.get(&symbol)?;
         for eq in eqs {
             subst.reset(eq.nr_vars);
-            let Some(mut sp) = eq.lhs.match_(self, sig, id, &mut subst) else { continue };
-            // The solution stream. Phase 1 equations are unconditional, so it accepts the first
-            // solution and returns; conditional equations / AC will iterate it (check the
-            // condition, `continue` to the next solution on failure), which is why it is a loop.
+            let Some(mut sp) = eq.lhs.match_(self, sig, id, &mut subst, ext_allowed) else {
+                continue;
+            };
+            // The solution stream. Unconditional equations accept the first solution and return; the
+            // ACU matcher already orders solutions minimal-first and skips the identity no-op, so the
+            // first solution is the right rewrite. (Conditional equations (B2) will check the
+            // condition here and `continue` to the next solution on failure — which is why it loops.)
             #[allow(clippy::never_loop)]
-            while sp.next(self, &mut subst) {
-                return Some(self.instantiate(sig, &eq.rhs, &subst));
+            while sp.next(self, sig, &mut subst) {
+                let rhs = self.instantiate(sig, &eq.rhs, &subst);
+                // Whole match → the rhs is the result; extension match (AC) → splice the unmatched
+                // residue back around the rhs and re-canonicalize (Maude's `partialConstruct`).
+                let result = if sp.matched_whole() {
+                    rhs
+                } else {
+                    let mut parts: Vec<(DagId, u32)> = Vec::with_capacity(sp.residue().len() + 1);
+                    parts.push((rhs, 1));
+                    parts.extend_from_slice(sp.residue());
+                    self.make_acu(sig, symbol, parts)
+                };
+                return Some(result);
             }
         }
         None
@@ -624,6 +652,12 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn runtime(&self) -> &Runtime {
         &self.rt
+    }
+    /// Both halves borrowed disjointly, for tests that drive the matcher seam's `next` (which needs
+    /// `&mut Runtime` + `&Signature` at once — the A4 split).
+    #[cfg(test)]
+    pub(crate) fn parts_mut(&mut self) -> (&Signature, &mut Runtime) {
+        (&self.sig, &mut self.rt)
     }
 
     // ---- sort signature ----
@@ -903,7 +937,7 @@ mod tests {
     }
 
     /// Engine with constants `a`,`b`,`c` and an `assoc comm` `+` (no identity) over sort `S`.
-    fn ac_ctx() -> (Engine, SymbolId, SymbolId, SymbolId, SymbolId) {
+    fn ac_ctx() -> (Engine, SortId, SymbolId, SymbolId, SymbolId, SymbolId) {
         let mut e = Engine::new();
         let s = e.add_sort("S");
         e.close_sorts();
@@ -911,14 +945,14 @@ mod tests {
         let b = e.add_op("b", vec![], s);
         let c = e.add_op("c", vec![], s);
         let plus = e.add_op_ac("+", vec![s, s], s, None);
-        (e, a, b, c, plus)
+        (e, s, a, b, c, plus)
     }
 
     /// B1.2: ACU construction is canonical modulo commutativity and associativity — `a+b == b+a`,
     /// and `(a+b)+c == a+(b+c) == a+b+c` (flattened to a 3-element multiset).
     #[test]
     fn acu_canonical_modulo_ac() {
-        let (mut e, a, b, c, plus) = ac_ctx();
+        let (mut e, _s, a, b, c, plus) = ac_ctx();
         let ab = {
             let (x, y) = (e.make_const(a), e.make_const(b));
             e.make_ac(plus, vec![x, y])
@@ -991,7 +1025,7 @@ mod tests {
     /// and a lone element never gets wrapped (`make_ac` of one element is that element).
     #[test]
     fn acu_merges_multiplicity_and_never_wraps_singleton() {
-        let (mut e, a, _b, _c, plus) = ac_ctx();
+        let (mut e, _s, a, _b, _c, plus) = ac_ctx();
         let aa = {
             let (x, y) = (e.make_const(a), e.make_const(a)); // distinct ids, structurally equal
             e.make_ac(plus, vec![x, y])
@@ -1008,7 +1042,7 @@ mod tests {
     /// is modulo-AC across *distinct* element ids.
     #[test]
     fn acu_gc_and_modulo_equality() {
-        let (mut e, a, b, _c, plus) = ac_ctx();
+        let (mut e, _s, a, b, _c, plus) = ac_ctx();
         let ab = {
             let (x, y) = (e.make_const(a), e.make_const(b));
             e.make_ac(plus, vec![x, y])
@@ -1025,9 +1059,103 @@ mod tests {
     #[test]
     #[should_panic(expected = "make_acu")]
     fn make_free_on_ac_operator_panics() {
-        let (mut e, a, _b, _c, plus) = ac_ctx();
+        let (mut e, _s, a, _b, _c, plus) = ac_ctx();
         let a0 = e.make_const(a);
         let _ = e.make_free(plus, vec![a0, a0]); // building an ACU op as a free node is a bug
+    }
+
+    fn s_of_zero(e: &mut Engine, zero: SymbolId, s: SymbolId) -> DagId {
+        let z = e.make_const(zero);
+        e.make_free(s, vec![z])
+    }
+
+    /// B1.5 reduce lock (== reference binary): `op _+_ [assoc comm]`, `eq X + 0 = X`;
+    /// `red s 0 + 0 + s 0 + s 0` → `s 0 + s 0 + s 0` in **1** rewrite (X absorbs the rest; the ground
+    /// `0` is consumed and spliced away as residue).
+    #[test]
+    fn ac_reduce_ground_consumed_with_extension() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op_ac("+", vec![nat, nat], nat, None);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        let (s0a, s0b, s0c) =
+            (s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s));
+        let z = e.make_const(zero);
+        let subject = e.make_ac(plus, vec![s0a, z, s0b, s0c]); // s0 + 0 + s0 + s0
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "one rewrite removes the 0");
+        let kids: Vec<_> = e.node(r).children().collect();
+        assert_eq!(kids.len(), 3, "result is s0 + s0 + s0");
+        assert!(kids.iter().all(|&k| e.node(k).symbol() == s), "all three are successors");
+    }
+
+    /// B1.5 reduce lock: ground AC pattern needing a residue splice — `eq a + a = a` on `a + a + b`
+    /// → `a + b` in **1** rewrite (the matched `{a,a}` is replaced by `a`, residue `b` spliced).
+    #[test]
+    fn ac_reduce_ground_pattern_residue_splice() {
+        let (mut e, _s, a, b, _c, plus) = ac_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::constant(a), Term::constant(a)]),
+            rhs: Term::constant(a),
+            nr_vars: 0,
+        });
+        let (a0, a1, b0) = (e.make_const(a), e.make_const(a), e.make_const(b));
+        let subject = e.make_ac(plus, vec![a0, a1, b0]); // a + a + b
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "a + a = a fires once");
+        let mut kids: Vec<_> = e.node(r).children().map(|k| e.node(k).symbol()).collect();
+        kids.sort_by_key(|s| format!("{s:?}"));
+        assert_eq!(kids, vec![a, b], "result is a + b");
+    }
+
+    /// B1.5 reduce lock (the subtle one — non-linear AC variable + identity): `op _;_ [assoc comm
+    /// id: empty]`, `eq N ; N = N`; `red 0 ; s0 ; 0 ; s0` → `0 ; s0` in **2** rewrites. Reproducing
+    /// the count needs minimal-first solution order + skipping the empty (no-op) binding.
+    #[test]
+    fn ac_reduce_set_idempotency_two_rewrites() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let empty = e.add_op("empty", vec![], nat);
+        let set = e.add_op_ac(";", vec![nat, nat], nat, Some(empty));
+        e.add_equation(Equation {
+            lhs: Term::op(set, vec![Term::var(0, nat), Term::var(0, nat)]), // N ; N
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        let (z0, z1) = (e.make_const(zero), e.make_const(zero));
+        let (s0a, s0b) = (s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s));
+        let subject = e.make_ac(set, vec![z0, s0a, z1, s0b]); // 0 ; s0 ; 0 ; s0
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 2, "two duplicate-removals (== reference binary)");
+        assert_eq!(e.node(r).children().count(), 2, "result is 0 ; s0");
+    }
+
+    /// B1.5 reduce lock: non-linear pure-AC idempotency `eq X + X = X` on `a+a+a+a` → `a` in **3**
+    /// rewrites (X binds a single `a` each step — minimal binding, not the whole half).
+    #[test]
+    fn ac_reduce_nonlinear_idempotency_three_rewrites() {
+        let (mut e, s, a, _b, _c, plus) = ac_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, s), Term::var(0, s)]), // X + X
+            rhs: Term::var(0, s),
+            nr_vars: 1,
+        });
+        let (a0, a1, a2, a3) =
+            (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
+        let subject = e.make_ac(plus, vec![a0, a1, a2, a3]); // a + a + a + a
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 3, "X binds a single `a` each step (== reference binary)");
+        assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
     }
 
     #[test]
