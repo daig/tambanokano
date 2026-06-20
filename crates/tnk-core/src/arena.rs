@@ -73,7 +73,7 @@ impl<T> Arena<T> {
         }
     }
 
-    pub fn get_mut(&mut self, id: Id<T>) -> &mut T {
+    pub(crate) fn get_mut(&mut self, id: Id<T>) -> &mut T {
         match &mut self.slots[id.index()] {
             Slot::Occupied(v) => v,
             Slot::Free => panic!("Arena::get_mut on freed {id:?}"),
@@ -96,7 +96,7 @@ impl<T> Arena<T> {
 
     /// Mark `id` reachable. Returns `true` if this newly marked it (lets a tracer prune
     /// already-visited subgraphs and terminate on shared DAG structure).
-    pub fn mark(&mut self, id: Id<T>) -> bool {
+    pub(crate) fn mark(&mut self, id: Id<T>) -> bool {
         let slot = &mut self.marks[id.index()];
         if *slot {
             false
@@ -110,13 +110,13 @@ impl<T> Arena<T> {
         self.marks[id.index()]
     }
 
-    pub fn clear_marks(&mut self) {
-        self.marks.iter_mut().for_each(|m| *m = false);
+    pub(crate) fn clear_marks(&mut self) {
+        self.marks.fill(false);
     }
 
     /// Reclaim every occupied-but-unmarked slot, handing each freed value to `on_free`
     /// (e.g. to release external resources). Returns the count reclaimed.
-    pub fn sweep(&mut self, mut on_free: impl FnMut(T)) -> usize {
+    pub(crate) fn sweep(&mut self, mut on_free: impl FnMut(T)) -> usize {
         let mut reclaimed = 0;
         for raw in 0..self.slots.len() {
             if !self.marks[raw] && matches!(self.slots[raw], Slot::Occupied(_)) {

@@ -114,13 +114,22 @@ impl Engine {
         self.dags.sweep(|_| {})
     }
 
-    /// Iterative (stack-based) transitive marker; terminates on shared structure because
-    /// [`Arena::mark`] reports whether a node was *newly* marked.
+    /// Iterative (stack-based) transitive marker. Marks each node **on push** (using the
+    /// "newly-marked" result of [`Arena::mark`]) so a node shared by *k* parents is pushed once,
+    /// keeping the work stack O(nodes) rather than O(edges); it also terminates on shared/cyclic
+    /// structure.
     fn mark_reachable(&mut self, root: DagId) {
-        let mut stack = vec![root];
+        let mut stack = Vec::new();
+        if self.dags.mark(root) {
+            stack.push(root);
+        }
         while let Some(id) = stack.pop() {
-            if self.dags.mark(id) {
-                stack.extend_from_slice(self.dags.get(id).children());
+            let len = self.dags.get(id).children().len();
+            for i in 0..len {
+                let child = self.dags.get(id).children()[i];
+                if self.dags.mark(child) {
+                    stack.push(child);
+                }
             }
         }
     }
