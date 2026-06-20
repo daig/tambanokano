@@ -41,6 +41,19 @@ into immediate panics in dev/test at ~zero release cost). The **release-mode** g
 open, to be decided by benchmarking an 8-byte handle vs `examples/peano.rs`. Co-design this with the
 iterative reducer (its explicit work-stack *is* the discoverable root set for safe-point GC).
 
+**Resolution (Phase-1 Stage A2, 2026-06-20; commits `7f8df37`, `f8b1c0d`).** Implemented as amended:
+the iterative reducer (A1) supplies the discoverable work-stack; `RootGuard`/root registry and the
+debug-gated slot-generation + per-arena-id checks landed in A2, plus opt-in safe-point GC during `reduce`.
+**Release default decided by benchmark: keep the bare 4-byte `u32` handle (checks compiled out in release).**
+Forcing the full generational machinery into an *optimized* build (`-C debug-assertions=on`, a 12-byte
+`raw+gen+arena` handle + checks — a conservative upper bound on the amendment's 8-byte `raw+gen`) cost
+**~28% reduce throughput** (6.75 → 4.84 M rewrites/s) and **~60% GC-mark throughput** (280 → 111 M nodes/s)
+on `examples/peano`, far above the ~5% bar for flipping the go/no-go-critical throughput metric. The
+debug-gated checks remain the dev/test safety net; equality/ordering/hashing are raw-only in *both* profiles
+so behavior is identical. A release-checked 8-byte handle (behind a `gen-checks` cargo feature, for code that
+enables `gc_interval` in release) is **deferred** until release-mode safe-point GC is actually used; the
+`set_gc_interval` rooting contract is documented in the meantime.
+
 ## D3 — Dispatch boundary: enums for the closed hot set, `dyn` at open seams
 **Decision.** `Symbol`/`DagNode`/`Term` and the fixed theory set (Free/ACU/AU/CUI/S/NA/Var/BuiltIn) are
 **enums with composed data** (sort/equation/rule/strategy/memo tables as fields), giving monomorphized hot
