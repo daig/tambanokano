@@ -6,9 +6,13 @@ foundation reshape, review Tier 2) is **complete and adversarially reviewed**; t
 supersedes `06-phase1-plan.md` §3–§4 for the breadth work (`06` remains the Phase-1 overview; its §3
 Stage A is now done).
 
-> Sequencing note: a thorough **audit of Stage A** is scheduled for a separate session *before* Stage B
-> begins. Treat §1 below as "Stage A as-built today"; if the audit refines a seam, update §1 first. The
-> seams were each reviewed at commit time (no semantic divergence found), so they should be stable.
+> **STATUS (2026-06-20).** The Stage-A **audit** is done (verdict GO; findings F-1…F-4 — **F-3**
+> ExtensionInfo and **F-4** `Subst` unbind were closed in B1, **F-1** no-op guard is moot for the
+> theories, **F-2 is outstanding**: safe-point GC's root set is local to one `reduce` invocation, so it
+> must become engine-global *before* release-mode safe-point GC meets B2's nested condition-reduce — see
+> §4). **B1's structural equational theories — ACU, AU, CUI — are DONE** (on `main`, commits
+> `c10bf0e..e4ea879`, every lock conformance-verified vs the binary); **S and NA are deferred to B3**
+> (they need bignums / built-in data). §1 below is refreshed to the **as-built post-B1** seams. **NEXT: B2.**
 
 ---
 
@@ -28,10 +32,11 @@ the meta half is Phase 3), `A4` (B4 parser), `A5` (B5 modules+REPL — *non-para
 parameterization is Phase 2). Decisions: `03-open-decisions.md` (D1–D8; **D2 resolved** = 4-byte
 release handle; D4 `malachite`).
 
-**The code:** `crates/tnk-core` (Stage A as-built). Sanity check before starting:
-- `cargo test -p tnk-core` → 37 pass; `cargo clippy --all-targets -- -D warnings` → clean.
-- `cargo run --release --example peano` → `fib(20)` ≈ **8.3 M rewrites/s**, GC mark ≈ 350 M nodes/s.
+**The code:** `crates/tnk-core` (Stage A + B1 structural theories as-built). Sanity check before starting:
+- `cargo test -p tnk-core` → **60 pass** (post-B1 ACU/AU/CUI); `cargo clippy --all-targets -- -D warnings` → clean.
+- `cargo run --release --example peano` → `fib(20)` ≈ **8 M rewrites/s** (free theory), GC mark ≈ 350 M nodes/s.
 - `cargo run --release --example peano 22 1 100` → `fib(22) = 17711 (186579 rewrites)` == reference.
+- ACU/AU/CUI conformance: `conformance/{acu-match,acu-reduce,au,cui}.maude` == reference binary.
 
 **The memory:** `maude-rust-migration.md` (status, the Stage-A commit map, this agenda in brief).
 
@@ -55,30 +60,41 @@ runtime to build nodes — *no clone*. **This is the borrow home for B2's condit
 condition is reduced via `&mut Runtime` while the equation table stays borrowed through `&Signature`.
 AC residue-node construction (B1) gets `&mut Runtime` the same way.
 
-### 1.2 Matcher seam: `LhsAutomaton` / `Subproblem` + solution-stream driver — A3 (`12d60c2`)
-`theory.rs` (crate-private, closed enums — decision D3):
-- `enum LhsAutomaton { Free(Term) }` — `compile(lhs: Term)`; `match_(&self, &Runtime, &Signature, subject, &mut Subst) -> Option<Subproblem>` (two-phase: bind the forced part, return a residual).
-- `enum Subproblem { FreeOnce { pending } }` — `next(&mut self, &Runtime, &mut Subst) -> bool` (a resumable solution enumerator; free theory yields one).
-- The driver is `Runtime::try_rewrite_top`:
-  ```text
-  for eq in eqs { reset subst; let Some(mut sp) = eq.lhs.match_(..) else continue;
-      while sp.next(..) { /* accept first solution */ return Some(instantiate(&eq.rhs, ..)); } }
-  ```
-  (`#[allow(clippy::never_loop)]` marks the loop as intentionally multi-iteration-in-the-future.)
+### 1.2 Matcher seam: `LhsAutomaton` / `Subproblem` + solution-stream driver — A3 (`12d60c2`), extended in B1
+`theory.rs` (crate-private, closed enums — decision D3). **As-built after B1:**
+- `enum LhsAutomaton { Free(Term), Acu(AcuLhs), Au(AuLhs), Cui(CuiLhs) }`; `compile(lhs: Term, &Signature)`
+  picks the arm from the top symbol's `theory()`. (Add `S`/`Na` arms at B3.)
+- `match_(&self, &Runtime, &Signature, subject, &mut Subst, ext_allowed: bool) -> Option<Subproblem>` —
+  two-phase: bind the forced/deterministic part, return a residual enumerator. **`ext_allowed`** enables
+  matching a *sub-part* of the subject and leaving a residue (true for ACU/AU; the audit-**F-3**
+  ExtensionInfo channel — false for free/CUI which always match the whole node).
+- `enum Subproblem { FreeOnce{..}, Acu(..), Au(..), Cui(..) }`, with
+  `next(&mut self, &mut Runtime, &Signature, &mut Subst) -> bool` (resumable; **`&mut Runtime`** so an
+  arm can build binding/residue nodes between solutions — the F-4 widening, now done) and
+  `build_result(&self, &mut Runtime, &Signature, rhs) -> DagId` (splice the rhs into the matched
+  position — whole → `rhs`; ACU → `rhs ⊎ residue`; AU → ordered `prefix ++ rhs ++ suffix`; Maude's
+  `partialConstruct`). `build_result` **replaced** the old `matched_whole()/residue()` reads in the driver.
+- The driver `Runtime::try_rewrite_top`: `ext_allowed = theory ∈ {Acu, Au}`; for each eq,
+  `match_` then `while sp.next(..) { return Some(sp.build_result(.., instantiate(&eq.rhs, ..))) }`
+  (`#[allow(clippy::never_loop)]`: unconditional eqs return the first solution; B2 conditions will
+  `continue` to the next on condition failure).
 
-**Why B needs it / how B extends it:**
-- **B1 (ACU/AU/CUI/S/NA):** add `LhsAutomaton::Acu(..)` / `Subproblem::Acu(..)` arms. AC matching is
-  *multi-solution* → `next()` yields several substitutions on successive calls. The driver loop already
-  consumes a stream — no reduce-core rewrite. ACU's residual `Subproblem` owns its bipartite graph +
-  Diophantine system (no borrows of the engine; `&Runtime`/`&mut` passed per `next`). When `next` must
-  allocate residue nodes, widen its `&Runtime` to `&mut Runtime` (a crate-internal change — these enums
-  are `pub(crate)`, so it is not a public-API break).
-- **B2 (conditional equations):** the `while sp.next(..)` body becomes
-  `if condition_holds(sig, rt, subst) { accept } else { continue }` — i.e. backtrack into the next
-  solution on condition failure. `condition_holds` reduces condition fragments via `rt.reduce(sig, ..)`
-  (the A4 borrow home). `CompiledEquation` gains a compiled condition; `Equation` (public) gains it too.
-- Discrimination net (free-theory perf) is a *later* optimization behind this same seam — it changes how
-  `match_` finds candidate equations, not the driver.
+**Matcher strategy (B1, correctness-first — `src/{acu,au,cui}.rs`).** Own *complete* enumerators (own
+Diophantine by backtracking), **not** Maude's optimized bipartite/Diophantine solver (a perf follow-up).
+Two ordering rules reproduce the binary's behaviour, both *forced by the reference* (not assumed):
+a **lone linear variable absorbs the whole remainder** (Maude's collector/LONE_VARIABLE — `eq a+X=b` on
+`a+c+c` is `b`, not `b+c`; a *correctness* rule, since that system is non-confluent under extension), and
+otherwise **minimal-matched-size first** with the **matched-size-0 identity no-op skipped** (so `X+X=X`
+on `a+a+a+a` is 3 rewrites and identity bindings never loop). CUI canonicalizes/collapses at construction
+(`f(a,a)`/`f(a,e)` → element) and enumerates the two commutative pairings.
+
+**How B2 extends it:** the `while sp.next(..)` body becomes
+`if condition_holds(sig, rt, subst) { accept } else { continue }` — backtrack into the next solution on
+condition failure; `condition_holds` reduces fragments via `rt.reduce(sig, ..)` (the A4 borrow home).
+**That nested `reduce` is the audit-F-2 hazard:** its safe-point GC must see the *outer* reduction's
+roots + the matcher's in-flight `Subst`/residue, which the current *per-`reduce`-call local* root set
+does not (§4 — fix before release-mode safe-point GC + conditions). The free-theory discrimination net
+stays a later perf step behind this seam (it changes how `match_` finds candidate eqs, not the driver).
 
 ### 1.3 Child traversal visitor — A5 (`13219cf`)
 `dag.rs`: `DagNode::children(&self) -> impl Iterator<Item = DagId>` and
@@ -86,15 +102,17 @@ AC residue-node construction (B1) gets `&mut Runtime` the same way.
 `children().extend`), `reduce` (`new_reduce_frame` via `children().collect`), and `deep_equal` (via
 `symbol()` + pairwise `children()`) are all theory-agnostic.
 
-**Why B needs it / contract for B reps:** a new `NodeTerm` arm (ACU multiset of `(DagId, mult)`,
-S `(count, arg)`, red-black tree) implements `children()`/`for_each_child` and is a *pure addition* —
-GC/reduce/equality are untouched. **Two contracts the new reps must honour:**
-- For `deep_equal` to stay correct, `children()` must yield the **full, canonically-ordered child
-  sequence** (ACU: the flattened multiset with repeats, in canonical order — Maude keeps ACU nodes
-  canonical, so pairwise comparison is equality).
+**Why B needs it / contract for B reps (B1 done; S/Na at B3).** A new `NodeTerm` arm implements
+`children()`/`for_each_child` and is a *pure addition* — GC/reduce/equality untouched. B1 added
+`Acu{(DagId,mult)}`, `Au{Vec<DagId>}`, `Cui{[x,y] canonical}`; `children()` is now a small `ChildIter`
+enum (the ACU arm expands multiplicities, the rest reuse the slice iterator). **Contracts the reps honour:**
+- For `deep_equal` — and `dag_compare`, the **new total order on nodes** consistent with it — to be
+  correct, `children()` must yield the **full, canonically-ordered child sequence** (ACU: flattened
+  multiset with repeats; AU: ordered sequence; CUI: sorted pair). `make_*` keep nodes canonical, so
+  pairwise comparison *is* equality. **`dag_compare` is the key the ACU/CUI canonicalizers sort by.**
 - A theory whose node carries **scalar payload that is not a child id** (the **S-theory's successor
-  `count`**) needs **theory-specific equality**, not `deep_equal` — exactly as matching is per-theory.
-  (Documented on `deep_equal`.) Plan an equality dispatch when S lands.
+  `count`** — B3) needs **theory-specific equality/compare**, not the generic `deep_equal`/`dag_compare`.
+  (Documented on `deep_equal`.) Add the dispatch when S lands.
 
 ### 1.4 Arena safety: generational handles + RootGuard + safe-point GC — A2 (`f8b1c0d`)
 `id.rs`/`arena.rs`/`root.rs`/`engine.rs`: debug-gated `(generation, arena_id)` on `Id` (bare `u32` in
@@ -118,7 +136,7 @@ this loop unchanged.
 |---|---|
 | `Engine::compute_free_sort` (sort = op `range`, else kind error sort) | **B2** per-symbol **sort decision diagram** (least sort, preregularity, overloading) |
 | `Symbol { name, domain, range }` — *one* declaration | **B2** multi-declaration `Symbol` + diagram handle (ad-hoc/subsort overloading) |
-| `NodeTerm { Free }` only | **B1** `Acu`/`Au`/`Cui`/`S`/`Na` arms (+ a built-in/number arm for **B3**) |
+| `NodeTerm { Free, Acu, Au, Cui }` (B1 done) | **B3** adds `S`/`Na` arms + a built-in/number arm |
 | `Equation { lhs, rhs, nr_vars }` (unconditional) | **B2** conditional `eq`/`ceq` + memberships `mb`/`cmb`; op/stmt attributes |
 | no built-ins | **B3** `enum SpecialOp` bound from `special(id-hook …)`; `malachite` bignums |
 | hand-built modules in tests | **B4** parser + **B5** module system load `.maude` text |
@@ -131,23 +149,31 @@ Each item: **goal · plugs into · what's new · done-when (conformance) · refs
 hand-constructed test modules (as Stage A did) for B1–B3; the parser (B4) is what makes the *end
 milestone* "load `.maude` text" possible. Conformance is always against the reference binary.
 
-### B1 — Equational theories (ACU, AU, CUI, S, NA) + persistent structures  *(the largest single piece)*
-- **Goal:** matching & rewriting **modulo** `assoc`/`comm`/`id:`/`idem`.
-- **Plugs into:** §1.2 matcher seam (new `LhsAutomaton`/`Subproblem` arms, multi-solution `next`),
-  §1.3 visitor (new `NodeTerm` arms yielding canonical children), §1.1 `&mut Runtime` for residue nodes.
-- **What's new:** **ACU first** — flat `ACU_DagNode` (`SmallVec<(DagId, u32)>`) vs red-black
-  `ACU_TreeDagNode` above a size threshold; the **bipartite + Diophantine** multiset matcher; lazy
-  subproblems; `MatchStrategy` selection (GROUND_OUT/LONE_VARIABLE/…); collapse matching (`id:`/`idem`).
-  Then **AU** (deque + extension), **CUI**, **S** (stacked-successor numbers — needs bignum, ties to B3;
-  S equality is theory-specific per §1.3), **NA** (trivial). Port the persistent structures
-  (`rpds`/`im` — **open: which crate**). New module(s): `theory/{acu,au,cui,s,na}` + `diophantine`.
-- **Done-when:** matching modulo the axioms conforms to the binary — **build the conformance suite from
-  the manual's `xmatch`/`match` worked examples *before* optimizing** (the multi-solution counts, e.g.
-  the 12-solution `xmatch`, are the spec).
+### B1 — Equational theories  *(the largest single piece)* — **ACU / AU / CUI DONE; S / NA → B3**
+- **Goal:** matching & rewriting **modulo** `assoc`/`comm`/`id:`/`idem`. ✅ for the structural theories.
+- **Plugs into:** §1.2 matcher seam (`LhsAutomaton`/`Subproblem` arms, multi-solution `next`,
+  `build_result`), §1.3 visitor (`NodeTerm` arms yielding canonical children), §1.1 `&mut Runtime` for
+  residue nodes.
+- **DONE (on `main`, `c10bf0e..e4ea879`):** **ACU** (`assoc comm [id:]`), **AU** (`assoc [id:]`, ordered),
+  **CUI** (`comm [idem] [id:]`). `Symbol{axioms,identity}` + the `Theory` enum + `add_op_{ac,au,cui}`; flat
+  reps `NodeTerm::{Acu(Vec<(DagId,u32)>), Au(Vec<DagId>), Cui([x,y])}` + `make_{acu,au,cui}`
+  canonicalizers + the `dag_compare` total order; **correctness-first** own enumerators
+  (`src/{acu,au,cui}.rs`) with the lone-variable-collector + minimal-first/skip-no-op strategy (§1.2).
+  Every lock differentially verified vs the binary (`conformance/{acu-match,acu-reduce,au,cui}.maude`).
+- **Deferred follow-ups (none block B2):** **S** (stacked-successor `iter` numbers — needs bignum) and
+  **NA** (atomic built-in constants — needs built-in data) **→ B3**; the red-black `ACU_TreeDagNode`
+  (flat `Vec` only — a perf step at `CONVERT_THRESHOLD`≈8); the **optimized bipartite + Diophantine**
+  matcher + lazy subproblems (own backtracking enumerator for now); the persistent-structure crate
+  (`rpds`/`im` — only the tree rep needs it); **aliens** (non-ground, non-var subterms) and **non-linear
+  variables** under AC/AU (loud `assert`s); CUI **collapse-matching** `f(X,Y) <=? a`; collapse on a
+  single-element ACU subject; exact solution-**order** for non-confluent systems + bounded `match[n]`.
+- **Done-when (met for ACU/AU/CUI):** matching/reduce modulo the axioms conforms to the binary — match
+  solution-sets *and* reduce rewrite-counts (the suite was built from the manual's `xmatch`/`match`
+  examples + captured reduce counts *before* any optimization).
 - **Refs:** `A2` (the whole report); arch-map L2 + decision #3.
-- **Risks (highest):** AC collapse correctness (`id:`/`idem` infinite classes); multi-solution
-  completeness with extension under sort constraints; the greedy fast-path vs full-search tradeoff;
-  flat↔tree rep switch + persistent-structure/GC interplay. Differential-test relentlessly.
+- **Risks (mostly retired):** AC collapse correctness, multi-solution completeness, lone-var/order
+  fidelity — all locked by differential tests. Remaining: flat↔tree switch + persistent-structure/GC
+  interplay (deferred); S/NA's bignum + built-in coupling (handled in B3).
 
 ### B2 — Sort decision diagram + memberships + conditional logic + operator attributes
 - **Goal:** correct least sorts under overloading; conditional equations/memberships; op attributes.
@@ -168,18 +194,29 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   evaluation re-entering reduction (the A4 borrow home is the enabler — confirm no per-step clones);
   `owise` semantics; preregularity-modulo-axioms once B1's AC sorts exist.
 
-### B3 — Built-in data types + bignums
-- **Goal:** `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` working.
-- **Plugs into:** a new `NodeTerm`/symbol arm for built-in constants + the symbol-reduction path; B1's S
-  theory (succ/`iter`) for NAT; B2's attribute parsing (`special`).
-- **What's new:** parse `special (id-hook …)` into a typed **`enum SpecialOp`** at module-build time
-  (resolving op/term hooks to symbol ids) — decision #6; built-in reduction becomes an arm of symbol
-  reduction (not a fn-pointer); arithmetic on **`malachite`** behind `tnk-core::num` (D4); the predefined
-  numeric/string modules. `NumberOp`/`Equality`/`Branch`/string/float per `A7` §2.
+### B3 — Built-in data types + bignums  *(now also hosts the **S** and **NA** theories — deferred from B1)*
+- **Goal:** `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` working — **plus the S (`iter`
+  successor) and NA (atomic constant) theories**, deferred from B1 because they need bignums / built-in
+  data respectively.
+- **Plugs into:** the §1.2 matcher seam + §1.3 visitor (new `NodeTerm::{S, Na}` arms — additive, exactly
+  as ACU/AU/CUI were); the symbol-reduction path; B2's attribute parsing (`special`, `iter`).
+- **What's new:**
+  - **S theory** (`iter`): `NodeTerm::S { symbol, count, arg }` — `s^count(arg)` stored compactly with a
+    **bignum** `count` (so `s^(10^9) 0` is O(1)); extension matching (`s^k` matches `s^n` for `k ≤ n`,
+    residue `s^(n−k)`); **theory-specific equality/compare** (the scalar `count` is not a child id — the
+    §1.3/§4 dispatch). Ties succ/`iter` to NAT.
+  - **NA theory:** the trivial atomic case — a built-in constant matches only itself (numbers / strings /
+    quoted-ids); per-type equality.
+  - parse `special (id-hook …)` into a typed **`enum SpecialOp`** at module-build time (resolving op/term
+    hooks to symbol ids) — decision #6; built-in reduction becomes an arm of symbol reduction (not a
+    fn-pointer); arithmetic on **`malachite`** behind `tnk-core::num` (D4); the predefined numeric/string
+    modules. `NumberOp`/`Equality`/`Branch`/string/float per `A7` §2.
 - **Done-when:** the predefined numeric/string prelude modules reduce and conform (numeric results,
-  rewrite counts, `if_then_else_fi`, equality).
-- **Refs:** `A7` §1/§2 (BuiltIn seam — *not* the meta half), decision #6/#7 (D4); arch-map L3.
-- **Risks:** RAT/FLOAT edge cases; conformance of conversions; tying succ/`iter` (S theory) to NAT.
+  rewrite counts, `if_then_else_fi`, equality); `s^n 0` / `iter` numerals and NA constants conform.
+- **Refs:** `A7` §1/§2 (BuiltIn seam — *not* the meta half), `A2` (the S/NA theories), decision #6/#7
+  (D4); arch-map L2 (S/NA) + L3 (built-ins).
+- **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
+  + its bignum `count`; tying succ/`iter` to NAT.
 
 ### B4 — Frontend: lexer + mixfix parser + pretty-printer
 - **Goal:** parse `.maude` *functional* modules to the same terms the hand-built fixtures produce; round-trip via pretty-print.
@@ -224,21 +261,33 @@ manual's worked examples (esp. **`xmatch`/`match` for B1**, `sort`/`parse` for B
 `.maude`, as Stage A did (e.g. the `fib(22) = 186579` lock).
 
 ## 4. Open decisions / risks specific to Stage B
-- **Persistent-structure crate for ACU/AU** (`rpds` vs `im`) — pick during B1 by benchmarking against the
-  GC/arena model (the tree rep must trace through the §1.3 visitor).
-- **`Subproblem::next` borrow widening** to `&mut Runtime` when AC allocates residue nodes — crate-internal (the enums are `pub(crate)`); do it when B1 needs it.
-- **Equality dispatch** for the S-theory (scalar `count` ≠ child id) — `deep_equal` is not enough (§1.3).
+- **[AUDIT F-2 — fix before B2 + release safe-point GC] Nested-reduce GC root set.** `safe_point_gc`
+  marks only the *current* `reduce` call's frame stack + `child_result` + registry. B2 evaluates
+  conditions by calling `reduce` *inside* the `while sp.next` loop; that nested reduce's safe points
+  can't see the OUTER reduction's frames, the matcher's in-flight `Subst` bindings, or B1 residue nodes →
+  they would be swept (Maude marks from ALL active contexts). Make the in-flight root set
+  **engine-global** (the `Runtime` owns a stack of active reduce frames that every safe-point GC walks),
+  or root condition state via `RootGuard`. Harmless today (gc_interval off by default; no conditions).
+- **`Subproblem::next` borrow widening to `&mut Runtime`** — **DONE** in B1 (plus `build_result`).
+- **Persistent-structure crate** (`rpds` vs `im`) — only the **deferred** red-black `ACU_TreeDagNode`
+  needs it; B1 ships the flat `Vec` rep. Pick when the tree rep lands (benchmark vs the GC/arena model;
+  it must trace through the §1.3 visitor).
+- **Equality/compare dispatch** for the S-theory (scalar `count` ≠ child id) — `deep_equal`/`dag_compare`
+  are not enough (§1.3). Add when **S lands in B3**.
 - **`leq` representation** (`BTreeSet` → `fixedbitset`) — with B2's larger sort sets (R3 M2).
 - **Parser ambiguity ordering** — observable; lock with differential tests (B4).
 - **Where built-in constants live** in `NodeTerm` (a `BuiltIn` arm vs per-type arms) — decide at B3.
+- **Solution-order fidelity beyond the locked cases** — the correctness-first matchers reproduce the
+  binary on the suite (lone-var + minimal-first), but exact order for *non-confluent* AC/AU systems and
+  bounded `match[n]` is pinned only once Maude's Diophantine order is ported (a B1 perf follow-up).
 - The `gen-checks` release feature (D2) stays deferred unless release-mode safe-point GC is actually used.
 
-## 5. Suggested first moves (post-audit)
-1. Read §0 docs + run the §0 sanity checks; skim §1 against the actual `crates/tnk-core` to confirm the
-   seams are as described (the audit may have refined them).
-2. Open **B1 with ACU** — the largest piece and the one the whole seam was built for. Before writing the
-   matcher, **build the `xmatch`/`match` conformance suite** from the manual so multi-solution behavior
-   is pinned. Add the `Acu` arms behind the §1.2 seam + §1.3 visitor; commit per sub-step (flat rep →
-   tree rep → bipartite/Diophantine → collapse), conformance green at each.
-3. Then B2 (sort diagram + conditions — conditions exercise the solution-stream's condition path), B3
-   (built-ins), B4 (parser), B5 (modules + REPL = the milestone).
+## 5. Suggested next moves (B1 structural theories done)
+1. Read §0 docs + run the §0 sanity checks (now **60 tests**; ACU/AU/CUI conformance green).
+2. **Open B2** — sort decision diagram + conditional equations + operator attributes (§2 B2). Conditions
+   exercise the solution-stream's condition path (§1.2); **first address audit F-2** (§4: the
+   nested-reduce GC root set) if release-mode safe-point GC will run with conditions.
+3. Then **B3** (built-ins + bignums, **including the deferred S/NA theories** — §2 B3), **B4** (parser),
+   **B5** (modules + REPL = the Phase-1 end milestone).
+4. *(B1 perf/coverage follow-ups, any time — see §2 B1 deferred list:)* the red-black ACU tree rep + the
+   optimized bipartite/Diophantine matcher; aliens / non-linear vars under AC/AU; CUI collapse-matching.

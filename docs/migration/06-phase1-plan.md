@@ -104,7 +104,8 @@ reduce go through the visitor; adding a non-slice arm needs no edits to them. *(
 
 With Stage A's seams in place, add capability. Each pulls heavily from its deep-dive report.
 
-**B1 — Equational theories** *(A2).* Add the theory enum arms behind the A3 seam + A5 visitor: **ACU**
+**B1 — Equational theories** *(A2).* **[Superseded by `07`; status: ACU/AU/CUI DONE, S+NA moved to B3.]**
+Add the theory enum arms behind the A3 seam + A5 visitor: **ACU**
 (the big one — flat vs red-black dag reps, bipartite + Diophantine multiset matcher, lazy subproblems),
 then **AU**, **CUI**, **S/iter** (stacked-successor numbers, needs bignum), **NA**. Port the persistent
 structures. *Done-when:* matching modulo `assoc`/`comm`/`id`/`idem` conforms to the binary (use the
