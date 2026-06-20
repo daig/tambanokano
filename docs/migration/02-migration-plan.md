@@ -124,7 +124,34 @@ Agreed Stage 1; each revisitable at the noted phase.
 - **D7 SMT:** `z3` crate behind `trait SmtEngine`, runtime/feature-selectable. *(revisit: Phase 3)*
 - **D8 Naming:** project name `tambanokano` (confirmed), `tnk-` crate prefix; final public *language* name deferred. *(revisit: post Phase 0/1)*
 
-## 7. Recommended immediate next step
-Execute **Phase 0** as a focused spike (free-theory vertical slice + GC benchmark). It is small, it
-exercises the three foundational decisions (#1 arena/GC, #2 enum-dispatch, #3 iterator backtracking), and
-its benchmark result is the go/no-go signal for the whole approach.
+## 7. Status: Phase 0 complete (go/no-go = GO)
+Phase 0 shipped a free-theory vertical slice and validated the architecture against the reference C++
+binary — see `04-phase0-results.md`. Next is **Phase 1** (core functional Maude): the remaining
+equational theories (esp. AC/ACU matching), built-in data + bignums, the lexer/mixfix parser, and a
+basic module system — opening with the deferred optimizations (discrimination net, inline args, compiled
+rhs, in-place rewrite, safe-point GC).
+
+## 8. Guardrails for Phase 1+ — do not overfit to the Phase 0 prototype
+Phase 0 code is a **validated probe, not a foundation to preserve**. It took deliberate shortcuts to
+de-risk quickly; several are *wrong as long-term design* and must be re-derived from the full spec
+(reports `A1`–`A8` + the manual), not extended out of convenience. Treat the following as **expected
+rewrites**, and don't let new code grow to depend on their current shape:
+
+- **`DagNode` is free-only.** Real nodes vary per theory (ACU flat array *and* red-black tree, S-theory
+  bignum, variables, built-in constants). The node representation will be reshaped; the generic arena/GC
+  stays, the `enum` arms are not final.
+- **One declaration per symbol; sort = `range`.** `compute_free_sort` is a placeholder. Overloading + the
+  sort decision diagram (least sort, preregularity, and preregularity *modulo axioms*) replace it. Nothing
+  should assume "a node's sort is its operator's range sort."
+- **Naive recursive matcher.** `match_pattern` is throwaway — it becomes per-theory compiled automata
+  (discrimination net for free; bipartite + Diophantine for AC). Don't depend on its recursion/shape.
+- **Functional reduce.** `reduce(id) -> id` with no in-place rewrite and no mid-reduction GC is a
+  simplification. In-place destructive rewrite + safe-point GC (RootGuard + context-tracked roots) will
+  change the reduction strategy and signatures.
+- **Unconditional, eager-only, no attributes.** Conditions (eqs/mb/rules), evaluation strategies
+  (`strat`/`frozen`/`memo`), and statement attributes are absent and need first-class support.
+- **`Engine` bundles signature + runtime.** The eventual split is a static `Module` (sorts/symbols/
+  statements) vs. a runtime `RewritingContext` over the arena; don't entrench the bundling.
+
+**Principle: let the architecture map drive the code, not the prototype.** Phase 0 proved *feasibility*;
+it does not define the *design*.
