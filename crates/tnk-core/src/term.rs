@@ -81,6 +81,13 @@ impl Engine {
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
     /// [`Subst::reset`] to the pattern's variable count). Returns `true` on success. On failure
     /// `subst` may hold partial bindings, so callers reset before each attempt.
+    ///
+    /// Recurses on *pattern* depth only (the `Op` arm descends `pat.args`; a `Var` binds without
+    /// descending, and the non-linear case defers to the iterative [`Engine::deep_equal`]). Pattern
+    /// depth is author-controlled and small for hand-written equations, so — unlike the old
+    /// subject-depth recursion in `reduce` (A1) — this cannot overflow on deep runtime terms. A
+    /// machine-generated equation with a pathologically deep lhs would still recurse; that path is
+    /// superseded by A3's compiled, iterative `LhsAutomaton`.
     #[must_use]
     pub fn match_pattern(&self, pat: &Term, subject: DagId, subst: &mut Subst) -> bool {
         match pat {
@@ -111,24 +118,38 @@ impl Engine {
     }
 
     /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
+    ///
+    /// Iterative (explicit pair-stack) for the same reason as [`Engine::reduce`]: the recursive form
+    /// descended on *subject* depth and overflowed on deep terms (e.g. a non-linear pattern over a
+    /// million-deep chain — review R2 C1).
     #[must_use]
     pub fn deep_equal(&self, a: DagId, b: DagId) -> bool {
-        if a == b {
-            return true;
-        }
-        match (&self.node(a).term, &self.node(b).term) {
-            (
-                NodeTerm::Free { symbol: sa, args: aa },
-                NodeTerm::Free { symbol: sb, args: bb },
-            ) => {
-                sa == sb
-                    && aa.len() == bb.len()
-                    && aa.iter().zip(bb).all(|(&x, &y)| self.deep_equal(x, y))
+        let mut stack: Vec<(DagId, DagId)> = vec![(a, b)];
+        while let Some((x, y)) = stack.pop() {
+            if x == y {
+                continue; // same node (shared structure): trivially equal, prune the subtree
+            }
+            match (&self.node(x).term, &self.node(y).term) {
+                (
+                    NodeTerm::Free { symbol: sx, args: ax },
+                    NodeTerm::Free { symbol: sy, args: ay },
+                ) => {
+                    if sx != sy || ax.len() != ay.len() {
+                        return false;
+                    }
+                    stack.extend(ax.iter().zip(ay).map(|(&x, &y)| (x, y)));
+                }
             }
         }
+        true
     }
 
     /// Build a DAG instance of `term` under `subst` (the rhs of a matched equation).
+    ///
+    /// Recurses on *rhs* depth only (author-controlled, small), so like [`Engine::match_pattern`] it
+    /// is not exposed to the deep-subject overflow A1 fixed. Note its freshly built children live in
+    /// the native-stack `arg_ids` local, so it must not be a GC safe point (see the `ReduceFrame`
+    /// safe-point contract in `engine`).
     pub fn instantiate(&mut self, term: &Term, subst: &Subst) -> DagId {
         match term {
             Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
@@ -242,5 +263,24 @@ mod tests {
         assert!(!e.match_pattern(&Term::var(0, nznat), z0, &mut s), "Zero is not <= NzNat");
         s.reset(1);
         assert!(e.match_pattern(&Term::var(0, nat), z0, &mut s), "Zero <= Nat");
+    }
+
+    /// Two structurally-equal chains `g^200000(a)` with *distinct* node ids: the recursive
+    /// `deep_equal` descended on subject depth and overflowed the stack on deep terms (review R2 C1,
+    /// e.g. a non-linear pattern `h(X, X)` over deep arguments). The iterative pair-stack must not.
+    #[test]
+    fn deep_equal_iterative_on_deep_terms() {
+        fn chain(e: &mut Engine, a: SymbolId, g: SymbolId, n: u32) -> DagId {
+            let mut acc = e.make_const(a);
+            for _ in 0..n {
+                acc = e.make_free(g, vec![acc]);
+            }
+            acc
+        }
+        let Ctx { mut e, a, g, .. } = ctx();
+        let x = chain(&mut e, a, g, 200_000);
+        let y = chain(&mut e, a, g, 200_000);
+        assert_ne!(x, y, "distinct ids (no hash-consing)");
+        assert!(e.deep_equal(x, y), "structurally equal deep chains compare equal");
     }
 }

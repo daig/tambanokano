@@ -12,6 +12,34 @@ use crate::symbol::{Symbol, SymbolId};
 use crate::term::{Equation, Subst, Term};
 use std::collections::HashMap;
 
+/// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
+///
+/// A frame mirrors one activation of the old recursive `reduce`/`reduce_args` pair: it reduces the
+/// node's children left-to-right (`reduced` accumulates results, `next` is the cursor over `orig`),
+/// then drives the top-rewrite fixpoint by *reusing its own slot* for each rewritten term.
+///
+/// **A2 safe-point-GC contract** (the reason this is an explicit heap stack). The frames hold most
+/// in-flight `DagId`s of an in-progress reduction — but *not all*: at the [`Engine::reduce`] loop
+/// head a just-completed child sits only in the `child_result` local until it is delivered into its
+/// parent's `reduced` on the next iteration. So the complete root set at the loop head is
+/// `walk(stack) ∪ child_result`. GC must therefore be confined to the loop head:
+/// `try_rewrite_top`/`instantiate`/`make_free` build fresh nodes whose ids live only in native-stack
+/// locals (`instantiate`'s `arg_ids`, the `Subst` bindings, the `rebuilt` node mid-rewrite) and are
+/// *not* discoverable by a stack walk, so they must not be safe points.
+struct ReduceFrame {
+    /// The node this frame started from; returned unchanged when no child changed (preserves the
+    /// shared DAG id rather than rebuilding an identical node).
+    original: DagId,
+    symbol: SymbolId,
+    /// The original children of `original`, copied out so the spine can be walked across the `&mut
+    /// self` reductions that may grow (and thus reallocate) the arena.
+    orig: Vec<DagId>,
+    /// Reduced children collected so far; length grows to `orig.len()` as `next` advances.
+    reduced: Vec<DagId>,
+    /// Index of the next child of `orig` to reduce.
+    next: usize,
+}
+
 pub struct Engine {
     sorts: Sorts,
     symbols: Arena<Symbol>,
@@ -168,43 +196,96 @@ impl Engine {
         self.rewrite_count = 0;
     }
 
-    /// Reduce `id` to canonical form by innermost, eager equational simplification (Phase 0:
-    /// unconditional free-theory equations). Already-reduced nodes are returned unchanged, so
-    /// shared subterms are normalized at most once.
+    /// Reduce `root` to canonical form by innermost, eager equational simplification (Phase 0:
+    /// unconditional free-theory equations). A node already stamped canonical at the current epoch is
+    /// returned unchanged, so a *shared, already-reduced* subterm is never re-normalized. (A shared
+    /// subterm that is still *reducible* is normalized once per occurrence — Phase 0 has no
+    /// hash-consing/forwarding — exactly as the recursive reducer did.)
+    ///
+    /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
+    /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
+    /// the process on deep terms (review R2 C1). This is a faithful simulation: children are reduced
+    /// left-to-right before the top is rewritten, and each rewrite result is itself re-reduced, so
+    /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
     #[must_use]
-    pub fn reduce(&mut self, id: DagId) -> DagId {
-        if self.node(id).reduced_epoch == self.eq_epoch {
-            return id;
+    pub fn reduce(&mut self, root: DagId) -> DagId {
+        if self.node(root).reduced_epoch == self.eq_epoch {
+            return root;
         }
-        let mut current = self.reduce_args(id);
-        while let Some(next) = self.try_rewrite_top(current) {
-            self.rewrite_count += 1;
-            current = self.reduce_args(next);
+
+        let mut stack: Vec<ReduceFrame> = Vec::new();
+        stack.push(self.new_reduce_frame(root));
+        // Carries a just-completed child's normal form up to the parent frame waiting on it.
+        let mut child_result: Option<DagId> = None;
+
+        loop {
+            // Invariant: `stack` is non-empty throughout the body. It starts with the root frame and
+            // the only `pop` (below) is immediately followed by a `return` when it empties, so the
+            // loop never re-enters with an empty stack — the `expect`s below are therefore unreachable.
+
+            // Deliver a completed child to the current (top) frame and advance its cursor.
+            if let Some(r) = child_result.take() {
+                let f = stack.last_mut().expect("child result with empty reduce stack");
+                f.reduced.push(r);
+                f.next += 1;
+            }
+
+            // Phase 1: reduce the next child (innermost, left-to-right). Already-reduced children
+            // (shared subterms, cached by epoch) are delivered without pushing a frame.
+            {
+                let f = stack.last().expect("empty reduce stack");
+                if f.next < f.orig.len() {
+                    let child = f.orig[f.next];
+                    if self.node(child).reduced_epoch == self.eq_epoch {
+                        child_result = Some(child);
+                    } else {
+                        let frame = self.new_reduce_frame(child);
+                        stack.push(frame);
+                    }
+                    continue;
+                }
+            }
+
+            // Phase 1 complete: rebuild this term iff some child changed, else keep the shared id.
+            let (symbol, original, reduced, changed) = {
+                let f = stack.last_mut().expect("empty reduce stack");
+                let changed = f.reduced != f.orig;
+                // `mem::take` moves the reduced children out (no clone) — the frame is about to be
+                // reused or popped, so its `reduced` is no longer needed.
+                let reduced = if changed { std::mem::take(&mut f.reduced) } else { Vec::new() };
+                (f.symbol, f.original, reduced, changed)
+            };
+            let rebuilt = if changed { self.make_free(symbol, reduced) } else { original };
+
+            // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
+            // this frame's slot for the rewritten term.
+            if let Some(next) = self.try_rewrite_top(rebuilt) {
+                self.rewrite_count += 1;
+                let frame = self.new_reduce_frame(next);
+                *stack.last_mut().expect("empty reduce stack") = frame;
+                continue;
+            }
+
+            // `rebuilt` is a normal form: stamp it canonical and hand it up (or return it as root).
+            self.dags.get_mut(rebuilt).reduced_epoch = self.eq_epoch;
+            stack.pop();
+            if stack.is_empty() {
+                return rebuilt;
+            }
+            child_result = Some(rebuilt);
         }
-        self.dags.get_mut(current).reduced_epoch = self.eq_epoch;
-        current
     }
 
-    /// Reduce each argument; rebuild the node only if some argument changed.
-    fn reduce_args(&mut self, id: DagId) -> DagId {
-        let (symbol, children) = {
-            let node = self.node(id);
-            (node.symbol(), node.children().to_vec())
-        };
-        if children.is_empty() {
-            return id;
-        }
-        let mut changed = false;
-        let mut reduced = Vec::with_capacity(children.len());
-        for c in children {
-            let rc = self.reduce(c);
-            changed |= rc != c;
-            reduced.push(rc);
-        }
-        if changed {
-            self.make_free(symbol, reduced)
-        } else {
-            id
+    /// Build a fresh [`ReduceFrame`] positioned at the start of `id`'s children.
+    fn new_reduce_frame(&self, id: DagId) -> ReduceFrame {
+        let node = self.node(id);
+        let orig = node.children().to_vec();
+        ReduceFrame {
+            original: id,
+            symbol: node.symbol(),
+            reduced: Vec::with_capacity(orig.len()),
+            orig,
+            next: 0,
         }
     }
 
@@ -431,5 +512,150 @@ mod tests {
         assert!(e.sorts().sort(e.sort_of(ft)).is_error, "ill-sorted f(t) is in the error sort");
         let r = e.reduce(ft);
         assert_eq!(e.node(r).symbol(), f, "f(t) does not rewrite: N:Nat cannot match a Bool");
+    }
+
+    /// Build the unary numeral `s^n 0`.
+    fn numeral(e: &mut Engine, zero: SymbolId, s: SymbolId, n: u32) -> DagId {
+        let mut acc = e.make_const(zero);
+        for _ in 0..n {
+            acc = e.make_free(s, vec![acc]);
+        }
+        acc
+    }
+
+    /// Decode a canonical Peano numeral `s^k 0` back to `k` (iteratively, so the *test* can't be the
+    /// thing that overflows).
+    fn decode(e: &Engine, mut id: DagId, zero: SymbolId, s: SymbolId) -> u32 {
+        let mut k = 0;
+        loop {
+            let sym = e.node(id).symbol();
+            if sym == zero {
+                return k;
+            }
+            assert_eq!(sym, s, "not a Peano numeral");
+            id = e.node(id).children()[0];
+            k += 1;
+        }
+    }
+
+    /// Depth 200_000 is ~4x the old recursive reducer's debug stack cliff (~50k); the recursive
+    /// `reduce`/`reduce_args` aborted the *process* here (review R2 C1). The iterative work-stack
+    /// must reduce it. `s^N + s^N` drives the deepest recursion the old code had (the addition loop
+    /// rebuilds `s(plus(..))` and re-descends ~N frames).
+    #[test]
+    fn iterative_reduce_handles_deep_addition_without_overflow() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+
+        const N: u32 = 200_000;
+        let a = numeral(&mut e, zero, s, N);
+        let b = numeral(&mut e, zero, s, N);
+        let sum = e.make_free(plus, vec![a, b]);
+        let r = e.reduce(sum);
+        assert_eq!(decode(&e, r, zero, s), 2 * N, "s^N + s^N = s^2N");
+    }
+
+    /// A deep chain with no applicable equation: the old `reduce` still descended the whole spine
+    /// (`reduce_args` → `reduce(child)`) and overflowed. The result must be the *input* id — change
+    /// detection preserves shared structure rather than rebuilding an identical chain.
+    #[test]
+    fn iterative_reduce_walks_deep_spine_without_overflow() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let chain = numeral(&mut e, zero, s, 200_000);
+        let r = e.reduce(chain);
+        assert_eq!(r, chain, "no equations: a deep chain is its own normal form (shared id kept)");
+    }
+
+    /// Conformance lock against the reference C++ Maude binary (`conformance/fib.maude`): the
+    /// iterative reducer must reproduce the *exact* redex sequence — `fib(22) = 17711` in `186579`
+    /// rewrites.
+    #[test]
+    fn fib_22_matches_reference_rewrite_count() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        let fib = e.add_op("fib", vec![nat], nat);
+
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        let zero_t = || Term::constant(zero);
+        e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), zero_t()]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
+            rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
+            nr_vars: 2,
+        });
+        e.add_equation(Equation { lhs: Term::op(fib, vec![zero_t()]), rhs: zero_t(), nr_vars: 0 });
+        e.add_equation(Equation {
+            lhs: Term::op(fib, vec![s_of(zero_t())]),
+            rhs: s_of(zero_t()),
+            nr_vars: 0,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(fib, vec![s_of(s_of(v(0)))]),
+            rhs: Term::op(plus, vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])]),
+            nr_vars: 1,
+        });
+
+        let n = numeral(&mut e, zero, s, 22);
+        let q = e.make_free(fib, vec![n]);
+        let r = e.reduce(q);
+        assert_eq!(decode(&e, r, zero, s), 17711, "fib(22) = 17711");
+        assert_eq!(e.rewrites(), 186579, "exact rewrite count matches reference Maude");
+    }
+
+    /// Faithfulness pin (review semantic-fidelity nit): a *shared, still-reducible* redex is reduced
+    /// — and counted — once per occurrence. Phase 0 has no hash-consing/forwarding, so a node that
+    /// rewrites is never stamped canonical (only its normal form is); the second occurrence of a
+    /// shared reducible subterm is therefore re-reduced, exactly as the old recursive reducer did.
+    /// This locks A1's faithfulness; if hash-consing later makes this a single rewrite the count must
+    /// be deliberately re-baselined here.
+    #[test]
+    fn shared_reducible_redex_is_reduced_once_per_occurrence() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        let f = e.add_op("f", vec![nat, nat], nat);
+        // eq N + 0 = N
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+
+        // C = s 0 + 0, built once and shared into both children of f (a genuine DAG share).
+        let s0 = numeral(&mut e, zero, s, 1);
+        let z = e.make_const(zero);
+        let c = e.make_free(plus, vec![s0, z]);
+        let root = e.make_free(f, vec![c, c]); // f(C, C), C shared
+        let r = e.reduce(root);
+
+        // f(s 0, s 0): each occurrence of the shared C fired `N + 0 = N` once.
+        assert_eq!(e.node(r).symbol(), f);
+        assert_eq!(e.rewrites(), 2, "shared reducible redex counted once per occurrence (no hash-consing)");
     }
 }
