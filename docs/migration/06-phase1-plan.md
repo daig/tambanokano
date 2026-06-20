@@ -4,6 +4,13 @@
 to re-acquire context, what the code currently is, and the exact ordered agenda. Everything it
 references already exists in this repo or in the two reference trees.
 
+> **STATUS (updated post-Stage-A):** Phase 1 **Stage A is COMPLETE** — all five foundation reshapes in
+> §3 are done and adversarially reviewed (commits `7f8df37` A1, `f8b1c0d` A2 + `758ebf9` D2-resolved,
+> `12d60c2` A3, `6e1b8da` A4, `13219cf` A5; 37 tests, reduce ≈8.3 M rw/s, `fib(22)`=186579 == reference).
+> §3 below is now history (kept for rationale). **For the breadth work (Stage B), the live plan is
+> [`07-stageB-plan.md`](07-stageB-plan.md)** — it records the *as-built* Stage-A seams that B1–B5 plug
+> into and supersedes §4 below. A thorough Stage-A audit is scheduled before Stage B begins.
+
 ---
 
 ## 0. Re-acquire context (do this at the start of the session)
