@@ -66,6 +66,12 @@ impl AcuLhs {
                         "an alien (non-ground, non-variable) subterm under an ACU operator is not \
                          yet supported (B1 follow-up)"
                     );
+                    assert!(
+                        ground.is_free_matchable(sig),
+                        "a theory-rooted ground subterm under an ACU operator is not yet supported: \
+                         it is matched by the free matcher, which fails silently on a theory subject \
+                         (cross-theory composition is a B1 follow-up)"
+                    );
                     grounds.push(ground);
                 }
             }

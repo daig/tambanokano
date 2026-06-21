@@ -13,6 +13,15 @@ Stage A is now done).
 > §4). **B1's structural equational theories — ACU, AU, CUI — are DONE** (on `main`, commits
 > `c10bf0e..e4ea879`, every lock conformance-verified vs the binary); **S and NA are deferred to B3**
 > (they need bignums / built-in data). §1 below is refreshed to the **as-built post-B1** seams. **NEXT: B2.**
+>
+> **Post-B1 audit (2026-06-20):** re-ran every `conformance/*.maude` lock against the reference binary
+> (all TRUE) and read the full kernel; found one *new* gap — **F-A**: a theory-rooted (ACU/AU/CUI)
+> subterm under a *free* operator (or a theory ground subterm under a theory op) *silently* failed to
+> match, leaving its equation quietly dead — the asymmetric twin of the loud alien-under-AC assert.
+> **Closed with a loud guard** (`Term::is_free_matchable`, enforced in `LhsAutomaton::compile` + the
+> ACU/AU/CUI compilers; 63 tests); the cross-theory `Sequence` composition itself stays deferred (below).
+> F-1's no-op guard is genuinely **unimplemented** — moot for B1's locked theories, but revisit when B2
+> adds conditional/`owise` equations. F-2 unchanged (still the pre-release-safe-point-GC item, §4).
 
 ---
 
@@ -164,8 +173,11 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   **NA** (atomic built-in constants — needs built-in data) **→ B3**; the red-black `ACU_TreeDagNode`
   (flat `Vec` only — a perf step at `CONVERT_THRESHOLD`≈8); the **optimized bipartite + Diophantine**
   matcher + lazy subproblems (own backtracking enumerator for now); the persistent-structure crate
-  (`rpds`/`im` — only the tree rep needs it); **aliens** (non-ground, non-var subterms) and **non-linear
-  variables** under AC/AU (loud `assert`s); CUI **collapse-matching** `f(X,Y) <=? a`; collapse on a
+  (`rpds`/`im` — only the tree rep needs it); **cross-theory composition** (the `Sequence` arm — a
+  theory subterm under a free op, a theory ground subterm under a theory op, or a non-ground/non-var
+  alien under AC/AU): all **loud-guarded** now (`Term::is_free_matchable` + the alien `assert`), never
+  silent (audit F-A). **Non-linear variables** *work* under **AC** (Diophantine coefficients — `X+X=X`
+  reduces correctly) but are a **loud `assert`** under **AU**; CUI **collapse-matching** `f(X,Y) <=? a`; collapse on a
   single-element ACU subject; exact solution-**order** for non-confluent systems + bounded `match[n]`.
 - **Done-when (met for ACU/AU/CUI):** matching/reduce modulo the axioms conforms to the binary — match
   solution-sets *and* reduce rewrite-counts (the suite was built from the manual's `xmatch`/`match`

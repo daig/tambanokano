@@ -53,7 +53,19 @@ impl LhsAutomaton {
             Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
-            _ => LhsAutomaton::Free(lhs),
+            _ => {
+                // Free-theory (or bare-variable) top. The recursive free matcher cannot see a
+                // theory-rooted subterm, so a pattern like `f(a + b)` (AC `+` under free `f`) would
+                // silently never fire. Reject it loudly until cross-theory composition (the
+                // `Sequence` arm) lands — the symmetric twin of the alien-under-AC assert.
+                assert!(
+                    lhs.is_free_matchable(sig),
+                    "unsupported pattern: a theory-rooted (ACU/AU/CUI) subterm appears under a free \
+                     operator, where the recursive free matcher would silently fail to match it. \
+                     Cross-theory pattern composition (the `Sequence` arm) is a B1 follow-up."
+                );
+                LhsAutomaton::Free(lhs)
+            }
         }
     }
 

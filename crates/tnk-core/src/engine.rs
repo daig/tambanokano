@@ -1360,6 +1360,68 @@ mod tests {
         assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c + c), not b + c");
     }
 
+    /// Audit F-A guard: a theory-rooted (AC) subterm under a *free* operator in a pattern is rejected
+    /// **loudly** — the recursive free matcher would otherwise silently fail to match it, leaving the
+    /// equation quietly dead. Cross-theory pattern composition (the `Sequence` arm) is a B1 follow-up.
+    #[test]
+    #[should_panic(expected = "theory-rooted")]
+    fn free_pattern_over_theory_subterm_is_rejected() {
+        let (mut e, s, a, b, _c, plus) = ac_ctx();
+        let c = e.add_op("cc", vec![], s);
+        let f = e.add_op("f", vec![s], s); // free, unary
+        // eq f(a + b) = cc   — `a + b` is an AC subterm under the free `f`.
+        e.add_equation(Equation {
+            lhs: Term::op(f, vec![Term::op(plus, vec![Term::constant(a), Term::constant(b)])]),
+            rhs: Term::constant(c),
+            nr_vars: 0,
+        });
+    }
+
+    /// The guard's boundary: a *variable* over a theory subject is fine (it binds the whole AC node),
+    /// so `eq f(X) = g(X)` compiles and fires on `f(a + b)`. Only a *structured* theory sub-pattern is
+    /// rejected — not a variable that happens to bind a theory term.
+    #[test]
+    fn free_pattern_with_variable_over_theory_subject_is_allowed() {
+        let (mut e, s, a, b, _c, plus) = ac_ctx();
+        let g = e.add_op("g", vec![s], s);
+        let f = e.add_op("f", vec![s], s);
+        e.add_equation(Equation {
+            lhs: Term::op(f, vec![Term::var(0, s)]), // f(X)
+            rhs: Term::op(g, vec![Term::var(0, s)]), // g(X)
+            nr_vars: 1,
+        });
+        let (a0, b0) = (e.make_const(a), e.make_const(b));
+        let ab = e.make_ac(plus, vec![a0, b0]); // a + b
+        let subject = e.make_free(f, vec![ab]); // f(a + b)
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "f(X) = g(X) fires once on f(a + b)");
+        assert_eq!(e.node(r).symbol(), g, "result is g(a + b)");
+    }
+
+    /// The symmetric case the same guard closes: a theory-rooted *ground* subterm under a *theory*
+    /// operator (an ACU `+` term as a ground argument of the ACU `;`) is handed to the free matcher as
+    /// a "ground" and would fail silently — so it too is rejected loudly.
+    #[test]
+    #[should_panic(expected = "theory-rooted")]
+    fn theory_ground_subterm_under_theory_operator_is_rejected() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let d = e.add_op("d", vec![], s);
+        let plus = e.add_op_ac("+", vec![s, s], s, None);
+        let semi = e.add_op_ac(";", vec![s, s], s, None);
+        // eq (a + b) ; c = d   — `(a + b)` is a theory-rooted ground subterm under the ACU `;`.
+        let ab = Term::op(plus, vec![Term::constant(a), Term::constant(b)]);
+        e.add_equation(Equation {
+            lhs: Term::op(semi, vec![ab, Term::constant(c)]),
+            rhs: Term::constant(d),
+            nr_vars: 0,
+        });
+    }
+
     /// Engine with constants `a`,`b`,`c`,`d` and an `assoc` (not comm) `__` over sort `E`.
     fn au_ctx() -> (Engine, SortId, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
         let mut e = Engine::new();

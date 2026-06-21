@@ -29,7 +29,7 @@ pub(crate) struct CuiLhs {
 }
 
 impl CuiLhs {
-    pub(crate) fn compile(lhs: Term, _sig: &Signature) -> Self {
+    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("CUI lhs must be an application");
         let (p1, p2) = match lhs {
             Term::Op { args, .. } => {
@@ -45,6 +45,14 @@ impl CuiLhs {
         collect_vars(&p1, &mut var_indices);
         collect_vars(&p2, &mut var_indices);
         let local_size = var_indices.iter().copied().max().map_or(0, |m| m + 1);
+        // CUI arguments are matched by the free matcher (handles variables, ground, nested-free), so
+        // a theory-rooted sub-pattern would fail silently — reject it loudly (composition follow-up).
+        assert!(
+            p1.is_free_matchable(sig) && p2.is_free_matchable(sig),
+            "a theory-rooted (ACU/AU/CUI) sub-pattern under a CUI operator is not yet supported: CUI \
+             arguments are matched by the free matcher, which fails silently on a theory subject \
+             (cross-theory composition is a follow-up)"
+        );
         CuiLhs { symbol, p1, p2, var_indices, local_size }
     }
 

@@ -8,7 +8,7 @@
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
-use crate::symbol::SymbolId;
+use crate::symbol::{SymbolId, Theory};
 
 /// A pattern variable: an index into the enclosing statement's substitution, plus its sort.
 #[derive(Debug, Clone)]
@@ -49,6 +49,25 @@ impl Term {
         match self {
             Term::Var(_) => false,
             Term::Op { args, .. } => args.iter().all(Term::is_ground),
+        }
+    }
+
+    /// Whether the recursive free matcher [`Runtime::match_pattern`] can match this pattern: every
+    /// `Op` in it — root and descendants — must be a **free-theory** operator. A theory-rooted
+    /// (ACU/AU/CUI) `Op` is matched only by its own automaton; handed to `match_pattern` it returns a
+    /// *silent* non-match on the theory subject (`match_pattern`'s `Op` arm yields `false` for any
+    /// `Acu`/`Au`/`Cui` node). So a theory `Op` buried inside a free-matched (sub)pattern — a theory
+    /// subterm under a free operator, or a theory-rooted *ground* subterm under a theory operator —
+    /// would make its equation quietly never fire. Such patterns need the cross-theory `Sequence`
+    /// composition (a B1 follow-up) and are rejected **loudly** at compile time until then, mirroring
+    /// the alien-under-AC assert. Variables match any subject, so they are always fine.
+    pub(crate) fn is_free_matchable(&self, sig: &Signature) -> bool {
+        match self {
+            Term::Var(_) => true,
+            Term::Op { symbol, args } => {
+                sig.symbol(*symbol).theory() == Theory::Free
+                    && args.iter().all(|a| a.is_free_matchable(sig))
+            }
         }
     }
 }

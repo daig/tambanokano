@@ -62,6 +62,12 @@ impl AuLhs {
                         "an alien (non-ground, non-variable) subterm under an AU operator is not yet \
                          supported (follow-up)"
                     );
+                    assert!(
+                        other.is_free_matchable(sig),
+                        "a theory-rooted ground subterm under an AU operator is not yet supported: \
+                         it is matched by the free matcher, which fails silently on a theory subject \
+                         (cross-theory composition is a follow-up)"
+                    );
                     elements.push(AuElem::Ground(other));
                 }
             }
