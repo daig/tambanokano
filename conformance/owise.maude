@@ -1,0 +1,36 @@
+*** B2.3b owise (otherwise) conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/owise.maude < /dev/null
+*** An owise equation applies only when no non-owise equation matches. Mirrors the engine.rs tests.
+
+fmod OWISE-EQ is
+  sorts Nat Truth .
+  ops tt ff : -> Truth [ctor] .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op iszero : Nat -> Truth .
+  var N : Nat .
+  eq iszero(z) = tt .
+  eq iszero(N) = ff [owise] .
+endfm
+red iszero(z) .          *** tt: the specific non-owise equation matches
+red iszero(s z) .        *** ff: nothing else matches, so owise applies
+red iszero(s s z) .      *** ff
+
+fmod OWISE-COND is
+  sorts Nat Truth .
+  ops tt ff : -> Truth [ctor] .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op _<=_ : Nat Nat -> Truth .
+  op clamp : Nat -> Nat .
+  vars M N : Nat .
+  eq z <= N = tt .
+  eq s M <= z = ff .
+  eq s M <= s N = M <= N .
+  ceq clamp(N) = z if N <= s z = tt .
+  eq clamp(N) = s z [owise] .
+endfm
+*** owise applies even when a non-owise equation matched structurally but its condition failed.
+red clamp(z) .           *** z: z <= 1 is tt
+red clamp(s z) .         *** z: 1 <= 1 is tt
+red clamp(s s z) .       *** s z: 2 <= 1 is ff, condition fails, owise applies

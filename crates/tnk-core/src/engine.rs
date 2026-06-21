@@ -31,6 +31,8 @@ struct CompiledEquation {
     /// Condition fragments (empty for an unconditional `eq`); all must hold for the equation to apply,
     /// and a failed condition backtracks into the next matcher solution (B2.3).
     condition: Vec<ConditionFragment>,
+    /// `[owise]`: this equation is tried only if no non-owise equation of the symbol applies (B2.3b).
+    owise: bool,
 }
 
 /// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
@@ -322,7 +324,7 @@ impl Signature {
     /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
     /// advance the equation epoch (see [`Engine::add_equation`]).
     pub(crate) fn add_equation(&mut self, eq: Equation) {
-        self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new());
+        self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new(), false);
     }
 
     /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3): the condition is a list of
@@ -335,16 +337,36 @@ impl Signature {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) {
-        self.push_equation(lhs, rhs, nr_vars, condition);
+        self.push_equation(lhs, rhs, nr_vars, condition, false);
     }
 
-    fn push_equation(&mut self, lhs: Term, rhs: Term, nr_vars: u32, condition: Vec<ConditionFragment>) {
+    /// Register an `[owise]` equation (optionally conditional): tried only if no non-owise equation of
+    /// the symbol applies (Maude's `applyReplaceNoOwise` two-phase matching, B2.3b).
+    pub(crate) fn add_owise_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.push_equation(lhs, rhs, nr_vars, condition, true);
+    }
+
+    fn push_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+        owise: bool,
+    ) {
         let top = lhs.top_symbol().expect("equation lhs must be an application");
         let compiled = CompiledEquation {
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
             condition,
+            owise,
         };
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
@@ -947,31 +969,49 @@ impl Runtime {
         // sub-multiset (ACU) or contiguous sub-sequence (AU) of the subject, leaving a residue to
         // splice back. The free theory matches the whole node.
         let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au);
-        let mut subst = Subst::new();
-        // Shared borrow of `sig` held across the loop; `self` (the runtime) is disjoint, so the
-        // matched `&eq.rhs` is instantiated in place without a defensive clone.
         let eqs = sig.equations.get(&symbol)?;
+        // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
+        // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
+        // only when the first found nothing — for a node with no equations the early `?` above skips both.
+        if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false) {
+            return Some(r);
+        }
+        self.try_equations(sig, id, eqs, ext_allowed, true)
+    }
+
+    /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
+    /// `[owise]` fallbacks) against `id`, returning the first applicable rewrite. Drives each equation
+    /// as a **solution stream** through the A3 matcher seam: the compiled [`LhsAutomaton`] yields a
+    /// [`Subproblem`](crate::theory::Subproblem) whose `next` enumerates solutions into `subst`; a
+    /// conditional equation accepts a solution only if its condition holds, else backtracks into the
+    /// next solution (Maude's `solveCondition` retry). The A4 borrow split lets the matched `&eq.rhs`
+    /// (a shared borrow of `sig`) instantiate in place without a defensive clone.
+    fn try_equations(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        eqs: &[CompiledEquation],
+        ext_allowed: bool,
+        owise: bool,
+    ) -> Option<DagId> {
+        let mut subst = Subst::new();
         for eq in eqs {
+            if eq.owise != owise {
+                continue; // wrong phase
+            }
             subst.reset(eq.nr_vars);
             let Some(mut sp) = eq.lhs.match_(self, sig, id, &mut subst, ext_allowed) else {
                 continue;
             };
-            // The solution stream. Unconditional equations accept the first solution and return; the
-            // ACU matcher already orders solutions minimal-first and skips the identity no-op, so the
-            // first solution is the right rewrite. (Conditional equations (B2) will check the
-            // condition here and `continue` to the next solution on failure — which is why it loops.)
             while sp.next(self, sig, &mut subst) {
-                // A conditional equation accepts a solution only if its condition holds; otherwise we
-                // backtrack into the next solution of the same lhs (Maude's `solveCondition` retry).
                 // Unconditional equations short-circuit (no call) — the free reduce hot path.
                 if !eq.condition.is_empty() && !self.condition_holds(sig, &eq.condition, &subst) {
                     continue;
                 }
                 let rhs = self.instantiate(sig, &eq.rhs, &subst);
-                // The subproblem splices the rhs into the matched position — for a whole match that is
-                // just the rhs; for an extension match it re-assembles the residue around it in the
-                // theory's normal form (ACU multiset, AU ordered prefix/suffix — Maude's
-                // `partialConstruct`).
+                // The subproblem splices the rhs into the matched position — a whole match is just the
+                // rhs; an extension match re-assembles the residue around it in the theory's normal
+                // form (ACU multiset, AU ordered prefix/suffix — Maude's `partialConstruct`).
                 return Some(sp.build_result(self, sig, rhs));
             }
         }
@@ -1235,6 +1275,18 @@ impl Engine {
         condition: Vec<ConditionFragment>,
     ) {
         self.sig.add_conditional_equation(lhs, rhs, nr_vars, condition);
+    }
+
+    /// Register an `[owise]` equation (optionally conditional): applied only when no non-owise equation
+    /// of the symbol matches (B2.3b). Pass an empty `condition` for a plain `eq ... [owise]`.
+    pub fn add_owise_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.sig.add_owise_equation(lhs, rhs, nr_vars, condition);
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
@@ -1753,6 +1805,101 @@ mod tests {
         let on = run(Some(4)); // aggressive collection around (not during) the condition reduce
         assert_eq!(off.1, 22, "f(20) → z in 22 rewrites (21 condition + 1 equation)");
         assert_eq!(on, off, "conditional reduce identical with safe-point GC on — F-2 mitigation holds");
+    }
+
+    /// B2.3b `owise` equations (== reference binary, `conformance/owise.maude` OWISE-EQ): an `[owise]`
+    /// equation fires only when no non-owise equation of the symbol matches.
+    #[test]
+    fn owise_equation_applies_when_no_normal_equation_matches() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let truth = e.add_sort("Truth");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let iszero = e.add_op("iszero", vec![nat], truth);
+        // eq iszero(z) = tt .   eq iszero(N) = ff [owise] .
+        e.add_equation(Equation {
+            lhs: Term::op(iszero, vec![Term::constant(z)]),
+            rhs: Term::constant(tt),
+            nr_vars: 0,
+        });
+        e.add_owise_equation(Term::op(iszero, vec![Term::var(0, nat)]), Term::constant(ff), 1, Vec::new());
+
+        // iszero(z): the specific non-owise equation matches.
+        e.reset_rewrites();
+        let z0 = e.make_const(z);
+        let q0 = e.make_free(iszero, vec![z0]);
+        let r0 = e.reduce(q0);
+        assert_eq!(e.rewrites(), 1);
+        assert_eq!(e.node(r0).symbol(), tt, "iszero(z) = tt");
+
+        // iszero(s z): nothing else matches → owise applies.
+        e.reset_rewrites();
+        let s0 = {
+            let z1 = e.make_const(z);
+            e.make_free(s, vec![z1])
+        };
+        let q1 = e.make_free(iszero, vec![s0]);
+        let r1 = e.reduce(q1);
+        assert_eq!(e.rewrites(), 1);
+        assert_eq!(e.node(r1).symbol(), ff, "iszero(s z) = ff via owise");
+    }
+
+    /// B2.3b (== reference binary, OWISE-COND): `owise` applies even when a non-owise *conditional*
+    /// equation matched structurally but its condition failed. `ceq clamp(N)=z if N<=s z=tt` /
+    /// `eq clamp(N)=s z [owise]`: clamp(0)=0 (2 rw), clamp(1)=0 (3 rw), clamp(2)=s z via owise (3 rw).
+    #[test]
+    fn owise_applies_when_conditional_equation_condition_fails() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let truth = e.add_sort("Truth");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let le = e.add_op("<=", vec![nat, nat], truth);
+        let clamp = e.add_op("clamp", vec![nat], nat);
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![Term::constant(z), v(0)]),
+            rhs: Term::constant(tt),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), Term::constant(z)]),
+            rhs: Term::constant(ff),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), s_of(v(1))]),
+            rhs: Term::op(le, vec![v(0), v(1)]),
+            nr_vars: 2,
+        });
+        // ceq clamp(N) = z if N <= s z = tt .   eq clamp(N) = s z [owise] .
+        e.add_conditional_equation(
+            Term::op(clamp, vec![v(0)]),
+            Term::constant(z),
+            1,
+            vec![ConditionFragment::Equality {
+                lhs: Term::op(le, vec![v(0), s_of(Term::constant(z))]),
+                rhs: Term::constant(tt),
+            }],
+        );
+        e.add_owise_equation(Term::op(clamp, vec![v(0)]), s_of(Term::constant(z)), 1, Vec::new());
+
+        for (input, expected, rewrites) in [(0u32, 0u32, 2u64), (1, 0, 3), (2, 1, 3)] {
+            e.reset_rewrites();
+            let n = numeral(&mut e, z, s, input);
+            let c = e.make_free(clamp, vec![n]);
+            let r = e.reduce(c);
+            assert_eq!(e.rewrites(), rewrites, "clamp({input}) rewrite count");
+            assert_eq!(decode(&e, r, z, s), expected, "clamp({input}) value");
+        }
     }
 
     #[test]
