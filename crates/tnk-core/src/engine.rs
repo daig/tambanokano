@@ -42,6 +42,9 @@ struct SortConstraint {
     lhs: LhsAutomaton,
     sort: SortId,
     nr_vars: u32,
+    /// Condition fragments (empty for an unconditional `mb`); checked under the membership match's
+    /// substitution before the sort is lowered (B2.3c `cmb`).
+    condition: Vec<ConditionFragment>,
 }
 
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
@@ -380,11 +383,29 @@ impl Signature {
     /// of their lhs's symbol is built** (a node built earlier keeps its un-constrained sort). Does not
     /// bump `eq_epoch`: memberships refine sorts, not the `reduced` cache.
     pub(crate) fn add_membership(&mut self, mb: Membership) {
-        let top = mb.lhs.top_symbol().expect("membership lhs must be an application");
+        self.push_membership(mb.lhs, mb.sort, mb.nr_vars, Vec::new());
+    }
+
+    /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
+    /// only when the condition (the same [`ConditionFragment`]s as `ceq`) holds under the membership
+    /// match's substitution. `mb` stays the unconditional entry point (empty condition).
+    pub(crate) fn add_conditional_membership(
+        &mut self,
+        lhs: Term,
+        sort: SortId,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.push_membership(lhs, sort, nr_vars, condition);
+    }
+
+    fn push_membership(&mut self, lhs: Term, sort: SortId, nr_vars: u32, condition: Vec<ConditionFragment>) {
+        let top = lhs.top_symbol().expect("membership lhs must be an application");
         let compiled = SortConstraint {
-            lhs: LhsAutomaton::compile(mb.lhs, self),
-            sort: mb.sort,
-            nr_vars: mb.nr_vars,
+            lhs: LhsAutomaton::compile(lhs, self),
+            sort,
+            nr_vars,
+            condition,
         };
         let sorts = &self.sorts;
         let v = self.memberships.entry(top).or_default();
@@ -459,7 +480,7 @@ impl Runtime {
                 if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
                     continue;
                 }
-                if self.membership_matches(sig, sc, id) {
+                if self.membership_applies(sig, sc, id) {
                     self.dags.get_mut(id).sort = sc.sort;
                     self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
                     lowered = true;
@@ -472,16 +493,23 @@ impl Runtime {
         }
     }
 
-    /// Whether the membership's compiled lhs matches node `id` (has any solution). Reads through the A3
-    /// matcher seam, so a free lhs uses the recursive matcher and a theory lhs its own automaton (B2.2
-    /// fixtures stay free-theory — AC/`iter` membership matching is the follow-up noted above).
-    fn membership_matches(&mut self, sig: &Signature, sc: &SortConstraint, id: DagId) -> bool {
+    /// Whether the membership applies to node `id`: its compiled lhs matches *and* (for a `cmb`) its
+    /// condition holds under that match. Reads through the A3 matcher seam, so a free lhs uses the
+    /// recursive matcher and a theory lhs its own automaton. A condition that fails for one match
+    /// solution backtracks into the next (B2.3c); the condition's own reductions count toward the
+    /// rewrite total whether or not it ends up holding. (AC/`iter` membership matching is a follow-up.)
+    fn membership_applies(&mut self, sig: &Signature, sc: &SortConstraint, id: DagId) -> bool {
         let mut subst = Subst::new();
         subst.reset(sc.nr_vars);
-        match sc.lhs.match_(self, sig, id, &mut subst, false) {
-            Some(mut sp) => sp.next(self, sig, &mut subst),
-            None => false,
+        let Some(mut sp) = sc.lhs.match_(self, sig, id, &mut subst, false) else {
+            return false;
+        };
+        while sp.next(self, sig, &mut subst) {
+            if sc.condition.is_empty() || self.condition_holds(sig, &sc.condition, &subst) {
+                return true;
+            }
         }
+        false
     }
 
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
@@ -1296,6 +1324,19 @@ impl Engine {
         self.sig.add_membership(mb);
     }
 
+    /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
+    /// only when the condition holds under the membership match. Pass an empty `condition` for a plain
+    /// `mb` (or use [`add_membership`](Self::add_membership)).
+    pub fn add_conditional_membership(
+        &mut self,
+        lhs: Term,
+        sort: SortId,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.sig.add_conditional_membership(lhs, sort, nr_vars, condition);
+    }
+
     /// Total equational rewrites applied so far.
     pub fn rewrites(&self) -> u64 {
         self.rt.rewrites()
@@ -1900,6 +1941,67 @@ mod tests {
             assert_eq!(e.rewrites(), rewrites, "clamp({input}) rewrite count");
             assert_eq!(decode(&e, r, z, s), expected, "clamp({input}) value");
         }
+    }
+
+    /// B2.3c conditional membership (== reference binary, `conformance/cmb.maude`):
+    /// `cmb < M, N > : GoodPair if M <= N = tt` lowers a pair's sort only when its condition holds —
+    /// and the condition's reductions count (`<z,sz>` is 2 rewrites: condition 1 + membership 1; the
+    /// failing `<sz,z>` is 1, the condition reduce alone).
+    #[test]
+    fn conditional_membership_lowers_sort_when_condition_holds() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let pair = e.add_sort("Pair");
+        let goodpair = e.add_sort("GoodPair");
+        let truth = e.add_sort("Truth");
+        e.add_subsort(goodpair, pair);
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let tt = e.add_op("tt", vec![], truth);
+        let _ff = e.add_op("ff", vec![], truth);
+        let le = e.add_op("<=", vec![nat, nat], truth);
+        let pairop = e.add_op("<_,_>", vec![nat, nat], pair);
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![Term::constant(z), v(0)]),
+            rhs: Term::constant(tt),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), Term::constant(z)]),
+            rhs: Term::constant(_ff),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), s_of(v(1))]),
+            rhs: Term::op(le, vec![v(0), v(1)]),
+            nr_vars: 2,
+        });
+        // cmb < M, N > : GoodPair if M <= N = tt .
+        e.add_conditional_membership(
+            Term::op(pairop, vec![v(0), v(1)]),
+            goodpair,
+            2,
+            vec![ConditionFragment::Equality {
+                lhs: Term::op(le, vec![v(0), v(1)]),
+                rhs: Term::constant(tt),
+            }],
+        );
+
+        // Build < a, b > (resetting the counter first) and read back its least sort + rewrite count.
+        let build = |e: &mut Engine, a: u32, b: u32| -> (SortId, u64) {
+            e.reset_rewrites();
+            let na = numeral(e, z, s, a);
+            let nb = numeral(e, z, s, b);
+            let p = e.make_free(pairop, vec![na, nb]);
+            (e.sort_of(p), e.rewrites())
+        };
+        assert_eq!(build(&mut e, 0, 1), (goodpair, 2), "< z, s z > : GoodPair, 2 rewrites");
+        assert_eq!(build(&mut e, 1, 0), (pair, 1), "< s z, z > : Pair (condition fails), 1 rewrite");
+        assert_eq!(build(&mut e, 0, 0), (goodpair, 2), "< z, z > : GoodPair, 2 rewrites");
+        assert_eq!(build(&mut e, 1, 1), (goodpair, 3), "< s z, s z > : GoodPair, 3 rewrites");
     }
 
     #[test]

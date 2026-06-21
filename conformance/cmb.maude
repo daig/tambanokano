@@ -1,0 +1,22 @@
+*** B2.3c conditional membership (cmb) conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/cmb.maude < /dev/null
+*** A pair is a GoodPair when its first component <= its second. Mirrors the engine.rs tests.
+
+fmod CMB is
+  sorts Nat Pair GoodPair Truth .
+  subsort GoodPair < Pair .
+  ops tt ff : -> Truth [ctor] .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op <_,_> : Nat Nat -> Pair [ctor] .
+  op _<=_ : Nat Nat -> Truth .
+  vars M N : Nat .
+  eq z <= N = tt .
+  eq s M <= z = ff .
+  eq s M <= s N = M <= N .
+  cmb < M, N > : GoodPair if M <= N = tt .
+endfm
+red < z, s z > .         *** GoodPair: 0 <= 1
+red < s z, z > .         *** Pair: 1 <= 0 is ff, condition fails
+red < z, z > .           *** GoodPair: 0 <= 0
+red < s z, s z > .       *** GoodPair: 1 <= 1
