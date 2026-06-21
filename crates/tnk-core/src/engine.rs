@@ -16,7 +16,7 @@ use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, Symbol, SymbolId, Theory};
-use crate::term::{Equation, Subst, Term};
+use crate::term::{Equation, Membership, Subst, Term};
 use crate::theory::LhsAutomaton;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -27,6 +27,15 @@ use std::collections::HashMap;
 struct CompiledEquation {
     lhs: LhsAutomaton,
     rhs: Term,
+    nr_vars: u32,
+}
+
+/// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
+/// plus the target sort and variable count. The public [`Membership`] is compiled into this by
+/// [`Signature::add_membership`]. (Conditional `cmb` gains a condition in B2.3.)
+struct SortConstraint {
+    lhs: LhsAutomaton,
+    sort: SortId,
     nr_vars: u32,
 }
 
@@ -66,6 +75,10 @@ pub(crate) struct Signature {
     symbols: Arena<Symbol>,
     /// Unconditional equations (LHS compiled to a theory automaton), indexed by lhs top symbol.
     equations: HashMap<SymbolId, Vec<CompiledEquation>>,
+    /// Membership axioms (`mb`), indexed by lhs top symbol; applied to lower a node's least sort at
+    /// construction (B2.2). Empty in modules without memberships — the construction hot path checks
+    /// `memberships.is_empty()` before doing any per-node work, so the free reduce path is untouched.
+    memberships: HashMap<SymbolId, Vec<SortConstraint>>,
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
     /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
     /// reduced" sentinel stored on nodes, so this starts at `1`.
@@ -103,6 +116,7 @@ impl Default for Signature {
             sorts: Sorts::default(),
             symbols: Arena::default(),
             equations: HashMap::default(),
+            memberships: HashMap::default(),
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
         }
     }
@@ -241,6 +255,18 @@ impl Signature {
             "arity mismatch building `{}`",
             self.symbols.get(symbol).name()
         );
+        // Fast path: a single declaration (no overloading — every free/theory op in practice). Its
+        // range is the unique least sort when applicable, else the kind's error sort. Avoids the
+        // per-node down-set clone the general path does, keeping the reduce hot path allocation-free.
+        if let [only] = decls {
+            let applicable =
+                arg_sorts.iter().zip(&only.domain).all(|(&a, &dom)| self.sorts.leq(a, dom));
+            return if applicable {
+                (only.range, true)
+            } else {
+                (self.sorts.error_sort(self.sorts.kind_of(only.range)), true)
+            };
+        }
         debug_assert!(
             decls.iter().all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
             "cross-kind ad-hoc overloading of `{}` is not yet supported (a B2 follow-up): the args, \
@@ -305,6 +331,37 @@ impl Signature {
         self.eq_epoch += 1;
     }
 
+    /// Register an (unconditional) membership axiom `mb lhs : sort`, compiling its lhs to a theory
+    /// [`LhsAutomaton`] and indexing it by the lhs top symbol. A node's least sort is constrained at
+    /// construction, so — like overload declarations — **memberships must be declared before any node
+    /// of their lhs's symbol is built** (a node built earlier keeps its un-constrained sort). Does not
+    /// bump `eq_epoch`: memberships refine sorts, not the `reduced` cache.
+    pub(crate) fn add_membership(&mut self, mb: Membership) {
+        let top = mb.lhs.top_symbol().expect("membership lhs must be an application");
+        let compiled = SortConstraint {
+            lhs: LhsAutomaton::compile(mb.lhs, self),
+            sort: mb.sort,
+            nr_vars: mb.nr_vars,
+        };
+        let sorts = &self.sorts;
+        let v = self.memberships.entry(top).or_default();
+        v.push(compiled);
+        // Order smallest-target-sort first (subsorts before supersorts), so the constrain pass lowers
+        // a node straight to its smallest applicable sort in ONE application — matching the membership
+        // count Maude reports (Maude also tries smallest-sort-first).
+        v.sort_by(|x, y| {
+            if x.sort == y.sort {
+                Ordering::Equal
+            } else if sorts.leq(x.sort, y.sort) {
+                Ordering::Less
+            } else if sorts.leq(y.sort, x.sort) {
+                Ordering::Greater
+            } else {
+                x.sort.cmp(&y.sort) // incomparable: deterministic tie-break (non-confluent is a follow-up)
+            }
+        });
+    }
+
     /// The current equation-set epoch (stamped into nodes proved canonical; see [`DagNode`]).
     pub(crate) fn eq_epoch(&self) -> u32 {
         self.eq_epoch
@@ -328,6 +385,62 @@ impl Runtime {
         self.dags.alloc(DagNode { sort, reduced_epoch: 0, term })
     }
 
+    /// Allocate a node, then apply the module's membership axioms (`mb`) to lower its least sort
+    /// (B2.2). Skips all per-node work when the module declares no memberships (the free reduce hot
+    /// path is untouched). The node must exist for a membership lhs to match against, so this runs
+    /// post-alloc, on the constructed node.
+    fn alloc_node_constrained(&mut self, sig: &Signature, sort: SortId, term: NodeTerm) -> DagId {
+        let id = self.alloc_node(sort, term);
+        if !sig.memberships.is_empty() {
+            self.constrain_to_smaller_sort(sig, id);
+        }
+        id
+    }
+
+    /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
+    /// `constrainToSmallerSort`): repeatedly find the first membership — they are ordered
+    /// **smallest-target-sort first** by [`add_membership`](Signature::add_membership) — whose target
+    /// is strictly below the node's current sort and whose lhs matches, lower the node's sort to it,
+    /// and retry from the top, to a fixpoint. **Each lowering counts as one rewrite** (Maude counts
+    /// membership applications in its `rewrites` total); the smallest-first order means a node drops
+    /// straight to its smallest applicable sort in one application, matching Maude's count. Non-confluent
+    /// membership sets (incomparable applicable targets) and matching modulo AC/`iter` are follow-ups.
+    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId) {
+        let symbol = self.node(id).symbol();
+        let Some(constraints) = sig.memberships.get(&symbol) else { return };
+        loop {
+            let current = self.node(id).sort;
+            let mut lowered = false;
+            for sc in constraints {
+                // Only a membership whose target is *strictly below* the current sort can refine it.
+                if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
+                    continue;
+                }
+                if self.membership_matches(sig, sc, id) {
+                    self.dags.get_mut(id).sort = sc.sort;
+                    self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
+                    lowered = true;
+                    break; // restart the scan with the new, smaller sort
+                }
+            }
+            if !lowered {
+                break;
+            }
+        }
+    }
+
+    /// Whether the membership's compiled lhs matches node `id` (has any solution). Reads through the A3
+    /// matcher seam, so a free lhs uses the recursive matcher and a theory lhs its own automaton (B2.2
+    /// fixtures stay free-theory — AC/`iter` membership matching is the follow-up noted above).
+    fn membership_matches(&mut self, sig: &Signature, sc: &SortConstraint, id: DagId) -> bool {
+        let mut subst = Subst::new();
+        subst.reset(sc.nr_vars);
+        match sc.lhs.match_(self, sig, id, &mut subst, false) {
+            Some(mut sp) => sp.next(self, sig, &mut subst),
+            None => false,
+        }
+    }
+
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
     pub(crate) fn make_free(
         &mut self,
@@ -343,9 +456,36 @@ impl Runtime {
             "`{}` is an ACU operator — build it with make_acu/make_ac, not make_free",
             sig.symbol(symbol).name()
         );
+        let sort = self.free_sort(sig, symbol, &args);
+        self.alloc_node_constrained(sig, sort, NodeTerm::Free { symbol, args })
+    }
+
+    /// Least sort of a free node `symbol(args…)`. The common case — a single declaration, no
+    /// overloading — is computed **inline** with no allocation (the equivalent of the old
+    /// `compute_free_sort`), keeping the reduce hot path fast; only an overloaded free operator falls
+    /// back to the general [`Signature::compute_sort`], which needs the argument sorts as a slice.
+    fn free_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
+        let decls = sig.symbol(symbol).decls();
+        if let [only] = decls {
+            assert_eq!(
+                args.len(),
+                only.domain.len(),
+                "arity mismatch building `{}`",
+                sig.symbol(symbol).name()
+            );
+            let well_sorted = only
+                .domain
+                .iter()
+                .zip(args)
+                .all(|(&dom, &arg)| sig.sorts().leq(self.dags.get(arg).sort, dom));
+            return if well_sorted {
+                only.range
+            } else {
+                sig.sorts().error_sort(sig.sorts().kind_of(only.range))
+            };
+        }
         let arg_sorts: Vec<SortId> = args.iter().map(|&a| self.dags.get(a).sort).collect();
-        let sort = sig.compute_sort(symbol, &arg_sorts);
-        self.alloc_node(sort, NodeTerm::Free { symbol, args })
+        sig.compute_sort(symbol, &arg_sorts)
     }
     /// Convenience for a constant (an arity-0 symbol).
     pub(crate) fn make_const(&mut self, sig: &Signature, symbol: SymbolId) -> DagId {
@@ -414,7 +554,7 @@ impl Runtime {
                     .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
                     .collect();
                 let sort = sig.compute_sort_fold(symbol, &elem_sorts);
-                self.alloc_node(sort, NodeTerm::Acu { symbol, args })
+                self.alloc_node_constrained(sig, sort, NodeTerm::Acu { symbol, args })
             }
         }
     }
@@ -448,7 +588,7 @@ impl Runtime {
             _ => {
                 let elem_sorts: Vec<SortId> = args.iter().map(|&e| self.dags.get(e).sort).collect();
                 let sort = sig.compute_sort_fold(symbol, &elem_sorts);
-                self.alloc_node(sort, NodeTerm::Au { symbol, args })
+                self.alloc_node_constrained(sig, sort, NodeTerm::Au { symbol, args })
             }
         }
     }
@@ -483,7 +623,7 @@ impl Runtime {
             std::mem::swap(&mut x, &mut y); // canonical order for commutativity
         }
         let sort = sig.compute_sort(symbol, &[self.dags.get(x).sort, self.dags.get(y).sort]);
-        self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
+        self.alloc_node_constrained(sig, sort, NodeTerm::Cui { symbol, args: vec![x, y] })
     }
 
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
@@ -1017,6 +1157,13 @@ impl Engine {
         self.sig.add_equation(eq);
     }
 
+    /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
+    /// matcher seam). Memberships lower a node's least sort at construction, so declare them before
+    /// building any node of the lhs's symbol (cf. the overload add-declarations-first contract).
+    pub fn add_membership(&mut self, mb: Membership) {
+        self.sig.add_membership(mb);
+    }
+
     /// Total equational rewrites applied so far.
     pub fn rewrites(&self) -> u64 {
         self.rt.rewrites()
@@ -1064,7 +1211,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::term::{Equation, Term};
+    use crate::term::{Equation, Membership, Term};
 
     /// `f(a, g(a))` over a single sort `Nat`, with `a` shared (a true DAG). Returns engine + root.
     fn fixture() -> (Engine, DagId, SortId) {
@@ -1248,6 +1395,121 @@ mod tests {
         let c0 = e.make_const(c);
         let fc = e.make_free(f, vec![c0]);
         assert_eq!(e.sort_of(fc), a, "f(c) : A — the earliest of the two incomparable declarations");
+    }
+
+    /// B2.2 membership axioms (== reference binary, `conformance/membership.maude` MB-PAIR): a
+    /// non-linear `mb < N, N > : SymPair` lowers a pair's least sort, and **each membership application
+    /// counts as a rewrite** (Maude's accounting). The lowered sort then drives which equations fire:
+    /// `eq f(P) = z` with `P : SymPair` reduces `f(< z, z >)` but not `f(< z, s z >)`. Memberships are
+    /// applied at construction, so each case resets the counter *before* building its query term.
+    #[test]
+    fn membership_lowers_sort_and_counts_as_rewrite() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let pair = e.add_sort("Pair");
+        let sympair = e.add_sort("SymPair");
+        e.add_subsort(sympair, pair);
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let pairop = e.add_op("<_,_>", vec![nat, nat], pair);
+        let f = e.add_op("f", vec![pair], nat);
+        e.add_membership(Membership {
+            lhs: Term::op(pairop, vec![Term::var(0, nat), Term::var(0, nat)]), // < N, N > (non-linear)
+            sort: sympair,
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(f, vec![Term::var(0, sympair)]), // f(P), P : SymPair
+            rhs: Term::constant(z),
+            nr_vars: 1,
+        });
+
+        // < z, z > : SymPair — one membership application.
+        e.reset_rewrites();
+        let (z0, z1) = (e.make_const(z), e.make_const(z));
+        let zz = e.make_free(pairop, vec![z0, z1]);
+        assert_eq!(e.sort_of(zz), sympair, "< z, z > : SymPair");
+        let r = e.reduce(zz);
+        assert_eq!(e.rewrites(), 1, "one membership application");
+        assert_eq!(e.sort_of(r), sympair);
+
+        // < z, s z > : Pair — components differ, no membership applies.
+        e.reset_rewrites();
+        let zc = e.make_const(z);
+        let sz = {
+            let z2 = e.make_const(z);
+            e.make_free(s, vec![z2])
+        };
+        let zsz = e.make_free(pairop, vec![zc, sz]);
+        assert_eq!(e.sort_of(zsz), pair, "< z, s z > : Pair");
+        let _ = e.reduce(zsz);
+        assert_eq!(e.rewrites(), 0, "no membership applies");
+
+        // f(< z, z >) : Nat — membership (1) + equation (1) = 2 rewrites.
+        e.reset_rewrites();
+        let (z3, z4) = (e.make_const(z), e.make_const(z));
+        let zz2 = e.make_free(pairop, vec![z3, z4]); // membership fires here
+        let fzz = e.make_free(f, vec![zz2]);
+        let r2 = e.reduce(fzz); // equation fires here
+        assert_eq!(e.rewrites(), 2, "membership + equation");
+        assert_eq!(e.node(r2).symbol(), z, "f(< z, z >) = z");
+
+        // f(< z, s z >) : Nat — arg is only Pair, so f(P : SymPair) does not match.
+        e.reset_rewrites();
+        let zc2 = e.make_const(z);
+        let sz2 = {
+            let z5 = e.make_const(z);
+            e.make_free(s, vec![z5])
+        };
+        let zsz2 = e.make_free(pairop, vec![zc2, sz2]);
+        let fzsz = e.make_free(f, vec![zsz2]);
+        let r3 = e.reduce(fzsz);
+        assert_eq!(e.rewrites(), 0, "no membership, no equation");
+        assert_eq!(e.node(r3).symbol(), f, "f(< z, s z >) is its own normal form");
+    }
+
+    /// B2.2 (== reference binary, MB-CHAIN): two memberships lower a sort two levels. The constrain
+    /// pass is **smallest-target-sort first**, so `g(g(a))` drops straight to C (one application on the
+    /// outer node), giving 2 applications total (inner `g(a) : B`, outer `g(g(a)) : C`) — not 3.
+    #[test]
+    fn membership_chain_lowers_two_levels() {
+        let mut e = Engine::new();
+        let sa = e.add_sort("A");
+        let sb = e.add_sort("B");
+        let sc = e.add_sort("C");
+        e.add_subsort(sc, sb);
+        e.add_subsort(sb, sa);
+        e.close_sorts();
+        let a = e.add_op("a", vec![], sa);
+        let g = e.add_op("g", vec![sa], sa);
+        e.add_membership(Membership { lhs: Term::op(g, vec![Term::var(0, sa)]), sort: sb, nr_vars: 1 }); // g(X) : B
+        e.add_membership(Membership {
+            lhs: Term::op(g, vec![Term::op(g, vec![Term::var(0, sa)])]), // g(g(X)) : C
+            sort: sc,
+            nr_vars: 1,
+        });
+
+        e.reset_rewrites();
+        let a0 = e.make_const(a);
+        assert_eq!(e.sort_of(a0), sa, "a : A");
+        let _ = e.reduce(a0);
+        assert_eq!(e.rewrites(), 0);
+
+        e.reset_rewrites();
+        let a1 = e.make_const(a);
+        let ga = e.make_free(g, vec![a1]);
+        assert_eq!(e.sort_of(ga), sb, "g(a) : B");
+        let _ = e.reduce(ga);
+        assert_eq!(e.rewrites(), 1, "one membership application g(X):B");
+
+        e.reset_rewrites();
+        let a2 = e.make_const(a);
+        let ga2 = e.make_free(g, vec![a2]);
+        let gga = e.make_free(g, vec![ga2]);
+        assert_eq!(e.sort_of(gga), sc, "g(g(a)) : C");
+        let _ = e.reduce(gga);
+        assert_eq!(e.rewrites(), 2, "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3");
     }
 
     #[test]

@@ -1,0 +1,38 @@
+*** B2.2 membership-axiom conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/membership.maude < /dev/null
+*** The `result <Sort>:` line is the (membership-refined) least sort. Free-theory only this increment.
+*** Mirrors the engine.rs B2.2 tests.
+
+fmod MB-PAIR is
+  sorts Nat Pair SymPair .
+  subsort SymPair < Pair .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op <_,_> : Nat Nat -> Pair [ctor] .
+  op f : Pair -> Nat .
+  var N : Nat .
+  var P : SymPair .
+  mb < N, N > : SymPair .
+  eq f(P) = z .
+endfm
+*** A pair with equal components is a SymPair; the membership lhs is non-linear.
+red < z, z > .          *** SymPair
+red < z, s z > .        *** Pair: components differ
+red < s z, s z > .      *** SymPair
+*** f is only defined (by the equation) on SymPair, so the membership drives the rewrite count.
+red f(< z, z >) .       *** z, 1 rewrite: arg is SymPair
+red f(< z, s z >) .     *** f(< z, s z >), 0 rewrites: arg is only Pair
+
+fmod MB-CHAIN is
+  sorts A B C .
+  subsorts C < B < A .
+  op a : -> A [ctor] .
+  op g : A -> A [ctor] .
+  var X : A .
+  mb g(X) : B .
+  mb g(g(X)) : C .
+endfm
+*** Two memberships that lower a sort two levels: the constrain pass iterates to the smallest, C.
+red a .                 *** A
+red g(a) .              *** B
+red g(g(a)) .           *** C: both g(X):B and g(g(X)):C apply, least is C

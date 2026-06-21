@@ -80,6 +80,16 @@ pub struct Equation {
     pub nr_vars: u32,
 }
 
+/// An (unconditional) membership axiom `mb lhs : sort` — asserts that any term matching `lhs` has
+/// (at least) sort `sort`, refining its least sort *downward* (B2.2). `nr_vars` is the distinct-variable
+/// count of `lhs`, as for [`Equation`]. Conditional membership (`cmb`) gains a condition in B2.3.
+#[derive(Debug, Clone)]
+pub struct Membership {
+    pub lhs: Term,
+    pub sort: SortId,
+    pub nr_vars: u32,
+}
+
 /// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].
 ///
 /// [`reset`]: Subst::reset
