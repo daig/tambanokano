@@ -60,13 +60,14 @@ enum CompiledFragment {
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
 ///
 /// A frame mirrors one activation of the old recursive `reduce`/`reduce_args` pair: it reduces the
-/// node's children left-to-right (`reduced` accumulates results, `next` is the cursor over `orig`),
-/// then drives the top-rewrite fixpoint by *reusing its own slot* for each rewritten term.
+/// arguments selected by the operator's evaluation strategy (the standard one is every argument
+/// left-to-right; `cursor` walks the strategy via [`Signature::strat_position`]), replacing each in
+/// `args`, then drives the top-rewrite fixpoint by *reusing its own slot* for each rewritten term.
 ///
 /// **A2 safe-point-GC contract** (the reason this is an explicit heap stack). The frames hold most
 /// in-flight `DagId`s of an in-progress reduction — but *not all*: at the [`Engine::reduce`] loop
 /// head a just-completed child sits only in the `child_result` local until it is delivered into its
-/// parent's `reduced` on the next iteration. So the complete root set at the loop head is
+/// parent's `args` on the next iteration. So the complete root set at the loop head is
 /// `walk(stack) ∪ child_result`. GC must therefore be confined to the loop head:
 /// `try_rewrite_top`/`instantiate`/`make_free` build fresh nodes whose ids live only in native-stack
 /// locals (`instantiate`'s `arg_ids`, the `Subst` bindings, the `rebuilt` node mid-rewrite) and are
@@ -77,12 +78,15 @@ struct ReduceFrame {
     original: DagId,
     symbol: SymbolId,
     /// The original children of `original`, copied out so the spine can be walked across the `&mut
-    /// self` reductions that may grow (and thus reallocate) the arena.
+    /// self` reductions that may grow (and thus reallocate) the arena. The change test is `args != orig`.
     orig: Vec<DagId>,
-    /// Reduced children collected so far; length grows to `orig.len()` as `next` advances.
-    reduced: Vec<DagId>,
-    /// Index of the next child of `orig` to reduce.
-    next: usize,
+    /// Current arguments: `orig` with each strategy-reduced position replaced by its normal form;
+    /// positions the strategy leaves unreduced keep their `orig` value (lazy). The node is rebuilt from
+    /// this.
+    args: Vec<DagId>,
+    /// Strategy steps taken so far — the cursor into the operator's strategy (or `0..arity` for the
+    /// standard strategy); [`Signature::strat_position`] maps it to the argument position to reduce.
+    cursor: usize,
 }
 
 /// The immutable-during-reduction half of the engine: the sort poset, the symbol table, and the
@@ -169,6 +173,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms::default(),
             identity: None,
+            strategy: None,
         })
     }
 
@@ -189,6 +194,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: true, idem: false },
             identity,
+            strategy: None,
         })
     }
 
@@ -208,6 +214,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: false, idem: false },
             identity,
+            strategy: None,
         })
     }
 
@@ -228,6 +235,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: false, comm: true, idem },
             identity,
+            strategy: None,
         })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
@@ -248,6 +256,47 @@ impl Signature {
             s.name()
         );
         s.decls.push(OpDeclaration { domain, range, ctor: false });
+    }
+
+    /// Mark every declaration of `sym` as a constructor (`[ctor]`, B2.4). Metadata only — it does not
+    /// change reduction; recorded for the later constructor analysis.
+    pub(crate) fn set_ctor(&mut self, sym: SymbolId) {
+        for decl in &mut self.symbols.get_mut(sym).decls {
+            decl.ctor = true;
+        }
+    }
+
+    /// Set an evaluation strategy `strat (raw…)` on `sym` (B2.4). `raw` is the user sequence of 1-based
+    /// argument positions ending in a single trailing `0` (reduce at top) — e.g. `[1, 0]` for a lazy
+    /// `if_then_else_fi`. Stored as the 0-based positions to reduce, in order; arguments not listed are
+    /// left unreduced. The general strategy (interleaved or absent `0`) is a follow-up — loud-assert.
+    pub(crate) fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
+        let arity = self.symbols.get(sym).arity();
+        assert_eq!(
+            raw.last(),
+            Some(&0),
+            "evaluation strategy {raw:?} for `{}` must end in a single trailing 0 (reduce at top); \
+             interleaved or absent top rewrites are a B-follow-up",
+            self.symbols.get(sym).name()
+        );
+        let positions = &raw[..raw.len() - 1];
+        assert!(
+            positions.iter().all(|&p| p >= 1 && p as usize <= arity),
+            "evaluation strategy {raw:?} for `{}` references an argument outside 1..={arity} (or has a \
+             non-trailing 0)",
+            self.symbols.get(sym).name()
+        );
+        self.symbols.get_mut(sym).strategy = Some(positions.iter().map(|&p| p - 1).collect());
+    }
+
+    /// The argument position to reduce at strategy step `cursor` for `symbol` (B2.4), or `None` once the
+    /// strategy is exhausted (→ attempt the top rewrite). The standard strategy reduces every argument
+    /// left-to-right; a custom strategy reduces only its listed positions, in order.
+    pub(crate) fn strat_position(&self, symbol: SymbolId, cursor: usize, arity: usize) -> Option<usize> {
+        match &self.symbols.get(symbol).strategy {
+            None => (cursor < arity).then_some(cursor),
+            Some(positions) => positions.get(cursor).map(|&p| p as usize),
+        }
     }
 
     /// Least sort of `symbol(args…)` whose arguments have sorts `arg_sorts`, under multi-declaration
@@ -857,16 +906,17 @@ impl Runtime {
     }
 
     /// Collect at a `reduce` safe point, rooting the in-flight working set: the registry, plus every
-    /// frame's term (`original`, which transitively covers its `orig` children) and its already-
-    /// `reduced` children, plus the `child_result` not yet delivered into a frame. This is the
-    /// complete loop-head root set (see the [`ReduceFrame`] safe-point contract); collecting anywhere
-    /// else would miss fresh nodes living only in native-stack locals.
+    /// frame's term (`original`, which transitively covers its unreduced `orig` children) and its
+    /// current `args` (the strategy-reduced positions are fresh nodes not reachable from `original`),
+    /// plus the `child_result` not yet delivered into a frame. This is the complete loop-head root set
+    /// (see the [`ReduceFrame`] safe-point contract); collecting anywhere else would miss fresh nodes
+    /// living only in native-stack locals.
     fn safe_point_gc(&mut self, frames: &[ReduceFrame], child_result: Option<DagId>) {
         self.dags.clear_marks();
         self.mark_registered_roots();
         for frame in frames {
             self.mark_reachable(frame.original);
-            for &r in &frame.reduced {
+            for &r in &frame.args {
                 self.mark_reachable(r);
             }
         }
@@ -942,19 +992,23 @@ impl Runtime {
                 self.allocs_since_gc = 0;
             }
 
-            // Deliver a completed child to the current (top) frame and advance its cursor.
+            // Deliver a completed child into its strategy position and advance the strategy cursor.
             if let Some(r) = child_result.take() {
                 let f = stack.last_mut().expect("child result with empty reduce stack");
-                f.reduced.push(r);
-                f.next += 1;
+                let pos = sig
+                    .strat_position(f.symbol, f.cursor, f.orig.len())
+                    .expect("delivering a child means a strategy step was in progress");
+                f.args[pos] = r;
+                f.cursor += 1;
             }
 
-            // Phase 1: reduce the next child (innermost, left-to-right). Already-reduced children
-            // (shared subterms, cached by epoch) are delivered without pushing a frame.
+            // Phase 1: reduce the next argument the strategy selects (the standard strategy walks them
+            // left-to-right; a custom strategy reduces only its listed positions). Already-reduced
+            // children (shared subterms, cached by epoch) are delivered without pushing a frame.
             {
                 let f = stack.last().expect("empty reduce stack");
-                if f.next < f.orig.len() {
-                    let child = f.orig[f.next];
+                if let Some(pos) = sig.strat_position(f.symbol, f.cursor, f.orig.len()) {
+                    let child = f.args[pos];
                     if self.node(child).reduced_epoch == sig.eq_epoch() {
                         child_result = Some(child);
                     } else {
@@ -965,16 +1019,16 @@ impl Runtime {
                 }
             }
 
-            // Phase 1 complete: rebuild this term iff some child changed, else keep the shared id.
-            let (symbol, original, reduced, changed) = {
+            // Phase 1 complete (strategy exhausted): rebuild iff some argument changed, else keep the id.
+            let (symbol, original, args, changed) = {
                 let f = stack.last_mut().expect("empty reduce stack");
-                let changed = f.reduced != f.orig;
-                // `mem::take` moves the reduced children out (no clone) — the frame is about to be
-                // reused or popped, so its `reduced` is no longer needed.
-                let reduced = if changed { std::mem::take(&mut f.reduced) } else { Vec::new() };
-                (f.symbol, f.original, reduced, changed)
+                let changed = f.args != f.orig;
+                // `mem::take` moves the args out (no clone) — the frame is about to be reused or popped,
+                // so its `args` is no longer needed.
+                let args = if changed { std::mem::take(&mut f.args) } else { Vec::new() };
+                (f.symbol, f.original, args, changed)
             };
-            let rebuilt = if changed { self.rebuild(sig, symbol, reduced) } else { original };
+            let rebuilt = if changed { self.rebuild(sig, symbol, args) } else { original };
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
@@ -1002,9 +1056,9 @@ impl Runtime {
         ReduceFrame {
             original: id,
             symbol: node.symbol(),
-            reduced: Vec::with_capacity(orig.len()),
+            args: orig.clone(),
             orig,
-            next: 0,
+            cursor: 0,
         }
     }
 
@@ -1219,6 +1273,23 @@ impl Engine {
     /// construction).
     pub fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
         self.sig.add_op_decl(sym, domain, range);
+    }
+
+    /// Mark an operator as a constructor (`[ctor]`, B2.4) — metadata that does not affect reduction.
+    pub fn set_ctor(&mut self, sym: SymbolId) {
+        self.sig.set_ctor(sym);
+    }
+
+    /// Whether every declaration of `sym` is a constructor (`[ctor]`).
+    pub fn is_constructor(&self, sym: SymbolId) -> bool {
+        self.sig.symbol(sym).is_constructor()
+    }
+
+    /// Set an evaluation strategy `strat (raw…)` on `sym` (B2.4): `raw` is the 1-based argument
+    /// positions to reduce, in order, ending in a single `0` (reduce at top). Arguments not listed are
+    /// left unreduced (lazy) — e.g. `if_then_else_fi` with `[1, 0]`.
+    pub fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
+        self.sig.set_strategy(sym, raw);
     }
 
     /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). Must be binary;
@@ -2150,6 +2221,97 @@ mod tests {
             let r = e.reduce(q);
             assert_eq!(e.rewrites(), 2, "f({input}): g reduces (1) + f→M (1)");
             assert_eq!(decode(&e, r, z, s), expected, "f({input}) = {expected}");
+        }
+    }
+
+    /// B2.4 `[ctor]` (== reference binary): a constructor declaration is recorded but does **not**
+    /// affect functional reduction — `s 0 + s s 0` is `s s s 0` in 3 rewrites either way.
+    #[test]
+    fn ctor_is_recorded_and_inert_for_reduction() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.set_ctor(z);
+        e.set_ctor(s);
+        assert!(e.is_constructor(z), "z is a constructor");
+        assert!(e.is_constructor(s), "s is a constructor");
+        assert!(!e.is_constructor(plus), "+ is a defined function, not a constructor");
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(z)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+        let (a, b) = (numeral(&mut e, z, s, 1), numeral(&mut e, z, s, 2));
+        let sum = e.make_free(plus, vec![a, b]);
+        let r = e.reduce(sum);
+        assert_eq!(e.rewrites(), 3, "[ctor] does not change the rewrite count");
+        assert_eq!(decode(&e, r, z, s), 3, "s 0 + s s 0 = s s s 0");
+    }
+
+    /// B2.4 evaluation strategy (== reference binary, `conformance/strat.maude`): `if_then_else_fi` with
+    /// `strat (1 0)` reduces the condition then the top, leaving the unused branch unreduced. The chosen
+    /// branch *is* reduced (it becomes the result), so `if tt then big else z` costs the `big` reduction
+    /// while `if tt then z else big` does not.
+    #[test]
+    fn evaluation_strategy_is_lazy() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let truth = e.add_sort("Truth");
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let big = e.add_op("big", vec![], nat);
+        let ite = e.add_op("if", vec![truth, nat, nat], nat);
+        e.set_strategy(ite, &[1, 0]); // reduce arg 1 (the condition), then top; branches lazy
+        let v = |i| Term::var(i, nat);
+        e.add_equation(Equation {
+            lhs: Term::constant(big), // eq big = s s z
+            rhs: Term::op(s, vec![Term::op(s, vec![Term::constant(z)])]),
+            nr_vars: 0,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(ite, vec![Term::constant(tt), v(0), v(1)]), // if tt then X else Y = X
+            rhs: v(0),
+            nr_vars: 2,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(ite, vec![Term::constant(ff), v(0), v(1)]), // if ff then X else Y = Y
+            rhs: v(1),
+            nr_vars: 2,
+        });
+
+        // big = s s z (sanity).
+        e.reset_rewrites();
+        let bnode = e.make_const(big);
+        let rb = e.reduce(bnode);
+        assert_eq!(e.rewrites(), 1);
+        assert_eq!(decode(&e, rb, z, s), 2, "big = s s z");
+
+        // Each case: build if(cond, then, else) and reduce. (cond_is_tt, then_big, expected, rewrites)
+        let cases = [
+            (true, false, 0u32, 1u64),  // if tt then z   else big -> z      (else not reduced)
+            (false, true, 0, 1),        // if ff then big else z   -> z      (then not reduced)
+            (true, true, 2, 2),         // if tt then big else z   -> s s z  (chosen big IS reduced)
+        ];
+        for (cond_tt, then_big, expected, rewrites) in cases {
+            e.reset_rewrites();
+            let cond = if cond_tt { e.make_const(tt) } else { e.make_const(ff) };
+            let then_arg = if then_big { e.make_const(big) } else { e.make_const(z) };
+            let else_arg = if then_big { e.make_const(z) } else { e.make_const(big) };
+            let q = e.make_free(ite, vec![cond, then_arg, else_arg]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), rewrites, "rewrite count for case {cond_tt}/{then_big}");
+            assert_eq!(decode(&e, r, z, s), expected, "result for case {cond_tt}/{then_big}");
         }
     }
 

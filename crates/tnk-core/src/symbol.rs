@@ -52,9 +52,9 @@ pub(crate) enum Theory {
 pub(crate) struct OpDeclaration {
     pub domain: Vec<SortId>,
     pub range: SortId,
-    /// `[ctor]` flag. Carried now, consumed when the constructor diagram / sufficient-completeness
-    /// lands (a later B2 sub-step); inert — hence unread — this increment.
-    #[allow(dead_code)]
+    /// `[ctor]` flag (B2.4). Metadata for functional reduction — a `[ctor]` operator reduces exactly as
+    /// a non-`ctor` one (verified against the binary); it marks the operator as a constructor for the
+    /// later sufficient-completeness / constructor-diagram analysis.
     pub ctor: bool,
 }
 
@@ -72,6 +72,10 @@ pub struct Symbol {
     /// identity *term* is a later generalization. Canonicalization drops identity arguments and a
     /// matched AC variable may bind this constant (the "collapse to unit" solutions).
     pub(crate) identity: Option<SymbolId>,
+    /// Evaluation strategy `strat (…)` (B2.4): the 0-based argument positions to reduce, in order,
+    /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
+    /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
+    pub(crate) strategy: Option<Vec<u32>>,
 }
 
 impl Symbol {
@@ -102,5 +106,11 @@ impl Symbol {
     /// The identity constant symbol, if this operator was declared with `id:`.
     pub(crate) fn identity(&self) -> Option<SymbolId> {
         self.identity
+    }
+
+    /// Whether every declaration of this operator is a constructor (`[ctor]`). Metadata — it does not
+    /// affect reduction; recorded for the later constructor analysis (B2.4).
+    pub(crate) fn is_constructor(&self) -> bool {
+        self.decls.iter().all(|d| d.ctor)
     }
 }
