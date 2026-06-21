@@ -1,0 +1,35 @@
+*** B2.3a conditional-equation conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/conditional.maude < /dev/null
+*** Result sorts + rewrite counts; condition reductions count too. Mirrors the engine.rs B2.3a tests.
+
+fmod CEQ-MAX is
+  sorts Nat Truth .
+  ops tt ff : -> Truth [ctor] .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op _<=_ : Nat Nat -> Truth .
+  op max : Nat Nat -> Nat .
+  vars M N : Nat .
+  eq z <= N = tt .
+  eq s M <= z = ff .
+  eq s M <= s N = M <= N .
+  ceq max(M, N) = N if M <= N = tt .
+  ceq max(M, N) = M if M <= N = ff .
+endfm
+*** The condition M <= N must itself reduce; the second ceq fires only after the first condition fails.
+red max(s z, s s z) .    *** s s z
+red max(s s z, s z) .    *** s s z (backtracks to the second equation)
+red max(z, z) .          *** z
+
+fmod CEQ-SORT is
+  sorts Nat NzNat .
+  subsort NzNat < Nat .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> NzNat [ctor] .
+  op nz? : Nat -> Nat .
+  var N : Nat .
+  ceq nz?(N) = s z if N : NzNat .
+endfm
+*** A sort-test condition: nz?(N) rewrites only when N is a NzNat.
+red nz?(s z) .           *** s z: the argument is NzNat
+red nz?(z) .             *** nz?(z): z is not NzNat, condition fails, no rewrite

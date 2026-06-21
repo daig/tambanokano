@@ -16,7 +16,7 @@ use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, Symbol, SymbolId, Theory};
-use crate::term::{Equation, Membership, Subst, Term};
+use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::LhsAutomaton;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -28,6 +28,9 @@ struct CompiledEquation {
     lhs: LhsAutomaton,
     rhs: Term,
     nr_vars: u32,
+    /// Condition fragments (empty for an unconditional `eq`); all must hold for the equation to apply,
+    /// and a failed condition backtracks into the next matcher solution (B2.3).
+    condition: Vec<ConditionFragment>,
 }
 
 /// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
@@ -319,11 +322,29 @@ impl Signature {
     /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
     /// advance the equation epoch (see [`Engine::add_equation`]).
     pub(crate) fn add_equation(&mut self, eq: Equation) {
-        let top = eq.lhs.top_symbol().expect("equation lhs must be an application");
+        self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new());
+    }
+
+    /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3): the condition is a list of
+    /// [`ConditionFragment`]s (equality / sort-test), all of which must hold; a failure backtracks into
+    /// the next matcher solution. `eq` stays the unconditional entry point (empty condition).
+    pub(crate) fn add_conditional_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.push_equation(lhs, rhs, nr_vars, condition);
+    }
+
+    fn push_equation(&mut self, lhs: Term, rhs: Term, nr_vars: u32, condition: Vec<ConditionFragment>) {
+        let top = lhs.top_symbol().expect("equation lhs must be an application");
         let compiled = CompiledEquation {
-            lhs: LhsAutomaton::compile(eq.lhs, self),
-            rhs: eq.rhs,
-            nr_vars: eq.nr_vars,
+            lhs: LhsAutomaton::compile(lhs, self),
+            rhs,
+            nr_vars,
+            condition,
         };
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
@@ -939,8 +960,13 @@ impl Runtime {
             // ACU matcher already orders solutions minimal-first and skips the identity no-op, so the
             // first solution is the right rewrite. (Conditional equations (B2) will check the
             // condition here and `continue` to the next solution on failure — which is why it loops.)
-            #[allow(clippy::never_loop)]
             while sp.next(self, sig, &mut subst) {
+                // A conditional equation accepts a solution only if its condition holds; otherwise we
+                // backtrack into the next solution of the same lhs (Maude's `solveCondition` retry).
+                // Unconditional equations short-circuit (no call) — the free reduce hot path.
+                if !eq.condition.is_empty() && !self.condition_holds(sig, &eq.condition, &subst) {
+                    continue;
+                }
                 let rhs = self.instantiate(sig, &eq.rhs, &subst);
                 // The subproblem splices the rhs into the matched position — for a whole match that is
                 // just the rhs; for an extension match it re-assembles the residue around it in the
@@ -950,6 +976,47 @@ impl Runtime {
             }
         }
         None
+    }
+
+    /// Whether every fragment of `condition` holds under the matched substitution `subst` — the B2.3
+    /// condition check the rewrite driver runs before accepting a solution (empty condition ⇒ `true`).
+    ///
+    /// Each fragment is evaluated by **re-entrant reduction** of its instantiated term(s). **F-2
+    /// mitigation:** safe-point GC is disabled for the duration — a nested `reduce`'s safe points
+    /// cannot see the *outer* reduction's in-flight frames / `Subst` / AC residue, so collecting here
+    /// would sweep them; not collecting during this window eliminates the hazard. (Bounded-memory
+    /// condition reduction via an engine-global active-frame root set is the remaining follow-up; the
+    /// temporaries are reclaimed at the next outer safe point once GC is restored.)
+    fn condition_holds(&mut self, sig: &Signature, condition: &[ConditionFragment], subst: &Subst) -> bool {
+        if condition.is_empty() {
+            return true;
+        }
+        let saved_gc = self.gc_interval;
+        self.gc_interval = None;
+        let holds = condition.iter().all(|frag| self.fragment_holds(sig, frag, subst));
+        self.gc_interval = saved_gc;
+        holds
+    }
+
+    /// Evaluate one condition fragment under `subst`: an **equality** fragment reduces both sides and
+    /// compares them modulo the axioms; a **sort-test** reduces the term and checks its least sort.
+    /// The reductions are what make a condition's rewrites count toward the total (Maude's accounting),
+    /// and the equation is re-checked (re-reduced) per candidate — Maude caches nothing here either.
+    fn fragment_holds(&mut self, sig: &Signature, frag: &ConditionFragment, subst: &Subst) -> bool {
+        match frag {
+            ConditionFragment::Equality { lhs, rhs } => {
+                let l = self.instantiate(sig, lhs, subst);
+                let l = self.reduce(sig, l);
+                let r = self.instantiate(sig, rhs, subst);
+                let r = self.reduce(sig, r);
+                self.deep_equal(l, r)
+            }
+            ConditionFragment::SortTest { term, sort } => {
+                let t = self.instantiate(sig, term, subst);
+                let t = self.reduce(sig, t);
+                sig.sorts().leq(self.node(t).sort, *sort)
+            }
+        }
     }
 }
 
@@ -1157,6 +1224,19 @@ impl Engine {
         self.sig.add_equation(eq);
     }
 
+    /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3). The condition is a list of
+    /// [`ConditionFragment`](crate::term::ConditionFragment)s (equality / sort-test); all must hold for
+    /// the equation to fire, and a failed condition backtracks into the next matcher solution.
+    pub fn add_conditional_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.sig.add_conditional_equation(lhs, rhs, nr_vars, condition);
+    }
+
     /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
     /// matcher seam). Memberships lower a node's least sort at construction, so declare them before
     /// building any node of the lhs's symbol (cf. the overload add-declarations-first contract).
@@ -1211,7 +1291,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::term::{Equation, Membership, Term};
+    use crate::term::{ConditionFragment, Equation, Membership, Term};
 
     /// `f(a, g(a))` over a single sort `Nat`, with `a` shared (a true DAG). Returns engine + root.
     fn fixture() -> (Engine, DagId, SortId) {
@@ -1510,6 +1590,169 @@ mod tests {
         assert_eq!(e.sort_of(gga), sc, "g(g(a)) : C");
         let _ = e.reduce(gga);
         assert_eq!(e.rewrites(), 2, "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3");
+    }
+
+    /// B2.3a conditional equations with equality conditions (== reference binary,
+    /// `conformance/conditional.maude` CEQ-MAX): `max` via `ceq max(M,N)=N if M<=N=tt` /
+    /// `ceq max(M,N)=M if M<=N=ff`. The condition `M<=N` itself reduces (re-entrant), its rewrites
+    /// count, and a failed first condition backtracks to the second equation — re-reducing the
+    /// condition (Maude caches nothing): `max(2,1)` is 5 rewrites, not 3.
+    #[test]
+    fn conditional_equation_with_equality_condition() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let truth = e.add_sort("Truth");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let le = e.add_op("<=", vec![nat, nat], truth);
+        let max = e.add_op("max", vec![nat, nat], nat);
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        // eq z <= N = tt . eq s M <= z = ff . eq s M <= s N = M <= N .
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![Term::constant(z), v(0)]),
+            rhs: Term::constant(tt),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), Term::constant(z)]),
+            rhs: Term::constant(ff),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(le, vec![s_of(v(0)), s_of(v(1))]),
+            rhs: Term::op(le, vec![v(0), v(1)]),
+            nr_vars: 2,
+        });
+        // ceq max(M, N) = N if M <= N = tt .   /   ceq max(M, N) = M if M <= N = ff .
+        let le_mn = || Term::op(le, vec![v(0), v(1)]);
+        e.add_conditional_equation(
+            Term::op(max, vec![v(0), v(1)]),
+            v(1),
+            2,
+            vec![ConditionFragment::Equality { lhs: le_mn(), rhs: Term::constant(tt) }],
+        );
+        e.add_conditional_equation(
+            Term::op(max, vec![v(0), v(1)]),
+            v(0),
+            2,
+            vec![ConditionFragment::Equality { lhs: le_mn(), rhs: Term::constant(ff) }],
+        );
+
+        // max(1, 2) = 2 in 3 rewrites: condition `1<=2` reduces to tt (2), then max→N (1).
+        e.reset_rewrites();
+        let (n1, n2) = (numeral(&mut e, z, s, 1), numeral(&mut e, z, s, 2));
+        let m = e.make_free(max, vec![n1, n2]);
+        let r = e.reduce(m);
+        assert_eq!(e.rewrites(), 3, "max(1,2): condition reduce (2) + max (1)");
+        assert_eq!(decode(&e, r, z, s), 2, "max(1,2) = 2");
+
+        // max(2, 1) = 2 in 5 rewrites: first condition `2<=1`→ff fails tt (2), backtrack, second
+        // condition re-reduces `2<=1`→ff (2), matches ff, then max→M (1).
+        e.reset_rewrites();
+        let (n2b, n1b) = (numeral(&mut e, z, s, 2), numeral(&mut e, z, s, 1));
+        let m2 = e.make_free(max, vec![n2b, n1b]);
+        let r2 = e.reduce(m2);
+        assert_eq!(e.rewrites(), 5, "max(2,1): cond fails (2) + cond re-reduced (2) + max (1)");
+        assert_eq!(decode(&e, r2, z, s), 2, "max(2,1) = 2 (backtracked to the second equation)");
+
+        // max(0, 0) = 0 in 2 rewrites.
+        e.reset_rewrites();
+        let (z1, z2) = (numeral(&mut e, z, s, 0), numeral(&mut e, z, s, 0));
+        let m3 = e.make_free(max, vec![z1, z2]);
+        let r3 = e.reduce(m3);
+        assert_eq!(e.rewrites(), 2, "max(0,0): condition reduce (1) + max (1)");
+        assert_eq!(decode(&e, r3, z, s), 0, "max(0,0) = 0");
+    }
+
+    /// B2.3a conditional equation with a sort-test condition (== reference binary, CEQ-SORT):
+    /// `ceq nz?(N) = s z if N : NzNat` fires only when the argument's least sort is `<= NzNat`.
+    #[test]
+    fn conditional_equation_with_sort_test_condition() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let nznat = e.add_sort("NzNat");
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nznat); // s_ : Nat -> NzNat
+        let nzq = e.add_op("nz?", vec![nat], nat);
+        e.add_conditional_equation(
+            Term::op(nzq, vec![Term::var(0, nat)]),
+            Term::op(s, vec![Term::constant(z)]), // = s z
+            1,
+            vec![ConditionFragment::SortTest { term: Term::var(0, nat), sort: nznat }],
+        );
+
+        // nz?(s z) : the argument is NzNat → condition holds → s z, 1 rewrite.
+        e.reset_rewrites();
+        let s0 = {
+            let z0 = e.make_const(z);
+            e.make_free(s, vec![z0])
+        };
+        let q1 = e.make_free(nzq, vec![s0]);
+        let r1 = e.reduce(q1);
+        assert_eq!(e.rewrites(), 1, "condition N : NzNat holds for s z");
+        assert_eq!(e.sort_of(r1), nznat, "result s z : NzNat");
+        assert_eq!(e.node(r1).symbol(), s);
+
+        // nz?(z) : z is only Nat → condition fails → no rewrite.
+        e.reset_rewrites();
+        let z1 = e.make_const(z);
+        let q2 = e.make_free(nzq, vec![z1]);
+        let r2 = e.reduce(q2);
+        assert_eq!(e.rewrites(), 0, "condition N : NzNat fails for z");
+        assert_eq!(e.node(r2).symbol(), nzq, "nz?(z) is its own normal form");
+    }
+
+    /// B2.3a audit-F-2 mitigation: a conditional equation whose condition reduces re-entrantly stays
+    /// correct with safe-point GC enabled. GC is disabled *during* condition evaluation, so the nested
+    /// reduce can't sweep the outer reduction's in-flight state; the result and rewrite count are
+    /// identical to the GC-off run. (`ceq f(N) = z if g(N) = tt`, with `g(s^k z)` reducing in `k+1`.)
+    #[test]
+    fn conditional_reduce_is_stable_under_safe_point_gc() {
+        fn run(interval: Option<u64>) -> (SymbolId, u64) {
+            let mut e = Engine::new();
+            let nat = e.add_sort("Nat");
+            let truth = e.add_sort("Truth");
+            e.close_sorts();
+            let z = e.add_op("z", vec![], nat);
+            let s = e.add_op("s", vec![nat], nat);
+            let tt = e.add_op("tt", vec![], truth);
+            let g = e.add_op("g", vec![nat], truth);
+            let f = e.add_op("f", vec![nat], nat);
+            e.add_equation(Equation {
+                lhs: Term::op(g, vec![Term::op(s, vec![Term::var(0, nat)])]), // g(s N) = g(N)
+                rhs: Term::op(g, vec![Term::var(0, nat)]),
+                nr_vars: 1,
+            });
+            e.add_equation(Equation {
+                lhs: Term::op(g, vec![Term::constant(z)]), // g(z) = tt
+                rhs: Term::constant(tt),
+                nr_vars: 0,
+            });
+            e.add_conditional_equation(
+                Term::op(f, vec![Term::var(0, nat)]), // ceq f(N) = z if g(N) = tt
+                Term::constant(z),
+                1,
+                vec![ConditionFragment::Equality {
+                    lhs: Term::op(g, vec![Term::var(0, nat)]),
+                    rhs: Term::constant(tt),
+                }],
+            );
+            e.set_gc_interval(interval);
+            let n = numeral(&mut e, z, s, 20); // condition g(20) reduces in 21 rewrites
+            let q = e.make_free(f, vec![n]);
+            let r = e.reduce(q);
+            (e.node(r).symbol(), e.rewrites())
+        }
+        let off = run(None);
+        let on = run(Some(4)); // aggressive collection around (not during) the condition reduce
+        assert_eq!(off.1, 22, "f(20) → z in 22 rewrites (21 condition + 1 equation)");
+        assert_eq!(on, off, "conditional reduce identical with safe-point GC on — F-2 mitigation holds");
     }
 
     #[test]

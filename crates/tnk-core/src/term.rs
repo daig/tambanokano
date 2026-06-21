@@ -90,6 +90,20 @@ pub struct Membership {
     pub nr_vars: u32,
 }
 
+/// One fragment of a conditional statement's condition (`ceq`/`cmb` ... `if` ...). All fragments must
+/// hold (a conjunction) for the statement to apply; a failed condition backtracks into the next
+/// matcher solution. Closed set (decision D3) — the **matching** fragment `pattern := term` (which
+/// binds new variables and backtracks) and the **rewrite** fragment `term => pattern` (Phase 2) are
+/// follow-ups. Fragment variables are the statement's pattern variables (already bound by the match).
+#[derive(Debug, Clone)]
+pub enum ConditionFragment {
+    /// `lhs = rhs` — holds iff both sides, instantiated under the match and reduced, are equal modulo
+    /// the axioms. Introduces no new variables.
+    Equality { lhs: Term, rhs: Term },
+    /// `term : sort` — holds iff `term`, instantiated and reduced, has a least sort `<= sort`.
+    SortTest { term: Term, sort: SortId },
+}
+
 /// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].
 ///
 /// [`reset`]: Subst::reset
