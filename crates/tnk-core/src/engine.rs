@@ -30,7 +30,7 @@ struct CompiledEquation {
     nr_vars: u32,
     /// Condition fragments (empty for an unconditional `eq`); all must hold for the equation to apply,
     /// and a failed condition backtracks into the next matcher solution (B2.3).
-    condition: Vec<ConditionFragment>,
+    condition: Vec<CompiledFragment>,
     /// `[owise]`: this equation is tried only if no non-owise equation of the symbol applies (B2.3b).
     owise: bool,
 }
@@ -44,7 +44,17 @@ struct SortConstraint {
     nr_vars: u32,
     /// Condition fragments (empty for an unconditional `mb`); checked under the membership match's
     /// substitution before the sort is lowered (B2.3c `cmb`).
-    condition: Vec<ConditionFragment>,
+    condition: Vec<CompiledFragment>,
+}
+
+/// A condition fragment compiled for evaluation: like the public [`ConditionFragment`] but with the
+/// matching fragment's pattern compiled to an [`LhsAutomaton`]. Built by
+/// [`Signature::compile_condition`]. The `fresh_vars` of a matching fragment are unbound before each
+/// match attempt so backtracking re-binds cleanly.
+enum CompiledFragment {
+    Equality { lhs: Term, rhs: Term },
+    SortTest { term: Term, sort: SortId },
+    Matching { pattern: LhsAutomaton, subject: Term, fresh_vars: Vec<u32> },
 }
 
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
@@ -368,13 +378,33 @@ impl Signature {
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
-            condition,
+            condition: self.compile_condition(condition),
             owise,
         };
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
         // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
         self.eq_epoch += 1;
+    }
+
+    /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test
+    /// fragments are stored as-is; a matching fragment's pattern is compiled to an [`LhsAutomaton`]
+    /// (B2.3d) through the same A3 seam (and F-A guard) as an equation lhs.
+    fn compile_condition(&self, condition: Vec<ConditionFragment>) -> Vec<CompiledFragment> {
+        condition
+            .into_iter()
+            .map(|frag| match frag {
+                ConditionFragment::Equality { lhs, rhs } => CompiledFragment::Equality { lhs, rhs },
+                ConditionFragment::SortTest { term, sort } => CompiledFragment::SortTest { term, sort },
+                ConditionFragment::Matching { pattern, subject, fresh_vars } => {
+                    CompiledFragment::Matching {
+                        pattern: LhsAutomaton::compile(pattern, self),
+                        subject,
+                        fresh_vars,
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort`, compiling its lhs to a theory
@@ -405,7 +435,7 @@ impl Signature {
             lhs: LhsAutomaton::compile(lhs, self),
             sort,
             nr_vars,
-            condition,
+            condition: self.compile_condition(condition),
         };
         let sorts = &self.sorts;
         let v = self.memberships.entry(top).or_default();
@@ -505,7 +535,7 @@ impl Runtime {
             return false;
         };
         while sp.next(self, sig, &mut subst) {
-            if sc.condition.is_empty() || self.condition_holds(sig, &sc.condition, &subst) {
+            if sc.condition.is_empty() || self.condition_holds(sig, &sc.condition, &mut subst) {
                 return true;
             }
         }
@@ -1033,7 +1063,7 @@ impl Runtime {
             };
             while sp.next(self, sig, &mut subst) {
                 // Unconditional equations short-circuit (no call) — the free reduce hot path.
-                if !eq.condition.is_empty() && !self.condition_holds(sig, &eq.condition, &subst) {
+                if !eq.condition.is_empty() && !self.condition_holds(sig, &eq.condition, &mut subst) {
                     continue;
                 }
                 let rhs = self.instantiate(sig, &eq.rhs, &subst);
@@ -1055,34 +1085,73 @@ impl Runtime {
     /// would sweep them; not collecting during this window eliminates the hazard. (Bounded-memory
     /// condition reduction via an engine-global active-frame root set is the remaining follow-up; the
     /// temporaries are reclaimed at the next outer safe point once GC is restored.)
-    fn condition_holds(&mut self, sig: &Signature, condition: &[ConditionFragment], subst: &Subst) -> bool {
+    fn condition_holds(&mut self, sig: &Signature, condition: &[CompiledFragment], subst: &mut Subst) -> bool {
         if condition.is_empty() {
             return true;
         }
         let saved_gc = self.gc_interval;
         self.gc_interval = None;
-        let holds = condition.iter().all(|frag| self.fragment_holds(sig, frag, subst));
+        let holds = self.solve_condition(sig, condition, 0, subst);
         self.gc_interval = saved_gc;
         holds
     }
 
-    /// Evaluate one condition fragment under `subst`: an **equality** fragment reduces both sides and
-    /// compares them modulo the axioms; a **sort-test** reduces the term and checks its least sort.
-    /// The reductions are what make a condition's rewrites count toward the total (Maude's accounting),
-    /// and the equation is re-checked (re-reduced) per candidate — Maude caches nothing here either.
-    fn fragment_holds(&mut self, sig: &Signature, frag: &ConditionFragment, subst: &Subst) -> bool {
+    /// Satisfy `condition[i..]` under `subst`, backtracking (Maude's `solveCondition`): an **equality**
+    /// fragment reduces both sides and compares modulo the axioms; a **sort-test** reduces the term and
+    /// checks its least sort; a **matching** (`:=`) fragment reduces the subject and enumerates the
+    /// pattern's solutions, recursing into the remaining fragments for each and retrying the next on
+    /// failure. The re-entrant reductions are what make a condition's rewrites count toward the total.
+    /// A matching fragment's `fresh_vars` are unbound before each attempt so backtracking re-binds
+    /// cleanly; on overall success the accepted bindings remain in `subst` for the rhs.
+    fn solve_condition(
+        &mut self,
+        sig: &Signature,
+        condition: &[CompiledFragment],
+        i: usize,
+        subst: &mut Subst,
+    ) -> bool {
+        let Some(frag) = condition.get(i) else {
+            return true; // every fragment satisfied
+        };
         match frag {
-            ConditionFragment::Equality { lhs, rhs } => {
+            CompiledFragment::Equality { lhs, rhs } => {
                 let l = self.instantiate(sig, lhs, subst);
                 let l = self.reduce(sig, l);
                 let r = self.instantiate(sig, rhs, subst);
                 let r = self.reduce(sig, r);
-                self.deep_equal(l, r)
+                self.deep_equal(l, r) && self.solve_condition(sig, condition, i + 1, subst)
             }
-            ConditionFragment::SortTest { term, sort } => {
+            CompiledFragment::SortTest { term, sort } => {
                 let t = self.instantiate(sig, term, subst);
                 let t = self.reduce(sig, t);
                 sig.sorts().leq(self.node(t).sort, *sort)
+                    && self.solve_condition(sig, condition, i + 1, subst)
+            }
+            CompiledFragment::Matching { pattern, subject, fresh_vars } => {
+                let subj = self.instantiate(sig, subject, subst);
+                let subj = self.reduce(sig, subj);
+                for &fv in fresh_vars {
+                    subst.unbind(fv); // fresh slate, so a backtracking re-entry rebinds cleanly
+                }
+                let satisfied = match pattern.match_(self, sig, subj, subst, false) {
+                    Some(mut sp) => {
+                        let mut ok = false;
+                        while sp.next(self, sig, subst) {
+                            if self.solve_condition(sig, condition, i + 1, subst) {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        ok
+                    }
+                    None => false,
+                };
+                if !satisfied {
+                    for &fv in fresh_vars {
+                        subst.unbind(fv);
+                    }
+                }
+                satisfied
             }
         }
     }
@@ -2002,6 +2071,86 @@ mod tests {
         assert_eq!(build(&mut e, 1, 0), (pair, 1), "< s z, z > : Pair (condition fails), 1 rewrite");
         assert_eq!(build(&mut e, 0, 0), (goodpair, 2), "< z, z > : GoodPair, 2 rewrites");
         assert_eq!(build(&mut e, 1, 1), (goodpair, 3), "< s z, s z > : GoodPair, 3 rewrites");
+    }
+
+    /// B2.3d matching condition `:=` (== reference binary, `conformance/match-cond.maude` MATCH-COND):
+    /// `ceq pred(N) = M if s M := N` binds the fresh `M` by matching the pattern `s M` against `N`. The
+    /// `:=` match itself is not a rewrite (only the rhs application is); a non-matching subject (`z`)
+    /// fails the condition.
+    #[test]
+    fn matching_condition_binds_fresh_variable() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let pred = e.add_op("pred", vec![nat], nat);
+        // ceq pred(N) = M if s M := N .   (N = var 0, M = var 1, introduced fresh by the `:=`)
+        e.add_conditional_equation(
+            Term::op(pred, vec![Term::var(0, nat)]),
+            Term::var(1, nat),
+            2,
+            vec![ConditionFragment::Matching {
+                pattern: Term::op(s, vec![Term::var(1, nat)]),
+                subject: Term::var(0, nat),
+                fresh_vars: vec![1],
+            }],
+        );
+
+        for (input, expected) in [(2u32, 1u32), (1, 0)] {
+            e.reset_rewrites();
+            let n = numeral(&mut e, z, s, input);
+            let q = e.make_free(pred, vec![n]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), 1, "pred({input}): one rewrite (the := match is not counted)");
+            assert_eq!(decode(&e, r, z, s), expected, "pred({input}) = {expected}");
+        }
+
+        // pred(z): `s M := z` has no match → condition fails → no rewrite.
+        e.reset_rewrites();
+        let n0 = numeral(&mut e, z, s, 0);
+        let q0 = e.make_free(pred, vec![n0]);
+        let r0 = e.reduce(q0);
+        assert_eq!(e.rewrites(), 0, "pred(z): the matching condition fails");
+        assert_eq!(e.node(r0).symbol(), pred, "pred(z) is its own normal form");
+    }
+
+    /// B2.3d (== reference binary, MATCH-COND2): the matching subject itself reduces before the pattern
+    /// is matched. `ceq f(N) = M if s M := g(N)` with `eq g(N) = s s N`: f(0)=1 and f(1)=2, each 2
+    /// rewrites (g reduces once, then f→M).
+    #[test]
+    fn matching_condition_reduces_subject_first() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let g = e.add_op("g", vec![nat], nat);
+        let f = e.add_op("f", vec![nat], nat);
+        e.add_equation(Equation {
+            lhs: Term::op(g, vec![Term::var(0, nat)]), // g(N) = s s N
+            rhs: Term::op(s, vec![Term::op(s, vec![Term::var(0, nat)])]),
+            nr_vars: 1,
+        });
+        e.add_conditional_equation(
+            Term::op(f, vec![Term::var(0, nat)]), // ceq f(N) = M if s M := g(N)
+            Term::var(1, nat),
+            2,
+            vec![ConditionFragment::Matching {
+                pattern: Term::op(s, vec![Term::var(1, nat)]),
+                subject: Term::op(g, vec![Term::var(0, nat)]),
+                fresh_vars: vec![1],
+            }],
+        );
+
+        for (input, expected) in [(0u32, 1u32), (1, 2)] {
+            e.reset_rewrites();
+            let n = numeral(&mut e, z, s, input);
+            let q = e.make_free(f, vec![n]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), 2, "f({input}): g reduces (1) + f→M (1)");
+            assert_eq!(decode(&e, r, z, s), expected, "f({input}) = {expected}");
+        }
     }
 
     #[test]

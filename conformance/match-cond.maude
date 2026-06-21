@@ -1,0 +1,29 @@
+*** B2.3d matching-condition (:=) conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/match-cond.maude < /dev/null
+*** `s M := N` matches the pattern `s M` against (the reduced) N, binding M. Mirrors the engine.rs tests.
+
+fmod MATCH-COND is
+  sorts Nat .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op pred : Nat -> Nat .
+  vars N M : Nat .
+  ceq pred(N) = M if s M := N .
+endfm
+red pred(s s z) .        *** s z: s M := s s z binds M = s z
+red pred(s z) .          *** z
+red pred(z) .            *** pred(z): s M := z has no match, condition fails
+
+fmod MATCH-COND2 is
+  sorts Nat .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op g : Nat -> Nat .
+  op f : Nat -> Nat .
+  vars N M : Nat .
+  eq g(N) = s s N .
+  ceq f(N) = M if s M := g(N) .
+endfm
+*** The matching subject g(N) itself reduces (to s s N) before the pattern s M is matched against it.
+red f(z) .               *** s z: g(z) = s s z, s M := s s z, M = s z
+red f(s z) .             *** s s z: g(s z) = s s s z, M = s s z
