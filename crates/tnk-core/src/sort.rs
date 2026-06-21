@@ -38,6 +38,9 @@ pub struct Sorts {
     up: Vec<Vec<SortId>>,
     /// Computed: `geq[s]` = every `x` with `s <= x` (includes `s` and `s`'s kind error sort).
     geq: Vec<BTreeSet<SortId>>,
+    /// Computed: `leqs[r]` = every `y` with `y <= r` — the **down-set** of `r` (Maude's
+    /// `Sort::getLeqSorts`). The inverse of `geq`; the key B2's least-sort resolution intersects.
+    leqs: Vec<BTreeSet<SortId>>,
     kind_of: Vec<KindId>,
     closed: bool,
 }
@@ -88,6 +91,14 @@ impl Sorts {
     pub fn leq(&self, a: SortId, b: SortId) -> bool {
         debug_assert!(self.closed, "leq before close()");
         self.geq[a.index()].contains(&b)
+    }
+
+    /// The **down-set** of `s`: every sort `y` with `y <= s` (Maude's `Sort::getLeqSorts`). B2's
+    /// least-sort resolution intersects these to find the GLB-with-earliest-declaration-tie-break.
+    /// Requires [`close`](Self::close).
+    pub(crate) fn down_set(&self, s: SortId) -> &BTreeSet<SortId> {
+        debug_assert!(self.closed, "down_set before close()");
+        &self.leqs[s.index()]
     }
 
     /// `true` if `a` and `b` are in the same kind (connected component).
@@ -178,7 +189,17 @@ impl Sorts {
             geq[k.error.index()].insert(k.error);
         }
 
+        // 6. Invert `geq` into down-sets: `leqs[r] = { y : y <= r }` (since `y <= r` iff `r ∈ geq[y]`).
+        let mut leqs: Vec<BTreeSet<SortId>> = vec![BTreeSet::new(); n];
+        for (y, up) in geq.iter().enumerate() {
+            let yid = Id::<Sort>::from_raw(y as u32);
+            for &r in up {
+                leqs[r.index()].insert(yid);
+            }
+        }
+
         self.geq = geq;
+        self.leqs = leqs;
         self.kind_of = kind_of_full;
         self.closed = true;
     }

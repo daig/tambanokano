@@ -1,0 +1,54 @@
+*** B2.1 least-sort-under-overloading conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/overload.maude < /dev/null
+*** The printed `result <Sort>:` line is the least sort. Mirrors the engine.rs B2.1 tests.
+
+fmod OVERLOAD-SORT is
+  sorts Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor] .
+  op _+_ : Nat Nat -> Nat .
+  op _+_ : NzNat NzNat -> NzNat .
+endfm
+*** Pure least sort, no equations: result is the term with its sort.
+red 0 .              *** Zero
+red s 0 .            *** NzNat
+red s 0 + s 0 .      *** NzNat: both args NzNat
+red 0 + s 0 .        *** Nat: Zero is not <= NzNat
+red 0 + 0 .          *** Nat
+
+fmod OVERLOAD-RED is
+  sorts Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor] .
+  op _+_ : Nat Nat -> Nat .
+  op _+_ : NzNat NzNat -> NzNat .
+  vars M N : Nat .
+  eq M + 0 = M .
+  eq M + s N = s (M + N) .
+endfm
+*** Overloading plus equations: result sort and rewrite count co-vary.
+red s 0 + s 0 .      *** s s 0 : NzNat, 2 rewrites
+red 0 + 0 .          *** 0 : Zero, 1 rewrite
+
+fmod OVERLOAD-ERR is
+  sorts Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor] .
+  op _+_ : NzNat NzNat -> NzNat .
+endfm
+*** No applicable declaration: the kind's error sort.
+red 0 + 0 .          *** error sort: Zero is not <= NzNat
+red s 0 + s 0 .      *** NzNat
+
+fmod OVERLOAD-PREREG is
+  sorts A B Top .
+  subsorts A B < Top .
+  op c : -> A .
+  op f : A -> A .
+  op f : A -> B .
+endfm
+*** Non-preregular: incomparable ranges, the earliest declaration wins.
+red f(c) .           *** A

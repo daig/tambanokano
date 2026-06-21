@@ -15,7 +15,7 @@ use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
-use crate::symbol::{Axioms, Symbol, SymbolId, Theory};
+use crate::symbol::{Axioms, OpDeclaration, Symbol, SymbolId, Theory};
 use crate::term::{Equation, Subst, Term};
 use crate::theory::LhsAutomaton;
 use std::cmp::Ordering;
@@ -134,8 +134,7 @@ impl Signature {
     ) -> SymbolId {
         self.symbols.alloc(Symbol {
             name: name.into(),
-            domain,
-            range,
+            decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms::default(),
             identity: None,
         })
@@ -155,8 +154,7 @@ impl Signature {
         assert_eq!(domain.len(), 2, "an `assoc comm` operator must be binary");
         self.symbols.alloc(Symbol {
             name: name.into(),
-            domain,
-            range,
+            decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: true, idem: false },
             identity,
         })
@@ -175,8 +173,7 @@ impl Signature {
         assert_eq!(domain.len(), 2, "an `assoc` operator must be binary");
         self.symbols.alloc(Symbol {
             name: name.into(),
-            domain,
-            range,
+            decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: false, idem: false },
             identity,
         })
@@ -196,14 +193,101 @@ impl Signature {
         assert_eq!(domain.len(), 2, "a `comm` operator must be binary");
         self.symbols.alloc(Symbol {
             name: name.into(),
-            domain,
-            range,
+            decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: false, comm: true, idem },
             identity,
         })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
+    }
+
+    /// Attach an additional declaration to an existing operator (ad-hoc / subsort overloading). All
+    /// declarations of an operator must agree on arity; least-sort resolution walks them in the order
+    /// added, so the *original* `add_op*` declaration stays first (the tie-break favours it). Must be
+    /// called before any node of `sym` is built (sorts are cached at construction). The parser (B4) is
+    /// the eventual real source; this is the hand-built-module entry point.
+    pub(crate) fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
+        let s = self.symbols.get_mut(sym);
+        assert_eq!(
+            s.decls[0].domain.len(),
+            domain.len(),
+            "overloaded declarations of `{}` must agree on arity",
+            s.name()
+        );
+        s.decls.push(OpDeclaration { domain, range, ctor: false });
+    }
+
+    /// Least sort of `symbol(args…)` whose arguments have sorts `arg_sorts`, under multi-declaration
+    /// overloading — Maude's `findMinSortIndex` (sortTable.cc:369). The least sort is the minimum of
+    /// the *applicable* declarations' range sorts (a declaration is applicable iff every `arg_sorts[i]
+    /// <= decl.domain[i]`), breaking incomparable (non-preregular) ties toward the **earliest**
+    /// declaration. Reproduced directly by intersecting range **down-sets** in declaration order
+    /// (correctness-first; the flattened sort-diagram decision table is a later perf step). No
+    /// applicable declaration → the error sort of the range's kind.
+    pub(crate) fn compute_sort(&self, symbol: SymbolId, arg_sorts: &[SortId]) -> SortId {
+        self.compute_sort_uniq(symbol, arg_sorts).0
+    }
+
+    /// [`compute_sort`](Self::compute_sort) plus the **preregularity** bit: `true` iff the least sort
+    /// is unique (the running down-set intersection equals the chosen range's down-set — Maude's
+    /// `unique` flag). Maude *warns* when this is false; we compute it but defer the user-facing
+    /// warning (no diagnostics sink yet) — the tie-break itself is exercised by conformance.
+    pub(crate) fn compute_sort_uniq(&self, symbol: SymbolId, arg_sorts: &[SortId]) -> (SortId, bool) {
+        let decls = self.symbols.get(symbol).decls();
+        assert_eq!(
+            arg_sorts.len(),
+            decls[0].domain.len(),
+            "arity mismatch building `{}`",
+            self.symbols.get(symbol).name()
+        );
+        debug_assert!(
+            decls.iter().all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
+            "cross-kind ad-hoc overloading of `{}` is not yet supported (a B2 follow-up): the args, \
+             not the range, would select the declaration group",
+            self.symbols.get(symbol).name()
+        );
+        // Walk declarations in order, intersecting applicable range down-sets. `running` is the
+        // down-set of the GLB so far; `min_range` is the earliest range that is <= everything so far.
+        let mut min_range: Option<SortId> = None;
+        let mut running: Option<std::collections::BTreeSet<SortId>> = None;
+        for d in decls {
+            if !arg_sorts.iter().zip(&d.domain).all(|(&a, &dom)| self.sorts.leq(a, dom)) {
+                continue; // declaration not applicable to these argument sorts
+            }
+            let down = self.sorts.down_set(d.range);
+            match &mut running {
+                None => {
+                    running = Some(down.clone());
+                    min_range = Some(d.range);
+                }
+                Some(r) => {
+                    r.retain(|x| down.contains(x)); // intersect with this range's down-set
+                    if *r == *down {
+                        min_range = Some(d.range); // d.range <= everything so far ⇒ new minimum
+                    }
+                }
+            }
+        }
+        match min_range {
+            // unique iff the GLB's down-set (`running`) equals the chosen min's down-set ⇒ min is the GLB.
+            Some(r) => (r, running.as_ref() == Some(self.sorts.down_set(r))),
+            None => (self.sorts.error_sort(self.sorts.kind_of(decls[0].range)), true),
+        }
+    }
+
+    /// Least sort of a theory (ACU/AU/CUI) node, folding the **binary** [`compute_sort`](Self::compute_sort)
+    /// left-to-right over the canonical element sorts (Maude's `traverse(traverse(0, i1), i2)`). For the
+    /// single binary declaration `[D, D] -> R` every B1 / conformance operator carries, this returns `R`
+    /// iff all elements `<= D` (else the kind's error sort) — identical to the old per-theory
+    /// `compute_*_sort` — and extends to subsort-overloaded AC later with no reshape. `elem_sorts` is
+    /// non-empty (a canonical theory node holds ≥ 2 elements).
+    pub(crate) fn compute_sort_fold(&self, symbol: SymbolId, elem_sorts: &[SortId]) -> SortId {
+        let mut acc = elem_sorts[0];
+        for &e in &elem_sorts[1..] {
+            acc = self.compute_sort(symbol, &[acc, e]);
+        }
+        acc
     }
 
     /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
@@ -251,36 +335,21 @@ impl Runtime {
         symbol: SymbolId,
         args: Vec<DagId>,
     ) -> DagId {
-        let sort = self.compute_free_sort(sig, symbol, &args);
+        // Keep the old `compute_free_sort` theory guard verbatim — its message must still name
+        // `make_acu` (see `make_free_on_ac_operator_panics`); the arity check now lives in `compute_sort`.
+        assert_eq!(
+            sig.symbol(symbol).theory(),
+            Theory::Free,
+            "`{}` is an ACU operator — build it with make_acu/make_ac, not make_free",
+            sig.symbol(symbol).name()
+        );
+        let arg_sorts: Vec<SortId> = args.iter().map(|&a| self.dags.get(a).sort).collect();
+        let sort = sig.compute_sort(symbol, &arg_sorts);
         self.alloc_node(sort, NodeTerm::Free { symbol, args })
     }
     /// Convenience for a constant (an arity-0 symbol).
     pub(crate) fn make_const(&mut self, sig: &Signature, symbol: SymbolId) -> DagId {
         self.make_free(sig, symbol, Vec::new())
-    }
-
-    /// Phase-0 sort computation for a free node: if every argument's sort is `<=` the declared
-    /// domain sort the node gets the operator's `range`; otherwise it lands in the error/top sort
-    /// of `range`'s kind. (Overloaded least-sort via a sort diagram arrives in B2.)
-    fn compute_free_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
-        let sym = sig.symbols.get(symbol);
-        assert_eq!(
-            sym.theory(),
-            Theory::Free,
-            "`{}` is an ACU operator — build it with make_acu/make_ac, not make_free",
-            sym.name
-        );
-        assert_eq!(sym.arity(), args.len(), "arity mismatch building `{}`", sym.name);
-        let well_sorted = sym
-            .domain
-            .iter()
-            .zip(args)
-            .all(|(&dom, &arg)| sig.sorts.leq(self.dags.get(arg).sort, dom));
-        if well_sorted {
-            sym.range
-        } else {
-            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
-        }
     }
 
     /// Build a canonical **ACU** node for `symbol` from `raw_args` (`(element, multiplicity)` pairs).
@@ -338,7 +407,13 @@ impl Runtime {
             }
             1 => args[0].0, // exactly one element, multiplicity 1 — never wrap a lone argument
             _ => {
-                let sort = self.compute_acu_sort(sig, symbol, &args);
+                // Fold the binary least-sort over the multiset elements (with multiplicity repeats),
+                // mirroring Maude's `traverse(traverse(0, i1), i2)` over the flattened arguments.
+                let elem_sorts: Vec<SortId> = args
+                    .iter()
+                    .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
+                    .collect();
+                let sort = sig.compute_sort_fold(symbol, &elem_sorts);
                 self.alloc_node(sort, NodeTerm::Acu { symbol, args })
             }
         }
@@ -371,21 +446,10 @@ impl Runtime {
             }
             1 => args[0],
             _ => {
-                let sort = self.compute_au_sort(sig, symbol, &args);
+                let elem_sorts: Vec<SortId> = args.iter().map(|&e| self.dags.get(e).sort).collect();
+                let sort = sig.compute_sort_fold(symbol, &elem_sorts);
                 self.alloc_node(sort, NodeTerm::Au { symbol, args })
             }
-        }
-    }
-
-    /// Sort of an AU node (first cut, mirroring [`compute_acu_sort`](Self::compute_acu_sort)).
-    fn compute_au_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
-        let sym = sig.symbols.get(symbol);
-        let dom = sym.domain[0];
-        let well_sorted = args.iter().all(|&e| sig.sorts.leq(self.dags.get(e).sort, dom));
-        if well_sorted {
-            sym.range
-        } else {
-            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
         }
     }
 
@@ -418,21 +482,8 @@ impl Runtime {
         if self.dag_compare(x, y) == Ordering::Greater {
             std::mem::swap(&mut x, &mut y); // canonical order for commutativity
         }
-        let sort = self.compute_cui_sort(sig, symbol, x, y);
+        let sort = sig.compute_sort(symbol, &[self.dags.get(x).sort, self.dags.get(y).sort]);
         self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
-    }
-
-    /// Sort of a CUI node (first cut, mirroring [`compute_acu_sort`](Self::compute_acu_sort)).
-    fn compute_cui_sort(&self, sig: &Signature, symbol: SymbolId, x: DagId, y: DagId) -> SortId {
-        let sym = sig.symbols.get(symbol);
-        let dom = sym.domain[0];
-        let well_sorted = sig.sorts.leq(self.dags.get(x).sort, dom)
-            && sig.sorts.leq(self.dags.get(y).sort, dom);
-        if well_sorted {
-            sym.range
-        } else {
-            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
-        }
     }
 
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
@@ -458,20 +509,6 @@ impl Runtime {
             &self.dags.get(arg).term,
             NodeTerm::Free { symbol, args } if *symbol == id_sym && args.is_empty()
         )
-    }
-
-    /// Sort of an ACU node (first cut, mirroring [`compute_free_sort`](Self::compute_free_sort)): if
-    /// every element's sort is `<=` the operator's argument-sort the node gets the operator's `range`,
-    /// else the error/top sort of `range`'s kind. (Preregularity / least-sort *modulo axioms* is B2.)
-    fn compute_acu_sort(&self, sig: &Signature, symbol: SymbolId, args: &[(DagId, u32)]) -> SortId {
-        let sym = sig.symbols.get(symbol);
-        let dom = sym.domain[0]; // an ACU operator is binary with a single argument sort
-        let well_sorted = args.iter().all(|&(e, _)| sig.sorts.leq(self.dags.get(e).sort, dom));
-        if well_sorted {
-            sym.range
-        } else {
-            sig.sorts.error_sort(sig.sorts.kind_of(sym.range))
-        }
     }
 
     /// A **total order** on DAG nodes, consistent with structural (modulo-AC) equality — i.e.
@@ -831,6 +868,15 @@ impl Engine {
         self.sig.add_op(name, domain, range)
     }
 
+    /// Attach an additional declaration to an existing operator (ad-hoc / subsort overloading); the
+    /// least sort of an application is then resolved across all of them. Declarations must agree on
+    /// arity and are tried in the order added (the original `add_op*` declaration stays first — the
+    /// tie-break favours it). Add all declarations before building any node of `sym` (sorts cache at
+    /// construction).
+    pub fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
+        self.sig.add_op_decl(sym, domain, range);
+    }
+
     /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). Must be binary;
     /// `identity` is the constant symbol declared as `id: <const>`, or `None`. The operator's
     /// arguments are stored flattened as a canonical multiset and matched/rewritten modulo AC(+U).
@@ -1079,6 +1125,129 @@ mod tests {
         assert_eq!(e.sort_of(n0), zero);
         assert_eq!(e.sort_of(n1), nznat);
         assert_eq!(e.sort_of(sum), nat);
+    }
+
+    /// B2.1 least sort under multi-declaration overloading (== reference binary,
+    /// `conformance/overload.maude` OVERLOAD-SORT): `_+_` is overloaded `Nat Nat -> Nat` *and*
+    /// `NzNat NzNat -> NzNat`; the least sort of an application is resolved across both declarations.
+    #[test]
+    fn overloaded_operator_least_sort() {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op("s", vec![nat], nznat);
+        let plus = e.add_op("+", vec![nat, nat], nat); // decl 0: Nat Nat -> Nat
+        e.add_op_decl(plus, vec![nznat, nznat], nznat); // decl 1: NzNat NzNat -> NzNat
+
+        let n0 = e.make_const(z); // 0 : Zero
+        let s0 = e.make_free(s, vec![n0]); // s 0 : NzNat
+        assert_eq!(e.sort_of(n0), zero, "0 : Zero");
+        assert_eq!(e.sort_of(s0), nznat, "s 0 : NzNat");
+        // s0 / n0 are reused as shared children below (a genuine DAG share).
+        let s0_plus_s0 = e.make_free(plus, vec![s0, s0]);
+        assert_eq!(e.sort_of(s0_plus_s0), nznat, "s 0 + s 0 : NzNat (both args NzNat)");
+        let zero_plus_s0 = e.make_free(plus, vec![n0, s0]);
+        assert_eq!(e.sort_of(zero_plus_s0), nat, "0 + s 0 : Nat (Zero is not <= NzNat)");
+        let zero_plus_zero = e.make_free(plus, vec![n0, n0]);
+        assert_eq!(e.sort_of(zero_plus_zero), nat, "0 + 0 : Nat");
+    }
+
+    /// B2.1 (== reference binary, OVERLOAD-RED): overloading + equations — the result's least sort and
+    /// the rewrite count co-vary. `s 0 + s 0` → `s s 0 : NzNat` (2 rewrites); `0 + 0` → `0 : Zero`
+    /// (1 rewrite, the result re-sorts *down* from Nat to Zero).
+    #[test]
+    fn overloaded_operator_reduce_and_resort() {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op("s", vec![nat], nznat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.add_op_decl(plus, vec![nznat, nznat], nznat);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(z)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+
+        let z0 = e.make_const(z);
+        let s0a = e.make_free(s, vec![z0]);
+        let s0b = e.make_free(s, vec![z0]);
+        let sum = e.make_free(plus, vec![s0a, s0b]); // s 0 + s 0
+        let r = e.reduce(sum);
+        assert_eq!(e.rewrites(), 2, "s 0 + s 0 = s s 0 in 2 rewrites");
+        assert_eq!(e.sort_of(r), nznat, "result s s 0 : NzNat");
+        assert_eq!(e.node(r).symbol(), s, "result is an s_ application");
+
+        e.reset_rewrites();
+        let (z1, z2) = (e.make_const(z), e.make_const(z));
+        let zz = e.make_free(plus, vec![z1, z2]); // 0 + 0
+        assert_eq!(e.sort_of(zz), nat, "0 + 0 : Nat before reduction");
+        let r2 = e.reduce(zz);
+        assert_eq!(e.rewrites(), 1, "0 + 0 = 0 in 1 rewrite");
+        assert_eq!(e.sort_of(r2), zero, "result 0 : Zero (re-sorted down)");
+    }
+
+    /// B2.1 (== reference binary, OVERLOAD-ERR): no applicable declaration → the kind's error sort
+    /// (and the ill-sorted term does not rewrite). Only `_+_ : NzNat NzNat -> NzNat` is declared, so
+    /// `0 + 0` (Zero arguments) has no applicable declaration.
+    #[test]
+    fn overloaded_operator_no_applicable_decl_is_error_sort() {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op("s", vec![nat], nznat);
+        let plus = e.add_op("+", vec![nznat, nznat], nznat); // ONLY NzNat NzNat -> NzNat
+
+        let (z1, z2) = (e.make_const(z), e.make_const(z));
+        let zz = e.make_free(plus, vec![z1, z2]); // 0 + 0 : no decl applies
+        assert!(e.sorts().sort(e.sort_of(zz)).is_error, "0 + 0 lands in the error sort");
+
+        let z0 = e.make_const(z);
+        let s0a = e.make_free(s, vec![z0]);
+        let s0b = e.make_free(s, vec![z0]);
+        let ss = e.make_free(plus, vec![s0a, s0b]); // s 0 + s 0 : NzNat
+        assert_eq!(e.sort_of(ss), nznat, "s 0 + s 0 : NzNat (the one declaration applies)");
+    }
+
+    /// B2.1 (== reference binary, OVERLOAD-PREREG): a non-preregular operator (`f : A -> A` and
+    /// `f : A -> B` with A, B incomparable) — Maude warns and assigns the least sort by the **earliest
+    /// declaration**. We reproduce the tie-break (the warning itself is deferred): `f(c) : A`.
+    #[test]
+    fn non_preregular_overload_breaks_toward_earliest_declaration() {
+        let mut e = Engine::new();
+        let a = e.add_sort("A");
+        let b = e.add_sort("B");
+        let top = e.add_sort("Top");
+        e.add_subsort(a, top);
+        e.add_subsort(b, top);
+        e.close_sorts();
+        let c = e.add_op("c", vec![], a);
+        let f = e.add_op("f", vec![a], a); // decl 0: A -> A
+        e.add_op_decl(f, vec![a], b); // decl 1: A -> B (incomparable range)
+
+        let c0 = e.make_const(c);
+        let fc = e.make_free(f, vec![c0]);
+        assert_eq!(e.sort_of(fc), a, "f(c) : A — the earliest of the two incomparable declarations");
     }
 
     #[test]

@@ -44,11 +44,27 @@ pub(crate) enum Theory {
     Cui,
 }
 
+/// One operator declaration: argument sorts (`domain`) → `range`, plus whether it is a constructor
+/// (`[ctor]`). An operator may carry several declarations (ad-hoc / subsort overloading); the least
+/// sort of an application is resolved across all of them (`Signature::compute_sort`). `ctor` is
+/// carried now and consumed when the constructor diagram lands (a later B2 sub-step).
+#[derive(Debug, Clone)]
+pub(crate) struct OpDeclaration {
+    pub domain: Vec<SortId>,
+    pub range: SortId,
+    /// `[ctor]` flag. Carried now, consumed when the constructor diagram / sufficient-completeness
+    /// lands (a later B2 sub-step); inert — hence unread — this increment.
+    #[allow(dead_code)]
+    pub ctor: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub(crate) name: String,
-    pub(crate) domain: Vec<SortId>,
-    pub(crate) range: SortId,
+    /// Operator declarations (≥ 1; the first is the original). Overloads share name + arity; sort
+    /// resolution walks them **in declaration order**, so order is load-bearing for the
+    /// non-preregular least-sort tie-break.
+    pub(crate) decls: Vec<OpDeclaration>,
     /// The structural axioms this operator is declared with.
     pub(crate) axioms: Axioms,
     /// The operator's two-sided identity (`id: <term>`), if any. Stored as the **constant** symbol
@@ -63,7 +79,12 @@ impl Symbol {
         &self.name
     }
     pub fn arity(&self) -> usize {
-        self.domain.len()
+        self.decls[0].domain.len()
+    }
+
+    /// The operator's declarations (≥ 1); least-sort resolution walks them in declaration order.
+    pub(crate) fn decls(&self) -> &[OpDeclaration] {
+        &self.decls
     }
 
     /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
