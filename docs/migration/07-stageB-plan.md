@@ -6,22 +6,26 @@ foundation reshape, review Tier 2) is **complete and adversarially reviewed**; t
 supersedes `06-phase1-plan.md` §3–§4 for the breadth work (`06` remains the Phase-1 overview; its §3
 Stage A is now done).
 
-> **STATUS (2026-06-20).** The Stage-A **audit** is done (verdict GO; findings F-1…F-4 — **F-3**
-> ExtensionInfo and **F-4** `Subst` unbind were closed in B1, **F-1** no-op guard is moot for the
-> theories, **F-2 is outstanding**: safe-point GC's root set is local to one `reduce` invocation, so it
-> must become engine-global *before* release-mode safe-point GC meets B2's nested condition-reduce — see
-> §4). **B1's structural equational theories — ACU, AU, CUI — are DONE** (on `main`, commits
-> `c10bf0e..e4ea879`, every lock conformance-verified vs the binary); **S and NA are deferred to B3**
-> (they need bignums / built-in data). §1 below is refreshed to the **as-built post-B1** seams. **NEXT: B2.**
+> **STATUS (2026-06-21) — STAGE B2 COMPLETE. NEXT: B3.** B1 (structural theories) and B2 (the
+> order-sorted / membership / conditional / attribute layer) are both **done on `main`**, every lock
+> conformance-verified vs the reference binary (**79 tests**, clippy `-D warnings` clean, `fib(22) =
+> 186579` and ~7.5 M rw/s intact throughout). §1 (as-built seams) and §2 B1/B2 below are refreshed to the
+> as-built state; §2 B3–B5 are the **unchanged forward plan** (the seams they plug into did not move).
+> Commit trail `23d6fd4..7d09469` (F-A guard + B2.1…B2.4). **Audit findings:** F-3/F-4 closed in B1; F-A
+> (below) closed by a loud guard; **F-1** (no-op rewrite guard) still genuinely unimplemented — moot for
+> the locked theories, revisit if a self-rewriting `eq a = a` becomes reachable; **F-2** (nested-reduce GC
+> root set) is now **mitigated** (GC disabled during condition eval, B2.3) but **not fully closed** — the
+> engine-global active-frame root set is still required before release-mode safe-point GC runs with
+> conditions (§4).
 >
-> **Post-B1 audit (2026-06-20):** re-ran every `conformance/*.maude` lock against the reference binary
+> **History — post-B1 audit (2026-06-20):** re-ran every `conformance/*.maude` lock against the binary
 > (all TRUE) and read the full kernel; found one *new* gap — **F-A**: a theory-rooted (ACU/AU/CUI)
 > subterm under a *free* operator (or a theory ground subterm under a theory op) *silently* failed to
 > match, leaving its equation quietly dead — the asymmetric twin of the loud alien-under-AC assert.
 > **Closed with a loud guard** (`Term::is_free_matchable`, enforced in `LhsAutomaton::compile` + the
-> ACU/AU/CUI compilers; 63 tests); the cross-theory `Sequence` composition itself stays deferred (below).
-> F-1's no-op guard is genuinely **unimplemented** — moot for B1's locked theories, but revisit when B2
-> adds conditional/`owise` equations. F-2 unchanged (still the pre-release-safe-point-GC item, §4).
+> ACU/AU/CUI compilers); the cross-theory `Sequence` composition itself stays deferred (§2 B1). The
+> Stage-A audit verdict was GO (F-3 ExtensionInfo / F-4 `Subst` unbind closed in B1; S and NA deferred to
+> B3 — they need bignums / built-in data).
 
 ---
 
@@ -41,11 +45,14 @@ the meta half is Phase 3), `A4` (B4 parser), `A5` (B5 modules+REPL — *non-para
 parameterization is Phase 2). Decisions: `03-open-decisions.md` (D1–D8; **D2 resolved** = 4-byte
 release handle; D4 `malachite`).
 
-**The code:** `crates/tnk-core` (Stage A + B1 structural theories as-built). Sanity check before starting:
-- `cargo test -p tnk-core` → **60 pass** (post-B1 ACU/AU/CUI); `cargo clippy --all-targets -- -D warnings` → clean.
-- `cargo run --release --example peano` → `fib(20)` ≈ **8 M rewrites/s** (free theory), GC mark ≈ 350 M nodes/s.
+**The code:** `crates/tnk-core` (Stage A + B1 theories + B2 sorts/memberships/conditions/attrs as-built).
+Sanity check before starting:
+- `cargo test -p tnk-core` → **79 pass** (post-B2); `cargo clippy --all-targets -- -D warnings` → clean.
+- `cargo run --release --example peano` → `fib(20)` ≈ **7.5 M rewrites/s** (free theory; B2's sort path is
+  fast-pathed for single-declaration ops so the free hot path is unregressed), GC mark ≈ 270–350 M nodes/s.
 - `cargo run --release --example peano 22 1 100` → `fib(22) = 17711 (186579 rewrites)` == reference.
-- ACU/AU/CUI conformance: `conformance/{acu-match,acu-reduce,au,cui}.maude` == reference binary.
+- Conformance: `conformance/{acu-match,acu-reduce,au,cui}.maude` (B1) + `{overload,membership,conditional,
+  owise,cmb,match-cond,strat}.maude` (B2) == reference binary.
 
 **The memory:** `maude-rust-migration.md` (status, the Stage-A commit map, this agenda in brief).
 
@@ -140,15 +147,15 @@ already trace via the visitor; nothing in A2 needs changing for B.
 depth, author-controlled — superseded by B1's compiled automata for the hot path). B reductions inherit
 this loop unchanged.
 
-### 1.6 Placeholders Stage B explicitly replaces (do not entrench)
-| As-built (Stage A) | Replaced by |
-|---|---|
-| `Engine::compute_free_sort` (sort = op `range`, else kind error sort) | **B2** per-symbol **sort decision diagram** (least sort, preregularity, overloading) |
-| `Symbol { name, domain, range }` — *one* declaration | **B2** multi-declaration `Symbol` + diagram handle (ad-hoc/subsort overloading) |
-| `NodeTerm { Free, Acu, Au, Cui }` (B1 done) | **B3** adds `S`/`Na` arms + a built-in/number arm |
-| `Equation { lhs, rhs, nr_vars }` (unconditional) | **B2** conditional `eq`/`ceq` + memberships `mb`/`cmb`; op/stmt attributes |
-| no built-ins | **B3** `enum SpecialOp` bound from `special(id-hook …)`; `malachite` bignums |
-| hand-built modules in tests | **B4** parser + **B5** module system load `.maude` text |
+### 1.6 Placeholders Stage B replaces — B1/B2 status
+| Placeholder (Stage A) | Replaced by | Status |
+|---|---|---|
+| `Engine::compute_free_sort` (sort = op `range`, else kind error sort) | **B2.1** least sort under overloading — `Signature::compute_sort` (`findMinSortIndex`: down-set GLB + earliest-decl tie-break) | **DONE** (the flattened sort-*diagram* decision table is a deferred perf step — correctness-first iteration for now) |
+| `Symbol { name, domain, range }` — *one* declaration | **B2.1** `Symbol { decls: Vec<OpDeclaration{domain,range,ctor}>, …, strategy }` + `add_op_decl` | **DONE** (no "diagram handle" — the down-set method needs none) |
+| `Equation { lhs, rhs, nr_vars }` (unconditional) | **B2.2/B2.3** memberships `mb`/`cmb`; conditional `ceq` + `owise`; **B2.4** op attributes (`ctor`/`strat`) | **DONE** (rewrite `=>` conditions → Phase 2; `frozen`/`memo` deferred) |
+| `NodeTerm { Free, Acu, Au, Cui }` (B1 done) | **B3** adds `S`/`Na` arms + a built-in/number arm | B3 |
+| no built-ins | **B3** `enum SpecialOp` bound from `special(id-hook …)`; `malachite` bignums | B3 |
+| hand-built modules in tests | **B4** parser + **B5** module system load `.maude` text | B4/B5 |
 
 ---
 
@@ -187,31 +194,54 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   fidelity — all locked by differential tests. Remaining: flat↔tree switch + persistent-structure/GC
   interplay (deferred); S/NA's bignum + built-in coupling (handled in B3).
 
-### B2 — Sort decision diagram + memberships + conditional logic + operator attributes
-- **Goal:** correct least sorts under overloading; conditional equations/memberships; op attributes.
-- **Plugs into:** §1.1 (`reduce(&Signature, &mut Runtime)` evaluates conditions while the eq table is
-  borrowed); §1.2 (the `while sp.next` condition-check + backtrack); replaces §1.6 `compute_free_sort`.
-- **What's new:** per-symbol **sort decision diagram** (`findMinSortIndex`, preregularity, *preregularity
-  modulo axioms*); **multi-declaration `Symbol`** (ad-hoc/subsort overloading) + the "earliest
-  declaration" least-sort tie-break; memberships (`mb`/`cmb`); conditional equations (`ceq` — the
-  condition is a list of fragments: equational, sort-test, matching, [rule for Phase 2]); operator
-  attributes (`ctor`, `strat`, `memo`, `frozen`, `owise`, `special`, `assoc/comm/id:/idem` → wire to B1).
-  `Equation`/`CompiledEquation` gain a condition; `Symbol` gains `Vec<OpDeclaration>` + a diagram handle;
-  `leq` likely moves to `fixedbitset` (R3 M2).
-- **Done-when:** overloaded/subsorted modules get the right least sorts (conform to the binary's `sort`/
-  `parse` output); a conditional functional module reduces correctly with the right rewrite counts;
-  `owise`/`strat`/`frozen`/`memo` behave per the manual.
-- **Refs:** `A3` (whole report); arch-map L1 + decision #2/#3; review R3 M2 (multi-decl + bitset).
-- **Risks:** least-sort "earliest declaration" must match Maude exactly (a watch-item); condition
-  evaluation re-entering reduction (the A4 borrow home is the enabler — confirm no per-step clones);
-  `owise` semantics; preregularity-modulo-axioms once B1's AC sorts exist.
+### B2 — Order-sorted least sorts + memberships + conditional logic + operator attributes — **DONE**
+- **Goal:** correct least sorts under overloading; conditional equations/memberships; op attributes. ✅
+- **Plugs into:** §1.1 (`reduce` evaluates conditions while the eq table stays borrowed); §1.2 (the
+  `while sp.next` condition-check + backtrack); replaced §1.6 `compute_free_sort`.
+- **DONE (on `main`, `f83bf7d..7d09469`), per sub-step:**
+  - **B2.1 overloading** (`f83bf7d`): `Symbol{decls: Vec<OpDeclaration>}` + `add_op_decl`;
+    `Signature::compute_sort` = Maude's `findMinSortIndex` (the **minimum of applicable declarations'
+    ranges via down-set intersection**, `Sorts::leqs` inverted from `geq` at `close()`, with the
+    **earliest-declaration** tie-break for non-preregular ops); theory nodes fold the binary `compute_sort`
+    over their element sorts. *Deviation from "sort decision diagram":* correctness-first **direct
+    iteration**, not the flattened decision table (a perf follow-up); the `unique`/preregularity bit is
+    computed but the user-facing **warning is deferred** (no diagnostics sink yet). Single-kind overloading
+    only (cross-kind ad-hoc → arg-driven kind selection is a follow-up, `debug_assert`-guarded).
+  - **B2.2 memberships `mb`** (`f43e158`): per-symbol `SortConstraint` table (smallest-target-sort first);
+    `constrain_to_smaller_sort` lowers a node's least sort at construction to a fixpoint, **each
+    application counted as a rewrite** (Maude accounting). Gated by `memberships.is_empty()` so the free
+    hot path is untouched.
+  - **B2.3 conditional logic** (`b90447d` ceq / `f36dfc5` owise / `3bfed04` cmb / `99d2bd8` `:=`):
+    `CompiledEquation`/`SortConstraint` gain a condition; a recursive **backtracking `solve_condition`**
+    (Maude `solveCondition`) over fragment kinds **equality / sort-test / matching `:=`** (the `:=` pattern
+    compiles to an `LhsAutomaton`, binds fresh vars, backtracks); `owise` via a two-phase `try_equations`
+    (non-owise first); `cmb` reuses the condition machinery. *Condition reductions are re-entrant and
+    count* (`max(2,1)` = 5 rewrites — the failed first condition is re-reduced for the second equation).
+    **Rewrite `=>` condition → Phase 2 (rules).**
+  - **B2.4 attributes** (`7d09469`): **`ctor`** wired (`OpDeclaration.ctor` + `is_constructor`) — metadata,
+    inert for functional reduce (verified). **`strat`** (evaluation strategy): the reduce frame was
+    redesigned to `orig`+`args`+`cursor` querying `Signature::strat_position` per step — the **standard
+    path is identical** (fib + all locks intact), a custom strat leaves unlisted args unreduced (lazy
+    `if_then_else_fi`). **`frozen`** (blocks *rule* rewriting — inert for functional reduce) and **`memo`**
+    (pure perf cache) are deferred; the general (non-`(args… 0)`) strategy form is loud-asserted.
+- **Done-when (met):** overloaded/subsorted modules get the binary's `result <Sort>:`; conditional /
+  `owise` / `cmb` / `:=` modules reduce with the binary's exact rewrite counts; `strat` is lazy per the
+  manual. Locked by `conformance/{overload,membership,conditional,owise,cmb,match-cond,strat}.maude`.
+- **Refs:** `A3` (whole report); arch-map L1 + decision #2/#3.
+- **Carried-forward follow-ups (none block B3):** the flattened sort-diagram + preregularity *warning*;
+  cross-kind ad-hoc overloading; `leq`/down-sets `BTreeSet` → `fixedbitset` (R3 M2 — B2 stayed `BTreeSet`);
+  **F-2** the engine-global condition-reduce GC root set (mitigated, §4); `frozen`/`memo`; rewrite `=>`
+  conditions (Phase 2); `special` (→ B3, with the built-in seam).
 
 ### B3 — Built-in data types + bignums  *(now also hosts the **S** and **NA** theories — deferred from B1)*
 - **Goal:** `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` working — **plus the S (`iter`
   successor) and NA (atomic constant) theories**, deferred from B1 because they need bignums / built-in
   data respectively.
 - **Plugs into:** the §1.2 matcher seam + §1.3 visitor (new `NodeTerm::{S, Na}` arms — additive, exactly
-  as ACU/AU/CUI were); the symbol-reduction path; B2's attribute parsing (`special`, `iter`).
+  as ACU/AU/CUI were); the symbol-reduction path; **B2's attribute infrastructure** (`OpDeclaration` +
+  `Symbol.strategy` + the condition machinery — `special`/`iter` parsing itself is B3's own work, deferred
+  here with the built-in seam). The **lazy `strat` reduce frame from B2.4 is already the mechanism
+  `if_then_else_fi` needs** — B3 adds only the BOOL built-in + the operator's `strat (…)` declaration.
 - **What's new:**
   - **S theory** (`iter`): `NodeTerm::S { symbol, count, arg }` — `s^count(arg)` stored compactly with a
     **bignum** `count` (so `s^(10^9) 0` is O(1)); extension matching (`s^k` matches `s^n` for `k ≤ n`,
@@ -273,20 +303,26 @@ manual's worked examples (esp. **`xmatch`/`match` for B1**, `sort`/`parse` for B
 `.maude`, as Stage A did (e.g. the `fib(22) = 186579` lock).
 
 ## 4. Open decisions / risks specific to Stage B
-- **[AUDIT F-2 — fix before B2 + release safe-point GC] Nested-reduce GC root set.** `safe_point_gc`
-  marks only the *current* `reduce` call's frame stack + `child_result` + registry. B2 evaluates
-  conditions by calling `reduce` *inside* the `while sp.next` loop; that nested reduce's safe points
-  can't see the OUTER reduction's frames, the matcher's in-flight `Subst` bindings, or B1 residue nodes →
-  they would be swept (Maude marks from ALL active contexts). Make the in-flight root set
-  **engine-global** (the `Runtime` owns a stack of active reduce frames that every safe-point GC walks),
-  or root condition state via `RootGuard`. Harmless today (gc_interval off by default; no conditions).
+- **[AUDIT F-2 — MITIGATED in B2.3; full fix still owed before release safe-point GC + conditions]
+  Nested-reduce GC root set.** `safe_point_gc` marks only the *current* `reduce` call's frame stack
+  (`original` + `args`) + `child_result` + registry. B2.3 evaluates conditions by calling `reduce` *inside*
+  the `while sp.next` loop; that nested reduce's safe points can't see the OUTER reduction's frames /
+  matcher `Subst` / residue. **Mitigation in place (`b90447d`):** safe-point GC is **disabled during
+  condition evaluation** (`condition_holds` saves/clears `gc_interval`), so nothing collects in the
+  vulnerable window — a conditional reduce is identical with GC on or off (locked by a test). This is
+  *correct under all GC settings* but forfeits bounded-memory condition reduction. **Still owed:** make the
+  in-flight root set **engine-global** (the `Runtime` owns a stack of active reduce frames every
+  safe-point GC walks) so conditions can reduce under GC — needed before release-mode safe-point GC is
+  actually used with conditions.
 - **`Subproblem::next` borrow widening to `&mut Runtime`** — **DONE** in B1 (plus `build_result`).
 - **Persistent-structure crate** (`rpds` vs `im`) — only the **deferred** red-black `ACU_TreeDagNode`
   needs it; B1 ships the flat `Vec` rep. Pick when the tree rep lands (benchmark vs the GC/arena model;
   it must trace through the §1.3 visitor).
 - **Equality/compare dispatch** for the S-theory (scalar `count` ≠ child id) — `deep_equal`/`dag_compare`
   are not enough (§1.3). Add when **S lands in B3**.
-- **`leq` representation** (`BTreeSet` → `fixedbitset`) — with B2's larger sort sets (R3 M2).
+- **`leq` representation** (`BTreeSet` → `fixedbitset`) — **still open**; B2 kept `BTreeSet` and added the
+  down-set table (`Sorts::leqs`, also `BTreeSet`) for `compute_sort`. Migrate both together with B2's
+  larger sort sets (R3 M2) as a perf step.
 - **Parser ambiguity ordering** — observable; lock with differential tests (B4).
 - **Where built-in constants live** in `NodeTerm` (a `BuiltIn` arm vs per-type arms) — decide at B3.
 - **Solution-order fidelity beyond the locked cases** — the correctness-first matchers reproduce the
@@ -294,12 +330,16 @@ manual's worked examples (esp. **`xmatch`/`match` for B1**, `sort`/`parse` for B
   bounded `match[n]` is pinned only once Maude's Diophantine order is ported (a B1 perf follow-up).
 - The `gen-checks` release feature (D2) stays deferred unless release-mode safe-point GC is actually used.
 
-## 5. Suggested next moves (B1 structural theories done)
-1. Read §0 docs + run the §0 sanity checks (now **60 tests**; ACU/AU/CUI conformance green).
-2. **Open B2** — sort decision diagram + conditional equations + operator attributes (§2 B2). Conditions
-   exercise the solution-stream's condition path (§1.2); **first address audit F-2** (§4: the
-   nested-reduce GC root set) if release-mode safe-point GC will run with conditions.
-3. Then **B3** (built-ins + bignums, **including the deferred S/NA theories** — §2 B3), **B4** (parser),
-   **B5** (modules + REPL = the Phase-1 end milestone).
-4. *(B1 perf/coverage follow-ups, any time — see §2 B1 deferred list:)* the red-black ACU tree rep + the
-   optimized bipartite/Diophantine matcher; aliens / non-linear vars under AC/AU; CUI collapse-matching.
+## 5. Suggested next moves (B1 + B2 done)
+1. Read §0 docs + run the §0 sanity checks (now **79 tests**; B1 + B2 conformance green).
+2. **Open B3** — built-in data types + `malachite` bignums, **including the deferred S (`iter`) and NA
+   theories** (§2 B3). New `NodeTerm::{S, Na}` arms (additive, as ACU/AU/CUI were) + the `enum SpecialOp`
+   built-in seam; the S-theory needs the **theory-specific equality/compare dispatch** (§1.3/§4). The lazy
+   `strat` reduce frame (B2.4) and the condition machinery (B2.3) are already in place for `if_then_else_fi`
+   / built-in predicates.
+3. Then **B4** (parser), **B5** (modules + REPL = the Phase-1 end milestone).
+4. *(Cross-cutting follow-ups, any time — see the §2 B1/B2 deferred lists + §4:)* **F-2** the engine-global
+   condition-reduce GC root set (before release safe-point GC + conditions); the flattened sort-diagram +
+   preregularity warning + cross-kind overloading; `leq`/down-sets → `fixedbitset`; `frozen`/`memo`; the
+   red-black ACU tree rep + optimized Diophantine matcher; CUI collapse-matching; rewrite `=>` conditions
+   (Phase 2).

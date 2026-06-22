@@ -124,12 +124,15 @@ Agreed Stage 1; each revisitable at the noted phase.
 - **D7 SMT:** `z3` crate behind `trait SmtEngine`, runtime/feature-selectable. *(revisit: Phase 3)*
 - **D8 Naming:** project name `tambanokano` (confirmed), `tnk-` crate prefix; final public *language* name deferred. *(revisit: post Phase 0/1)*
 
-## 7. Status: Phase 0 complete (go/no-go = GO)
+## 7. Status: Phase 1 in progress (Phase 0 = GO; Stage A + B1 + B2 done)
 Phase 0 shipped a free-theory vertical slice and validated the architecture against the reference C++
-binary — see `04-phase0-results.md`. Next is **Phase 1** (core functional Maude): the remaining
-equational theories (esp. AC/ACU matching), built-in data + bignums, the lexer/mixfix parser, and a
-basic module system — opening with the deferred optimizations (discrimination net, inline args, compiled
-rhs, in-place rewrite, safe-point GC).
+binary — see `04-phase0-results.md`. **Phase 1** (core functional Maude) is now well underway, tracked in
+detail by [`06-phase1-plan.md`](06-phase1-plan.md) (overview) and [`07-stageB-plan.md`](07-stageB-plan.md)
+(the live Stage-B plan): **Stage A** (foundation reshape) and **Stage B1** (ACU/AU/CUI theories) + **B2**
+(least sort under overloading, memberships, conditional logic, operator attributes) are **complete and
+conformance-verified**. Remaining in Phase 1: **B3** built-in data + bignums (and the deferred S/NA
+theories), **B4** the lexer/mixfix parser, **B5** the non-parameterized module system + REPL (the Phase-1
+end milestone).
 
 ## 8. Guardrails for Phase 1+ — do not overfit to the Phase 0 prototype
 Phase 0 code is a **validated probe, not a foundation to preserve**. It took deliberate shortcuts to

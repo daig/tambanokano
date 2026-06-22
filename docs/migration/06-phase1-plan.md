@@ -9,7 +9,8 @@ references already exists in this repo or in the two reference trees.
 > `12d60c2` A3, `6e1b8da` A4, `13219cf` A5; 37 tests, reduce ≈8.3 M rw/s, `fib(22)`=186579 == reference).
 > §3 below is now history (kept for rationale). **For the breadth work (Stage B), the live plan is
 > [`07-stageB-plan.md`](07-stageB-plan.md)** — it records the *as-built* Stage-A seams that B1–B5 plug
-> into and supersedes §4 below. A thorough Stage-A audit is scheduled before Stage B begins.
+> into and supersedes §4 below. The Stage-A audit was done (verdict GO; the F-A guard followed); **B1
+> (theories) and B2 (sorts/memberships/conditions/attributes) are now COMPLETE — see `07`. NEXT: B3.**
 
 ---
 
@@ -111,11 +112,13 @@ then **AU**, **CUI**, **S/iter** (stacked-successor numbers, needs bignum), **NA
 structures. *Done-when:* matching modulo `assoc`/`comm`/`id`/`idem` conforms to the binary (use the
 manual's `xmatch`/`match` examples as the conformance suite).
 
-**B2 — Membership/conditional logic + sort diagram + attributes** *(A3).* Replace the placeholder sort
-computation with the per-symbol **sort decision diagram** (ad-hoc overloading, least sort, preregularity);
-add memberships (`mb`/`cmb`), conditional equations, and operator attributes (`ctor`, `strat`, `memo`,
-`frozen`, `owise`, `special`). *Done-when:* overloaded/subsorted modules get the right least sorts; a
-conditional functional module reduces correctly.
+**B2 — Membership/conditional logic + sort diagram + attributes** *(A3).* **[Superseded by `07`; status:
+DONE — overloading least sort / `mb`+`cmb` / `ceq`+`owise`+`:=` / `ctor`+`strat`; `frozen`/`memo` and the
+flattened sort-diagram deferred. See `07` §2 B2.]** Replace the placeholder sort computation with
+per-symbol least-sort resolution (ad-hoc overloading, preregularity); add memberships (`mb`/`cmb`),
+conditional equations, and operator attributes (`ctor`, `strat`, `memo`, `frozen`, `owise`, `special`).
+*Done-when:* overloaded/subsorted modules get the right least sorts; a conditional functional module
+reduces correctly.
 
 **B3 — Built-in data** *(A7).* The `special (id-hook …)` seam → a typed `enum SpecialOp`; implement
 `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` on `malachite` bignums (D4). *Done-when:* the
