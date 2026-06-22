@@ -19,9 +19,10 @@ use crate::sig::build_sig::build_module;
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::{Command, PreModule, Source, Statement};
 use crate::surface::parser::Parser;
+use std::collections::BTreeSet;
 use tnk_core::dag::DagId;
 use tnk_core::sort::SortId;
-use tnk_core::term::{Equation, Membership, Term};
+use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
 /// A fully loaded module: its kernel state (signature + statements) and its mixfix grammar (for parsing
 /// command/REPL terms).
@@ -64,31 +65,156 @@ fn load_statements(
     for stmt in &pm.statements {
         match stmt {
             Statement::Eq { lhs, rhs, cond, owise } => {
-                if cond.is_some() {
-                    return Err("conditional equations (ceq) are deferred to B4.5".into());
-                }
+                // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
+                // one variable index. Then add via the matching kernel facade.
                 let mut vars = VarIndex::new();
                 let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+                let condition = match cond {
+                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                    None => Vec::new(),
+                };
                 let rhs_t = parse_build(rhs, g, m, i, &mut vars)?;
                 let nr = vars.count();
                 if *owise {
-                    m.engine.add_owise_equation(lhs_t, rhs_t, nr, Vec::new());
-                } else {
+                    m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition);
+                } else if condition.is_empty() {
                     m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr });
+                } else {
+                    m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition);
                 }
             }
             Statement::Mb { lhs, sort, cond } => {
-                if cond.is_some() {
-                    return Err("conditional memberships (cmb) are deferred to B4.5".into());
-                }
                 let mut vars = VarIndex::new();
                 let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
                 let sort_id = resolve_sort(sort, m, i)?;
-                m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: vars.count() });
+                let condition = match cond {
+                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                    None => Vec::new(),
+                };
+                let nr = vars.count();
+                if condition.is_empty() {
+                    m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr });
+                } else {
+                    m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// The connective of a condition fragment.
+enum Connective {
+    /// `pattern := subject` (matching).
+    Match,
+    /// `lhs = rhs` (equality).
+    Eq,
+    /// `term : sort` (sort test).
+    Sort,
+}
+
+/// Parse a condition bubble (the tokens after `if`) into kernel [`ConditionFragment`]s: split on `/\` at
+/// paren-depth 0, then each fragment on its connective. Shares the statement's variable index; a `:=`
+/// fragment's *fresh* variables are the pattern variables not already bound (by the lhs or an earlier
+/// fragment), which the matcher binds.
+fn parse_condition(
+    bubble: &[Token],
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+    bound: &mut BTreeSet<u32>,
+) -> Result<Vec<ConditionFragment>, String> {
+    let mut frags = Vec::new();
+    for ftoks in split_on_text(bubble, "/\\", i) {
+        let (left, conn, right) = split_connective(ftoks, i)?;
+        let frag = match conn {
+            Connective::Match => {
+                let pattern = parse_build(left, g, m, i, vars)?;
+                let subject = parse_build(right, g, m, i, vars)?;
+                let mut pat_vars = Vec::new();
+                term_var_indices(&pattern, &mut pat_vars);
+                let fresh: Vec<u32> = pat_vars.iter().copied().filter(|v| !bound.contains(v)).collect();
+                bound.extend(pat_vars);
+                ConditionFragment::Matching { pattern, subject, fresh_vars: fresh }
+            }
+            Connective::Eq => ConditionFragment::Equality {
+                lhs: parse_build(left, g, m, i, vars)?,
+                rhs: parse_build(right, g, m, i, vars)?,
+            },
+            Connective::Sort => ConditionFragment::SortTest {
+                term: parse_build(left, g, m, i, vars)?,
+                sort: resolve_sort(right, m, i)?,
+            },
+        };
+        frags.push(frag);
+    }
+    Ok(frags)
+}
+
+/// Split `toks` on the `sep`-text token at paren-depth 0 (e.g. `/\`). Always yields ≥ 1 part.
+fn split_on_text<'a>(toks: &'a [Token], sep: &str, i: &Interner) -> Vec<&'a [Token]> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (k, t) in toks.iter().enumerate() {
+        match i.resolve(t.sym) {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            s if depth == 0 && s == sep => {
+                parts.push(&toks[start..k]);
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&toks[start..]);
+    parts
+}
+
+/// Find a fragment's connective token (`:=` / `=` / `:`) at paren-depth 0 and split around it.
+fn split_connective<'a>(
+    toks: &'a [Token],
+    i: &Interner,
+) -> Result<(&'a [Token], Connective, &'a [Token]), String> {
+    let mut depth = 0i32;
+    for (k, t) in toks.iter().enumerate() {
+        let conn = match i.resolve(t.sym) {
+            "(" => {
+                depth += 1;
+                None
+            }
+            ")" => {
+                depth -= 1;
+                None
+            }
+            ":=" if depth == 0 => Some(Connective::Match),
+            "=" if depth == 0 => Some(Connective::Eq),
+            ":" if depth == 0 => Some(Connective::Sort),
+            _ => None,
+        };
+        if let Some(conn) = conn {
+            return Ok((&toks[..k], conn, &toks[k + 1..]));
+        }
+    }
+    Err("condition fragment has no connective (`=` / `:=` / `:`)".into())
+}
+
+/// Collect a term's distinct variable indices, in first-seen order.
+fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Op { args, .. } => {
+            for a in args {
+                term_var_indices(a, out);
+            }
+        }
+    }
 }
 
 /// Parse a term token bubble to its (unambiguous) parse tree; rejects empty input, no-parse, and ambiguity.
@@ -96,10 +222,12 @@ fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<P
     if tokens.is_empty() {
         return Err("empty term".into());
     }
+    let rendered = || tokens.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ");
     let chart = earley::parse(g, tokens, Nt::Term, i);
-    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term)?;
+    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term)
+        .map_err(|e| format!("{e}: `{}`", rendered()))?;
     if parsed.ambiguous {
-        return Err("ambiguous parse".into());
+        return Err(format!("ambiguous parse: `{}`", rendered()));
     }
     Ok(parsed.tree)
 }
@@ -440,6 +568,64 @@ mod tests {
                 e("NzNat", "5", 1),
                 e("NzRat", "3 / 4", 0),
                 e("Rat", "0 / 5", 0),
+            ],
+        );
+    }
+
+    // ---- B4.5c: conditional statements (ceq / cmb / owise-with-condition / := / sort-test) ----
+
+    #[test]
+    fn conditional_conforms() {
+        conform(
+            conformance_file!("conditional.maude"),
+            &[
+                e("Nat", "s s z", 3),
+                e("Nat", "s s z", 5),
+                e("Nat", "z", 2),
+                e("NzNat", "s z", 1),
+                e("Nat", "nz?(z)", 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn owise_conforms() {
+        conform(
+            conformance_file!("owise.maude"),
+            &[
+                e("Truth", "tt", 1),
+                e("Truth", "ff", 1),
+                e("Truth", "ff", 1),
+                e("Nat", "z", 2),
+                e("Nat", "z", 3),
+                e("Nat", "s z", 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn match_cond_conforms() {
+        conform(
+            conformance_file!("match-cond.maude"),
+            &[
+                e("Nat", "s z", 1),
+                e("Nat", "z", 1),
+                e("Nat", "pred(z)", 0),
+                e("Nat", "s z", 2),
+                e("Nat", "s s z", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn cmb_conforms() {
+        conform(
+            conformance_file!("cmb.maude"),
+            &[
+                e("GoodPair", "< z, s z >", 2),
+                e("Pair", "< s z, z >", 1),
+                e("GoodPair", "< z, z >", 2),
+                e("GoodPair", "< s z, s z >", 3),
             ],
         );
     }

@@ -223,13 +223,17 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let lhs = self.collect_until(&["="]);
                 self.eat("=")?;
+                // The rhs (and a condition) end at the optional trailing attribute `[ … ]` (e.g.
+                // `[owise]`) or the terminator `.`; stop the bubble at `[` so the attribute is not
+                // swallowed into the term. (A rhs term containing a top-level `[` would need smarter
+                // delimiting — none in the conformance suite.)
                 let (rhs, cond);
                 if conditional {
                     rhs = self.collect_until(&["if"]);
                     self.eat("if")?;
-                    cond = Some(self.collect_until(&["[owise]"]));
+                    cond = Some(self.collect_until(&["["]));
                 } else {
-                    rhs = self.collect_until(&[]);
+                    rhs = self.collect_until(&["["]);
                     cond = None;
                 }
                 let owise = self.opt_owise()?;
