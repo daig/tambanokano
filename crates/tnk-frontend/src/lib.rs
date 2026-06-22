@@ -9,6 +9,7 @@
 //!
 //! See `docs/migration/reports/A4-parser-mixfix.md` and `docs/migration/07-stageB-plan.md` §2 B4.
 
+pub mod cfparser;
 pub mod grammar;
 pub mod lex;
 pub mod sig;
