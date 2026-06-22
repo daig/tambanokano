@@ -65,6 +65,11 @@ impl Nat {
     pub(crate) fn to_usize(&self) -> Option<usize> {
         usize::try_from(&self.0).ok()
     }
+    /// Base-10 rendering — for the pretty-printer's decimal numerals / iter counts (a `usize` would
+    /// truncate a bignum count). Malachite's `Natural` is `Display`.
+    pub(crate) fn to_decimal(&self) -> String {
+        self.0.to_string()
+    }
     /// `self % m` as a machine `usize` (the S sort-path cycle index; `m` is the small cycle length, so
     /// the remainder is `< m` and always fits). Panics if `m == 0` (a cycle length is always `>= 1`).
     pub(crate) fn rem_usize(&self, m: usize) -> usize {

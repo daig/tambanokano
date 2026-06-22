@@ -87,6 +87,26 @@ pub(crate) enum NaValue {
 /// A static empty child slice — the children of a leaf ([`NodeTerm::Na`]) without allocating.
 const NO_CHILDREN: &[DagId] = &[];
 
+/// A public, read-only view of a node's representation, for a consumer (the frontend pretty-printer,
+/// B4.6) that must render the **scalar payload** the generic [`symbol`](DagNode::symbol) /
+/// [`children`](DagNode::children) visitor cannot reach — the S-theory iter `count` and the `Na` constant
+/// value. [`App`](NodeRepr::App) covers *every* operator application (free / ACU / AU / CUI); the consumer
+/// renders it from `symbol()` + `children()`. This keeps [`NodeTerm`]/[`NaValue`] crate-private while
+/// exposing exactly what surface rendering needs.
+#[derive(Debug)]
+pub enum NodeRepr<'a> {
+    /// A free / ACU / AU / CUI operator application — render via `symbol()` + `children()`.
+    App,
+    /// An `iter` successor `s^count(arg)`; `count` is the base-10 rendering (it may be a bignum).
+    Iter { count: String, arg: DagId },
+    /// A string constant's value (the content, without surrounding quotes).
+    Str(&'a str),
+    /// A quoted-identifier constant's name (without the leading quote).
+    Qid(&'a str),
+    /// A float constant's value.
+    Float(f64),
+}
+
 impl DagNode {
     /// Visit each child once via a closure — the form a consumer uses when it wants to act on each
     /// child *without materializing a collection* (the C++ `markArguments` visitor). Rather than
@@ -152,6 +172,24 @@ impl DagNode {
     pub fn sort(&self) -> SortId {
         self.sort
     }
+
+    /// A read-only view exposing the scalar payload (`iter` count / `Na` value) the generic child visitor
+    /// cannot — for the frontend pretty-printer (B4.6). Operator applications are [`NodeRepr::App`]
+    /// (rendered from `symbol()` + `children()`); only S/NA carry extra payload.
+    pub fn repr(&self) -> NodeRepr<'_> {
+        match &self.term {
+            NodeTerm::Free { .. }
+            | NodeTerm::Acu { .. }
+            | NodeTerm::Au { .. }
+            | NodeTerm::Cui { .. } => NodeRepr::App,
+            NodeTerm::S { count, arg, .. } => NodeRepr::Iter { count: count.to_decimal(), arg: *arg },
+            NodeTerm::Na { value, .. } => match value {
+                NaValue::Str(s) => NodeRepr::Str(s),
+                NaValue::Qid(q) => NodeRepr::Qid(q),
+                NaValue::Float(bits) => NodeRepr::Float(f64::from_bits(*bits)),
+            },
+        }
+    }
 }
 
 /// The iterator returned by [`DagNode::children`]: one arm per `NodeTerm` rep, unified into a single
@@ -208,5 +246,30 @@ mod tests {
         assert_eq!(via_iter, via_visitor, "children() and for_each_child enumerate the same set");
 
         assert_eq!(e.node(x).children().count(), 0, "a constant has no children");
+    }
+
+    /// `repr` exposes the S-theory iter `count` (a value the generic child visitor cannot reach) as a
+    /// decimal, and reports operator applications as `App`.
+    #[test]
+    fn repr_exposes_iter_count_and_app() {
+        use super::NodeRepr;
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let nznat = e.add_sort("NzNat");
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let z = e.make_const(zero);
+        let five = e.make_iter(s, 5, z); // s^5(0)
+
+        match e.node(five).repr() {
+            NodeRepr::Iter { count, arg } => {
+                assert_eq!(count, "5", "the iter count renders in decimal");
+                assert_eq!(arg, z, "the successor's base is the 0 constant");
+            }
+            other => panic!("expected Iter, got {other:?}"),
+        }
+        assert!(matches!(e.node(z).repr(), NodeRepr::App), "a constant is an App");
     }
 }
