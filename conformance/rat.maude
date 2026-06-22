@@ -1,0 +1,29 @@
+*** B3.8 RAT — the DivisionSymbol kernel op conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/rat.maude < /dev/null
+*** `_/_` (DivisionSymbol) canonicalises `I / N` to lowest terms (divide by gcd; denominator 1 ->
+*** the integer). RAT's arithmetic (+, *, quo, ...) is EQUATION-DEFINED in the prelude on top of INT,
+*** so it is a module-loading milestone (post-B4 parser), not a kernel op. `0/N` is the user equation
+*** `0/Q = 0`, so it does not reduce here. Mirrors the engine.rs B3.8 test.
+fmod RATB is
+  sorts Zero NzNat Nat NzInt Int NzRat Rat .
+  subsorts Zero NzNat < Nat .
+  subsorts NzNat < NzInt .
+  subsorts Nat < Int .
+  subsorts NzInt < Int .
+  subsorts NzInt < NzRat .
+  subsorts Int < Rat .
+  subsorts NzRat < Rat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op -_ : NzNat -> NzInt [ctor special (id-hook MinusSymbol op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op -_ : Int -> Int [ditto] .
+  op _/_ : NzInt NzNat -> NzRat [ctor special (id-hook DivisionSymbol op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _/_ : Int NzNat -> Rat [ditto] .
+endfm
+red 4 / 2 .     *** NzNat: 2        (denominator 1 -> integer)
+red 12 / 16 .   *** NzRat: 3/4      (reduced by gcd 4)
+red 6 / 4 .     *** NzRat: 3/2
+red - 6 / 4 .   *** NzRat: -3/2     (signed numerator)
+red 5 / 1 .     *** NzNat: 5
+red 3 / 4 .     *** NzRat: 3/4      (already canonical — 0 rewrites)
+red 0 / 5 .     *** Rat: 0 / 5      (0/N is a user equation — 0 rewrites)

@@ -29,6 +29,7 @@ impl Runtime {
             SpecialOp::FloatOp { op, float_sym, bool_ } => {
                 self.reduce_float_op(sig, id, *op, *float_sym, bool_.as_ref())
             }
+            SpecialOp::Division { nat } => self.reduce_division(sig, id, nat),
         }
     }
 
@@ -327,6 +328,31 @@ impl Runtime {
                 Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
             }
         }
+    }
+
+    /// `_/_` (Maude's `DivisionSymbol`): canonicalise `I / N` to lowest terms. Divide both by
+    /// `g = gcd(|I|, N)`: when the denominator becomes 1, reduce to the integer `I/g`; when `g > 1`,
+    /// rebuild the reduced rational. An already-canonical `I/N` (`g == 1`, `N > 1`) or a zero numerator
+    /// does not rewrite (`0/N` is the user equation `0/Q = 0`, not a kernel op).
+    fn reduce_division(&mut self, sig: &Signature, id: DagId, nat: &NatHooks) -> Option<DagId> {
+        let symbol = self.node(id).symbol();
+        let kids: Vec<DagId> = self.node(id).children().collect();
+        let num = self.as_int(kids[0], nat)?;
+        let den = self.as_int(kids[1], nat)?;
+        if num.is_zero() || den.is_zero() {
+            return None; // 0/N (left to the user eq) or a malformed /0
+        }
+        let gcd = num.magnitude().gcd(&den.magnitude());
+        let g = Int::from_nat(&gcd);
+        let (new_num, new_den) = (num.div_rem(&g).0, den.div_rem(&g).0);
+        if new_den.magnitude() == Nat::one() {
+            return self.make_int(sig, nat, new_num); // denominator 1 → the integer
+        }
+        if gcd > Nat::one() {
+            let (nn, dn) = (self.make_int(sig, nat, new_num)?, self.make_int(sig, nat, new_den)?);
+            return Some(self.make_free(sig, symbol, vec![nn, dn]));
+        }
+        None // already in lowest terms
     }
 }
 

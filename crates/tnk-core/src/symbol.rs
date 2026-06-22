@@ -121,6 +121,11 @@ pub enum SpecialOp {
     /// Float arithmetic / functions / comparisons (Maude's `FloatOpSymbol`): operate on `NodeTerm::Na`
     /// float (`f64`) values. `float_sym` builds float results; `bool_` is the comparison result hook.
     FloatOp { op: FltOp, float_sym: SymbolId, bool_: Option<BoolHooks> },
+    /// `_/_` (Maude's `DivisionSymbol`): canonicalise a rational `I / N` to lowest terms — divide by
+    /// `gcd(|I|, N)`, reducing to the integer `I/g` when the denominator becomes 1. RAT's arithmetic
+    /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
+    /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
+    Division { nat: NatHooks },
 }
 
 /// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes). This slice has

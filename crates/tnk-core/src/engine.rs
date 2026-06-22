@@ -3091,6 +3091,22 @@ mod tests {
         }
     }
 
+    /// Render a rational/integer result for comparison: `"2"`, `"3/4"`, `"-3/2"`, `"0/5"`.
+    fn rat_str(e: &Engine, minus: SymbolId, div: SymbolId, id: DagId) -> String {
+        let int_str = |i: DagId| match &e.node(i).term {
+            NodeTerm::Free { symbol, args } if *symbol == minus && args.len() == 1 => {
+                format!("-{}", decode_nat(e, args[0]))
+            }
+            _ => decode_nat(e, i).to_string(),
+        };
+        match &e.node(id).term {
+            NodeTerm::Free { symbol, args } if *symbol == div && args.len() == 2 => {
+                format!("{}/{}", int_str(args[0]), int_str(args[1]))
+            }
+            _ => int_str(id),
+        }
+    }
+
     /// B3.2 S-theory construction + sort (== reference binary, `conformance/iter.maude` ITER): `s^n(0)`
     /// stores the count compactly, `s^0(x)` collapses to `x`, nested successors flatten, and the sort
     /// follows the successor's declaration (`s^n(0) : NzNat` for n >= 1, `0 : Zero`).
@@ -3643,6 +3659,63 @@ mod tests {
         };
         assert_eq!(cf(&mut e, 1.5, 2.5), tt, "1.5 < 2.5 = tt");
         assert_eq!(cf(&mut e, 2.5, 1.5), ff, "2.5 < 1.5 = ff");
+    }
+
+    /// B3.8 RAT — the DivisionSymbol kernel op (== reference binary, `conformance/rat.maude`): `_/_`
+    /// canonicalises `I / N` to lowest terms (divide by gcd; denominator 1 → the integer). RAT's
+    /// arithmetic is equation-defined (a post-parser milestone), so this is the only RAT kernel op;
+    /// `0/N` and an already-canonical fraction do not rewrite.
+    #[test]
+    fn builtin_division_canonicalizes_rationals() {
+        use crate::symbol::{NatHooks, SpecialOp};
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        let nzint = e.add_sort("NzInt");
+        let int = e.add_sort("Int");
+        let nzrat = e.add_sort("NzRat");
+        let rat = e.add_sort("Rat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.add_subsort(nznat, nzint);
+        e.add_subsort(nat, int);
+        e.add_subsort(nzint, int);
+        e.add_subsort(nzint, nzrat);
+        e.add_subsort(int, rat);
+        e.add_subsort(nzrat, rat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let minus = e.add_op("-", vec![nznat], nzint);
+        e.add_op_decl(minus, vec![int], int);
+        let nh = NatHooks { succ: s, zero: z, minus: Some(minus) };
+        e.set_special(minus, SpecialOp::Minus { nat: nh });
+        let div = e.add_op("/", vec![nzint, nznat], nzrat);
+        e.add_op_decl(div, vec![int, nznat], rat);
+        e.set_special(div, SpecialOp::Division { nat: nh });
+
+        // Build I / N (numerator `n` signed via `-`, denominator `d` positive), reduce, render result.
+        let frac = |e: &mut Engine, n: i64, d: u64| -> (String, u64) {
+            e.reset_rewrites();
+            let nn = if n >= 0 {
+                iter_num(e, z, s, n as u64)
+            } else {
+                let p = iter_num(e, z, s, (-n) as u64);
+                e.make_free(minus, vec![p])
+            };
+            let dn = iter_num(e, z, s, d);
+            let q = e.make_free(div, vec![nn, dn]);
+            let r = e.reduce(q);
+            (rat_str(e, minus, div, r), e.rewrites())
+        };
+        assert_eq!(frac(&mut e, 4, 2), ("2".into(), 1), "4/2 = 2");
+        assert_eq!(frac(&mut e, 12, 16), ("3/4".into(), 1), "12/16 = 3/4");
+        assert_eq!(frac(&mut e, 6, 4), ("3/2".into(), 1), "6/4 = 3/2");
+        assert_eq!(frac(&mut e, -6, 4), ("-3/2".into(), 1), "-6/4 = -3/2");
+        assert_eq!(frac(&mut e, 5, 1), ("5".into(), 1), "5/1 = 5");
+        assert_eq!(frac(&mut e, 3, 4), ("3/4".into(), 0), "3/4 already canonical (0 rewrites)");
+        assert_eq!(frac(&mut e, 0, 5), ("0/5".into(), 0), "0/5 left to the user eq (0 rewrites)");
     }
 
     #[test]
