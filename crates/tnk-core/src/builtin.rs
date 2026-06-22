@@ -6,10 +6,11 @@
 //! counter, so the existing `reduce` Phase-2 increment fires once when `try_rewrite_top` returns `Some`
 //! (identical to a user-equation rewrite); the returned node is then re-reduced by the outer loop.
 
-use crate::dag::{DagId, NodeTerm};
+use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::num::{Int, Nat};
-use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp, SymbolId};
+use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp, StrOp, SymbolId};
+use std::rc::Rc;
 
 impl Runtime {
     /// Reduce `id` by its operator's built-in rule, or `None` if the rule does not apply.
@@ -22,6 +23,9 @@ impl Runtime {
                 self.reduce_number_op(sig, id, *op, nat, bool_.as_ref())
             }
             SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
+            SpecialOp::StringOp { op, str_sym, nat, bool_ } => {
+                self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref())
+            }
         }
     }
 
@@ -210,6 +214,63 @@ impl Runtime {
             // ACU ops never reach the free path (the seam pairs each op with the right SpecialOp arm).
             NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => {
                 unreachable!("ACU number op `{op:?}` reached the free NumberOp path")
+            }
+        }
+    }
+
+    /// Read a string value from a `NodeTerm::Na::Str`, or `None` (not a string literal/result).
+    fn as_str(&self, id: DagId) -> Option<Rc<str>> {
+        match &self.node(id).term {
+            NodeTerm::Na { value: NaValue::Str(s), .. } => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// `StringOpSymbol` (concat / length / substr / comparisons): operate on string `NodeTerm::Na`
+    /// values, building a string (`str_sym`), a Nat (`nat`), or a Bool (`bool_`) result.
+    fn reduce_string_op(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: StrOp,
+        str_sym: SymbolId,
+        nat: Option<&NatHooks>,
+        bool_: Option<&BoolHooks>,
+    ) -> Option<DagId> {
+        let kids: Vec<DagId> = self.node(id).children().collect();
+        match op {
+            StrOp::Concat => {
+                let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
+                let r: Rc<str> = format!("{a}{b}").into();
+                Some(self.make_na(sig, str_sym, NaValue::Str(r)))
+            }
+            StrOp::Length => {
+                let len = self.as_str(kids[0])?.chars().count();
+                self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(len as u64)))
+            }
+            StrOp::Substr => {
+                let nat = nat?;
+                let a = self.as_str(kids[0])?;
+                let (start, len) = (self.as_int(kids[1], nat)?, self.as_int(kids[2], nat)?);
+                if start.is_negative() || len.is_negative() {
+                    return None;
+                }
+                let (start, len) = (start.magnitude().to_usize()?, len.magnitude().to_usize()?);
+                let r: String = a.chars().skip(start).take(len).collect();
+                Some(self.make_na(sig, str_sym, NaValue::Str(r.into())))
+            }
+            StrOp::Lt | StrOp::Le | StrOp::Gt | StrOp::Ge => {
+                let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
+                let ord = a.as_ref().cmp(b.as_ref());
+                let res = match op {
+                    StrOp::Lt => ord.is_lt(),
+                    StrOp::Le => ord.is_le(),
+                    StrOp::Gt => ord.is_gt(),
+                    StrOp::Ge => ord.is_ge(),
+                    _ => unreachable!(),
+                };
+                let h = bool_?;
+                Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
             }
         }
     }

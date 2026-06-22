@@ -12,7 +12,7 @@
 //! non-moving mark-sweep) over the DAG from an explicit root set.
 
 use crate::arena::Arena;
-use crate::dag::{DagId, DagNode, NodeTerm};
+use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
 use crate::num::Nat;
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
@@ -927,6 +927,13 @@ impl Runtime {
         self.alloc_node_constrained(sig, sort, NodeTerm::S { symbol, count, arg })
     }
 
+    /// Build an atomic **NA** constant node carrying `value` (a string/qid/float). The sort is
+    /// `symbol`'s range (`symbol` is an arity-0 NA-constant symbol — Maude's `StringSymbol` etc.).
+    pub(crate) fn make_na(&mut self, sig: &Signature, symbol: SymbolId, value: NaValue) -> DagId {
+        let sort = sig.compute_sort(symbol, &[]);
+        self.alloc_node_constrained(sig, sort, NodeTerm::Na { symbol, value })
+    }
+
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
     /// operator's theory: a free node directly, or a canonical ACU/AU/CUI/S node. Used by `reduce` when a
     /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
@@ -1020,6 +1027,8 @@ impl Runtime {
                     ord => ord,
                 }
             }
+            // An NA constant orders by its scalar value (consistent with the `deep_equal` Na arm).
+            (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
     }
@@ -1577,6 +1586,16 @@ impl Engine {
     /// `symbol` must be an `iter` operator (declared via [`add_op_iter`](Self::add_op_iter)).
     pub fn make_iter(&mut self, symbol: SymbolId, count: u64, arg: DagId) -> DagId {
         self.rt.make_s(&self.sig, symbol, Nat::from_u64(count), arg)
+    }
+
+    /// Build a string-literal NA node (the `<Strings>` `StringSymbol`, B3.6); `symbol` is an arity-0
+    /// string-constant operator.
+    pub fn make_string(&mut self, symbol: SymbolId, value: &str) -> DagId {
+        self.rt.make_na(&self.sig, symbol, NaValue::Str(value.into()))
+    }
+    /// Build a quoted-identifier NA node (the `<Qids>` `QuotedIdentifierSymbol`, B3.6).
+    pub fn make_qid(&mut self, symbol: SymbolId, value: &str) -> DagId {
+        self.rt.make_na(&self.sig, symbol, NaValue::Qid(value.into()))
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -3439,6 +3458,104 @@ mod tests {
         };
         assert_eq!(cmp(&mut e, -2, 3), tt, "-2 < 3 = tt");
         assert_eq!(cmp(&mut e, 3, -2), ff, "3 < -2 = ff");
+    }
+
+    /// B3.6 NA theory + STRING + QID (== reference binary, `conformance/string.maude`): strings/qids
+    /// are atomic `NodeTerm::Na` constants. `StringOpSymbol` does concat / length / substr /
+    /// comparisons; quoted-ids match only themselves via the Na equality arm (through `EqualitySymbol`).
+    #[test]
+    fn builtin_string_and_qid() {
+        use crate::dag::NaValue;
+        use crate::symbol::{BoolHooks, NatHooks, SpecialOp, StrOp};
+        let mut e = Engine::new();
+        let truth = e.add_sort("Truth");
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        let str_s = e.add_sort("Str");
+        let qid_s = e.add_sort("Qid");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let strsym = e.add_op("<Strings>", vec![], str_s);
+        let qidsym = e.add_op("<Qids>", vec![], qid_s);
+        let nh = NatHooks { succ: s, zero: z, minus: None };
+        let bh = BoolHooks { true_: tt, false_: ff };
+        let concat = e.add_op(".", vec![str_s, str_s], str_s);
+        e.set_special(concat, SpecialOp::StringOp { op: StrOp::Concat, str_sym: strsym, nat: None, bool_: None });
+        let len = e.add_op("len", vec![str_s], nat);
+        e.set_special(len, SpecialOp::StringOp { op: StrOp::Length, str_sym: strsym, nat: Some(nh), bool_: None });
+        let sub = e.add_op("sub", vec![str_s, nat, nat], str_s);
+        e.set_special(sub, SpecialOp::StringOp { op: StrOp::Substr, str_sym: strsym, nat: Some(nh), bool_: None });
+        let lt = e.add_op("lt", vec![str_s, str_s], truth);
+        e.set_special(lt, SpecialOp::StringOp { op: StrOp::Lt, str_sym: strsym, nat: None, bool_: Some(bh) });
+        let se = e.add_op("se", vec![str_s, str_s], truth);
+        e.set_special(se, SpecialOp::Equality { eq: tt, neq: ff });
+        let qe = e.add_op("qe", vec![qid_s, qid_s], truth);
+        e.set_special(qe, SpecialOp::Equality { eq: tt, neq: ff });
+
+        let dstr = |e: &Engine, id: DagId| -> String {
+            match &e.node(id).term {
+                NodeTerm::Na { value: NaValue::Str(v), .. } => v.to_string(),
+                _ => panic!("not a string node"),
+            }
+        };
+
+        // concat
+        e.reset_rewrites();
+        let (a, b) = (e.make_string(strsym, "ab"), e.make_string(strsym, "cd"));
+        let q = e.make_free(concat, vec![a, b]);
+        let r = e.reduce(q);
+        assert_eq!((dstr(&e, r), e.rewrites()), ("abcd".into(), 1), "\"ab\" . \"cd\" = \"abcd\"");
+
+        // length → Nat (sort follows the value)
+        e.reset_rewrites();
+        let h = e.make_string(strsym, "hello");
+        let q = e.make_free(len, vec![h]);
+        let r = e.reduce(q);
+        assert_eq!((decode_nat(&e, r), e.rewrites()), (5, 1), "len(\"hello\") = 5");
+        assert_eq!(e.sorts().name(e.sort_of(r)), "NzNat");
+        let empty = e.make_string(strsym, "");
+        let q = e.make_free(len, vec![empty]);
+        let r = e.reduce(q);
+        assert_eq!(decode_nat(&e, r), 0, "len(\"\") = 0");
+        assert_eq!(e.sorts().name(e.sort_of(r)), "Zero");
+
+        // substr(s, start, len)
+        e.reset_rewrites();
+        let (hh, n1, n3) = (e.make_string(strsym, "hello"), iter_num(&mut e, z, s, 1), iter_num(&mut e, z, s, 3));
+        let q = e.make_free(sub, vec![hh, n1, n3]);
+        let r = e.reduce(q);
+        assert_eq!((dstr(&e, r), e.rewrites()), ("ell".into(), 1), "sub(\"hello\", 1, 3) = \"ell\"");
+
+        // string comparison + NA equality (string + qid)
+        let cmp = |e: &mut Engine, op: SymbolId, x: &str, y: &str| -> SymbolId {
+            e.reset_rewrites();
+            let (a, b) = (e.make_string(strsym, x), e.make_string(strsym, y));
+            let q = e.make_free(op, vec![a, b]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), 1);
+            e.node(r).symbol()
+        };
+        assert_eq!(cmp(&mut e, lt, "abc", "abd"), tt, "\"abc\" < \"abd\"");
+        assert_eq!(cmp(&mut e, lt, "b", "abc"), ff, "\"b\" < \"abc\" is false");
+        assert_eq!(cmp(&mut e, se, "abc", "abc"), tt, "\"abc\" == \"abc\"");
+        assert_eq!(cmp(&mut e, se, "abc", "abd"), ff, "\"abc\" == \"abd\" is false");
+
+        // quoted-id NA equality (matches only itself)
+        let qcmp = |e: &mut Engine, x: &str, y: &str| -> SymbolId {
+            e.reset_rewrites();
+            let (a, b) = (e.make_qid(qidsym, x), e.make_qid(qidsym, y));
+            let q = e.make_free(qe, vec![a, b]);
+            let r = e.reduce(q);
+            e.node(r).symbol()
+        };
+        assert_eq!(qcmp(&mut e, "foo", "foo"), tt, "'foo == 'foo");
+        assert_eq!(qcmp(&mut e, "foo", "bar"), ff, "'foo == 'bar is false");
     }
 
     #[test]

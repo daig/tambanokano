@@ -185,9 +185,11 @@ impl Runtime {
                 // The recursive free matcher never matches a theory subject: those are matched by
                 // their own automata, and a free Op pattern's symbol differs from any theory symbol.
                 // (A *variable* pattern still binds such a subject — that is the `Term::Var` arm.)
-                NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } | NodeTerm::S { .. } => {
-                    false
-                }
+                NodeTerm::Acu { .. }
+                | NodeTerm::Au { .. }
+                | NodeTerm::Cui { .. }
+                | NodeTerm::S { .. }
+                | NodeTerm::Na { .. } => false,
             },
         }
     }
@@ -227,6 +229,17 @@ impl Runtime {
                     return false;
                 }
                 stack.push((*ax, *ay));
+                continue;
+            }
+            // An NA constant's `value` is scalar identity, not a child: equal symbols are equal iff the
+            // values are (same shape — equal symbols ⇒ both the Na arm). A leaf — `continue` on equal
+            // (process the rest of the pair-stack), fail on unequal.
+            if let (NodeTerm::Na { value: vx, .. }, NodeTerm::Na { value: vy, .. }) =
+                (&nx.term, &ny.term)
+            {
+                if vx != vy {
+                    return false;
+                }
                 continue;
             }
             // Enqueue children pairwise; a length mismatch (different arity) is inequality.

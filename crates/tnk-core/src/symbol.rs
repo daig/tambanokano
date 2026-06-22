@@ -114,6 +114,23 @@ pub enum SpecialOp {
     /// `-_` (Maude's `MinusSymbol`): integer negation. `-(s^n(0))` is the canonical negative (no
     /// rewrite); `-(-x)` reduces to `x` and `-0` to `0`. `nat.minus` is this operator.
     Minus { nat: NatHooks },
+    /// `_+_` (concat) / `length` / `substr` / `_<_`/`_<=_`/`_>_`/`_>=_` over strings (Maude's
+    /// `StringOpSymbol`): operate on `NodeTerm::Na` string values. `str_sym` builds string results;
+    /// `nat` (length/substr) and `bool_` (comparisons) are the result-type hooks.
+    StringOp { op: StrOp, str_sym: SymbolId, nat: Option<NatHooks>, bool_: Option<BoolHooks> },
+}
+
+/// The string operation a [`SpecialOp::StringOp`] performs (Maude's `StringOpSymbol` codes). This slice
+/// has concat / length / substr / comparisons; `find`/`rfind`/`upperCase`/`ascii`/… are follow-ups.
+#[derive(Debug, Clone, Copy)]
+pub enum StrOp {
+    Concat,
+    Length,
+    Substr,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// The `op-hook succSymbol` (an `iter` successor) and its `Zero` constant (the successor's `zeroTerm`),

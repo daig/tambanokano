@@ -1,0 +1,30 @@
+*** B3.6 NA theory (atomic constants) + STRING + QID conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/string.maude < /dev/null
+*** Strings/qids are atomic NA constants (NodeTerm::Na). StringOpSymbol does concat/length/substr/
+*** comparisons; quoted-ids match only themselves (the Na equality arm), tested via EqualitySymbol.
+*** A `Truth`/`Str` naming avoids the prelude's built-in Bool/String. Mirrors the engine.rs B3.6 test.
+fmod STRB is
+  sorts Truth Zero NzNat Nat Str Qid .
+  subsorts Zero NzNat < Nat .
+  ops tt ff : -> Truth [ctor] .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op <Strings> : -> Str [special (id-hook StringSymbol)] .
+  op <Qids> : -> Qid [special (id-hook QuotedIdentifierSymbol)] .
+  op _._ : Str Str -> Str [special (id-hook StringOpSymbol (+) op-hook stringSymbol (<Strings> : ~> Str))] .
+  op len : Str -> Nat [special (id-hook StringOpSymbol (length) op-hook stringSymbol (<Strings> : ~> Str) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op sub : Str Nat Nat -> Str [special (id-hook StringOpSymbol (substr) op-hook stringSymbol (<Strings> : ~> Str) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _lt_ : Str Str -> Truth [special (id-hook StringOpSymbol (<) op-hook stringSymbol (<Strings> : ~> Str) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+  op _se_ : Str Str -> Truth [special (id-hook EqualitySymbol term-hook equalTerm (tt) term-hook notEqualTerm (ff))] .
+  op _qe_ : Qid Qid -> Truth [special (id-hook EqualitySymbol term-hook equalTerm (tt) term-hook notEqualTerm (ff))] .
+endfm
+red "ab" . "cd" .          *** Str: "abcd"
+red len("hello") .         *** NzNat: 5
+red len("") .              *** Zero: 0
+red sub("hello", 1, 3) .   *** Str: "ell"
+red "abc" lt "abd" .       *** Truth: tt
+red "b" lt "abc" .         *** Truth: ff
+red "abc" se "abc" .       *** Truth: tt   (NA equality)
+red "abc" se "abd" .       *** Truth: ff
+red 'foo qe 'foo .         *** Truth: tt   (quoted-id NA equality)
+red 'foo qe 'bar .         *** Truth: ff

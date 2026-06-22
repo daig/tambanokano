@@ -60,7 +60,25 @@ pub(crate) enum NodeTerm {
     /// (without them `s^2(0)` and `s^3(0)` would compare equal). Built only by `make_s`, which keeps
     /// `count >= 1` (`s^0(x)` collapses to `x`) and flattens nested same-symbol successors.
     S { symbol: SymbolId, count: crate::num::Nat, arg: DagId },
+    /// An **NA** (atomic built-in constant): a leaf carrying a [`NaValue`] (a string / quoted-id /
+    /// float), built by the built-in seam (string/qid/float literals + results). Like the S `count`,
+    /// the `value` is scalar payload, not a child, so equality/order need theory-specific arms. Has no
+    /// children; matches only itself (Maude's `NA_DagNode`). Built only by `make_na`.
+    Na { symbol: SymbolId, value: NaValue },
 }
+
+/// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
+/// reference-counted backing (`Rc<str>`, cheap to clone); the float arm lands with `FLOAT` (B3.7).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum NaValue {
+    /// A string literal / result (the `<Strings>` `StringSymbol`).
+    Str(std::rc::Rc<str>),
+    /// A quoted identifier (the `<Qids>` `QuotedIdentifierSymbol`).
+    Qid(std::rc::Rc<str>),
+}
+
+/// A static empty child slice — the children of a leaf ([`NodeTerm::Na`]) without allocating.
+const NO_CHILDREN: &[DagId] = &[];
 
 impl DagNode {
     /// Visit each child once via a closure — the form a consumer uses when it wants to act on each
@@ -88,6 +106,8 @@ impl DagNode {
             }
             // The S successor has exactly one child (`arg`); `count` is scalar, not a child.
             NodeTerm::S { arg, .. } => f(*arg),
+            // An atomic NA constant is a leaf — no children.
+            NodeTerm::Na { .. } => {}
         }
     }
 
@@ -105,6 +125,8 @@ impl DagNode {
             NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
             // The S successor's single child reuses the slice iterator via `from_ref` — no new arm.
             NodeTerm::S { arg, .. } => ChildIter::Free(std::slice::from_ref(arg).iter()),
+            // An atomic NA constant is a leaf — an empty child iterator.
+            NodeTerm::Na { .. } => ChildIter::Free(NO_CHILDREN.iter()),
         }
     }
 
@@ -114,7 +136,8 @@ impl DagNode {
             | NodeTerm::Acu { symbol, .. }
             | NodeTerm::Au { symbol, .. }
             | NodeTerm::Cui { symbol, .. }
-            | NodeTerm::S { symbol, .. } => *symbol,
+            | NodeTerm::S { symbol, .. }
+            | NodeTerm::Na { symbol, .. } => *symbol,
         }
     }
 
