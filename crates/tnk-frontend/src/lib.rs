@@ -14,5 +14,6 @@ pub mod cfparser;
 pub mod grammar;
 pub mod lex;
 pub mod load;
+pub mod pretty;
 pub mod sig;
 pub mod surface;
