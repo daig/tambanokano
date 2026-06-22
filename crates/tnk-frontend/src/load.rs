@@ -8,8 +8,9 @@
 //! (their kernel facades and the build_term machinery already exist; only the condition-bubble parse is
 //! missing).
 
-use crate::build_term::{build_term, VarIndex};
+use crate::build_term::{build_dag, build_term, VarIndex};
 use crate::cfparser::compile::CompiledGrammar;
+use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::Nt;
@@ -20,7 +21,7 @@ use crate::surface::ast::{Command, PreModule, Source, Statement};
 use crate::surface::parser::Parser;
 use tnk_core::dag::DagId;
 use tnk_core::sort::SortId;
-use tnk_core::term::{Equation, Membership, Subst, Term};
+use tnk_core::term::{Equation, Membership, Term};
 
 /// A fully loaded module: its kernel state (signature + statements) and its mixfix grammar (for parsing
 /// command/REPL terms).
@@ -90,14 +91,8 @@ fn load_statements(
     Ok(())
 }
 
-/// Parse a term token bubble and build its kernel [`Term`]; rejects no-parse and (for now) ambiguity.
-fn parse_build(
-    tokens: &[Token],
-    g: &CompiledGrammar,
-    m: &BuiltModule,
-    i: &Interner,
-    vars: &mut VarIndex,
-) -> Result<Term, String> {
+/// Parse a term token bubble to its (unambiguous) parse tree; rejects empty input, no-parse, and ambiguity.
+fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
     if tokens.is_empty() {
         return Err("empty term".into());
     }
@@ -106,7 +101,18 @@ fn parse_build(
     if parsed.ambiguous {
         return Err("ambiguous parse".into());
     }
-    build_term(&parsed.tree, g, m, tokens, i, vars)
+    Ok(parsed.tree)
+}
+
+/// Parse a term token bubble and build its kernel [`Term`] (the statement/pattern path).
+fn parse_build(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<Term, String> {
+    build_term(&parse_forest(tokens, g, i)?, g, m, tokens, i, vars)
 }
 
 /// Resolve a sort token bubble to a [`SortId`] (single token only; structured sorts are B4.5).
@@ -121,24 +127,18 @@ fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortI
     }
 }
 
-/// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`.
+/// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`. Builds the term
+/// directly as a DAG ([`build_dag`]) so built-in literals (string/qid/float) and compact numerals work.
 pub fn reduce_command(
     lm: &mut LoadedModule,
     i: &Interner,
     term: &[Token],
 ) -> Result<(DagId, u64), String> {
-    let mut vars = VarIndex::new();
-    let t = parse_build(term, &lm.grammar, &lm.built, i, &mut vars)?;
-    if vars.count() != 0 {
-        return Err("a reduce-command term must be ground".into());
-    }
-    let mut subst = Subst::new();
-    subst.reset(0);
-    // Reset BEFORE instantiate: building the term applies any membership axioms (`constrain_to_smaller_sort`
-    // fires at construction and counts as a rewrite — Maude's accounting), so those rewrites belong to the
-    // command's count. Resetting after `instantiate` would zero them (the `membership.maude` count bug).
+    let tree = parse_forest(term, &lm.grammar, i)?;
+    // Reset BEFORE building: construction applies membership axioms (`constrain_to_smaller_sort` counts as
+    // a rewrite — Maude's accounting), so those rewrites belong to this command's count.
     lm.built.engine.reset_rewrites();
-    let dag = lm.built.engine.instantiate(&t, &subst);
+    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, term, i)?;
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -357,6 +357,89 @@ mod tests {
                 e("[Zero]", "0 + 0", 0),
                 e("NzNat", "s 0 + s 0", 0),
                 e("A", "f(c)", 0),
+            ],
+        );
+    }
+
+    // ---- B4.5b: built-in literals (string / qid / float) ----
+
+    /// Like [`conform`], but checks the result's *printed* form (Maude-faithful, uncolored) against the
+    /// binary's text — for modules whose results are literals best compared textually (no ACU residues,
+    /// so no order/spacing caveats).
+    fn conform_render(src: &str, expected: &[Expect]) {
+        let mut loaded = load_source(src).expect("load source");
+        let cmds: Vec<(usize, Vec<Token>)> = loaded
+            .commands
+            .iter()
+            .map(|(m, c)| match c {
+                Command::Reduce { term } => (*m, term.clone()),
+                Command::Match { .. } => panic!("milestone uses only reduce"),
+            })
+            .collect();
+        assert_eq!(cmds.len(), expected.len(), "command count");
+        for (idx, ((m, term), exp)) in cmds.iter().zip(expected).enumerate() {
+            let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+            let built = &loaded.modules[*m].built;
+            let sort = built.engine.sorts().name(built.engine.sort_of(got)).to_string();
+            assert_eq!(sort, exp.sort, "command {idx} sort");
+            assert_eq!(rw, exp.rewrites, "command {idx} rewrites");
+            let printed = crate::pretty::print_pretty(built, &loaded.interner, got, false);
+            assert_eq!(printed, exp.term, "command {idx} printed value");
+        }
+    }
+
+    #[test]
+    fn float_conforms() {
+        conform_render(
+            conformance_file!("float.maude"),
+            &[
+                e("Flt", "4.0", 1),
+                e("Flt", "3.5", 1),
+                e("Flt", "6.0", 1),
+                e("Flt", "3.5", 1),
+                e("Flt", "-1.5", 1),
+                e("Flt", "3.0", 2),
+                e("Flt", "2.0", 1),
+                e("Truth", "tt", 1),
+                e("Truth", "ff", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn string_conforms() {
+        conform_render(
+            conformance_file!("string.maude"),
+            &[
+                e("Str", "\"abcd\"", 1),
+                e("NzNat", "5", 1),
+                e("Zero", "0", 1),
+                e("Str", "\"ell\"", 1),
+                e("Truth", "tt", 1),
+                e("Truth", "ff", 1),
+                e("Truth", "tt", 1),
+                e("Truth", "ff", 1),
+                e("Truth", "tt", 1),
+                e("Truth", "ff", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn rat_conforms() {
+        // Rationals have no ACU-order issue, but `_/_` prints with spaces here (`3 / 4`) vs the binary's
+        // `3/4`, so compare by value (deep_equal), not text.
+        conform(
+            conformance_file!("rat.maude"),
+            &[
+                e("NzNat", "2", 1),
+                e("NzRat", "3 / 4", 1),
+                e("NzRat", "3 / 2", 1),
+                e("NzRat", "- 3 / 2", 1),
+                e("NzNat", "5", 1),
+                e("NzRat", "3 / 4", 0),
+                e("Rat", "0 / 5", 0),
             ],
         );
     }

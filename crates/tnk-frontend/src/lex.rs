@@ -80,13 +80,53 @@ fn is_punct(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
 }
 
-/// Whether `chars[i] == '.'` is a statement/command **terminator** (next is whitespace/EOF/punctuation)
-/// rather than part of a maudeId (a float `1.5`, a structured sort).
+/// A line comment `***`/`---` begins at `chars[j]`.
+fn is_line_comment_start(chars: &[char], j: usize) -> bool {
+    matches!(chars.get(j), Some('*') | Some('-'))
+        && chars.get(j + 1) == chars.get(j)
+        && chars.get(j + 2) == chars.get(j)
+}
+
+/// A top-level keyword that can begin a new statement/command/declaration — so a `.` immediately before
+/// one (on the same line) is a terminator. Maude's `SEEN_DOT` one-token lookahead, reduced to the
+/// functional-fragment keyword set.
+fn is_top_level_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "fmod" | "mod" | "fth" | "th" | "endfm" | "endm" | "endfth" | "endth"
+            | "sort" | "sorts" | "subsort" | "subsorts" | "op" | "ops" | "var" | "vars"
+            | "eq" | "ceq" | "mb" | "cmb" | "rl" | "crl"
+            | "red" | "reduce" | "match" | "xmatch" | "rew" | "rewrite" | "search"
+    )
+}
+
+/// Whether `chars[i] == '.'` is a statement/command **terminator** rather than an ordinary token (a `.`
+/// inside a float `1.5`, a structured sort, or the `_._` operator).
+///
+/// Maude's rule (the stateful `SEEN_DOT` lexer state) is one-token lookahead: a `.` terminates iff what
+/// follows it — skipping spaces/tabs — is end-of-line, EOF, a line comment, **or a top-level keyword**
+/// (a new statement/command, even on the same line, as in `sort N . op 0 : …`). A `.` followed by an
+/// ordinary token on the same line is the `_._` operator (`"ab" . "cd"`), not a terminator.
 fn is_terminator_dot(chars: &[char], i: usize) -> bool {
-    match chars.get(i + 1) {
-        None => true,
-        Some(&next) => next.is_whitespace() || is_punct(next),
+    let mut j = i + 1;
+    while matches!(chars.get(j), Some(' ') | Some('\t') | Some('\r')) {
+        j += 1;
     }
+    match chars.get(j) {
+        None | Some('\n') => return true,
+        _ if is_line_comment_start(chars, j) => return true,
+        _ => {}
+    }
+    // Read the next word and check it against the top-level keywords.
+    let start = j;
+    while let Some(&c) = chars.get(j) {
+        if c.is_whitespace() || is_punct(c) {
+            break;
+        }
+        j += 1;
+    }
+    let word: String = chars[start..j].iter().collect();
+    is_top_level_keyword(&word)
 }
 
 /// The class of a scanned maudeId text.

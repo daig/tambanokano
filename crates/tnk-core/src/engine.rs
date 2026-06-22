@@ -1546,6 +1546,15 @@ impl Engine {
 
     // ---- DAG construction ----
 
+    /// Build a node for `symbol` from `children`, **dispatching on the operator's theory** (free / ACU /
+    /// AU / CUI / S) — the public form of the internal `rebuild`. Lets a caller (the frontend's command
+    /// builder) construct a node from a symbol + already-built child DAGs without knowing the theory; the
+    /// canonicalization (ACU multiset, AU flatten, S fold) happens inside. For an S (`iter`) symbol the
+    /// children are one successor layer (folded into the count).
+    pub fn make_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
+        self.rt.rebuild(&self.sig, symbol, children)
+    }
+
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
     pub fn make_free(&mut self, symbol: SymbolId, args: Vec<DagId>) -> DagId {
         self.rt.make_free(&self.sig, symbol, args)

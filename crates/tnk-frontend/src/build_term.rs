@@ -13,6 +13,8 @@ use crate::cfparser::forest::PTree;
 use crate::grammar::Action;
 use crate::lex::{Interner, Token};
 use crate::sig::syntax::BuiltModule;
+use tnk_core::dag::DagId;
+use tnk_core::engine::Engine;
 use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
@@ -138,6 +140,117 @@ fn numeral_term(succ: SymbolId, zero: SymbolId, n: u64) -> Term {
         t = Term::op(succ, vec![t]);
     }
     t
+}
+
+/// Build a kernel `DagId` directly from a parse tree — the **ground command-term** path. Unlike
+/// [`build_term`] (which yields a `Term` for statements/patterns), this constructs DAG nodes through the
+/// engine, so it can build built-in **literals** (string/qid/float values a `Term` cannot carry) and a
+/// compact `s^n(0)` numeral (no successor chain). Operators dispatch by theory via [`Engine::make_node`].
+/// Variables are rejected — a `reduce` term is ground.
+pub fn build_dag(
+    tree: &PTree,
+    g: &CompiledGrammar,
+    engine: &mut Engine,
+    nat_zero: Option<SymbolId>,
+    tokens: &[Token],
+    i: &Interner,
+) -> Result<DagId, String> {
+    match g.prods[tree.prod as usize].action {
+        Action::PassThru => {
+            let child = tree.nt_children.first().ok_or("PassThru without a child")?;
+            build_dag(child, g, engine, nat_zero, tokens, i)
+        }
+        Action::MakeTerm(sym) => {
+            let args = dag_args(tree, g, engine, nat_zero, tokens, i)?;
+            Ok(engine.make_node(sym, args))
+        }
+        Action::MakeNatural(succ) => {
+            let text = tokens[tree.start].text(i);
+            let n: u64 = text.parse().map_err(|_| format!("bad numeral `{text}`"))?;
+            let zero = nat_zero.ok_or("MAKE_NATURAL without a zero symbol")?;
+            let base = engine.make_const(zero);
+            Ok(engine.make_iter(succ, n, base))
+        }
+        Action::MakeString(sym) => Ok(engine.make_string(sym, &unquote_string(tokens[tree.start].text(i)))),
+        Action::MakeQid(sym) => {
+            let text = tokens[tree.start].text(i);
+            Ok(engine.make_qid(sym, text.strip_prefix('\'').unwrap_or(text)))
+        }
+        Action::MakeFloat(sym) => {
+            let text = tokens[tree.start].text(i);
+            let v: f64 = text.parse().map_err(|_| format!("bad float `{text}`"))?;
+            Ok(engine.make_float(sym, v))
+        }
+        Action::MakeVariable(_) => Err("a reduce-command term must be ground (no variables)".into()),
+        Action::AssocList => Err("assoc-list node reached build_dag directly".into()),
+        Action::Nop => Err("a sort production has no term".into()),
+        Action::MakeIter(_) => Err("the f^n iter-token form is deferred".into()),
+    }
+}
+
+/// The argument DAGs for a `MakeTerm`: the nonterminal children, flattening a single assoc-list child to
+/// the operator's full argument sequence (the `build_term` `make_args` analogue, on the DAG side). A
+/// manual loop (not `map`) so the `&mut Engine` reborrows per child.
+fn dag_args(
+    tree: &PTree,
+    g: &CompiledGrammar,
+    engine: &mut Engine,
+    nat_zero: Option<SymbolId>,
+    tokens: &[Token],
+    i: &Interner,
+) -> Result<Vec<DagId>, String> {
+    if tree.nt_children.len() == 1 && is_assoc_list(g, &tree.nt_children[0]) {
+        return flatten_dag_assoc(&tree.nt_children[0], g, engine, nat_zero, tokens, i);
+    }
+    let mut args = Vec::with_capacity(tree.nt_children.len());
+    for c in &tree.nt_children {
+        args.push(build_dag(c, g, engine, nat_zero, tokens, i)?);
+    }
+    Ok(args)
+}
+
+fn flatten_dag_assoc(
+    node: &PTree,
+    g: &CompiledGrammar,
+    engine: &mut Engine,
+    nat_zero: Option<SymbolId>,
+    tokens: &[Token],
+    i: &Interner,
+) -> Result<Vec<DagId>, String> {
+    let mut rev = Vec::new();
+    let mut cur = node;
+    loop {
+        rev.push(build_dag(&cur.nt_children[1], g, engine, nat_zero, tokens, i)?);
+        let left = &cur.nt_children[0];
+        if is_assoc_list(g, left) {
+            cur = left;
+        } else {
+            rev.push(build_dag(left, g, engine, nat_zero, tokens, i)?);
+            break;
+        }
+    }
+    rev.reverse();
+    Ok(rev)
+}
+
+/// Strip a string literal's surrounding quotes and undo its escapes (the lexer keeps the quotes).
+fn unquote_string(tok: &str) -> String {
+    let inner = tok.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(tok);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other), // \" \\ and any other escaped char
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
