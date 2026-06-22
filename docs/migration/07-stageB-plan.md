@@ -10,11 +10,14 @@ Stage A is now done).
 > `conformance/{iter,bool,nat,int}.maude` from text and reduces them to the reference binary's exact sort +
 > rewrite count + value (lexer → surface parser + signature build → mixfix grammar → plain Earley+prec/gather
 > [DRP bypassed] → forest → build_term → load/reduce). Commits `b3b5819..01f28a5`; 31 frontend + 100 core
-> tests; clippy clean; fib(22)=186579; tnk-core untouched. **NEXT: B4.6 (pretty-printer) FIRST, then B4.5
-> (coverage) — we deliberately swap the plan's 5/6 order because B4.5's whole-prelude differential test needs
-> the pretty-printer for a textual diff vs the binary; see the ⚠ ORDERING note in §2 B4. Then B5 (modules +
-> REPL = Phase-1 end).** See §2 B4 below for the as-built detail and the deferred list. *(History:)* B1
-> (structural theories), B2
+> tests; clippy clean; fib(22)=186579; tnk-core untouched (until B4.6's one read accessor). **B4.6
+> (pretty-printer) DONE too** (`76b41ca..e356bc5`): a **raw** round-trip printer (`parse∘print=id`) + a
+> Maude-faithful **pretty** printer with ANSI syntax coloring; the uncolored faithful form textually matches
+> the binary's printed result on the milestone (exposing one value-identical ACU-print-order divergence =
+> a `dag_compare` follow-up). **NEXT (the last B4 item): B4.5** (coverage: punctuation-split op names,
+> structured sorts, conditional `ceq`/`cmb` + `match`, and the whole-prelude differential test). **Then B5
+> (modules + REPL = Phase-1 end).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
+> theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
 > reference binary (**100 tests**, clippy `-D warnings` clean, `fib(22) = 186579` and ~7.2 M rw/s intact
@@ -301,7 +304,7 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
 - **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
   + its bignum `count`; tying succ/`iter` to NAT.
 
-### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 DONE (milestone hit); NEXT: B4.6 (pretty-printer) THEN B4.5 (coverage)**
+### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 + B4.6 DONE; NEXT (last B4 item): B4.5 (coverage + whole-prelude diff-test)**
 - **As-built (on `main`, `b3b5819..01f28a5`):** the `tnk-frontend` crate. **B4.1** lexer (Maude tokenization
   + op-name `_`-splitting). **B4.2** surface recursive-descent parser (`fmod…endfm` → `PreModule` with raw
   token *bubbles*) + `build_sig` (drives the kernel constructor API, resolves `special (id-hook…)` →
@@ -320,8 +323,19 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   constant) so `s s 0` is unambiguous. **31 frontend tests; 100 core tests; clippy `-D warnings` clean; fib(22)
   =186579 and tnk-core untouched throughout B4.** **Deferred to B4.5/B4.6 (below):** punctuation-split op names
   (`<_,_>`), structured sorts, conditional `ceq`/`cmb`/`owise`-conditions + `match` command, large-numeral
-  DagId fast-path, the `f^n(t)` iter-token form, `mayAssoc` bias, and the **whole-prelude differential test**;
-  the **pretty-printer** (B4.6, the round-trip + REPL output).
+  DagId fast-path, the `f^n(t)` iter-token form, `mayAssoc` bias, and the **whole-prelude differential test**.
+- **B4.6 DONE (`76b41ca..e356bc5`):** the pretty-printer, both forms. **B4.6a** the one `tnk-core` read accessor
+  (`DagNode::repr` → `NodeRepr{App,Iter,Str,Qid,Float}` + `Nat::to_decimal`). **B4.6b** the **raw** round-trip
+  printer + the shared core walk — parenthesization is the exact inverse of the Earley prec/gather gate
+  (`required_prec < prec` + the `LEFT_BARE`/`RIGHT_BARE` capture cases, ported from `dagNodePrint.cc`),
+  resolved prec/gather via `prec_gather::compute`; round-trips all four milestone modules
+  (`parse∘build∘print_raw(reduce(t)) == reduce(t)`). **B4.6c** the **Maude-faithful** display printer
+  (`s_^n(0)` power form, compact `-3`) + ANSI **syntax-category** coloring (toggle); the uncolored faithful
+  form **textually equals the binary's printed result** for every milestone command (a stronger check than
+  B4.4's `deep_equal`). **FINDING it exposed:** the residue prints `5 + x` vs the binary's `x + 5` — the
+  kernel's `dag_compare` orders ACU elements by `SymbolId` (declaration index) while Maude uses
+  `Symbol::orderInt`; value-identical, a *focused `dag_compare` kernel follow-up* (re-verify AC rewrite
+  counts), not a printer bug. **40 frontend + 101 core tests; clippy `-D` clean; fib(22)=186579.**
 - **⚠ ORDERING — do B4.6 (pretty-printer) BEFORE B4.5 (coverage).** *(The plan lists them 5-then-6; we
   deliberately swap.)* **Why:** B4.5's strongest deliverable — the **whole-prelude differential test** — needs
   a true *textual* comparison against the reference binary's printed output, which requires the pretty-printer
