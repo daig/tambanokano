@@ -55,4 +55,7 @@ pub struct BuiltModule {
     pub string_sym: Option<SymbolId>,
     pub float_sym: Option<SymbolId>,
     pub qid_sym: Option<SymbolId>,
+    /// The `MinusSymbol` operator (`-_`), if any — the pretty-printer renders `-(s^n(0))` compactly as
+    /// `-n` (Maude-faithful), as Maude's `handleMinus` does.
+    pub minus_sym: Option<SymbolId>,
 }
