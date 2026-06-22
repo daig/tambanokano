@@ -16,7 +16,7 @@ use crate::dag::{DagId, DagNode, NodeTerm};
 use crate::num::Nat;
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
-use crate::symbol::{Axioms, OpDeclaration, Symbol, SymbolId, Theory};
+use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::LhsAutomaton;
 use std::cmp::Ordering;
@@ -175,6 +175,7 @@ impl Signature {
             axioms: Axioms::default(),
             identity: None,
             strategy: None,
+            special: None,
         })
     }
 
@@ -196,6 +197,7 @@ impl Signature {
             axioms: Axioms { assoc: true, comm: true, idem: false, iter: false },
             identity,
             strategy: None,
+            special: None,
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -218,6 +220,7 @@ impl Signature {
             axioms: Axioms { assoc: true, comm: false, idem: false, iter: false },
             identity,
             strategy: None,
+            special: None,
         })
     }
 
@@ -239,6 +242,7 @@ impl Signature {
             axioms: Axioms { assoc: false, comm: true, idem, iter: false },
             identity,
             strategy: None,
+            special: None,
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -260,6 +264,7 @@ impl Signature {
             axioms: Axioms { iter: true, ..Default::default() },
             identity: None,
             strategy: None,
+            special: None,
         })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
@@ -357,6 +362,24 @@ impl Signature {
             self.symbols.get(sym).name()
         );
         self.symbols.get_mut(sym).strategy = Some(positions.iter().map(|&p| p - 1).collect());
+    }
+
+    /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym`. The op-hook/term-hook
+    /// references are passed already resolved to [`SymbolId`]s (the future parser does the resolution;
+    /// for now the hand-built module supplies them). A [`SpecialOp::Branch`] is intrinsically lazy, so
+    /// this installs its `strat (1 0)` (condition eager, branches lazy) — the real `if_then_else_fi`
+    /// carries no user `strat`, so the seam wires it here (cf. the B2.4 lazy-strat mechanism).
+    pub(crate) fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
+        if let SpecialOp::Branch { .. } = op {
+            assert!(
+                self.symbols.get(sym).strategy.is_none(),
+                "`{}` is a Branch operator; its laziness is installed by the seam — it must not also \
+                 carry a user strat",
+                self.symbols.get(sym).name()
+            );
+            self.set_strategy(sym, &[1, 0]); // reduce the condition (arg 1) only, then the top rewrite
+        }
+        self.symbols.get_mut(sym).special = Some(op);
     }
 
     /// The argument position to reduce at strategy step `cursor` for `symbol` (B2.4), or `None` once the
@@ -1233,6 +1256,14 @@ impl Runtime {
     /// instantiated straight out of the still-borrowed equation table.
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
+        // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
+        // they are tried before user equations and fall through (`None`) on no-match. The `&SpecialOp`
+        // borrowed from `sig` coexists with `&mut self` (the A4 split).
+        if let Some(op) = sig.symbol(symbol).special()
+            && let Some(r) = self.try_special(sig, id, op)
+        {
+            return Some(r);
+        }
         // ACU/AU/S rewriting matches *modulo* the axioms with extension: a pattern may match a
         // sub-multiset (ACU), a contiguous sub-sequence (AU), or a successor prefix `s^k` of an `s^n`
         // subject (S), leaving a residue to splice back. The free/CUI theories match the whole node.
@@ -1446,6 +1477,14 @@ impl Engine {
     /// left unreduced (lazy) — e.g. `if_then_else_fi` with `[1, 0]`.
     pub fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
         self.sig.set_strategy(sym, raw);
+    }
+
+    /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user
+    /// equations. Hook references are passed already resolved to [`SymbolId`]s (the future parser does
+    /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]). A
+    /// [`SpecialOp::Branch`](crate::symbol::SpecialOp) auto-installs its lazy `strat (1 0)`.
+    pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
+        self.sig.set_special(sym, op);
     }
 
     /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). Must be binary;
@@ -3100,6 +3139,74 @@ mod tests {
         assert_eq!(e.rewrites(), 1, "s^3 -> s 0");
         let s1b = iter_num(&mut e, z, s, 1);
         assert!(e.deep_equal(r2, s1b));
+    }
+
+    /// B3.3 built-in seam (== reference binary, `conformance/bool.maude`): `EqualitySymbol` (`_~_`)
+    /// reduces to `tt`/`ff` by structural equality (1 rewrite); the lazy `BranchSymbol` (`myif`) selects
+    /// a branch and leaves the dead branch **unreduced** (`myif(tt,0,big)` = 0 in 1 rewrite, while
+    /// `myif(tt,big,0)` reduces the chosen `big` = `s s 0` for 2). Attached via `set_special`.
+    #[test]
+    fn builtin_equality_and_branch_over_bool() {
+        use crate::symbol::SpecialOp;
+        let mut e = Engine::new();
+        let truth = e.add_sort("Truth");
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let big = e.add_op("big", vec![], nat);
+        e.add_equation(Equation {
+            lhs: Term::constant(big), // eq big = s s 0
+            rhs: Term::op(s, vec![Term::op(s, vec![Term::constant(z)])]),
+            nr_vars: 0,
+        });
+        let eq = e.add_op("~", vec![nat, nat], truth);
+        e.set_special(eq, SpecialOp::Equality { eq: tt, neq: ff });
+        let myif = e.add_op("myif", vec![truth, nat, nat], nat);
+        e.set_special(myif, SpecialOp::Branch { tests: vec![tt, ff] });
+
+        // _~_ over (reduced) Nat numerals: structural equality → tt/ff, 1 rewrite each.
+        let mut eqtest = |a: u64, b: u64| -> (SymbolId, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (iter_num(&mut e, z, s, a), iter_num(&mut e, z, s, b));
+            let q = e.make_free(eq, vec![na, nb]);
+            let r = e.reduce(q);
+            (e.node(r).symbol(), e.rewrites())
+        };
+        assert_eq!(eqtest(2, 2), (tt, 1), "s^2 0 ~ s^2 0 = tt");
+        assert_eq!(eqtest(2, 3), (ff, 1), "s^2 0 ~ s^3 0 = ff");
+        assert_eq!(eqtest(0, 0), (tt, 1), "0 ~ 0 = tt");
+
+        // myif(tt, 0, big) -> 0, 1 rewrite (dead `big` never reduced).
+        e.reset_rewrites();
+        let (c, t0, ebig) = (e.make_const(tt), iter_num(&mut e, z, s, 0), e.make_const(big));
+        let q = e.make_free(myif, vec![c, t0, ebig]);
+        let r = e.reduce(q);
+        assert_eq!(e.node(r).symbol(), z, "myif(tt, 0, big) = 0");
+        assert_eq!(e.rewrites(), 1, "selection only — big unreduced");
+
+        // myif(tt, big, 0) -> s s 0, 2 rewrites (selection + big reduces).
+        e.reset_rewrites();
+        let (c, tbig, e0) = (e.make_const(tt), e.make_const(big), iter_num(&mut e, z, s, 0));
+        let q = e.make_free(myif, vec![c, tbig, e0]);
+        let r = e.reduce(q);
+        assert_eq!(e.rewrites(), 2, "selection + big = s s 0");
+        let s2 = iter_num(&mut e, z, s, 2);
+        assert!(e.deep_equal(r, s2), "myif(tt, big, 0) = s s 0");
+
+        // myif(ff, big, 0) -> 0, 1 rewrite (else branch; big unreduced).
+        e.reset_rewrites();
+        let (c, tbig, e0) = (e.make_const(ff), e.make_const(big), iter_num(&mut e, z, s, 0));
+        let q = e.make_free(myif, vec![c, tbig, e0]);
+        let r = e.reduce(q);
+        assert_eq!(e.node(r).symbol(), z, "myif(ff, big, 0) = 0");
+        assert_eq!(e.rewrites(), 1, "else branch — big unreduced");
     }
 
     #[test]

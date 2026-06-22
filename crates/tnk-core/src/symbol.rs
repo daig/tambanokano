@@ -82,6 +82,26 @@ pub struct Symbol {
     /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
     /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
     pub(crate) strategy: Option<Vec<u32>>,
+    /// Built-in reduction rule (`special (id-hook …)`, B3), if any — tried before user equations.
+    pub(crate) special: Option<SpecialOp>,
+}
+
+/// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam
+/// as a typed enum resolved at module-build time and dispatched by `match` in symbol reduction — not
+/// C++'s attached member-function pointers. `term-hook`/`op-hook` references are resolved to
+/// [`SymbolId`]s. This slice has the BOOL operators; NAT/INT arithmetic variants are added with those
+/// ops. (Until the parser lands the hooks are supplied programmatically via `Engine::set_special`.)
+#[derive(Debug, Clone)]
+pub enum SpecialOp {
+    /// `_==_` / `_=/=_` (Maude's `EqualitySymbol`): reduce both arguments, compare them structurally,
+    /// rewrite to `eq` if equal else `neq` (the `equalTerm`/`notEqualTerm` constants, swapped for
+    /// `=/=`).
+    Equality { eq: SymbolId, neq: SymbolId },
+    /// `if_then_else_fi` (Maude's `BranchSymbol`): with the condition reduced (the seam installs a lazy
+    /// `strat (1 0)`), select the branch whose position matches the condition among `tests` (the
+    /// `term-hook` constants, e.g. `[true, false]`), returning it **unreduced** — the dead branch is
+    /// never reduced.
+    Branch { tests: Vec<SymbolId> },
 }
 
 impl Symbol {
@@ -115,6 +135,11 @@ impl Symbol {
     /// The identity constant symbol, if this operator was declared with `id:`.
     pub(crate) fn identity(&self) -> Option<SymbolId> {
         self.identity
+    }
+
+    /// The operator's built-in reduction rule (`special (id-hook …)`), if any (B3).
+    pub(crate) fn special(&self) -> Option<&SpecialOp> {
+        self.special.as_ref()
     }
 
     /// Whether every declaration of this operator is a constructor (`[ctor]`). Metadata — it does not

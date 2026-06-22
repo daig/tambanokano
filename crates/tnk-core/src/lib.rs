@@ -23,6 +23,8 @@ pub mod term;
 // consumer exists).
 pub(crate) mod acu;
 pub(crate) mod au;
+// B3: built-in operator reduction (the `special (id-hook …)` seam).
+pub(crate) mod builtin;
 pub(crate) mod cui;
 // B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
 // named outside `num`.
