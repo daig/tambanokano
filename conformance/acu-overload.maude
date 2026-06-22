@@ -1,0 +1,34 @@
+*** F-B regression (post-B2 audit) — an ASYMMETRIC overloaded declaration on a COMMUTATIVE operator
+*** must give an argument-order-INDEPENDENT least sort (Maude's `commutativeSortCompletion`, which
+*** adds the swapped declaration `[b,a] -> r` for each `[a,b] -> r`). This is exactly the shape of the
+*** prelude's `op _+_ : NzNat Nat -> NzNat [assoc comm]`. Mirrors the engine.rs B2.1 regression tests.
+***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-overload.maude < /dev/null
+
+fmod ACU-OVERLOAD is
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op z : -> Zero [ctor] .
+  op nz : -> NzNat [ctor] .
+  op _+_ : NzNat Nat -> NzNat [assoc comm] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+endfm
+*** The canonical multiset order may present the Zero element first; the swapped `Nat NzNat -> NzNat`
+*** declaration is what keeps the result NzNat regardless.
+red z + nz .       *** NzNat
+red nz + z .       *** NzNat
+red z + z .        *** Nat
+red nz + nz .      *** NzNat
+red z + z + nz .   *** NzNat  (the left-to-right multiset fold stays order-independent)
+
+fmod CUI-OVERLOAD is
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op z : -> Zero [ctor] .
+  op nz : -> NzNat [ctor] .
+  op g : NzNat Nat -> NzNat [comm] .
+  op g : Nat Nat -> Nat [ditto] .
+endfm
+*** make_cui orders its pair canonically (Zero before NzNat); the swapped declaration keeps it NzNat.
+red g(z, nz) .     *** NzNat
+red g(nz, z) .     *** NzNat
+red g(z, z) .      *** Nat

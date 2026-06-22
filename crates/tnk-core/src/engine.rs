@@ -189,13 +189,15 @@ impl Signature {
         identity: Option<SymbolId>,
     ) -> SymbolId {
         assert_eq!(domain.len(), 2, "an `assoc comm` operator must be binary");
-        self.symbols.alloc(Symbol {
+        let id = self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: true, idem: false },
             identity,
             strategy: None,
-        })
+        });
+        self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
+        id
     }
 
     /// Register an **AU** operator (`assoc`, not commutative, optionally with a two-sided `id:`). Must
@@ -230,13 +232,15 @@ impl Signature {
         identity: Option<SymbolId>,
     ) -> SymbolId {
         assert_eq!(domain.len(), 2, "a `comm` operator must be binary");
-        self.symbols.alloc(Symbol {
+        let id = self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: false, comm: true, idem },
             identity,
             strategy: None,
-        })
+        });
+        self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
+        id
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
@@ -248,14 +252,60 @@ impl Signature {
     /// called before any node of `sym` is built (sorts are cached at construction). The parser (B4) is
     /// the eventual real source; this is the hand-built-module entry point.
     pub(crate) fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
-        let s = self.symbols.get_mut(sym);
-        assert_eq!(
-            s.decls[0].domain.len(),
-            domain.len(),
-            "overloaded declarations of `{}` must agree on arity",
-            s.name()
-        );
-        s.decls.push(OpDeclaration { domain, range, ctor: false });
+        {
+            let s = self.symbols.get_mut(sym);
+            assert_eq!(
+                s.decls[0].domain.len(),
+                domain.len(),
+                "overloaded declarations of `{}` must agree on arity",
+                s.name()
+            );
+            s.decls.push(OpDeclaration { domain, range, ctor: false });
+        }
+        // Keep a commutative operator's declaration set complete under argument swap (no-op for free
+        // and AU operators, whose declarations stay positional).
+        self.commutative_sort_completion(sym);
+    }
+
+    /// Maude's `BinarySymbol::commutativeSortCompletion` (`Interface/binarySymbol.cc`): a commutative
+    /// operator's declaration set is completed so that every **asymmetric** declaration `[a, b] -> r`
+    /// also carries its swapped form `[b, a] -> r` (same range, same `ctor`), unless one is already
+    /// present.
+    ///
+    /// Maude builds a *positional* sort diagram from the declarations and folds it left-to-right over
+    /// an ACU multiset / CUI pair (`ACU_DagNode::argVecComputeBaseSort` → `computeMultSortIndex`);
+    /// [`compute_sort`](Self::compute_sort) likewise checks `arg_sorts[i] <= decl.domain[i]`
+    /// **positionally**. Commutativity requires either argument order to yield the same least sort,
+    /// but the canonical element order (by [`dag_compare`](Runtime::dag_compare)) can present the
+    /// lower-sorted element first — so without the swapped declaration an asymmetric overload such as
+    /// NAT's `_+_ : NzNat Nat -> NzNat` would compute an argument-order-dependent (wrong) least sort
+    /// (e.g. `z + nz : Nat` instead of `NzNat`). Completing the set restores order-independence
+    /// without changing the fold. Idempotent (a swap's swap is the original, already present), so it is
+    /// safe to run after each declaration is registered. AU (associative, non-commutative) and free
+    /// operators are left untouched — their argument order is significant.
+    fn commutative_sort_completion(&mut self, sym: SymbolId) {
+        let s = self.symbols.get(sym);
+        if !matches!(s.theory(), Theory::Acu | Theory::Cui) {
+            return; // only commutative theories complete; AU / free stay positional
+        }
+        // Snapshot the current declarations so the shared borrow ends before the mutable push below
+        // (the sort ids are `Copy`, so this clone is cheap and small).
+        let decls: Vec<OpDeclaration> = s.decls.clone();
+        let mut to_add: Vec<OpDeclaration> = Vec::new();
+        for d in &decls {
+            if d.domain.len() != 2 || d.domain[0] == d.domain[1] {
+                continue; // a symmetric (or non-binary) declaration is its own swap
+            }
+            let swapped = vec![d.domain[1], d.domain[0]];
+            let present = decls
+                .iter()
+                .chain(to_add.iter())
+                .any(|e| e.domain == swapped && e.range == d.range && e.ctor == d.ctor);
+            if !present {
+                to_add.push(OpDeclaration { domain: swapped, range: d.range, ctor: d.ctor });
+            }
+        }
+        self.symbols.get_mut(sym).decls.extend(to_add);
     }
 
     /// Mark every declaration of `sym` as a constructor (`[ctor]`, B2.4). Metadata only — it does not
@@ -1708,6 +1758,70 @@ mod tests {
         let c0 = e.make_const(c);
         let fc = e.make_free(f, vec![c0]);
         assert_eq!(e.sort_of(fc), a, "f(c) : A — the earliest of the two incomparable declarations");
+    }
+
+    /// B2.1 / audit-F-B regression (== reference binary, `conformance/acu-overload.maude` ACU-OVERLOAD):
+    /// an **asymmetric** overloaded declaration on a **commutative** operator must give an
+    /// argument-order-independent least sort. `_+_ : NzNat Nat -> NzNat [assoc comm]` overloaded
+    /// `Nat Nat -> Nat`: `z + nz : NzNat` whichever element the canonical multiset order puts first
+    /// (Maude's `commutativeSortCompletion` adds the swapped `Nat NzNat -> NzNat` declaration). The
+    /// pre-fix positional fold gave `Nat` whenever the Zero element sorted first.
+    #[test]
+    fn acu_asymmetric_overload_least_sort_is_commutative() {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("z", vec![], zero);
+        let nz = e.add_op("nz", vec![], nznat);
+        let plus = e.add_op_ac("+", vec![nznat, nat], nznat, None); // decl0: NzNat Nat -> NzNat
+        e.add_op_decl(plus, vec![nat, nat], nat); // decl1: Nat Nat -> Nat
+
+        let sum = |e: &mut Engine, a: SymbolId, b: SymbolId| {
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            let s = e.make_ac(plus, vec![x, y]);
+            e.sorts().name(e.sort_of(s)).to_string()
+        };
+        assert_eq!(sum(&mut e, z, nz), "NzNat", "z + nz : NzNat (order-independent)");
+        assert_eq!(sum(&mut e, nz, z), "NzNat", "nz + z : NzNat");
+        assert_eq!(sum(&mut e, z, z), "Nat", "z + z : Nat");
+        assert_eq!(sum(&mut e, nz, nz), "NzNat", "nz + nz : NzNat");
+        // Ternary: the left-to-right multiset fold stays order-independent.
+        let tern = {
+            let (x, y, w) = (e.make_const(z), e.make_const(nz), e.make_const(z));
+            e.make_ac(plus, vec![x, y, w])
+        };
+        assert_eq!(e.sorts().name(e.sort_of(tern)), "NzNat", "z + z + nz : NzNat");
+    }
+
+    /// B1/B2.1 / audit-F-B regression (== reference binary, CUI-OVERLOAD): the same order-independence
+    /// for a **commutative non-associative** operator. `make_cui` orders its pair canonically (Zero
+    /// before NzNat), so `g(z, nz) : NzNat` needs the swapped `Nat NzNat -> NzNat` declaration too.
+    #[test]
+    fn cui_asymmetric_overload_least_sort_is_commutative() {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("z", vec![], zero);
+        let nz = e.add_op("nz", vec![], nznat);
+        let g = e.add_op_cui("g", vec![nznat, nat], nznat, false, None); // NzNat Nat -> NzNat
+        e.add_op_decl(g, vec![nat, nat], nat); // Nat Nat -> Nat
+
+        let gg = |e: &mut Engine, a: SymbolId, b: SymbolId| {
+            let (x, y) = (e.make_const(a), e.make_const(b));
+            let s = e.make_cui(g, x, y);
+            e.sorts().name(e.sort_of(s)).to_string()
+        };
+        assert_eq!(gg(&mut e, z, nz), "NzNat", "g(z, nz) : NzNat (order-independent)");
+        assert_eq!(gg(&mut e, nz, z), "NzNat", "g(nz, z) : NzNat");
+        assert_eq!(gg(&mut e, z, z), "Nat", "g(z, z) : Nat");
     }
 
     /// B2.2 membership axioms (== reference binary, `conformance/membership.maude` MB-PAIR): a

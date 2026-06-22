@@ -8,8 +8,8 @@ Stage A is now done).
 
 > **STATUS (2026-06-21) — STAGE B2 COMPLETE. NEXT: B3.** B1 (structural theories) and B2 (the
 > order-sorted / membership / conditional / attribute layer) are both **done on `main`**, every lock
-> conformance-verified vs the reference binary (**79 tests**, clippy `-D warnings` clean, `fib(22) =
-> 186579` and ~7.5 M rw/s intact throughout). §1 (as-built seams) and §2 B1/B2 below are refreshed to the
+> conformance-verified vs the reference binary (**81 tests**, clippy `-D warnings` clean, `fib(22) =
+> 186579` and ~7.2 M rw/s intact throughout). §1 (as-built seams) and §2 B1/B2 below are refreshed to the
 > as-built state; §2 B3–B5 are the **unchanged forward plan** (the seams they plug into did not move).
 > Commit trail `23d6fd4..7d09469` (F-A guard + B2.1…B2.4). **Audit findings:** F-3/F-4 closed in B1; F-A
 > (below) closed by a loud guard; **F-1** (no-op rewrite guard) still genuinely unimplemented — moot for
@@ -17,6 +17,17 @@ Stage A is now done).
 > root set) is now **mitigated** (GC disabled during condition eval, B2.3) but **not fully closed** — the
 > engine-global active-frame root set is still required before release-mode safe-point GC runs with
 > conditions (§4).
+>
+> **POST-B2 AUDIT (2026-06-21) — ready for B3 after one fix.** Re-ran all 12 conformance locks on the
+> reference binary (all TRUE) + full-kernel re-read. Found & **closed F-B**: an asymmetric overloaded
+> declaration on a *commutative* op (the prelude's `_+_ : NzNat Nat -> NzNat`) gave an
+> argument-order-dependent **wrong** least sort — a silent *correctness* gap the locks didn't cover (every
+> theory op in the suite is single-decl). Fixed by Maude's `commutativeSortCompletion` (§2 B2.1 + B2 below);
+> `conformance/acu-overload.maude` added. **B3 watch-items:** the S-theory scalar `count` is the #1 *silent*
+> trap (`deep_equal` walks `children()` generically → an `[arg]` S arm makes `s^2(0)==s^3(0)`; §1.3); and the
+> real `if_then_else_fi` is a `BranchSymbol special` with `poly`, **not** a user `strat (1 0)`, so B3 must
+> actively wire BranchSymbol→lazy and decide `poly`/`Universal` handling (B2.4's lazy frame is the mechanism,
+> not an automatic fit).
 >
 > **History — post-B1 audit (2026-06-20):** re-ran every `conformance/*.maude` lock against the binary
 > (all TRUE) and read the full kernel; found one *new* gap — **F-A**: a theory-rooted (ACU/AU/CUI)
@@ -204,9 +215,16 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
     ranges via down-set intersection**, `Sorts::leqs` inverted from `geq` at `close()`, with the
     **earliest-declaration** tie-break for non-preregular ops); theory nodes fold the binary `compute_sort`
     over their element sorts. *Deviation from "sort decision diagram":* correctness-first **direct
-    iteration**, not the flattened decision table (a perf follow-up); the `unique`/preregularity bit is
-    computed but the user-facing **warning is deferred** (no diagnostics sink yet). Single-kind overloading
-    only (cross-kind ad-hoc → arg-driven kind selection is a follow-up, `debug_assert`-guarded).
+    iteration**, not the flattened decision table (the *table* is a perf follow-up); the `unique`/preregularity
+    bit is computed but the user-facing **warning is deferred** (no diagnostics sink yet). Single-kind
+    overloading only (cross-kind ad-hoc → arg-driven kind selection is a follow-up, `debug_assert`-guarded).
+    **Post-B2 audit fix (F-B):** direct iteration checks declaration applicability *positionally*
+    (`leq(arg_sorts[i], decl.domain[i])`), so an **asymmetric overload on a commutative op** (the prelude's
+    `_+_ : NzNat Nat -> NzNat`) gave an argument-order-dependent **wrong** least sort — a *correctness* gap,
+    not perf. Closed by porting Maude's `BinarySymbol::commutativeSortCompletion`: `commutative_sort_completion`
+    adds the swapped `[b,a]->r` declaration for each asymmetric `[a,b]->r` on an ACU/CUI op, so the positional
+    check (and the multiset fold = Maude's `argVecComputeBaseSort`) is order-independent. Locked by
+    `conformance/acu-overload.maude` + the `{acu,cui}_asymmetric_overload_least_sort_is_commutative` tests.
   - **B2.2 memberships `mb`** (`f43e158`): per-symbol `SortConstraint` table (smallest-target-sort first);
     `constrain_to_smaller_sort` lowers a node's least sort at construction to a fixpoint, **each
     application counted as a rewrite** (Maude accounting). Gated by `memberships.is_empty()` so the free
@@ -228,8 +246,9 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   `owise` / `cmb` / `:=` modules reduce with the binary's exact rewrite counts; `strat` is lazy per the
   manual. Locked by `conformance/{overload,membership,conditional,owise,cmb,match-cond,strat}.maude`.
 - **Refs:** `A3` (whole report); arch-map L1 + decision #2/#3.
-- **Carried-forward follow-ups (none block B3):** the flattened sort-diagram + preregularity *warning*;
-  cross-kind ad-hoc overloading; `leq`/down-sets `BTreeSet` → `fixedbitset` (R3 M2 — B2 stayed `BTreeSet`);
+- **Carried-forward follow-ups (none block B3):** the flattened sort-diagram *decision table* (perf only —
+  the *correctness* of commutative-overload sorts is now handled by `commutative_sort_completion`, F-B) +
+  preregularity *warning*; cross-kind ad-hoc overloading; `leq`/down-sets `BTreeSet` → `fixedbitset` (R3 M2);
   **F-2** the engine-global condition-reduce GC root set (mitigated, §4); `frozen`/`memo`; rewrite `=>`
   conditions (Phase 2); `special` (→ B3, with the built-in seam).
 
