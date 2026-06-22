@@ -44,6 +44,11 @@ impl VarIndex {
     pub fn count(&self) -> u32 {
         self.entries.len() as u32
     }
+
+    /// The source name of the variable at `index` (for rendering a `match` solution's `X --> …` lines).
+    pub fn name(&self, index: u32) -> &str {
+        &self.entries[index as usize].0
+    }
 }
 
 /// Build a kernel [`Term`] from a parse tree. `vars` accumulates the statement-local variable indices

@@ -3,10 +3,10 @@
 //! commands are run against the module they follow (Maude's current module). The B4.4c entry point and
 //! the basis for the B5 REPL.
 //!
-//! Scope (B4.4c milestone): unconditional `eq`/`mb` and the `reduce` command. Conditional statements
-//! (`ceq`/`cmb`/condition fragments), `owise` conditions, and the `match` command are deferred to B4.5
-//! (their kernel facades and the build_term machinery already exist; only the condition-bubble parse is
-//! missing).
+//! Scope: unconditional and conditional `eq`/`mb` (`ceq`/`cmb`/condition fragments/`owise`, B4.5c) and
+//! the `reduce` (B4.4c) and `match`/`xmatch` (B4.5d, via [`match_command`]) commands. The `match`
+//! command drives the kernel's public multi-solution stream (`Engine::match_solutions`). Still open in
+//! B4.5: `__` juxtaposition (B4.5e, blocks `au`) and the whole-prelude differential test.
 
 use crate::build_term::{build_dag, build_term, VarIndex};
 use crate::cfparser::compile::CompiledGrammar;
@@ -15,6 +15,7 @@ use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::Nt;
 use crate::lex::{tokenize, Interner, Token};
+use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::{Command, PreModule, Source, Statement};
@@ -271,53 +272,174 @@ pub fn reduce_command(
     Ok((result, lm.built.engine.rewrites()))
 }
 
+/// The matched-portion id (for `xmatch`) and binding ids of one match solution, captured while the
+/// kernel [`tnk_core::engine::Solutions`] stream is live; rendered to text only after it drops (the
+/// stream holds `&mut Engine`, the pretty-printer needs `&BuiltModule`).
+struct RawSolution {
+    /// One `DagId` per pattern variable, indexed `0..nr_vars`.
+    bindings: Vec<DagId>,
+    /// The matched portion (`xmatch` only); `None` for a plain `match`.
+    portion: Option<DagId>,
+}
+
+/// Parse + build + enumerate the solutions of a `match`/`xmatch` command. Returns one rendered block
+/// per solution (each the `Var --> value` lines, prefixed for `xmatch` by `Matched portion = …`), in
+/// the kernel matcher's enumeration order; [`format_matchers`] wraps them into Maude's `Matcher N`
+/// display. The blocks are the unit the conformance harness compares against the reference binary —
+/// **as a set**, since exact ACU/AU solution *order* (Maude's Diophantine order) is a deferred B1
+/// follow-up (§4); every solution and its bindings are reproduced, only the order may differ.
+///
+/// The pattern is built as a kernel [`Term`] (tracking variable names for display); the subject is
+/// built as a ground DAG and reduced to normal form, matching Maude's behaviour (and a no-op on the
+/// already-normal conformance subjects). `xmatch` enables extension matching (a sub-part of the
+/// subject, leaving a residue); plain `match` requires the whole subject to be consumed.
+pub fn match_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    pattern: &[Token],
+    subject: &[Token],
+    xmatch: bool,
+) -> Result<Vec<String>, String> {
+    let mut vars = VarIndex::new();
+    let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
+    let nr = vars.count();
+
+    let subj_tree = parse_forest(subject, &lm.grammar, i)?;
+    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, subject, i)?;
+    let subj = lm.built.engine.reduce(subj);
+
+    // Enumerate while the stream borrows the engine, capturing only `DagId`s; render afterwards.
+    let mut raws: Vec<RawSolution> = Vec::new();
+    {
+        let mut sols = lm.built.engine.match_solutions(pat, nr, subj, xmatch);
+        while sols.advance() {
+            let bindings = (0..nr)
+                .map(|k| sols.binding(k).expect("the matcher binds every pattern variable"))
+                .collect();
+            let portion = xmatch.then(|| sols.matched_portion());
+            raws.push(RawSolution { bindings, portion });
+        }
+    }
+
+    Ok(raws.iter().map(|r| render_solution(&lm.built, i, r, &vars)).collect())
+}
+
+/// Render one solution's body: the `Matched portion = …` line (for `xmatch`) followed by the
+/// substitution — either `Var --> value` lines (variable order = first occurrence in the pattern,
+/// Maude's index order) or `empty substitution` when the pattern is ground.
+fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarIndex) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(p) = sol.portion {
+        lines.push(format!("Matched portion = {}", print_pretty(m, i, p, false)));
+    }
+    if sol.bindings.is_empty() {
+        lines.push("empty substitution".to_string());
+    } else {
+        for (k, &b) in sol.bindings.iter().enumerate() {
+            lines.push(format!("{} --> {}", vars.name(k as u32), print_pretty(m, i, b, false)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Wrap rendered solution blocks into Maude's `match`/`xmatch` display: `No match.` when empty, else
+/// each block under a `Matcher N` header, blocks separated by a blank line. (The B5 REPL renderer; the
+/// header/`Decision time` framing around it is the command layer's.)
+pub fn format_matchers(blocks: &[String]) -> String {
+    if blocks.is_empty() {
+        return "No match.".to_string();
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(n, b)| format!("Matcher {}\n{}", n + 1, b))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// One expected command result, transcribed from the reference binary:
     /// `~/Downloads/Maude-3/maude -no-banner conformance/<file>.maude < /dev/null`.
-    /// `(result-sort, an expected-term in surface syntax, rewrite-count)`. The expected term is reduced
-    /// through the same pipeline and compared by `deep_equal`, so its surface form just has to denote the
-    /// same value (e.g. `- 3` for the binary's `-3`, `s s 0` for `s_^2(0)`).
-    struct Expect {
-        sort: &'static str,
-        term: &'static str,
-        rewrites: u64,
+    enum Expect {
+        /// A `reduce`: `(result-sort, an expected-term in surface syntax, rewrite-count)`. The expected
+        /// term is reduced through the same pipeline and compared by `deep_equal`, so its surface form
+        /// just has to denote the same value (e.g. `- 3` for the binary's `-3`, `s s 0` for `s_^2(0)`).
+        Reduce { sort: &'static str, term: &'static str, rewrites: u64 },
+        /// A `match`/`xmatch`: the expected solution blocks (each the `Var --> value` lines, or for
+        /// `xmatch` the `Matched portion = …` line + substitution), rendered by [`render_solution`].
+        /// Compared **as a set** (both sides sorted): the binary's exact ACU/AU solution *order* is
+        /// Maude's Diophantine order, a deferred B1 follow-up — we reproduce every solution and its
+        /// bindings, only the order may differ (CUI's two pairings happen to match order too).
+        Match(&'static [&'static str]),
     }
 
     const fn e(sort: &'static str, term: &'static str, rewrites: u64) -> Expect {
-        Expect { sort, term, rewrites }
+        Expect::Reduce { sort, term, rewrites }
     }
 
-    /// Load `src`, run each `reduce` command, and assert its result sort, rewrite count, and value match
-    /// the reference binary (the value via reducing `expected[k].term` through the same pipeline).
+    const fn mat(blocks: &'static [&'static str]) -> Expect {
+        Expect::Match(blocks)
+    }
+
+    /// A command's tokens, owned so the loop can `&mut`-borrow `loaded.modules` while iterating.
+    enum Cmd {
+        Reduce(Vec<Token>),
+        Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
+    }
+
+    /// Load `src` and assert each command matches the reference binary: a `reduce`'s result sort, rewrite
+    /// count, and value (via reducing the expected term through the same pipeline); a `match`/`xmatch`'s
+    /// solution set (rendered blocks, sorted — see [`Expect::Match`]).
     fn conform(src: &str, expected: &[Expect]) {
         let mut loaded = load_source(src).expect("load source");
-        let cmds: Vec<(usize, Vec<Token>)> = loaded
+        let cmds: Vec<(usize, Cmd)> = loaded
             .commands
             .iter()
-            .map(|(m, c)| match c {
-                Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("milestone modules use only `reduce`"),
+            .map(|(m, c)| {
+                let cmd = match c {
+                    Command::Reduce { term } => Cmd::Reduce(term.clone()),
+                    Command::Match { pattern, subject, xmatch } => Cmd::Match {
+                        pattern: pattern.clone(),
+                        subject: subject.clone(),
+                        xmatch: *xmatch,
+                    },
+                };
+                (*m, cmd)
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
 
-        for (idx, ((m, term), exp)) in cmds.iter().zip(expected).enumerate() {
-            let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
-                .unwrap_or_else(|err| panic!("command {idx}: {err}"));
-            {
-                let eng = &loaded.modules[*m].built.engine;
-                assert_eq!(eng.sorts().name(eng.sort_of(got)), exp.sort, "command {idx} sort");
-            }
-            assert_eq!(rw, exp.rewrites, "command {idx} rewrite count");
+        for (idx, ((m, cmd), exp)) in cmds.iter().zip(expected).enumerate() {
+            match (cmd, exp) {
+                (Cmd::Reduce(term), Expect::Reduce { sort, term: eterm, rewrites }) => {
+                    let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                        .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+                    {
+                        let eng = &loaded.modules[*m].built.engine;
+                        assert_eq!(eng.sorts().name(eng.sort_of(got)), *sort, "command {idx} sort");
+                    }
+                    assert_eq!(rw, *rewrites, "command {idx} rewrite count");
 
-            let exp_toks = tokenize(exp.term, &mut loaded.interner);
-            let (want, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &exp_toks)
-                .unwrap_or_else(|err| panic!("command {idx} expected `{}`: {err}", exp.term));
-            let eng = &loaded.modules[*m].built.engine;
-            assert!(eng.deep_equal(got, want), "command {idx} value: expected `{}`", exp.term);
+                    let exp_toks = tokenize(eterm, &mut loaded.interner);
+                    let (want, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &exp_toks)
+                        .unwrap_or_else(|err| panic!("command {idx} expected `{eterm}`: {err}"));
+                    let eng = &loaded.modules[*m].built.engine;
+                    assert!(eng.deep_equal(got, want), "command {idx} value: expected `{eterm}`");
+                }
+                (Cmd::Match { pattern, subject, xmatch }, Expect::Match(blocks)) => {
+                    let mut got =
+                        match_command(&mut loaded.modules[*m], &loaded.interner, pattern, subject, *xmatch)
+                            .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+                    got.sort();
+                    let mut want: Vec<String> = blocks.iter().map(|s| (*s).to_string()).collect();
+                    want.sort();
+                    assert_eq!(got, want, "command {idx} match solution set");
+                }
+                _ => panic!("command {idx}: command kind does not match its expectation"),
+            }
         }
     }
 
@@ -501,19 +623,22 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("milestone uses only reduce"),
+                Command::Match { .. } => panic!("conform_render handles only reduce"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
         for (idx, ((m, term), exp)) in cmds.iter().zip(expected).enumerate() {
+            let Expect::Reduce { sort: esort, term: eterm, rewrites } = exp else {
+                panic!("conform_render handles only reduce expectations");
+            };
             let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
                 .unwrap_or_else(|err| panic!("command {idx}: {err}"));
             let built = &loaded.modules[*m].built;
             let sort = built.engine.sorts().name(built.engine.sort_of(got)).to_string();
-            assert_eq!(sort, exp.sort, "command {idx} sort");
-            assert_eq!(rw, exp.rewrites, "command {idx} rewrites");
+            assert_eq!(sort, *esort, "command {idx} sort");
+            assert_eq!(rw, *rewrites, "command {idx} rewrites");
             let printed = crate::pretty::print_pretty(built, &loaded.interner, got, false);
-            assert_eq!(printed, exp.term, "command {idx} printed value");
+            assert_eq!(printed, *eterm, "command {idx} printed value");
         }
     }
 
@@ -626,6 +751,64 @@ mod tests {
                 e("Pair", "< s z, z >", 1),
                 e("GoodPair", "< z, z >", 2),
                 e("GoodPair", "< s z, s z >", 3),
+            ],
+        );
+    }
+
+    /// B4.5d: the `match`/`xmatch` command end-to-end through the public kernel solution stream. ACU
+    /// matching with and without identity, and an extension `xmatch` reporting the matched portion — the
+    /// strongest from-text exercise of the B1 matcher. Solution sets vs the reference binary (order is
+    /// Maude's deferred Diophantine order; see [`Expect::Match`]).
+    #[test]
+    fn acu_match_conforms() {
+        conform(
+            conformance_file!("acu-match.maude"),
+            &[
+                // match X + Y <=? a + b + c  — six splits into two non-empty parts.
+                mat(&[
+                    "X --> a\nY --> b + c",
+                    "X --> b\nY --> a + c",
+                    "X --> c\nY --> a + b",
+                    "X --> a + b\nY --> c",
+                    "X --> a + c\nY --> b",
+                    "X --> b + c\nY --> a",
+                ]),
+                // match X # Y <=? a # b  — four, including a variable binding the identity `e`.
+                mat(&[
+                    "X --> e\nY --> a # b",
+                    "X --> a\nY --> b",
+                    "X --> b\nY --> a",
+                    "X --> a # b\nY --> e",
+                ]),
+                // xmatch a + b <=? a + b + c  — one extension match, residue c, empty substitution.
+                mat(&["Matched portion = a + b\nempty substitution"]),
+            ],
+        );
+    }
+
+    /// The Maude `match` display layout: `No match.` when empty, else `Matcher N` headers with a blank
+    /// line between blocks (the B5 REPL renderer over [`match_command`]'s blocks).
+    #[test]
+    fn format_matchers_layout() {
+        assert_eq!(format_matchers(&[]), "No match.");
+        assert_eq!(
+            format_matchers(&["X --> a\nY --> b".to_string(), "X --> b\nY --> a".to_string()]),
+            "Matcher 1\nX --> a\nY --> b\n\nMatcher 2\nX --> b\nY --> a"
+        );
+    }
+
+    /// B4.5d: CUI `match` (the two commutative pairings) alongside the CUI reduce locks (matching modulo
+    /// commutativity, and the idem/identity collapses at construction).
+    #[test]
+    fn cui_conforms() {
+        conform(
+            conformance_file!("cui.maude"),
+            &[
+                // match f(X, Y) <=? f(a, b)  — the two pairings.
+                mat(&["X --> a\nY --> b", "X --> b\nY --> a"]),
+                e("E", "c", 1), // red f(b, a)  — matching modulo comm
+                e("E", "a", 0), // red g(a, a)  — idempotence collapses at construction
+                e("E", "a", 0), // red h(a, e)  — identity collapses at construction
             ],
         );
     }

@@ -18,7 +18,7 @@ use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
-use crate::theory::LhsAutomaton;
+use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -1428,9 +1428,9 @@ impl Engine {
     pub(crate) fn runtime(&self) -> &Runtime {
         &self.rt
     }
-    /// Both halves borrowed disjointly, for tests that drive the matcher seam's `next` (which needs
-    /// `&mut Runtime` + `&Signature` at once — the A4 split).
-    #[cfg(test)]
+    /// Both halves borrowed disjointly, to drive the matcher seam's `next` — which needs a `&mut
+    /// Runtime` and a `&Signature` at once (the A4 split). Used by
+    /// [`match_solutions`](Self::match_solutions) and its [`Solutions`] stream, and by the theory tests.
     pub(crate) fn parts_mut(&mut self) -> (&Signature, &mut Runtime) {
         (&self.sig, &mut self.rt)
     }
@@ -1759,6 +1759,81 @@ impl Engine {
     pub fn instantiate(&mut self, term: &Term, subst: &Subst) -> DagId {
         self.rt.instantiate(&self.sig, term, subst)
     }
+
+    /// Begin enumerating *every* match of `pattern` (with `nr_vars` distinct variables, indexed
+    /// `0..nr_vars`) against `subject` — the public face of the A3 matcher seam's multi-solution
+    /// [`Subproblem`] stream, which [`match_pattern`](Self::match_pattern) (a single yes/no) cannot
+    /// reach. Drives the `match`/`xmatch` commands and, later, the REPL.
+    ///
+    /// `extension` allows the pattern to match a *sub-part* of the subject and leave a residue (the
+    /// `xmatch` command, and how AC/AU equations rewrite at the top); `false` requires the whole
+    /// subject to be consumed (the plain `match` command). Returns a resumable [`Solutions`] — call
+    /// [`Solutions::advance`] to step, then read [`Solutions::binding`] / [`Solutions::matched_portion`].
+    pub fn match_solutions(
+        &mut self,
+        pattern: Term,
+        nr_vars: u32,
+        subject: DagId,
+        extension: bool,
+    ) -> Solutions<'_> {
+        // Compile and run the first (deterministic) match phase. The returned `Subproblem` owns its
+        // state (no borrow of the automaton or the engine), so the throwaway `automaton` can drop here
+        // while the stream lives on — exactly as `try_equations` consumes it per equation.
+        let automaton = LhsAutomaton::compile(pattern.clone(), &self.sig);
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        let subproblem = {
+            let (sig, rt) = self.parts_mut();
+            automaton.match_(rt, sig, subject, &mut subst, extension)
+        };
+        Solutions { engine: self, pattern, subproblem, subst }
+    }
+}
+
+/// A resumable stream of the matches of `pattern <=? subject`, wrapping the A3 matcher seam's
+/// [`Subproblem`] so callers outside the kernel can enumerate solutions without touching the
+/// crate-private matcher types. Created by [`Engine::match_solutions`].
+///
+/// Holds `&mut Engine` because advancing a multi-solution (ACU/AU) match allocates fresh
+/// binding/residue nodes between solutions (the F-3/F-4 widening) — the same reason the reduce driver
+/// drives `Subproblem::next` with `&mut Runtime`.
+pub struct Solutions<'e> {
+    engine: &'e mut Engine,
+    /// Kept to reconstruct the matched portion (the instantiated pattern) on demand.
+    pattern: Term,
+    /// `None` when the subject could not match at all (no first-phase solution); then `advance` is
+    /// always `false`. `Some` holds the live enumerator.
+    subproblem: Option<Subproblem>,
+    subst: Subst,
+}
+
+impl Solutions<'_> {
+    /// Advance to the next solution, binding its variables into the internal substitution; returns
+    /// `false` once the solutions are exhausted (and stays `false` thereafter). Read the solution with
+    /// [`binding`](Self::binding) / [`matched_portion`](Self::matched_portion) before the next call.
+    /// (Named `advance` rather than `next` — it returns a `bool` and the bound solution is read through
+    /// the accessors, not yielded, so it is not an [`Iterator`].)
+    #[must_use]
+    pub fn advance(&mut self) -> bool {
+        let Some(sp) = self.subproblem.as_mut() else { return false };
+        let (sig, rt) = self.engine.parts_mut();
+        sp.next(rt, sig, &mut self.subst)
+    }
+
+    /// The current solution's binding for variable `index` (`None` before the first successful
+    /// [`advance`](Self::advance), or if the index is out of range).
+    #[must_use]
+    pub fn binding(&self, index: u32) -> Option<DagId> {
+        self.subst.get(index)
+    }
+
+    /// The matched portion of the subject under the current solution — the pattern instantiated with
+    /// the current bindings. For a whole (`match`) match this equals the subject; for an extension
+    /// (`xmatch`) match it is the matched sub-part (the subject minus the residue). Builds a fresh
+    /// node, so it takes `&mut self`; valid only after a successful [`advance`](Self::advance).
+    pub fn matched_portion(&mut self) -> DagId {
+        self.engine.instantiate(&self.pattern, &self.subst)
+    }
 }
 
 #[cfg(test)]
@@ -1778,6 +1853,72 @@ mod tests {
         let ga = e.make_free(g, vec![a1]);
         let root = e.make_free(f, vec![a1, ga]);
         (e, root, nat)
+    }
+
+    /// Decode a DAG into a sorted multiset of leaf-constant names (`b + c` → `["b","c"]`), so a public
+    /// `match_solutions` binding can be compared by value.
+    fn leaf_names(e: &Engine, id: DagId) -> Vec<String> {
+        let node = e.node(id);
+        let kids: Vec<DagId> = node.children().collect();
+        if kids.is_empty() {
+            vec![e.symbol(node.symbol()).name().to_string()]
+        } else {
+            let mut out: Vec<String> = kids.into_iter().flat_map(|c| leaf_names(e, c)).collect();
+            out.sort();
+            out
+        }
+    }
+
+    /// The public [`Engine::match_solutions`] facade drives the ACU matcher seam end-to-end:
+    /// `X + Y <=? a + b + c` enumerates the binary's six solutions (compared as a set — exact
+    /// Diophantine *order* is a deferred B1 follow-up), and `xmatch a + b <=? a + b + c` yields the one
+    /// extension match whose matched portion is `a + b`.
+    #[test]
+    fn match_solutions_enumerates_acu() {
+        let mut e = Engine::new();
+        let s = e.add_sort("E");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let plus = e.add_op_ac("+", vec![s, s], s, None);
+        let (a0, b0, c0) = (e.make_const(a), e.make_const(b), e.make_const(c));
+        let subject = e.make_ac(plus, vec![a0, b0, c0]);
+
+        // `match X + Y <=? a + b + c` — whole match (no extension), six solutions. Collect the binding
+        // ids while the stream is live, then decode after it drops (the caller pattern the frontend uses).
+        let pat = Term::op(plus, vec![Term::var(0, s), Term::var(1, s)]);
+        let mut ids: Vec<(DagId, DagId)> = Vec::new();
+        {
+            let mut sols = e.match_solutions(pat, 2, subject, false);
+            while sols.advance() {
+                ids.push((sols.binding(0).unwrap(), sols.binding(1).unwrap()));
+            }
+        }
+        let mut got: Vec<(Vec<String>, Vec<String>)> =
+            ids.iter().map(|&(x, y)| (leaf_names(&e, x), leaf_names(&e, y))).collect();
+        got.sort();
+        let mut want = vec![
+            (vec!["a".into()], vec!["b".into(), "c".into()]),
+            (vec!["b".into()], vec!["a".into(), "c".into()]),
+            (vec!["c".into()], vec!["a".into(), "b".into()]),
+            (vec!["a".into(), "b".into()], vec!["c".into()]),
+            (vec!["a".into(), "c".into()], vec!["b".into()]),
+            (vec!["b".into(), "c".into()], vec!["a".into()]),
+        ];
+        want.sort();
+        assert_eq!(got, want, "six ACU matchers, as a set");
+
+        // `xmatch a + b <=? a + b + c` — one extension match, matched portion `a + b`, empty subst.
+        let ground = Term::op(plus, vec![Term::constant(a), Term::constant(b)]);
+        let portion = {
+            let mut sols = e.match_solutions(ground, 0, subject, true);
+            assert!(sols.advance(), "one extension solution");
+            let p = sols.matched_portion();
+            assert!(!sols.advance(), "exactly one");
+            p
+        };
+        assert_eq!(leaf_names(&e, portion), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
