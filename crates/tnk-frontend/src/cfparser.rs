@@ -16,3 +16,4 @@
 
 pub mod compile;
 pub mod earley;
+pub mod forest;

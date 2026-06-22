@@ -4,7 +4,7 @@
 
 use super::compile::CompiledGrammar;
 use crate::grammar::{GSym, Nt, Terminal};
-use crate::lex::{TokKind, Token};
+use crate::lex::{Interner, TokKind, Token};
 use std::collections::HashSet;
 
 /// An Earley item: a production, the dot position within its rhs, and the token index where the item
@@ -17,13 +17,20 @@ pub struct Item {
 }
 
 /// The Earley chart: one item set per token position `0..=n` (`sets[j]` = items recognized just before
-/// token `j`; `sets[n]` is the final set). Retained for forest extraction (B4.4b).
+/// token `j`; `sets[n]` is the final set). `present[j]` is the same content as a set, for O(1) membership
+/// (the forest extractor's prefix check, B4.4b). Retained for forest extraction.
 #[derive(Debug)]
 pub struct Chart {
     pub sets: Vec<Vec<Item>>,
+    present: Vec<HashSet<Item>>,
 }
 
 impl Chart {
+    /// Whether `item` is in set `pos` (the forest extractor's prefix check).
+    pub fn contains(&self, pos: usize, item: Item) -> bool {
+        self.present[pos].contains(&item)
+    }
+
     /// Whether the input parsed to `start`: some production of `start` completed spanning the whole input
     /// (origin 0, dot at end, in the final set).
     pub fn recognized(&self, g: &CompiledGrammar, start: Nt) -> bool {
@@ -46,11 +53,15 @@ impl Chart {
 }
 
 /// Does grammar terminal `t` match input token `tok`? A specific token matches by interned `Sym`; a
-/// built-in class matches by lexical kind.
-fn terminal_matches(t: Terminal, tok: &Token) -> bool {
+/// built-in class matches by lexical kind. `SMALL_NAT` excludes the value-zero numeral (`0`, `00`):
+/// Maude splits `ZERO` from `SMALL_NAT`, and a successor symbol's numeral production accepts only
+/// positives — `0` is solely the declared zero constant, so excluding it here avoids a spurious parse.
+fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
     match t {
         Terminal::Tok(s) => tok.sym == s,
-        Terminal::SmallNat => tok.kind == TokKind::Number,
+        Terminal::SmallNat => {
+            tok.kind == TokKind::Number && i.resolve(tok.sym).bytes().any(|b| b != b'0')
+        }
         Terminal::Float => tok.kind == TokKind::Float,
         Terminal::Str => tok.kind == TokKind::Str,
         Terminal::Qid => tok.kind == TokKind::Qid,
@@ -58,8 +69,9 @@ fn terminal_matches(t: Terminal, tok: &Token) -> bool {
 }
 
 /// Run the Earley recognizer over `tokens`, seeding the start nonterminal `start`. Returns the chart;
-/// call [`Chart::recognized`] / [`Chart::root_items`] to interpret it.
-pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt) -> Chart {
+/// call [`Chart::recognized`] / [`Chart::root_items`] to interpret it. `i` resolves token text for the
+/// built-in lexical-class terminals (`SMALL_NAT`).
+pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> Chart {
     let n = tokens.len();
     let mut sets: Vec<Vec<Item>> = vec![Vec::new(); n + 1];
     let mut seen: Vec<HashSet<Item>> = vec![HashSet::new(); n + 1];
@@ -89,7 +101,7 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt) -> Chart {
                     }
                     GSym::T(t) => {
                         // Scan: consume token j if it matches, advancing into set j+1.
-                        if j < n && terminal_matches(t, &tokens[j]) {
+                        if j < n && terminal_matches(t, &tokens[j], i) {
                             add(
                                 &mut sets,
                                 &mut seen,
@@ -103,7 +115,7 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt) -> Chart {
         }
     }
 
-    Chart { sets }
+    Chart { sets, present: seen }
 }
 
 /// Completer: a finished production of nonterminal `N` (`item`, spanning `[item.origin, j)`) advances
@@ -181,7 +193,7 @@ endfm
         let g = CompiledGrammar::compile(&build_grammar(&m, &mut i));
         move |term: &str| {
             let tokens = tokenize(term, &mut i);
-            parse(&g, &tokens, Nt::Term).recognized(&g, Nt::Term)
+            parse(&g, &tokens, Nt::Term, &i).recognized(&g, Nt::Term)
         }
     }
 
