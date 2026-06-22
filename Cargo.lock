@@ -127,6 +127,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tnk-frontend"
+version = "0.0.0"
+dependencies = [
+ "tnk-core",
+]
+
+[[package]]
 name = "wide"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
