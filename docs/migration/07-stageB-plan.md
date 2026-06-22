@@ -6,12 +6,14 @@ foundation reshape, review Tier 2) is **complete and adversarially reviewed**; t
 supersedes `06-phase1-plan.md` §3–§4 for the breadth work (`06` remains the Phase-1 overview; its §3
 Stage A is now done).
 
-> **STATUS (2026-06-21) — STAGE B2 COMPLETE. NEXT: B3.** B1 (structural theories) and B2 (the
-> order-sorted / membership / conditional / attribute layer) are both **done on `main`**, every lock
-> conformance-verified vs the reference binary (**81 tests**, clippy `-D warnings` clean, `fib(22) =
-> 186579` and ~7.2 M rw/s intact throughout). §1 (as-built seams) and §2 B1/B2 below are refreshed to the
-> as-built state; §2 B3–B5 are the **unchanged forward plan** (the seams they plug into did not move).
-> Commit trail `23d6fd4..7d09469` (F-A guard + B2.1…B2.4). **Audit findings:** F-3/F-4 closed in B1; F-A
+> **STATUS (2026-06-22) — STAGE B3 COMPLETE. NEXT: B4 (frontend/parser).** B1 (structural theories), B2
+> (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
+> `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
+> reference binary (**100 tests**, clippy `-D warnings` clean, `fib(22) = 186579` and ~7.2 M rw/s intact
+> throughout). B3 = 8 sub-steps `a90f0b3..fe7cd3a` (num/S → BOOL → NAT → INT → NA/STRING/QID → FLOAT →
+> RAT); both B3 audit watch-items closed in code (the S-`count` `deep_equal`/`dag_compare` arms; BranchSymbol
+> laziness via auto `strat (1 0)`). §2 B3 below is the as-built summary; **§2 B4–B5 are the unchanged forward
+> plan.** Earlier commit trail `23d6fd4..7d09469` (F-A guard + B2.1…B2.4). **Audit findings:** F-3/F-4 closed in B1; F-A
 > (below) closed by a loud guard; **F-1** (no-op rewrite guard) still genuinely unimplemented — moot for
 > the locked theories, revisit if a self-rewriting `eq a = a` becomes reachable; **F-2** (nested-reduce GC
 > root set) is now **mitigated** (GC disabled during condition eval, B2.3) but **not fully closed** — the
@@ -252,10 +254,22 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   **F-2** the engine-global condition-reduce GC root set (mitigated, §4); `frozen`/`memo`; rewrite `=>`
   conditions (Phase 2); `special` (→ B3, with the built-in seam).
 
-### B3 — Built-in data types + bignums  *(now also hosts the **S** and **NA** theories — deferred from B1)*
-- **Goal:** `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` working — **plus the S (`iter`
-  successor) and NA (atomic constant) theories**, deferred from B1 because they need bignums / built-in
-  data respectively.
+### B3 — Built-in data types + bignums  — **DONE** (`a90f0b3..fe7cd3a`, 2026-06-22)
+- **As-built (on `main`):** the S (`iter`) and NA (atomic) theories + the `special (id-hook …)` seam
+  (`enum SpecialOp` + public `Engine::set_special`, dispatched at the top of `try_rewrite_top`) + bignums
+  (`crate::num` over `malachite`, D4). **BOOL** (EqualitySymbol; lazy BranchSymbol via auto `strat (1 0)`),
+  **NAT** (S numerals; ACU_NumberOp folds the multiset w/ multiplicity + residue; NumberOp quo/rem/`^`/cmp),
+  **INT** (MinusSymbol; the number machinery lifted `Nat`→`Int`, the `minus` hook gating negatives),
+  **NA + STRING + QID** (`NodeTerm::Na{value:NaValue}`, value-compared in deep_equal/dag_compare; StringOp
+  concat/length/substr/cmp), **FLOAT** (`NaValue::Float(u64 bits)`; FloatOp), **RAT** (DivisionSymbol
+  canonicalises `I/N` — RAT *arithmetic* is equation-defined, a post-parser B5 milestone). The two audit
+  watch-items closed: the S-`count` `deep_equal`/`dag_compare` arms (else `s^2(0)==s^3(0)`); BranchSymbol
+  laziness wiring. 100 tests, conformance `conformance/{iter,bool,nat,int,string,float,rat}.maude` == binary.
+  *Op-coverage follow-ups (same machinery, add on demand):* bit ops/shifts, string find/rfind/case/ascii,
+  float rem/floor/trig, INT/RAT gcd/lcm/min/max, NA-constants-in-patterns (`Term::Na`), `poly`/`Universal`.
+- **Original goal (met):** `BOOL`, `NAT`, `INT`, `RAT`, `FLOAT`, `STRING`, `QID` working — **plus the S
+  (`iter` successor) and NA (atomic constant) theories**, deferred from B1 because they need bignums /
+  built-in data respectively.
 - **Plugs into:** the §1.2 matcher seam + §1.3 visitor (new `NodeTerm::{S, Na}` arms — additive, exactly
   as ACU/AU/CUI were); the symbol-reduction path; **B2's attribute infrastructure** (`OpDeclaration` +
   `Symbol.strategy` + the condition machinery — `special`/`iter` parsing itself is B3's own work, deferred
