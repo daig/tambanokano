@@ -24,4 +24,8 @@ pub mod term;
 pub(crate) mod acu;
 pub(crate) mod au;
 pub(crate) mod cui;
+// B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
+// named outside `num`.
+pub(crate) mod num;
+pub(crate) mod s;
 pub(crate) mod theory;

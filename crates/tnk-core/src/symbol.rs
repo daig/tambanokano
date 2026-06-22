@@ -24,6 +24,9 @@ pub(crate) struct Axioms {
     /// Idempotence (`f(a, a) = a`) — only meaningful for the commutative, non-associative CUI theory
     /// in this slice (`idem` cannot combine with `assoc`).
     pub idem: bool,
+    /// Iteration (`iter`, B3): a unary "stacked successor" operator (`s_`) whose node stores the
+    /// iteration count compactly (the **S theory**). Mutually exclusive with assoc/comm/idem.
+    pub iter: bool,
 }
 
 /// Which equational theory an operator belongs to — selects its `DagNode` representation and its
@@ -42,6 +45,9 @@ pub(crate) enum Theory {
     /// Commutative (with optional identity and/or idempotence), **not** associative: a binary node
     /// with canonically-ordered arguments, matched modulo C(+U+I).
     Cui,
+    /// Iteration (`iter`, B3): a unary successor `s_` stored as `s^count(arg)` with a bignum `count`,
+    /// matched modulo the stacked-successor extension (`s^k` matches `s^n` for `k <= n`).
+    S,
 }
 
 /// One operator declaration: argument sorts (`domain`) → `range`, plus whether it is a constructor
@@ -95,6 +101,9 @@ impl Symbol {
     /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm` only →
     /// [`Cui`](Theory::Cui); else [`Free`](Theory::Free). (`idem` rides along inside CUI.)
     pub(crate) fn theory(&self) -> Theory {
+        if self.axioms.iter {
+            return Theory::S; // `iter` is mutually exclusive with assoc/comm (checked at registration)
+        }
         match (self.axioms.assoc, self.axioms.comm) {
             (true, true) => Theory::Acu,
             (true, false) => Theory::Au,

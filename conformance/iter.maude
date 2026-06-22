@@ -1,0 +1,27 @@
+*** B3.2 S-theory (`iter`) conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/iter.maude < /dev/null
+*** A unary `s_ [iter]` stores `s^count(0)` compactly (the binary prints it `s_^n(0)`). Sorts follow the
+*** successor's declaration (`s^n(0) : NzNat` for n >= 1); a ground or variable iter equation rewrites
+*** modulo the successor extension. Mirrors the engine.rs B3.2 tests.
+
+fmod ITER is
+  sorts Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter] .
+  eq s s 0 = 0 .
+endfm
+red 0 .                 *** Zero: 0          (0 rewrites)
+red s 0 .               *** NzNat: s 0       (0 rewrites)
+red s s s s s 0 .       *** NzNat: s 0       (2 rewrites: s^5 -> s^3 -> s^1, then n < 2 stops)
+
+fmod ITER-VAR is
+  sorts Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter] .
+  var X : Nat .
+  eq s s s X = s X .
+endfm
+red s s s s s 0 .       *** NzNat: s 0       (2 rewrites: s^3(X)->s^1(X) twice)
+red s s s 0 .           *** NzNat: s 0       (1 rewrite)

@@ -13,6 +13,7 @@
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NodeTerm};
+use crate::num::Nat;
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, Symbol, SymbolId, Theory};
@@ -192,7 +193,7 @@ impl Signature {
         let id = self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: true, comm: true, idem: false },
+            axioms: Axioms { assoc: true, comm: true, idem: false, iter: false },
             identity,
             strategy: None,
         });
@@ -214,7 +215,7 @@ impl Signature {
         self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: true, comm: false, idem: false },
+            axioms: Axioms { assoc: true, comm: false, idem: false, iter: false },
             identity,
             strategy: None,
         })
@@ -235,12 +236,31 @@ impl Signature {
         let id = self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: false, comm: true, idem },
+            axioms: Axioms { assoc: false, comm: true, idem, iter: false },
             identity,
             strategy: None,
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
+    }
+
+    /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Its nodes
+    /// store the iteration count compactly as `s^count(arg)` and match modulo the successor extension.
+    /// Must be unary; not commutative, so no declaration completion.
+    pub(crate) fn add_op_iter(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+    ) -> SymbolId {
+        assert_eq!(domain.len(), 1, "an `iter` operator must be unary");
+        self.symbols.alloc(Symbol {
+            name: name.into(),
+            decls: vec![OpDeclaration { domain, range, ctor: false }],
+            axioms: Axioms { iter: true, ..Default::default() },
+            identity: None,
+            strategy: None,
+        })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
@@ -431,6 +451,44 @@ impl Signature {
             acc = self.compute_sort(symbol, &[acc, e]);
         }
         acc
+    }
+
+    /// Least sort of an **S** node `s^count(arg)` (Maude's `S_Symbol::computeBaseSort` /
+    /// `SortPath::computeSortIndex`). The successor's unary sort function, iterated over the argument
+    /// sort, is eventually periodic (it maps a finite kind into itself), so the sort follows a **lead**
+    /// prefix then a **cycle**: `count` in the lead indexes the prefix directly, beyond it indexes into
+    /// the cycle. For NAT (`s_ : Nat -> NzNat`) the path is `Zero ↦ NzNat ↦ NzNat …`, so `s^n(0)` is
+    /// `NzNat` for every `n >= 1`. Correctness-first: the path is recomputed per call (Maude precomputes
+    /// a `sortPathTable` per argument sort — a perf follow-up).
+    pub(crate) fn compute_s_sort(&self, symbol: SymbolId, arg_sort: SortId, count: &Nat) -> SortId {
+        let (seq, lead) = self.s_sort_path(symbol, arg_sort);
+        let path_len = seq.len();
+        // An S node always has count >= 1. The first `path_len` successors index the path directly.
+        if let Some(c) = count.to_usize()
+            && c <= path_len
+        {
+            return seq[c - 1];
+        }
+        // Past the lead: index into the cycle (Maude's `computeSortIndex` tail arithmetic).
+        let cycle = path_len - lead;
+        let steps =
+            count.checked_sub(&Nat::from_u64((lead + 1) as u64)).expect("count > path_len >= lead+1");
+        seq[lead + steps.rem_usize(cycle)]
+    }
+
+    /// The successor sort path from `arg_sort`: `seq[k]` = least sort of `s^(k+1)(arg)`, iterating the
+    /// unary [`compute_sort`](Self::compute_sort) until a sort repeats; returns `(seq, lead)` where
+    /// `lead` is the index at which the cycle begins. Pigeonhole-terminating (finite kind).
+    fn s_sort_path(&self, symbol: SymbolId, arg_sort: SortId) -> (Vec<SortId>, usize) {
+        let mut seq: Vec<SortId> = Vec::new();
+        let mut cur = arg_sort;
+        loop {
+            cur = self.compute_sort(symbol, &[cur]);
+            if let Some(p) = seq.iter().position(|&s| s == cur) {
+                return (seq, p);
+            }
+            seq.push(cur);
+        }
     }
 
     /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
@@ -826,8 +884,28 @@ impl Runtime {
         self.alloc_node_constrained(sig, sort, NodeTerm::Cui { symbol, args: vec![x, y] })
     }
 
+    /// Build a canonical **S** (`iter`) node `s^count(arg)` (Maude's `S_DagNode::normalizeAtTop`):
+    /// `count == 0` collapses to `arg` (`s^0(x) = x`); a nested same-symbol successor flattens
+    /// (`s^j(s^k(x)) = s^(j+k)(x)` — one level suffices, the inner node is already normalized); otherwise
+    /// an [`NodeTerm::S`] with the periodic least sort ([`compute_s_sort`](Signature::compute_s_sort)).
+    pub(crate) fn make_s(&mut self, sig: &Signature, symbol: SymbolId, count: Nat, arg: DagId) -> DagId {
+        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::S, "make_s on a non-S symbol");
+        if count.is_zero() {
+            return arg;
+        }
+        let (count, arg) = match &self.dags.get(arg).term {
+            NodeTerm::S { symbol: inner, count: k, arg: inner_arg } if *inner == symbol => {
+                (count.add(k), *inner_arg)
+            }
+            _ => (count, arg),
+        };
+        let arg_sort = self.dags.get(arg).sort;
+        let sort = sig.compute_s_sort(symbol, arg_sort, &count);
+        self.alloc_node_constrained(sig, sort, NodeTerm::S { symbol, count, arg })
+    }
+
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
-    /// operator's theory: a free node directly, or a canonical ACU/AU/CUI node. Used by `reduce` when a
+    /// operator's theory: a free node directly, or a canonical ACU/AU/CUI/S node. Used by `reduce` when a
     /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
     /// theory symbols).
     pub(crate) fn rebuild(&mut self, sig: &Signature, symbol: SymbolId, children: Vec<DagId>) -> DagId {
@@ -838,6 +916,13 @@ impl Runtime {
             Theory::Cui => {
                 debug_assert_eq!(children.len(), 2, "a CUI node is binary");
                 self.make_cui(sig, symbol, children[0], children[1])
+            }
+            // An iter `Op` layer (from `instantiate`) is one successor; `make_s` flattening folds nested
+            // layers into a single `s^k`. `reduce` re-seats existing S nodes with their preserved count
+            // directly (not through here), so this `s^1` semantics is only ever what `instantiate` wants.
+            Theory::S => {
+                debug_assert_eq!(children.len(), 1, "an S successor is unary");
+                self.make_s(sig, symbol, Nat::one(), children[0])
             }
         }
     }
@@ -902,6 +987,15 @@ impl Runtime {
                     }
                 }
                 xa.len().cmp(&ya.len()) // lexicographic, then by length
+            }
+            // S successor: the scalar `count` is part of identity (not a child), so compare it first,
+            // then the argument (Maude's `S_DagNode::compareArguments`). This keeps the order consistent
+            // with the `deep_equal` S-arm, so `s^2(0)` and `s^3(0)` order correctly inside an ACU subject.
+            (NodeTerm::S { count: xc, arg: xa, .. }, NodeTerm::S { count: yc, arg: ya, .. }) => {
+                match xc.cmp(yc) {
+                    Ordering::Equal => self.dag_compare(*xa, *ya),
+                    ord => ord,
+                }
             }
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
@@ -1078,7 +1172,19 @@ impl Runtime {
                 let args = if changed { std::mem::take(&mut f.args) } else { Vec::new() };
                 (f.symbol, f.original, args, changed)
             };
-            let rebuilt = if changed { self.rebuild(sig, symbol, args) } else { original };
+            let rebuilt = if !changed {
+                original
+            } else if matches!(sig.symbol(symbol).theory(), Theory::S) {
+                // An S node's `count` is non-child state `rebuild` cannot recover (it would re-wrap as
+                // `s^1`); preserve the original count and re-seat it over the reduced argument.
+                let count = match &self.node(original).term {
+                    NodeTerm::S { count, .. } => count.clone(),
+                    _ => unreachable!("a Theory::S node is NodeTerm::S"),
+                };
+                self.make_s(sig, symbol, count, args[0])
+            } else {
+                self.rebuild(sig, symbol, args)
+            };
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
@@ -1127,10 +1233,10 @@ impl Runtime {
     /// instantiated straight out of the still-borrowed equation table.
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
-        // ACU/AU rewriting matches *modulo* the axioms with extension: a pattern may match a
-        // sub-multiset (ACU) or contiguous sub-sequence (AU) of the subject, leaving a residue to
-        // splice back. The free theory matches the whole node.
-        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au);
+        // ACU/AU/S rewriting matches *modulo* the axioms with extension: a pattern may match a
+        // sub-multiset (ACU), a contiguous sub-sequence (AU), or a successor prefix `s^k` of an `s^n`
+        // subject (S), leaving a residue to splice back. The free/CUI theories match the whole node.
+        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
         let eqs = sig.equations.get(&symbol)?;
         // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
         // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
@@ -1380,6 +1486,12 @@ impl Engine {
     ) -> SymbolId {
         self.sig.add_op_cui(name, domain, range, idem, identity)
     }
+
+    /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Must be
+    /// unary; its nodes (built via [`make_iter`](Self::make_iter)) store `s^count(arg)` compactly.
+    pub fn add_op_iter(&mut self, name: impl Into<String>, domain: Vec<SortId>, range: SortId) -> SymbolId {
+        self.sig.add_op_iter(name, domain, range)
+    }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
     }
@@ -1419,6 +1531,13 @@ impl Engine {
     /// [`Runtime::make_cui`]): commutatively ordered, with `f(a,a)`/`f(a,e)` collapsed.
     pub fn make_cui(&mut self, symbol: SymbolId, x: DagId, y: DagId) -> DagId {
         self.rt.make_cui(&self.sig, symbol, x, y)
+    }
+
+    /// Build a canonical **S** (`iter`) node `s^count(arg)` for an `iter` operator (see
+    /// [`Runtime::make_s`]): `count == 0` collapses to `arg`, nested same-symbol successors flatten.
+    /// `symbol` must be an `iter` operator (declared via [`add_op_iter`](Self::add_op_iter)).
+    pub fn make_iter(&mut self, symbol: SymbolId, count: u64, arg: DagId) -> DagId {
+        self.rt.make_s(&self.sig, symbol, Nat::from_u64(count), arg)
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -2880,6 +2999,107 @@ mod tests {
         let r = e.reduce(fba);
         assert_eq!(e.rewrites(), 1, "f(a,b)=c matches f(b,a) modulo comm");
         assert_eq!(e.node(r).symbol(), c, "result is c");
+    }
+
+    /// Engine with sorts `Zero NzNat < Nat`, `0 : Zero`, and a unary `iter` successor `s_ : Nat -> NzNat`.
+    fn iter_ctx() -> (Engine, SortId, SortId, SortId, SymbolId, SymbolId) {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        (e, zero, nznat, nat, z, s)
+    }
+
+    /// Build `s^n(0)` (a fresh `0` each call, so subjects don't alias).
+    fn iter_num(e: &mut Engine, z: SymbolId, s: SymbolId, n: u64) -> DagId {
+        let z0 = e.make_const(z);
+        e.make_iter(s, n, z0)
+    }
+
+    /// B3.2 S-theory construction + sort (== reference binary, `conformance/iter.maude` ITER): `s^n(0)`
+    /// stores the count compactly, `s^0(x)` collapses to `x`, nested successors flatten, and the sort
+    /// follows the successor's declaration (`s^n(0) : NzNat` for n >= 1, `0 : Zero`).
+    #[test]
+    fn iter_node_construction_and_sort() {
+        let (mut e, zero, nznat, _nat, z, s) = iter_ctx();
+        let z0 = e.make_const(z);
+        assert_eq!(e.sort_of(z0), zero, "0 : Zero");
+        let s1 = e.make_iter(s, 1, z0);
+        assert_eq!(e.sort_of(s1), nznat, "s 0 : NzNat");
+        let s5 = e.make_iter(s, 5, z0);
+        assert_eq!(e.sort_of(s5), nznat, "s^5 0 : NzNat");
+
+        let collapse = e.make_iter(s, 0, z0);
+        assert_eq!(collapse, z0, "s^0(0) collapses to 0");
+
+        let s3 = e.make_iter(s, 3, z0);
+        let s2_s3 = e.make_iter(s, 2, s3); // s^2(s^3(0))
+        assert!(e.deep_equal(s2_s3, s5), "s^2(s^3(0)) flattens to s^5(0)");
+        assert_eq!(e.node(s2_s3).children().count(), 1, "an S node has one child (the base)");
+    }
+
+    /// B3.2 THE soundness gate (the audit's #1 B3 trap): the S `count` is scalar payload, not a child,
+    /// so `deep_equal`/`dag_compare` must compare it — else `s^2(0)` and `s^3(0)` (both child `[0]`)
+    /// would compare equal.
+    #[test]
+    fn iter_equality_and_order_use_the_count() {
+        let (mut e, _zero, _nznat, _nat, z, s) = iter_ctx();
+        let z0 = e.make_const(z);
+        let (s2a, s2b, s3) = (e.make_iter(s, 2, z0), e.make_iter(s, 2, z0), e.make_iter(s, 3, z0));
+        assert!(e.deep_equal(s2a, s2b), "s^2(0) == s^2(0) (distinct ids, equal count)");
+        assert!(!e.deep_equal(s2a, s3), "s^2(0) != s^3(0) — count distinguishes them");
+        assert_eq!(e.runtime().dag_compare(s2a, s3), Ordering::Less, "s^2 < s^3 by count");
+        assert_eq!(e.runtime().dag_compare(s3, s2a), Ordering::Greater);
+        assert_eq!(e.runtime().dag_compare(s2a, s2b), Ordering::Equal);
+    }
+
+    /// B3.2 S-theory reduce, ground equation (== reference binary, ITER): `eq s s 0 = 0` rewrites
+    /// `s^5(0)` modulo the successor extension — `s^5 -> s^3 -> s^1`, 2 rewrites, result `s 0 : NzNat`.
+    #[test]
+    fn iter_reduce_ground_equation() {
+        let (mut e, _zero, nznat, _nat, z, s) = iter_ctx();
+        e.add_equation(Equation {
+            lhs: Term::op(s, vec![Term::op(s, vec![Term::constant(z)])]), // s s 0
+            rhs: Term::constant(z),
+            nr_vars: 0,
+        });
+        let s5 = iter_num(&mut e, z, s, 5);
+        let r = e.reduce(s5);
+        assert_eq!(e.rewrites(), 2, "s^5 -> s^3 -> s^1 (2 rewrites)");
+        assert_eq!(e.sort_of(r), nznat, "result s 0 : NzNat");
+        let s1 = iter_num(&mut e, z, s, 1);
+        assert!(e.deep_equal(r, s1), "result is s 0");
+    }
+
+    /// B3.2 S-theory reduce, variable equation (== reference binary, ITER-VAR): `eq s s s X = s X`
+    /// rewrites `s^5(0) -> s 0` (2 rewrites) and `s^3(0) -> s 0` (1) — the variable absorbs the
+    /// successor surplus (the extension's first/whole solution).
+    #[test]
+    fn iter_reduce_variable_equation() {
+        let (mut e, _zero, _nznat, nat, z, s) = iter_ctx();
+        let sx = |t| Term::op(s, vec![t]);
+        e.add_equation(Equation {
+            lhs: sx(sx(sx(Term::var(0, nat)))), // s s s X
+            rhs: sx(Term::var(0, nat)),         // s X
+            nr_vars: 1,
+        });
+        let s5 = iter_num(&mut e, z, s, 5);
+        let r = e.reduce(s5);
+        assert_eq!(e.rewrites(), 2, "s^5 -> s^3 -> s^1");
+        let s1 = iter_num(&mut e, z, s, 1);
+        assert!(e.deep_equal(r, s1), "s^5 -> s 0");
+
+        e.reset_rewrites();
+        let s3 = iter_num(&mut e, z, s, 3);
+        let r2 = e.reduce(s3);
+        assert_eq!(e.rewrites(), 1, "s^3 -> s 0");
+        let s1b = iter_num(&mut e, z, s, 1);
+        assert!(e.deep_equal(r2, s1b));
     }
 
     #[test]

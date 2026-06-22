@@ -24,6 +24,7 @@ use crate::au::{AuLhs, AuSubproblem};
 use crate::cui::{CuiLhs, CuiSubproblem};
 use crate::dag::DagId;
 use crate::engine::{Runtime, Signature};
+use crate::s::{SLhs, SSubproblem};
 use crate::symbol::Theory;
 use crate::term::{Subst, Term};
 
@@ -44,6 +45,8 @@ pub(crate) enum LhsAutomaton {
     Au(AuLhs),
     /// CUI theory (`comm [idem] [id:]`, not associative): commutative binary matching.
     Cui(CuiLhs),
+    /// S theory (`iter`): unary stacked-successor matching with extension (`s^k` matches `s^n`).
+    S(SLhs),
 }
 
 impl LhsAutomaton {
@@ -53,6 +56,7 @@ impl LhsAutomaton {
             Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
+            Some(Theory::S) => LhsAutomaton::S(SLhs::compile(lhs, sig)),
             _ => {
                 // Free-theory (or bare-variable) top. The recursive free matcher cannot see a
                 // theory-rooted subterm, so a pattern like `f(a + b)` (AC `+` under free `f`) would
@@ -95,6 +99,8 @@ impl LhsAutomaton {
             LhsAutomaton::Au(lhs) => lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Au),
             // CUI is binary with no extension, so it ignores `ext_allowed`.
             LhsAutomaton::Cui(lhs) => lhs.match_(rt, sig, subject).map(Subproblem::Cui),
+            // S reads only the runtime (the count comparison) — no `sig`/`subst` in its first phase.
+            LhsAutomaton::S(lhs) => lhs.match_(rt, subject, ext_allowed).map(Subproblem::S),
         }
     }
 }
@@ -117,6 +123,8 @@ pub(crate) enum Subproblem {
     Au(AuSubproblem),
     /// CUI theory: the (at most two) commutative pairings (see [`CuiSubproblem`]).
     Cui(CuiSubproblem),
+    /// S theory: the (lazy) successor-extension solutions (see [`SSubproblem`]).
+    S(SSubproblem),
 }
 
 impl Subproblem {
@@ -131,6 +139,7 @@ impl Subproblem {
             Subproblem::Acu(sp) => sp.next(rt, sig, subst),
             Subproblem::Au(sp) => sp.next(rt, sig, subst),
             Subproblem::Cui(sp) => sp.next(rt, sig, subst),
+            Subproblem::S(sp) => sp.next(rt, sig, subst),
         }
     }
 
@@ -144,6 +153,7 @@ impl Subproblem {
             Subproblem::Acu(sp) => sp.build_result(rt, sig, rhs),
             Subproblem::Au(sp) => sp.build_result(rt, sig, rhs),
             Subproblem::Cui(sp) => sp.build_result(rt, sig, rhs),
+            Subproblem::S(sp) => sp.build_result(rt, sig, rhs),
         }
     }
 }

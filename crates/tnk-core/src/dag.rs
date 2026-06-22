@@ -53,6 +53,13 @@ pub(crate) enum NodeTerm {
     /// collapse to a single element at construction, so a canonical CUI node always has exactly two
     /// arguments. Built only by `make_cui`; traversal is the slice-based form.
     Cui { symbol: SymbolId, args: Vec<DagId> },
+    /// An **S** (`iter`) application `s^count(arg)` — a unary stacked successor with a **bignum**
+    /// `count` (so `s^(10^9) 0` is O(1)). The single child is `arg`; `count` is **scalar payload, not a
+    /// child id**, so it is invisible to the generic [`children`](DagNode::children) traversal — which
+    /// is exactly why `deep_equal`/`dag_compare` need theory-specific arms that also compare `count`
+    /// (without them `s^2(0)` and `s^3(0)` would compare equal). Built only by `make_s`, which keeps
+    /// `count >= 1` (`s^0(x)` collapses to `x`) and flattens nested same-symbol successors.
+    S { symbol: SymbolId, count: crate::num::Nat, arg: DagId },
 }
 
 impl DagNode {
@@ -79,6 +86,8 @@ impl DagNode {
                     }
                 }
             }
+            // The S successor has exactly one child (`arg`); `count` is scalar, not a child.
+            NodeTerm::S { arg, .. } => f(*arg),
         }
     }
 
@@ -94,6 +103,8 @@ impl DagNode {
             | NodeTerm::Au { args, .. }
             | NodeTerm::Cui { args, .. } => ChildIter::Free(args.iter()),
             NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
+            // The S successor's single child reuses the slice iterator via `from_ref` — no new arm.
+            NodeTerm::S { arg, .. } => ChildIter::Free(std::slice::from_ref(arg).iter()),
         }
     }
 
@@ -102,7 +113,8 @@ impl DagNode {
             NodeTerm::Free { symbol, .. }
             | NodeTerm::Acu { symbol, .. }
             | NodeTerm::Au { symbol, .. }
-            | NodeTerm::Cui { symbol, .. } => *symbol,
+            | NodeTerm::Cui { symbol, .. }
+            | NodeTerm::S { symbol, .. } => *symbol,
         }
     }
 

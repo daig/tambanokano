@@ -185,7 +185,9 @@ impl Runtime {
                 // The recursive free matcher never matches a theory subject: those are matched by
                 // their own automata, and a free Op pattern's symbol differs from any theory symbol.
                 // (A *variable* pattern still binds such a subject — that is the `Term::Var` arm.)
-                NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } => false,
+                NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } | NodeTerm::S { .. } => {
+                    false
+                }
             },
         }
     }
@@ -214,6 +216,18 @@ impl Runtime {
             let (nx, ny) = (self.node(x), self.node(y));
             if nx.symbol() != ny.symbol() {
                 return false;
+            }
+            // The S successor's `count` is scalar identity, not a child: compare it explicitly, else
+            // `s^2(0)` and `s^3(0)` — both `[arg]` under the generic child walk — would compare equal.
+            // Equal symbols ⇒ same theory ⇒ both are the S arm; recurse on the argument.
+            if let (NodeTerm::S { count: cx, arg: ax, .. }, NodeTerm::S { count: cy, arg: ay, .. }) =
+                (&nx.term, &ny.term)
+            {
+                if cx != cy {
+                    return false;
+                }
+                stack.push((*ax, *ay));
+                continue;
             }
             // Enqueue children pairwise; a length mismatch (different arity) is inequality.
             let (mut cx, mut cy) = (nx.children(), ny.children());

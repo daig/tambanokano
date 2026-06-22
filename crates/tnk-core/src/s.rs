@@ -1,0 +1,326 @@
+//! S-theory (`iter` successor) matching: a matcher for the unary stacked successor `s_`.
+//!
+//! A pattern `s^k(sub)` matches a subject `s^n(base)` of the same operator. The successor count `k` is
+//! peeled off the pattern at compile time; matching then compares it to the subject's count `n`:
+//! - `n < k` — no match (the pattern needs more successors than the subject has).
+//! - `n == k` — `sub` matches the subject's `base`, no residue (a "whole" match).
+//! - `n > k`, with **extension** (`ext_allowed`, the top-rewrite / `xmatch` case) — the matched `s^k`
+//!   sits under `residue = n − k − j` surplus successors that wrap the rhs; a *variable* `sub` can
+//!   absorb `j` of the surplus (`X = s^j(base)`, `j` from `n−k` down to `0` — genuinely multi-solution,
+//!   so the enumerator is **lazy** because `n−k` is a bignum), while a ground/alien `sub` forces `j = 0`
+//!   (it must align with the single base), leaving `residue = n − k`.
+//! - `n > k`, **no extension** (condition / membership matching) — a variable `sub` must absorb the
+//!   whole surplus (`X = s^(n−k)(base)`, residue 0); a ground/alien `sub` cannot match.
+//!
+//! Scope (this slice): a variable or a free-matchable (ground / free-alien) sub-pattern. A theory-rooted
+//! sub-pattern is rejected loudly (the `is_free_matchable` guard, as ACU/AU/CUI do). A *non-linear*
+//! iter variable (already bound elsewhere) is a loud assert — it cannot arise for a top-level iter
+//! equation lhs (the variable is bound here), only via cross-theory nesting, which is itself deferred.
+
+use crate::dag::{DagId, NodeTerm};
+use crate::engine::{Runtime, Signature};
+use crate::num::Nat;
+use crate::sort::SortId;
+use crate::symbol::SymbolId;
+use crate::term::{Subst, Term};
+
+/// A compiled S left-hand side `s^count(sub)`: the peeled successor `count` (≥ 1) and the residual
+/// sub-pattern.
+pub(crate) struct SLhs {
+    symbol: SymbolId,
+    count: Nat,
+    sub: SSub,
+}
+
+/// The residual sub-pattern after peeling the successors.
+enum SSub {
+    /// A bare variable — absorbs a run of successors over the base.
+    Var { index: u32, sort: SortId },
+    /// A free-matchable sub-pattern (ground, or a free non-variable alien like `f(X)`): matched against
+    /// the subject's base by the recursive free matcher. `vars` are its variable indices (to unbind on
+    /// backtracking).
+    Pat { pat: Term, vars: Vec<u32> },
+}
+
+impl SLhs {
+    /// Compile an iter pattern: peel the leading `s_` layers, counting them, then classify the residual.
+    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+        let symbol = lhs.top_symbol().expect("S lhs must be an application");
+        let mut count = Nat::zero();
+        let mut t = lhs;
+        loop {
+            match t {
+                Term::Op { symbol: s, args } if s == symbol && args.len() == 1 => {
+                    count = count.add(&Nat::one());
+                    t = args.into_iter().next().unwrap();
+                }
+                other => {
+                    t = other;
+                    break;
+                }
+            }
+        }
+        debug_assert!(!count.is_zero(), "an S pattern has at least one successor");
+        let sub = match t {
+            Term::Var(v) => SSub::Var { index: v.index, sort: v.sort },
+            other => {
+                assert!(
+                    other.is_free_matchable(sig),
+                    "a theory-rooted sub-pattern under an `iter` operator is not yet supported: it is \
+                     matched by the free matcher, which fails silently on a theory subject \
+                     (cross-theory composition is a B-follow-up)"
+                );
+                let mut vars = Vec::new();
+                collect_vars(&other, &mut vars);
+                SSub::Pat { pat: other, vars }
+            }
+        };
+        SLhs { symbol, count, sub }
+    }
+
+    /// First match phase: the subject must be an S node of this operator with `count >= self.count`.
+    /// Sets up the (resumable) solution enumerator; `None` if the subject is not an S node of this
+    /// symbol or has too few successors.
+    pub(crate) fn match_(
+        &self,
+        rt: &Runtime,
+        subject: DagId,
+        ext_allowed: bool,
+    ) -> Option<SSubproblem> {
+        let (n, base) = match &rt.node(subject).term {
+            NodeTerm::S { symbol, count, arg } if *symbol == self.symbol => (count.clone(), *arg),
+            _ => return None,
+        };
+        let diff = n.checked_sub(&self.count)?; // None ⇒ n < k ⇒ no match
+        let state = match &self.sub {
+            SSub::Var { index, sort } if ext_allowed => {
+                // X absorbs j of the surplus, j = diff … 0 (lazy — diff is a bignum).
+                SState::VarExt { index: *index, sort: *sort, diff: diff.clone(), next_j: Some(diff) }
+            }
+            SSub::Var { index, sort } => {
+                // No extension: X absorbs the whole surplus (residue 0).
+                SState::VarWhole { index: *index, sort: *sort, j: diff }
+            }
+            SSub::Pat { pat, vars } => {
+                if !ext_allowed && !diff.is_zero() {
+                    return None; // a ground/alien sub needs n == k without extension
+                }
+                SState::Pat { pat: pat.clone(), vars: vars.clone(), residue: diff }
+            }
+        };
+        Some(SSubproblem {
+            symbol: self.symbol,
+            base,
+            state,
+            bound: Vec::new(),
+            residue: Nat::zero(),
+            matched_whole: true,
+        })
+    }
+}
+
+/// A resumable enumerator over the solutions of an [`SLhs`] against a subject (an arm of the closed
+/// [`crate::theory::Subproblem`] enum). Owns its state, so it survives the `&mut Runtime` calls the
+/// driver makes between solutions.
+pub(crate) struct SSubproblem {
+    symbol: SymbolId,
+    base: DagId,
+    state: SState,
+    /// Variable indices bound by the most recent solution (unbound before the next one — F-4).
+    bound: Vec<u32>,
+    /// Residue of the most recent solution: the rhs is wrapped in `s^residue` (`build_result`).
+    residue: Nat,
+    matched_whole: bool,
+}
+
+/// The per-pattern-shape enumerator state.
+enum SState {
+    /// Variable + extension: bind `X = s^j(base)` for `j` descending from `next_j` to `0`, residue
+    /// `diff − j`. Lazy because `diff` may be astronomically large.
+    VarExt { index: u32, sort: SortId, diff: Nat, next_j: Option<Nat> },
+    /// Variable, no extension: a single solution `X = s^j(base)`, residue 0.
+    VarWhole { index: u32, sort: SortId, j: Nat },
+    /// Free sub-pattern matched against the base, with a fixed `residue` (`diff`): a single solution.
+    Pat { pat: Term, vars: Vec<u32>, residue: Nat },
+    /// Exhausted (the single-solution arms transition here after yielding once).
+    Done,
+}
+
+/// One pending candidate, pulled out of the state so the `&mut self.state` borrow is released before the
+/// runtime work (binding nodes, matching) touches the other `self` fields.
+enum Cand {
+    Var { index: u32, sort: SortId, j: Nat },
+    Pat { pat: Term, vars: Vec<u32> },
+}
+
+impl SSubproblem {
+    /// Advance to the next solution, binding its variable(s) into `subst` and recording the residue;
+    /// `false` when exhausted. Builds binding nodes (needs `&mut Runtime`).
+    pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
+        for &idx in &self.bound {
+            subst.unbind(idx);
+        }
+        self.bound.clear();
+
+        let symbol = self.symbol;
+        let base = self.base;
+        loop {
+            // Extract one candidate + its residue, releasing the `self.state` borrow before the work.
+            let (cand, residue) = match &mut self.state {
+                SState::VarExt { index, sort, diff, next_j } => match next_j.take() {
+                    None => return false,
+                    Some(j) => {
+                        *next_j =
+                            if j.is_zero() { None } else { Some(j.checked_sub(&Nat::one()).unwrap()) };
+                        let residue = diff.checked_sub(&j).unwrap();
+                        (Cand::Var { index: *index, sort: *sort, j }, residue)
+                    }
+                },
+                SState::VarWhole { index, sort, j } => {
+                    let cand = Cand::Var { index: *index, sort: *sort, j: j.clone() };
+                    self.state = SState::Done;
+                    (cand, Nat::zero())
+                }
+                SState::Pat { pat, vars, residue } => {
+                    let cand = Cand::Pat { pat: pat.clone(), vars: std::mem::take(vars) };
+                    let residue = residue.clone();
+                    self.state = SState::Done;
+                    (cand, residue)
+                }
+                SState::Done => return false,
+            };
+
+            match cand {
+                Cand::Var { index, sort, j } => {
+                    assert!(
+                        subst.get(index).is_none(),
+                        "non-linear S variable is not yet supported (a follow-up)"
+                    );
+                    let binding = rt.make_s(sig, symbol, j, base);
+                    if !sig.sorts().leq(rt.sort_of(binding), sort) {
+                        continue; // this j violates the variable's sort; try the next (or finish)
+                    }
+                    subst.bind(index, binding);
+                    self.bound.push(index);
+                }
+                Cand::Pat { pat, vars } => {
+                    if !rt.match_pattern(sig, &pat, base, subst) {
+                        // The sub-pattern does not match the base — unbind any partial bindings and stop.
+                        for idx in vars {
+                            subst.unbind(idx);
+                        }
+                        return false;
+                    }
+                    self.bound = vars;
+                }
+            }
+            self.residue = residue;
+            self.matched_whole = self.residue.is_zero();
+            return true;
+        }
+    }
+
+    /// Splice the instantiated `rhs` into the matched position: a whole match is just `rhs`; an
+    /// extension match wraps it in the residue successors (`s^residue(rhs)` — Maude's `partialConstruct`).
+    pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
+        if self.matched_whole {
+            rhs
+        } else {
+            rt.make_s(sig, self.symbol, self.residue.clone(), rhs)
+        }
+    }
+}
+
+/// Collect the distinct variable indices of a (free) sub-pattern, in first-seen order.
+fn collect_vars(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Op { args, .. } => {
+            for a in args {
+                collect_vars(a, out);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+
+    /// Sorts `Zero NzNat < Nat`, `0 : Zero`, unary `iter` `s_ : Nat -> NzNat`; returns `(e, nat, 0, s_)`.
+    fn ctx() -> (Engine, SortId, SymbolId, SymbolId) {
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        (e, nat, z, s)
+    }
+
+    /// Decode an `s^n(0)` DAG node to `n` (a constant base `0` is `n = 0`).
+    fn count_of(e: &Engine, id: DagId) -> u64 {
+        match &e.node(id).term {
+            NodeTerm::S { count, .. } => count.to_usize().unwrap() as u64,
+            _ => 0,
+        }
+    }
+
+    /// Drive `match_` + `next` over a 1-variable pattern, returning each solution's `X` binding as a count.
+    fn solutions(e: &mut Engine, pattern: Term, subject: DagId, ext: bool) -> Vec<u64> {
+        let lhs = SLhs::compile(pattern, e.signature());
+        let mut subst = Subst::new();
+        subst.reset(1);
+        let mut bindings: Vec<DagId> = Vec::new();
+        {
+            let (sig, rt) = e.parts_mut();
+            let Some(mut sp) = lhs.match_(rt, subject, ext) else { return Vec::new() };
+            while sp.next(rt, sig, &mut subst) {
+                bindings.push(subst.get(0).expect("X bound"));
+            }
+        }
+        bindings.into_iter().map(|b| count_of(e, b)).collect()
+    }
+
+    /// `xmatch s X <=? s s s 0` (== reference binary): 3 solutions, X absorbing `j = 2,1,0` successors
+    /// (descending — the first is the whole match).
+    #[test]
+    fn s_extension_enumerates_descending_absorptions() {
+        let (mut e, nat, z, s) = ctx();
+        let z0 = e.make_const(z);
+        let subject = e.make_iter(s, 3, z0); // s^3(0)
+        let pat = Term::op(s, vec![Term::var(0, nat)]); // s X
+        assert_eq!(solutions(&mut e, pat, subject, true), vec![2, 1, 0], "X = s^2 0, s 0, 0");
+    }
+
+    /// Without extension a variable sub-pattern absorbs the *whole* surplus — the single collector
+    /// solution `X = s^(n-k)(0)` (the condition/membership matching case).
+    #[test]
+    fn s_without_extension_is_the_whole_collector() {
+        let (mut e, nat, z, s) = ctx();
+        let z0 = e.make_const(z);
+        let subject = e.make_iter(s, 3, z0);
+        let pat = Term::op(s, vec![Term::var(0, nat)]); // s X
+        assert_eq!(solutions(&mut e, pat, subject, false), vec![2], "only X = s^2 0 (whole)");
+    }
+
+    /// A pattern needing more successors than the subject has does not match; a ground sub matches only
+    /// its own base.
+    #[test]
+    fn s_too_few_successors_and_ground_base() {
+        let (mut e, nat, z, s) = ctx();
+        let z0 = e.make_const(z);
+        let s1 = e.make_iter(s, 1, z0); // s^1(0)
+        // s s X <=? s 0 : pattern needs 2 successors, subject has 1 → no match.
+        let pat = Term::op(s, vec![Term::op(s, vec![Term::var(0, nat)])]);
+        assert!(solutions(&mut e, pat, s1, true).is_empty(), "s s X !<=? s 0");
+    }
+}

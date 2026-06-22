@@ -9,3 +9,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# D4: arbitrary-precision integers/rationals (pure Rust). Wrapped behind `crate::num` so the kernel
+# never names the backend; `Float` stays IEEE f64. License: LGPL-3.0-only (revisit before distribution).
+malachite = "0.9"
