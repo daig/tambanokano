@@ -18,6 +18,10 @@ pub struct SymbolSyntax {
     pub range: SortId,
     pub prec: Option<u32>,
     pub gather: Option<Vec<GatherElem>>,
+    /// Whether the operator carries the `assoc` axiom (ACU/AU). Recorded from the attributes (the kernel
+    /// keeps the theory `pub(crate)`); the grammar builder uses it to choose the flattened assoc-list
+    /// prefix form `f(<assocList>)` over the positional `f(a, …)` form, and the right-associating gather.
+    pub assoc: bool,
 }
 
 impl SymbolSyntax {
@@ -40,6 +44,9 @@ pub struct BuiltModule {
     pub ops: HashMap<(String, usize), SymbolId>,
     /// Per-symbol surface syntax.
     pub syntax: HashMap<SymbolId, SymbolSyntax>,
+    /// Declared variables `(name, sort)` (from `var`/`vars`). Used by the grammar builder (variable
+    /// productions) and `build_term` (resolving a variable token to its sort + statement-local index).
+    pub vars: Vec<(String, SortId)>,
     /// The raw statement bubbles (parsed + added to the engine in B4.4).
     pub statements: Vec<Statement>,
     /// Built-in literal anchors (for the grammar's literal productions + `make_*` in build_term).

@@ -73,6 +73,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                     range,
                     prec: od.attrs.prec,
                     gather: od.attrs.gather.clone(),
+                    assoc: od.attrs.assoc,
                 },
             );
             sym
@@ -129,12 +130,22 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         }
     }
 
+    // Resolve declared variables `(name, sort)` for the grammar builder + `build_term`.
+    let mut vars: Vec<(String, SortId)> = Vec::new();
+    for vd in &pm.vars {
+        let sort = sort_id(&sorts, &vd.sort)?;
+        for name in &vd.names {
+            vars.push((name.clone(), sort));
+        }
+    }
+
     Ok(BuiltModule {
         engine,
         name: pm.name.clone(),
         sorts,
         ops,
         syntax,
+        vars,
         statements: Vec::new(), // moved in by the caller (B4.4); kept out of `&PreModule`
         nat_succ,
         nat_zero,
