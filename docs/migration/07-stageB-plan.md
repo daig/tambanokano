@@ -10,9 +10,11 @@ Stage A is now done).
 > `conformance/{iter,bool,nat,int}.maude` from text and reduces them to the reference binary's exact sort +
 > rewrite count + value (lexer → surface parser + signature build → mixfix grammar → plain Earley+prec/gather
 > [DRP bypassed] → forest → build_term → load/reduce). Commits `b3b5819..01f28a5`; 31 frontend + 100 core
-> tests; clippy clean; fib(22)=186579; tnk-core untouched. **NEXT: B4.5 (coverage + whole-prelude diff-test)
-> → B4.6 (pretty-printer) → B5 (modules + REPL = Phase-1 end).** See §2 B4 below for the as-built detail and
-> the deferred list. *(History:)* B1 (structural theories), B2
+> tests; clippy clean; fib(22)=186579; tnk-core untouched. **NEXT: B4.6 (pretty-printer) FIRST, then B4.5
+> (coverage) — we deliberately swap the plan's 5/6 order because B4.5's whole-prelude differential test needs
+> the pretty-printer for a textual diff vs the binary; see the ⚠ ORDERING note in §2 B4. Then B5 (modules +
+> REPL = Phase-1 end).** See §2 B4 below for the as-built detail and the deferred list. *(History:)* B1
+> (structural theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
 > reference binary (**100 tests**, clippy `-D warnings` clean, `fib(22) = 186579` and ~7.2 M rw/s intact
@@ -299,7 +301,7 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
 - **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
   + its bignum `count`; tying succ/`iter` to NAT.
 
-### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 DONE (milestone hit); B4.5/B4.6 next**
+### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 DONE (milestone hit); NEXT: B4.6 (pretty-printer) THEN B4.5 (coverage)**
 - **As-built (on `main`, `b3b5819..01f28a5`):** the `tnk-frontend` crate. **B4.1** lexer (Maude tokenization
   + op-name `_`-splitting). **B4.2** surface recursive-descent parser (`fmod…endfm` → `PreModule` with raw
   token *bubbles*) + `build_sig` (drives the kernel constructor API, resolves `special (id-hook…)` →
@@ -320,6 +322,17 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   (`<_,_>`), structured sorts, conditional `ceq`/`cmb`/`owise`-conditions + `match` command, large-numeral
   DagId fast-path, the `f^n(t)` iter-token form, `mayAssoc` bias, and the **whole-prelude differential test**;
   the **pretty-printer** (B4.6, the round-trip + REPL output).
+- **⚠ ORDERING — do B4.6 (pretty-printer) BEFORE B4.5 (coverage).** *(The plan lists them 5-then-6; we
+  deliberately swap.)* **Why:** B4.5's strongest deliverable — the **whole-prelude differential test** — needs
+  a true *textual* comparison against the reference binary's printed output, which requires the pretty-printer
+  (the inverse renderer). The B4.4 conformance instead hand-encodes expected values; that does not scale to the
+  prelude. Building the pretty-printer first lets B4.5 validate coverage by **round-trip** (`parse∘pretty = id`
+  on reduced terms) and by **textual diff vs the binary**, rather than by hand-transcription. B4.6 is also where
+  B4 **first touches `tnk-core`**: it needs a few small *read* accessors (S-node iter `count`, `NaValue`
+  rendering, and a public rep discriminator — `NodeTerm`/`NaValue` are `pub(crate)` today, and there is no
+  public accessor for the iter count). The B4.5 items that are pure-frontend and *not* gated on the printer
+  (punctuation-split op names `<_,_>`, structured sorts, conditional `ceq`/`cmb` + the `match` command) may be
+  picked up in either order, but the prelude diff-test lands last, on top of B4.6.
 - **Goal:** parse `.maude` *functional* modules to the same terms the hand-built fixtures produce; round-trip via pretty-print.
 - **Plugs into:** B2 sorts/components feed grammar build; `build_term` returns kernel arena terms
   (§1.1/§1.5); B5 consumes the parsed `PreModule`.
