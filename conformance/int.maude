@@ -1,0 +1,37 @@
+*** B3.5 INT built-in number ops conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/int.maude < /dev/null
+*** A negative is `-(s^n(0))` via MinusSymbol (`-_`, a ctor): `-(s^n(0))` is canonical (0 rewrites),
+*** `-(-x)` reduces to `x` and `-0` to `0` (1 each). The same ACU/NumberOp symbols as NAT, lifted to
+*** signed via the `minusSymbol` op-hook; `quo`/`rem` truncate toward zero. Mirrors the engine.rs B3.5
+*** test. A `Truth` sort avoids the prelude's built-in `Bool`.
+fmod INTB is
+  sorts Truth Zero NzNat Nat NzInt Int .
+  subsorts Zero NzNat < Nat .
+  subsorts NzNat < NzInt .
+  subsorts Nat < Int .
+  subsorts NzInt < Int .
+  ops tt ff : -> Truth [ctor] .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op -_ : NzNat -> NzInt [ctor special (id-hook MinusSymbol op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op -_ : Int -> Int [ditto] .
+  op _+_ : Int Int -> Int [assoc comm special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _-_ : Int Int -> Int [special (id-hook NumberOpSymbol (-) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _*_ : Int Int -> Int [assoc comm special (id-hook ACU_NumberOpSymbol (*) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _quo_ : Int NzInt -> Int [special (id-hook NumberOpSymbol (quo) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _rem_ : Int NzInt -> Int [special (id-hook NumberOpSymbol (rem) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _<_ : Int Int -> Truth [special (id-hook NumberOpSymbol (<) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+endfm
+red - 3 .         *** NzInt: -3   (0 rewrites — a negative numeral is canonical)
+red - - 3 .       *** NzNat: 3    (1 rewrite — double negation)
+red - 0 .         *** Zero: 0     (1 rewrite — -0 = 0)
+red 2 + - 5 .     *** NzInt: -3
+red - 2 + - 3 .   *** NzInt: -5
+red 2 - 5 .       *** NzInt: -3
+red 5 - 2 .       *** NzNat: 3
+red 3 * - 2 .     *** NzInt: -6
+red - 2 * - 3 .   *** NzNat: 6
+red 7 quo - 2 .   *** NzInt: -3   (truncates toward zero)
+red - 7 rem 2 .   *** NzInt: -1   (remainder takes the dividend's sign)
+red - 2 < 3 .     *** Truth: tt
+red 3 < - 2 .     *** Truth: ff

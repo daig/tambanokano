@@ -7,9 +7,11 @@
 //! `mpz_class` usage in `BuiltIn/{succSymbol,numberOpSymbol,ACU_NumberOpSymbol}.cc` — it grows as each
 //! consumer lands (this slice is what the S theory needs; NAT/INT arithmetic is added with those ops).
 
-use malachite::Natural;
-use malachite::base::num::arithmetic::traits::{CheckedSub, DivMod, DivisibleBy, Gcd, Lcm, Pow};
+use malachite::base::num::arithmetic::traits::{
+    CheckedSub, DivRem, DivisibleBy, Gcd, Lcm, Pow, UnsignedAbs,
+};
 use malachite::base::num::basic::traits::{One, Zero};
+use malachite::{Integer, Natural};
 
 /// A non-negative arbitrary-precision integer (Maude's `Natural`). `Clone`/`Eq`/`Ord`/`Debug` are
 /// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) can derive `Debug` and the S-theory's
@@ -45,24 +47,9 @@ impl Nat {
     pub(crate) fn checked_sub(&self, other: &Nat) -> Option<Nat> {
         (&self.0).checked_sub(&other.0).map(Nat)
     }
-    /// `self * other`.
-    pub(crate) fn mul(&self, other: &Nat) -> Nat {
-        Nat(&self.0 * &other.0)
-    }
-    /// `(self / other, self % other)` — Euclidean quotient and remainder; the caller guards `other != 0`.
-    pub(crate) fn div_rem(&self, other: &Nat) -> (Nat, Nat) {
-        let (q, r) = (&self.0).div_mod(&other.0);
-        (Nat(q), Nat(r))
-    }
-    /// `self ^ exp`, or `None` if `exp` does not fit `u64` (an unrepresentable result).
-    pub(crate) fn pow(&self, exp: &Nat) -> Option<Nat> {
-        let e = u64::try_from(&exp.0).ok()?;
-        Some(Nat((&self.0).pow(e)))
-    }
-    /// `self ^ exp` for a small machine exponent (the ACU-multiplicity fold `n^m` for `_*_`).
-    pub(crate) fn pow_u64(&self, exp: u64) -> Nat {
-        Nat((&self.0).pow(exp))
-    }
+    // Signed arithmetic (`*`/`/`/`^`/`-`) lives on `Int` — `NAT` and `INT` both compute in `Int`, since
+    // `Nat ⊂ Int` (a negative result with no `minus` hook is the NAT "fall through" case). `Nat` keeps
+    // only what the S theory and the magnitude-based ops (gcd/lcm/divides) need.
     pub(crate) fn gcd(&self, other: &Nat) -> Nat {
         Nat((&self.0).gcd(&other.0))
     }
@@ -83,6 +70,55 @@ impl Nat {
     pub(crate) fn rem_usize(&self, m: usize) -> usize {
         let r = &self.0 % Natural::from(m as u64);
         usize::try_from(&r).expect("remainder < m fits usize")
+    }
+}
+
+/// A signed arbitrary-precision integer (Maude's `Integer`), the `INT` built-ins' value type. A numeral
+/// is `0`, `s^n(0)` (positive), or `-(s^n(0))` (negative), so an [`Int`] decomposes into a sign and a
+/// [`Nat`] [magnitude](Int::magnitude). `quo`/`rem` truncate toward zero (Maude's convention — the
+/// remainder takes the dividend's sign), which is malachite's `DivRem` (not `DivMod`, which floors).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Int(Integer);
+
+impl Int {
+    /// A non-negative `Int` from a `Nat` magnitude (the fold's accumulator seed; `Int::from_nat(&zero)`
+    /// is the zero value).
+    pub(crate) fn from_nat(n: &Nat) -> Self {
+        Int(Integer::from(n.0.clone()))
+    }
+    pub(crate) fn is_zero(&self) -> bool {
+        self.0 == Integer::ZERO
+    }
+    pub(crate) fn is_negative(&self) -> bool {
+        self.0 < Integer::ZERO
+    }
+    /// `|self|` as a `Nat` — the magnitude a numeral node stores (`s^|self|(0)`, negated if negative).
+    pub(crate) fn magnitude(&self) -> Nat {
+        Nat((&self.0).unsigned_abs())
+    }
+    /// `-self`.
+    pub(crate) fn neg(&self) -> Int {
+        Int(-&self.0)
+    }
+
+    pub(crate) fn add(&self, other: &Int) -> Int {
+        Int(&self.0 + &other.0)
+    }
+    pub(crate) fn sub(&self, other: &Int) -> Int {
+        Int(&self.0 - &other.0)
+    }
+    pub(crate) fn mul(&self, other: &Int) -> Int {
+        Int(&self.0 * &other.0)
+    }
+    /// `(self / other, self % other)`, **truncated toward zero** (remainder takes the dividend's sign —
+    /// Maude `quo`/`rem`). The caller guards `other != 0`.
+    pub(crate) fn div_rem(&self, other: &Int) -> (Int, Int) {
+        let (q, r) = (&self.0).div_rem(&other.0);
+        (Int(q), Int(r))
+    }
+    /// `self ^ exp` for a non-negative machine exponent (`_^_ : Int Nat -> Int`).
+    pub(crate) fn pow_u64(&self, exp: u64) -> Int {
+        Int((&self.0).pow(exp))
     }
 }
 
@@ -122,12 +158,8 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_and_number_theory() {
-        assert_eq!(n(3).mul(&n(4)), n(12));
-        assert_eq!(n(7).div_rem(&n(2)), (n(3), n(1)));
-        assert_eq!(n(2).pow(&n(10)), Some(n(1024)));
-        assert_eq!(n(2).pow_u64(3), n(8));
-        assert_eq!(n(0).pow(&n(0)), Some(n(1)), "0^0 = 1 (malachite convention)");
+    fn number_theory() {
+        // `Nat` keeps only the magnitude-based ops; signed `*`/`/`/`^`/`-` are tested on `Int` below.
         assert_eq!(n(12).gcd(&n(18)), n(6));
         assert_eq!(n(4).lcm(&n(6)), n(12));
     }
@@ -136,5 +168,24 @@ mod tests {
     fn divides() {
         assert!(n(3).divides(&n(12)) && !n(5).divides(&n(12)));
         assert!(n(1).divides(&n(7)) && !n(7).divides(&n(1)));
+    }
+
+    #[test]
+    fn signed_int() {
+        use super::Int;
+        let i = |x: u64| Int::from_nat(&n(x));
+        let neg = |x: u64| i(x).sub(&i(2 * x)); // -x
+        assert!(i(0).is_zero() && !i(3).is_negative());
+        assert!(neg(3).is_negative(), "-3 is negative");
+        assert_eq!(neg(3).magnitude(), n(3), "|-3| = 3");
+        assert_eq!(i(2).add(&neg(5)), neg(3), "2 + (-5) = -3");
+        assert_eq!(i(2).sub(&i(5)), neg(3), "2 - 5 = -3");
+        assert_eq!(neg(2).mul(&neg(3)), i(6), "(-2)(-3) = 6");
+        // quo/rem truncate toward zero; the remainder takes the dividend's sign.
+        let (q, r) = i(7).div_rem(&neg(2));
+        assert_eq!((q, r), (neg(3), i(1)), "7 quo -2 = -3, 7 rem -2 = 1");
+        let (q, r) = neg(7).div_rem(&i(2));
+        assert_eq!((q, r), (neg(3), neg(1)), "-7 quo 2 = -3, -7 rem 2 = -1");
+        assert!(neg(2) < i(3) && i(3) > neg(2), "-2 < 3");
     }
 }

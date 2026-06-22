@@ -3236,7 +3236,7 @@ mod tests {
         let ff = e.add_op("ff", vec![], truth);
         let z = e.add_op("0", vec![], zero);
         let s = e.add_op_iter("s", vec![nat], nznat);
-        let nh = NatHooks { succ: s, zero: z };
+        let nh = NatHooks { succ: s, zero: z, minus: None }; // NAT: no negatives
         let bh = BoolHooks { true_: tt, false_: ff };
         // ACU ops: NzNat Nat -> NzNat overloaded Nat Nat -> Nat (the prelude shape; F-B-completed).
         let acu_op = |e: &mut Engine, name: &'static str, op: NumOp| -> SymbolId {
@@ -3321,6 +3321,124 @@ mod tests {
             }
         }
         assert!(has_x && has_5, "x + 5 = {{x, s^5(0)}}");
+    }
+
+    /// B3.5 INT signed arithmetic (== reference binary, `conformance/int.maude`): negatives are
+    /// `-(s^n(0))` via `MinusSymbol` (a negative numeral is canonical — 0 rewrites; `-(-x)` and `-0`
+    /// reduce in 1). The same ACU/Number ops as NAT, lifted to signed via the `minus` hook; `quo`/`rem`
+    /// truncate toward zero. The result sort follows the value (`NzInt`/`NzNat`/`Zero`).
+    #[test]
+    fn builtin_int_signed_arithmetic() {
+        use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp};
+        let mut e = Engine::new();
+        let truth = e.add_sort("Truth");
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        let nzint = e.add_sort("NzInt");
+        let int = e.add_sort("Int");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.add_subsort(nznat, nzint);
+        e.add_subsort(nat, int);
+        e.add_subsort(nzint, int);
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let minus = e.add_op("-", vec![nznat], nzint); // -_ : NzNat -> NzInt
+        e.add_op_decl(minus, vec![int], int); //          -_ : Int -> Int
+        let nh = NatHooks { succ: s, zero: z, minus: Some(minus) };
+        let bh = BoolHooks { true_: tt, false_: ff };
+        e.set_special(minus, SpecialOp::Minus { nat: nh });
+        let plus = e.add_op_ac("+", vec![int, int], int, None);
+        e.set_special(plus, SpecialOp::AcuNumberOp { op: NumOp::Add, nat: nh });
+        let times = e.add_op_ac("*", vec![int, int], int, None);
+        e.set_special(times, SpecialOp::AcuNumberOp { op: NumOp::Mul, nat: nh });
+        let sub = e.add_op("-bin", vec![int, int], int);
+        e.set_special(sub, SpecialOp::NumberOp { op: NumOp::Sub, nat: nh, bool_: None });
+        let quo = e.add_op("quo", vec![int, nzint], int);
+        e.set_special(quo, SpecialOp::NumberOp { op: NumOp::Quo, nat: nh, bool_: None });
+        let rem = e.add_op("rem", vec![int, nzint], int);
+        e.set_special(rem, SpecialOp::NumberOp { op: NumOp::Rem, nat: nh, bool_: None });
+        let lt = e.add_op("<", vec![int, int], truth);
+        e.set_special(lt, SpecialOp::NumberOp { op: NumOp::Lt, nat: nh, bool_: Some(bh) });
+
+        // Build a signed numeral `v` (`s^v(0)`, or `-(s^|v|(0))`).
+        let mk = |e: &mut Engine, v: i64| -> DagId {
+            if v >= 0 {
+                iter_num(e, z, s, v as u64)
+            } else {
+                let p = iter_num(e, z, s, (-v) as u64);
+                e.make_free(minus, vec![p])
+            }
+        };
+        // Decode a signed numeral.
+        let di = |e: &Engine, id: DagId| -> i64 {
+            match &e.node(id).term {
+                NodeTerm::Free { symbol, args } if *symbol == minus && args.len() == 1 => {
+                    -(decode_nat(e, args[0]) as i64)
+                }
+                _ => decode_nat(e, id) as i64,
+            }
+        };
+
+        // Negation: `- 3` is canonical (0 rewrites); `- - 3` and `- 0` reduce in 1.
+        e.reset_rewrites();
+        let m3 = mk(&mut e, -3);
+        let r = e.reduce(m3);
+        assert_eq!((di(&e, r), e.rewrites()), (-3, 0), "- 3 = -3 (canonical)");
+        assert_eq!(e.sorts().name(e.sort_of(r)), "NzInt", "-3 : NzInt");
+        e.reset_rewrites();
+        let p3 = mk(&mut e, 3);
+        let m3a = e.make_free(minus, vec![p3]);
+        let mm3 = e.make_free(minus, vec![m3a]);
+        let r = e.reduce(mm3);
+        assert_eq!((di(&e, r), e.rewrites()), (3, 1), "- - 3 = 3");
+        e.reset_rewrites();
+        let z0 = e.make_const(z);
+        let m0 = e.make_free(minus, vec![z0]);
+        let r = e.reduce(m0);
+        assert_eq!((di(&e, r), e.rewrites()), (0, 1), "- 0 = 0");
+
+        // Binary ops over an ACU operator (+, *) → (decoded value, rewrites).
+        let acu = |e: &mut Engine, op: SymbolId, a: i64, b: i64| -> (i64, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (mk(e, a), mk(e, b));
+            let q = e.make_ac(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (di(e, r), e.rewrites())
+        };
+        assert_eq!(acu(&mut e, plus, 2, -5), (-3, 1), "2 + -5 = -3");
+        assert_eq!(acu(&mut e, plus, -2, -3), (-5, 1), "-2 + -3 = -5");
+        assert_eq!(acu(&mut e, times, 3, -2), (-6, 1), "3 * -2 = -6");
+        assert_eq!(acu(&mut e, times, -2, -3), (6, 1), "-2 * -3 = 6");
+
+        // Binary free arithmetic (-, quo, rem) → (decoded value, rewrites).
+        let bin = |e: &mut Engine, op: SymbolId, a: i64, b: i64| -> (i64, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (mk(e, a), mk(e, b));
+            let q = e.make_free(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (di(e, r), e.rewrites())
+        };
+        assert_eq!(bin(&mut e, sub, 2, 5), (-3, 1), "2 - 5 = -3");
+        assert_eq!(bin(&mut e, sub, 5, 2), (3, 1), "5 - 2 = 3");
+        assert_eq!(bin(&mut e, quo, 7, -2), (-3, 1), "7 quo -2 = -3 (toward zero)");
+        assert_eq!(bin(&mut e, rem, -7, 2), (-1, 1), "-7 rem 2 = -1 (dividend's sign)");
+
+        // Comparison → Truth.
+        let cmp = |e: &mut Engine, a: i64, b: i64| -> SymbolId {
+            e.reset_rewrites();
+            let (na, nb) = (mk(e, a), mk(e, b));
+            let q = e.make_free(lt, vec![na, nb]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), 1);
+            e.node(r).symbol()
+        };
+        assert_eq!(cmp(&mut e, -2, 3), tt, "-2 < 3 = tt");
+        assert_eq!(cmp(&mut e, 3, -2), ff, "3 < -2 = ff");
     }
 
     #[test]

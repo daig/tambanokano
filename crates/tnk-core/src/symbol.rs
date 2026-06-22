@@ -111,14 +111,20 @@ pub enum SpecialOp {
     /// rewrite to a Bool constant; arithmetic ops to a Nat. A non-numeric argument, division by zero, or
     /// a would-be-negative result falls through to user equations (`None`).
     NumberOp { op: NumOp, nat: NatHooks, bool_: Option<BoolHooks> },
+    /// `-_` (Maude's `MinusSymbol`): integer negation. `-(s^n(0))` is the canonical negative (no
+    /// rewrite); `-(-x)` reduces to `x` and `-0` to `0`. `nat.minus` is this operator.
+    Minus { nat: NatHooks },
 }
 
-/// The `op-hook succSymbol` (an `iter` successor) and its `Zero` constant (the successor's `zeroTerm`).
-/// [`as_nat`/`make_nat`](crate::engine) use these to recognise and build `s^n(0)` numerals.
+/// The `op-hook succSymbol` (an `iter` successor) and its `Zero` constant (the successor's `zeroTerm`),
+/// plus the optional `op-hook minusSymbol` (`-_`). The numeral bridge uses these to recognise and build
+/// `0` / `s^n(0)` / `-(s^n(0))`. `minus` is `None` for `NAT` (no negatives — a negative result falls
+/// through to user equations) and `Some` for `INT`.
 #[derive(Debug, Clone, Copy)]
 pub struct NatHooks {
     pub succ: SymbolId,
     pub zero: SymbolId,
+    pub minus: Option<SymbolId>,
 }
 
 /// A relational number op's `term-hook trueTerm`/`falseTerm` result constants.
@@ -141,7 +147,8 @@ pub enum NumOp {
     Lcm,
     Min,
     Max,
-    // free arithmetic → Nat — `_quo_` `_rem_` `_^_`.
+    // free arithmetic → Nat/Int — `_-_` (INT) `_quo_` `_rem_` `_^_`.
+    Sub,
     Quo,
     Rem,
     Pow,

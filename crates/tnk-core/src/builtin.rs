@@ -8,7 +8,7 @@
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
-use crate::num::Nat;
+use crate::num::{Int, Nat};
 use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp, SymbolId};
 
 impl Runtime {
@@ -21,6 +21,7 @@ impl Runtime {
             SpecialOp::NumberOp { op, nat, bool_ } => {
                 self.reduce_number_op(sig, id, *op, nat, bool_.as_ref())
             }
+            SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
         }
     }
 
@@ -53,8 +54,8 @@ impl Runtime {
         tests.iter().position(|&t| t == cond_sym).map(|i| kids[i + 1])
     }
 
-    /// Read a `Nat` numeral from `id` — the `zero` constant (`0`) or `s^count(0)` — or `None` if `id`
-    /// is not a numeral (a variable-headed term, the error sort, a foreign symbol, …).
+    /// The magnitude of a non-negative numeral at `id` — the `zero` constant (`0`) or `s^count(0)` — or
+    /// `None` if `id` is not such a numeral. (`as_int` builds on this; `divides` works on magnitudes.)
     fn as_nat(&self, id: DagId, nat: &NatHooks) -> Option<Nat> {
         match &self.node(id).term {
             NodeTerm::Free { symbol, args } if *symbol == nat.zero && args.is_empty() => {
@@ -70,14 +71,50 @@ impl Runtime {
         }
     }
 
-    /// Build the `Nat` numeral for `n`: the `zero` constant (`n == 0`) or `s^n(0)` (Maude's
-    /// `succSymbol->makeNatDag`). The sort follows from the node — `0 : Zero`, `s^n(0) : NzNat`.
-    fn make_nat(&mut self, sig: &Signature, nat: &NatHooks, n: Nat) -> DagId {
+    /// Read an `Int` numeral from `id`: a non-negative numeral (`0` / `s^n(0)`), or `-(s^n(0))` when the
+    /// `minus` hook is set (INT). `None` if `id` is not a numeral.
+    fn as_int(&self, id: DagId, nat: &NatHooks) -> Option<Int> {
+        if let Some(n) = self.as_nat(id, nat) {
+            return Some(Int::from_nat(&n));
+        }
+        let minus = nat.minus?;
+        match &self.node(id).term {
+            NodeTerm::Free { symbol, args } if *symbol == minus && args.len() == 1 => {
+                Some(Int::from_nat(&self.as_nat(args[0], nat)?).neg())
+            }
+            _ => None,
+        }
+    }
+
+    /// Build the numeral for `n`: `0` / `s^|n|(0)` / `-(s^|n|(0))` (Maude's `succSymbol->makeNatDag` and
+    /// `MinusSymbol`). The sort follows the node (`0 : Zero`, `s^n(0) : NzNat`, `-(s^n(0)) : NzInt`). A
+    /// **negative** `n` with no `minus` hook (NAT) returns `None` — the op falls through to user
+    /// equations (a signed result needs INT).
+    fn make_int(&mut self, sig: &Signature, nat: &NatHooks, n: Int) -> Option<DagId> {
         if n.is_zero() {
-            self.make_const(sig, nat.zero)
-        } else {
+            return Some(self.make_const(sig, nat.zero));
+        }
+        let pos = {
             let z = self.make_const(sig, nat.zero);
-            self.make_s(sig, nat.succ, n, z)
+            self.make_s(sig, nat.succ, n.magnitude(), z)
+        };
+        if n.is_negative() {
+            Some(self.make_free(sig, nat.minus?, vec![pos]))
+        } else {
+            Some(pos)
+        }
+    }
+
+    /// `-_` (Maude's `MinusSymbol`): `-(-x) = x`, `-0 = 0`; `-(s^n(0))` is the canonical negative (no
+    /// rewrite). The argument is already reduced (standard strategy).
+    fn reduce_minus(&self, id: DagId, nat: &NatHooks) -> Option<DagId> {
+        let arg = self.node(id).children().next().expect("-_ is unary");
+        match &self.node(arg).term {
+            NodeTerm::Free { symbol, args } if Some(*symbol) == nat.minus && args.len() == 1 => {
+                Some(args[0]) // -(-x) = x
+            }
+            NodeTerm::Free { symbol, args } if *symbol == nat.zero && args.is_empty() => Some(arg), // -0 = 0
+            _ => None, // -(s^n(0)) is canonical
         }
     }
 
@@ -97,11 +134,11 @@ impl Runtime {
             NodeTerm::Acu { args, .. } => args.clone(),
             _ => return None,
         };
-        let mut acc: Option<Nat> = None;
+        let mut acc: Option<Int> = None;
         let mut used: u64 = 0;
         let mut residue: Vec<(DagId, u32)> = Vec::new();
         for (elem, m) in pairs {
-            match self.as_nat(elem, nat) {
+            match self.as_int(elem, nat) {
                 Some(n) => {
                     acc = Some(match &acc {
                         None => acu_fold_first(op, &n, m),
@@ -115,7 +152,7 @@ impl Runtime {
         if used < 2 {
             return None;
         }
-        let result = self.make_nat(sig, nat, acc.expect("used >= 2 ⇒ acc set"));
+        let result = self.make_int(sig, nat, acc.expect("used >= 2 ⇒ acc set"))?;
         if residue.is_empty() {
             Some(result)
         } else {
@@ -124,9 +161,10 @@ impl Runtime {
         }
     }
 
-    /// `NumberOpSymbol` (`_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_`/`_>_`/`_>=_`/`_divides_`): a free op over
-    /// numeric arguments. A non-numeric argument, a zero divisor, or a too-large exponent falls through
-    /// (`None`). Relational ops rewrite to a Bool constant (`bool_`), arithmetic ops to a Nat.
+    /// `NumberOpSymbol` (`_-_`/`_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_`/`_>_`/`_>=_`/`_divides_`): a free op
+    /// over numeric arguments. A non-numeric argument, a zero divisor, a negative result with no `minus`
+    /// hook, or a too-large/negative exponent falls through (`None`). Relational ops rewrite to a Bool
+    /// constant (`bool_`); arithmetic ops to a Nat/Int.
     fn reduce_number_op(
         &mut self,
         sig: &Signature,
@@ -136,9 +174,9 @@ impl Runtime {
         bool_: Option<&BoolHooks>,
     ) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
-        let mut a: Vec<Nat> = Vec::with_capacity(kids.len());
+        let mut a: Vec<Int> = Vec::with_capacity(kids.len());
         for k in kids {
-            a.push(self.as_nat(k, nat)?); // any non-numeric argument ⇒ no built-in reduction
+            a.push(self.as_int(k, nat)?); // any non-numeric argument ⇒ no built-in reduction
         }
         match op {
             NumOp::Lt | NumOp::Le | NumOp::Gt | NumOp::Ge | NumOp::Divides => {
@@ -147,22 +185,27 @@ impl Runtime {
                     NumOp::Le => a[0] <= a[1],
                     NumOp::Gt => a[0] > a[1],
                     NumOp::Ge => a[0] >= a[1],
-                    NumOp::Divides => a[0].divides(&a[1]), // divisor is NzNat (well-typed), so > 0
+                    // `_divides_ : NzNat Nat -> Bool` — non-negative operands, so compare magnitudes.
+                    NumOp::Divides => a[0].magnitude().divides(&a[1].magnitude()),
                     _ => unreachable!(),
                 };
                 let h = bool_.expect("a relational number op carries the true/false hooks");
                 Some(self.make_const(sig, if b { h.true_ } else { h.false_ }))
             }
+            NumOp::Sub => self.make_int(sig, nat, a[0].sub(&a[1])),
             NumOp::Quo | NumOp::Rem => {
                 if a[1].is_zero() {
                     return None; // division by zero ⇒ fall through to user equations
                 }
-                let (q, r) = a[0].div_rem(&a[1]);
-                Some(self.make_nat(sig, nat, if matches!(op, NumOp::Quo) { q } else { r }))
+                let (q, r) = a[0].div_rem(&a[1]); // truncated toward zero (Maude quo/rem)
+                self.make_int(sig, nat, if matches!(op, NumOp::Quo) { q } else { r })
             }
             NumOp::Pow => {
-                let r = a[0].pow(&a[1])?; // exponent too large ⇒ fall through
-                Some(self.make_nat(sig, nat, r))
+                if a[1].is_negative() {
+                    return None; // `_^_ : Int Nat -> Int` needs a non-negative exponent
+                }
+                let e = a[1].magnitude().to_usize()? as u64; // too-large exponent ⇒ fall through
+                self.make_int(sig, nat, a[0].pow_u64(e))
             }
             // ACU ops never reach the free path (the seam pairs each op with the right SpecialOp arm).
             NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => {
@@ -173,23 +216,24 @@ impl Runtime {
 }
 
 /// The first numeric operand `n` (multiplicity `m`) folded into a fresh accumulator.
-fn acu_fold_first(op: NumOp, n: &Nat, m: u32) -> Nat {
+fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
     match op {
-        NumOp::Add => n.mul(&Nat::from_u64(u64::from(m))), // n added m times
-        NumOp::Mul => n.pow_u64(u64::from(m)),             // n multiplied m times
-        // gcd/lcm/min/max are idempotent in multiplicity.
-        NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => n.clone(),
+        NumOp::Add => n.mul(&Int::from_nat(&Nat::from_u64(u64::from(m)))), // n added m times
+        NumOp::Mul => n.pow_u64(u64::from(m)),                            // n multiplied m times
+        // gcd/lcm/min/max are idempotent in multiplicity; their operands are non-negative.
+        NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => Int::from_nat(&n.magnitude()),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
 }
 
 /// A subsequent numeric operand `n` (multiplicity `m`) combined with the accumulator `acc`.
-fn acu_fold(op: NumOp, acc: &Nat, n: &Nat, m: u32) -> Nat {
+fn acu_fold(op: NumOp, acc: &Int, n: &Int, m: u32) -> Int {
     match op {
-        NumOp::Add => acc.add(&n.mul(&Nat::from_u64(u64::from(m)))),
+        NumOp::Add => acc.add(&n.mul(&Int::from_nat(&Nat::from_u64(u64::from(m))))),
         NumOp::Mul => acc.mul(&n.pow_u64(u64::from(m))),
-        NumOp::Gcd => acc.gcd(n),
-        NumOp::Lcm => acc.lcm(n),
+        // gcd/lcm work on magnitudes (non-negative operands); min/max via the `Int` order.
+        NumOp::Gcd => Int::from_nat(&acc.magnitude().gcd(&n.magnitude())),
+        NumOp::Lcm => Int::from_nat(&acc.magnitude().lcm(&n.magnitude())),
         NumOp::Min => core::cmp::min(acc.clone(), n.clone()),
         NumOp::Max => core::cmp::max(acc.clone(), n.clone()),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
