@@ -812,4 +812,107 @@ mod tests {
             ],
         );
     }
+
+    /// B4.5e: `__` juxtaposition (`op __ : E E -> E [assoc]`, the empty-syntax production `E ::= E E`).
+    /// The `[assoc]` right-associating gather `(e E)` disambiguates the otherwise-ambiguous adjacent
+    /// nonterminals; the kernel then flattens the parse modulo associativity. AU `match` (ordered
+    /// prefix/suffix splits incl. the identity `nil`) + the two AU reduce locks (extension on both ends;
+    /// the lone variable absorbing the ordered tail).
+    #[test]
+    fn au_conforms() {
+        conform(
+            conformance_file!("au.maude"),
+            &[
+                // match X Y <=? a b c  — four ordered splits, including nil via the identity.
+                mat(&[
+                    "X --> nil\nY --> a b c",
+                    "X --> a\nY --> b c",
+                    "X --> a b\nY --> c",
+                    "X --> a b c\nY --> nil",
+                ]),
+                e("E", "d a d", 1), // red d b c d  — `b c` rewrites to `a` in place (extension both ends)
+                e("E", "b", 1),     // red a c c    — lone var absorbs the tail (`a X = b`)
+            ],
+        );
+    }
+
+    /// The whole-conformance-suite differential gate (B4.5e, the last B4 deliverable). EVERY conformance
+    /// module loads, EVERY command runs, and every reduced result **round-trips** (`parse∘print_raw =
+    /// id`). The per-module `*_conforms` tests pin exact sorts / counts / values against the reference
+    /// binary; this sweep is the breadth guarantee — parser and pretty-printer stay mutually consistent
+    /// across the *entire* suite — and the explicit list is the coverage guard: a new `conformance/*.maude`
+    /// must be added here, so nothing silently drops out of coverage.
+    #[test]
+    fn whole_conformance_suite() {
+        use crate::pretty::print_raw;
+        // (name, source, round_trip). `fib` is the throughput fixture — its result is a 17711-deep
+        // successor chain, so we run+count it but skip the (correct, but O(n)-token) round-trip reparse;
+        // `peano` round-trips the same Peano-Fibonacci theory at a small numeral.
+        let modules: &[(&str, &str, bool)] = &[
+            ("acu-match", conformance_file!("acu-match.maude"), true),
+            ("acu-overload", conformance_file!("acu-overload.maude"), true),
+            ("acu-reduce", conformance_file!("acu-reduce.maude"), true),
+            ("au", conformance_file!("au.maude"), true),
+            ("bool", conformance_file!("bool.maude"), true),
+            ("cmb", conformance_file!("cmb.maude"), true),
+            ("conditional", conformance_file!("conditional.maude"), true),
+            ("cui", conformance_file!("cui.maude"), true),
+            ("fib", conformance_file!("fib.maude"), false),
+            ("float", conformance_file!("float.maude"), true),
+            ("int", conformance_file!("int.maude"), true),
+            ("iter", conformance_file!("iter.maude"), true),
+            ("match-cond", conformance_file!("match-cond.maude"), true),
+            ("membership", conformance_file!("membership.maude"), true),
+            ("nat", conformance_file!("nat.maude"), true),
+            ("overload", conformance_file!("overload.maude"), true),
+            ("owise", conformance_file!("owise.maude"), true),
+            ("peano", conformance_file!("peano.maude"), true),
+            ("rat", conformance_file!("rat.maude"), true),
+            ("strat", conformance_file!("strat.maude"), true),
+            ("string", conformance_file!("string.maude"), true),
+        ];
+        for &(name, src, round_trip) in modules {
+            let mut loaded = load_source(src).unwrap_or_else(|e| panic!("{name}: load: {e}"));
+            let cmds: Vec<(usize, Cmd)> = loaded
+                .commands
+                .iter()
+                .map(|(m, c)| {
+                    let cmd = match c {
+                        Command::Reduce { term } => Cmd::Reduce(term.clone()),
+                        Command::Match { pattern, subject, xmatch } => Cmd::Match {
+                            pattern: pattern.clone(),
+                            subject: subject.clone(),
+                            xmatch: *xmatch,
+                        },
+                    };
+                    (*m, cmd)
+                })
+                .collect();
+            assert!(!cmds.is_empty(), "{name}: no commands parsed");
+            for (idx, (m, cmd)) in cmds.iter().enumerate() {
+                match cmd {
+                    Cmd::Reduce(term) => {
+                        let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                            .unwrap_or_else(|e| panic!("{name} cmd {idx}: reduce: {e}"));
+                        if round_trip {
+                            let printed = print_raw(&loaded.modules[*m].built, &loaded.interner, result);
+                            let toks = tokenize(&printed, &mut loaded.interner);
+                            let (reparsed, _) =
+                                reduce_command(&mut loaded.modules[*m], &loaded.interner, &toks)
+                                    .unwrap_or_else(|e| panic!("{name} cmd {idx} reparse `{printed}`: {e}"));
+                            let eng = &loaded.modules[*m].built.engine;
+                            assert!(
+                                eng.deep_equal(result, reparsed),
+                                "{name} cmd {idx}: `{printed}` did not round-trip"
+                            );
+                        }
+                    }
+                    Cmd::Match { pattern, subject, xmatch } => {
+                        match_command(&mut loaded.modules[*m], &loaded.interner, pattern, subject, *xmatch)
+                            .unwrap_or_else(|e| panic!("{name} cmd {idx}: match: {e}"));
+                    }
+                }
+            }
+        }
+    }
 }

@@ -137,15 +137,31 @@ fn classify(text: &str) -> TokKind {
     if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
         return TokKind::Number;
     }
-    if let Some((a, b)) = text.split_once('.')
-        && !a.is_empty()
-        && a.bytes().all(|c| c.is_ascii_digit())
-        && !b.is_empty()
-        && b.bytes().all(|c| c.is_ascii_digit())
-    {
+    if is_float_literal(text) {
         return TokKind::Float;
     }
     TokKind::Ident
+}
+
+/// A float literal: an optional leading sign, an integer part, `.`, a fraction, and an optional
+/// exponent — `1.5`, `-1.5`, `5.0e-1`, `2.0E+3` (the forms Maude lexes and prints, e.g. `neg(1.5)`
+/// reduces to the literal `-1.5`). Tokens are whitespace-delimited, so `5.0 - 1.5` keeps `-` as its own
+/// token; only a sign written *attached* to the number (`-1.5`) reaches `classify` as a single token,
+/// exactly as in Maude.
+fn is_float_literal(text: &str) -> bool {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let Some((int_part, rest)) = body.split_once('.') else { return false };
+    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(int_part) {
+        return false;
+    }
+    // The fraction, optionally followed by an `[eE][-+]?digits` exponent.
+    match rest.split_once(['e', 'E']) {
+        None => all_digits(rest),
+        Some((fraction, exp)) => {
+            all_digits(fraction) && all_digits(exp.strip_prefix(['-', '+']).unwrap_or(exp))
+        }
+    }
 }
 
 /// Tokenize Maude source into a [`Token`] stream (interning into `interner`). Handles whitespace, `***`/
@@ -313,6 +329,27 @@ mod tests {
         assert_eq!(texts, ["red", "1.5", "."]);
         assert_eq!(t[1].1, TokKind::Float);
         assert_eq!(t[2].1, TokKind::Dot);
+    }
+
+    /// Signed and exponent float literals (Maude prints `neg(1.5)` as `-1.5`); a *spaced* `-` stays its
+    /// own token, so binary subtraction (`5.0 - 1.5`) is unaffected. (Round-trip gap found by the whole-
+    /// conformance-suite sweep.)
+    #[test]
+    fn signed_and_exponent_floats() {
+        assert_eq!(classify("-1.5"), TokKind::Float);
+        assert_eq!(classify("+0.25"), TokKind::Float);
+        assert_eq!(classify("5.0e-1"), TokKind::Float);
+        assert_eq!(classify("2.0E+3"), TokKind::Float);
+        assert_eq!(classify("4.0"), TokKind::Float);
+        // Not floats: a bare integer / sign / dotless or malformed text.
+        assert_eq!(classify("-3"), TokKind::Ident, "no dot → not a float (negation is the `-_` op)");
+        assert_eq!(classify("1."), TokKind::Ident);
+        assert_eq!(classify(".5"), TokKind::Ident);
+        assert_eq!(classify("1.5e"), TokKind::Ident);
+        // `5.0 - 1.5` keeps the spaced `-` as a separate Ident token (binary minus).
+        let (_i, t) = lex("5.0 - 1.5");
+        let decoded: Vec<(&str, TokKind)> = t.iter().map(|(s, k)| (s.as_str(), *k)).collect();
+        assert_eq!(decoded, [("5.0", TokKind::Float), ("-", TokKind::Ident), ("1.5", TokKind::Float)]);
     }
 
     #[test]
