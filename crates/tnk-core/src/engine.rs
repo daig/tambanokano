@@ -3060,6 +3060,14 @@ mod tests {
         e.make_iter(s, n, z0)
     }
 
+    /// Decode an `s^n(0)` numeral (or the `0` constant) back to `n`.
+    fn decode_nat(e: &Engine, id: DagId) -> u64 {
+        match &e.node(id).term {
+            NodeTerm::S { count, .. } => count.to_usize().expect("small numeral") as u64,
+            _ => 0,
+        }
+    }
+
     /// B3.2 S-theory construction + sort (== reference binary, `conformance/iter.maude` ITER): `s^n(0)`
     /// stores the count compactly, `s^0(x)` collapses to `x`, nested successors flatten, and the sort
     /// follows the successor's declaration (`s^n(0) : NzNat` for n >= 1, `0 : Zero`).
@@ -3207,6 +3215,112 @@ mod tests {
         let r = e.reduce(q);
         assert_eq!(e.node(r).symbol(), z, "myif(ff, big, 0) = 0");
         assert_eq!(e.rewrites(), 1, "else branch — big unreduced");
+    }
+
+    /// B3.4 NAT built-in number ops (== reference binary, `conformance/nat.maude`): `_+_`/`_*_`/`gcd`
+    /// (ACU_NumberOp, fold the multiset with multiplicity) and `_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_`
+    /// (NumberOp). Each is 1 rewrite; the result sort follows the value (`s^n(0) : NzNat`); a
+    /// non-numeric operand survives as ACU residue (`x + 2 + 3 = x + 5`).
+    #[test]
+    fn builtin_nat_arithmetic_and_comparisons() {
+        use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp};
+        let mut e = Engine::new();
+        let truth = e.add_sort("Truth");
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let nh = NatHooks { succ: s, zero: z };
+        let bh = BoolHooks { true_: tt, false_: ff };
+        // ACU ops: NzNat Nat -> NzNat overloaded Nat Nat -> Nat (the prelude shape; F-B-completed).
+        let acu_op = |e: &mut Engine, name: &'static str, op: NumOp| -> SymbolId {
+            let o = e.add_op_ac(name, vec![nznat, nat], nznat, None);
+            e.add_op_decl(o, vec![nat, nat], nat);
+            e.set_special(o, SpecialOp::AcuNumberOp { op, nat: nh });
+            o
+        };
+        let plus = acu_op(&mut e, "+", NumOp::Add);
+        let times = acu_op(&mut e, "*", NumOp::Mul);
+        let gcd = acu_op(&mut e, "gcd", NumOp::Gcd);
+        // free arithmetic → Nat, and relational → Truth.
+        let num_op = |e: &mut Engine, name: &'static str, op: NumOp, b: Option<BoolHooks>| -> SymbolId {
+            let rng = if b.is_some() { truth } else { nat };
+            let o = e.add_op(name, vec![nat, nat], rng);
+            e.set_special(o, SpecialOp::NumberOp { op, nat: nh, bool_: b });
+            o
+        };
+        let quo = num_op(&mut e, "quo", NumOp::Quo, None);
+        let rem = num_op(&mut e, "rem", NumOp::Rem, None);
+        let pow = num_op(&mut e, "^", NumOp::Pow, None);
+        let lt = num_op(&mut e, "<", NumOp::Lt, Some(bh));
+        let le = num_op(&mut e, "<=", NumOp::Le, Some(bh));
+        let x = e.add_op("x", vec![], nat);
+
+        // ACU op of two numerals → (decoded value, sort, rewrites).
+        let acu = |e: &mut Engine, op: SymbolId, a: u64, b: u64| -> (u64, SortId, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (iter_num(e, z, s, a), iter_num(e, z, s, b));
+            let q = e.make_ac(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (decode_nat(e, r), e.sort_of(r), e.rewrites())
+        };
+        assert_eq!(acu(&mut e, plus, 2, 3), (5, nznat, 1), "2 + 3 = 5");
+        assert_eq!(acu(&mut e, plus, 2, 2), (4, nznat, 1), "2 + 2 = 4 (multiplicity fold)");
+        assert_eq!(acu(&mut e, plus, 0, 5), (5, nznat, 1), "0 + 5 = 5");
+        assert_eq!(acu(&mut e, times, 3, 4), (12, nznat, 1), "3 * 4 = 12");
+        assert_eq!(acu(&mut e, times, 2, 2), (4, nznat, 1), "2 * 2 = 4");
+        assert_eq!(acu(&mut e, gcd, 12, 18), (6, nznat, 1), "gcd(12, 18) = 6");
+
+        // Free arithmetic op of two numerals → (decoded value, rewrites).
+        let arith = |e: &mut Engine, op: SymbolId, a: u64, b: u64| -> (u64, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (iter_num(e, z, s, a), iter_num(e, z, s, b));
+            let q = e.make_free(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (decode_nat(e, r), e.rewrites())
+        };
+        assert_eq!(arith(&mut e, quo, 7, 2), (3, 1), "7 quo 2 = 3");
+        assert_eq!(arith(&mut e, rem, 7, 2), (1, 1), "7 rem 2 = 1");
+        assert_eq!(arith(&mut e, pow, 2, 10), (1024, 1), "2 ^ 10 = 1024");
+
+        // Relational op → Truth constant.
+        let cmp = |e: &mut Engine, op: SymbolId, a: u64, b: u64| -> (SymbolId, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (iter_num(e, z, s, a), iter_num(e, z, s, b));
+            let q = e.make_free(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (e.node(r).symbol(), e.rewrites())
+        };
+        assert_eq!(cmp(&mut e, lt, 2, 3), (tt, 1), "2 < 3 = tt");
+        assert_eq!(cmp(&mut e, lt, 3, 2), (ff, 1), "3 < 2 = ff");
+        assert_eq!(cmp(&mut e, le, 3, 3), (tt, 1), "3 <= 3 = tt");
+
+        // Residue: x + 2 + 3 = x + 5 (the non-numeric x survives), NzNat, 1 rewrite.
+        e.reset_rewrites();
+        let (xn, n2, n3) = (e.make_const(x), iter_num(&mut e, z, s, 2), iter_num(&mut e, z, s, 3));
+        let q = e.make_ac(plus, vec![xn, n2, n3]);
+        let r = e.reduce(q);
+        assert_eq!(e.rewrites(), 1, "x + 2 + 3 = x + 5 in 1 rewrite");
+        assert_eq!(e.sort_of(r), nznat, "x + 5 : NzNat (asymmetric overload, F-B)");
+        assert_eq!(e.node(r).symbol(), plus, "result is still a + node");
+        let kids: Vec<DagId> = e.node(r).children().collect();
+        assert_eq!(kids.len(), 2, "x + 5 has two operands");
+        let mut has_x = false;
+        let mut has_5 = false;
+        for k in kids {
+            if e.node(k).symbol() == x {
+                has_x = true;
+            } else if decode_nat(&e, k) == 5 {
+                has_5 = true;
+            }
+        }
+        assert!(has_x && has_5, "x + 5 = {{x, s^5(0)}}");
     }
 
     #[test]

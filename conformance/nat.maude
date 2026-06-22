@@ -1,0 +1,39 @@
+*** B3.4 NAT built-in number ops conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/nat.maude < /dev/null
+*** Numerals are `s^n(0)` (the iter/S theory); `_+_`/`_*_`/`gcd` are ACU_NumberOpSymbol (fold the
+*** multiset operands), `_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_` are NumberOpSymbol. Each built-in reduction
+*** is exactly 1 rewrite; the result sort follows the value (`s^n(0) : NzNat`). A non-numeric operand
+*** survives as residue (`x + 2 + 3 = x + 5`). Mirrors the engine.rs B3.4 test. A `Truth` sort avoids
+*** the prelude's built-in `Bool`.
+fmod NATB is
+  sorts Truth Zero NzNat Nat .
+  subsorts Zero NzNat < Nat .
+  ops tt ff : -> Truth [ctor] .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op _+_ : NzNat Nat -> NzNat [assoc comm special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+  op _*_ : NzNat NzNat -> NzNat [assoc comm special (id-hook ACU_NumberOpSymbol (*) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _*_ : Nat Nat -> Nat [ditto] .
+  op _quo_ : Nat NzNat -> Nat [special (id-hook NumberOpSymbol (quo) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _rem_ : Nat NzNat -> Nat [special (id-hook NumberOpSymbol (rem) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _^_ : Nat Nat -> Nat [special (id-hook NumberOpSymbol (^) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op gcd : NzNat Nat -> NzNat [assoc comm special (id-hook ACU_NumberOpSymbol (gcd) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op gcd : Nat Nat -> Nat [ditto] .
+  op _<_ : Nat Nat -> Truth [special (id-hook NumberOpSymbol (<) op-hook succSymbol (s_ : Nat ~> NzNat) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+  op _<=_ : Nat Nat -> Truth [special (id-hook NumberOpSymbol (<=) op-hook succSymbol (s_ : Nat ~> NzNat) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+  op x : -> Nat .
+endfm
+red 2 + 3 .       *** NzNat: 5   (1 rewrite)
+red 2 + 2 .       *** NzNat: 4   (multiplicity fold)
+red 0 + 5 .       *** NzNat: 5
+red 3 * 4 .       *** NzNat: 12
+red 2 * 2 .       *** NzNat: 4
+red 7 quo 2 .     *** NzNat: 3
+red 7 rem 2 .     *** NzNat: 1
+red 2 ^ 10 .      *** NzNat: 1024
+red gcd(12, 18) . *** NzNat: 6
+red 2 < 3 .       *** Truth: tt
+red 3 < 2 .       *** Truth: ff
+red 3 <= 3 .      *** Truth: tt
+red x + 2 + 3 .   *** NzNat: x + 5  (the non-numeric x survives as residue)

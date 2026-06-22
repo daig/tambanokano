@@ -102,6 +102,55 @@ pub enum SpecialOp {
     /// `term-hook` constants, e.g. `[true, false]`), returning it **unreduced** — the dead branch is
     /// never reduced.
     Branch { tests: Vec<SymbolId> },
+    /// `_+_` / `_*_` / `gcd` / `lcm` / `min` / `max` / `_xor_` / `_&_` / `_|_` (Maude's
+    /// `ACU_NumberOpSymbol`): fold the **numeric** operands of the ACU multiset (with multiplicity),
+    /// rebuilding from the result number and any non-numeric residue operands.
+    AcuNumberOp { op: NumOp, nat: NatHooks },
+    /// `_quo_` / `_rem_` / `_^_` / `_<<_` / `_>>_` / `_<_` / `_<=_` / `_>_` / `_>=_` / `_divides_`
+    /// (Maude's `NumberOpSymbol`): a free op over numeric arguments. Relational ops (`bool_` present)
+    /// rewrite to a Bool constant; arithmetic ops to a Nat. A non-numeric argument, division by zero, or
+    /// a would-be-negative result falls through to user equations (`None`).
+    NumberOp { op: NumOp, nat: NatHooks, bool_: Option<BoolHooks> },
+}
+
+/// The `op-hook succSymbol` (an `iter` successor) and its `Zero` constant (the successor's `zeroTerm`).
+/// [`as_nat`/`make_nat`](crate::engine) use these to recognise and build `s^n(0)` numerals.
+#[derive(Debug, Clone, Copy)]
+pub struct NatHooks {
+    pub succ: SymbolId,
+    pub zero: SymbolId,
+}
+
+/// A relational number op's `term-hook trueTerm`/`falseTerm` result constants.
+#[derive(Debug, Clone, Copy)]
+pub struct BoolHooks {
+    pub true_: SymbolId,
+    pub false_: SymbolId,
+}
+
+/// The arithmetic / relational operation a numeric built-in performs (Maude packs these as a 2-char
+/// `CODE` int in `numberOpSymbol.cc`; a typed enum here — decision #6). The arithmetic ops return a
+/// `Nat`, the relational ops a `Bool`. Bit ops (`_xor_`/`_&_`/`_|_`) and shifts (`_<<_`/`_>>_`) are a
+/// follow-up (xor needs the ACU-multiplicity parity, shifts are free).
+#[derive(Debug, Clone, Copy)]
+pub enum NumOp {
+    // ACU (fold the multiset) — `_+_` `_*_` `gcd` `lcm` `min` `max`.
+    Add,
+    Mul,
+    Gcd,
+    Lcm,
+    Min,
+    Max,
+    // free arithmetic → Nat — `_quo_` `_rem_` `_^_`.
+    Quo,
+    Rem,
+    Pow,
+    // free relational → Bool — `_<_` `_<=_` `_>_` `_>=_` `_divides_`.
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Divides,
 }
 
 impl Symbol {
