@@ -111,22 +111,25 @@ impl<'a> Parser<'a> {
     pub fn parse_source(&mut self) -> PResult<Source> {
         let mut src = Source::default();
         while let Some(txt) = self.peek_text() {
+            // A command runs against the most recently entered module (Maude's current module).
             match txt {
                 "fmod" | "mod" => src.modules.push(self.module()?),
                 "reduce" | "red" => {
+                    let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
                     self.advance();
                     let term = self.collect_until(&[]);
                     self.eat_dot()?;
-                    src.commands.push(Command::Reduce { term });
+                    src.commands.push((m, Command::Reduce { term }));
                 }
                 "match" | "xmatch" => {
+                    let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
                     let xmatch = txt == "xmatch";
                     self.advance();
                     let pattern = self.collect_until(&["<=?"]);
                     self.eat("<=?")?;
                     let subject = self.collect_until(&[]);
                     self.eat_dot()?;
-                    src.commands.push(Command::Match { pattern, subject, xmatch });
+                    src.commands.push((m, Command::Match { pattern, subject, xmatch }));
                 }
                 _ => return Err(format!("unexpected top-level token {txt:?}")),
             }

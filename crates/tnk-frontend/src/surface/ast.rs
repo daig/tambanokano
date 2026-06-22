@@ -87,9 +87,10 @@ pub enum Command {
     Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
 }
 
-/// The result of surface-parsing a source file: the modules and the top-level commands (in order).
+/// The result of surface-parsing a source file: the modules and the top-level commands, each tagged with
+/// the index (into `modules`) of the module it runs against — the most recently entered one, as in Maude.
 #[derive(Debug, Default)]
 pub struct Source {
     pub modules: Vec<PreModule>,
-    pub commands: Vec<Command>,
+    pub commands: Vec<(usize, Command)>,
 }

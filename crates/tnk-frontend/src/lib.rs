@@ -13,5 +13,6 @@ pub mod build_term;
 pub mod cfparser;
 pub mod grammar;
 pub mod lex;
+pub mod load;
 pub mod sig;
 pub mod surface;
