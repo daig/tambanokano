@@ -332,10 +332,13 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   (`parse∘build∘print_raw(reduce(t)) == reduce(t)`). **B4.6c** the **Maude-faithful** display printer
   (`s_^n(0)` power form, compact `-3`) + ANSI **syntax-category** coloring (toggle); the uncolored faithful
   form **textually equals the binary's printed result** for every milestone command (a stronger check than
-  B4.4's `deep_equal`). **FINDING it exposed:** the residue prints `5 + x` vs the binary's `x + 5` — the
-  kernel's `dag_compare` orders ACU elements by `SymbolId` (declaration index) while Maude uses
-  `Symbol::orderInt`; value-identical, a *focused `dag_compare` kernel follow-up* (re-verify AC rewrite
-  counts), not a printer bug. **40 frontend + 101 core tests; clippy `-D` clean; fib(22)=186579.**
+  B4.4's `deep_equal`). **What it exposed (COSMETIC, not a bug):** the residue prints `5 + x` vs the binary's
+  `x + 5` — `dag_compare` orders ACU elements by `SymbolId`, Maude by `Symbol::orderInt`. Same multiset →
+  identical equality / normal forms / sorts / arithmetic; only the print order differs, and we don't need
+  visual parity. The only non-cosmetic leak would be AC matcher solution-order → rewrite *counts* in
+  *non-confluent* systems (not results; functional modules are confluent; already the pre-existing "Maude
+  Diophantine order" deferral). So aligning it is **optional** (task #7) and costs a full AC count
+  re-verification — deliberately NOT done. **40 frontend + 101 core tests; clippy `-D` clean; fib(22)=186579.**
 - **⚠ ORDERING — do B4.6 (pretty-printer) BEFORE B4.5 (coverage).** *(The plan lists them 5-then-6; we
   deliberately swap.)* **Why:** B4.5's strongest deliverable — the **whole-prelude differential test** — needs
   a true *textual* comparison against the reference binary's printed output, which requires the pretty-printer
