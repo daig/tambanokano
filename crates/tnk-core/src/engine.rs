@@ -1597,6 +1597,10 @@ impl Engine {
     pub fn make_qid(&mut self, symbol: SymbolId, value: &str) -> DagId {
         self.rt.make_na(&self.sig, symbol, NaValue::Qid(value.into()))
     }
+    /// Build a float NA node (the `<Floats>` `FloatSymbol`, B3.7).
+    pub fn make_float(&mut self, symbol: SymbolId, value: f64) -> DagId {
+        self.rt.make_na(&self.sig, symbol, NaValue::Float(value.to_bits()))
+    }
 
     pub fn node(&self, id: DagId) -> &DagNode {
         self.rt.node(id)
@@ -3556,6 +3560,89 @@ mod tests {
         };
         assert_eq!(qcmp(&mut e, "foo", "foo"), tt, "'foo == 'foo");
         assert_eq!(qcmp(&mut e, "foo", "bar"), ff, "'foo == 'bar is false");
+    }
+
+    /// B3.7 FLOAT built-in ops (== reference binary, `conformance/float.maude`): `f64` arithmetic /
+    /// negation / abs / sqrt / comparisons via FloatOpSymbol over atomic `NodeTerm::Na` float values
+    /// (all free ops). Each built-in is 1 rewrite (`abs(neg(3.0))` is 2).
+    #[test]
+    fn builtin_float_ops() {
+        use crate::dag::NaValue;
+        use crate::symbol::{BoolHooks, FltOp, SpecialOp};
+        let mut e = Engine::new();
+        let truth = e.add_sort("Truth");
+        let flt = e.add_sort("Flt");
+        e.close_sorts();
+        let tt = e.add_op("tt", vec![], truth);
+        let ff = e.add_op("ff", vec![], truth);
+        let fsym = e.add_op("<Floats>", vec![], flt);
+        let bh = BoolHooks { true_: tt, false_: ff };
+        let unary = |e: &mut Engine, op: FltOp| -> SymbolId {
+            let o = e.add_op("uf", vec![flt], flt);
+            e.set_special(o, SpecialOp::FloatOp { op, float_sym: fsym, bool_: None });
+            o
+        };
+        let binary = |e: &mut Engine, op: FltOp| -> SymbolId {
+            let o = e.add_op("bf", vec![flt, flt], flt);
+            e.set_special(o, SpecialOp::FloatOp { op, float_sym: fsym, bool_: None });
+            o
+        };
+        let (neg, abs, sqrt) = (unary(&mut e, FltOp::Neg), unary(&mut e, FltOp::Abs), unary(&mut e, FltOp::Sqrt));
+        let (add, sub, mul, div) = (
+            binary(&mut e, FltOp::Add),
+            binary(&mut e, FltOp::Sub),
+            binary(&mut e, FltOp::Mul),
+            binary(&mut e, FltOp::Div),
+        );
+        let lt = e.add_op("lt", vec![flt, flt], truth);
+        e.set_special(lt, SpecialOp::FloatOp { op: FltOp::Lt, float_sym: fsym, bool_: Some(bh) });
+
+        let df = |e: &Engine, id: DagId| -> f64 {
+            match &e.node(id).term {
+                NodeTerm::Na { value: NaValue::Float(b), .. } => f64::from_bits(*b),
+                _ => panic!("not a float node"),
+            }
+        };
+        // Binary arithmetic (results are exact f64 values).
+        let bf = |e: &mut Engine, op: SymbolId, a: f64, b: f64| -> (f64, u64) {
+            e.reset_rewrites();
+            let (na, nb) = (e.make_float(fsym, a), e.make_float(fsym, b));
+            let q = e.make_free(op, vec![na, nb]);
+            let r = e.reduce(q);
+            (df(e, r), e.rewrites())
+        };
+        assert_eq!(bf(&mut e, add, 1.5, 2.5), (4.0, 1), "1.5 + 2.5 = 4.0");
+        assert_eq!(bf(&mut e, sub, 5.0, 1.5), (3.5, 1), "5.0 - 1.5 = 3.5");
+        assert_eq!(bf(&mut e, mul, 2.0, 3.0), (6.0, 1), "2.0 * 3.0 = 6.0");
+        assert_eq!(bf(&mut e, div, 7.0, 2.0), (3.5, 1), "7.0 / 2.0 = 3.5");
+        // Unary functions.
+        let uf = |e: &mut Engine, op: SymbolId, a: f64| -> (f64, u64) {
+            e.reset_rewrites();
+            let na = e.make_float(fsym, a);
+            let q = e.make_free(op, vec![na]);
+            let r = e.reduce(q);
+            (df(e, r), e.rewrites())
+        };
+        assert_eq!(uf(&mut e, neg, 1.5), (-1.5, 1), "neg(1.5) = -1.5");
+        assert_eq!(uf(&mut e, sqrt, 4.0), (2.0, 1), "sqrt(4.0) = 2.0");
+        // Nested: abs(neg(3.0)) = 3.0 in 2 rewrites.
+        e.reset_rewrites();
+        let n3 = e.make_float(fsym, 3.0);
+        let negn3 = e.make_free(neg, vec![n3]);
+        let absq = e.make_free(abs, vec![negn3]);
+        let r = e.reduce(absq);
+        assert_eq!((df(&e, r), e.rewrites()), (3.0, 2), "abs(neg(3.0)) = 3.0 in 2 rewrites");
+        // Comparison → Truth.
+        let cf = |e: &mut Engine, a: f64, b: f64| -> SymbolId {
+            e.reset_rewrites();
+            let (na, nb) = (e.make_float(fsym, a), e.make_float(fsym, b));
+            let q = e.make_free(lt, vec![na, nb]);
+            let r = e.reduce(q);
+            assert_eq!(e.rewrites(), 1);
+            e.node(r).symbol()
+        };
+        assert_eq!(cf(&mut e, 1.5, 2.5), tt, "1.5 < 2.5 = tt");
+        assert_eq!(cf(&mut e, 2.5, 1.5), ff, "2.5 < 1.5 = ff");
     }
 
     #[test]

@@ -1,0 +1,27 @@
+*** B3.7 FLOAT built-in ops conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/float.maude < /dev/null
+*** Floats are atomic NA constants (f64). FloatOpSymbol does arithmetic / negation / abs / sqrt /
+*** comparisons — all FREE ops (float arithmetic is not associative, so floats are never AC). Each is
+*** 1 rewrite. Mirrors the engine.rs B3.7 test. A `Truth`/`Flt` naming avoids the prelude's Bool/Float.
+fmod FLTB is
+  sorts Truth Flt .
+  ops tt ff : -> Truth [ctor] .
+  op <Floats> : -> Flt [special (id-hook FloatSymbol)] .
+  op _+_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (+) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _-_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (-) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _*_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (*) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _/_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (/) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op neg : Flt -> Flt [special (id-hook FloatOpSymbol (-) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op abs : Flt -> Flt [special (id-hook FloatOpSymbol (abs) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op sqrt : Flt -> Flt [special (id-hook FloatOpSymbol (sqrt) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _lt_ : Flt Flt -> Truth [special (id-hook FloatOpSymbol (<) op-hook floatSymbol (<Floats> : ~> Flt) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+endfm
+red 1.5 + 2.5 .       *** Flt: 4.0
+red 5.0 - 1.5 .       *** Flt: 3.5
+red 2.0 * 3.0 .       *** Flt: 6.0
+red 7.0 / 2.0 .       *** Flt: 3.5
+red neg(1.5) .        *** Flt: -1.5
+red abs(neg(3.0)) .   *** Flt: 3.0   (2 rewrites)
+red sqrt(4.0) .       *** Flt: 2.0
+red 1.5 lt 2.5 .      *** Truth: tt
+red 2.5 lt 1.5 .      *** Truth: ff

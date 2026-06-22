@@ -75,6 +75,13 @@ pub(crate) enum NaValue {
     Str(std::rc::Rc<str>),
     /// A quoted identifier (the `<Qids>` `QuotedIdentifierSymbol`).
     Qid(std::rc::Rc<str>),
+    /// An IEEE double, stored as its bit pattern (`f64::to_bits`) so `NaValue` keeps a total
+    /// `Eq`/`Ord`/`Hash` (the float ops convert via `from_bits`). Bitwise equality agrees with Maude's
+    /// value equality for all normal floats; it diverges only at the IEEE edge cases `+0.0`/`-0.0`
+    /// (distinct bits, value-equal) and `NaN` (value-unequal, bit-equal) — both unreachable here, since
+    /// float ops are free (never AC, so `dag_compare` is not exercised on floats) and `==` on floats is
+    /// not used (the float relational ops compare values directly).
+    Float(u64),
 }
 
 /// A static empty child slice — the children of a leaf ([`NodeTerm::Na`]) without allocating.

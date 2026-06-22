@@ -9,7 +9,7 @@
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::num::{Int, Nat};
-use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp, StrOp, SymbolId};
+use crate::symbol::{BoolHooks, FltOp, NatHooks, NumOp, SpecialOp, StrOp, SymbolId};
 use std::rc::Rc;
 
 impl Runtime {
@@ -25,6 +25,9 @@ impl Runtime {
             SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
             SpecialOp::StringOp { op, str_sym, nat, bool_ } => {
                 self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref())
+            }
+            SpecialOp::FloatOp { op, float_sym, bool_ } => {
+                self.reduce_float_op(sig, id, *op, *float_sym, bool_.as_ref())
             }
         }
     }
@@ -267,6 +270,57 @@ impl Runtime {
                     StrOp::Le => ord.is_le(),
                     StrOp::Gt => ord.is_gt(),
                     StrOp::Ge => ord.is_ge(),
+                    _ => unreachable!(),
+                };
+                let h = bool_?;
+                Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
+            }
+        }
+    }
+
+    /// Read an `f64` from a `NodeTerm::Na::Float`, or `None`.
+    fn as_float(&self, id: DagId) -> Option<f64> {
+        match &self.node(id).term {
+            NodeTerm::Na { value: NaValue::Float(bits), .. } => Some(f64::from_bits(*bits)),
+            _ => None,
+        }
+    }
+
+    /// `FloatOpSymbol` (arithmetic / negation / abs / sqrt / comparisons): operate on `f64` values,
+    /// building a float (`float_sym`) or a Bool (`bool_`) result via IEEE semantics.
+    fn reduce_float_op(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: FltOp,
+        float_sym: SymbolId,
+        bool_: Option<&BoolHooks>,
+    ) -> Option<DagId> {
+        let kids: Vec<DagId> = self.node(id).children().collect();
+        let a = self.as_float(kids[0])?;
+        let make_f = |this: &mut Self, v: f64| this.make_na(sig, float_sym, NaValue::Float(v.to_bits()));
+        match op {
+            FltOp::Neg => Some(make_f(self, -a)),
+            FltOp::Abs => Some(make_f(self, a.abs())),
+            FltOp::Sqrt => Some(make_f(self, a.sqrt())),
+            FltOp::Add | FltOp::Sub | FltOp::Mul | FltOp::Div => {
+                let b = self.as_float(kids[1])?;
+                let v = match op {
+                    FltOp::Add => a + b,
+                    FltOp::Sub => a - b,
+                    FltOp::Mul => a * b,
+                    FltOp::Div => a / b,
+                    _ => unreachable!(),
+                };
+                Some(make_f(self, v))
+            }
+            FltOp::Lt | FltOp::Le | FltOp::Gt | FltOp::Ge => {
+                let b = self.as_float(kids[1])?;
+                let res = match op {
+                    FltOp::Lt => a < b,
+                    FltOp::Le => a <= b,
+                    FltOp::Gt => a > b,
+                    FltOp::Ge => a >= b,
                     _ => unreachable!(),
                 };
                 let h = bool_?;

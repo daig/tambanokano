@@ -118,6 +118,26 @@ pub enum SpecialOp {
     /// `StringOpSymbol`): operate on `NodeTerm::Na` string values. `str_sym` builds string results;
     /// `nat` (length/substr) and `bool_` (comparisons) are the result-type hooks.
     StringOp { op: StrOp, str_sym: SymbolId, nat: Option<NatHooks>, bool_: Option<BoolHooks> },
+    /// Float arithmetic / functions / comparisons (Maude's `FloatOpSymbol`): operate on `NodeTerm::Na`
+    /// float (`f64`) values. `float_sym` builds float results; `bool_` is the comparison result hook.
+    FloatOp { op: FltOp, float_sym: SymbolId, bool_: Option<BoolHooks> },
+}
+
+/// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes). This slice has
+/// arithmetic, negation/abs/sqrt, and comparisons; the rest (`rem`/`floor`/`exp`/trig/…) are follow-ups.
+#[derive(Debug, Clone, Copy)]
+pub enum FltOp {
+    Neg,
+    Abs,
+    Sqrt,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// The string operation a [`SpecialOp::StringOp`] performs (Maude's `StringOpSymbol` codes). This slice
