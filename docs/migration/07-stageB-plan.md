@@ -6,7 +6,13 @@ foundation reshape, review Tier 2) is **complete and adversarially reviewed**; t
 supersedes `06-phase1-plan.md` §3–§4 for the breadth work (`06` remains the Phase-1 overview; its §3
 Stage A is now done).
 
-> **STATUS (2026-06-22) — STAGE B3 COMPLETE. NEXT: B4 (frontend/parser).** B1 (structural theories), B2
+> **STATUS (2026-06-22) — B4.1–B4.4 DONE: the parser MILESTONE is hit.** `tnk-frontend` parses
+> `conformance/{iter,bool,nat,int}.maude` from text and reduces them to the reference binary's exact sort +
+> rewrite count + value (lexer → surface parser + signature build → mixfix grammar → plain Earley+prec/gather
+> [DRP bypassed] → forest → build_term → load/reduce). Commits `b3b5819..01f28a5`; 31 frontend + 100 core
+> tests; clippy clean; fib(22)=186579; tnk-core untouched. **NEXT: B4.5 (coverage + whole-prelude diff-test)
+> → B4.6 (pretty-printer) → B5 (modules + REPL = Phase-1 end).** See §2 B4 below for the as-built detail and
+> the deferred list. *(History:)* B1 (structural theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
 > reference binary (**100 tests**, clippy `-D warnings` clean, `fib(22) = 186579` and ~7.2 M rw/s intact
@@ -293,7 +299,27 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
 - **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
   + its bignum `count`; tying succ/`iter` to NAT.
 
-### B4 — Frontend: lexer + mixfix parser + pretty-printer
+### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 DONE (milestone hit); B4.5/B4.6 next**
+- **As-built (on `main`, `b3b5819..01f28a5`):** the `tnk-frontend` crate. **B4.1** lexer (Maude tokenization
+  + op-name `_`-splitting). **B4.2** surface recursive-descent parser (`fmod…endfm` → `PreModule` with raw
+  token *bubbles*) + `build_sig` (drives the kernel constructor API, resolves `special (id-hook…)` →
+  `SpecialOp`). **B4.3** per-module mixfix grammar — port of `makeComponentProductions`/`makeSymbolProductions`
+  + `computePrecAndGather` (`grammar::{prec_gather,build}`); typed `Nt`/`Terminal`/`GSym`/`Action`/`Production`;
+  per-*kind* nonterminals (sort/overload resolution stays post-parse, B2); `mayAssoc` sort bias deferred
+  (verified no-op on the locked modules). **B4.4a** Earley recognizer (`cfparser::{compile,earley}`) — **plain
+  Earley + prec/gather, DRP bypassed** (purely-additive memo; Maude's two gating checks collapse to one
+  completer rule `hole-gather-bound >= completed-prec`). **B4.4b** forest extraction (`cfparser::forest`,
+  right-to-left `extractFirstSubparse` + ambiguity flag) + `build_term` (the functional `makeTerm` subset —
+  `MakeTerm`/assoc-list-flatten/`MakeVariable`/`MakeNatural`/`PassThru`; the kernel folds the uniform `Term`
+  into the right theory node at `instantiate`/`rebuild`) + the `reduce` command. **B4.4c = THE MILESTONE**
+  (`load::load_source`): unconditional `eq`/`mb` wired, commands tagged to their module; **`conformance/
+  {iter,bool,nat,int}.maude` parse→reduce→identical sort + rewrite count + value vs the reference binary**.
+  Fix found: `SMALL_NAT` excludes the value-0 numeral (Maude splits `ZERO`/`SMALL_NAT`; `0` is the declared
+  constant) so `s s 0` is unambiguous. **31 frontend tests; 100 core tests; clippy `-D warnings` clean; fib(22)
+  =186579 and tnk-core untouched throughout B4.** **Deferred to B4.5/B4.6 (below):** punctuation-split op names
+  (`<_,_>`), structured sorts, conditional `ceq`/`cmb`/`owise`-conditions + `match` command, large-numeral
+  DagId fast-path, the `f^n(t)` iter-token form, `mayAssoc` bias, and the **whole-prelude differential test**;
+  the **pretty-printer** (B4.6, the round-trip + REPL output).
 - **Goal:** parse `.maude` *functional* modules to the same terms the hand-built fixtures produce; round-trip via pretty-print.
 - **Plugs into:** B2 sorts/components feed grammar build; `build_term` returns kernel arena terms
   (§1.1/§1.5); B5 consumes the parsed `PreModule`.
