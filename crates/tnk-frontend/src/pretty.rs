@@ -420,6 +420,33 @@ mod tests {
         round_trips(file!("int.maude"));
     }
 
+    // B4.5a: round-trip the broader loadable set — exercises the raw printer on `<_,_>` / `_;_` / ACU
+    // residues / prefix ops / membership-lowered sorts, beyond the milestone's forms.
+    #[test]
+    fn peano_round_trips() {
+        round_trips(file!("peano.maude"));
+    }
+    #[test]
+    fn strat_round_trips() {
+        round_trips(file!("strat.maude"));
+    }
+    #[test]
+    fn acu_overload_round_trips() {
+        round_trips(file!("acu-overload.maude"));
+    }
+    #[test]
+    fn acu_reduce_round_trips() {
+        round_trips(file!("acu-reduce.maude"));
+    }
+    #[test]
+    fn membership_round_trips() {
+        round_trips(file!("membership.maude"));
+    }
+    #[test]
+    fn overload_round_trips() {
+        round_trips(file!("overload.maude"));
+    }
+
     /// Maude-faithful (uncolored) rendering of each command's result equals the reference binary's printed
     /// term (`~/Downloads/Maude-3/maude -no-banner conformance/<f>.maude < /dev/null`). A strictly stronger
     /// check than the B4.4 conformance: it pins the printed form exactly, incl. ACU element *order*.

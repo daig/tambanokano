@@ -134,8 +134,11 @@ pub fn reduce_command(
     }
     let mut subst = Subst::new();
     subst.reset(0);
-    let dag = lm.built.engine.instantiate(&t, &subst);
+    // Reset BEFORE instantiate: building the term applies any membership axioms (`constrain_to_smaller_sort`
+    // fires at construction and counts as a rewrite — Maude's accounting), so those rewrites belong to the
+    // command's count. Resetting after `instantiate` would zero them (the `membership.maude` count bug).
     lm.built.engine.reset_rewrites();
+    let dag = lm.built.engine.instantiate(&t, &subst);
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -265,6 +268,95 @@ mod tests {
                 e("NzInt", "- 1", 1),
                 e("Truth", "tt", 1),
                 e("Truth", "ff", 1),
+            ],
+        );
+    }
+
+    // ---- B4.5a: broaden the differential harness to the currently-loadable conformance modules ----
+
+    #[test]
+    fn peano_conforms() {
+        conform(
+            conformance_file!("peano.maude"),
+            &[e("Nat", "s s s s 0", 3), e("Nat", "s s s s s s s s s s s s 0", 21)],
+        );
+    }
+
+    #[test]
+    fn strat_conforms() {
+        conform(
+            conformance_file!("strat.maude"),
+            &[e("Nat", "s s z", 1), e("Nat", "z", 1), e("Nat", "z", 1), e("Nat", "s s z", 2)],
+        );
+    }
+
+    #[test]
+    fn acu_overload_conforms() {
+        conform(
+            conformance_file!("acu-overload.maude"),
+            &[
+                e("NzNat", "z + nz", 0),
+                e("NzNat", "z + nz", 0),
+                e("Nat", "z + z", 0),
+                e("NzNat", "nz + nz", 0),
+                e("NzNat", "z + z + nz", 0),
+                e("NzNat", "g(z, nz)", 0),
+                e("NzNat", "g(z, nz)", 0),
+                e("Nat", "g(z, z)", 0),
+            ],
+        );
+    }
+
+    #[test]
+    fn acu_reduce_conforms() {
+        conform(
+            conformance_file!("acu-reduce.maude"),
+            &[
+                e("N", "s 0 + s 0 + s 0", 1),
+                e("E", "a + b", 1),
+                e("E", "0 ; s 0", 2),
+                e("E", "a", 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn membership_conforms() {
+        conform(
+            conformance_file!("membership.maude"),
+            &[
+                e("SymPair", "< z, z >", 1),
+                e("Pair", "< z, s z >", 0),
+                e("SymPair", "< s z, s z >", 1),
+                e("Nat", "z", 2),
+                e("Nat", "f(< z, s z >)", 0),
+                e("A", "a", 0),
+                e("B", "g(a)", 1),
+                e("C", "g(g(a))", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn overload_conforms() {
+        // Command 8 is a kind-level (error-sort) result. COSMETIC NAMING DIVERGENCE (task #8, like the ACU
+        // order #7): the kernel names a kind's error sort `[<first-declared member>]` = `[Zero]`, whereas
+        // Maude names it after a maximal sort = `[Nat]`. Same kind, semantically irrelevant; we assert our
+        // `[Zero]`. (overload.maude is the non-preregular module; Maude also warns on preregularity, which we
+        // don't surface yet — B2.1's deferred diagnostics sink — but the reduced results/sorts still match.)
+        conform(
+            conformance_file!("overload.maude"),
+            &[
+                e("Zero", "0", 0),
+                e("NzNat", "s 0", 0),
+                e("NzNat", "s 0 + s 0", 0),
+                e("Nat", "0 + s 0", 0),
+                e("Nat", "0 + 0", 0),
+                e("NzNat", "s s 0", 2),
+                e("Zero", "0", 1),
+                e("[Zero]", "0 + 0", 0),
+                e("NzNat", "s 0 + s 0", 0),
+                e("A", "f(c)", 0),
             ],
         );
     }
