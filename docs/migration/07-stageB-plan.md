@@ -14,9 +14,14 @@ Stage A is now done).
 > (pretty-printer) DONE too** (`76b41ca..e356bc5`): a **raw** round-trip printer (`parse∘print=id`) + a
 > Maude-faithful **pretty** printer with ANSI syntax coloring; the uncolored faithful form textually matches
 > the binary's printed result on the milestone (exposing one value-identical ACU-print-order divergence =
-> a `dag_compare` follow-up). **NEXT (the last B4 item): B4.5** (coverage: punctuation-split op names,
-> structured sorts, conditional `ceq`/`cmb` + `match`, and the whole-prelude differential test). **Then B5
-> (modules + REPL = Phase-1 end).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
+> a `dag_compare` follow-up). **B4.5a–d DONE** (`0e88496..688af56`): the differential
+> harness now covers **15 of ~17** conformance modules text→reduce vs the binary (B4.5a–c: built-in
+> literals, the `.`-terminator lexer fix, conditional `ceq`/`cmb`/`owise`/`:=`), and **B4.5d** added the
+> **`match`/`xmatch` command** via a new public kernel multi-solution API (`Engine::match_solutions` →
+> `Solutions::{advance,binding,matched_portion}`) — `acu-match`+`cui` lit up, solution **sets** verified vs
+> the binary (exact ACU *order* = the deferred Diophantine follow-up; CUI order matches). **NEXT (the last
+> B4 items): B4.5e** (`__` juxtaposition — blocks `au`) **+ the whole-conformance-suite differential test**.
+> **Then B5 (modules + REPL = Phase-1 end).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
 > theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
@@ -304,7 +309,7 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
 - **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
   + its bignum `count`; tying succ/`iter` to NAT.
 
-### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 + B4.6 DONE; NEXT (last B4 item): B4.5 (coverage + whole-prelude diff-test)**
+### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 + B4.6 + B4.5a–d DONE; NEXT (last B4 items): B4.5e (`__`) + whole-suite diff-test**
 - **As-built (on `main`, `b3b5819..01f28a5`):** the `tnk-frontend` crate. **B4.1** lexer (Maude tokenization
   + op-name `_`-splitting). **B4.2** surface recursive-descent parser (`fmod…endfm` → `PreModule` with raw
   token *bubbles*) + `build_sig` (drives the kernel constructor API, resolves `special (id-hook…)` →
@@ -339,6 +344,28 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   *non-confluent* systems (not results; functional modules are confluent; already the pre-existing "Maude
   Diophantine order" deferral). So aligning it is **optional** (task #7) and costs a full AC count
   re-verification — deliberately NOT done. **40 frontend + 101 core tests; clippy `-D` clean; fib(22)=186579.**
+- **B4.5a–d DONE (`0e88496..688af56`) — coverage, broadened to the conformance suite.** Scope correction:
+  the "whole-prelude" diff is really the **conformance suite** (only `TRUTH-VALUE` is import-free in the real
+  prelude; the rest need B5 imports). **B4.5a–c** (`0e88496` harness + membership-count fix / `e953375`
+  built-in literals via `build_dag` + the `.`-terminator lexer fix [Maude's keyword-lookahead, also fixing
+  multi-statement lines] / `2af15f3` conditional `ceq`/`cmb`/`owise`/`:=` condition-bubble parse): **13** of
+  ~17 modules load+reduce, differentially verified. Three real bugs the wide net surfaced — a reset-after-
+  build rewrite-count error, the space-`.` terminator flaw, an `[owise]`-swallowing rhs bubble. **B4.5d**
+  (`688af56`) the **`match`/`xmatch` command**: a **new public kernel multi-solution API** —
+  `Engine::match_solutions(pattern, nr_vars, subject, extension) -> Solutions<'e>` (holds `&mut Engine`),
+  `Solutions::{advance()->bool, binding(idx), matched_portion()->DagId}` — lifts the crate-private
+  `LhsAutomaton`/`Subproblem.next` stream (only `match_pattern`'s single yes/no reached it) out for callers.
+  `extension` threads `ext_allowed` (true=`xmatch` sub-part+residue, false=plain `match` whole-subject);
+  `matched_portion` = `instantiate(pattern, subst)`. Frontend `load.rs::match_command` builds the pattern→
+  `Term` (VarIndex names) + subject→ground DAG, drives the stream capturing `DagId`s **while** it borrows the
+  engine, renders after it drops (the stream's `&mut Engine` vs the printer's `&BuiltModule` — collect-then-
+  render); `render_solution`/`format_matchers` reproduce Maude's `Var --> value` / `Matched portion = …` /
+  `empty substitution` / `No match.` layout. **Correctness call:** solutions are compared **as a SET** — the
+  correctness-first AC enumerator finds all-and-only the right solutions in *its own* order; Maude's exact
+  Diophantine order stays the deferred B1 follow-up (every binding renders byte-identical; CUI's 2 pairings
+  even match order). `acu-match`+`cui` now conform (15 of ~17). **102 core + 62 frontend tests; clippy `-D`
+  clean; fib(22)=186579; tnk-core += the `match_solutions` API only.** **REMAINING B4.5: (e)** `__`
+  juxtaposition (blocks `au`'s match + AU reduce locks) + the whole-suite diff-test.
 - **⚠ ORDERING — do B4.6 (pretty-printer) BEFORE B4.5 (coverage).** *(The plan lists them 5-then-6; we
   deliberately swap.)* **Why:** B4.5's strongest deliverable — the **whole-prelude differential test** — needs
   a true *textual* comparison against the reference binary's printed output, which requires the pretty-printer
