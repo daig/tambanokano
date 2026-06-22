@@ -19,9 +19,15 @@ Stage A is now done).
 > literals, the `.`-terminator lexer fix, conditional `ceq`/`cmb`/`owise`/`:=`), and **B4.5d** added the
 > **`match`/`xmatch` command** via a new public kernel multi-solution API (`Engine::match_solutions` →
 > `Solutions::{advance,binding,matched_portion}`) — `acu-match`+`cui` lit up, solution **sets** verified vs
-> the binary (exact ACU *order* = the deferred Diophantine follow-up; CUI order matches). **NEXT (the last
-> B4 items): B4.5e** (`__` juxtaposition — blocks `au`) **+ the whole-conformance-suite differential test**.
-> **Then B5 (modules + REPL = Phase-1 end).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
+> the binary (exact ACU *order* = the deferred Diophantine follow-up; CUI order matches). **B4.5e + the
+> whole-suite test DONE (`1442fa8`) → B4 COMPLETE.** `__` juxtaposition (`op __ : E E -> E [assoc]`, the
+> empty-syntax production `E ::= E E`) turned out to **already work** through the existing machinery — the
+> `[assoc]` right-associating gather + the recognizer's prec gate disambiguate the adjacent nonterminals,
+> then the AU kernel flattens — so it just needed `au.maude` wired (verbatim vs the binary). The
+> **whole-conformance-suite differential test** round-trips (`parse∘print_raw = id`) **all 21** modules and
+> immediately earned its keep, surfacing a negative-float round-trip gap (`neg(1.5)` → the literal `-1.5`,
+> which the lexer now classifies — optional sign + exponent). **65 frontend + 102 core tests. NEXT: B5
+> (modules + REPL = Phase-1 end milestone).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
 > theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
@@ -309,7 +315,7 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
 - **Risks:** RAT/FLOAT edge cases; conformance of conversions; the **S-theory equality dispatch** (§1.3)
   + its bignum `count`; tying succ/`iter` to NAT.
 
-### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **B4.1–B4.4 + B4.6 + B4.5a–d DONE; NEXT (last B4 items): B4.5e (`__`) + whole-suite diff-test**
+### B4 — Frontend: lexer + mixfix parser + pretty-printer  — **COMPLETE (B4.1–B4.6, all sub-steps); NEXT: B5**
 - **As-built (on `main`, `b3b5819..01f28a5`):** the `tnk-frontend` crate. **B4.1** lexer (Maude tokenization
   + op-name `_`-splitting). **B4.2** surface recursive-descent parser (`fmod…endfm` → `PreModule` with raw
   token *bubbles*) + `build_sig` (drives the kernel constructor API, resolves `special (id-hook…)` →
@@ -364,8 +370,27 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   correctness-first AC enumerator finds all-and-only the right solutions in *its own* order; Maude's exact
   Diophantine order stays the deferred B1 follow-up (every binding renders byte-identical; CUI's 2 pairings
   even match order). `acu-match`+`cui` now conform (15 of ~17). **102 core + 62 frontend tests; clippy `-D`
-  clean; fib(22)=186579; tnk-core += the `match_solutions` API only.** **REMAINING B4.5: (e)** `__`
-  juxtaposition (blocks `au`'s match + AU reduce locks) + the whole-suite diff-test.
+  clean; fib(22)=186579; tnk-core += the `match_solutions` API only.**
+- **B4.5e + the whole-suite test DONE (`1442fa8`) — B4 COMPLETE.** **`__` juxtaposition already worked.**
+  `op __ : E E -> E [assoc]` emits the empty-syntax production `<E> ::= <E> <E>` (two adjacent nonterminals,
+  no anchoring terminal). The prior session deferred it as "the hardest grammar case" *without testing it* —
+  but it needs no new code: the `[assoc]` right-associating gather `(e E) = [40,41]` disambiguates it. The
+  recognizer's prec gate blocks the wrong (left-assoc) split — a prec-41 `__` app can't fill the bound-40
+  left hole, so `E → E•E` at that origin is never created — and `find_split`'s prefix check (`existsCall`)
+  therefore finds only the right-associative parse, which the AU kernel flattens modulo assoc. `au.maude`
+  loads + matches the binary verbatim (the 4 ordered AU matchers incl. `nil` via the identity; `d b c d =>
+  d a d`; `a c c => b`). Wired as `au_conforms` (match set-compared + the two reduce locks). **The
+  whole-conformance-suite differential test** (`whole_conformance_suite`): a **round-trip** sweep
+  (`parse∘print_raw = id`) over **all 21** conformance modules, the explicit list a coverage guard. It
+  immediately earned its keep — surfaced a **negative-float round-trip gap**: `neg(1.5)` reduces to the
+  literal `-1.5` (Maude prints `-1.5` and re-lexes it as one Float token, since tokens are
+  whitespace-delimited — `5.0 - 1.5` stays three), but our `classify` required the integer part to be
+  all-digits, so `-1.5` fell through to `Ident`. Fixed in the lexer (`is_float_literal`: optional leading
+  sign + optional `[eE][-+]?` exponent; a spaced `-` is untouched = binary minus). **All 21 modules now
+  load+reduce (15 value-checked + the full set round-tripped); 102 core + 65 frontend tests; clippy `-D`
+  clean; fib(22)=186579.** **Deferred B4.5 items (loud, never silent; none block B5): structured sorts
+  (`resolve_sort` errors), the `f^n(t)` iter-token form (`build_dag` errors), large-numeral DagId fast-path
+  (perf), `mayAssoc` bias (verified no-op). NEXT: B5 (modules + REPL = the Phase-1 end milestone).**
 - **⚠ ORDERING — do B4.6 (pretty-printer) BEFORE B4.5 (coverage).** *(The plan lists them 5-then-6; we
   deliberately swap.)* **Why:** B4.5's strongest deliverable — the **whole-prelude differential test** — needs
   a true *textual* comparison against the reference binary's printed output, which requires the pretty-printer
