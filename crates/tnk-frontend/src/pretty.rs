@@ -16,6 +16,7 @@ use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use tnk_core::dag::{DagId, NodeRepr};
 use tnk_core::sort::KindId;
 use tnk_core::symbol::SymbolId;
+use tnk_core::term::Term;
 
 /// `s_`'s OBJ3 unary precedence — the precedence of the iterated-successor mixfix form (`grammar`'s
 /// `UNARY_PREC`). Used when laying out the round-trip repeated `s s … base` form.
@@ -50,24 +51,53 @@ enum Cat {
 /// Render `d` (a reduced node) as round-trippable plain text: `parse(print_raw(t)) == t`. Plain-iter
 /// successors print as repeated `s s … base` and negation as `- n`, the forms our parser reads back.
 pub fn print_raw(m: &BuiltModule, i: &Interner, d: DagId) -> String {
-    Printer { m, i, faithful: false, color: false }.render(d)
+    Printer { m, i, faithful: false, color: false, vars: &[] }.render(d)
 }
 
 /// Render `d` for interactive display: Maude-faithful forms (`s_^n(0)`, `-3`) with optional ANSI syntax
 /// coloring. With `color = false` this is the Maude-faithful plain rendering used to diff against the
 /// reference binary's printed output.
 pub fn print_pretty(m: &BuiltModule, i: &Interner, d: DagId, color: bool) -> String {
-    Printer { m, i, faithful: true, color }.render(d)
+    Printer { m, i, faithful: true, color, vars: &[] }.render(d)
+}
+
+/// Render a static [`Term`] (an equation/membership LHS/RHS pattern, with variables) — the inverse of the
+/// same mixfix grammar, sharing the DAG printer's prec/gather walk (Maude's `MixfixModule::prettyPrint`
+/// vs `dagNodePrint` split). A `Term::Var` prints as its name from `vars` (index → name, the statement's
+/// [`VarIndex`](crate::build_term::VarIndex) order); used by the trace to render `eq lhs = rhs .`.
+pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], color: bool) -> String {
+    let p = Printer { m, i, faithful: true, color, vars };
+    let mut out = String::new();
+    p.print_term(&mut out, t, UNBOUNDED, NONE_CAP, NONE_CAP);
+    out
 }
 
 /// The shared printer. `m`/`i`/flags are immutable; the output buffer is threaded as a `&mut String`
 /// parameter so the recursive walk can read `self` freely while appending. `faithful` selects
-/// Maude-faithful leaf forms over round-trippable ones; `color` enables ANSI syntax coloring.
+/// Maude-faithful leaf forms over round-trippable ones; `color` enables ANSI syntax coloring; `vars`
+/// names the variables for a [`Term`] walk (empty for the DAG walk).
 struct Printer<'a> {
     m: &'a BuiltModule,
     i: &'a Interner,
     faithful: bool,
     color: bool,
+    vars: &'a [String],
+}
+
+/// A child of an application in either walk: a `DagId` (recurse via [`Printer::print`]) or a `&Term`
+/// (recurse via [`Printer::print_term`]). Lets the mixfix frag/hole loop be shared (Option iii).
+trait Child {
+    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap);
+}
+impl Child for DagId {
+    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap) {
+        p.print(out, *self, req_prec, lcap, rcap);
+    }
+}
+impl Child for Term {
+    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap) {
+        p.print_term(out, self, req_prec, lcap, rcap);
+    }
 }
 
 impl Printer<'_> {
@@ -75,6 +105,48 @@ impl Printer<'_> {
         let mut out = String::new();
         self.print(&mut out, d, UNBOUNDED, NONE_CAP, NONE_CAP);
         out
+    }
+
+    /// Print a static [`Term`]: a variable by name, or an operator application via the shared mixfix walk.
+    fn print_term(&self, out: &mut String, t: &Term, req_prec: u32, lcap: Cap, rcap: Cap) {
+        match t {
+            Term::Var(v) => {
+                let name = self.vars.get(v.index as usize).map(String::as_str).unwrap_or("_");
+                self.emit(out, Cat::Op, name);
+            }
+            Term::Op { symbol, args } => self.print_app_term(out, *symbol, args, req_prec, lcap, rcap),
+        }
+    }
+
+    /// A `Term::Op` application — the term-walk twin of [`print_app`](Self::print_app) (no DAG leaf/iter/
+    /// minus special-casing; children are `&[Term]`). Parenthesization is the same prec/gather inverse.
+    fn print_app_term(&self, out: &mut String, symbol: SymbolId, args: &[Term], req_prec: u32, lcap: Cap, rcap: Cap) {
+        let Some(syn) = self.m.syntax.get(&symbol) else {
+            self.emit(out, Cat::Op, self.m.engine.symbol(symbol).name());
+            if !args.is_empty() {
+                self.print_arg_list(out, args);
+            }
+            return;
+        };
+        let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
+        if !has_hole {
+            let cat = if args.is_empty() { Cat::Lit } else { Cat::Op };
+            self.emit(out, cat, self.frag_text(&syn.frags[0]));
+            if !args.is_empty() {
+                self.print_arg_list(out, args);
+            }
+            return;
+        }
+        let pg = prec_gather::compute(&syn.frags, syn.domain.len(), syn.prec, syn.gather.as_deref(), syn.assoc);
+        let paren = req_prec < pg.prec || self.captures(syn, &pg.gather, lcap, rcap);
+        if paren {
+            self.emit(out, Cat::Punct, "(");
+        }
+        let (lcap, rcap) = if paren { (NONE_CAP, NONE_CAP) } else { (lcap, rcap) };
+        self.print_mixfix(out, syn, &pg, args, lcap, rcap);
+        if paren {
+            self.emit(out, Cat::Punct, ")");
+        }
     }
 
     /// Print node `d` under a position whose gather bound is `req_prec`, with the given left/right
@@ -145,15 +217,16 @@ impl Printer<'_> {
     /// Emit a mixfix form: walk the syntax fragments, emitting literal tokens and recursing into argument
     /// holes (each at its gather bound + adjacency context). An associative operator with more arguments
     /// than its arity folds its flattened children over the infix tokens (`a + b + c`).
-    fn print_mixfix(&self, out: &mut String, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[DagId], lcap: Cap, rcap: Cap) {
+    fn print_mixfix<C: Child>(&self, out: &mut String, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[C], lcap: Cap, rcap: Cap) {
         let nr_args = syn.domain.len();
         let left_bare = matches!(syn.frags.first(), Some(Frag::Hole));
         let right_bare = matches!(syn.frags.last(), Some(Frag::Hole));
 
-        // Associative fold for the pure binary infix `_ OP _` with > 2 flattened children.
+        // Associative fold for the pure binary infix `_ OP _` with > 2 flattened children (the DAG case;
+        // a `Term` pattern is nested binary, so prec/gather alone handles `a + b + c`).
         if syn.assoc && nr_args == 2 && left_bare && right_bare && children.len() > 2 {
             let mid: Vec<&Frag> = syn.frags[1..syn.frags.len() - 1].iter().collect();
-            for (idx, &c) in children.iter().enumerate() {
+            for (idx, c) in children.iter().enumerate() {
                 if idx > 0 {
                     for f in &mid {
                         out.push(' ');
@@ -163,7 +236,7 @@ impl Printer<'_> {
                 }
                 // Inner elements bind at the tighter gather[1]; left/right ends keep the outer capture.
                 let bound = if idx == 0 { pg.gather[0] } else { pg.gather[1] };
-                self.print(out, c, bound, NONE_CAP, NONE_CAP);
+                c.render(self, out, bound, NONE_CAP, NONE_CAP);
             }
             return;
         }
@@ -179,7 +252,7 @@ impl Printer<'_> {
                 Frag::Tok(_) => self.emit(out, Cat::Op, self.frag_text(frag)),
                 Frag::Hole => {
                     let (lc, rc) = self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
-                    self.print(out, children[k], pg.gather[k], lc, rc);
+                    children[k].render(self, out, pg.gather[k], lc, rc);
                     k += 1;
                 }
             }
@@ -254,15 +327,15 @@ impl Printer<'_> {
         }
     }
 
-    /// `(a, b, …)` — a prefix argument list.
-    fn print_arg_list(&self, out: &mut String, children: &[DagId]) {
+    /// `(a, b, …)` — a prefix argument list (shared by both walks).
+    fn print_arg_list<C: Child>(&self, out: &mut String, children: &[C]) {
         self.emit(out, Cat::Punct, "(");
-        for (idx, &c) in children.iter().enumerate() {
+        for (idx, c) in children.iter().enumerate() {
             if idx > 0 {
                 self.emit(out, Cat::Punct, ",");
                 out.push(' ');
             }
-            self.print(out, c, PREFIX_GATHER, NONE_CAP, NONE_CAP);
+            c.render(self, out, PREFIX_GATHER, NONE_CAP, NONE_CAP);
         }
         self.emit(out, Cat::Punct, ")");
     }
@@ -532,5 +605,33 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The Term printer renders a pattern (variables + prefix/mixfix ops) byte-identically to the DAG
+    /// printer's mixfix layout — the basis for the trace's `eq lhs = rhs .` line.
+    #[test]
+    fn term_printer_renders_patterns() {
+        let loaded = load_source(
+            "fmod M is sort N . op 0 : -> N [ctor] . op s : N -> N [ctor] . \
+             op add : N N -> N . op _+_ : N N -> N [assoc] . endfm",
+        )
+        .expect("load");
+        let m = &loaded.modules[0].built;
+        let i = &loaded.interner;
+        let nat = m.sorts["N"];
+        let s = m.ops[&("s".to_string(), 1)];
+        let add = m.ops[&("add".to_string(), 2)];
+        let plus = m.ops[&("_+_".to_string(), 2)];
+        let v = |idx| Term::var(idx, nat);
+        let names = ["X".to_string(), "Y".to_string(), "Z".to_string()];
+
+        // prefix ops + variables: add(s(X), Y)
+        let t1 = Term::op(add, vec![Term::op(s, vec![v(0)]), v(1)]);
+        assert_eq!(print_term(m, i, &t1, &names, false), "add(s(X), Y)");
+        // right-associating infix, nested binary `+(X, +(Y, Z))` renders flat `X + Y + Z`
+        let t2 = Term::op(plus, vec![v(0), Term::op(plus, vec![v(1), v(2)])]);
+        assert_eq!(print_term(m, i, &t2, &names, false), "X + Y + Z");
+        // a constant
+        assert_eq!(print_term(m, i, &Term::constant(m.ops[&("0".to_string(), 0)]), &[], false), "0");
     }
 }
