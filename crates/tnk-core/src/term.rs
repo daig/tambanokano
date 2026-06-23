@@ -128,6 +128,13 @@ impl Subst {
     pub fn get(&self, index: u32) -> Option<DagId> {
         self.bindings[index as usize]
     }
+    /// The number of variable slots (`nr_vars` of the statement this substitution was [`reset`] for).
+    /// Used to snapshot the whole substitution for a trace event without threading `nr_vars` separately.
+    ///
+    /// [`reset`]: Subst::reset
+    pub(crate) fn len(&self) -> u32 {
+        self.bindings.len() as u32
+    }
     /// Bind variable `index` to `id` (overwriting any previous binding).
     pub(crate) fn bind(&mut self, index: u32, id: DagId) {
         self.bindings[index as usize] = Some(id);

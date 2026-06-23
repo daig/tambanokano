@@ -8,7 +8,7 @@
 //! `format_matchers`, and the pretty-printer.
 
 use std::collections::HashMap;
-use tnk_core::engine::{TraceKind, TraceStep};
+use tnk_core::engine::{RewriteKind, TraceEvent};
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_frontend::load::{
     build_loaded_module, format_matchers, match_command, reduce_command, LoadedModule,
@@ -257,19 +257,36 @@ fn join_tokens(toks: &[Token], i: &Interner) -> String {
 }
 
 /// Render a reduction trace (Maude's `*********** <kind>` + redex `--->` result, per step). Empty when
-/// there were no rewrites. The full equation + substitution lines are an additive follow-up.
-fn render_trace(m: &BuiltModule, i: &Interner, steps: &[TraceStep], color: bool) -> String {
+/// there were no rewrites. This is the interim step-trace renderer; the full equation/substitution/
+/// condition rendering (driven by the [`TraceEvent`] stream + the frontend's trace metadata) lands in
+/// Phase 4/5. Trial/fragment events are skipped here.
+fn render_trace(m: &BuiltModule, i: &Interner, events: &[TraceEvent], color: bool) -> String {
     let mut out = String::new();
-    for st in steps {
-        let kind = match st.kind {
-            TraceKind::Equation => "equation",
-            TraceKind::BuiltIn => "built-in",
-        };
-        out.push_str(&format!(
-            "*********** {kind}\n{}\n--->\n{}\n",
-            print_pretty(m, i, st.before, color),
-            print_pretty(m, i, st.after, color),
-        ));
+    for ev in events {
+        match ev {
+            TraceEvent::Rewrite { kind, redex, result, .. } => {
+                let label = match kind {
+                    RewriteKind::Equation => "equation",
+                    RewriteKind::BuiltIn => "built-in",
+                };
+                out.push_str(&format!(
+                    "*********** {label}\n{}\n--->\n{}\n",
+                    print_pretty(m, i, *redex, color),
+                    print_pretty(m, i, *result, color),
+                ));
+            }
+            TraceEvent::Membership { subject, old_sort, new_sort, .. } => {
+                let eng = &m.engine;
+                out.push_str(&format!(
+                    "*********** membership axiom\n{}: {} becomes {}\n",
+                    eng.sorts().name(*old_sort),
+                    print_pretty(m, i, *subject, color),
+                    eng.sorts().name(*new_sort),
+                ));
+            }
+            // Trial/fragment events render in Phase 5.
+            _ => {}
+        }
     }
     out
 }

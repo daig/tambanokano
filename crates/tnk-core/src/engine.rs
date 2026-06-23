@@ -26,6 +26,9 @@ use std::collections::HashMap;
 /// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
 /// The public [`Equation`] (lhs as a [`Term`]) is compiled into this by [`Engine::add_equation`].
 struct CompiledEquation {
+    /// Dense per-module id (assigned by [`Signature::push_equation`]); the frontend keeps this
+    /// equation's source `Term`s + variable names at `eq_traces[id]` for the trace renderer.
+    id: u32,
     lhs: LhsAutomaton,
     rhs: Term,
     nr_vars: u32,
@@ -40,6 +43,9 @@ struct CompiledEquation {
 /// plus the target sort and variable count. The public [`Membership`] is compiled into this by
 /// [`Signature::add_membership`]. (Conditional `cmb` gains a condition in B2.3.)
 struct SortConstraint {
+    /// Dense per-module id (assigned by [`Signature::push_membership`]); the frontend keeps this
+    /// membership's source `Term` + variable names at `mb_traces[id]` for the trace renderer.
+    id: u32,
     lhs: LhsAutomaton,
     sort: SortId,
     nr_vars: u32,
@@ -106,40 +112,149 @@ pub(crate) struct Signature {
     /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
     /// reduced" sentinel stored on nodes, so this starts at `1`.
     eq_epoch: u32,
+    /// Next dense equation id (the count of equations added). Assigned to each [`CompiledEquation`] so
+    /// the frontend can key its trace metadata by it; per-module (each `Engine` starts at 0).
+    next_eq_id: u32,
+    /// Next dense membership-axiom id (the count of memberships added). Assigned to each
+    /// [`SortConstraint`]; the trace counterpart of `next_eq_id`.
+    next_mb_id: u32,
 }
 
-/// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
-/// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
-/// `&Signature`; everything else is pure arena work.
-/// One recorded reduction step (opt-in via [`Engine::set_trace`]): the redex `before` rewritten to
-/// `after` by a `kind` of rule. The frontend renders these as Maude's `*********** <kind>` trace.
-#[derive(Debug, Clone, Copy)]
-pub struct TraceStep {
-    pub kind: TraceKind,
-    pub before: DagId,
-    pub after: DagId,
+/// One recorded reduction event (opt-in via [`Engine::set_trace`]) — the structured stream the REPL
+/// renders as Maude's full `trace`. Each event carries its **condition-nesting `depth`** (0 at the top
+/// level, +1 inside every condition-fragment reduction): the REPL's `set trace condition off` renders
+/// only depth-0 events, mirroring Maude's `CONDITION_EVAL` sub-context trace flag. Node ids held here
+/// (redex/result/bindings/subject/whole) are rooted by [`safe_point_gc`](Runtime::safe_point_gc).
+///
+/// The `id`s name a module's compiled equations / membership axioms (dense, per-module, assigned by
+/// [`Signature::push_equation`]/[`push_membership`](Signature::push_membership)); the frontend keeps the
+/// source `Term`s + variable names keyed by them and renders the bodies.
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    /// A term rewrite: an equation (`eq_id = Some`) or a built-in (`special`) reduction (`eq_id =
+    /// None`). `bindings[i]` is the matched value of the equation's variable `i` (`None` = unbound; empty
+    /// for a built-in). `whole_before`/`whole_after` are the whole root term before/after this rewrite —
+    /// `Some` only when whole-tracing is on (`set trace whole`); reconstructed from the reduce frame stack.
+    Rewrite {
+        kind: RewriteKind,
+        eq_id: Option<u32>,
+        depth: u32,
+        redex: DagId,
+        result: DagId,
+        bindings: Vec<Option<DagId>>,
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    },
+    /// A membership-axiom sort narrowing (not a term rewrite): `subject`'s least sort was lowered from
+    /// `old_sort` to `new_sort` by membership `mb_id`. `bindings` is the membership match's substitution.
+    /// (`whole` is reserved for `set trace whole`; currently `None` — memberships fire at node
+    /// construction, where the reduce frame stack isn't available, so the whole term isn't reconstructed.)
+    Membership {
+        mb_id: u32,
+        depth: u32,
+        subject: DagId,
+        old_sort: SortId,
+        new_sort: SortId,
+        bindings: Vec<Option<DagId>>,
+        whole: Option<DagId>,
+    },
+    /// Begin trying a conditional equation/membership against one matcher solution (a *trial*).
+    /// `bindings` is the substitution so far (the lhs match; fresh `:=` variables are still `None`).
+    TrialStart { kind: StmtKind, stmt_id: u32, depth: u32, bindings: Vec<Option<DagId>> },
+    /// End a trial: `success` iff the whole condition held. `kind`/`depth` mirror the matching
+    /// [`TrialStart`](TraceEvent::TrialStart) so the renderer gates (and so pairs) them identically.
+    TrialEnd { kind: StmtKind, depth: u32, success: bool },
+    /// Begin solving condition fragment `index` of `stmt_id`'s condition (`first_attempt = false` on a
+    /// backtracking re-solve → Maude's `re-solving`).
+    FragmentStart { kind: StmtKind, stmt_id: u32, index: u32, depth: u32, first_attempt: bool },
+    /// End solving a condition fragment. On `success`, `bindings` is the substitution after the fragment
+    /// (it may have bound fresh `:=` variables).
+    FragmentEnd {
+        kind: StmtKind,
+        stmt_id: u32,
+        index: u32,
+        depth: u32,
+        success: bool,
+        bindings: Vec<Option<DagId>>,
+    },
 }
 
-/// What kind of rule produced a [`TraceStep`]. (Membership sort-narrowings are not term rewrites, so
-/// they are not traced; equation `lhs => rhs` rule-tracing is a Phase-2 follow-up.)
+impl TraceEvent {
+    /// The condition-nesting depth this event was recorded at (0 = top level). The REPL renders an
+    /// event iff `depth == 0` or `set trace condition` is on.
+    pub fn depth(&self) -> u32 {
+        match self {
+            TraceEvent::Rewrite { depth, .. }
+            | TraceEvent::Membership { depth, .. }
+            | TraceEvent::TrialStart { depth, .. }
+            | TraceEvent::TrialEnd { depth, .. }
+            | TraceEvent::FragmentStart { depth, .. }
+            | TraceEvent::FragmentEnd { depth, .. } => *depth,
+        }
+    }
+
+    /// Every DAG node id this event references (for GC rooting under in-reduction GC).
+    fn for_each_id(&self, mut f: impl FnMut(DagId)) {
+        let binds = |bs: &[Option<DagId>], f: &mut dyn FnMut(DagId)| bs.iter().flatten().for_each(|&d| f(d));
+        match self {
+            TraceEvent::Rewrite { redex, result, bindings, whole_before, whole_after, .. } => {
+                f(*redex);
+                f(*result);
+                binds(bindings, &mut f);
+                whole_before.iter().chain(whole_after.iter()).for_each(|&d| f(d));
+            }
+            TraceEvent::Membership { subject, bindings, whole, .. } => {
+                f(*subject);
+                binds(bindings, &mut f);
+                whole.iter().for_each(|&d| f(d));
+            }
+            TraceEvent::TrialStart { bindings, .. } | TraceEvent::FragmentEnd { bindings, .. } => {
+                binds(bindings, &mut f)
+            }
+            TraceEvent::TrialEnd { .. } | TraceEvent::FragmentStart { .. } => {}
+        }
+    }
+}
+
+/// What kind of rule produced a [`Rewrite`](TraceEvent::Rewrite) event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceKind {
+pub enum RewriteKind {
     /// A user equation.
     Equation,
     /// A built-in (`special`) operator's reduction.
     BuiltIn,
 }
 
+/// Which statement table a trial / fragment / membership event refers to — selects the frontend
+/// metadata (`eq_traces` vs `mb_traces`) the REPL looks `stmt_id` up in, and the `eqs`/`mbs` trace flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StmtKind {
+    /// A (conditional) equation.
+    Equation,
+    /// A (conditional) membership axiom.
+    Membership,
+}
+
+/// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
+/// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
+/// `&Signature`; everything else is pure arena work.
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic).
     rewrite_count: u64,
-    /// When `Some`, [`reduce`](Engine::reduce) records each rewrite here (opt-in via
-    /// [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate (pre-rewrite) node
-    /// ids, so it is rooted by [`safe_point_gc`](Self::safe_point_gc) — but it is meant for the REPL,
-    /// which runs with in-reduction GC off.
-    trace: Option<Vec<TraceStep>>,
+    /// When `Some`, [`reduce`](Engine::reduce) records a structured [`TraceEvent`] stream here (opt-in
+    /// via [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate node ids, so it
+    /// is rooted by [`safe_point_gc`](Self::safe_point_gc) — but it is meant for the REPL, which runs
+    /// with in-reduction GC off.
+    trace: Option<Vec<TraceEvent>>,
+    /// Current condition-fragment nesting depth: 0 at top level, incremented around each condition
+    /// fragment's re-entrant reduction (so events recorded inside a condition are tagged `depth >= 1`).
+    /// Always maintained (a cheap `u32`), but only consulted when `trace` is `Some`.
+    condition_depth: u32,
+    /// Whether to reconstruct the whole root term at each rewrite (`set trace whole`). Off by default
+    /// (the reconstruction allocates O(depth) nodes per rewrite, so it is gated). Only acts when tracing.
+    record_whole: bool,
     /// Persistent GC roots held by live [`RootGuard`]s (decision D2 amendment). `gc` always marks
     /// from here; the shared `Rc<RefCell<…>>` lets a guard outlive a `&mut self` call.
     roots: Roots,
@@ -165,6 +280,8 @@ impl Default for Signature {
             equations: HashMap::default(),
             memberships: HashMap::default(),
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
+            next_eq_id: 0,
+            next_mb_id: 0,
         }
     }
 }
@@ -540,8 +657,8 @@ impl Signature {
 
     /// Register an unconditional equation, compiling its lhs to a theory `LhsAutomaton` once, and
     /// advance the equation epoch (see [`Engine::add_equation`]).
-    pub(crate) fn add_equation(&mut self, eq: Equation) {
-        self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new(), false);
+    pub(crate) fn add_equation(&mut self, eq: Equation) -> u32 {
+        self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new(), false)
     }
 
     /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3): the condition is a list of
@@ -553,8 +670,8 @@ impl Signature {
         rhs: Term,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.push_equation(lhs, rhs, nr_vars, condition, false);
+    ) -> u32 {
+        self.push_equation(lhs, rhs, nr_vars, condition, false)
     }
 
     /// Register an `[owise]` equation (optionally conditional): tried only if no non-owise equation of
@@ -565,10 +682,12 @@ impl Signature {
         rhs: Term,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.push_equation(lhs, rhs, nr_vars, condition, true);
+    ) -> u32 {
+        self.push_equation(lhs, rhs, nr_vars, condition, true)
     }
 
+    /// Compile and register an equation, returning its dense per-module **id** (the index the frontend
+    /// keys its trace metadata by).
     fn push_equation(
         &mut self,
         lhs: Term,
@@ -576,9 +695,12 @@ impl Signature {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
         owise: bool,
-    ) {
+    ) -> u32 {
         let top = lhs.top_symbol().expect("equation lhs must be an application");
+        let id = self.next_eq_id;
+        self.next_eq_id += 1;
         let compiled = CompiledEquation {
+            id,
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
@@ -589,6 +711,7 @@ impl Signature {
         // A term canonical under the old equation set may now be reducible: invalidate every
         // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
         self.eq_epoch += 1;
+        id
     }
 
     /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test
@@ -616,8 +739,8 @@ impl Signature {
     /// construction, so — like overload declarations — **memberships must be declared before any node
     /// of their lhs's symbol is built** (a node built earlier keeps its un-constrained sort). Does not
     /// bump `eq_epoch`: memberships refine sorts, not the `reduced` cache.
-    pub(crate) fn add_membership(&mut self, mb: Membership) {
-        self.push_membership(mb.lhs, mb.sort, mb.nr_vars, Vec::new());
+    pub(crate) fn add_membership(&mut self, mb: Membership) -> u32 {
+        self.push_membership(mb.lhs, mb.sort, mb.nr_vars, Vec::new())
     }
 
     /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
@@ -629,13 +752,19 @@ impl Signature {
         sort: SortId,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.push_membership(lhs, sort, nr_vars, condition);
+    ) -> u32 {
+        self.push_membership(lhs, sort, nr_vars, condition)
     }
 
-    fn push_membership(&mut self, lhs: Term, sort: SortId, nr_vars: u32, condition: Vec<ConditionFragment>) {
+    /// Compile and register a membership axiom, returning its dense per-module **id**. (The membership
+    /// table is re-sorted smallest-target-first for application, but `id` stays declaration order — the
+    /// frontend keys `mb_traces` by it.)
+    fn push_membership(&mut self, lhs: Term, sort: SortId, nr_vars: u32, condition: Vec<ConditionFragment>) -> u32 {
         let top = lhs.top_symbol().expect("membership lhs must be an application");
+        let id = self.next_mb_id;
+        self.next_mb_id += 1;
         let compiled = SortConstraint {
+            id,
             lhs: LhsAutomaton::compile(lhs, self),
             sort,
             nr_vars,
@@ -658,6 +787,7 @@ impl Signature {
                 x.sort.cmp(&y.sort) // incomparable: deterministic tie-break (non-confluent is a follow-up)
             }
         });
+        id
     }
 
     /// The current equation-set epoch (stamped into nodes proved canonical; see [`DagNode`]).
@@ -714,7 +844,20 @@ impl Runtime {
                 if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
                     continue;
                 }
-                if self.membership_applies(sig, sc, id) {
+                if let Some(bindings) = self.membership_applies(sig, sc, id) {
+                    // Record BEFORE mutating the sort: the event captures the *old* (current) sort.
+                    if self.tracing() {
+                        let depth = self.condition_depth;
+                        self.record(TraceEvent::Membership {
+                            mb_id: sc.id,
+                            depth,
+                            subject: id,
+                            old_sort: current,
+                            new_sort: sc.sort,
+                            bindings,
+                            whole: None,
+                        });
+                    }
                     self.dags.get_mut(id).sort = sc.sort;
                     self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
                     lowered = true;
@@ -732,18 +875,46 @@ impl Runtime {
     /// recursive matcher and a theory lhs its own automaton. A condition that fails for one match
     /// solution backtracks into the next (B2.3c); the condition's own reductions count toward the
     /// rewrite total whether or not it ends up holding. (AC/`iter` membership matching is a follow-up.)
-    fn membership_applies(&mut self, sig: &Signature, sc: &SortConstraint, id: DagId) -> bool {
+    /// On success returns the membership match's substitution snapshot (for the trace), or an empty
+    /// `Vec` when not tracing (no allocation); `None` on no-match. A conditional membership (`cmb`) emits
+    /// a *trial* per matcher solution, backtracking on condition failure.
+    fn membership_applies(
+        &mut self,
+        sig: &Signature,
+        sc: &SortConstraint,
+        id: DagId,
+    ) -> Option<Vec<Option<DagId>>> {
         let mut subst = Subst::new();
         subst.reset(sc.nr_vars);
-        let Some(mut sp) = sc.lhs.match_(self, sig, id, &mut subst, false) else {
-            return false;
-        };
+        let mut sp = sc.lhs.match_(self, sig, id, &mut subst, false)?;
         while sp.next(self, sig, &mut subst) {
-            if sc.condition.is_empty() || self.condition_holds(sig, &sc.condition, &mut subst) {
-                return true;
+            if sc.condition.is_empty() {
+                return Some(if self.tracing() { Self::snapshot_subst(&subst) } else { Vec::new() });
+            }
+            let depth = self.condition_depth;
+            if self.tracing() {
+                let bindings = Self::snapshot_subst(&subst);
+                self.record(TraceEvent::TrialStart {
+                    kind: StmtKind::Membership,
+                    stmt_id: sc.id,
+                    depth,
+                    bindings,
+                });
+            }
+            let holds =
+                self.condition_holds(sig, &sc.condition, &mut subst, StmtKind::Membership, sc.id);
+            if self.tracing() {
+                self.record(TraceEvent::TrialEnd {
+                    kind: StmtKind::Membership,
+                    depth,
+                    success: holds,
+                });
+            }
+            if holds {
+                return Some(if self.tracing() { Self::snapshot_subst(&subst) } else { Vec::new() });
             }
         }
-        false
+        None
     }
 
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
@@ -1123,11 +1294,15 @@ impl Runtime {
         if let Some(r) = child_result {
             self.mark_reachable(r);
         }
-        // A trace holds intermediate (pre-rewrite) node ids for later rendering — root them too so a
-        // traced reduction under in-reduction GC keeps them alive. (Collected first to release the
-        // shared borrow before `mark_reachable` takes `&mut self`; `None` on the common untraced path.)
+        // A trace holds intermediate node ids (redex/result/bindings/subject/whole, incl. of failed
+        // condition trials) for later rendering — root them all so a traced reduction under in-reduction
+        // GC keeps them alive. (Collected first to release the shared borrow before `mark_reachable`
+        // takes `&mut self`; `None` on the common untraced path.)
         if let Some(trace) = &self.trace {
-            let ids: Vec<DagId> = trace.iter().flat_map(|s| [s.before, s.after]).collect();
+            let mut ids: Vec<DagId> = Vec::new();
+            for ev in trace {
+                ev.for_each_id(|d| ids.push(d));
+            }
             for id in ids {
                 self.mark_reachable(id);
             }
@@ -1255,6 +1430,15 @@ impl Runtime {
             // this frame's slot for the rewritten term.
             if let Some(next) = self.try_rewrite_top(sig, rebuilt) {
                 self.rewrite_count += 1;
+                // Faithful `set trace whole`: reconstruct the whole root term before/after this top
+                // rewrite (the redex `rebuilt` / result `next` threaded up through the ancestor frames)
+                // and patch the just-recorded `Rewrite` event. Gated — off by default; only allocates
+                // when whole-tracing is on.
+                if self.record_whole && self.tracing() {
+                    let before = self.reconstruct_whole(sig, &stack, rebuilt);
+                    let after = self.reconstruct_whole(sig, &stack, next);
+                    self.patch_whole(before, after);
+                }
                 let frame = self.new_reduce_frame(next);
                 *stack.last_mut().expect("empty reduce stack") = frame;
                 continue;
@@ -1283,6 +1467,46 @@ impl Runtime {
         }
     }
 
+    /// Reconstruct the whole root term with `leaf` threaded up through the ancestor reduce frames — the
+    /// in-progress whole term Maude's `root()` would show for `set trace whole`. The deepest frame
+    /// (`stack.last`) is the one being rewritten (its node is `leaf`); each shallower frame contributes
+    /// its symbol + current `args`, with the position it is mid-reducing (`strat_position`) replaced by
+    /// the threaded child. Already-reduced siblings sit in `args`; not-yet-visited ones keep their
+    /// originals — exactly the partially-normalized whole term. Allocates O(depth) nodes, so it is only
+    /// called when whole-tracing is on.
+    fn reconstruct_whole(&mut self, sig: &Signature, stack: &[ReduceFrame], leaf: DagId) -> DagId {
+        let mut node = leaf;
+        for frame in stack[..stack.len() - 1].iter().rev() {
+            let pos = sig
+                .strat_position(frame.symbol, frame.cursor, frame.orig.len())
+                .expect("an ancestor reduce frame is mid-strategy");
+            let mut args = frame.args.clone();
+            args[pos] = node;
+            // Preserve an S node's `count` (as the reduce loop does), else `rebuild` would re-wrap `s^1`.
+            node = if matches!(sig.symbol(frame.symbol).theory(), Theory::S) {
+                let count = match &self.node(frame.original).term {
+                    NodeTerm::S { count, .. } => count.clone(),
+                    _ => unreachable!("a Theory::S frame is over an S node"),
+                };
+                self.make_s(sig, frame.symbol, count, args[0])
+            } else {
+                self.rebuild(sig, frame.symbol, args)
+            };
+        }
+        node
+    }
+
+    /// Attach reconstructed whole-before/after terms to the most-recently recorded `Rewrite` event (the
+    /// top rewrite `try_equations`/`try_special` just recorded).
+    fn patch_whole(&mut self, before: DagId, after: DagId) {
+        if let Some(TraceEvent::Rewrite { whole_before, whole_after, .. }) =
+            self.trace.as_mut().and_then(|b| b.last_mut())
+        {
+            *whole_before = Some(before);
+            *whole_after = Some(after);
+        }
+    }
+
     /// Apply the first matching equation at the top of `id`, returning the instantiated rhs (or
     /// `None` if no equation applies).
     ///
@@ -1296,11 +1520,22 @@ impl Runtime {
     /// The A4 borrow split is what lets this avoid cloning the rhs: `eqs` (and thus `&eq.rhs`) is a
     /// shared borrow of `sig`, disjoint from the `&mut self` runtime, so the matched rhs is
     /// instantiated straight out of the still-borrowed equation table.
-    /// Record a rewrite of `before` to `after` when tracing is on (a cheap `None` check otherwise).
-    fn trace_step(&mut self, kind: TraceKind, before: DagId, after: DagId) {
+    /// Whether the [`TraceEvent`] stream is being recorded (opt-in via [`Engine::set_trace`]).
+    fn tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Push a trace event when tracing is on (a cheap `None` check otherwise).
+    fn record(&mut self, ev: TraceEvent) {
         if let Some(buf) = &mut self.trace {
-            buf.push(TraceStep { kind, before, after });
+            buf.push(ev);
         }
+    }
+
+    /// Snapshot all bindings of `subst` (each `Some`/`None`) for a trace event — the statement's
+    /// variables `0..nr_vars`, in index order (Maude prints them so, `(unbound)` for `None`).
+    fn snapshot_subst(subst: &Subst) -> Vec<Option<DagId>> {
+        (0..subst.len()).map(|i| subst.get(i)).collect()
     }
 
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
@@ -1311,7 +1546,19 @@ impl Runtime {
         if let Some(op) = sig.symbol(symbol).special()
             && let Some(r) = self.try_special(sig, id, op)
         {
-            self.trace_step(TraceKind::BuiltIn, id, r);
+            if self.tracing() {
+                let depth = self.condition_depth;
+                self.record(TraceEvent::Rewrite {
+                    kind: RewriteKind::BuiltIn,
+                    eq_id: None,
+                    depth,
+                    redex: id,
+                    result: r,
+                    bindings: Vec::new(),
+                    whole_before: None,
+                    whole_after: None,
+                });
+            }
             return Some(r);
         }
         // ACU/AU/S rewriting matches *modulo* the axioms with extension: a pattern may match a
@@ -1322,13 +1569,12 @@ impl Runtime {
         // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
         // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
         // only when the first found nothing — for a node with no equations the early `?` above skips both.
+        // Equation rewrites (and the conditional trial/fragment events) are recorded inside
+        // `try_equations`, where the eq id + substitution are in scope.
         if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false) {
-            self.trace_step(TraceKind::Equation, id, r);
             return Some(r);
         }
-        let r = self.try_equations(sig, id, eqs, ext_allowed, true)?;
-        self.trace_step(TraceKind::Equation, id, r);
-        Some(r)
+        self.try_equations(sig, id, eqs, ext_allowed, true)
     }
 
     /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
@@ -1356,15 +1602,53 @@ impl Runtime {
                 continue;
             };
             while sp.next(self, sig, &mut subst) {
+                // Conditional equations: each matcher solution is a *trial* — evaluate the condition,
+                // and on failure backtrack into the next solution (Maude's `solveCondition` retry).
                 // Unconditional equations short-circuit (no call) — the free reduce hot path.
-                if !eq.condition.is_empty() && !self.condition_holds(sig, &eq.condition, &mut subst) {
-                    continue;
+                if !eq.condition.is_empty() {
+                    let depth = self.condition_depth;
+                    if self.tracing() {
+                        let bindings = Self::snapshot_subst(&subst);
+                        self.record(TraceEvent::TrialStart {
+                            kind: StmtKind::Equation,
+                            stmt_id: eq.id,
+                            depth,
+                            bindings,
+                        });
+                    }
+                    let holds =
+                        self.condition_holds(sig, &eq.condition, &mut subst, StmtKind::Equation, eq.id);
+                    if self.tracing() {
+                        self.record(TraceEvent::TrialEnd {
+                            kind: StmtKind::Equation,
+                            depth,
+                            success: holds,
+                        });
+                    }
+                    if !holds {
+                        continue;
+                    }
                 }
                 let rhs = self.instantiate(sig, &eq.rhs, &subst);
                 // The subproblem splices the rhs into the matched position — a whole match is just the
                 // rhs; an extension match re-assembles the residue around it in the theory's normal
                 // form (ACU multiset, AU ordered prefix/suffix — Maude's `partialConstruct`).
-                return Some(sp.build_result(self, sig, rhs));
+                let result = sp.build_result(self, sig, rhs);
+                if self.tracing() {
+                    let depth = self.condition_depth;
+                    let bindings = Self::snapshot_subst(&subst);
+                    self.record(TraceEvent::Rewrite {
+                        kind: RewriteKind::Equation,
+                        eq_id: Some(eq.id),
+                        depth,
+                        redex: id,
+                        result,
+                        bindings,
+                        whole_before: None,
+                        whole_after: None,
+                    });
+                }
+                return Some(result);
             }
         }
         None
@@ -1379,15 +1663,38 @@ impl Runtime {
     /// would sweep them; not collecting during this window eliminates the hazard. (Bounded-memory
     /// condition reduction via an engine-global active-frame root set is the remaining follow-up; the
     /// temporaries are reclaimed at the next outer safe point once GC is restored.)
-    fn condition_holds(&mut self, sig: &Signature, condition: &[CompiledFragment], subst: &mut Subst) -> bool {
+    fn condition_holds(
+        &mut self,
+        sig: &Signature,
+        condition: &[CompiledFragment],
+        subst: &mut Subst,
+        kind: StmtKind,
+        stmt_id: u32,
+    ) -> bool {
         if condition.is_empty() {
             return true;
         }
         let saved_gc = self.gc_interval;
         self.gc_interval = None;
-        let holds = self.solve_condition(sig, condition, 0, subst);
+        let holds = self.solve_condition(sig, condition, 0, subst, kind, stmt_id);
         self.gc_interval = saved_gc;
         holds
+    }
+
+    /// Record the end of solving condition fragment `index` (Maude's `traceEndFragment`): the fragment
+    /// text again, plus — on success — the substitution after it (`Var --> binding` lines).
+    fn end_fragment(&mut self, kind: StmtKind, stmt_id: u32, index: usize, depth: u32, success: bool, subst: &Subst) {
+        if self.tracing() {
+            let bindings = if success { Self::snapshot_subst(subst) } else { Vec::new() };
+            self.record(TraceEvent::FragmentEnd {
+                kind,
+                stmt_id,
+                index: index as u32,
+                depth,
+                success,
+                bindings,
+            });
+        }
     }
 
     /// Satisfy `condition[i..]` under `subst`, backtracking (Maude's `solveCondition`): an **equality**
@@ -1397,48 +1704,97 @@ impl Runtime {
     /// failure. The re-entrant reductions are what make a condition's rewrites count toward the total.
     /// A matching fragment's `fresh_vars` are unbound before each attempt so backtracking re-binds
     /// cleanly; on overall success the accepted bindings remain in `subst` for the rhs.
+    #[allow(clippy::too_many_arguments)]
     fn solve_condition(
         &mut self,
         sig: &Signature,
         condition: &[CompiledFragment],
         i: usize,
         subst: &mut Subst,
+        kind: StmtKind,
+        stmt_id: u32,
     ) -> bool {
         let Some(frag) = condition.get(i) else {
             return true; // every fragment satisfied
         };
+        let depth = self.condition_depth;
+        // Begin solving this fragment (Maude's `traceBeginFragment`, first attempt). A matching
+        // fragment may re-solve on backtrack below, emitting its own `FragmentStart { first_attempt:
+        // false }`.
+        if self.tracing() {
+            self.record(TraceEvent::FragmentStart {
+                kind,
+                stmt_id,
+                index: i as u32,
+                depth,
+                first_attempt: true,
+            });
+        }
+        // The fragment's own reduction is one condition-level deeper, so its rewrites are tagged
+        // `depth + 1` (gated by `set trace condition`).
         match frag {
             CompiledFragment::Equality { lhs, rhs } => {
                 let l = self.instantiate(sig, lhs, subst);
-                let l = self.reduce(sig, l);
                 let r = self.instantiate(sig, rhs, subst);
+                self.condition_depth += 1;
+                let l = self.reduce(sig, l);
                 let r = self.reduce(sig, r);
-                self.deep_equal(l, r) && self.solve_condition(sig, condition, i + 1, subst)
+                self.condition_depth -= 1;
+                let holds = self.deep_equal(l, r);
+                self.end_fragment(kind, stmt_id, i, depth, holds, subst);
+                holds && self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)
             }
             CompiledFragment::SortTest { term, sort } => {
                 let t = self.instantiate(sig, term, subst);
+                self.condition_depth += 1;
                 let t = self.reduce(sig, t);
-                sig.sorts().leq(self.node(t).sort, *sort)
-                    && self.solve_condition(sig, condition, i + 1, subst)
+                self.condition_depth -= 1;
+                let holds = sig.sorts().leq(self.node(t).sort, *sort);
+                self.end_fragment(kind, stmt_id, i, depth, holds, subst);
+                holds && self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)
             }
             CompiledFragment::Matching { pattern, subject, fresh_vars } => {
                 let subj = self.instantiate(sig, subject, subst);
+                self.condition_depth += 1;
                 let subj = self.reduce(sig, subj);
+                self.condition_depth -= 1;
                 for &fv in fresh_vars {
                     subst.unbind(fv); // fresh slate, so a backtracking re-entry rebinds cleanly
                 }
                 let satisfied = match pattern.match_(self, sig, subj, subst, false) {
                     Some(mut sp) => {
                         let mut ok = false;
-                        while sp.next(self, sig, subst) {
-                            if self.solve_condition(sig, condition, i + 1, subst) {
+                        let mut first = true;
+                        loop {
+                            // A re-solve (backtrack) begins a fresh attempt (`re-solving condition
+                            // fragment`); the first attempt's begin was emitted above.
+                            if !first && self.tracing() {
+                                self.record(TraceEvent::FragmentStart {
+                                    kind,
+                                    stmt_id,
+                                    index: i as u32,
+                                    depth,
+                                    first_attempt: false,
+                                });
+                            }
+                            first = false;
+                            let found = sp.next(self, sig, subst);
+                            self.end_fragment(kind, stmt_id, i, depth, found, subst);
+                            if !found {
+                                break; // matcher exhausted — this fragment fails
+                            }
+                            if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
                                 ok = true;
                                 break;
                             }
+                            // else: later fragment failed — backtrack into the next matcher solution.
                         }
                         ok
                     }
-                    None => false,
+                    None => {
+                        self.end_fragment(kind, stmt_id, i, depth, false, subst);
+                        false
+                    }
                 };
                 if !satisfied {
                     for &fv in fresh_vars {
@@ -1712,8 +2068,8 @@ impl Engine {
     /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once. A term canonical under
     /// the old equation set may now be reducible, so this advances the equation epoch, invalidating
     /// every node's cached "reduced" stamp (review R2 H2).
-    pub fn add_equation(&mut self, eq: Equation) {
-        self.sig.add_equation(eq);
+    pub fn add_equation(&mut self, eq: Equation) -> u32 {
+        self.sig.add_equation(eq)
     }
 
     /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3). The condition is a list of
@@ -1725,8 +2081,8 @@ impl Engine {
         rhs: Term,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.sig.add_conditional_equation(lhs, rhs, nr_vars, condition);
+    ) -> u32 {
+        self.sig.add_conditional_equation(lhs, rhs, nr_vars, condition)
     }
 
     /// Register an `[owise]` equation (optionally conditional): applied only when no non-owise equation
@@ -1737,15 +2093,15 @@ impl Engine {
         rhs: Term,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.sig.add_owise_equation(lhs, rhs, nr_vars, condition);
+    ) -> u32 {
+        self.sig.add_owise_equation(lhs, rhs, nr_vars, condition)
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
     /// matcher seam). Memberships lower a node's least sort at construction, so declare them before
     /// building any node of the lhs's symbol (cf. the overload add-declarations-first contract).
-    pub fn add_membership(&mut self, mb: Membership) {
-        self.sig.add_membership(mb);
+    pub fn add_membership(&mut self, mb: Membership) -> u32 {
+        self.sig.add_membership(mb)
     }
 
     /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
@@ -1757,8 +2113,8 @@ impl Engine {
         sort: SortId,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
-    ) {
-        self.sig.add_conditional_membership(lhs, sort, nr_vars, condition);
+    ) -> u32 {
+        self.sig.add_conditional_membership(lhs, sort, nr_vars, condition)
     }
 
     /// Total equational rewrites applied so far.
@@ -1769,11 +2125,19 @@ impl Engine {
         self.rt.reset_rewrites();
     }
 
-    /// Enable or disable reduction tracing. When on, every rewrite during [`reduce`](Self::reduce) is
-    /// recorded as a [`TraceStep`]; collect them with [`take_trace`](Self::take_trace). Disabling drops
-    /// any buffered steps. Intended for the REPL (which runs with in-reduction GC off).
+    /// Enable or disable reduction tracing. When on, [`reduce`](Self::reduce) records a structured
+    /// [`TraceEvent`] stream; collect it with [`take_trace`](Self::take_trace). Disabling drops any
+    /// buffered events. Intended for the REPL (which runs with in-reduction GC off).
     pub fn set_trace(&mut self, on: bool) {
         self.rt.trace = on.then(Vec::new);
+        self.rt.condition_depth = 0;
+    }
+
+    /// Enable/disable whole-root-term reconstruction at each rewrite (Maude's `set trace whole`). Only
+    /// acts while tracing; off by default (the reconstruction allocates per rewrite). Set it alongside
+    /// [`set_trace`](Self::set_trace) when rendering with the `whole` flag on.
+    pub fn set_record_whole(&mut self, on: bool) {
+        self.rt.record_whole = on;
     }
 
     /// Whether tracing is currently enabled.
@@ -1781,8 +2145,8 @@ impl Engine {
         self.rt.trace.is_some()
     }
 
-    /// Take the recorded trace steps, clearing the buffer (tracing stays enabled). Empty when off.
-    pub fn take_trace(&mut self) -> Vec<TraceStep> {
+    /// Take the recorded trace events, clearing the buffer (tracing stays enabled). Empty when off.
+    pub fn take_trace(&mut self) -> Vec<TraceEvent> {
         self.rt.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
@@ -2331,11 +2695,10 @@ mod tests {
         assert_eq!(e.rewrites(), 2, "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3");
     }
 
-    /// B2.3a conditional equations with equality conditions (== reference binary,
-    /// `conformance/conditional.maude` CEQ-MAX): `max` via `ceq max(M,N)=N if M<=N=tt` /
-    /// Tracing (opt-in) records one [`TraceStep`] per rewrite — the redex `before` and its replacement
-    /// `after`. `add(s(0), s(0))` reduces in two equation steps; `take_trace` drains them and leaves the
-    /// buffer empty (tracing stays on).
+    /// Tracing (opt-in) records a [`TraceEvent::Rewrite`] per rewrite — kind, the equation `id`, its
+    /// `depth` (0 at top level), the redex/result, and the matched substitution. `add(s(0), s(0))`
+    /// reduces in two equation steps; `take_trace` drains them and leaves the buffer empty (tracing
+    /// stays on).
     #[test]
     fn trace_records_rewrite_steps() {
         let mut e = Engine::new();
@@ -2346,13 +2709,15 @@ mod tests {
         let add = e.add_op("add", vec![nat, nat], nat);
         let v = |i| Term::var(i, nat);
         let s_of = |t| Term::op(s, vec![t]);
-        // eq add(0, Y) = Y .   eq add(s(X), Y) = s(add(X, Y)) .
-        e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
-        e.add_equation(Equation {
+        // eq add(0, Y) = Y .   eq add(s(X), Y) = s(add(X, Y)) .   (ids 0 and 1)
+        let id_add0 =
+            e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
+        let id_adds = e.add_equation(Equation {
             lhs: Term::op(add, vec![s_of(v(0)), v(1)]),
             rhs: s_of(Term::op(add, vec![v(0), v(1)])),
             nr_vars: 2,
         });
+        assert_eq!((id_add0, id_adds), (0, 1), "dense per-module equation ids");
 
         let z0 = e.make_const(z);
         let one = e.make_free(s, vec![z0]);
@@ -2364,9 +2729,28 @@ mod tests {
         let steps = e.take_trace();
 
         assert_eq!(steps.len(), 2, "two equation rewrites");
-        assert!(steps.iter().all(|st| st.kind == TraceKind::Equation));
-        // The first step's redex is the whole subject; the result is s(s(0)).
-        assert_eq!(steps[0].before, subject);
+        // Step 0: add(s(X),Y) fires on the whole subject, binding X and Y (2 vars).
+        match &steps[0] {
+            TraceEvent::Rewrite { kind, eq_id, depth, redex, bindings, whole_before, .. } => {
+                assert_eq!(*kind, RewriteKind::Equation);
+                assert_eq!(*eq_id, Some(id_adds));
+                assert_eq!(*depth, 0);
+                assert_eq!(*redex, subject, "first redex is the whole subject");
+                assert_eq!(bindings.len(), 2, "X, Y bound");
+                assert!(bindings.iter().all(Option::is_some));
+                assert!(whole_before.is_none(), "whole off by default");
+            }
+            ev => panic!("expected Rewrite, got {ev:?}"),
+        }
+        // Step 1: add(0,Y) fires on the inner redex, binding Y (1 var).
+        match &steps[1] {
+            TraceEvent::Rewrite { kind, eq_id, bindings, .. } => {
+                assert_eq!(*kind, RewriteKind::Equation);
+                assert_eq!(*eq_id, Some(id_add0));
+                assert_eq!(bindings.len(), 1, "Y bound");
+            }
+            ev => panic!("expected Rewrite, got {ev:?}"),
+        }
         let z1 = e.make_const(z);
         let s1 = e.make_free(s, vec![z1]);
         let two = e.make_free(s, vec![s1]);
@@ -2374,6 +2758,58 @@ mod tests {
         // take_trace drained the buffer; tracing is still on.
         assert!(e.take_trace().is_empty());
         assert!(e.is_tracing());
+    }
+
+    /// Whole-term tracing (`set trace whole`): each `Rewrite` event carries the reconstructed whole root
+    /// term before/after. The second (inner) rewrite's whole is the *full* term `s(add(0, s 0))` → `s s
+    /// 0`, not just the inner redex `add(0, s 0)` → `s 0`.
+    #[test]
+    fn trace_records_whole_terms() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let add = e.add_op("add", vec![nat, nat], nat);
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(add, vec![s_of(v(0)), v(1)]),
+            rhs: s_of(Term::op(add, vec![v(0), v(1)])),
+            nr_vars: 2,
+        });
+        let z0 = e.make_const(z);
+        let one = e.make_free(s, vec![z0]);
+        let subject = e.make_free(add, vec![one, one]); // add(s(0), s(0))
+
+        e.set_trace(true);
+        e.set_record_whole(true);
+        let result = e.reduce(subject);
+        let steps = e.take_trace();
+        assert_eq!(steps.len(), 2);
+
+        // Build the expected whole terms to compare structurally.
+        let mk = |e: &mut Engine, n: u32| {
+            let mut t = e.make_const(z);
+            for _ in 0..n {
+                t = e.make_free(s, vec![t]);
+            }
+            t
+        };
+        let two = mk(&mut e, 2); // s s 0
+        let one_again = mk(&mut e, 1); // s 0
+        // Step 1 is the inner rewrite add(0, s 0) -> s 0; its WHOLE after is s s 0 (not s 0).
+        match &steps[1] {
+            TraceEvent::Rewrite { redex, result: res, whole_before, whole_after, .. } => {
+                assert!(e.deep_equal(*res, one_again), "inner result is s 0");
+                assert!(e.deep_equal(whole_after.unwrap(), two), "whole after is s s 0");
+                // whole_before is s (add(0, s 0)) — strictly larger than the redex add(0, s 0).
+                assert!(!e.deep_equal(whole_before.unwrap(), *redex), "whole_before is the full term");
+            }
+            ev => panic!("expected Rewrite, got {ev:?}"),
+        }
+        assert!(e.deep_equal(result, two));
     }
 
     /// `ceq max(M,N)=M if M<=N=ff`. The condition `M<=N` itself reduces (re-entrant), its rewrites
