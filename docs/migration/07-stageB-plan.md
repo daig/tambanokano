@@ -26,8 +26,12 @@ Stage A is now done).
 > then the AU kernel flattens — so it just needed `au.maude` wired (verbatim vs the binary). The
 > **whole-conformance-suite differential test** round-trips (`parse∘print_raw = id`) **all 21** modules and
 > immediately earned its keep, surfacing a negative-float round-trip gap (`neg(1.5)` → the literal `-1.5`,
-> which the lexer now classifies — optional sign + exponent). **65 frontend + 102 core tests. NEXT: B5
-> (modules + REPL = Phase-1 end milestone).** See §2 B4 below for as-built detail. *(History:)* B1 (structural
+> which the lexer now classifies — optional sign + exponent). **B5 MODULE SYSTEM DONE** (`5d72976`
+> frontend / `8aab414` `tnk-modules`): the new `tnk-modules` crate flattens a module's `protecting`/
+> `extending`/`including` import closure (+ summation `+` + renaming `* (…)`) as a **pure `PreModule →
+> PreModule` transform** (decision #5), feeding the unchanged build pipeline; `import-*.maude` conform vs
+> the binary. **102 core + 68 frontend + 10 modules tests. NEXT: the REPL (`tnk-repl`) = the Phase-1 end
+> milestone.** See §2 B5 below for as-built detail. *(History:)* B1 (structural
 > theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
@@ -417,21 +421,35 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   *ordering* is observable** (Maude takes the first of two parses — preserve forest-extraction order);
   bubble boundaries need grammar context (clean API without globals is the key design call).
 
-### B5 — Module system (non-parameterized) + REPL  *(the Phase-1 end milestone)*
-- **Goal:** load real functional prelude modules from text and `reduce`/`match` them.
-- **Plugs into:** B4 (parsed `PreModule`), B1–B3 (the engine they flatten into), §1.4 (root module-DB
-  terms if safe-point GC is on).
-- **What's new:** module database; `protecting`/`extending`/`including` import + **flatten** (as a *pure
-  function* producing fresh arena terms — decision #5, not C++ "donation"); summation `+`; renaming
-  `*(...)`; a REPL (`rustyline`) with `reduce`/`red`/`match`/`trace`/`show` + `set` options.
-  **Parameterized programming (theories/views/parameterized modules) is Phase 2 — keep B5 to
-  non-parameterized modules.** New crates `tnk-modules`, `tnk-repl`.
-- **Done-when (the milestone):** load the non-parameterized functional prelude fragments from `.maude`
-  text and `reduce`/`match`, differential-tested vs the binary — *same canonical forms and rewrite
-  counts*. "Write Maude, get answers."
-- **Refs:** `A5` (the module half — skip §parameterization for now); arch-map L6 + decision #5.
-- **Risks:** flatten/cache coherence (`Rc` + dirty-set vs rebuild); term ownership across modules
-  (deep-copy vs shared arena — coordinate with the kernel arena).
+### B5 — Module system (non-parameterized) + REPL  *(the Phase-1 end milestone)* — **MODULE SYSTEM DONE; REPL NEXT**
+- **Goal:** load multi-module functional `.maude` text and `reduce`/`match` it. ✅ for the module system.
+- **MODULE SYSTEM DONE (`5d72976` frontend / `8aab414` `tnk-modules`):** the new **`tnk-modules`** crate
+  (→ `tnk-frontend` → `tnk-core`). **Flatten is a pure `PreModule → PreModule` transform** (decision #5,
+  not C++ donation): resolve the transitive import closure depth-first, **imports-before-importer**
+  (Maude's donation order → rewrite counts conform), merge every module's declarations **once** (a
+  `visited` set keyed by the canonical module expression dedupes diamonds; sorts/var-names de-duplicated;
+  the frontend's `(name,arity)` map folds op overloads), then hand the combined module to the **unchanged**
+  `build_loaded_module`. The build pipeline (`build_module`/special-hook + anchor resolution/grammar/
+  statements) needed **no change** — it already resolves everything **by name** over the whole `PreModule`.
+  Import **modes are invisible to flattening** (confirmed in `importModule.cc`: the donate routines never
+  consult the mode — it's a semantic-check annotation), so `protecting`/`extending`/`including` flatten
+  identically. **Summation** `A + B` = the union; **renaming** `* (sort A to B, op f to g)` substitutes
+  names across declarations + statement bubbles (single-token op names; mixfix/disambiguated op-rename
+  loud-deferred). As-built: `tnk-frontend` parses imports + module expressions (`surface::ast::{Import,
+  ModuleExpr,RenameItem}`, the `module_expr` recursive-descent, `is_top_level_keyword` += the import kw);
+  `tnk-modules::{db::ModuleDb, flatten::flatten, rename::apply_renaming, load::load_program → Program}`.
+  **Conformance** (vs the binary): `conformance/import-{protecting,modes,diamond,summation,renaming}.maude`
+  — sort + rewrite count + value + a `print_raw` round-trip. **102 core + 68 frontend + 10 modules tests;
+  clippy `-D` clean; fib(22)=186579.**
+- **NEXT — the REPL** (`tnk-repl` + `rustyline`): `reduce`/`red`/`match`/`xmatch`/`show`/`set`, a current
+  module, incremental module entry (the `ModuleDb` + `load_program`/`Program` are built for exactly this).
+  Then Phase 1 is complete.
+- **Deferred (loud, never silent):** parameterized programming (theories/views/`LIST{X}`/instantiation) =
+  Phase 2; the real prelude (Universal/poly); disambiguated/mixfix op-rename; module expressions in command
+  position (`reduce in A + B : …`) = REPL; semantic no-junk/no-confusion checks; flatten caching.
+- **Refs:** `A5` (the module half — skip §parameterization); arch-map L6 + decision #5.
+- **Risks (retired for the module system):** flatten was made a pure transform (no `Rc`/dirty-set/donation
+  coherence problem); term ownership is per-module (fresh engine per flattened module — decision #5).
 
 ---
 
