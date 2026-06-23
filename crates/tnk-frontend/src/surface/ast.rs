@@ -123,6 +123,14 @@ pub enum Command {
     Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
 }
 
+/// One top-level item: a module definition or a command. The unit the REPL consumes one at a time
+/// (a command here is *untagged* — the REPL binds it to its persistent current module).
+#[derive(Debug)]
+pub enum TopItem {
+    Module(PreModule),
+    Command(Command),
+}
+
 /// The result of surface-parsing a source file: the modules and the top-level commands, each tagged with
 /// the index (into `modules`) of the module it runs against — the most recently entered one, as in Maude.
 #[derive(Debug, Default)]

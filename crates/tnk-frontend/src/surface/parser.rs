@@ -108,30 +108,44 @@ impl<'a> Parser<'a> {
     }
 
     // ---- top level ----
+
+    /// Parse one top-level item — a module or a (module-untagged) command — or `None` at end of input.
+    /// The REPL drives this directly (a command binds to its persistent current module); `parse_source`
+    /// loops over it and re-applies Maude's most-recently-entered-module tagging.
+    pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
+        let Some(txt) = self.peek_text() else { return Ok(None) };
+        let item = match txt {
+            "fmod" | "mod" => TopItem::Module(self.module()?),
+            "reduce" | "red" => {
+                self.advance();
+                let term = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::Reduce { term })
+            }
+            "match" | "xmatch" => {
+                let xmatch = txt == "xmatch";
+                self.advance();
+                let pattern = self.collect_until(&["<=?"]);
+                self.eat("<=?")?;
+                let subject = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::Match { pattern, subject, xmatch })
+            }
+            _ => return Err(format!("unexpected top-level token {txt:?}")),
+        };
+        Ok(Some(item))
+    }
+
     pub fn parse_source(&mut self) -> PResult<Source> {
         let mut src = Source::default();
-        while let Some(txt) = self.peek_text() {
-            // A command runs against the most recently entered module (Maude's current module).
-            match txt {
-                "fmod" | "mod" => src.modules.push(self.module()?),
-                "reduce" | "red" => {
+        while let Some(item) = self.parse_top_item()? {
+            match item {
+                TopItem::Module(m) => src.modules.push(m),
+                // A command runs against the most recently entered module (Maude's current module).
+                TopItem::Command(c) => {
                     let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
-                    self.advance();
-                    let term = self.collect_until(&[]);
-                    self.eat_dot()?;
-                    src.commands.push((m, Command::Reduce { term }));
+                    src.commands.push((m, c));
                 }
-                "match" | "xmatch" => {
-                    let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
-                    let xmatch = txt == "xmatch";
-                    self.advance();
-                    let pattern = self.collect_until(&["<=?"]);
-                    self.eat("<=?")?;
-                    let subject = self.collect_until(&[]);
-                    self.eat_dot()?;
-                    src.commands.push((m, Command::Match { pattern, subject, xmatch }));
-                }
-                _ => return Err(format!("unexpected top-level token {txt:?}")),
             }
         }
         Ok(src)
