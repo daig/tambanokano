@@ -246,6 +246,60 @@ fn trace_membership_and_cmb() {
     assert!(out.contains("result C:"), "result sort C: {out}");
 }
 
+/// Drive a multi-submission session the way the binary's stdin loop does (main.rs): buffer lines until
+/// `input_complete`, then `eval` each submission. Returns the concatenated output.
+fn run_session(input: &str) -> String {
+    let mut r = repl();
+    let mut out = String::new();
+    let mut buffer = String::new();
+    for line in input.lines() {
+        buffer.push_str(line);
+        buffer.push('\n');
+        if r.input_complete(&buffer) {
+            let ev = r.eval(&buffer);
+            buffer.clear();
+            if !ev.output.is_empty() {
+                out.push_str(&ev.output);
+                out.push('\n');
+            }
+            if ev.exit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The `conformance/trace-*.maude` fixtures (the §1 spec modules) load through the REPL's stdin loop and
+/// produce the expected trace. The byte-exact match against the reference binary is verified separately
+/// (the doc-comment diff command); this is the in-repo regression guard.
+#[test]
+fn trace_fixtures_run_through_repl() {
+    let eq = run_session(conformance_file!("trace-eq.maude"));
+    assert!(
+        eq.contains(
+            "*********** equation\neq N + s M = s (N + M) .\nN --> s 0\nM --> 0\ns 0 + s 0\n--->\ns (s 0 + 0)\n"
+        ),
+        "trace-eq:\n{eq}"
+    );
+
+    let bi = run_session(conformance_file!("trace-builtin.maude"));
+    assert!(bi.contains("(built-in equation for symbol _+_)\n2 + 3\n--->\n5\n"), "trace-builtin:\n{bi}");
+
+    let mb = run_session(conformance_file!("trace-membership.maude"));
+    assert!(
+        mb.contains("*********** membership axiom\nmb g(X) : B .\nX --> a\nA: g(a) becomes B\n"),
+        "trace-membership:\n{mb}"
+    );
+
+    let cond = run_session(conformance_file!("trace-conditional.maude"));
+    assert!(cond.contains("*********** trial #1\nceq max(M, N) = N if M <= N = tt ."), "trial #1:\n{cond}");
+    assert!(
+        cond.contains("*********** failure #1") && cond.contains("*********** trial #2"),
+        "backtrack #1->#2:\n{cond}"
+    );
+}
+
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
 /// or a terminator-less line keep buffering; a bare `quit` completes.
 #[test]

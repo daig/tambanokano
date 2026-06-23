@@ -1,5 +1,36 @@
 # Full Maude `trace` — implementation plan (resume document)
 
+> **STATUS (2026-06-23) — COMPLETE. Phases 2–6 all done; the full `trace` surface ships.** Commits
+> `0ef40cd` (P2 kernel `TraceEvent` stream) → `61cae43` (P3 frontend `eq_traces`/`mb_traces`) → `fe0b932`
+> (P4+P5 REPL `TraceFlags` + the eq/built-in/membership/conditional renderer + a pretty-printer comma/
+> bracket spacing fix) → P6 (this commit: `conformance/trace-*.maude` fixtures + docs). The REPL renders
+> **byte-identically to the reference binary** (color off) for: user equations (header + `[c]eq … .` body +
+> `Var --> binding` substitution + redex/`--->`/result), built-ins (`(built-in equation for symbol _+_)`),
+> memberships (`mb … : … .` + `oldSort: t becomes newSort`), the **conditional sub-stream** (`trial #N` /
+> `[re-]solving` / `success`/`failure for condition fragment` / `success`/`failure #N`, render-time trial
+> numbering reset per command + stack-paired), and the granular **`set trace <option> on|off`** sub-flags
+> (`body`/`substitution`/`rewrite`/`whole`/`condition`/`eqs`/`mbs`/`builtin`). **Faithful `set trace
+> whole`** for equations (`Old:`/`New:` reconstructed from the reduce frame stack, gated + zero-cost off).
+> Verified live against `~/Downloads/Maude-3/maude` over all of §1a–1e + the sub-flags; 5 inline + 1
+> fixture-driven REPL tests lock it. **199 tests (104 core + 69 frontend + 10 modules + 16 repl); clippy
+> `-D` clean; fib(22)=186579 at ~7 M rw/s** (the per-rewrite trace cost is an `if self.trace.is_some()`).
+>
+> **Documented deviations (none block correctness; none hit by any conformance fixture):**
+> 1. **Command echo line** (`reduce in M : <echo> .`) — pre-existing `join_tokens` spacing (`g ( g ( a ) )`
+>    vs Maude's `g(g(a))`); orthogonal to the trace (the trace lines are byte-identical). A REPL follow-up
+>    (re-render the parsed command term).
+> 2. **Membership `Whole:`** (the `whole` flag on a membership step) — not reconstructed (memberships fire
+>    at node construction, off the reduce frame stack), so the `Whole:` line is omitted. Equation
+>    `Old:`/`New:` is faithful.
+> 3. **Variable index order** — our `VarIndex` orders lhs→condition→rhs; Maude orders lhs→rhs→condition.
+>    Affects only the *display order* of the substitution lines, and only when a rhs-only variable is
+>    introduced after a condition-fresh `:=` variable. Internal indices stay consistent.
+> 4. **Multi-fragment `:=` backtrack** — the `re-solving condition fragment` event ordering is exact for
+>    single-fragment conditions (all conformance fixtures) and a close approximation for a multi-solution
+>    `:=` fragment followed by a later failing fragment.
+>
+> Everything below is the original plan, kept for reference.
+
 **Purpose.** Bootstrap the next session to finish the **full Maude reduction trace** in the REPL. This
 doc is self-contained: it has the verified output spec, every code pointer, the Maude C++ references, and
 the phase-by-phase plan. The work is partly done (the step trace + the Term pretty-printer); **Phases 2–6

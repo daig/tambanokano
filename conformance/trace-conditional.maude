@@ -1,0 +1,24 @@
+*** Full-trace fixture: the conditional-equation sub-stream. Each trial prints a trial header, the ceq
+*** body and substitution, a solving-condition-fragment section with the fragment and its own nested
+*** equation steps, a success-or-failure-for-condition-fragment section, then a trial success/failure
+*** line, and finally the firing equation step. The second reduce backtracks: trial 1 of the first ceq
+*** fails, trial 2 of the second ceq succeeds. The trial counter resets per command.
+***   ~/Downloads/Maude-3/maude -no-banner conformance/trace-conditional.maude < /dev/null
+*** The set trace condition off behaviour is exercised by the tnk-repl tests.
+fmod CEQ-MAX is
+  sorts Nat Truth .
+  ops tt ff : -> Truth [ctor] .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op _<=_ : Nat Nat -> Truth .
+  op max : Nat Nat -> Nat .
+  vars M N : Nat .
+  eq z <= N = tt .
+  eq s M <= z = ff .
+  eq s M <= s N = M <= N .
+  ceq max(M, N) = N if M <= N = tt .
+  ceq max(M, N) = M if M <= N = ff .
+endfm
+set trace on .
+red max(s z, s s z) .
+red max(s s z, s z) .

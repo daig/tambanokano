@@ -463,13 +463,19 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   the module system (B5 `tnk-modules`), and the interactive REPL (`tnk-repl`), all conformance-verified vs the
   reference binary. Next is **Phase 2** (parameterized programming: theories/views/`LIST{X}`; rules `rl`/`rew`/
   `search`; the real prelude with `Universal`/`poly`) and the deferred cross-cutting follow-ups (below).
-- **`set trace on` DONE (`4590e0d` kernel / `97b9aab` repl):** an opt-in `Option<Vec<TraceStep>>` reduce-loop
-  hook in `tnk-core` (zero-cost off — fib(22) unregressed at ~7 M rw/s; `Engine::{set_trace,take_trace}`), and
-  the REPL renders each step as Maude's `*********** <kind>` + redex `--->` result (render-after; the
-  redex/result terms are **byte-identical to Maude**). The full `eq lhs = rhs .` + `Var --> binding` lines are
-  the chosen **additive follow-up** (needs the kernel to retain equation source + variable names + a
-  term-form printer).
-- **Deferred (loud, never silent):** the full trace detail (eq + substitution, above); other `set` options;
+- **FULL MAUDE `trace` DONE (`0ef40cd`..P6, 2026-06-23) — see `docs/migration/08-full-trace-plan.md`.**
+  Supersedes the earlier step-trace (`4590e0d`/`97b9aab`). The kernel records a structured
+  `Option<Vec<TraceEvent>>` stream (Rewrite/Membership/Trial/Fragment, each tagged with a condition-nesting
+  `depth`; zero-cost off; eq/mb get dense ids); the frontend keeps per-statement source `Term`s + var names
+  (`BuiltModule::{eq_traces,mb_traces}`); the REPL renders the whole surface — eq/built-in/membership bodies +
+  substitution + redex/`--->`/result, the **conditional sub-stream** (`trial`/`solving`/`success`/`failure`),
+  and the granular **`set trace <option> on|off`** flags (body/substitution/rewrite/whole/condition/eqs/mbs/
+  builtin), incl. **faithful `set trace whole`** (`Old:`/`New:` reconstructed from the reduce frame stack).
+  **Byte-identical to the reference binary** (color off) across §1a–1e of `08`; `conformance/trace-*.maude`
+  fixtures + 6 repl tests. Deviations (documented in `08`, none correctness-affecting): the pre-existing
+  command-echo spacing, membership `Whole:` (omitted), the lhs→cond→rhs var-index order, multi-fragment `:=`
+  re-solving order.
+- **Deferred (loud, never silent):** other `set` options (rule/strategy/select trace are Phase-2-of-project);
   module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the real prelude =
   Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.
 - **Refs:** `A5` (the module half — skip §parameterization); arch-map L6 + decision #5.
