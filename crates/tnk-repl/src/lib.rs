@@ -247,10 +247,27 @@ impl Repl {
     }
 }
 
-/// Join a token bubble back to text (the command echo). Spaces between every token — readable, not a
-/// faithful re-render (the *result* is pretty-printed; this is just the `reduce in M : …` line).
+/// Join a token bubble back to text for the command echo (the `reduce in M : … .` / `match …` line),
+/// applying Maude's mixfix spacing rules (`prettyPrint.cc::printTokens`): no space before a `,` or a
+/// bracket, no space *after* an opening bracket, a single space elsewhere. This re-spaces the input
+/// tokens — `g ( g ( a ) )` → `g(g(a))`, `< z , s z >` → `< z, s z >` — to match the reference binary's
+/// echo on the common command forms. It preserves the input's surface form (numerals stay numerals,
+/// operands keep their order) rather than re-parsing, so the one place it can differ from Maude is
+/// redundant input parentheses (kept here; Maude's re-render drops them).
 fn join_tokens(toks: &[Token], i: &Interner) -> String {
-    toks.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ")
+    let mut out = String::new();
+    let mut no_space = true; // suppress the leading space, and the space after an opening bracket
+    for t in toks {
+        let text = i.resolve(t.sym);
+        let open = matches!(text, "(" | "[" | "{");
+        let close = matches!(text, ")" | "]" | "}");
+        if !(no_space || open || close || text == ",") {
+            out.push(' ');
+        }
+        out.push_str(text);
+        no_space = open;
+    }
+    out
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the

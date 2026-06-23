@@ -472,10 +472,11 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   and the granular **`set trace <option> on|off`** flags (body/substitution/rewrite/whole/condition/eqs/mbs/
   builtin), incl. **faithful `set trace whole`** (`Old:`/`New:` reconstructed from the reduce frame stack).
   **Byte-identical to the reference binary** (color off) across §1a–1e of `08`; `conformance/trace-*.maude`
-  fixtures + 6 repl tests. Deviations (documented in `08`, none correctness-affecting): the pre-existing
-  command-echo spacing; membership `Whole:` (omitted — eager-at-construction sort constraints); the
-  multi-fragment `:=` backtrack re-solving of a *deterministic* crossed fragment. (Variable index order
-  MATCHES Maude — lhs→condition→rhs, `equation.cc:74`.)
+  fixtures + 7 repl tests (the command-echo now re-spaces via Maude's `printTokens` rules, byte-matching
+  the binary's echo). Remaining deviations (documented in `08`, none correctness-affecting): membership
+  `Whole:` (omitted — eager-at-construction sort constraints); the multi-fragment `:=` backtrack re-solving
+  of a *deterministic* crossed fragment. (Variable index order MATCHES Maude — lhs→condition→rhs,
+  `equation.cc:74`.)
 - **Deferred (loud, never silent):** other `set` options (rule/strategy/select trace are Phase-2-of-project);
   module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the real prelude =
   Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.

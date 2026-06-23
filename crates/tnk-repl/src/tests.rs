@@ -246,6 +246,22 @@ fn trace_membership_and_cmb() {
     assert!(out.contains("result C:"), "result sort C: {out}");
 }
 
+/// The command echo (`reduce in M : … .`) re-spaces the input tokens with Maude's rules — no space
+/// before a `,` or bracket, none after an opening bracket — so nested-paren / comma terms echo compactly
+/// (matching the reference binary), instead of the old space-between-every-token form.
+#[test]
+fn command_echo_spacing() {
+    let mut r = repl();
+    r.eval(
+        "fmod E is sorts N P . op z : -> N [ctor] . op s_ : N -> N [ctor] . op g : N -> N . \
+         op <_,_> : N N -> P [ctor] . var X : N . eq g(X) = X . endfm",
+    );
+    let nested = r.eval("red g(g(z)) .").output;
+    assert!(nested.contains("reduce in E : g(g(z)) ."), "nested-paren echo: {nested}");
+    let comma = r.eval("red < z, s z > .").output;
+    assert!(comma.contains("reduce in E : < z, s z > ."), "comma echo: {comma}");
+}
+
 /// Drive a multi-submission session the way the binary's stdin loop does (main.rs): buffer lines until
 /// `input_complete`, then `eval` each submission. Returns the concatenated output.
 fn run_session(input: &str) -> String {

@@ -16,23 +16,23 @@
 > `-D` clean; fib(22)=186579 at ~7 M rw/s** (the per-rewrite trace cost is an `if self.trace.is_some()`).
 >
 > **Documented deviations (none block correctness; none hit by any conformance fixture):**
-> 1. **Command echo line** (`reduce in M : <echo> .`) — pre-existing `join_tokens` spacing (`g ( g ( a ) )`
->    vs Maude's `g(g(a))`); orthogonal to the trace (the trace lines are byte-identical). A REPL follow-up
->    (re-render the parsed command term).
-> 2. **Membership `Whole:`** (the `whole` flag on a membership step) — Maude prints `Whole: <root>`; we omit
+> 1. **Membership `Whole:`** (the `whole` flag on a membership step) — Maude prints `Whole: <root>`; we omit
 >    it. Our sort constraints fire *eagerly at node construction* (off the reduce frame stack, and — for the
 >    initial term — before the whole term even exists), so the root isn't reconstructable there. Equation
 >    `Old:`/`New:` is faithful.
-> 3. **Multi-fragment `:=` backtrack** — exact for single-fragment conditions (all conformance fixtures) and
+> 2. **Multi-fragment `:=` backtrack** — exact for single-fragment conditions (all conformance fixtures) and
 >    for backtracking that re-solves a *matching* fragment. The only gap: when backtracking crosses a
 >    *deterministic* (equality/sort-test) fragment to re-solve an earlier matching fragment, Maude emits a
 >    `re-solving`/`failure for condition fragment` pair for that deterministic fragment (it has no further
 >    solutions); our recursive solver returns through it without re-emitting. Needs ≥3 fragments with a
 >    multi-solution `:=` before a deterministic fragment. Result identical; only extra event lines in Maude.
 >
-> *(An earlier draft listed a fourth "variable index order" deviation — that was wrong: `Equation::check`
-> indexes lhs→condition→rhs (rhs last, `equation.cc:74`), exactly our `load_statements` order; verified
-> identical to the binary on the order-sensitive case. There is no variable-order deviation.)*
+> *(FIXED, no longer a deviation: the command-echo line `reduce in M : <echo> .` now re-spaces the input
+> tokens with Maude's `printTokens` rules — no space before `,`/brackets, none after an opening bracket —
+> so `g(g(a))` / `< z, s z >` echo compactly, byte-matching the binary on the common command forms. An
+> earlier draft also wrongly listed a "variable index order" deviation: `Equation::check` indexes
+> lhs→condition→rhs (rhs last, `equation.cc:74`), exactly our `load_statements` order — verified identical
+> to the binary on the order-sensitive case.)*
 >
 > Everything below is the original plan, kept for reference.
 
