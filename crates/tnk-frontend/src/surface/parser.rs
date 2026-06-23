@@ -143,6 +143,7 @@ impl<'a> Parser<'a> {
         self.eat("is")?;
         let mut m = PreModule {
             name,
+            imports: Vec::new(),
             sorts: Vec::new(),
             subsorts: Vec::new(),
             ops: Vec::new(),
@@ -159,6 +160,17 @@ impl<'a> Parser<'a> {
     fn decl(&mut self, m: &mut PreModule) -> PResult<()> {
         let kw = self.peek_text().ok_or("unexpected end of input in module")?;
         match kw {
+            "protecting" | "pr" | "extending" | "ex" | "including" | "inc" => {
+                let mode = match kw {
+                    "protecting" | "pr" => ImportMode::Protecting,
+                    "extending" | "ex" => ImportMode::Extending,
+                    _ => ImportMode::Including,
+                };
+                self.advance();
+                let expr = self.module_expr()?;
+                self.eat_dot()?;
+                m.imports.push(Import { mode, expr });
+            }
             "sort" | "sorts" => {
                 self.advance();
                 while !self.at_dot() {
@@ -261,6 +273,84 @@ impl<'a> Parser<'a> {
             other => return Err(format!("unsupported declaration `{other}`")),
         }
         Ok(())
+    }
+
+    // ---- module expressions (B5) ----
+
+    /// A (non-parameterized) module expression: a summation of renamings of atoms. `*` (renaming) binds
+    /// tighter than `+` (summation); both are left-associative. Parses up to the terminator `.`.
+    fn module_expr(&mut self) -> PResult<ModuleExpr> {
+        let mut e = self.module_rename()?;
+        while self.at("+") {
+            self.advance();
+            let rhs = self.module_rename()?;
+            e = ModuleExpr::Sum(Box::new(e), Box::new(rhs));
+        }
+        Ok(e)
+    }
+
+    /// `atom ('*' '(' renaming ')')*`.
+    fn module_rename(&mut self) -> PResult<ModuleExpr> {
+        let mut e = self.module_atom()?;
+        while self.at("*") {
+            self.advance();
+            let items = self.renaming()?;
+            e = ModuleExpr::Rename(Box::new(e), items);
+        }
+        Ok(e)
+    }
+
+    /// `NAME | '(' module_expr ')'`. A `{` after a name is parameterized instantiation (Phase 2).
+    fn module_atom(&mut self) -> PResult<ModuleExpr> {
+        if self.at("(") {
+            self.advance();
+            let e = self.module_expr()?;
+            self.eat(")")?;
+            return Ok(e);
+        }
+        let name = self.name()?;
+        if self.at("{") {
+            return Err(format!(
+                "parameterized module instantiation `{name}{{…}}` is Phase 2 (theories/views)"
+            ));
+        }
+        Ok(ModuleExpr::Named(name))
+    }
+
+    /// A renaming `( sort A to B , op f to g , … )`. Disambiguated op renaming (`op f : A -> B to g`) is
+    /// a B5 follow-up, rejected loudly here; mixfix op renaming is rejected when applied (in `tnk-modules`).
+    fn renaming(&mut self) -> PResult<Vec<RenameItem>> {
+        self.eat("(")?;
+        let mut items = Vec::new();
+        loop {
+            match self.name()?.as_str() {
+                "sort" => {
+                    let from = self.name()?;
+                    self.eat("to")?;
+                    let to = self.name()?;
+                    items.push(RenameItem::Sort { from, to });
+                }
+                "op" => {
+                    let from = self.name()?;
+                    if self.at(":") {
+                        return Err("disambiguated op renaming `op f : … to g` is a B5 follow-up".into());
+                    }
+                    self.eat("to")?;
+                    let to = self.name()?;
+                    items.push(RenameItem::Op { from, to });
+                }
+                other => {
+                    return Err(format!("renaming item must start with `sort` or `op`, found `{other}`"));
+                }
+            }
+            if self.at(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(")")?;
+        Ok(items)
     }
 
     /// A trailing `[owise]` on an equation (the only attribute statements carry in the functional subset).
@@ -462,5 +552,69 @@ endfm
         assert_eq!(sp.id_hook.as_ref().unwrap().1, ["<"]);
         assert_eq!(sp.op_hooks.len(), 1);
         assert_eq!(sp.term_hooks.len(), 2);
+    }
+
+    /// B5: import declarations parse into `PreModule.imports` with the right mode + module expression.
+    #[test]
+    fn parses_imports() {
+        let src = "\
+fmod M is
+  protecting BOOL .
+  extending FOO + BAR .
+  including BAZ * (sort S to T, op f to g) .
+  sort X .
+endfm
+";
+        let m = &parse(src).modules[0];
+        assert_eq!(m.imports.len(), 3);
+        // protecting BOOL
+        assert_eq!(m.imports[0].mode, ImportMode::Protecting);
+        assert!(matches!(&m.imports[0].expr, ModuleExpr::Named(n) if n == "BOOL"));
+        // extending FOO + BAR
+        assert_eq!(m.imports[1].mode, ImportMode::Extending);
+        match &m.imports[1].expr {
+            ModuleExpr::Sum(a, b) => {
+                assert!(matches!(&**a, ModuleExpr::Named(n) if n == "FOO"));
+                assert!(matches!(&**b, ModuleExpr::Named(n) if n == "BAR"));
+            }
+            other => panic!("expected Sum, got {other:?}"),
+        }
+        // including BAZ * (sort S to T, op f to g)
+        assert_eq!(m.imports[2].mode, ImportMode::Including);
+        match &m.imports[2].expr {
+            ModuleExpr::Rename(base, items) => {
+                assert!(matches!(&**base, ModuleExpr::Named(n) if n == "BAZ"));
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0], RenameItem::Sort { from, to } if from == "S" && to == "T"));
+                assert!(matches!(&items[1], RenameItem::Op { from, to } if from == "f" && to == "g"));
+            }
+            other => panic!("expected Rename, got {other:?}"),
+        }
+        // the rest of the module still parses.
+        assert_eq!(m.sorts, ["X"]);
+    }
+
+    /// `*` (renaming) binds tighter than `+` (summation): `A + B * (R)` = `A + (B * R)`.
+    #[test]
+    fn renaming_binds_tighter_than_summation() {
+        let src = "fmod M is protecting A + B * (sort S to T) . endfm\n";
+        let m = &parse(src).modules[0];
+        match &m.imports[0].expr {
+            ModuleExpr::Sum(a, b) => {
+                assert!(matches!(&**a, ModuleExpr::Named(n) if n == "A"));
+                assert!(matches!(&**b, ModuleExpr::Rename(_, _)));
+            }
+            other => panic!("expected Sum(A, Rename(B,…)), got {other:?}"),
+        }
+    }
+
+    /// Parameterized instantiation is Phase 2 — rejected loudly.
+    #[test]
+    fn parameterized_instantiation_rejected() {
+        let src = "fmod M is protecting LIST { Nat } . endfm\n";
+        let mut i = Interner::new();
+        let toks = tokenize(src, &mut i);
+        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
+        assert!(err.contains("Phase 2"), "got: {err}");
     }
 }

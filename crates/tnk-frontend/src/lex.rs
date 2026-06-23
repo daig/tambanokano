@@ -95,6 +95,7 @@ fn is_top_level_keyword(w: &str) -> bool {
         w,
         "fmod" | "mod" | "fth" | "th" | "endfm" | "endm" | "endfth" | "endth"
             | "sort" | "sorts" | "subsort" | "subsorts" | "op" | "ops" | "var" | "vars"
+            | "protecting" | "pr" | "extending" | "ex" | "including" | "inc"
             | "eq" | "ceq" | "mb" | "cmb" | "rl" | "crl"
             | "red" | "reduce" | "match" | "xmatch" | "rew" | "rewrite" | "search"
     )

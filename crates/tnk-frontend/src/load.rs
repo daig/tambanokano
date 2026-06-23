@@ -40,7 +40,20 @@ pub struct Loaded {
     pub commands: Vec<(usize, Command)>,
 }
 
-/// Surface-parse `src`, then build every module (signature + grammar + statements).
+/// Build one `PreModule` into a runnable [`LoadedModule`]: signature ([`build_module`]) + mixfix grammar
+/// ([`build_grammar`]) + its statements ([`load_statements`]). The module system (`tnk-modules`) calls
+/// this on a *flattened* `PreModule` (the import closure merged into one), so imports need no kernel
+/// change — flattening is a pure `PreModule → PreModule` transform upstream of here.
+pub fn build_loaded_module(pm: &PreModule, interner: &mut Interner) -> Result<LoadedModule, String> {
+    let mut built = build_module(pm, interner)?;
+    let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+    load_statements(pm, &mut built, &grammar, interner)?;
+    Ok(LoadedModule { built, grammar })
+}
+
+/// Surface-parse `src`, then build every module (signature + grammar + statements). This loader builds
+/// each module **standalone** (no import resolution); a module with `imports` is rejected — use the
+/// `tnk-modules` `load_program`, which flattens first. (Keeps the frontend's own import-free tests here.)
 pub fn load_source(src: &str) -> Result<Loaded, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
@@ -48,10 +61,13 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
 
     let mut modules = Vec::with_capacity(pre.len());
     for pm in &pre {
-        let mut built = build_module(pm, &mut interner)?;
-        let grammar = CompiledGrammar::compile(&build_grammar(&built, &mut interner));
-        load_statements(pm, &mut built, &grammar, &interner)?;
-        modules.push(LoadedModule { built, grammar });
+        if !pm.imports.is_empty() {
+            return Err(format!(
+                "module `{}` has imports — load it through tnk-modules `load_program` (which flattens)",
+                pm.name
+            ));
+        }
+        modules.push(build_loaded_module(pm, &mut interner)?);
     }
     Ok(Loaded { interner, modules, commands })
 }

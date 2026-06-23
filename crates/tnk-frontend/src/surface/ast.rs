@@ -4,10 +4,13 @@
 
 use crate::lex::Token;
 
-/// A parsed functional-module skeleton.
-#[derive(Debug)]
+/// A parsed functional-module skeleton. `Clone` so the module system (B5) can combine the declarations
+/// of an import closure into one flattened `PreModule`.
+#[derive(Debug, Clone)]
 pub struct PreModule {
     pub name: String,
+    /// Imported modules (`protecting`/`extending`/`including <module-expr> .`), in declaration order.
+    pub imports: Vec<Import>,
     pub sorts: Vec<String>,
     /// Each subsort chain `A B < C < D` as ordered groups (every group is below the next).
     pub subsorts: Vec<Vec<Vec<String>>>,
@@ -16,9 +19,42 @@ pub struct PreModule {
     pub statements: Vec<Statement>,
 }
 
+/// An import declaration: a mode and the module expression it imports. The mode does **not** affect
+/// flattening (which declarations are imported) — it is a semantic-check annotation (no-junk /
+/// no-confusion), stored for later. So B5 flattens all three modes identically.
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub mode: ImportMode,
+    pub expr: ModuleExpr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    Protecting,
+    Extending,
+    Including,
+}
+
+/// A (non-parameterized) module expression: a named module, a summation `A + B` (the union), or a
+/// renaming `M * (sort A to B, op f to g)`. Parameterized instantiation (`LIST{Nat}`) is Phase 2.
+#[derive(Debug, Clone)]
+pub enum ModuleExpr {
+    Named(String),
+    Sum(Box<ModuleExpr>, Box<ModuleExpr>),
+    Rename(Box<ModuleExpr>, Vec<RenameItem>),
+}
+
+/// One mapping inside a renaming `* (…)`. Op renaming is by canonical name (disambiguated
+/// `op f : A -> B to g` and mixfix renaming are B5 follow-ups, rejected loudly).
+#[derive(Debug, Clone)]
+pub enum RenameItem {
+    Sort { from: String, to: String },
+    Op { from: String, to: String },
+}
+
 /// One operator declaration `op <name> : <domain> -> <range> [<attrs>] .` (or `ops …` expanded to one
 /// `OpDecl` per name).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpDecl {
     /// The mixfix name as raw tokens (`[_+_]`, `[s_]`, `[<_, ,, _>]`, `[gcd]`).
     pub name: Vec<Token>,
@@ -27,14 +63,14 @@ pub struct OpDecl {
     pub attrs: Attrs,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VarDecl {
     pub names: Vec<String>,
     pub sort: String,
 }
 
 /// Operator attributes (`[assoc comm id: … ctor iter prec gather strat special ditto]`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Attrs {
     pub assoc: bool,
     pub comm: bool,
@@ -74,7 +110,7 @@ pub struct SpecialSpec {
 }
 
 /// A statement — `eq`/`ceq`/`owise`, `mb`/`cmb`. Term parts are raw bubbles (parsed in B4.4).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Statement {
     Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool },
     Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>> },
