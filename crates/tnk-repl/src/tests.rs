@@ -98,7 +98,11 @@ fn unknown_import_reported() {
     assert!(out.contains("not defined") || out.contains("error"), "got: {out}");
 }
 
-/// `set trace on` prints each rewrite step (redex `--->` result); `set trace off` removes them.
+/// A Peano module (matches the reference binary's rendering exactly: `s_` mixfix, infix `_+_`).
+const PEANO: &str = "fmod PEANO is sort Nat . op 0 : -> Nat [ctor] . op s_ : Nat -> Nat [ctor] . \
+     op _+_ : Nat Nat -> Nat . vars N M : Nat . eq N + 0 = N . eq N + s M = s (N + M) . endfm";
+
+/// `set trace on` prints each rewrite step; `set trace off` removes them.
 #[test]
 fn trace_shows_rewrite_steps() {
     let mut r = repl();
@@ -115,6 +119,131 @@ fn trace_shows_rewrite_steps() {
     r.eval("set trace off .");
     let plain = r.eval("red add(s(0), s(0)) .").output;
     assert!(!plain.contains("***********"), "no trace when off: {plain}");
+}
+
+/// The full equation trace (body + substitution + redex/result) is byte-identical to the reference
+/// binary (`~/Downloads/Maude-3/maude` on the same module + `set trace on .`).
+#[test]
+fn trace_full_equation_block() {
+    let mut r = repl();
+    r.eval(PEANO);
+    r.eval("set trace on .");
+    let out = r.eval("red s 0 + s 0 .").output;
+    assert!(
+        out.contains(
+            "*********** equation\n\
+             eq N + s M = s (N + M) .\n\
+             N --> s 0\n\
+             M --> 0\n\
+             s 0 + s 0\n\
+             --->\n\
+             s (s 0 + 0)\n\
+             *********** equation\n\
+             eq N + 0 = N .\n\
+             N --> s 0\n\
+             s 0 + 0\n\
+             --->\n\
+             s 0\n"
+        ),
+        "full eq trace block:\n{out}"
+    );
+}
+
+/// `set trace substitution off` drops the `Var --> binding` lines; `set trace whole on` adds the
+/// `Old:`/`New:` whole-term lines (the inner step's whole is the *full* term, not just the redex).
+#[test]
+fn trace_substitution_and_whole_flags() {
+    let mut r = repl();
+    r.eval(PEANO);
+    r.eval("set trace on .");
+    r.eval("set trace substitution off .");
+    let no_subst = r.eval("red s 0 + s 0 .").output;
+    assert!(no_subst.contains("*********** equation\neq N + s M = s (N + M) .\ns 0 + s 0\n--->"), "no subst: {no_subst}");
+    // The substitution `Var --> binding` lines are gone (the `--->` arrow is not a substitution line).
+    assert!(!no_subst.contains("N --> ") && !no_subst.contains("M --> "), "substitution lines dropped: {no_subst}");
+
+    r.eval("set trace substitution on .");
+    r.eval("set trace whole on .");
+    let whole = r.eval("red s 0 + s 0 .").output;
+    // The second (inner) step rewrites `s 0 + 0`; its whole term is `s (s 0 + 0)` -> `s s 0`.
+    assert!(whole.contains("Old: s (s 0 + 0)\ns 0 + 0\n--->\ns 0\nNew: s s 0\n"), "whole inner step: {whole}");
+}
+
+/// A conditional equation traces the whole sub-stream: `trial #1`, the `ceq … if …` body + the
+/// substitution, `solving`/`success for condition fragment`, and `success #1`, then the firing step.
+#[test]
+fn trace_conditional_substream() {
+    let mut r = repl();
+    r.eval(
+        "fmod CEQ-MAX is sorts Nat Truth . ops tt ff : -> Truth [ctor] . op z : -> Nat [ctor] . \
+         op s_ : Nat -> Nat [ctor] . op _<=_ : Nat Nat -> Truth . op max : Nat Nat -> Nat . \
+         vars M N : Nat . eq z <= N = tt . eq s M <= z = ff . eq s M <= s N = M <= N . \
+         ceq max(M, N) = N if M <= N = tt . ceq max(M, N) = M if M <= N = ff . endfm",
+    );
+    r.eval("set trace on .");
+    let out = r.eval("red max(s z, s s z) .").output;
+    assert!(
+        out.contains(
+            "*********** trial #1\n\
+             ceq max(M, N) = N if M <= N = tt .\n\
+             M --> s z\n\
+             N --> s s z\n\
+             *********** solving condition fragment\n\
+             M <= N = tt\n"
+        ),
+        "trial + fragment start:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "*********** success for condition fragment\n\
+             M <= N = tt\n\
+             M --> s z\n\
+             N --> s s z\n\
+             *********** success #1\n"
+        ),
+        "fragment success + trial success:\n{out}"
+    );
+    assert!(out.contains("result Nat: s s z"), "result: {out}");
+}
+
+/// `set trace condition off` keeps the trial/fragment scaffolding but hides the condition's nested
+/// reductions (the `s z <= s s z` equation steps); a failed-then-backtracked trial renders `failure #1`.
+#[test]
+fn trace_condition_off_and_backtrack() {
+    let mut r = repl();
+    r.eval(
+        "fmod CEQ-MAX is sorts Nat Truth . ops tt ff : -> Truth [ctor] . op z : -> Nat [ctor] . \
+         op s_ : Nat -> Nat [ctor] . op _<=_ : Nat Nat -> Truth . op max : Nat Nat -> Nat . \
+         vars M N : Nat . eq z <= N = tt . eq s M <= z = ff . eq s M <= s N = M <= N . \
+         ceq max(M, N) = N if M <= N = tt . ceq max(M, N) = M if M <= N = ff . endfm",
+    );
+    r.eval("set trace on .");
+    // Backtrack: trial #1 (first ceq) fails, trial #2 (second ceq) succeeds.
+    let bt = r.eval("red max(s s z, s z) .").output;
+    assert!(bt.contains("*********** failure for condition fragment\nM <= N = tt\n*********** failure #1\n"), "failure: {bt}");
+    assert!(bt.contains("*********** trial #2\nceq max(M, N) = M if M <= N = ff ."), "trial #2: {bt}");
+
+    // condition off: the nested `_<=_` equation steps inside the condition disappear, scaffolding stays.
+    r.eval("set trace condition off .");
+    let off = r.eval("red max(s z, s s z) .").output;
+    assert!(off.contains("*********** solving condition fragment\nM <= N = tt\n*********** success for condition fragment"), "scaffolding kept: {off}");
+    assert!(!off.contains("z <= s z\n--->"), "nested condition rewrites hidden: {off}");
+}
+
+/// A membership axiom traces as a sort narrowing: `mb lhs : sort .` + substitution + `oldSort: term
+/// becomes newSort`. `cmb` fires as a membership but its trial uses the `cmb …` body.
+#[test]
+fn trace_membership_and_cmb() {
+    let mut r = repl();
+    r.eval(
+        "fmod MB-CHAIN is sorts A B C . subsorts C < B < A . op a : -> A [ctor] . op g : A -> A [ctor] . \
+         var X : A . mb g(X) : B . mb g(g(X)) : C . endfm",
+    );
+    r.eval("set trace on .");
+    let out = r.eval("red g(g(a)) .").output;
+    assert!(out.contains("*********** membership axiom\nmb g(X) : B .\nX --> a\nA: g(a) becomes B\n"), "inner mb: {out}");
+    assert!(out.contains("*********** membership axiom\nmb g(g(X)) : C .\nX --> a\nA: g(g(a)) becomes C\n"), "outer mb: {out}");
+    assert!(out.contains("result C:"), "result sort C: {out}");
 }
 
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body

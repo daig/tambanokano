@@ -7,18 +7,19 @@
 //! is reused as-is: flatten + build (`tnk-modules`/`tnk-frontend`), `reduce_command`/`match_command`/
 //! `format_matchers`, and the pretty-printer.
 
+mod trace;
+
 use std::collections::HashMap;
-use tnk_core::engine::{RewriteKind, TraceEvent};
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_frontend::load::{
     build_loaded_module, format_matchers, match_command, reduce_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
-use tnk_frontend::sig::syntax::BuiltModule;
 use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::flatten::flatten;
+use trace::{render_trace, TraceFlags};
 
 /// The result of evaluating one input submission: the text to print, and whether to exit the loop.
 #[derive(Debug, Default)]
@@ -41,8 +42,8 @@ pub struct Repl {
     current: Option<String>,
     /// Colorize printed results (true interactively, false in tests).
     color: bool,
-    /// `set trace on` — record + print each rewrite step of a `reduce`.
-    trace: bool,
+    /// The full `trace` flags (`set trace [<option>] on|off`); `master` off by default.
+    trace: TraceFlags,
 }
 
 impl Repl {
@@ -54,7 +55,7 @@ impl Repl {
             order: Vec::new(),
             current: None,
             color,
-            trace: false,
+            trace: TraceFlags::default(),
         }
     }
 
@@ -135,11 +136,12 @@ impl Repl {
             Command::Reduce { term } => {
                 let echo = join_tokens(&term, &self.interner);
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
-                lm.built.engine.set_trace(self.trace);
+                lm.built.engine.set_trace(self.trace.master);
+                lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                 match reduce_command(lm, &self.interner, &term) {
                     Ok((dag, rw)) => {
-                        let steps = lm.built.engine.take_trace();
-                        let trace = render_trace(&lm.built, &self.interner, &steps, self.color);
+                        let events = lm.built.engine.take_trace();
+                        let trace = render_trace(&lm.built, &self.interner, &events, self.trace, self.color);
                         let eng = &lm.built.engine;
                         let sort = eng.sorts().name(eng.sort_of(dag)).to_string();
                         let value = print_pretty(&lm.built, &self.interner, dag, self.color);
@@ -158,6 +160,7 @@ impl Repl {
                 let kw = if xmatch { "xmatch" } else { "match" };
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // the match's subject-reduce is not traced (yet)
+                lm.built.engine.set_record_whole(false);
                 match match_command(lm, &self.interner, &pattern, &subject, xmatch) {
                     Ok(blocks) => out.push_str(&format!(
                         "{kw} in {cur} : {pe} <=? {se} .\n\
@@ -205,20 +208,14 @@ impl Repl {
         Eval { output: out, exit: false }
     }
 
-    /// `set trace on|off` — the only `set` option in this build (others are a follow-up).
+    /// `set trace [<option>] on|off` — the full `trace` flag surface (master + body / substitution /
+    /// rewrite / whole / condition / eqs / mbs / builtin). Other `set` options are a follow-up.
     fn meta_set(&mut self, line: &str) -> Eval {
         let words: Vec<&str> =
             line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
-        let out = match (words.get(1).copied(), words.get(2).copied()) {
-            (Some("trace"), Some("on")) => {
-                self.trace = true;
-                String::new()
-            }
-            (Some("trace"), Some("off")) => {
-                self.trace = false;
-                String::new()
-            }
-            _ => "set: only `set trace on|off` is supported in this build.".into(),
+        let out = match words.get(1).copied() {
+            Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
+            _ => "set: only `set trace [<option>] on|off` is supported in this build.".into(),
         };
         Eval { output: out, exit: false }
     }
@@ -254,41 +251,6 @@ impl Repl {
 /// faithful re-render (the *result* is pretty-printed; this is just the `reduce in M : …` line).
 fn join_tokens(toks: &[Token], i: &Interner) -> String {
     toks.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ")
-}
-
-/// Render a reduction trace (Maude's `*********** <kind>` + redex `--->` result, per step). Empty when
-/// there were no rewrites. This is the interim step-trace renderer; the full equation/substitution/
-/// condition rendering (driven by the [`TraceEvent`] stream + the frontend's trace metadata) lands in
-/// Phase 4/5. Trial/fragment events are skipped here.
-fn render_trace(m: &BuiltModule, i: &Interner, events: &[TraceEvent], color: bool) -> String {
-    let mut out = String::new();
-    for ev in events {
-        match ev {
-            TraceEvent::Rewrite { kind, redex, result, .. } => {
-                let label = match kind {
-                    RewriteKind::Equation => "equation",
-                    RewriteKind::BuiltIn => "built-in",
-                };
-                out.push_str(&format!(
-                    "*********** {label}\n{}\n--->\n{}\n",
-                    print_pretty(m, i, *redex, color),
-                    print_pretty(m, i, *result, color),
-                ));
-            }
-            TraceEvent::Membership { subject, old_sort, new_sort, .. } => {
-                let eng = &m.engine;
-                out.push_str(&format!(
-                    "*********** membership axiom\n{}: {} becomes {}\n",
-                    eng.sorts().name(*old_sort),
-                    print_pretty(m, i, *subject, color),
-                    eng.sorts().name(*new_sort),
-                ));
-            }
-            // Trial/fragment events render in Phase 5.
-            _ => {}
-        }
-    }
-    out
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the

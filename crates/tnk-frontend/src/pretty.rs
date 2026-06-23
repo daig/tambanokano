@@ -241,19 +241,30 @@ impl Printer<'_> {
             return;
         }
 
+        // Maude's mixfix spacing (`prettyPrint.cc::printTokens`, no `format` attribute): a space precedes
+        // each fragment EXCEPT at the very start, before a `,`, and around the brackets `()[]{}` (which
+        // also suppress the following space). So `<_,_>` prints `< M, N >`, not `< M , N >`.
         let mut k = 0;
-        let mut first = true;
+        let mut no_space = true;
         for (pos, frag) in syn.frags.iter().enumerate() {
-            if !first {
-                out.push(' ');
-            }
-            first = false;
             match frag {
-                Frag::Tok(_) => self.emit(out, Cat::Op, self.frag_text(frag)),
+                Frag::Tok(_) => {
+                    let text = self.frag_text(frag);
+                    let special = matches!(text, "(" | ")" | "[" | "]" | "{" | "}");
+                    if !(no_space || special || text == ",") {
+                        out.push(' ');
+                    }
+                    self.emit(out, Cat::Op, text);
+                    no_space = special;
+                }
                 Frag::Hole => {
+                    if !no_space {
+                        out.push(' ');
+                    }
                     let (lc, rc) = self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
                     children[k].render(self, out, pg.gather[k], lc, rc);
                     k += 1;
+                    no_space = false;
                 }
             }
         }
