@@ -1,0 +1,12 @@
+*** B5: module summation `A + B` — the importer sees both modules' signatures.
+fmod A is
+  sort SA . ops a1 a2 : -> SA [ctor] . op fa : SA -> SA . eq fa(a1) = a2 .
+endfm
+fmod B is
+  sort SB . ops b1 b2 : -> SB [ctor] . op fb : SB -> SB . eq fb(b1) = b2 .
+endfm
+fmod AB is
+  protecting A + B .
+endfm
+red fa(a1) .   *** a2
+red fb(b1) .   *** b2

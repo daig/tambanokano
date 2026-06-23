@@ -1,0 +1,19 @@
+*** B5: protecting / extending / including all flatten identically (mode is a semantic annotation only).
+fmod NAT0 is
+  sort N .
+  op 0 : -> N [ctor] .
+  op s : N -> N [ctor] .
+  op add : N N -> N .
+  vars X Y : N .
+  eq add(0, Y) = Y .
+  eq add(s(X), Y) = s(add(X, Y)) .
+endfm
+
+fmod P is protecting NAT0 . op d : N -> N . var X : N . eq d(X) = add(X, X) . endfm
+red d(s(s(0))) .   *** 4
+
+fmod E is extending NAT0 . op d : N -> N . var X : N . eq d(X) = add(X, X) . endfm
+red d(s(s(0))) .   *** 4
+
+fmod I is including NAT0 . op d : N -> N . var X : N . eq d(X) = add(X, X) . endfm
+red d(s(s(0))) .   *** 4

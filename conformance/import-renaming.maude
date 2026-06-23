@@ -1,0 +1,16 @@
+*** B5: renaming `* (sort A to B, op f to g)` — names substituted across decls + statement bubbles.
+fmod ORIG is
+  sort Elt .
+  op e : -> Elt [ctor] .
+  op wrap : Elt -> Elt .
+  var X : Elt .
+  eq wrap(X) = X .
+endfm
+fmod USER is
+  protecting ORIG * (sort Elt to Item, op wrap to box) .
+  op top : Item -> Item .
+  var X : Item .
+  eq top(X) = box(X) .
+endfm
+red top(e) .   *** box(e) = e
+red box(e) .   *** e
