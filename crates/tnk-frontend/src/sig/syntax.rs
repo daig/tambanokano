@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
+use tnk_core::term::{ConditionFragment, Term};
 
 /// One operator's surface syntax — the per-symbol record the kernel does not store. Holds the mixfix
 /// fragments, the resolved domain/range, and the user-given prec/gather (the OBJ3 defaults are filled in
@@ -33,6 +34,32 @@ impl SymbolSyntax {
     }
 }
 
+/// Source-form trace metadata for one equation, keyed by the kernel's dense equation id
+/// (`BuiltModule::eq_traces[id]`). The kernel keeps no source `Term`s, so the full trace renderer reads
+/// the body from here: it Term-prints `[c]eq {lhs} = {rhs}[ if {condition}][ \[owise\]] .` and labels the
+/// `Var --> binding` substitution lines from `var_names` (statement-local index → name).
+#[derive(Debug, Clone)]
+pub struct EqTrace {
+    pub lhs: Term,
+    pub rhs: Term,
+    /// The condition fragments (empty for an unconditional `eq`), in source form for Term-printing the
+    /// `if …` clause and the per-fragment `solving/success/failure condition fragment` lines.
+    pub condition: Vec<ConditionFragment>,
+    /// Statement-local variable names, indexed as the kernel's substitution is (first occurrence order).
+    pub var_names: Vec<String>,
+    pub owise: bool,
+}
+
+/// Source-form trace metadata for one membership axiom, keyed by the kernel's dense membership id
+/// (`BuiltModule::mb_traces[id]`) — the counterpart of [`EqTrace`] for `[c]mb {lhs} : {sort}[ if …] .`.
+#[derive(Debug, Clone)]
+pub struct MbTrace {
+    pub lhs: Term,
+    pub sort: SortId,
+    pub condition: Vec<ConditionFragment>,
+    pub var_names: Vec<String>,
+}
+
 /// A built module: the `Engine` (sorts + ops + attributes, but **not** statements — those need the grammar,
 /// B4.4) plus the frontend's resolution tables and the still-raw statements/commands.
 pub struct BuiltModule {
@@ -49,6 +76,11 @@ pub struct BuiltModule {
     pub vars: Vec<(String, SortId)>,
     /// The raw statement bubbles (parsed + added to the engine in B4.4).
     pub statements: Vec<Statement>,
+    /// Per-equation trace metadata, indexed by the kernel's dense equation id (populated by
+    /// `load_statements`; empty until statements are loaded). See [`EqTrace`].
+    pub eq_traces: Vec<EqTrace>,
+    /// Per-membership trace metadata, indexed by the kernel's dense membership id. See [`MbTrace`].
+    pub mb_traces: Vec<MbTrace>,
     /// Built-in literal anchors (for the grammar's literal productions + `make_*` in build_term).
     pub nat_succ: Option<SymbolId>,
     pub nat_zero: Option<SymbolId>,

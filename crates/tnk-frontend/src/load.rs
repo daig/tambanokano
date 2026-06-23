@@ -17,7 +17,7 @@ use crate::grammar::Nt;
 use crate::lex::{tokenize, Interner, Token};
 use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
-use crate::sig::syntax::BuiltModule;
+use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace};
 use crate::surface::ast::{Command, PreModule, Source, Statement};
 use crate::surface::parser::Parser;
 use std::collections::BTreeSet;
@@ -93,13 +93,24 @@ fn load_statements(
                 };
                 let rhs_t = parse_build(rhs, g, m, i, &mut vars)?;
                 let nr = vars.count();
-                if *owise {
-                    m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition);
+                // Capture the source-form trace metadata before the Terms are moved into the kernel; the
+                // kernel returns the dense equation id, which must index `eq_traces` (asserted).
+                let trace = EqTrace {
+                    lhs: lhs_t.clone(),
+                    rhs: rhs_t.clone(),
+                    condition: condition.clone(),
+                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                    owise: *owise,
+                };
+                let id = if *owise {
+                    m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition)
                 } else if condition.is_empty() {
-                    m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr });
+                    m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr })
                 } else {
-                    m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition);
-                }
+                    m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition)
+                };
+                assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
+                m.eq_traces.push(trace);
             }
             Statement::Mb { lhs, sort, cond } => {
                 let mut vars = VarIndex::new();
@@ -111,11 +122,19 @@ fn load_statements(
                     None => Vec::new(),
                 };
                 let nr = vars.count();
-                if condition.is_empty() {
-                    m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr });
+                let trace = MbTrace {
+                    lhs: lhs_t.clone(),
+                    sort: sort_id,
+                    condition: condition.clone(),
+                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                };
+                let id = if condition.is_empty() {
+                    m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr })
                 } else {
-                    m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition);
-                }
+                    m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition)
+                };
+                assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
+                m.mb_traces.push(trace);
             }
         }
     }
