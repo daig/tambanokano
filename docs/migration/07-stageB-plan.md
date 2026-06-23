@@ -30,9 +30,12 @@ Stage A is now done).
 > frontend / `8aab414` `tnk-modules`): the new `tnk-modules` crate flattens a module's `protecting`/
 > `extending`/`including` import closure (+ summation `+` + renaming `* (…)`) as a **pure `PreModule →
 > PreModule` transform** (decision #5), feeding the unchanged build pipeline; `import-*.maude` conform vs
-> the binary. **102 core + 68 frontend + 10 modules tests. NEXT: the REPL (`tnk-repl`) = the Phase-1 end
-> milestone.** See §2 B5 below for as-built detail. *(History:)* B1 (structural
-> theories), B2
+> the binary. **B5 REPL DONE → PHASE 1 COMPLETE** (`92b6b4d` frontend / `e7e4e69` `tnk-repl`): the new
+> `tnk-repl` crate (lib `Repl::eval` + a `rustyline` binary) enters modules, `reduce`/`match`es against a
+> current module, `select`/`show`/`quit`s, and loads a `.maude` file from argv — `tnk-core` untouched.
+> "Write Maude, get answers." **102 core + 68 frontend + 10 modules + 9 repl tests; fib(22)=186579.** Next
+> is Phase 2 (parameterized programming, rules, the real prelude). See §2 B5 below for as-built detail.
+> *(History:)* B1 (structural theories), B2
 > (order-sorted / membership / conditional / attribute), and **B3 (built-in data types + bignums + the S
 > `iter` and NA atomic theories)** are all **done on `main`**, every lock conformance-verified vs the
 > reference binary (**100 tests**, clippy `-D warnings` clean, `fib(22) = 186579` and ~7.2 M rw/s intact
@@ -421,8 +424,8 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   *ordering* is observable** (Maude takes the first of two parses — preserve forest-extraction order);
   bubble boundaries need grammar context (clean API without globals is the key design call).
 
-### B5 — Module system (non-parameterized) + REPL  *(the Phase-1 end milestone)* — **MODULE SYSTEM DONE; REPL NEXT**
-- **Goal:** load multi-module functional `.maude` text and `reduce`/`match` it. ✅ for the module system.
+### B5 — Module system (non-parameterized) + REPL  *(the Phase-1 end milestone)* — **COMPLETE → PHASE 1 DONE**
+- **Goal:** load multi-module functional `.maude` text and `reduce`/`match` it interactively. ✅
 - **MODULE SYSTEM DONE (`5d72976` frontend / `8aab414` `tnk-modules`):** the new **`tnk-modules`** crate
   (→ `tnk-frontend` → `tnk-core`). **Flatten is a pure `PreModule → PreModule` transform** (decision #5,
   not C++ donation): resolve the transitive import closure depth-first, **imports-before-importer**
@@ -441,12 +444,28 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   **Conformance** (vs the binary): `conformance/import-{protecting,modes,diamond,summation,renaming}.maude`
   — sort + rewrite count + value + a `print_raw` round-trip. **102 core + 68 frontend + 10 modules tests;
   clippy `-D` clean; fib(22)=186579.**
-- **NEXT — the REPL** (`tnk-repl` + `rustyline`): `reduce`/`red`/`match`/`xmatch`/`show`/`set`, a current
-  module, incremental module entry (the `ModuleDb` + `load_program`/`Program` are built for exactly this).
-  Then Phase 1 is complete.
-- **Deferred (loud, never silent):** parameterized programming (theories/views/`LIST{X}`/instantiation) =
-  Phase 2; the real prelude (Universal/poly); disambiguated/mixfix op-rename; module expressions in command
-  position (`reduce in A + B : …`) = REPL; semantic no-junk/no-confusion checks; flatten caching.
+- **REPL DONE (`92b6b4d` frontend / `e7e4e69` `tnk-repl`) → PHASE 1 COMPLETE.** The new **`tnk-repl`** crate
+  (lib + bin over `tnk-modules`). **Lib** `Repl`: a terminal-free engine (persistent interner + `ModuleDb` +
+  built modules + current module); `eval(input) -> Eval{output,exit}` dispatches REPL meta-commands
+  (`quit`/`q`/`exit`, `select`, `show module[s]`, a `set` stub), module definitions (insert → `flatten` →
+  `build_loaded_module` → current, silent on success), and `reduce`/`match` against the current module
+  (Maude-style `reduce in M : … / rewrites: N / result Sort: value` + `match … <=? … / Matcher N …`, reusing
+  `reduce_command`/`match_command`/`format_matchers`/`print_pretty`); `input_complete` is the multi-line
+  buffer boundary (a closed module / a top-level `.` / a bare `quit`). **`tnk-core` UNTOUCHED.** **Bin**: a
+  `rustyline` driver — load an optional `.maude` from argv, then buffer multi-line input and `eval` it; color
+  only on a TTY (`IsTerminal`), Ctrl-C abandons the buffer, Ctrl-D quits. The frontend gained
+  `Parser::parse_top_item` (single top-level item — a module or an *untagged* command — so a REPL command
+  binds to the persistent current module; `parse_source` loops over it). **9 eval-driven tests** (module entry;
+  a command in a later submission; the import-diamond + renaming files reduced *through the REPL* matching the
+  binary; match display; select/show/quit; `input_complete`). **102 core + 68 frontend + 10 modules + 9 repl
+  tests; clippy `-D` clean; fib(22)=186579.**
+- **PHASE 1 IS COMPLETE.** "Write Maude, get answers" — the kernel (B1–B3), the parser + pretty-printer (B4),
+  the module system (B5 `tnk-modules`), and the interactive REPL (`tnk-repl`), all conformance-verified vs the
+  reference binary. Next is **Phase 2** (parameterized programming: theories/views/`LIST{X}`; rules `rl`/`rew`/
+  `search`; the real prelude with `Universal`/`poly`) and the deferred cross-cutting follow-ups (below).
+- **Deferred (loud, never silent):** `trace` (per-step rewrite display — needs a kernel reduce-loop hook);
+  `set` options; module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the
+  real prelude = Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.
 - **Refs:** `A5` (the module half — skip §parameterization); arch-map L6 + decision #5.
 - **Risks (retired for the module system):** flatten was made a pure transform (no `Rc`/dirty-set/donation
   coherence problem); term ownership is per-module (fresh engine per flattened module — decision #5).
