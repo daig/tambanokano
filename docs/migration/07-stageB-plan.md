@@ -463,9 +463,15 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   the module system (B5 `tnk-modules`), and the interactive REPL (`tnk-repl`), all conformance-verified vs the
   reference binary. Next is **Phase 2** (parameterized programming: theories/views/`LIST{X}`; rules `rl`/`rew`/
   `search`; the real prelude with `Universal`/`poly`) and the deferred cross-cutting follow-ups (below).
-- **Deferred (loud, never silent):** `trace` (per-step rewrite display — needs a kernel reduce-loop hook);
-  `set` options; module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the
-  real prelude = Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.
+- **`set trace on` DONE (`4590e0d` kernel / `97b9aab` repl):** an opt-in `Option<Vec<TraceStep>>` reduce-loop
+  hook in `tnk-core` (zero-cost off — fib(22) unregressed at ~7 M rw/s; `Engine::{set_trace,take_trace}`), and
+  the REPL renders each step as Maude's `*********** <kind>` + redex `--->` result (render-after; the
+  redex/result terms are **byte-identical to Maude**). The full `eq lhs = rhs .` + `Var --> binding` lines are
+  the chosen **additive follow-up** (needs the kernel to retain equation source + variable names + a
+  term-form printer).
+- **Deferred (loud, never silent):** the full trace detail (eq + substitution, above); other `set` options;
+  module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the real prelude =
+  Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.
 - **Refs:** `A5` (the module half — skip §parameterization); arch-map L6 + decision #5.
 - **Risks (retired for the module system):** flatten was made a pure transform (no `Rc`/dirty-set/donation
   coherence problem); term ownership is per-module (fresh engine per flattened module — decision #5).
