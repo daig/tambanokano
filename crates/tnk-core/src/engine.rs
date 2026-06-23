@@ -1697,6 +1697,17 @@ impl Runtime {
         }
     }
 
+    /// Trace the re-visit of a *deterministic* (equality/sort-test) fragment as the solver backtracks
+    /// back through it: a succeeded deterministic fragment whose later fragments failed is re-solved by
+    /// Maude's iterative `solveCondition` (and fails, having no second solution). Our recursive solver
+    /// unwinds through it instead, so we reproduce just the trace events here — a `re-solving` +
+    /// `failure for condition fragment` pair. **Trace-only**: it never affects the search, the rewrite
+    /// count, or the bindings (a deterministic re-solve does no reduction). No-op when not tracing.
+    fn trace_deterministic_backtrack(&mut self, kind: StmtKind, stmt_id: u32, i: usize, depth: u32) {
+        self.record(TraceEvent::FragmentStart { kind, stmt_id, index: i as u32, depth, first_attempt: false });
+        self.record(TraceEvent::FragmentEnd { kind, stmt_id, index: i as u32, depth, success: false, bindings: Vec::new() });
+    }
+
     /// Satisfy `condition[i..]` under `subst`, backtracking (Maude's `solveCondition`): an **equality**
     /// fragment reduces both sides and compares modulo the axioms; a **sort-test** reduces the term and
     /// checks its least sort; a **matching** (`:=`) fragment reduces the subject and enumerates the
@@ -1742,7 +1753,16 @@ impl Runtime {
                 self.condition_depth -= 1;
                 let holds = self.deep_equal(l, r);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
-                holds && self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)
+                if !holds {
+                    return false;
+                }
+                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
+                    return true;
+                }
+                // A later fragment failed: backtrack unwinds through this (succeeded) deterministic
+                // fragment. Trace it as Maude does; the search/result/count are unaffected.
+                self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
+                false
             }
             CompiledFragment::SortTest { term, sort } => {
                 let t = self.instantiate(sig, term, subst);
@@ -1751,7 +1771,14 @@ impl Runtime {
                 self.condition_depth -= 1;
                 let holds = sig.sorts().leq(self.node(t).sort, *sort);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
-                holds && self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)
+                if !holds {
+                    return false;
+                }
+                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
+                    return true;
+                }
+                self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
+                false
             }
             CompiledFragment::Matching { pattern, subject, fresh_vars } => {
                 let subj = self.instantiate(sig, subject, subst);

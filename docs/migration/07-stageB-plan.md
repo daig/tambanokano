@@ -472,11 +472,17 @@ milestone* "load `.maude` text" possible. Conformance is always against the refe
   and the granular **`set trace <option> on|off`** flags (body/substitution/rewrite/whole/condition/eqs/mbs/
   builtin), incl. **faithful `set trace whole`** (`Old:`/`New:` reconstructed from the reduce frame stack).
   **Byte-identical to the reference binary** (color off) across §1a–1e of `08`; `conformance/trace-*.maude`
-  fixtures + 7 repl tests (the command-echo now re-spaces via Maude's `printTokens` rules, byte-matching
-  the binary's echo). Remaining deviations (documented in `08`, none correctness-affecting): membership
-  `Whole:` (omitted — eager-at-construction sort constraints); the multi-fragment `:=` backtrack re-solving
-  of a *deterministic* crossed fragment. (Variable index order MATCHES Maude — lhs→condition→rhs,
-  `equation.cc:74`.)
+  fixtures + 8 repl tests. FIXED follow-ups: command-echo re-spacing (`c0a8827`, Maude `printTokens`) and the
+  multi-fragment `:=` backtrack (`trace_deterministic_backtrack` — the recursive solver now emits the
+  `re-solving`/`failure` pair when unwinding through a succeeded deterministic fragment; trace-only,
+  byte-exact across crossing shapes). **One remaining deviation — a real evaluation-model difference**:
+  **eager** sort-constraint application (we apply `mb` at node construction) vs Maude's **lazy**
+  (`DagNode::reduce` applies constraints only to equational normal forms). Symptoms: rewrite-count over-count
+  on a membership over a *reducible* term (e.g. `eq g(a)=b`+`mb g(a):T`: Maude 1, ours 2), and the omitted
+  membership `Whole:`. Result/least-sort always faithful (verified, incl. lazy `strat`); triggered only by
+  memberships on reducible terms (well-formed specs use constructor memberships → conformance passes). Fix =
+  move `constrain_to_smaller_sort` into the reduce loop (after `try_rewrite_top`→None) with a base/true-sort
+  split. (Variable index order MATCHES Maude — lhs→condition→rhs, `equation.cc:74`.)
 - **Deferred (loud, never silent):** other `set` options (rule/strategy/select trace are Phase-2-of-project);
   module re-entry cache invalidation (build-on-entry); parameterized programming + rules + the real prelude =
   Phase 2; disambiguated/mixfix op-rename; semantic no-junk/no-confusion checks; flatten caching.

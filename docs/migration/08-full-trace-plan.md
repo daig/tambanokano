@@ -15,24 +15,36 @@
 > fixture-driven REPL tests lock it. **199 tests (104 core + 69 frontend + 10 modules + 16 repl); clippy
 > `-D` clean; fib(22)=186579 at ~7 M rw/s** (the per-rewrite trace cost is an `if self.trace.is_some()`).
 >
-> **Documented deviations (none block correctness; none hit by any conformance fixture):**
-> 1. **Membership `Whole:`** (the `whole` flag on a membership step) — Maude prints `Whole: <root>`; we omit
->    it. Our sort constraints fire *eagerly at node construction* (off the reduce frame stack, and — for the
->    initial term — before the whole term even exists), so the root isn't reconstructable there. Equation
->    `Old:`/`New:` is faithful.
-> 2. **Multi-fragment `:=` backtrack** — exact for single-fragment conditions (all conformance fixtures) and
->    for backtracking that re-solves a *matching* fragment. The only gap: when backtracking crosses a
->    *deterministic* (equality/sort-test) fragment to re-solve an earlier matching fragment, Maude emits a
->    `re-solving`/`failure for condition fragment` pair for that deterministic fragment (it has no further
->    solutions); our recursive solver returns through it without re-emitting. Needs ≥3 fragments with a
->    multi-solution `:=` before a deterministic fragment. Result identical; only extra event lines in Maude.
+> **Remaining deviation — one, and it is a real *evaluation-model* difference (not formatting).**
+> **Eager vs lazy sort-constraint (`mb`) application.** Maude applies sort constraints **lazily** — only to a
+> node that is already an equational normal form (`DagNode::reduce`, `dagNode.hh:563`, calls
+> `fastComputeTrueSort` *after* `eqRewrite` returns false). We apply them **eagerly, at node construction**
+> (`alloc_node_constrained`). Two observable symptoms, both from this one cause:
+> - **Rewrite count** can over-count: a membership whose LHS matches a *reducible* term fires in our model
+>   (at construction, before the equation rewrites the term away) but never in Maude's. With `eq g(a)=b` +
+>   `mb g(a):T`, `red g(a)` is **1** rewrite in Maude, **2** in ours (result `b` in both). Compounds with
+>   rebuilds.
+> - **Membership `Whole:`** under `set trace whole on` is omitted: the constraint fires off the reduce frame
+>   stack (and, for the initial term, before the whole term exists), so the root isn't reconstructable.
 >
-> *(FIXED, no longer a deviation: the command-echo line `reduce in M : <echo> .` now re-spaces the input
-> tokens with Maude's `printTokens` rules — no space before `,`/brackets, none after an opening bracket —
-> so `g(g(a))` / `< z, s z >` echo compactly, byte-matching the binary on the common command forms. An
-> earlier draft also wrongly listed a "variable index order" deviation: `Equation::check` indexes
-> lhs→condition→rhs (rhs last, `equation.cc:74`), exactly our `load_statements` order — verified identical
-> to the binary on the order-sensitive case.)*
+> **The result and least sort are always faithful** — verified across adversarial cases, including a lazy
+> `strat` where Maude *also* applies the constraint to compute an unreduced argument's sort (so they agree):
+> innermost reduction reduces an argument to normal form (applying its constraints) before any parent
+> matches against it, and sort-test conditions reduce first. The divergence triggers only on a membership
+> over a *reducible* (defined-op) term — atypical; well-formed specs put memberships on **constructors**
+> (normal forms), where both models agree, so the whole conformance suite passes. **The fix** (not yet done —
+> a genuine evaluator change, unlike the two below): move `constrain_to_smaller_sort` out of construction
+> into the reduce loop (apply after `try_rewrite_top` returns `None`), with a base-sort/true-sort split so
+> matching still has sorts mid-reduction — Maude's exact model. Needs a full rewrite-count re-verification.
+>
+> *(FIXED, no longer deviations: **command-echo spacing** (`c0a8827` — re-renders the input with Maude's
+> `printTokens` rules, so `g(g(a))` / `< z, s z >` echo compactly, byte-matching the binary). **Multi-fragment
+> `:=` backtrack**: the recursive condition solver now emits the `re-solving` + `failure for condition
+> fragment` pair when it unwinds back through a *succeeded* deterministic (equality/sort-test) fragment —
+> trace-only (`trace_deterministic_backtrack`, gated off; the search/count/result were already correct),
+> verified byte-exact vs the binary across 1- and 2-deterministic-crossing shapes and sort-test fragments.
+> And the never-real "variable index order": `Equation::check` indexes lhs→condition→rhs (`equation.cc:74`),
+> exactly our order.)*
 >
 > Everything below is the original plan, kept for reference.
 

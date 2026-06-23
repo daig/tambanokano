@@ -262,6 +262,35 @@ fn command_echo_spacing() {
     assert!(comma.contains("reduce in E : < z, s z > ."), "comma echo: {comma}");
 }
 
+/// Multi-fragment `:=` backtracking: when the search backtracks *through* a deterministic fragment
+/// (`g(X) = ok`) to re-solve an earlier matching fragment, Maude re-visits the deterministic fragment
+/// (`re-solving` then `failure for condition fragment`). Trace-only — the result/count are unaffected.
+/// Byte-exact vs the reference binary (verified separately); this pins the events in CI.
+#[test]
+fn trace_multi_fragment_backtrack_resolves_deterministic() {
+    let mut r = repl();
+    r.eval(
+        "fmod BT is sorts E R B . ops a b c : -> E [ctor] . op _;_ : E E -> E [assoc] . \
+         op f : E -> E . op g : E -> R . op ok : -> R [ctor] . ops tt ff : -> B [ctor] . \
+         op test : E -> B . vars X Y Z : E . eq g(X) = ok . eq test(c) = tt . \
+         ceq f(Z) = Y if X ; Y := Z /\\ g(X) = ok /\\ test(Y) = tt . endfm",
+    );
+    r.eval("set trace on .");
+    let out = r.eval("red f(a ; b ; c) .").output;
+    // The split (a, b c) passes g(X)=ok but fails test(b c)=tt, so the solver backtracks through the
+    // deterministic g(X)=ok fragment — which Maude (and now we) re-solve and fail.
+    assert!(
+        out.contains(
+            "*********** re-solving condition fragment\n\
+             g(X) = ok\n\
+             *********** failure for condition fragment\n\
+             g(X) = ok\n"
+        ),
+        "deterministic re-solve on backtrack:\n{out}"
+    );
+    assert!(out.contains("result E: c"), "result (a ; b -> X, c -> Y): {out}");
+}
+
 /// Drive a multi-submission session the way the binary's stdin loop does (main.rs): buffer lines until
 /// `input_complete`, then `eval` each submission. Returns the concatenated output.
 fn run_session(input: &str) -> String {
