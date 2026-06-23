@@ -111,11 +111,35 @@ pub(crate) struct Signature {
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
 /// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
 /// `&Signature`; everything else is pure arena work.
+/// One recorded reduction step (opt-in via [`Engine::set_trace`]): the redex `before` rewritten to
+/// `after` by a `kind` of rule. The frontend renders these as Maude's `*********** <kind>` trace.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceStep {
+    pub kind: TraceKind,
+    pub before: DagId,
+    pub after: DagId,
+}
+
+/// What kind of rule produced a [`TraceStep`]. (Membership sort-narrowings are not term rewrites, so
+/// they are not traced; equation `lhs => rhs` rule-tracing is a Phase-2 follow-up.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceKind {
+    /// A user equation.
+    Equation,
+    /// A built-in (`special`) operator's reduction.
+    BuiltIn,
+}
+
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic).
     rewrite_count: u64,
+    /// When `Some`, [`reduce`](Engine::reduce) records each rewrite here (opt-in via
+    /// [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate (pre-rewrite) node
+    /// ids, so it is rooted by [`safe_point_gc`](Self::safe_point_gc) — but it is meant for the REPL,
+    /// which runs with in-reduction GC off.
+    trace: Option<Vec<TraceStep>>,
     /// Persistent GC roots held by live [`RootGuard`]s (decision D2 amendment). `gc` always marks
     /// from here; the shared `Rc<RefCell<…>>` lets a guard outlive a `&mut self` call.
     roots: Roots,
@@ -1099,6 +1123,15 @@ impl Runtime {
         if let Some(r) = child_result {
             self.mark_reachable(r);
         }
+        // A trace holds intermediate (pre-rewrite) node ids for later rendering — root them too so a
+        // traced reduction under in-reduction GC keeps them alive. (Collected first to release the
+        // shared borrow before `mark_reachable` takes `&mut self`; `None` on the common untraced path.)
+        if let Some(trace) = &self.trace {
+            let ids: Vec<DagId> = trace.iter().flat_map(|s| [s.before, s.after]).collect();
+            for id in ids {
+                self.mark_reachable(id);
+            }
+        }
         self.dags.sweep(|_| {});
     }
 
@@ -1263,6 +1296,13 @@ impl Runtime {
     /// The A4 borrow split is what lets this avoid cloning the rhs: `eqs` (and thus `&eq.rhs`) is a
     /// shared borrow of `sig`, disjoint from the `&mut self` runtime, so the matched rhs is
     /// instantiated straight out of the still-borrowed equation table.
+    /// Record a rewrite of `before` to `after` when tracing is on (a cheap `None` check otherwise).
+    fn trace_step(&mut self, kind: TraceKind, before: DagId, after: DagId) {
+        if let Some(buf) = &mut self.trace {
+            buf.push(TraceStep { kind, before, after });
+        }
+    }
+
     fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
@@ -1271,6 +1311,7 @@ impl Runtime {
         if let Some(op) = sig.symbol(symbol).special()
             && let Some(r) = self.try_special(sig, id, op)
         {
+            self.trace_step(TraceKind::BuiltIn, id, r);
             return Some(r);
         }
         // ACU/AU/S rewriting matches *modulo* the axioms with extension: a pattern may match a
@@ -1282,9 +1323,12 @@ impl Runtime {
         // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
         // only when the first found nothing — for a node with no equations the early `?` above skips both.
         if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false) {
+            self.trace_step(TraceKind::Equation, id, r);
             return Some(r);
         }
-        self.try_equations(sig, id, eqs, ext_allowed, true)
+        let r = self.try_equations(sig, id, eqs, ext_allowed, true)?;
+        self.trace_step(TraceKind::Equation, id, r);
+        Some(r)
     }
 
     /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
@@ -1723,6 +1767,23 @@ impl Engine {
     }
     pub fn reset_rewrites(&mut self) {
         self.rt.reset_rewrites();
+    }
+
+    /// Enable or disable reduction tracing. When on, every rewrite during [`reduce`](Self::reduce) is
+    /// recorded as a [`TraceStep`]; collect them with [`take_trace`](Self::take_trace). Disabling drops
+    /// any buffered steps. Intended for the REPL (which runs with in-reduction GC off).
+    pub fn set_trace(&mut self, on: bool) {
+        self.rt.trace = on.then(Vec::new);
+    }
+
+    /// Whether tracing is currently enabled.
+    pub fn is_tracing(&self) -> bool {
+        self.rt.trace.is_some()
+    }
+
+    /// Take the recorded trace steps, clearing the buffer (tracing stays enabled). Empty when off.
+    pub fn take_trace(&mut self) -> Vec<TraceStep> {
+        self.rt.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Reduce `root` to canonical form by innermost, eager equational simplification (Phase 0:
@@ -2272,6 +2333,49 @@ mod tests {
 
     /// B2.3a conditional equations with equality conditions (== reference binary,
     /// `conformance/conditional.maude` CEQ-MAX): `max` via `ceq max(M,N)=N if M<=N=tt` /
+    /// Tracing (opt-in) records one [`TraceStep`] per rewrite — the redex `before` and its replacement
+    /// `after`. `add(s(0), s(0))` reduces in two equation steps; `take_trace` drains them and leaves the
+    /// buffer empty (tracing stays on).
+    #[test]
+    fn trace_records_rewrite_steps() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let add = e.add_op("add", vec![nat, nat], nat);
+        let v = |i| Term::var(i, nat);
+        let s_of = |t| Term::op(s, vec![t]);
+        // eq add(0, Y) = Y .   eq add(s(X), Y) = s(add(X, Y)) .
+        e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(add, vec![s_of(v(0)), v(1)]),
+            rhs: s_of(Term::op(add, vec![v(0), v(1)])),
+            nr_vars: 2,
+        });
+
+        let z0 = e.make_const(z);
+        let one = e.make_free(s, vec![z0]);
+        let subject = e.make_free(add, vec![one, one]); // add(s(0), s(0))
+
+        assert!(!e.is_tracing());
+        e.set_trace(true);
+        let result = e.reduce(subject);
+        let steps = e.take_trace();
+
+        assert_eq!(steps.len(), 2, "two equation rewrites");
+        assert!(steps.iter().all(|st| st.kind == TraceKind::Equation));
+        // The first step's redex is the whole subject; the result is s(s(0)).
+        assert_eq!(steps[0].before, subject);
+        let z1 = e.make_const(z);
+        let s1 = e.make_free(s, vec![z1]);
+        let two = e.make_free(s, vec![s1]);
+        assert!(e.deep_equal(result, two), "add(s(0), s(0)) = s(s(0))");
+        // take_trace drained the buffer; tracing is still on.
+        assert!(e.take_trace().is_empty());
+        assert!(e.is_tracing());
+    }
+
     /// `ceq max(M,N)=M if M<=N=ff`. The condition `M<=N` itself reduces (re-entrant), its rewrites
     /// count, and a failed first condition backtracks to the second equation — re-reducing the
     /// condition (Maude caches nothing): `max(2,1)` is 5 rewrites, not 3.
