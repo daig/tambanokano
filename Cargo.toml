@@ -2,7 +2,7 @@
 # See docs/migration/ for the architecture map, phased plan, and decision record (D1–D8).
 [workspace]
 resolver = "3"
-members = ["crates/tnk-core", "crates/tnk-frontend", "crates/tnk-modules"]
+members = ["crates/tnk-core", "crates/tnk-frontend", "crates/tnk-modules", "crates/tnk-repl"]
 
 [workspace.package]
 version = "0.0.0"

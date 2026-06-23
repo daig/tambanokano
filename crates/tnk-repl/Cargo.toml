@@ -1,0 +1,15 @@
+[package]
+name = "tnk-repl"
+description = "tambanokano REPL: an interactive shell over the module system — enter modules, reduce/match, show/select"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tnk-core = { path = "../tnk-core" }
+tnk-frontend = { path = "../tnk-frontend" }
+tnk-modules = { path = "../tnk-modules" }
+rustyline = "14"               # interactive line editing + history (binary only)
