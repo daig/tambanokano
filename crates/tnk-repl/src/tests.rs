@@ -98,6 +98,25 @@ fn unknown_import_reported() {
     assert!(out.contains("not defined") || out.contains("error"), "got: {out}");
 }
 
+/// `set trace on` prints each rewrite step (redex `--->` result); `set trace off` removes them.
+#[test]
+fn trace_shows_rewrite_steps() {
+    let mut r = repl();
+    r.eval(
+        "fmod NAT0 is sort N . op 0 : -> N [ctor] . op s : N -> N [ctor] . op add : N N -> N . \
+         vars X Y : N . eq add(0, Y) = Y . eq add(s(X), Y) = s(add(X, Y)) . endfm",
+    );
+    r.eval("set trace on .");
+    let out = r.eval("red add(s(0), s(0)) .").output;
+    assert_eq!(out.matches("*********** equation").count(), 2, "two steps: {out}");
+    assert!(out.contains("add(s(0), s(0))\n--->"), "first redex: {out}");
+    assert!(out.contains("result N: s(s(0))"), "result: {out}");
+
+    r.eval("set trace off .");
+    let plain = r.eval("red add(s(0), s(0)) .").output;
+    assert!(!plain.contains("***********"), "no trace when off: {plain}");
+}
+
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
 /// or a terminator-less line keep buffering; a bare `quit` completes.
 #[test]

@@ -8,11 +8,13 @@
 //! `format_matchers`, and the pretty-printer.
 
 use std::collections::HashMap;
+use tnk_core::engine::{TraceKind, TraceStep};
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_frontend::load::{
     build_loaded_module, format_matchers, match_command, reduce_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
+use tnk_frontend::sig::syntax::BuiltModule;
 use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
@@ -39,6 +41,8 @@ pub struct Repl {
     current: Option<String>,
     /// Colorize printed results (true interactively, false in tests).
     color: bool,
+    /// `set trace on` — record + print each rewrite step of a `reduce`.
+    trace: bool,
 }
 
 impl Repl {
@@ -50,6 +54,7 @@ impl Repl {
             order: Vec::new(),
             current: None,
             color,
+            trace: false,
         }
     }
 
@@ -69,12 +74,7 @@ impl Repl {
             "quit" | "q" | "exit" => return Eval { output: "Bye.".into(), exit: true },
             "select" => return self.meta_select(trimmed),
             "show" => return self.meta_show(trimmed),
-            "set" => {
-                return Eval {
-                    output: "set: no options in this build (trace/options are a follow-up)".into(),
-                    exit: false,
-                }
-            }
+            "set" => return self.meta_set(trimmed),
             _ => {}
         }
 
@@ -135,13 +135,16 @@ impl Repl {
             Command::Reduce { term } => {
                 let echo = join_tokens(&term, &self.interner);
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.set_trace(self.trace);
                 match reduce_command(lm, &self.interner, &term) {
                     Ok((dag, rw)) => {
+                        let steps = lm.built.engine.take_trace();
+                        let trace = render_trace(&lm.built, &self.interner, &steps, self.color);
                         let eng = &lm.built.engine;
                         let sort = eng.sorts().name(eng.sort_of(dag)).to_string();
                         let value = print_pretty(&lm.built, &self.interner, dag, self.color);
                         out.push_str(&format!(
-                            "reduce in {cur} : {echo} .\n\
+                            "reduce in {cur} : {echo} .\n{trace}\
                              rewrites: {rw} in 0ms cpu (0ms real) (~ rewrites/second)\n\
                              result {sort}: {value}\n"
                         ));
@@ -154,6 +157,7 @@ impl Repl {
                     (join_tokens(&pattern, &self.interner), join_tokens(&subject, &self.interner));
                 let kw = if xmatch { "xmatch" } else { "match" };
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.set_trace(false); // the match's subject-reduce is not traced (yet)
                 match match_command(lm, &self.interner, &pattern, &subject, xmatch) {
                     Ok(blocks) => out.push_str(&format!(
                         "{kw} in {cur} : {pe} <=? {se} .\n\
@@ -201,6 +205,24 @@ impl Repl {
         Eval { output: out, exit: false }
     }
 
+    /// `set trace on|off` — the only `set` option in this build (others are a follow-up).
+    fn meta_set(&mut self, line: &str) -> Eval {
+        let words: Vec<&str> =
+            line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
+        let out = match (words.get(1).copied(), words.get(2).copied()) {
+            (Some("trace"), Some("on")) => {
+                self.trace = true;
+                String::new()
+            }
+            (Some("trace"), Some("off")) => {
+                self.trace = false;
+                String::new()
+            }
+            _ => "set: only `set trace on|off` is supported in this build.".into(),
+        };
+        Eval { output: out, exit: false }
+    }
+
     /// Whether `input` forms a complete submission — the multi-line buffer boundary for the binary.
     /// Complete iff it is a bare `quit`/`q`/`exit`, or its last token closes a module (`endfm`/…) or is a
     /// terminator `.` at module-depth 0 (so a half-typed module body keeps buffering).
@@ -232,6 +254,24 @@ impl Repl {
 /// faithful re-render (the *result* is pretty-printed; this is just the `reduce in M : …` line).
 fn join_tokens(toks: &[Token], i: &Interner) -> String {
     toks.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ")
+}
+
+/// Render a reduction trace (Maude's `*********** <kind>` + redex `--->` result, per step). Empty when
+/// there were no rewrites. The full equation + substitution lines are an additive follow-up.
+fn render_trace(m: &BuiltModule, i: &Interner, steps: &[TraceStep], color: bool) -> String {
+    let mut out = String::new();
+    for st in steps {
+        let kind = match st.kind {
+            TraceKind::Equation => "equation",
+            TraceKind::BuiltIn => "built-in",
+        };
+        out.push_str(&format!(
+            "*********** {kind}\n{}\n--->\n{}\n",
+            print_pretty(m, i, st.before, color),
+            print_pretty(m, i, st.after, color),
+        ));
+    }
+    out
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the
