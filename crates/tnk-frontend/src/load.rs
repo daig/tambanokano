@@ -632,6 +632,23 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C8 — uniform cross-theory composition: a theory-rooted subterm under an `iter` (S)
+    /// or `comm` (CUI) operator now matches modulo its theory (`s (a + X)`, `(a + X) ; Y`), via the same
+    /// `enumerate_alien_solutions` seam as ACU/AU aliens and free-with-theory-children. Were panics.
+    #[test]
+    fn correctness_cross_theory_conforms() {
+        conform(
+            conformance_file!("correctness-cross-theory.maude"),
+            &[
+                e("Foo", "s (a + b)", 1), // membership lhs `s (a + X)` matches modulo AC under iter
+                e("E", "b", 1),           // eq reduces s(a+a) before the membership (C1 lazy)
+                e("E", "s (b + b)", 0),   // no leading a
+                e("E", "b ; b", 1),       // AC term as a CUI argument
+                e("E", "(b + b) ; a", 0), // no leading a in either pairing
+            ],
+        );
+    }
+
     /// Phase 1.5 / C5 — membership axioms whose lhs is a theory term, matched modulo the theory. Since
     /// memberships compile to the same `LhsAutomaton` as equations, the C8 cross-theory matching covers
     /// their lhs: AC (non-linear `X + X`, alien `s M + N`), AU (`a L`, alien `(s M) L`), and iter/S

@@ -1,0 +1,32 @@
+*** Phase 1.5 / C8 — uniform cross-theory composition: a theory-rooted subterm under an `iter` (S) or a
+*** `comm` (CUI) operator.  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-cross-theory.maude < /dev/null
+***
+*** Completes C8 so every theory matcher composes sub-patterns through the same seam: the S and CUI
+*** sub-patterns (like ACU/AU aliens and free-with-theory-children) are matched recursively via
+*** `enumerate_alien_solutions`, so an AC term under `s_` (`s (a + X)`) or under `_;_` (`(a + X) ; Y`)
+*** matches modulo its theory. These were loud panics (s.rs:67 / cui.rs).
+
+fmod S-OVER-AC is
+  sorts E Foo .
+  subsort Foo < E .
+  ops a b : -> E [ctor] .
+  op _+_ : E E -> E [assoc comm] .
+  op s_ : E -> E [ctor iter] .
+  var X : E .
+  mb s (a + X) : Foo .          *** AC term (a + X) under the iter successor s
+  eq s (a + a) = b .
+endfm
+red s (a + b) .                  *** Foo: s (a + b), 1 rewrite (membership lhs matches modulo AC under s)
+red s (a + a) .                  *** E: b, 1 rewrite (the equation reduces it before the membership)
+red s (b + b) .                  *** E: s (b + b), 0 rewrites (no leading a)
+
+fmod AC-UNDER-CUI is
+  sorts E .
+  ops a b : -> E [ctor] .
+  op _+_ : E E -> E [assoc comm] .
+  op _;_ : E E -> E [comm] .
+  vars X Y : E .
+  eq (a + X) ; Y = X ; Y .       *** AC term (a + X) as a CUI argument
+endfm
+red (a + b) ; b .                *** E: b ; b, 1 rewrite (CUI arg matched modulo AC)
+red (b + b) ; a .                *** E: (b + b) ; a, 0 rewrites (no leading a in either pairing)

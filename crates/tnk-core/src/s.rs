@@ -12,10 +12,10 @@
 //! - `n > k`, **no extension** (condition / membership matching) — a variable `sub` must absorb the
 //!   whole surplus (`X = s^(n−k)(base)`, residue 0); a ground/alien `sub` cannot match.
 //!
-//! Scope (this slice): a variable or a free-matchable (ground / free-alien) sub-pattern. A theory-rooted
-//! sub-pattern is rejected loudly (the `is_free_matchable` guard, as ACU/AU/CUI do). A *non-linear*
-//! iter variable (already bound elsewhere) is a loud assert — it cannot arise for a top-level iter
-//! equation lhs (the variable is bound here), only via cross-theory nesting, which is itself deferred.
+//! A bare-variable sub-pattern takes the direct (possibly lazy, bignum) absorption path here; any other
+//! sub-pattern (ground, free alien, **or theory-rooted**) is matched against the subject's base through
+//! the full matcher seam ([`enumerate_alien_solutions`](crate::theory::enumerate_alien_solutions)), so
+//! cross-theory composition under an `iter` operator works uniformly with the other theories.
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
@@ -23,6 +23,7 @@ use crate::num::Nat;
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
+use crate::theory::enumerate_alien_solutions;
 
 /// A compiled S left-hand side `s^count(sub)`: the peeled successor `count` (≥ 1) and the residual
 /// sub-pattern.
@@ -36,15 +37,15 @@ pub(crate) struct SLhs {
 enum SSub {
     /// A bare variable — absorbs a run of successors over the base.
     Var { index: u32, sort: SortId },
-    /// A free-matchable sub-pattern (ground, or a free non-variable alien like `f(X)`): matched against
-    /// the subject's base by the recursive free matcher. `vars` are its variable indices (to unbind on
-    /// backtracking).
+    /// A non-variable sub-pattern (ground, free alien like `f(X)`, or theory-rooted like `a + b`):
+    /// matched against the subject's base through the full matcher seam. `vars` are its variable indices
+    /// (captured into each solution / unbound on backtracking).
     Pat { pat: Term, vars: Vec<u32> },
 }
 
 impl SLhs {
     /// Compile an iter pattern: peel the leading `s_` layers, counting them, then classify the residual.
-    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+    pub(crate) fn compile(lhs: Term, _sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("S lhs must be an application");
         let mut count = Nat::zero();
         let mut t = lhs;
@@ -64,12 +65,8 @@ impl SLhs {
         let sub = match t {
             Term::Var(v) => SSub::Var { index: v.index, sort: v.sort },
             other => {
-                assert!(
-                    other.is_free_matchable(sig),
-                    "a theory-rooted sub-pattern under an `iter` operator is not yet supported: it is \
-                     matched by the free matcher, which fails silently on a theory subject \
-                     (cross-theory composition is a B-follow-up)"
-                );
+                // Any non-variable sub-pattern (ground / free alien / theory-rooted) matches the base
+                // through the full matcher seam in `next` (`enumerate_alien_solutions`).
                 let mut vars = Vec::new();
                 collect_vars(&other, &mut vars);
                 SSub::Pat { pat: other, vars }
@@ -103,9 +100,15 @@ impl SLhs {
             }
             SSub::Pat { pat, vars } => {
                 if !ext_allowed && !diff.is_zero() {
-                    return None; // a ground/alien sub needs n == k without extension
+                    return None; // a non-variable sub needs n == k without extension
                 }
-                SState::Pat { pat: pat.clone(), vars: vars.clone(), residue: diff }
+                SState::Pat {
+                    pat: pat.clone(),
+                    vars: vars.clone(),
+                    residue: diff,
+                    recorded: None,
+                    cursor: 0,
+                }
             }
         };
         Some(SSubproblem {
@@ -140,17 +143,12 @@ enum SState {
     VarExt { index: u32, sort: SortId, diff: Nat, next_j: Option<Nat> },
     /// Variable, no extension: a single solution `X = s^j(base)`, residue 0.
     VarWhole { index: u32, sort: SortId, j: Nat },
-    /// Free sub-pattern matched against the base, with a fixed `residue` (`diff`): a single solution.
-    Pat { pat: Term, vars: Vec<u32>, residue: Nat },
+    /// Non-variable sub-pattern matched against the base (through the full matcher seam, so it may be
+    /// theory-rooted), with a fixed `residue` (`diff`). Multi-solution: `recorded` holds the per-solution
+    /// variable snapshots (enumerated lazily on the first `next`), `cursor` the replay position.
+    Pat { pat: Term, vars: Vec<u32>, residue: Nat, recorded: Option<Vec<Vec<(u32, DagId)>>>, cursor: usize },
     /// Exhausted (the single-solution arms transition here after yielding once).
     Done,
-}
-
-/// One pending candidate, pulled out of the state so the `&mut self.state` borrow is released before the
-/// runtime work (binding nodes, matching) touches the other `self` fields.
-enum Cand {
-    Var { index: u32, sort: SortId, j: Nat },
-    Pat { pat: Term, vars: Vec<u32> },
 }
 
 impl SSubproblem {
@@ -164,56 +162,73 @@ impl SSubproblem {
 
         let symbol = self.symbol;
         let base = self.base;
+
+        // Non-variable sub-pattern: match it against the base through the full matcher seam (so it may
+        // be free, theory-rooted, or mixed), enumerated once then replayed. Each solution carries the
+        // same fixed `residue` (the surplus successors that wrap the rhs).
+        if matches!(self.state, SState::Pat { .. }) {
+            if matches!(self.state, SState::Pat { recorded: None, .. }) {
+                let (pat, vars) = match &self.state {
+                    SState::Pat { pat, vars, .. } => (pat.clone(), vars.clone()),
+                    _ => unreachable!(),
+                };
+                let sols = enumerate_alien_solutions(rt, sig, subst, &[(pat, base)], &vars);
+                if let SState::Pat { recorded, .. } = &mut self.state {
+                    *recorded = Some(sols);
+                }
+            }
+            let (binds, residue) = match &mut self.state {
+                SState::Pat { recorded: Some(sols), cursor, residue, .. } => {
+                    if *cursor >= sols.len() {
+                        return false;
+                    }
+                    let binds = sols[*cursor].clone();
+                    *cursor += 1;
+                    (binds, residue.clone())
+                }
+                _ => unreachable!(),
+            };
+            for (idx, b) in binds {
+                subst.bind(idx, b);
+                self.bound.push(idx);
+            }
+            self.residue = residue;
+            self.matched_whole = self.residue.is_zero();
+            return true;
+        }
+
         loop {
-            // Extract one candidate + its residue, releasing the `self.state` borrow before the work.
-            let (cand, residue) = match &mut self.state {
+            // A variable sub-pattern absorbs `j` successors over the base: extract `(index, sort, j,
+            // residue)` (releasing the `self.state` borrow), build `s^j(base)`, bind. Sort-violating `j`
+            // skips to the next.
+            let (index, sort, j, residue) = match &mut self.state {
                 SState::VarExt { index, sort, diff, next_j } => match next_j.take() {
                     None => return false,
                     Some(j) => {
                         *next_j =
                             if j.is_zero() { None } else { Some(j.checked_sub(&Nat::one()).unwrap()) };
                         let residue = diff.checked_sub(&j).unwrap();
-                        (Cand::Var { index: *index, sort: *sort, j }, residue)
+                        (*index, *sort, j, residue)
                     }
                 },
                 SState::VarWhole { index, sort, j } => {
-                    let cand = Cand::Var { index: *index, sort: *sort, j: j.clone() };
+                    let r = (*index, *sort, j.clone(), Nat::zero());
                     self.state = SState::Done;
-                    (cand, Nat::zero())
-                }
-                SState::Pat { pat, vars, residue } => {
-                    let cand = Cand::Pat { pat: pat.clone(), vars: std::mem::take(vars) };
-                    let residue = residue.clone();
-                    self.state = SState::Done;
-                    (cand, residue)
+                    r
                 }
                 SState::Done => return false,
+                SState::Pat { .. } => unreachable!("a Pat sub-pattern is handled above"),
             };
-
-            match cand {
-                Cand::Var { index, sort, j } => {
-                    assert!(
-                        subst.get(index).is_none(),
-                        "non-linear S variable is not yet supported (a follow-up)"
-                    );
-                    let binding = rt.make_s(sig, symbol, j, base);
-                    if !sig.sorts().leq(rt.sort_of(binding), sort) {
-                        continue; // this j violates the variable's sort; try the next (or finish)
-                    }
-                    subst.bind(index, binding);
-                    self.bound.push(index);
-                }
-                Cand::Pat { pat, vars } => {
-                    if !rt.match_pattern(sig, &pat, base, subst) {
-                        // The sub-pattern does not match the base — unbind any partial bindings and stop.
-                        for idx in vars {
-                            subst.unbind(idx);
-                        }
-                        return false;
-                    }
-                    self.bound = vars;
-                }
+            assert!(
+                subst.get(index).is_none(),
+                "non-linear S variable is not yet supported (a follow-up)"
+            );
+            let binding = rt.make_s(sig, symbol, j, base);
+            if !sig.sorts().leq(rt.sort_of(binding), sort) {
+                continue; // this j violates the variable's sort; try the next (or finish)
             }
+            subst.bind(index, binding);
+            self.bound.push(index);
             self.residue = residue;
             self.matched_whole = self.residue.is_zero();
             return true;

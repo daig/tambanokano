@@ -220,36 +220,52 @@ impl SequenceSubproblem {
     /// Enumerate every combination of the aliens' solutions (nested backtracking, shared scratch seeded
     /// from `base` so the free skeleton's variable bindings are respected).
     fn enumerate(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<Vec<(u32, DagId)>> {
-        let mut out = Vec::new();
-        let mut scratch = base.clone();
-        self.rec(0, rt, sig, &mut scratch, &mut out);
-        out
+        enumerate_alien_solutions(rt, sig, base, &self.aliens, &self.alien_var_indices)
     }
+}
 
-    fn rec(
-        &self,
-        idx: usize,
-        rt: &mut Runtime,
-        sig: &Signature,
-        scratch: &mut Subst,
-        out: &mut Vec<Vec<(u32, DagId)>>,
-    ) {
-        if idx == self.aliens.len() {
-            let snap =
-                self.alien_var_indices.iter().filter_map(|&i| scratch.get(i).map(|b| (i, b))).collect();
-            out.push(snap);
-            return;
-        }
-        let (pat, subj) = &self.aliens[idx];
-        let automaton = LhsAutomaton::compile(pat.clone(), sig);
-        let checkpoint = scratch.clone();
-        if let Some(mut sp) = automaton.match_(rt, sig, *subj, scratch, false) {
-            while sp.next(rt, sig, scratch) {
-                self.rec(idx + 1, rt, sig, scratch, out);
-            }
-        }
-        *scratch = checkpoint;
+/// Match each `(pattern, subject)` alien pair recursively, composing the solutions by nested
+/// backtracking over a shared scratch substitution (seeded from `base`), and return each combined
+/// solution as a snapshot of `var_indices`. The general cross-theory sub-matching primitive: it drives
+/// each sub-pattern through the full [`LhsAutomaton`] seam, so an alien may be free, theory-rooted, or
+/// mixed — and nested aliens compose recursively. Shared by the free [`SequenceSubproblem`] and by the
+/// S/CUI theory matchers, so all sub-pattern matching is uniformly cross-theory (no `match_pattern`
+/// "free only" islands). Eager (records full solutions, like the ACU/AU paths); the caller replays them.
+pub(crate) fn enumerate_alien_solutions(
+    rt: &mut Runtime,
+    sig: &Signature,
+    base: &Subst,
+    aliens: &[(Term, DagId)],
+    var_indices: &[u32],
+) -> Vec<Vec<(u32, DagId)>> {
+    let mut out = Vec::new();
+    let mut scratch = base.clone();
+    rec_aliens(0, aliens, var_indices, rt, sig, &mut scratch, &mut out);
+    out
+}
+
+fn rec_aliens(
+    idx: usize,
+    aliens: &[(Term, DagId)],
+    var_indices: &[u32],
+    rt: &mut Runtime,
+    sig: &Signature,
+    scratch: &mut Subst,
+    out: &mut Vec<Vec<(u32, DagId)>>,
+) {
+    if idx == aliens.len() {
+        out.push(var_indices.iter().filter_map(|&i| scratch.get(i).map(|b| (i, b))).collect());
+        return;
     }
+    let (pat, subj) = &aliens[idx];
+    let automaton = LhsAutomaton::compile(pat.clone(), sig);
+    let checkpoint = scratch.clone();
+    if let Some(mut sp) = automaton.match_(rt, sig, *subj, scratch, false) {
+        while sp.next(rt, sig, scratch) {
+            rec_aliens(idx + 1, aliens, var_indices, rt, sig, scratch, out);
+        }
+    }
+    *scratch = checkpoint;
 }
 
 /// Collect the distinct variable indices in a pattern (an alien's internal bindings to capture).

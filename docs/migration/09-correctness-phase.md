@@ -52,11 +52,12 @@ priority ranks.
 
 #### C8 — Cross-theory "alien subterm" matching  **[DONE — was a HIGH-severity panic]**
 
-A pattern lhs with a **non-ground, non-variable subterm under an AC/AU operator** — or a theory-rooted
-subterm under a free operator — (an "alien" in Maude's terms) was unsupported: a **loud panic at module
-load**. The parked B1 cross-theory-composition follow-up (`07-stageB-plan.md` §"Deferred follow-ups";
-loud-guarded, never silently wrong — audit F-A). Maude matches each alien recursively via its own
-`LhsAutomaton` (`NonGroundAlien`), composing the child subproblems into the shared substitution.
+A pattern lhs with a **non-ground, non-variable subterm under any theory operator** (AC/AU/S/CUI) — or a
+theory-rooted subterm under a free operator — (an "alien" in Maude's terms) was unsupported: a **loud panic
+at module load**. The parked B1 cross-theory-composition follow-up (`07-stageB-plan.md` §"Deferred
+follow-ups"; loud-guarded, never silently wrong — audit F-A). Maude matches each alien recursively via its
+own `LhsAutomaton` (`NonGroundAlien`), composing the child subproblems into the shared substitution. **Now
+uniform across all five axes** — alien under ACU / AU / S / CUI, and theory-under-free.
 
 The matching **order is from the source, not tuned**: for `reduce`, `ACU_GreedyMatcher` scans the subject's
 canonically-sorted args (`findFirstPotentialMatch` + the `partialCompare … != LESS` walk) and binds each
@@ -82,6 +83,13 @@ subproblem is the backtracking closure for `match`/conditions (set-compared, so 
   (`SequenceSubproblem`) composes their sub-automata by nested backtracking (Maude's `SubproblemSequence`).
   The all-free hot path stays a separate `Free` variant on `match_pattern` (fib untouched). Verified —
   `conformance/correctness-free-alien.maude`.
+- **S + CUI directions — DONE (uniformity).** A theory-rooted subterm under an `iter` op (`s (a + X)`) or
+  a `comm` op (`(a + X) ; Y`) now matches — the last two axes, previously loud panics (`s.rs:67` / `cui.rs`).
+  The recorded-enumeration core was extracted into one shared primitive,
+  `theory::enumerate_alien_solutions` (match each `(pattern, subject)` alien through the full seam, compose
+  by nested backtracking, snapshot bindings); the free `Sequence`, the S non-variable sub-pattern, and the
+  CUI argument pairings all route through it — no `match_pattern` "free-only islands" left. The S
+  bare-variable absorption path (fib/numbers) is untouched. Verified — `conformance/correctness-cross-theory.maude`.
 - **Residual (not C8).** A `match`/`xmatch` order caveat: AC/AU solution *sets* match the reference but the
   enumeration *order* differs in places (the deferred Diophantine order, set-compared per the B1 discipline);
   `reduce` counts conform because they use Maude's greedy first solution. **C5** (AC/`iter` *membership*-lhs
@@ -158,10 +166,10 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
   not membership-specific:** (a) **collapse matching** — when a membership pattern collapses under an
   identity (`mb a L : Lst` with `[id: nil]`), Maude also applies it to the collapsed sub-element (`a`,
   `L=nil`), so the *count* is higher than ours (sort/value still correct); Maude itself warns on such
-  patterns; the deferred `07` §collapse gap, which affects equations too. (b) a **theory-rooted sub-pattern
-  under an `iter` successor** (`mb s (a + X) : Foo`) still panics (loud, `s.rs:67` — the S theory's
-  sub-pattern isn't yet composed via `match_skeleton`); exotic (an AC/AU term directly under a numeric
-  successor). Neither blocks idiomatic membership specs.
+  patterns; the deferred `07` §collapse gap, which affects equations too. (b) ~~a theory-rooted sub-pattern
+  under an `iter` successor~~ — **now closed** as part of C8's uniform cross-theory composition (the S/CUI
+  directions): `mb s (a + X) : Foo` matches modulo AC under the successor. So only (a), collapse matching,
+  remains — and it never blocked idiomatic membership specs.
 - **C6 — Substitution-size / re-entrant reduce edge cases.** Deep/condition-nested reductions, the F-2
   engine-global GC root set (also a Phase-2 `rew`/`search` prerequisite — slot it here).
 

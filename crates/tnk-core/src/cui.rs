@@ -8,15 +8,17 @@
 //! two-argument node; **collapse matching** of `f(X,Y)` against a non-`f` subject (the `match`-command
 //! case `f(X,Y) <=? a`) is a follow-up.
 //!
-//! Each argument sub-pattern is matched with the free recursive matcher
-//! ([`Runtime::match_pattern`](crate::engine::Runtime)), which handles variables (including the
-//! non-linear `f(X, X)` via structural equality) and ground/nested-free subterms; theory sub-patterns
-//! under a CUI operator are a follow-up.
+//! Each argument sub-pattern is matched through the full [`LhsAutomaton`](crate::theory) seam (via
+//! [`enumerate_alien_solutions`](crate::theory::enumerate_alien_solutions)), so it may be a variable
+//! (including the non-linear `f(X, X)`), a ground/free subterm, **or a theory-rooted subterm** — the two
+//! arguments compose as a length-2 alien sequence, sharing the substitution. (Collapse matching of
+//! `f(X, Y)` against a non-`f` subject — the `match`-command case `f(X,Y) <=? a` — is still a follow-up.)
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
+use crate::theory::enumerate_alien_solutions;
 
 /// A compiled CUI left-hand side: the binary pattern `f(p1, p2)` plus the variable indices it binds.
 pub(crate) struct CuiLhs {
@@ -24,12 +26,10 @@ pub(crate) struct CuiLhs {
     p1: Term,
     p2: Term,
     var_indices: Vec<u32>,
-    /// Size for the scratch substitution used while trying a pairing (max variable index + 1).
-    local_size: u32,
 }
 
 impl CuiLhs {
-    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+    pub(crate) fn compile(lhs: Term, _sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("CUI lhs must be an application");
         let (p1, p2) = match lhs {
             Term::Op { args, .. } => {
@@ -44,41 +44,27 @@ impl CuiLhs {
         let mut var_indices = Vec::new();
         collect_vars(&p1, &mut var_indices);
         collect_vars(&p2, &mut var_indices);
-        let local_size = var_indices.iter().copied().max().map_or(0, |m| m + 1);
-        // CUI arguments are matched by the free matcher (handles variables, ground, nested-free), so
-        // a theory-rooted sub-pattern would fail silently — reject it loudly (composition follow-up).
-        assert!(
-            p1.is_free_matchable(sig) && p2.is_free_matchable(sig),
-            "a theory-rooted (ACU/AU/CUI) sub-pattern under a CUI operator is not yet supported: CUI \
-             arguments are matched by the free matcher, which fails silently on a theory subject \
-             (cross-theory composition is a follow-up)"
-        );
-        CuiLhs { symbol, p1, p2, var_indices, local_size }
+        CuiLhs { symbol, p1, p2, var_indices }
     }
 
-    /// Match the binary pattern against a CUI subject of the same operator, enumerating the (deduped)
-    /// commutative pairings. Reads only the runtime (no allocation — bindings are subject arguments).
-    pub(crate) fn match_(&self, rt: &Runtime, sig: &Signature, subject: DagId) -> Option<CuiSubproblem> {
+    /// Match the binary pattern against a CUI subject of the same operator. The two commutative pairings
+    /// are enumerated lazily in [`CuiSubproblem::next`] (each argument is matched through the full
+    /// matcher seam, which needs `&mut Runtime` for a theory-rooted argument); this phase only confirms
+    /// the subject is a CUI node of this operator and captures its two arguments.
+    pub(crate) fn match_(&self, rt: &Runtime, _sig: &Signature, subject: DagId) -> Option<CuiSubproblem> {
         let (s1, s2) = match &rt.node(subject).term {
             NodeTerm::Cui { symbol, args } if *symbol == self.symbol => (args[0], args[1]),
             _ => return None,
         };
-        let mut solutions: Vec<Vec<(u32, DagId)>> = Vec::new();
-        for (a, b) in [(s1, s2), (s2, s1)] {
-            let mut local = Subst::new();
-            local.reset(self.local_size);
-            if rt.match_pattern(sig, &self.p1, a, &mut local)
-                && rt.match_pattern(sig, &self.p2, b, &mut local)
-            {
-                let binding: Vec<(u32, DagId)> =
-                    self.var_indices.iter().map(|&i| (i, local.get(i).expect("bound"))).collect();
-                // The two pairings coincide for symmetric matches (e.g. `f(X, X) <=? f(a, a)`).
-                if !solutions.contains(&binding) {
-                    solutions.push(binding);
-                }
-            }
-        }
-        Some(CuiSubproblem { solutions, cursor: 0, bound: Vec::new() })
+        Some(CuiSubproblem {
+            p1: self.p1.clone(),
+            p2: self.p2.clone(),
+            var_indices: self.var_indices.clone(),
+            pairings: [(s1, s2), (s2, s1)],
+            solutions: None,
+            cursor: 0,
+            bound: Vec::new(),
+        })
     }
 }
 
@@ -98,30 +84,54 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
     }
 }
 
-/// A resumable enumerator over the (at most two) commutative pairings of a [`CuiLhs`]. Each solution
-/// is a precomputed list of bindings; [`next`](CuiSubproblem::next) installs the next one.
+/// A resumable enumerator over the (at most two, deduped) commutative pairings of a [`CuiLhs`]. The
+/// pairings are enumerated lazily on the first [`next`](CuiSubproblem::next) — each argument is matched
+/// through the full matcher seam, so a theory-rooted argument needs `&mut Runtime` — then replayed.
 pub(crate) struct CuiSubproblem {
-    solutions: Vec<Vec<(u32, DagId)>>,
+    p1: Term,
+    p2: Term,
+    var_indices: Vec<u32>,
+    pairings: [(DagId, DagId); 2],
+    /// Deduped pairing solutions; `None` until the first `next` enumerates them.
+    solutions: Option<Vec<Vec<(u32, DagId)>>>,
     cursor: usize,
     bound: Vec<u32>,
 }
 
 impl CuiSubproblem {
-    /// Install the next pairing's bindings into `subst`; `false` when exhausted. No allocation (the
-    /// bindings are subject arguments), so `rt`/`sig` are unused.
-    pub(crate) fn next(&mut self, _rt: &mut Runtime, _sig: &Signature, subst: &mut Subst) -> bool {
+    /// Install the next pairing's bindings into `subst`; `false` when exhausted. On the first call,
+    /// enumerate both commutative pairings — each as a length-2 alien sequence `[(p1, a), (p2, b)]` so
+    /// theory-rooted arguments and non-linear variables compose correctly — deduping symmetric matches.
+    pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         for &idx in &self.bound {
             subst.unbind(idx);
         }
         self.bound.clear();
-        if self.cursor >= self.solutions.len() {
-            return false;
+        if self.solutions.is_none() {
+            let mut sols: Vec<Vec<(u32, DagId)>> = Vec::new();
+            for (a, b) in self.pairings {
+                let aliens = [(self.p1.clone(), a), (self.p2.clone(), b)];
+                for sol in enumerate_alien_solutions(rt, sig, subst, &aliens, &self.var_indices) {
+                    // The two pairings coincide for symmetric matches (`f(X, X) <=? f(a, a)`).
+                    if !sols.contains(&sol) {
+                        sols.push(sol);
+                    }
+                }
+            }
+            self.solutions = Some(sols);
         }
-        for &(idx, b) in &self.solutions[self.cursor] {
+        let binds = {
+            let sols = self.solutions.as_ref().expect("just enumerated");
+            if self.cursor >= sols.len() {
+                return false;
+            }
+            sols[self.cursor].clone()
+        };
+        self.cursor += 1;
+        for &(idx, b) in &binds {
             subst.bind(idx, b);
             self.bound.push(idx);
         }
-        self.cursor += 1;
         true
     }
 
