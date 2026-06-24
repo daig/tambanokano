@@ -18,7 +18,8 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does), and
 > **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints).
 > Still open: **C13** (long-output line-wrapping — the C12 residual, lowest priority), **C7** (confirmed,
-> count-only, subject-DAG sharing), and the **C2 / C3 / C4 / C6** probes. The as-built records are the commits
+> count-only, subject-DAG sharing), and the **C3 / C4 / C6** probes (**C2** struck — Maude loops on
+> `eq a = a` too, so the F-1 no-op guard would *diverge*; see §2.3). The as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
 Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked B1 matcher items behind C8)
@@ -159,9 +160,19 @@ the REPL/pretty layer. Lowest-priority of the open items.
 ### 2.3 Unconfirmed candidate probes  *(write the differential test first)*
 
 Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed.
-- **C2 — F-1 no-op rewrite guard.** A self-rewriting `eq a = a` (or a rule producing an identical term): does
-  Maude detect the no-op and stop, or loop? We currently loop. Cheap if real; another spurious-non-termination
-  axis adjacent to C1's. (`07` §F-1.)
+- **C2 — F-1 no-op rewrite guard — STRUCK (no divergence; must NOT implement).** Differentially refuted
+  (2026-06-24): Maude **loops** on `eq a = a` and `eq f(X) = f(X)` exactly as we do — confirmed both
+  empirically (the reference binary prints the `reduce in …` echo then spins, no result; ours likewise) and
+  in the source. `DagNode::reduce` (`Interface/dagNode.hh:563`) is `while (!isReduced()) { if (!eqRewrite(…))
+  { setReduced(); … break; } }` — it exits *only* when `eqRewrite` returns false (no equation applied); and
+  `FreeSymbol::eqRewrite`→`discriminationNet.applyReplace` returns true on every applied equation, with **no**
+  `result == redex` short-circuit anywhere in the rewrite path. A non-terminating spec is *supposed* to loop,
+  and we already match Maude byte-for-byte up to the loop. **Adding the F-1 guard would make us halt where
+  Maude loops — a brand-new divergence — so it must not be added.** (F-1 was a Phase-0 *robustness* suggestion,
+  not a conformance requirement; it is incompatible with the byte-faithfulness goal.) The real robustness
+  concern it gestured at is **interruptibility** — Maude aborts a runaway `reduce` on SIGINT back to the
+  prompt, whereas our REPL can't yet interrupt an in-progress reduce. That is a separate, legitimate item
+  (signal-checked reduce loop), tracked apart from the (rejected) no-op guard. Not fixture-able (it loops).
 - **C3 — Non-confluent / order-dependent membership & equation application.** Incomparable applicable
   membership targets, or owise/condition interplay where application order is observable. Confirm our
   smallest-first order matches Maude's beyond the locked cases.
@@ -196,8 +207,9 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
 4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
    already open.
-5. **C2–C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has a
-   confirmed repro from the C9–C11 sweep).
+5. **C3 / C4 / C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has
+   a confirmed repro from the C9–C11 sweep; **C2 struck** — refuted: Maude loops on `eq a = a` too, so the
+   F-1 guard would make us diverge by halting).
 6. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
    *and* a prerequisite for bounded-memory `rew`/`search` in Phase 2 (folded into C6).
 7. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
