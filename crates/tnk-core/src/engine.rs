@@ -264,6 +264,14 @@ pub(crate) struct Runtime {
     gc_interval: Option<u64>,
     /// DAG nodes allocated since the last collection (drives `gc_interval`).
     allocs_since_gc: u64,
+    /// Engine-global GC roots that protect the **outer** reduction's working set across a re-entrant
+    /// condition reduction (F-2). A condition fragment is evaluated by calling [`reduce`](Self::reduce)
+    /// again; that nested reduce's [`safe_point_gc`](Self::safe_point_gc) can only see *its own* frame
+    /// stack, so [`condition_holds`](Self::condition_holds) pushes the outer frames' roots + match
+    /// bindings + redex here for the duration of the solve (Maude marks from all active rewriting
+    /// contexts). `safe_point_gc` marks everything here in addition to the current stack. Used only when
+    /// `gc_interval` is `Some` (otherwise GC never fires, so the vec stays empty — no overhead off-path).
+    protected: Vec<DagId>,
 }
 
 #[derive(Default)]
@@ -832,7 +840,7 @@ impl Runtime {
     /// term an equation reduces away is never constrained (no over-count; a `cmb` whose condition loops
     /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
     /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
-    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>) {
+    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
         let symbol = self.node(id).symbol();
         let Some(constraints) = sig.memberships.get(&symbol) else { return };
         loop {
@@ -843,7 +851,7 @@ impl Runtime {
                 if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
                     continue;
                 }
-                if let Some(bindings) = self.membership_applies(sig, sc, id) {
+                if let Some(bindings) = self.membership_applies(sig, sc, id, frames) {
                     // Record BEFORE mutating the sort: the event captures the *old* (current) sort.
                     if self.tracing() {
                         let depth = self.condition_depth;
@@ -882,6 +890,7 @@ impl Runtime {
         sig: &Signature,
         sc: &SortConstraint,
         id: DagId,
+        frames: &[ReduceFrame],
     ) -> Option<Vec<Option<DagId>>> {
         let mut subst = Subst::new();
         subst.reset(sc.nr_vars);
@@ -900,8 +909,15 @@ impl Runtime {
                     bindings,
                 });
             }
-            let holds =
-                self.condition_holds(sig, &sc.condition, &mut subst, StmtKind::Membership, sc.id);
+            let holds = self.condition_holds(
+                sig,
+                &sc.condition,
+                &mut subst,
+                StmtKind::Membership,
+                sc.id,
+                frames,
+                id,
+            );
             if self.tracing() {
                 self.record(TraceEvent::TrialEnd {
                     kind: StmtKind::Membership,
@@ -1010,18 +1026,19 @@ impl Runtime {
     /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
     /// across two separate strat frames* in one reduction would be refined once per frame — a documented
     /// edge requiring DAG sharing that `build_dag` never produces; see `docs/migration/09`.)
-    fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>) {
+    fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>, frames: &[ReduceFrame]) {
         if self.node(id).reduced_epoch == sig.eq_epoch() || !seen.insert(id) {
             return; // already at its true sort, or already refined in this pass
         }
         let children: Vec<DagId> = self.node(id).children().collect();
         for c in children {
-            self.compute_true_sort(sig, c, seen);
+            self.compute_true_sort(sig, c, seen, frames);
         }
         let base = self.compute_base_sort(sig, id);
         self.dags.get_mut(id).sort = base;
-        // No reduce frame here (this is off the main stack), so no `Whole:` reconstruction — `None`.
-        self.constrain_to_smaller_sort(sig, id, None);
+        // No reduce frame here (this is off the main stack), so no `Whole:` reconstruction — `None`. `frames`
+        // is the enclosing reduce's stack: an F-2 root set for a `cmb` condition that re-enters `reduce`.
+        self.constrain_to_smaller_sort(sig, id, None, frames);
     }
 
     /// Convenience for a constant (an arity-0 symbol).
@@ -1368,6 +1385,16 @@ impl Runtime {
                 self.mark_reachable(id);
             }
         }
+        // F-2: the outer reduction(s)' working set, protected across any re-entrant condition reduce we
+        // are nested inside (`condition_holds` pushed it). Without this a nested condition-GC would sweep
+        // the outer frames' siblings / match bindings / redex. (Cloned to release the borrow before
+        // `mark_reachable` takes `&mut self`; empty — a no-op — unless we are inside a condition.)
+        if !self.protected.is_empty() {
+            let protected = self.protected.clone();
+            for id in protected {
+                self.mark_reachable(id);
+            }
+        }
         self.dags.sweep(|_| {});
     }
 
@@ -1477,7 +1504,7 @@ impl Runtime {
                 let args = stack.last().expect("empty reduce stack").args.clone();
                 let mut seen = HashSet::new();
                 for arg in args {
-                    self.compute_true_sort(sig, arg, &mut seen);
+                    self.compute_true_sort(sig, arg, &mut seen, &stack);
                 }
             }
 
@@ -1506,7 +1533,7 @@ impl Runtime {
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
-            if let Some(next) = self.try_rewrite_top(sig, rebuilt) {
+            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack) {
                 self.rewrite_count += 1;
                 // Faithful `set trace whole`: reconstruct the whole root term before/after this top
                 // rewrite (the redex `rebuilt` / result `next` threaded up through the ancestor frames)
@@ -1537,7 +1564,7 @@ impl Runtime {
                 // render Maude's `Whole:` line. Gated — allocates O(depth) only when whole-tracing.
                 let whole = (self.record_whole && self.tracing())
                     .then(|| self.reconstruct_whole(sig, &stack, rebuilt));
-                self.constrain_to_smaller_sort(sig, rebuilt, whole);
+                self.constrain_to_smaller_sort(sig, rebuilt, whole, &stack);
             }
             // `rebuilt` is a normal form: stamp it canonical and hand it up (or return it as root).
             self.dags.get_mut(rebuilt).reduced_epoch = sig.eq_epoch();
@@ -1633,7 +1660,7 @@ impl Runtime {
         (0..subst.len()).map(|i| subst.get(i)).collect()
     }
 
-    fn try_rewrite_top(&mut self, sig: &Signature, id: DagId) -> Option<DagId> {
+    fn try_rewrite_top(&mut self, sig: &Signature, id: DagId, frames: &[ReduceFrame]) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
         // they are tried before user equations and fall through (`None`) on no-match. The `&SpecialOp`
@@ -1666,10 +1693,10 @@ impl Runtime {
         // only when the first found nothing — for a node with no equations the early `?` above skips both.
         // Equation rewrites (and the conditional trial/fragment events) are recorded inside
         // `try_equations`, where the eq id + substitution are in scope.
-        if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false) {
+        if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
             return Some(r);
         }
-        self.try_equations(sig, id, eqs, ext_allowed, true)
+        self.try_equations(sig, id, eqs, ext_allowed, true, frames)
     }
 
     /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
@@ -1686,6 +1713,7 @@ impl Runtime {
         eqs: &[CompiledEquation],
         ext_allowed: bool,
         owise: bool,
+        frames: &[ReduceFrame],
     ) -> Option<DagId> {
         let mut subst = Subst::new();
         for eq in eqs {
@@ -1711,8 +1739,15 @@ impl Runtime {
                             bindings,
                         });
                     }
-                    let holds =
-                        self.condition_holds(sig, &eq.condition, &mut subst, StmtKind::Equation, eq.id);
+                    let holds = self.condition_holds(
+                        sig,
+                        &eq.condition,
+                        &mut subst,
+                        StmtKind::Equation,
+                        eq.id,
+                        frames,
+                        id,
+                    );
                     if self.tracing() {
                         self.record(TraceEvent::TrialEnd {
                             kind: StmtKind::Equation,
@@ -1752,12 +1787,17 @@ impl Runtime {
     /// Whether every fragment of `condition` holds under the matched substitution `subst` — the B2.3
     /// condition check the rewrite driver runs before accepting a solution (empty condition ⇒ `true`).
     ///
-    /// Each fragment is evaluated by **re-entrant reduction** of its instantiated term(s). **F-2
-    /// mitigation:** safe-point GC is disabled for the duration — a nested `reduce`'s safe points
-    /// cannot see the *outer* reduction's in-flight frames / `Subst` / AC residue, so collecting here
-    /// would sweep them; not collecting during this window eliminates the hazard. (Bounded-memory
-    /// condition reduction via an engine-global active-frame root set is the remaining follow-up; the
-    /// temporaries are reclaimed at the next outer safe point once GC is restored.)
+    /// Each fragment is evaluated by **re-entrant reduction** of its instantiated term(s). **F-2 (the
+    /// engine-global active-frame root set):** that nested `reduce`'s [`safe_point_gc`](Self::safe_point_gc)
+    /// only sees its *own* frame stack, so before solving we push the **outer** reduction's working set —
+    /// each ancestor frame's `original` (transitively its unreduced children) and strategy-reduced `args`,
+    /// the match `subst` bindings, and the `redex` — onto [`protected`](Self::protected), which
+    /// `safe_point_gc` also marks (Maude marks from all active rewriting contexts). Nested conditions stack
+    /// further roots; each pops its own on return. In-reduction GC therefore stays *enabled* during a
+    /// condition (bounded memory — the condition's own garbage is reclaimed) without sweeping outer state.
+    /// Gated on `gc_interval`: with GC off the vec is never read, so we skip the push entirely (the default
+    /// REPL path is unchanged). `frames` is the outer reduce's stack; `redex` the node being rewritten/tested.
+    #[allow(clippy::too_many_arguments)]
     fn condition_holds(
         &mut self,
         sig: &Signature,
@@ -1765,14 +1805,30 @@ impl Runtime {
         subst: &mut Subst,
         kind: StmtKind,
         stmt_id: u32,
+        frames: &[ReduceFrame],
+        redex: DagId,
     ) -> bool {
         if condition.is_empty() {
             return true;
         }
-        let saved_gc = self.gc_interval;
-        self.gc_interval = None;
+        let restore = self.gc_interval.is_some().then(|| {
+            let base = self.protected.len();
+            for f in frames {
+                self.protected.push(f.original);
+                self.protected.extend_from_slice(&f.args);
+            }
+            for i in 0..subst.len() {
+                if let Some(b) = subst.get(i) {
+                    self.protected.push(b);
+                }
+            }
+            self.protected.push(redex);
+            base
+        });
         let holds = self.solve_condition(sig, condition, 0, subst, kind, stmt_id);
-        self.gc_interval = saved_gc;
+        if let Some(base) = restore {
+            self.protected.truncate(base);
+        }
         holds
     }
 
@@ -1840,10 +1896,15 @@ impl Runtime {
         // `depth + 1` (gated by `set trace condition`).
         match frag {
             CompiledFragment::Equality { lhs, rhs } => {
-                let l = self.instantiate(sig, lhs, subst);
-                let r = self.instantiate(sig, rhs, subst);
+                // F-2: reduce each side, pinning the reduced `l` across `r`'s reduction — under
+                // in-reduction GC, `l` is live only in this native local while `r` reduces, so a nested
+                // safe point would otherwise sweep it. `r` is instantiated *after* `l`'s reduce, so nothing
+                // unrooted is live during `l`'s reduction either.
                 self.condition_depth += 1;
+                let l = self.instantiate(sig, lhs, subst);
                 let l = self.reduce(sig, l);
+                let _root_l = self.root(l);
+                let r = self.instantiate(sig, rhs, subst);
                 let r = self.reduce(sig, r);
                 self.condition_depth -= 1;
                 let holds = self.deep_equal(l, r);
@@ -1880,6 +1941,10 @@ impl Runtime {
                 self.condition_depth += 1;
                 let subj = self.reduce(sig, subj);
                 self.condition_depth -= 1;
+                // F-2: `subj` — and the fresh-var bindings, which are its subterms — must survive the
+                // pattern match and the recursive solve of the later fragments, both of which reduce under
+                // in-reduction GC; pin it for the rest of this fragment.
+                let _root_subj = self.root(subj);
                 for &fv in fresh_vars {
                     subst.unbind(fv); // fresh slate, so a backtracking re-entry rebinds cleanly
                 }
@@ -4942,5 +5007,112 @@ mod tests {
         let _ = e.reduce(big_sum);
 
         assert_eq!(decode(&e, g.get(), zero, s), 4, "the rooted result survives intact");
+    }
+
+    /// F-2 (engine-global condition-reduce root set): with in-reduction GC on, a re-entrant condition
+    /// reduction must NOT sweep the OUTER reduction's live state. Reducing `pair(a, cond(b))` (`a`, `b`
+    /// distinct numerals): reducing `cond(b)` fires a conditional equation whose condition reduces
+    /// `b + b` on both sides (allocating enough to trigger several collections), during which `pair`'s
+    /// already-reduced first argument `a` is live ONLY in the outer reduce frame. Before the fix the
+    /// hazard was avoided by disabling GC for the whole condition (unbounded memory); now GC stays on and
+    /// `condition_holds` protects the outer frame + bindings + redex, so `a` survives and the result is
+    /// `pair(a, b)` intact. (Without the protected root set a nested collection would reclaim `a`, leaving
+    /// a dangling/reused id — `decode` would then panic or read the wrong value.)
+    #[test]
+    fn safe_point_gc_during_condition_preserves_outer_frame() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+        let pair = e.add_op("pair", vec![nat, nat], nat); // a free ctor, no equations
+        // cond(X) = X  if  X + X = X + X  — the condition reduces X + X on both sides (allocating), so a
+        // nested safe-point GC fires *inside* it; the equality always holds, so cond(X) → X.
+        let cond = e.add_op("cond", vec![nat], nat);
+        let x = Term::var(0, nat);
+        e.add_conditional_equation(
+            Term::op(cond, vec![x.clone()]),
+            x.clone(),
+            1,
+            vec![ConditionFragment::Equality {
+                lhs: Term::op(plus, vec![x.clone(), x.clone()]),
+                rhs: Term::op(plus, vec![x.clone(), x.clone()]),
+            }],
+        );
+        e.set_gc_interval(Some(20)); // collect frequently — several times within the condition reduce
+
+        // Distinct values (so `a` and `b` are distinct nodes): `a` lives only in `pair`'s frame while
+        // `cond(b)`'s condition reduces.
+        let a = numeral(&mut e, zero, s, 100);
+        let b = numeral(&mut e, zero, s, 120);
+        let cb = e.make_free(cond, vec![b]);
+        let subj = e.make_free(pair, vec![a, cb]);
+        let r = e.reduce(subj);
+
+        let children: Vec<DagId> = e.node(r).children().collect();
+        assert_eq!(children.len(), 2, "pair keeps its two arguments");
+        assert_eq!(decode(&e, children[0], zero, s), 100, "outer-frame sibling survived the condition GC");
+        assert_eq!(decode(&e, children[1], zero, s), 120, "cond(b) reduced to b");
+    }
+
+    /// F-2, matching (`:=`) condition variant: locks the `solve_condition` *matching* arm's rooting of the
+    /// reduced subject — and thus the fresh-var bindings, which are its subterms — across the recursive
+    /// solve, under in-reduction GC (a distinct path from the equality arm above). `pickm(X) = Y if
+    /// Y := X + X` returns `X + X`; reducing `pickm(b)` reduces `b + b` (allocating → GC fires), and
+    /// `pair`'s sibling `a` (outer frame), the subject `b + b`, and the matched `Y` must all survive.
+    #[test]
+    fn safe_point_gc_during_matching_condition() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let zero = e.add_op("0", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op("+", vec![nat, nat], nat);
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(zero)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+        let pair = e.add_op("pair", vec![nat, nat], nat);
+        let pickm = e.add_op("pickm", vec![nat], nat);
+        // pickm(X) = Y  if  Y := X + X  — the `:=` reduces `X + X` (allocating) and binds the fresh `Y` to it.
+        e.add_conditional_equation(
+            Term::op(pickm, vec![Term::var(0, nat)]),
+            Term::var(1, nat),
+            2,
+            vec![ConditionFragment::Matching {
+                pattern: Term::var(1, nat),
+                subject: Term::op(plus, vec![Term::var(0, nat), Term::var(0, nat)]),
+                fresh_vars: vec![1],
+            }],
+        );
+        e.set_gc_interval(Some(20));
+
+        let a = numeral(&mut e, zero, s, 100);
+        let b = numeral(&mut e, zero, s, 60);
+        let pb = e.make_free(pickm, vec![b]);
+        let subj = e.make_free(pair, vec![a, pb]);
+        let r = e.reduce(subj);
+
+        let children: Vec<DagId> = e.node(r).children().collect();
+        assert_eq!(children.len(), 2, "pair keeps its two arguments");
+        assert_eq!(decode(&e, children[0], zero, s), 100, "outer-frame sibling survived the condition GC");
+        assert_eq!(decode(&e, children[1], zero, s), 120, "pickm(b) = b + b = 120 (matched subject survived)");
     }
 }
