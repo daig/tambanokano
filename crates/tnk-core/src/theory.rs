@@ -32,13 +32,15 @@ use crate::term::{Subst, Term};
 /// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
 /// automata and are pure additions behind this type.
 pub(crate) enum LhsAutomaton {
-    /// Free theory: matched by direct structural recursion ([`Engine::match_pattern`]). The pattern
-    /// is stored as-is; compiling it to a discrimination net is a later performance optimization that
-    /// does not change this seam. Single-solution **only while every argument is itself free**: once
-    /// alien sub-theory arguments appear (e.g. an AC subterm), this arm recurses to the alien boundary
-    /// and composes the children's subproblems (a future `Sequence` arm) instead of always returning
-    /// [`Subproblem::FreeOnce`].
+    /// Free theory, **all-free** pattern: matched by direct structural recursion
+    /// ([`Engine::match_pattern`]), a single deterministic solution. The hot path (this is what `fib`
+    /// and the prelude use); compiling it to a discrimination net is a later performance step.
     Free(Term),
+    /// Free-theory top with a **theory-rooted (alien) subterm** (`f(a + b)`, AC `+` under free `f`):
+    /// matched via [`Runtime::match_skeleton`] (free skeleton + variables) composing the aliens'
+    /// subproblems into a [`Subproblem::Sequence`] (C8). Separate from [`Free`](LhsAutomaton::Free) so
+    /// the all-free path stays a plain single-solution match.
+    FreeWithAliens(Term),
     /// ACU theory (`assoc comm [id:]`): multiset matching, genuinely multi-solution.
     Acu(AcuLhs),
     /// AU theory (`assoc [id:]`, not commutative): ordered-sequence matching with extension.
@@ -57,19 +59,13 @@ impl LhsAutomaton {
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
             Some(Theory::S) => LhsAutomaton::S(SLhs::compile(lhs, sig)),
-            _ => {
-                // Free-theory (or bare-variable) top. The recursive free matcher cannot see a
-                // theory-rooted subterm, so a pattern like `f(a + b)` (AC `+` under free `f`) would
-                // silently never fire. Reject it loudly until cross-theory composition (the
-                // `Sequence` arm) lands — the symmetric twin of the alien-under-AC assert.
-                assert!(
-                    lhs.is_free_matchable(sig),
-                    "unsupported pattern: a theory-rooted (ACU/AU/CUI) subterm appears under a free \
-                     operator, where the recursive free matcher would silently fail to match it. \
-                     Cross-theory pattern composition (the `Sequence` arm) is a B1 follow-up."
-                );
-                LhsAutomaton::Free(lhs)
-            }
+            // Free-theory (or bare-variable) top. An all-free pattern is the deterministic
+            // single-solution match (`match_pattern`); a theory-rooted subterm under it (`f(a + b)`, AC
+            // `+` under free `f`) takes the C8 cross-theory path (`match_skeleton` + a
+            // [`Subproblem::Sequence`] composing the alien sub-automata), kept a separate variant so the
+            // free hot path pays nothing for it.
+            _ if lhs.is_free_matchable(sig) => LhsAutomaton::Free(lhs),
+            _ => LhsAutomaton::FreeWithAliens(lhs),
         }
     }
 
@@ -93,6 +89,14 @@ impl LhsAutomaton {
             LhsAutomaton::Free(pat) => rt
                 .match_pattern(sig, pat, subject, subst)
                 .then_some(Subproblem::FreeOnce { pending: true }),
+            LhsAutomaton::FreeWithAliens(pat) => {
+                // Match the free skeleton (binding the free variables), collecting the theory-rooted
+                // alien subterms, then compose their subproblems into a Sequence (C8). The skeleton is
+                // deterministic; the aliens are the multi-solution part.
+                let mut aliens = Vec::new();
+                rt.match_skeleton(sig, pat, subject, subst, &mut aliens)
+                    .then(|| Subproblem::Sequence(SequenceSubproblem::new(aliens)))
+            }
             LhsAutomaton::Acu(lhs) => {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
             }
@@ -125,6 +129,9 @@ pub(crate) enum Subproblem {
     Cui(CuiSubproblem),
     /// S theory: the (lazy) successor-extension solutions (see [`SSubproblem`]).
     S(SSubproblem),
+    /// Cross-theory composition (C8): the theory-rooted alien subterms of a free-rooted pattern, matched
+    /// recursively and composed (Maude's `SubproblemSequence`). See [`SequenceSubproblem`].
+    Sequence(SequenceSubproblem),
 }
 
 impl Subproblem {
@@ -140,6 +147,7 @@ impl Subproblem {
             Subproblem::Au(sp) => sp.next(rt, sig, subst),
             Subproblem::Cui(sp) => sp.next(rt, sig, subst),
             Subproblem::S(sp) => sp.next(rt, sig, subst),
+            Subproblem::Sequence(sp) => sp.next(rt, sig, subst),
         }
     }
 
@@ -154,7 +162,105 @@ impl Subproblem {
             Subproblem::Au(sp) => sp.build_result(rt, sig, rhs),
             Subproblem::Cui(sp) => sp.build_result(rt, sig, rhs),
             Subproblem::S(sp) => sp.build_result(rt, sig, rhs),
+            // A free-rooted match consumes the whole subject (no extension), so the result is just rhs.
+            Subproblem::Sequence(_) => rhs,
         }
+    }
+}
+
+/// The C8 cross-theory composition: a free-rooted pattern's **theory-rooted alien subterms** (collected
+/// by [`Runtime::match_skeleton`] as `(pattern, subject)` pairs) matched recursively and composed —
+/// Maude's `SubproblemSequence`. Each alien is matched by its own [`LhsAutomaton`] against its subject
+/// subterm, sharing the substitution (so a variable shared across aliens / the free skeleton stays
+/// consistent). The combinations are enumerated by nested backtracking on the first `next` (needs
+/// `&mut Runtime` to drive the sub-automata) and replayed one per `next`, mirroring the ACU/AU paths.
+pub(crate) struct SequenceSubproblem {
+    aliens: Vec<(Term, DagId)>,
+    /// The alien sub-patterns' variable indices, captured into each recorded solution.
+    alien_var_indices: Vec<u32>,
+    /// Fully-built solutions (each a variable-binding snapshot); `None` until the first `next`.
+    recorded: Option<Vec<Vec<(u32, DagId)>>>,
+    rec_cursor: usize,
+    bound: Vec<u32>,
+}
+
+impl SequenceSubproblem {
+    fn new(aliens: Vec<(Term, DagId)>) -> Self {
+        let mut alien_var_indices = Vec::new();
+        for (t, _) in &aliens {
+            collect_vars(t, &mut alien_var_indices);
+        }
+        SequenceSubproblem { aliens, alien_var_indices, recorded: None, rec_cursor: 0, bound: Vec::new() }
+    }
+
+    fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
+        for &idx in &self.bound {
+            subst.unbind(idx);
+        }
+        self.bound.clear();
+        if self.recorded.is_none() {
+            let sols = self.enumerate(rt, sig, subst);
+            self.recorded = Some(sols);
+        }
+        let binds = {
+            let recorded = self.recorded.as_ref().expect("just enumerated");
+            if self.rec_cursor >= recorded.len() {
+                return false;
+            }
+            recorded[self.rec_cursor].clone()
+        };
+        self.rec_cursor += 1;
+        for &(idx, b) in &binds {
+            subst.bind(idx, b);
+            self.bound.push(idx);
+        }
+        true
+    }
+
+    /// Enumerate every combination of the aliens' solutions (nested backtracking, shared scratch seeded
+    /// from `base` so the free skeleton's variable bindings are respected).
+    fn enumerate(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<Vec<(u32, DagId)>> {
+        let mut out = Vec::new();
+        let mut scratch = base.clone();
+        self.rec(0, rt, sig, &mut scratch, &mut out);
+        out
+    }
+
+    fn rec(
+        &self,
+        idx: usize,
+        rt: &mut Runtime,
+        sig: &Signature,
+        scratch: &mut Subst,
+        out: &mut Vec<Vec<(u32, DagId)>>,
+    ) {
+        if idx == self.aliens.len() {
+            let snap =
+                self.alien_var_indices.iter().filter_map(|&i| scratch.get(i).map(|b| (i, b))).collect();
+            out.push(snap);
+            return;
+        }
+        let (pat, subj) = &self.aliens[idx];
+        let automaton = LhsAutomaton::compile(pat.clone(), sig);
+        let checkpoint = scratch.clone();
+        if let Some(mut sp) = automaton.match_(rt, sig, *subj, scratch, false) {
+            while sp.next(rt, sig, scratch) {
+                self.rec(idx + 1, rt, sig, scratch, out);
+            }
+        }
+        *scratch = checkpoint;
+    }
+}
+
+/// Collect the distinct variable indices in a pattern (an alien's internal bindings to capture).
+fn collect_vars(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
     }
 }
 

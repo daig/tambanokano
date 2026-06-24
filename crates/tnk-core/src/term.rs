@@ -206,6 +206,56 @@ impl Runtime {
         }
     }
 
+    /// Match the **free skeleton** of `pat` against `subject`, binding the free variables and recording
+    /// each **theory-rooted** sub-pattern (an "alien" under a free operator — e.g. `a X` under `f`) as a
+    /// `(pattern, subject)` pair into `aliens` rather than matching it here (it is multi-solution and
+    /// matched later by its own automaton, composed into a [`Subproblem::Sequence`]). Returns `false`
+    /// if the free structure / variable sorts don't match. Used by the C8 free-with-aliens path; an
+    /// all-free pattern leaves `aliens` empty and behaves exactly like [`match_pattern`](Self::match_pattern).
+    pub(crate) fn match_skeleton(
+        &self,
+        sig: &Signature,
+        pat: &Term,
+        subject: DagId,
+        subst: &mut Subst,
+        aliens: &mut Vec<(Term, DagId)>,
+    ) -> bool {
+        match pat {
+            Term::Var(v) => match subst.get(v.index) {
+                Some(bound) => self.deep_equal(bound, subject),
+                None => {
+                    if sig.sorts().leq(self.sort_of(subject), v.sort) {
+                        subst.bind(v.index, subject);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
+            // A theory-rooted sub-pattern is an alien: record it (with its subject subterm) for the
+            // Sequence to match recursively; the recursive free matcher can't enumerate its solutions.
+            Term::Op { symbol, .. } if sig.symbol(*symbol).theory() != Theory::Free => {
+                aliens.push((pat.clone(), subject));
+                true
+            }
+            Term::Op { symbol, args } => match &self.node(subject).term {
+                NodeTerm::Free { symbol: ssym, args: sargs } => {
+                    *ssym == *symbol
+                        && sargs.len() == args.len()
+                        && args
+                            .iter()
+                            .zip(sargs.iter())
+                            .all(|(p, &s)| self.match_skeleton(sig, p, s, subst, aliens))
+                }
+                NodeTerm::Acu { .. }
+                | NodeTerm::Au { .. }
+                | NodeTerm::Cui { .. }
+                | NodeTerm::S { .. }
+                | NodeTerm::Na { .. } => false,
+            },
+        }
+    }
+
     /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
     ///
     /// Iterative (explicit pair-stack) for the same reason as [`Engine::reduce`]: the recursive form

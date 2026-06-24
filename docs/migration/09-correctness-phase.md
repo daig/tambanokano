@@ -50,7 +50,7 @@ priority ranks.
 
 ### 2.1 Confirmed — evaluator
 
-#### C8 — Cross-theory "alien subterm" matching  **[HIGH severity — was panics on idiomatic input]**
+#### C8 — Cross-theory "alien subterm" matching  **[DONE — was a HIGH-severity panic]**
 
 A pattern lhs with a **non-ground, non-variable subterm under an AC/AU operator** — or a theory-rooted
 subterm under a free operator — (an "alien" in Maude's terms) was unsupported: a **loud panic at module
@@ -75,13 +75,18 @@ subproblem is the backtracking closure for `match`/conditions (set-compared, so 
   analog of the ACU skip). Verified vs the reference — `conformance/correctness-au-alien.maude`. The order
   (leftmost-alien / maximal-collector) falls out of ascending enumeration + the stable maximal-matched-first
   sort = Maude's greedy order.
-- **REMAINING.** **Theory subterm under a *free* op** — `theory.rs:65` still panics on e.g. `eq f(a X) = X`
-  (`a X` an AU term under free `f`); needs the free matcher (`Engine::match_pattern` / the `Free` automaton)
-  to compose alien sub-automata (Maude's `FreeLhsAutomaton::nonGroundAliens` + the `Sequence` arm). Same
-  `NonGroundAlien` mechanism, now under a free top. (A `match`/`xmatch` order caveat: AC/AU solution *sets*
-  match the reference but the enumeration *order* still differs in places — the deferred Diophantine order,
-  set-compared per the B1 discipline; `reduce` counts conform because they use Maude's greedy first solution.)
-- **C5** (AC/`iter` *membership*-lhs matching) is the membership-side cousin and shares this machinery.
+- **Free-top direction — DONE.** A theory-rooted subterm under a free op (`eq f(a X) = X` AU, `eq g(a ; X)
+  = X` AC, `eq h(a X, b Y) = X Y` two aliens) now matches. The `theory.rs:65` guard is gone:
+  `Runtime::match_skeleton` matches the free skeleton + binds variables and collects the theory-rooted
+  aliens as `(pattern, subject)` pairs; a new `LhsAutomaton::FreeWithAliens` + `Subproblem::Sequence`
+  (`SequenceSubproblem`) composes their sub-automata by nested backtracking (Maude's `SubproblemSequence`).
+  The all-free hot path stays a separate `Free` variant on `match_pattern` (fib untouched). Verified —
+  `conformance/correctness-free-alien.maude`.
+- **Residual (not C8).** A `match`/`xmatch` order caveat: AC/AU solution *sets* match the reference but the
+  enumeration *order* differs in places (the deferred Diophantine order, set-compared per the B1 discipline);
+  `reduce` counts conform because they use Maude's greedy first solution. **C5** (AC/`iter` *membership*-lhs
+  matching) is the membership-side cousin sharing this machinery — still open. The single-element ACU collapse
+  with identity (`s M + N <=? s e`) is a separate pre-existing deferred match-only gap (`07` §collapse).
 
 #### C7 — Subject-DAG sharing of repeated subterms  **[confirmed, count-only]**
 
@@ -153,8 +158,8 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
 
 ## 3. Sequencing
 
-1. **C8 first** — it *panics* on idiomatic AC/AU specs; highest severity, and it shares matcher work with
-   **C5**, so do them together. Largest item in the phase.
+1. **C8 — DONE** (was the highest-severity item, a panic on idiomatic AC/AU/free specs). It shares matcher
+   machinery with **C5** (AC/`iter` membership-lhs matching), which is the natural next pickup.
 2. **C9–C11** (frontend fidelity) — cheap and independent; C10 (glued-minus lexer) is the smallest, C9
    (float printer) the most load-bearing for Phase 2's prelude.
 3. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is

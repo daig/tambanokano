@@ -3708,12 +3708,12 @@ mod tests {
         assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c + c), not b + c");
     }
 
-    /// Audit F-A guard: a theory-rooted (AC) subterm under a *free* operator in a pattern is rejected
-    /// **loudly** — the recursive free matcher would otherwise silently fail to match it, leaving the
-    /// equation quietly dead. Cross-theory pattern composition (the `Sequence` arm) is a B1 follow-up.
+    /// C8: a theory-rooted (AC) subterm under a *free* operator is matched via the cross-theory
+    /// `Sequence` arm — the free skeleton (`f(_)`) binds, the AC alien `a + b` is matched recursively.
+    /// `eq f(a + b) = cc` fires on `f(b + a)` (the `+` canonicalizes). Was a loud guard ("theory-rooted
+    /// … not yet supported"); == the reference binary (`cc`, 1 rewrite).
     #[test]
-    #[should_panic(expected = "theory-rooted")]
-    fn free_pattern_over_theory_subterm_is_rejected() {
+    fn free_pattern_over_theory_subterm_matches() {
         let (mut e, s, a, b, _c, plus) = ac_ctx();
         let c = e.add_op("cc", vec![], s);
         let f = e.add_op("f", vec![s], s); // free, unary
@@ -3723,6 +3723,12 @@ mod tests {
             rhs: Term::constant(c),
             nr_vars: 0,
         });
+        let (a0, b0) = (e.make_const(a), e.make_const(b));
+        let ba = e.make_ac(plus, vec![b0, a0]); // b + a  → canonical a + b
+        let subject = e.make_free(f, vec![ba]); // f(b + a)
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "f(a + b) = cc fires once");
+        assert_eq!(e.node(r).symbol(), c, "result is cc");
     }
 
     /// The guard's boundary: a *variable* over a theory subject is fine (it binds the whole AC node),

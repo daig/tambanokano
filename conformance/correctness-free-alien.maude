@@ -1,0 +1,27 @@
+*** Phase 1.5 / C8 — a theory-rooted subterm under a FREE operator, conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-free-alien.maude < /dev/null
+***
+*** The cross-theory `Sequence` arm: a free operator wrapping an AC/AU argument pattern (`f(a X)`,
+*** `g(a ; X)`). The free skeleton binds deterministically; each theory-rooted "alien" subterm is matched
+*** recursively by its own automaton and composed (Maude's SubproblemSequence). Was a loud panic
+*** (theory.rs:65). Mirrors the engine.rs C8 test.
+
+fmod FREE-ALIEN is
+  sort E .
+  ops a b c : -> E [ctor] .
+  op nil : -> E [ctor] .
+  op __ : E E -> E [assoc id: nil] .       *** AU (lists)
+  op _;_ : E E -> E [assoc comm] .          *** AC (multisets)
+  op f : E -> E .
+  op g : E -> E .
+  op h : E E -> E .
+  vars X Y : E .
+  eq f(a X) = X .            *** AU subterm under free f
+  eq g(a ; X) = X .          *** AC subterm under free g
+  eq h(a X, b Y) = X Y .     *** two AU aliens under free h (one per argument)
+endfm
+red f(a b c) .              *** b c, 1 rewrite
+red f(b c) .                *** f(b c), 0 rewrites (head is not a)
+red g(a ; b ; c) .          *** b ; c, 1 rewrite
+red g(b ; c) .              *** g(b ; c), 0 rewrites
+red h(a c, b a) .           *** c a, 1 rewrite (X = c, Y = a)

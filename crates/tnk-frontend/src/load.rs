@@ -615,6 +615,23 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C8 — a theory-rooted subterm under a FREE operator (the cross-theory `Sequence`
+    /// arm): `eq f(a X) = X` (AU arg) and `eq g(a ; X) = X` (AC arg). The free skeleton binds; the alien
+    /// subterm is matched recursively. Was a panic (theory.rs:65). Byte-identical to the reference.
+    #[test]
+    fn correctness_free_alien_conforms() {
+        conform(
+            conformance_file!("correctness-free-alien.maude"),
+            &[
+                e("E", "b c", 1),       // f(a b c) — AU alien under free f
+                e("E", "f(b c)", 0),    // f(b c)   — no match (head is not a)
+                e("E", "b ; c", 1),     // g(a ; b ; c) — AC alien under free g
+                e("E", "g(b ; c)", 0),  // g(b ; c)
+                e("E", "c a", 1),       // h(a c, b a) — two aliens, one per argument
+            ],
+        );
+    }
+
     /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
