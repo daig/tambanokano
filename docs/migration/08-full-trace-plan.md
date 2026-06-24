@@ -36,6 +36,11 @@
 > a genuine evaluator change, unlike the two below): move `constrain_to_smaller_sort` out of construction
 > into the reduce loop (apply after `try_rewrite_top` returns `None`), with a base-sort/true-sort split so
 > matching still has sorts mid-reduction — Maude's exact model. Needs a full rewrite-count re-verification.
+> **Beyond the count + `Whole:` symptoms above, this also causes a *termination* difference** (a `cmb` whose
+> condition diverges, on a reducible op, loops for us where Maude halts by reducing the term away first).
+> **Now planned in full as item C1 of the dedicated correctness phase: `docs/migration/09-correctness-phase.md`**
+> (the construction/reduce/strat seams, the risk + verification checklists; the fix also restores this
+> `Whole:` line).
 >
 > *(FIXED, no longer deviations: **command-echo spacing** (`c0a8827` — re-renders the input with Maude's
 > `printTokens` rules, so `g(g(a))` / `< z, s z >` echo compactly, byte-matching the binary). **Multi-fragment
