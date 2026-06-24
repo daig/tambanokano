@@ -113,11 +113,25 @@ occurrence. Repro: `mb mkA : Sml` over `op <_,_> : Elem Elem -> P`, `red < mkA, 
 Maude, **2** in ours (result `< mkA, mkA > : P`, `mkA : Sml`, identical in both). Surfaced while verifying
 C1 seam 3 (`pick(tt, mkA, mkA)`), but **independent of C1** — the old eager model had the same gap, and it
 fires with or without `strat`.
-- **Boundary.** Count-only (result value + least sort always faithful); needs a *repeated* subterm that
-  *also* carries a reducible membership — idiom-rare (repeated constructors don't reduce, so no membership
-  fires twice on them anyway).
-- **Fix.** Hash-cons identical subterms in `build_dag` (and reduce's rebuild) — a term-builder change that
-  touches matching's structure-sharing assumptions, so a deliberate item, not a rider.
+- **Boundary.** Count-only (result value + least sort always faithful). Applies to any repeated *reducible*
+  subterm — under a membership *or* an equation, in the **subject** *and* in an **RHS**: probed (2026-06-24)
+  `eq g(a)=b`, `red < g(a), g(a) >` = Maude **1** / ours **2**; `eq f(X)=< g(X), g(X) >`, `red f(a)` = Maude
+  **2** / ours **3** (Maude's `RhsBuilder` shares the RHS duplicate too). Idiom-rare: a bare-variable
+  duplicate (`X * X`) already shares via the substitution, and an ACU duplicate (`a + a`) already merges to
+  one element with multiplicity 2 — so only a repeated *compound* under a free/AU/CUI op diverges.
+- **Fix is DEEPER than first assessed — it is the out-of-place reduction model, not construction sharing.**
+  Implemented construction-time structural dedup (a `NodeTerm`-keyed memo on `alloc_node`, enabled around the
+  subject build + a flagged RHS; verified it *does* collapse the duplicates — instrumented dedup hits) and it
+  **did not move the count.** Root cause: our `reduce` is **out-of-place** — when `g(a)` rewrites to `b` the
+  frame moves to a fresh `b` and the original `g(a)` node is never stamped reduced, so a *shared* `g(a)` is
+  re-reduced once per parent reference. Maude counts once because it rewrites **in place** (the node becomes
+  `b`, marked reduced, seen by every ref). So matching the count needs either **(a) in-place reduction** —
+  a foundational reduce-loop rework that also breaks the **render-after trace** (which holds redex/result
+  *ids* and would re-render mutated nodes; it would have to snapshot terms instead) — or **(b) an id-keyed
+  reduce memo** (redex→nf), which conflicts with **bounded-memory reduction (C6)** by pinning every reduced
+  subterm and entangles with GC id-reuse. Both are disproportionate to an idiom-rare, count-only divergence,
+  so C7 stays deferred as a deliberate foundational item (bundle with any future reduce-loop work). The
+  construction-dedup exploration was reverted (no standalone payoff).
 
 #### C9 / C10 / C11 — frontend fidelity (parse / print) — **DONE**
 
