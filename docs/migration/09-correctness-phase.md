@@ -18,8 +18,10 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does), and
 > **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints).
 > Still open: **C13** (long-output line-wrapping — the C12 residual, lowest priority), **C7** (confirmed,
-> count-only, subject-DAG sharing), and the **C3 / C4 / C6** probes (**C2** struck — Maude loops on
-> `eq a = a` too, so the F-1 no-op guard would *diverge*; see §2.3). The as-built records are the commits
+> count-only, subject-DAG sharing), and the **C4 / C6** probes (**C2** struck — Maude loops on `eq a = a`
+> too, so the F-1 no-op guard would *diverge*; **C3** verified — we match Maude on every well-formed
+> order-dependent case, only a narrow contradictory-membership residual remains; both §2.3). The as-built
+> records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
 Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked B1 matcher items behind C8)
@@ -173,9 +175,25 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
   concern it gestured at is **interruptibility** — Maude aborts a runaway `reduce` on SIGINT back to the
   prompt, whereas our REPL can't yet interrupt an in-progress reduce. That is a separate, legitimate item
   (signal-checked reduce loop), tracked apart from the (rejected) no-op guard. Not fixture-able (it loops).
-- **C3 — Non-confluent / order-dependent membership & equation application.** Incomparable applicable
-  membership targets, or owise/condition interplay where application order is observable. Confirm our
-  smallest-first order matches Maude's beyond the locked cases.
+- **C3 — order-dependent equation & membership application — VERIFIED (matches on every well-formed spec;
+  one narrow ill-formed-spec residual).** Probed (2026-06-24) the order-observable cases:
+  - **Equations — MATCH (byte-identical).** The *first-declared matching* equation fires (declaration order,
+    not specificity): `eq f(a)=b . eq f(X)=c .` → `f(a) = b`, but the swapped `eq f(X)=c . eq f(a)=b .` →
+    `f(a) = c`; the non-confluent `eq a=b . eq a=c .` → `b`; a conditional fallback (`ceq … if c` then a
+    plain `eq`) takes the first whose condition holds. These are the *common* real cases (overlapping
+    specific/general patterns) and we reproduce Maude exactly.
+  - **Comparable membership targets — MATCH.** Smallest-sort-first, correct count: `mb x:B . mb x:A .`
+    (A < B) → sort `A`, 1 rewrite (drops straight to A, no double count).
+  - **Incomparable membership targets — NARROW DIVERGENCE (ill-formed specs only).** `mb x:A . mb x:B .`
+    with A, B incomparable (a *contradictory* membership — no element is both) → Maude picks **B**, we pick
+    **A** (1 rewrite in both). Maude orders sort constraints by `sort->index()` **descending** (smallest sort
+    = largest index first; `Core/sortConstraintTable.cc::sortConstraintLt`), and for incomparable targets the
+    tiebreak is Maude's *component sort index* (a topological numbering) — which our declaration-order
+    `SortId` doesn't replicate. Idiom-rare (well-formed specs never assert contradictory memberships),
+    result-sort-only (count matches), silent in both. **Fix (if ever needed):** port Maude's component
+    sort-index + `sortConstraintLt`. Deferred — disproportionate to an ill-formed-spec edge.
+  - The `g(a), g(a)` count-doubling found while probing (Maude 3 rw, ours 6) is **C7** (subject-DAG sharing
+    of the repeated reducible subterm), not an ordering issue.
 - **C4 — Error-sort / kind computation.** `[Sort]` error-sort naming and propagation. Confirmed repro (the
   C9–C11 sweep): `overload.maude` `red 0 + 0 .` → Maude `[Nat]`, ours `[Zero]` — the kind's *representative
   sort* name differs (a kernel least-sort/kind concern, untouched by the frontend work). Audit whether
@@ -207,9 +225,11 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
 4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
    already open.
-5. **C3 / C4 / C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has
-   a confirmed repro from the C9–C11 sweep; **C2 struck** — refuted: Maude loops on `eq a = a` too, so the
-   F-1 guard would make us diverge by halting).
+5. **C4 / C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has a
+   confirmed repro from the C9–C11 sweep). **C2 struck** (Maude loops on `eq a = a` too — the F-1 guard would
+   diverge). **C3 verified** — we match Maude on every well-formed order-dependent case (declaration-order
+   equation selection, comparable-membership smallest-first); only the contradictory-membership tiebreak
+   (incomparable targets, ill-formed specs) differs, deferred.
 6. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
    *and* a prerequisite for bounded-memory `rew`/`search` in Phase 2 (folded into C6).
 7. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.

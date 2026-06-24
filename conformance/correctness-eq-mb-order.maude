@@ -1,0 +1,51 @@
+*** Phase 1.5 / C3 — order-dependent equation + membership application matches the reference binary.
+*** The first-DECLARED matching equation fires (declaration order, NOT specificity); comparable membership
+*** targets apply smallest-sort-first with no double count. Differential vs the binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-eq-mb-order.maude < /dev/null
+*** The contradictory-membership tiebreak (incomparable targets) and repeated-subterm sharing are separate
+*** documented residuals (doc 09 C3 / C7), not exercised here.
+fmod EQORD is
+  sort S .
+  ops a d b c : -> S [ctor] .
+  op f : S -> S .
+  var X : S .
+  eq f(a) = b .
+  eq f(X) = c .
+endfm
+red f(a) .     *** S: b  (specific eq, declared first)
+red f(d) .     *** S: c  (general eq)
+
+fmod EQORD2 is
+  sort S .
+  ops a d b c : -> S [ctor] .
+  op f : S -> S .
+  var X : S .
+  eq f(X) = c .
+  eq f(a) = b .
+endfm
+red f(a) .     *** S: c  (general eq declared first wins)
+
+fmod NCEQ is
+  sort S .
+  ops a b c : -> S [ctor] .
+  eq a = b .
+  eq a = c .
+endfm
+red a .        *** S: b  (first-declared eq)
+
+fmod MBORD is
+  sorts S A B .
+  subsort A < B .  subsort B < S .
+  op x : -> S [ctor] .
+  mb x : B .
+  mb x : A .
+endfm
+red x .        *** A: x  (smallest sort, 1 rewrite)
+
+fmod CONDORD is
+  sort S .  ops a b c : -> S [ctor] .  op f : S -> S .  var X : S .
+  ceq f(X) = b if X = a .
+  eq f(X) = c .
+endfm
+red f(a) .     *** S: b  (condition holds)
+red f(c) .     *** S: c  (condition fails -> fallback)

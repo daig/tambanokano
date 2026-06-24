@@ -891,6 +891,28 @@ mod tests {
         );
     }
 
+    /// C3: order-dependent equation + membership application matches the reference binary. The
+    /// first-*declared* matching equation fires (declaration order, not specificity — `f(a)` → `b` when
+    /// `eq f(a)=b` is first, `c` when `eq f(X)=c` is first); a non-confluent `eq a=b . eq a=c` → `b`;
+    /// comparable membership targets apply smallest-sort-first (1 rewrite, no double count); a conditional
+    /// fallback takes the first whose condition holds. (The incomparable-membership tiebreak and
+    /// repeated-subterm sharing are separate documented residuals — doc 09 C3 / C7.)
+    #[test]
+    fn eq_mb_order_conforms() {
+        conform_render(
+            conformance_file!("correctness-eq-mb-order.maude"),
+            &[
+                e("S", "b", 1),
+                e("S", "c", 1),
+                e("S", "c", 1),
+                e("S", "b", 1),
+                e("A", "x", 1),
+                e("S", "b", 1),
+                e("S", "c", 1),
+            ],
+        );
+    }
+
     #[test]
     fn string_conforms() {
         conform_render(
