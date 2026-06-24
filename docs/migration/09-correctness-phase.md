@@ -12,10 +12,18 @@ reduce-loop/matcher neighborhood — so a sort-model change made *after* rules f
 None of these are blocking idiomatic code (that's why Phase 1 passed), but they are **release blockers** for
 a "byte-identical to the reference" engine.
 
-> **STATUS.** Scaffolding + **C1 (eager→lazy sort/membership computation)** fully planned below. C1 is the
-> front-and-center item — the deepest of the known divergences (it alone causes a *termination* difference)
-> and the root cause of full-trace deviation #2 (membership `Whole:`). The remaining audit items (§3) are
-> placeholders to be filled by a systematic differential sweep of the evaluator.
+> **STATUS — C1 DONE.** Implemented and differentially re-verified vs the reference binary (all four seams
+> of §2.4; the design below is as-built). Construction now builds with the **base** sort only (`alloc_node`,
+> the eager `alloc_node_constrained` removed); `constrain_to_smaller_sort` runs at the reduce normal-form
+> point after `try_rewrite_top` returns `None`, recomputing the base sort from the now-refined children
+> (`compute_base_sort`) before constraining; `compute_true_sort` refines `strat`-skipped args at the top
+> step; and the membership trace carries a reconstructed `Whole:` term. **Closes three divergences** — the
+> reducible-membership over-count, the `cmb`-on-reducible-op *termination* gap, and full-trace deviation #2
+> (`Whole:`). Fixtures: `conformance/correctness-mb-reducible.maude` (count + termination) and
+> `conformance/correctness-strat-mb.maude` (seam 3); the kernel membership tests now assert base-at-construct
+> / refined-after-reduce; `fib(22)=186579` unregressed (membership-free → the new step is gated off). One
+> orthogonal divergence surfaced and is filed below as **C7** (subject-DAG sharing). The remaining audit
+> items (§3) are still placeholders for the systematic sweep.
 
 Read order: this doc → `08-full-trace-plan.md` §status (the deviation that surfaced C1) → the code seams
 cited in §2.
@@ -212,6 +220,17 @@ Candidate probes (unconfirmed — prioritize by writing the differential test fi
   (matching modulo ACU/AU/S) — currently a noted follow-up; confirm coverage or scope it.
 - **C6? Substitution-size / re-entrant reduce edge cases.** Deep/condition-nested reductions, the F-2
   engine-global GC root set (also a Phase-2 `rew`/`search` prerequisite — slot it here).
+- **C7 — Subject-DAG sharing of repeated subterms (CONFIRMED, count-only, deferred).** Maude hash-conses
+  identical ground subterms when it builds the subject DAG, so a membership on a *repeated* reducible
+  subterm is applied (and counted) once; our `build_dag` builds a tree, so it counts once per occurrence.
+  Minimal repro: `mb mkA : Sml` over `op <_,_> : Elem Elem -> P`, `red < mkA, mkA >` = **1** rewrite in
+  Maude, **2** in ours (result `< mkA, mkA > : P`, `mkA : Sml`, identical in both). Surfaced while verifying
+  C1 seam 3 (`pick(tt, mkA, mkA)`), but it is **independent of C1** — the eager model has the same gap, and
+  it fires with or without `strat`. **Boundary:** count-only (result value + least sort always faithful);
+  needs a *repeated* subterm that *also* carries a reducible membership (idiom-rare — constructors that
+  repeat don't reduce, so no membership fires twice on them anyway). **Fix:** hash-cons identical subterms
+  in `build_dag` (and reduce's rebuild) — a term-builder change touching matching's structure-sharing
+  assumptions, so a deliberate item, not a C1 rider. Differential-confirmed; deferred to the sweep.
 - *(add as the sweep surfaces them.)*
 
 ---

@@ -231,7 +231,10 @@ fn trace_condition_off_and_backtrack() {
 }
 
 /// A membership axiom traces as a sort narrowing: `mb lhs : sort .` + substitution + `oldSort: term
-/// becomes newSort`. `cmb` fires as a membership but its trial uses the `cmb …` body.
+/// becomes newSort`. `cmb` fires as a membership but its trial uses the `cmb …` body. With `set trace
+/// whole on` each step also shows Maude's `Whole:` line — the full root term with the constrained
+/// subject in place (C1: memberships fire inside the reduce loop, so the frame stack is available to
+/// reconstruct it; closes full-trace deviation #2). Byte-exact vs the reference binary.
 #[test]
 fn trace_membership_and_cmb() {
     let mut r = repl();
@@ -244,6 +247,13 @@ fn trace_membership_and_cmb() {
     assert!(out.contains("*********** membership axiom\nmb g(X) : B .\nX --> a\nA: g(a) becomes B\n"), "inner mb: {out}");
     assert!(out.contains("*********** membership axiom\nmb g(g(X)) : C .\nX --> a\nA: g(g(a)) becomes C\n"), "outer mb: {out}");
     assert!(out.contains("result C:"), "result sort C: {out}");
+
+    // `set trace whole on` adds the `Whole:` line — the full root term (`g(g(a))`) at each membership
+    // application, for both the inner (`g(a) becomes B`) and outer (`g(g(a)) becomes C`) steps.
+    r.eval("set trace whole on .");
+    let whole = r.eval("red g(g(a)) .").output;
+    assert!(whole.contains("X --> a\nWhole: g(g(a))\nA: g(a) becomes B\n"), "inner mb Whole: {whole}");
+    assert!(whole.contains("X --> a\nWhole: g(g(a))\nA: g(g(a)) becomes C\n"), "outer mb Whole: {whole}");
 }
 
 /// The command echo (`reduce in M : … .`) re-spaces the input tokens with Maude's rules — no space

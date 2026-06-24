@@ -20,7 +20,7 @@ use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
 /// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
@@ -803,26 +803,19 @@ impl Signature {
 impl Runtime {
     // ---- DAG construction ----
 
-    /// Allocate a node with a precomputed sort, accounting it against the safe-point-GC interval.
-    /// (Shared by `make_free`/`make_acu`; the alloc counter only matters when `gc_interval` is set,
-    /// so the default path is a no-op increment. Reset by `safe_point_gc`, so it can't overflow.)
+    /// Allocate a node with its **base** (structural) sort, accounting it against the safe-point-GC
+    /// interval. The universal allocator for every `make_*` builder: a freshly built node carries only
+    /// its base sort — membership axioms (`mb`/`cmb`) are **not** applied here. Maude likewise gives a
+    /// fresh `DagNode` no sort at construction (`SORT_UNKNOWN`) and refines it lazily at the reduce
+    /// normal-form point (`DagNode::reduce` → `fastComputeTrueSort`); we keep the eager *base* sort (so
+    /// `sort_of` stays a total read) but defer the membership refinement identically — see the C1
+    /// normal-form step in [`reduce`](Self::reduce). (The alloc counter only matters when `gc_interval`
+    /// is set, so the default path is a no-op increment. Reset by `safe_point_gc`, so it can't overflow.)
     fn alloc_node(&mut self, sort: SortId, term: NodeTerm) -> DagId {
         if self.gc_interval.is_some() {
             self.allocs_since_gc += 1;
         }
         self.dags.alloc(DagNode { sort, reduced_epoch: 0, term })
-    }
-
-    /// Allocate a node, then apply the module's membership axioms (`mb`) to lower its least sort
-    /// (B2.2). Skips all per-node work when the module declares no memberships (the free reduce hot
-    /// path is untouched). The node must exist for a membership lhs to match against, so this runs
-    /// post-alloc, on the constructed node.
-    fn alloc_node_constrained(&mut self, sig: &Signature, sort: SortId, term: NodeTerm) -> DagId {
-        let id = self.alloc_node(sort, term);
-        if !sig.memberships.is_empty() {
-            self.constrain_to_smaller_sort(sig, id);
-        }
-        id
     }
 
     /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
@@ -833,7 +826,13 @@ impl Runtime {
     /// membership applications in its `rewrites` total); the smallest-first order means a node drops
     /// straight to its smallest applicable sort in one application, matching Maude's count. Non-confluent
     /// membership sets (incomparable applicable targets) and matching modulo AC/`iter` are follow-ups.
-    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId) {
+    ///
+    /// **Lazy timing (C1):** this is now called only at a node's reduce **normal-form point** (after its
+    /// equations are exhausted), never at construction — mirroring Maude's `fastComputeTrueSort`. So a
+    /// term an equation reduces away is never constrained (no over-count; a `cmb` whose condition loops
+    /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
+    /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
+    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>) {
         let symbol = self.node(id).symbol();
         let Some(constraints) = sig.memberships.get(&symbol) else { return };
         loop {
@@ -855,7 +854,7 @@ impl Runtime {
                             old_sort: current,
                             new_sort: sc.sort,
                             bindings,
-                            whole: None,
+                            whole,
                         });
                     }
                     self.dags.get_mut(id).sort = sc.sort;
@@ -933,7 +932,7 @@ impl Runtime {
             sig.symbol(symbol).name()
         );
         let sort = self.free_sort(sig, symbol, &args);
-        self.alloc_node_constrained(sig, sort, NodeTerm::Free { symbol, args })
+        self.alloc_node(sort, NodeTerm::Free { symbol, args })
     }
 
     /// Least sort of a free node `symbol(args…)`. The common case — a single declaration, no
@@ -963,6 +962,68 @@ impl Runtime {
         let arg_sorts: Vec<SortId> = args.iter().map(|&a| self.dags.get(a).sort).collect();
         sig.compute_sort(symbol, &arg_sorts)
     }
+
+    /// Recompute `id`'s **base** (structural) sort from its current children's sorts — Maude's
+    /// `computeBaseSort`, the pure membership-free part of `fastComputeTrueSort`. Mirrors the per-theory
+    /// sort each `make_*` builder computes, but reads the *existing* (already-canonical) node instead of
+    /// rebuilding it. The C1 reduce normal-form step calls this before constraining: a child refined in
+    /// place at its own normal-form point does **not** propagate to a parent that was not rebuilt (the
+    /// reduce loop keeps `original` when `args == orig`), so the parent must recompute its base sort from
+    /// the now-refined children here. A pure function of the children's sorts ⇒ idempotent. An `Na`
+    /// constant has no children, so its base sort never changes (kept as-is).
+    fn compute_base_sort(&self, sig: &Signature, id: DagId) -> SortId {
+        match &self.node(id).term {
+            NodeTerm::Free { symbol, args } => self.free_sort(sig, *symbol, args),
+            NodeTerm::Acu { symbol, args } => {
+                let elem_sorts: Vec<SortId> = args
+                    .iter()
+                    .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
+                    .collect();
+                sig.compute_sort_fold(*symbol, &elem_sorts)
+            }
+            NodeTerm::Au { symbol, args } => {
+                let arg_sorts: Vec<SortId> = args.iter().map(|&e| self.dags.get(e).sort).collect();
+                sig.compute_sort_fold(*symbol, &arg_sorts)
+            }
+            NodeTerm::Cui { symbol, args } => {
+                sig.compute_sort(*symbol, &[self.dags.get(args[0]).sort, self.dags.get(args[1]).sort])
+            }
+            NodeTerm::S { symbol, count, arg } => {
+                sig.compute_s_sort(*symbol, self.dags.get(*arg).sort, count)
+            }
+            NodeTerm::Na { .. } => self.node(id).sort,
+        }
+    }
+
+    /// Refine `id`'s sort — and recursively its subterms' — to their **true sorts** without applying any
+    /// equations: Maude's `DagNode::computeTrueSort`. The C1 seam-3 counterpart to the reduce normal-form
+    /// step, for **strat-skipped** args: a custom evaluation strategy (`strat`) never reduces them, so
+    /// they never reach a reduce normal-form point — yet Maude's `complexStrategy` calls `computeTrueSort`
+    /// on *all* args at the strat `0` step (`FreeTheory/freeSymbol.cc:503`), refining even the skipped
+    /// ones. We mirror that: recurse into the children, recompute this node's base sort from the
+    /// now-refined children, then constrain by its memberships (each application counts, as Maude counts
+    /// membership applications).
+    ///
+    /// `seen` dedupes shared subterms reached within one strat node (e.g. an instantiated `f(X, X)` whose
+    /// two slots are the same node), so such a node is refined — and its membership counted — exactly
+    /// once, matching Maude (whose `slowComputeTrueSort` no-ops once a node's sort is known). An
+    /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
+    /// across two separate strat frames* in one reduction would be refined once per frame — a documented
+    /// edge requiring DAG sharing that `build_dag` never produces; see `docs/migration/09`.)
+    fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>) {
+        if self.node(id).reduced_epoch == sig.eq_epoch() || !seen.insert(id) {
+            return; // already at its true sort, or already refined in this pass
+        }
+        let children: Vec<DagId> = self.node(id).children().collect();
+        for c in children {
+            self.compute_true_sort(sig, c, seen);
+        }
+        let base = self.compute_base_sort(sig, id);
+        self.dags.get_mut(id).sort = base;
+        // No reduce frame here (this is off the main stack), so no `Whole:` reconstruction — `None`.
+        self.constrain_to_smaller_sort(sig, id, None);
+    }
+
     /// Convenience for a constant (an arity-0 symbol).
     pub(crate) fn make_const(&mut self, sig: &Signature, symbol: SymbolId) -> DagId {
         self.make_free(sig, symbol, Vec::new())
@@ -1030,7 +1091,7 @@ impl Runtime {
                     .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
                     .collect();
                 let sort = sig.compute_sort_fold(symbol, &elem_sorts);
-                self.alloc_node_constrained(sig, sort, NodeTerm::Acu { symbol, args })
+                self.alloc_node(sort, NodeTerm::Acu { symbol, args })
             }
         }
     }
@@ -1064,7 +1125,7 @@ impl Runtime {
             _ => {
                 let elem_sorts: Vec<SortId> = args.iter().map(|&e| self.dags.get(e).sort).collect();
                 let sort = sig.compute_sort_fold(symbol, &elem_sorts);
-                self.alloc_node_constrained(sig, sort, NodeTerm::Au { symbol, args })
+                self.alloc_node(sort, NodeTerm::Au { symbol, args })
             }
         }
     }
@@ -1099,7 +1160,7 @@ impl Runtime {
             std::mem::swap(&mut x, &mut y); // canonical order for commutativity
         }
         let sort = sig.compute_sort(symbol, &[self.dags.get(x).sort, self.dags.get(y).sort]);
-        self.alloc_node_constrained(sig, sort, NodeTerm::Cui { symbol, args: vec![x, y] })
+        self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
     }
 
     /// Build a canonical **S** (`iter`) node `s^count(arg)` (Maude's `S_DagNode::normalizeAtTop`):
@@ -1119,14 +1180,14 @@ impl Runtime {
         };
         let arg_sort = self.dags.get(arg).sort;
         let sort = sig.compute_s_sort(symbol, arg_sort, &count);
-        self.alloc_node_constrained(sig, sort, NodeTerm::S { symbol, count, arg })
+        self.alloc_node(sort, NodeTerm::S { symbol, count, arg })
     }
 
     /// Build an atomic **NA** constant node carrying `value` (a string/qid/float). The sort is
     /// `symbol`'s range (`symbol` is an arity-0 NA-constant symbol — Maude's `StringSymbol` etc.).
     pub(crate) fn make_na(&mut self, sig: &Signature, symbol: SymbolId, value: NaValue) -> DagId {
         let sort = sig.compute_sort(symbol, &[]);
-        self.alloc_node_constrained(sig, sort, NodeTerm::Na { symbol, value })
+        self.alloc_node(sort, NodeTerm::Na { symbol, value })
     }
 
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
@@ -1403,6 +1464,23 @@ impl Runtime {
                 }
             }
 
+            // C1 seam 3 — a custom evaluation strategy (`strat`) leaves some args unreduced, so they
+            // never reach a reduce normal-form point; Maude's `complexStrategy` still computes their true
+            // sort at the strat `0` step. Refine the (skipped) args' sorts here — no equations — so the
+            // rebuild's base-sort recompute and the top-rewrite matching below see the same sorts Maude
+            // does. Gated on a custom strat + the module having memberships: the standard strategy reduces
+            // every arg (each refined at its own normal-form point), and a membership-free module never
+            // changes a sort, so both keep the unchanged hot path. Already-reduced args no-op (guarded).
+            if !sig.memberships.is_empty()
+                && sig.symbol(stack.last().expect("empty reduce stack").symbol).strategy.is_some()
+            {
+                let args = stack.last().expect("empty reduce stack").args.clone();
+                let mut seen = HashSet::new();
+                for arg in args {
+                    self.compute_true_sort(sig, arg, &mut seen);
+                }
+            }
+
             // Phase 1 complete (strategy exhausted): rebuild iff some argument changed, else keep the id.
             let (symbol, original, args, changed) = {
                 let f = stack.last_mut().expect("empty reduce stack");
@@ -1444,6 +1522,23 @@ impl Runtime {
                 continue;
             }
 
+            // C1 normal-form point (Maude's `DagNode::reduce` → `fastComputeTrueSort`): `rebuilt`'s
+            // equations are exhausted, so now — and only now — refine its true sort by the memberships.
+            // Recompute the base sort first: a child refined in place at *its* normal-form point does
+            // not propagate to this node when it was not rebuilt (`args == orig` kept `original`), so we
+            // must recompute from the now-refined children before constraining. Gated on the module
+            // having any `mb`/`cmb` — else the base sort never changes and `fib`/the prelude keep exactly
+            // today's hot path (base sort at construction, no normal-form step, no per-rewrite cost).
+            if !sig.memberships.is_empty() {
+                let base = self.compute_base_sort(sig, rebuilt);
+                self.dags.get_mut(rebuilt).sort = base;
+                // For `set trace whole`: snapshot the whole root with `rebuilt` threaded up the ancestor
+                // frames (a membership changes only its sort, not the structure) so each application can
+                // render Maude's `Whole:` line. Gated — allocates O(depth) only when whole-tracing.
+                let whole = (self.record_whole && self.tracing())
+                    .then(|| self.reconstruct_whole(sig, &stack, rebuilt));
+                self.constrain_to_smaller_sort(sig, rebuilt, whole);
+            }
             // `rebuilt` is a normal form: stamp it canonical and hand it up (or return it as root).
             self.dags.get_mut(rebuilt).reduced_epoch = sig.eq_epoch();
             stack.pop();
@@ -2635,14 +2730,15 @@ mod tests {
             nr_vars: 1,
         });
 
-        // < z, z > : SymPair — one membership application.
+        // < z, z > : SymPair — one membership application. C1: construction gives the *base* sort
+        // (Pair); the membership refines it to SymPair lazily, at the reduce normal-form point.
         e.reset_rewrites();
         let (z0, z1) = (e.make_const(z), e.make_const(z));
         let zz = e.make_free(pairop, vec![z0, z1]);
-        assert_eq!(e.sort_of(zz), sympair, "< z, z > : SymPair");
+        assert_eq!(e.sort_of(zz), pair, "base sort Pair at construction (membership applies lazily)");
         let r = e.reduce(zz);
         assert_eq!(e.rewrites(), 1, "one membership application");
-        assert_eq!(e.sort_of(r), sympair);
+        assert_eq!(e.sort_of(r), sympair, "< z, z > : SymPair after reduce");
 
         // < z, s z > : Pair — components differ, no membership applies.
         e.reset_rewrites();
@@ -2706,20 +2802,23 @@ mod tests {
         let _ = e.reduce(a0);
         assert_eq!(e.rewrites(), 0);
 
+        // C1: construction gives the base sort (A); the memberships refine it lazily at reduce.
         e.reset_rewrites();
         let a1 = e.make_const(a);
         let ga = e.make_free(g, vec![a1]);
-        assert_eq!(e.sort_of(ga), sb, "g(a) : B");
-        let _ = e.reduce(ga);
+        assert_eq!(e.sort_of(ga), sa, "g(a) base sort A at construction");
+        let rga = e.reduce(ga);
         assert_eq!(e.rewrites(), 1, "one membership application g(X):B");
+        assert_eq!(e.sort_of(rga), sb, "g(a) : B after reduce");
 
         e.reset_rewrites();
         let a2 = e.make_const(a);
         let ga2 = e.make_free(g, vec![a2]);
         let gga = e.make_free(g, vec![ga2]);
-        assert_eq!(e.sort_of(gga), sc, "g(g(a)) : C");
-        let _ = e.reduce(gga);
+        assert_eq!(e.sort_of(gga), sa, "g(g(a)) base sort A at construction");
+        let rgga = e.reduce(gga);
         assert_eq!(e.rewrites(), 2, "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3");
+        assert_eq!(e.sort_of(rgga), sc, "g(g(a)) : C after reduce");
     }
 
     /// Tracing (opt-in) records a [`TraceEvent::Rewrite`] per rewrite — kind, the equation `id`, its
@@ -3142,12 +3241,15 @@ mod tests {
             }],
         );
 
-        // Build < a, b > (resetting the counter first) and read back its least sort + rewrite count.
+        // Build < a, b >, reduce it, and read back its least sort + rewrite count. C1: the cmb now fires
+        // at the reduce normal-form point (not construction), so we reduce before reading — the count
+        // (condition reductions + the cmb application) is the same, just relocated from build to reduce.
         let build = |e: &mut Engine, a: u32, b: u32| -> (SortId, u64) {
             e.reset_rewrites();
             let na = numeral(e, z, s, a);
             let nb = numeral(e, z, s, b);
             let p = e.make_free(pairop, vec![na, nb]);
+            let p = e.reduce(p);
             (e.sort_of(p), e.rewrites())
         };
         assert_eq!(build(&mut e, 0, 1), (goodpair, 2), "< z, s z > : GoodPair, 2 rewrites");

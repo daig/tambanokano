@@ -15,32 +15,24 @@
 > fixture-driven REPL tests lock it. **199 tests (104 core + 69 frontend + 10 modules + 16 repl); clippy
 > `-D` clean; fib(22)=186579 at ~7 M rw/s** (the per-rewrite trace cost is an `if self.trace.is_some()`).
 >
-> **Remaining deviation — one, and it is a real *evaluation-model* difference (not formatting).**
-> **Eager vs lazy sort-constraint (`mb`) application.** Maude applies sort constraints **lazily** — only to a
-> node that is already an equational normal form (`DagNode::reduce`, `dagNode.hh:563`, calls
-> `fastComputeTrueSort` *after* `eqRewrite` returns false). We apply them **eagerly, at node construction**
-> (`alloc_node_constrained`). Two observable symptoms, both from this one cause:
-> - **Rewrite count** can over-count: a membership whose LHS matches a *reducible* term fires in our model
->   (at construction, before the equation rewrites the term away) but never in Maude's. With `eq g(a)=b` +
->   `mb g(a):T`, `red g(a)` is **1** rewrite in Maude, **2** in ours (result `b` in both). Compounds with
->   rebuilds.
-> - **Membership `Whole:`** under `set trace whole on` is omitted: the constraint fires off the reduce frame
->   stack (and, for the initial term, before the whole term exists), so the root isn't reconstructable.
+> **The eager-vs-lazy `mb` deviation is FIXED (Phase 1.5 / C1).** We now apply sort constraints **lazily**,
+> exactly as Maude does — only to a node that is already an equational normal form (`DagNode::reduce` →
+> `fastComputeTrueSort` *after* `eqRewrite` returns false). `alloc_node` builds with the **base** sort only;
+> `constrain_to_smaller_sort` runs at the reduce normal-form point (after `try_rewrite_top` returns `None`),
+> recomputing the base sort from the now-refined children first (`compute_base_sort`), then constraining —
+> and `compute_true_sort` refines `strat`-skipped args at the top step (Maude's `complexStrategy`). All three
+> former symptoms are closed and differentially re-verified vs the reference binary:
+> - **Rewrite count** no longer over-counts a membership on a *reducible* term (`eq g(a)=big` + `mb g(X):Small`,
+>   `red g(a)` = **1** rewrite in both; `conformance/correctness-mb-reducible.maude`).
+> - **Termination**: a `cmb` whose condition diverges on a reducible op now **halts** (the equation reduces the
+>   term away before the constraint is ever reached) — same case file.
+> - **Membership `Whole:`** under `set trace whole on` is now rendered: the constraint fires inside the reduce
+>   loop, so the frame stack reconstructs the root (`reconstruct_whole`); byte-exact vs the binary.
 >
-> **The result and least sort are always faithful** — verified across adversarial cases, including a lazy
-> `strat` where Maude *also* applies the constraint to compute an unreduced argument's sort (so they agree):
-> innermost reduction reduces an argument to normal form (applying its constraints) before any parent
-> matches against it, and sort-test conditions reduce first. The divergence triggers only on a membership
-> over a *reducible* (defined-op) term — atypical; well-formed specs put memberships on **constructors**
-> (normal forms), where both models agree, so the whole conformance suite passes. **The fix** (not yet done —
-> a genuine evaluator change, unlike the two below): move `constrain_to_smaller_sort` out of construction
-> into the reduce loop (apply after `try_rewrite_top` returns `None`), with a base-sort/true-sort split so
-> matching still has sorts mid-reduction — Maude's exact model. Needs a full rewrite-count re-verification.
-> **Beyond the count + `Whole:` symptoms above, this also causes a *termination* difference** (a `cmb` whose
-> condition diverges, on a reducible op, loops for us where Maude halts by reducing the term away first).
-> **Now planned in full as item C1 of the dedicated correctness phase: `docs/migration/09-correctness-phase.md`**
-> (the construction/reduce/strat seams, the risk + verification checklists; the fix also restores this
-> `Whole:` line).
+> One residual, **orthogonal** divergence surfaced while verifying C1 (a *separate* item, tracked as **C7** in
+> `09`): Maude hash-conses identical ground subterms in the subject DAG, so a membership on a *repeated*
+> reducible subterm counts once (`red < mkA, mkA >` with `mb mkA:Sml` = 1 in Maude, 2 in ours). Count-only
+> (result + least sort always faithful), pre-existing (independent of eager/lazy), and idiom-rare. Deferred.
 >
 > *(FIXED, no longer deviations: **command-echo spacing** (`c0a8827` — re-renders the input with Maude's
 > `printTokens` rules, so `g(g(a))` / `< z, s z >` echo compactly, byte-matching the binary). **Multi-fragment

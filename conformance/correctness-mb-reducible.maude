@@ -1,0 +1,55 @@
+*** Phase 1.5 / C1 — eager→lazy sort & membership computation, conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-mb-reducible.maude < /dev/null
+***
+*** A membership (`mb`/`cmb`) whose top symbol ALSO has equations ("reducible-operator membership").
+*** Maude applies memberships only at the reduce normal-form point (`computeTrueSort`), so a term an
+*** equation reduces away is never constrained. The previous eager model (apply at node construction)
+*** over-counted such redexes and could DIVERGE on a `cmb` whose condition loops. These fixtures pin the
+*** faithful counts/termination; the membership.maude / cmb.maude fixtures cover the constructor case
+*** (where eager and lazy agree). Mirrors the engine.rs C1 tests.
+
+fmod MB-REDUCIBLE is
+  sorts Small Big Top .
+  subsorts Small Big < Top .
+  op a : -> Top [ctor] .
+  op big : -> Big [ctor] .
+  op g : Top -> Top .
+  var X : Top .
+  mb g(X) : Small .
+  eq g(a) = big .
+endfm
+*** g(a) is reduced to big by the equation BEFORE its membership is reached, so `mb g(X):Small` never
+*** fires on it: 1 rewrite (the equation), not 2. (Eager applied the mb to the doomed g(a) too → 2.)
+red g(a) .              *** Big: big, 1 rewrite
+
+fmod MB-REWRITE-CHAIN is
+  sorts S Top .
+  subsort S < Top .
+  op a : -> Top [ctor] .
+  op b : -> Top [ctor] .
+  op g : Top -> Top .
+  var X : Top .
+  mb g(X) : S .
+  eq g(a) = g(b) .
+endfm
+*** g(a) → g(b) [1]; g(b) is a normal form, so its `mb g(X):S` fires once [2]. g(a)'s own membership is
+*** never applied (it is reduced away first): 2 rewrites, not 3.
+red g(a) .              *** S: g(b), 2 rewrites
+
+fmod CMB-DIVERGENT is
+  sorts Small Big Top Truth .
+  subsorts Small Big < Top .
+  ops tt ff : -> Truth [ctor] .
+  op a : -> Top [ctor] .
+  op big : -> Big [ctor] .
+  op g : Top -> Top .
+  op loops : -> Truth .
+  var X : Top .
+  cmb g(X) : Small if loops = tt .
+  eq loops = loops .
+  eq g(a) = big .
+endfm
+*** TERMINATION: g(a) → big by the equation before the cmb is reached, so the divergent condition
+*** `loops = tt` (loops → loops → …) is NEVER evaluated. Lazy halts at `big`; the eager model looped
+*** forever evaluating the cmb condition at construction of g(a).
+red g(a) .              *** Big: big, 1 rewrite

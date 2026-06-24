@@ -299,8 +299,9 @@ pub fn reduce_command(
     term: &[Token],
 ) -> Result<(DagId, u64), String> {
     let tree = parse_forest(term, &lm.grammar, i)?;
-    // Reset BEFORE building: construction applies membership axioms (`constrain_to_smaller_sort` counts as
-    // a rewrite — Maude's accounting), so those rewrites belong to this command's count.
+    // Reset BEFORE building so this command's count starts clean. Construction itself does no rewrites
+    // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
+    // `reduce` below is where every equation and membership application is counted (Maude's accounting).
     lm.built.engine.reset_rewrites();
     let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, term, i)?;
     let result = lm.built.engine.reduce(dag);
@@ -575,6 +576,22 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
+    /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
+    /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
+    /// membership counted (4 rewrites). Distinct subterms only — a repeated reducible-membership subterm
+    /// hits the orthogonal subject-DAG-sharing divergence (docs/migration/09 C7), out of scope for C1.
+    #[test]
+    fn correctness_strat_mb_conforms() {
+        conform(
+            conformance_file!("correctness-strat-mb.maude"),
+            &[
+                e("WrS", "wrap(mk(e))", 1), // skipped arg refined → overloaded range WrS
+                e("Sml", "mkA", 4),         // both branches refined before selection; discarded one counts
+            ],
+        );
+    }
+
     #[test]
     fn acu_overload_conforms() {
         conform(
@@ -618,6 +635,23 @@ mod tests {
                 e("A", "a", 0),
                 e("B", "g(a)", 1),
                 e("C", "g(g(a))", 2),
+            ],
+        );
+    }
+
+    /// Phase 1.5 / C1 — eager→lazy sort & membership computation. A membership on a *reducible* operator
+    /// (one that also has equations) is applied only at the reduce normal-form point, so a redex an
+    /// equation reduces away is never constrained: the counts are 1 / 2 / 1 (not the eager 2 / 3 / hang).
+    /// The third command is a `cmb` with a divergent condition that Maude — and now we — never evaluate,
+    /// because the equation reduces `g(a)` to `big` first (a *termination* fix, not just a count fix).
+    #[test]
+    fn correctness_mb_reducible_conforms() {
+        conform(
+            conformance_file!("correctness-mb-reducible.maude"),
+            &[
+                e("Big", "big", 1),  // MB-REDUCIBLE: eq g(a)=big fires; mb g(X):Small never reached
+                e("S", "g(b)", 2),   // MB-REWRITE-CHAIN: g(a)→g(b) [1] then g(b)'s mb [2]
+                e("Big", "big", 1),  // CMB-DIVERGENT: halts at big; the looping cmb condition is unreached
             ],
         );
     }

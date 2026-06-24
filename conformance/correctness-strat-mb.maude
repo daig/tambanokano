@@ -1,0 +1,42 @@
+*** Phase 1.5 / C1 seam 3 — strat × membership, conformance vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-strat-mb.maude < /dev/null
+***
+*** A custom evaluation strategy (`strat`) leaves some arguments unreduced, so they never reach a reduce
+*** normal-form point. Maude's `complexStrategy` still computes the TRUE SORT of every argument at the
+*** strat `0` step (FreeTheory/freeSymbol.cc), refining even the skipped ones — so their memberships
+*** apply (and count) and an overloaded operator's result sort reflects the refined argument sort.
+*** Mirrors the engine.rs C1 seam-3 test. (Distinct subterms only: a *repeated* reducible-membership
+*** subterm exposes a separate, orthogonal subject-DAG-sharing divergence — see docs/migration/09 C7.)
+
+fmod STRAT-MB-WRAP is
+  sorts Elem Sml Wr WrS .
+  subsort Sml < Elem .
+  subsort WrS < Wr .
+  op e : -> Elem [ctor] .
+  op mk : Elem -> Elem [ctor] .
+  var X : Elem .
+  mb mk(X) : Sml .
+  op wrap : Elem -> Wr [strat (0)] .
+  op wrap : Sml -> WrS [strat (0)] .
+endfm
+*** strat (0) skips wrap's argument; its sort is still refined `mk(e) : Sml` at the top step, so the
+*** overloaded `wrap : Sml -> WrS` applies → result WrS (not Wr), 1 rewrite (the membership).
+red wrap(mk(e)) .          *** WrS: wrap(mk(e)), 1 rewrite
+
+fmod STRAT-MB-PICK is
+  sorts B Elem Sml .
+  subsort Sml < Elem .
+  ops tt ff : -> B [ctor] .
+  op mkA : -> Elem [ctor] .
+  op mkB : -> Elem [ctor] .
+  vars X Y : Elem .
+  mb mkA : Sml .
+  mb mkB : Sml .
+  op pick : B Elem Elem -> Elem [strat (1 0)] .
+  eq pick(tt, X, Y) = X .
+  eq pick(ff, X, Y) = Y .
+endfm
+*** strat (1 0) reduces only the selector; at the top step BOTH branches' sorts are refined (mkA:Sml,
+*** mkB:Sml) before `pick(tt,X,Y)=X` selects mkA — so the discarded branch's membership counts too, the
+*** way Maude counts it: 4 rewrites (mkA mb, mkB mb, the equation, then the result mkA's mb), result Sml.
+red pick(tt, mkA, mkB) .   *** Sml: mkA, 4 rewrites
