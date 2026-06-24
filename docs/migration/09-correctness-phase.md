@@ -13,11 +13,12 @@ block *idiomatic* code (that's why Phase 1 passed), but they are **release block
 to the reference" engine, and the panicking one (C8) blocks a textbook spec class outright.
 
 > **STATUS.** Done so far: **C1** (eager→lazy `mb` sort model, commit `160b956`), **C8** (cross-theory
-> alien matching: ACU `75454a9` / AU `f2b025d` / free `4a0cea6`), and **C5** (theory-lhs membership
-> matching — covered by C8's shared seam, confirmed differentially). Still open: **C9–C11** (the cheap
-> frontend-fidelity cluster — float / glued-minus / rational printing), **C7** (confirmed, count-only,
-> subject-DAG sharing), and the **C2 / C3 / C4 / C6** probes. The as-built records are the commits +
-> `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
+> alien matching: ACU `75454a9` / AU `f2b025d` / free `4a0cea6`), **C5** (theory-lhs membership matching —
+> covered by C8's shared seam), and **C9 / C10 / C11** (the frontend-fidelity cluster — float / glued-minus /
+> rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does). Still
+> open: **C12** (recursion-depth limit on very deep ctor chains — newly surfaced), **C7** (confirmed,
+> count-only, subject-DAG sharing), and the **C2 / C3 / C4 / C6** probes. The as-built records are the commits
+> + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
 Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked B1 matcher items behind C8)
 → the cited code seams.
@@ -111,40 +112,39 @@ fires with or without `strat`.
 - **Fix.** Hash-cons identical subterms in `build_dag` (and reduce's rebuild) — a term-builder change that
   touches matching's structure-sharing assumptions, so a deliberate item, not a rider.
 
-### 2.2 Confirmed — frontend fidelity (parse / print; value always correct)
+#### C9 / C10 / C11 — frontend fidelity (parse / print) — **DONE**
 
-These don't change the computed value/sort/count — they break *byte-identical* surface I/O. Grouped because
-they live in `tnk-frontend` (lexer + pretty-printer), not the evaluator. **The float printer (C9) will block
-Phase 2's real `FLOAT` prelude** — every float result misprints — so it is the most load-bearing of the three.
+All three were `tnk-frontend`-only (value/sort/count always already correct); all differentially verified
+byte-identical to the reference binary (echo + result), conformance fixtures added.
+- **C9 — float printing.** `render_float` now ports Maude's `doubleToString` (`Utility/macros.cc`): 17
+  significant digits, mantissa normalized to `[1,10)` with trailing zeros stripped, signed exponent only when
+  nonzero (`1.0e+4`, `2.5e-1`, `1.0000000000000001e-1`). Fixture `correctness-float-print.maude` (the old
+  `float.maude` only used format-coincident values like `1.0`/`2.0`).
+- **C10 — glued prefix-minus.** `-7` now lexes as one `SMALL_NEG` token (`TokKind::NegNumber`) parsed via the
+  `-_` minus op (`Terminal::SmallNeg` → `Action::MakeInteger`, mirroring `SMALL_NAT`→`MAKE_NATURAL`), exactly
+  as Maude. A spaced `-` stays its own token (subtraction unaffected); `5 -7` fails to parse just as the
+  reference binary rejects it. Fixture `correctness-glued-minus.maude`.
+- **C11 — rational printing.** A `DivisionSymbol` node whose args are integer numerals (Maude's `isRat`)
+  prints compactly as `num/den`; a `0/N` (Zero numerator) is *not* a rational and stays spaced (`0 / 5`).
+  `rat_conforms` upgraded from value-only to printed-text (`conform_render`).
+- **Echo, as a rider.** The reduce-command echo (`reduce in M : … .`) now pretty-prints the *normalized parsed
+  term* (new `command_echo`), which is what Maude echoes — so special constants collapse in the echo too
+  (`100.0` → `1.0e+2`, `2 / 4` → `2/4`, `- 3` → `-3`). The only residual echo divergence is the pre-existing
+  **AC print-order** cosmetic difference (our `SymbolId` order vs Maude's `orderInt`; `08` §status), now also
+  visible in echoes of 3+-element AC terms — multiset-identical, order-only, no conformance fixture hits it.
 
-#### C9 — Float printing
+### 2.2 Confirmed — recursion depth
 
-Maude renders `f64` via its own `doubleToString` (a normalized scientific form); we use Rust's default
-`Display`. Same bits, different text:
+#### C12 — Deep ctor-chain stack overflow  **[confirmed, pre-existing]**
 
-| `red` | Maude | Ours |
-|---|---|---|
-| `1.0 / 3.0` | `3.3333333333333331e-1` | `0.3333333333333333` |
-| `100.0 * 100.0` | `1.0e+2`* | `100.0` |
-| `1.0 / 4.0` | `2.5e-1` | `0.25` |
-| `1.0e16` | `1.0e+16` | `10000000000000000.0` |
-
-(*`1.0e+2` from `100.0 * 100.0`.) **Fix:** port Maude's float→string into the NA-value pretty-printer. The
-`conformance/float.maude` fixture only exercises format-coincident values (`1.0`/`2.0`/`3.0`), so it passes
-today — a coverage gap; widen it once the printer matches.
-
-#### C10 — Glued prefix-minus lexing
-
-`-7 quo 2` → our lexer/parser errors (`no parse`); `- 7 quo 2` (spaced) works; Maude accepts both. The
-B4.5e negative-*float* lexer fix (`-1.5`) didn't extend to integer numerals glued to a prefix `-_`.
-- **Fix.** Lexer/mixfix handling of a prefix `-` glued to an integer numeral (cheapest of the three).
-
-#### C11 — Rational printing
-
-`red 2 / 4` → Maude `1/2`, ours `1 / 2`. The rational is normalized correctly (value faithful); Maude
-prints rational special-constants compactly (no spaces around `/`) via the `DivisionSymbol`'s special
-printing, where we render the generic mixfix `_/_`. **Fix:** special-constant printing for rationals (same
-pretty-printer neighborhood as C9; check whether other special constants share the path).
+A reduction whose result (or subject) is a very deep chain of *plain free* constructors overflows the stack:
+`conformance/fib.maude` (`s_` is a plain `[ctor]`, not `iter`/`SuccSymbol`) reduces `fib(s^22 0)` to
+`s^17711(0)` as a 17711-deep nested free node, and the recursive pretty-printer (`pretty.rs` `print`/
+`print_app`) — and likely the recursive `reduce`/`instantiate`/matcher paths — blow the stack. Maude prints
+it fine (iterative output). Orthogonal to C9–C11 and pre-existing (verified: the crash predates the C9–C11
+echo change). **Fix:** make the hot recursive walks (printer first; audit reduce/match/build) iterative or
+depth-bounded with an explicit work stack. Idiom-rare (only non-`iter` ctor towers this deep), so a deliberate
+item, not a rider — but a real release blocker for arbitrary specs.
 
 ### 2.3 Unconfirmed candidate probes  *(write the differential test first)*
 
@@ -155,9 +155,10 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
 - **C3 — Non-confluent / order-dependent membership & equation application.** Incomparable applicable
   membership targets, or owise/condition interplay where application order is observable. Confirm our
   smallest-first order matches Maude's beyond the locked cases.
-- **C4 — Error-sort / kind computation.** `[Sort]` error-sort naming and propagation (one known cosmetic
-  naming divergence, `overload.maude` task #8); audit whether kind-level results ever differ *semantically*,
-  not just in the printed bracket name.
+- **C4 — Error-sort / kind computation.** `[Sort]` error-sort naming and propagation. Confirmed repro (the
+  C9–C11 sweep): `overload.maude` `red 0 + 0 .` → Maude `[Nat]`, ours `[Zero]` — the kind's *representative
+  sort* name differs (a kernel least-sort/kind concern, untouched by the frontend work). Audit whether
+  kind-level results ever differ *semantically*, not just in the printed bracket name.
 - **C5 — AC / `iter` membership-lhs matching — DONE (covered by C8).** Memberships compile to the same
   `LhsAutomaton` and match via the same seam as equations (`SortConstraint.lhs`, engine.rs:49/768/888), so
   C8's cross-theory matching covers their lhs. Differentially verified vs the reference — AC (non-linear
@@ -179,14 +180,17 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
 
 1. **C8 — DONE** (was the highest-severity item, a panic on idiomatic AC/AU/free specs), and **C5 — DONE**
    (AC/`iter` membership-lhs matching, covered by C8's shared matcher seam; confirmed differentially).
-2. **C9–C11** (frontend fidelity) — cheap and independent; C10 (glued-minus lexer) is the smallest, C9
-   (float printer) the most load-bearing for Phase 2's prelude.
-3. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
+2. **C9–C11 — DONE** (frontend fidelity: float / glued-minus / rational printing + the normalized command
+   echo; all differentially byte-identical, fixtures added).
+3. **C12** (deep ctor-chain recursion limit) — newly surfaced; idiom-rare but a release blocker for arbitrary
+   specs. Make the recursive printer (and audit reduce/match/build) iterative/depth-bounded.
+4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
    already open.
-4. **C2–C6 sweep** — confirm/refute each with a differential test, fix in cheapness order.
-5. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
+5. **C2–C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has a
+   confirmed repro from the C9–C11 sweep).
+6. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
    *and* a prerequisite for bounded-memory `rew`/`search` in Phase 2 (folded into C6).
-6. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
+7. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
 
 **Conformance discipline (unchanged):** every fix is validated against the reference binary — value, sort,
 rewrite count, and termination — not from memory. Grow `conformance/` with a `correctness-*.maude` fixture

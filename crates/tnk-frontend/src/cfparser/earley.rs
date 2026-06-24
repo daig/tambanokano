@@ -63,6 +63,7 @@ fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
             tok.kind == TokKind::Number && i.resolve(tok.sym).bytes().any(|b| b != b'0')
         }
         Terminal::Float => tok.kind == TokKind::Float,
+        Terminal::SmallNeg => tok.kind == TokKind::NegNumber,
         Terminal::Str => tok.kind == TokKind::Str,
         Terminal::Qid => tok.kind == TokKind::Qid,
     }

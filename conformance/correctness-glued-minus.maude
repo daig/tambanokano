@@ -1,0 +1,31 @@
+*** Phase 1.5 / C10 — glued prefix-minus lexing. A `-` glued to digits like `-7` is one SMALL_NEG
+*** token in Maude token.cc, parsed via the `-_` MinusSymbol MAKE_INTEGER action, exactly as a
+*** spaced `- 7`. A spaced `-` stays the `_-_`/`-_` operator token, so subtraction is unaffected,
+*** and `5 -7` fails to parse just as the reference binary rejects it. Differential vs the binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-glued-minus.maude < /dev/null
+fmod INTB is
+  sorts Truth Zero NzNat Nat NzInt Int .
+  subsorts Zero NzNat < Nat .
+  subsorts NzNat < NzInt .
+  subsorts Nat < Int .
+  subsorts NzInt < Int .
+  ops tt ff : -> Truth [ctor] .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op -_ : NzNat -> NzInt [ctor special (id-hook MinusSymbol op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op -_ : Int -> Int [ditto] .
+  op _+_ : Int Int -> Int [assoc comm special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _-_ : Int Int -> Int [special (id-hook NumberOpSymbol (-) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _*_ : Int Int -> Int [assoc comm special (id-hook ACU_NumberOpSymbol (*) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _quo_ : Int NzInt -> Int [special (id-hook NumberOpSymbol (quo) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _rem_ : Int NzInt -> Int [special (id-hook NumberOpSymbol (rem) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op _<_ : Int Int -> Truth [special (id-hook NumberOpSymbol (<) op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+endfm
+red - 3 .         *** NzInt: -3   (0 rewrites — a negative numeral is canonical)
+red -7 .          *** NzInt: -7   (a glued negative numeral, 0 rewrites)
+red -7 quo 2 .    *** NzInt: -3
+red 3 + -7 .      *** NzInt: -4
+red -7 rem 2 .    *** NzInt: -1
+red 5 - -7 .      *** NzNat: 12  (subtraction of a glued negative)
+red -2 * -3 .     *** NzNat: 6
+red -7 < 3 .      *** Truth: tt

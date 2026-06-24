@@ -293,6 +293,23 @@ fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortI
 
 /// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`. Builds the term
 /// directly as a DAG ([`build_dag`]) so built-in literals (string/qid/float) and compact numerals work.
+/// The Maude-faithful command echo for `reduce in M : <term> .`: the parsed term, theory-normalized and
+/// pretty-printed exactly as the reference binary prints it — so float / rational / negative special
+/// constants collapse to their canonical surface form (`1.0e+2`, `2/4`, `-3`), redundant parens drop, and
+/// AC arguments appear in the kernel's canonical order, matching Maude's "normalize, then print" echo
+/// behaviour. Builds the pre-reduction DAG (a second, cheap parse — the echo is interactive-only) and
+/// renders it; returns an error if the term does not parse, so the caller can fall back to a raw rendering.
+pub fn command_echo(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+    color: bool,
+) -> Result<String, String> {
+    let tree = parse_forest(term, &lm.grammar, i)?;
+    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i)?;
+    Ok(print_pretty(&lm.built, i, dag, color))
+}
+
 pub fn reduce_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -303,7 +320,7 @@ pub fn reduce_command(
     // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
     // `reduce` below is where every equation and membership application is counted (Maude's accounting).
     lm.built.engine.reset_rewrites();
-    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, term, i)?;
+    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i)?;
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -341,7 +358,7 @@ pub fn match_command(
     let nr = vars.count();
 
     let subj_tree = parse_forest(subject, &lm.grammar, i)?;
-    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, subject, i)?;
+    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i)?;
     let subj = lm.built.engine.reduce(subj);
 
     // Enumerate while the stream borrows the engine, capturing only `DagId`s; render afterwards.
@@ -830,6 +847,50 @@ mod tests {
         );
     }
 
+    /// C9: floats print via Maude's `doubleToString` — the normalized scientific form (`1.0e+4`,
+    /// `2.5e-1`), the 17-significant-digit rounding of 0.1, and a long non-scientific mantissa. `float.maude`
+    /// only used format-coincident values, so this fixture is what pins the printer against the binary.
+    #[test]
+    fn float_print_conforms() {
+        conform_render(
+            conformance_file!("correctness-float-print.maude"),
+            &[
+                e("Flt", "3.3333333333333331e-1", 1),
+                e("Flt", "1.0e+4", 1),
+                e("Flt", "2.5e-1", 0),
+                e("Flt", "1.0000000000000001e-1", 0),
+                e("Flt", "1.0e+3", 0),
+                e("Flt", "1.0e-3", 0),
+                e("Flt", "1.0e+1", 0),
+                e("Flt", "5.0e-1", 0),
+                e("Flt", "1.0e+16", 0),
+                e("Flt", "1.23456789e+5", 0),
+                e("Flt", "1.0", 0),
+                e("Flt", "1.4142135623730951", 1),
+            ],
+        );
+    }
+
+    /// C10: a `-` glued to digits (`-7`) lexes as one `SMALL_NEG` token and parses via the `-_` minus op
+    /// (`MAKE_INTEGER`), exactly as a spaced `- 7` — so `-7 quo 2`, `3 + -7`, `5 - -7` all parse and reduce.
+    /// (The lexer-level `5 -7` rejection — matching the binary — is pinned in `lex::tests`.)
+    #[test]
+    fn glued_minus_conforms() {
+        conform_render(
+            conformance_file!("correctness-glued-minus.maude"),
+            &[
+                e("NzInt", "-3", 0),
+                e("NzInt", "-7", 0),
+                e("NzInt", "-3", 1),
+                e("NzInt", "-4", 1),
+                e("NzInt", "-1", 1),
+                e("NzNat", "12", 1),
+                e("NzNat", "6", 1),
+                e("Truth", "tt", 1),
+            ],
+        );
+    }
+
     #[test]
     fn string_conforms() {
         conform_render(
@@ -849,19 +910,20 @@ mod tests {
         );
     }
 
+    /// C11: a rational special constant prints compactly as `num/den` (Maude's `handleDivision`), so this
+    /// now checks the printed text (was value-only `conform` while we printed the generic `3 / 4`). A
+    /// `0/N` is *not* a rational — `0` is the `Zero` constant, not a numeral — so it stays spaced (`0 / 5`).
     #[test]
     fn rat_conforms() {
-        // Rationals have no ACU-order issue, but `_/_` prints with spaces here (`3 / 4`) vs the binary's
-        // `3/4`, so compare by value (deep_equal), not text.
-        conform(
+        conform_render(
             conformance_file!("rat.maude"),
             &[
                 e("NzNat", "2", 1),
-                e("NzRat", "3 / 4", 1),
-                e("NzRat", "3 / 2", 1),
-                e("NzRat", "- 3 / 2", 1),
+                e("NzRat", "3/4", 1),
+                e("NzRat", "3/2", 1),
+                e("NzRat", "-3/2", 1),
                 e("NzNat", "5", 1),
-                e("NzRat", "3 / 4", 0),
+                e("NzRat", "3/4", 0),
                 e("Rat", "0 / 5", 0),
             ],
         );

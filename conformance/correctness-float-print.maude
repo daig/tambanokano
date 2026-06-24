@@ -1,0 +1,32 @@
+*** Phase 1.5 / C9 — Maude-faithful float printing (`doubleToString`, Utility/macros.cc): 17 significant
+*** digits, the mantissa normalized to [1,10) with trailing zeros stripped (>=1 fractional digit), and a
+*** signed exponent shown only when nonzero.  Differential vs the reference binary:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-float-print.maude < /dev/null
+*** `float.maude` only uses format-coincident values (1.0/2.0/3.5/...) so it never exercised the
+*** scientific form; this fixture pins it: `1.0e+4`, sub-1 values (`2.5e-1`), the 17-digit rounding of
+*** 0.1 (`1.0000000000000001e-1`), and a long non-scientific mantissa (`sqrt 2`).
+fmod FLTB is
+  sorts Truth Flt .
+  ops tt ff : -> Truth [ctor] .
+  op <Floats> : -> Flt [special (id-hook FloatSymbol)] .
+  op _+_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (+) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _-_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (-) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _*_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (*) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _/_ : Flt Flt -> Flt [special (id-hook FloatOpSymbol (/) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op neg : Flt -> Flt [special (id-hook FloatOpSymbol (-) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op abs : Flt -> Flt [special (id-hook FloatOpSymbol (abs) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op sqrt : Flt -> Flt [special (id-hook FloatOpSymbol (sqrt) op-hook floatSymbol (<Floats> : ~> Flt))] .
+  op _lt_ : Flt Flt -> Truth [special (id-hook FloatOpSymbol (<) op-hook floatSymbol (<Floats> : ~> Flt) term-hook trueTerm (tt) term-hook falseTerm (ff))] .
+endfm
+red 1.0 / 3.0 .       *** Flt: 3.3333333333333331e-1   (1 rewrite)
+red 100.0 * 100.0 .   *** Flt: 1.0e+4                  (1 rewrite)
+red 0.25 .            *** Flt: 2.5e-1
+red 0.1 .             *** Flt: 1.0000000000000001e-1
+red 1000.0 .          *** Flt: 1.0e+3
+red 0.001 .           *** Flt: 1.0e-3
+red 10.0 .            *** Flt: 1.0e+1
+red 0.5 .             *** Flt: 5.0e-1
+red 1.0e16 .          *** Flt: 1.0e+16
+red 123456.789 .      *** Flt: 1.23456789e+5
+red 1.0 .             *** Flt: 1.0
+red sqrt(2.0) .       *** Flt: 1.4142135623730951      (1 rewrite)

@@ -12,7 +12,7 @@ mod trace;
 use std::collections::HashMap;
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_frontend::load::{
-    build_loaded_module, format_matchers, match_command, reduce_command, LoadedModule,
+    build_loaded_module, command_echo, format_matchers, match_command, reduce_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
@@ -134,8 +134,12 @@ impl Repl {
         };
         match c {
             Command::Reduce { term } => {
-                let echo = join_tokens(&term, &self.interner);
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                // Maude echoes the *normalized, pretty-printed* parsed term (special constants collapsed,
+                // AC args canonically ordered), not the raw input; fall back to the token join if it
+                // somehow does not parse (the reduce below then reports the real error).
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                 match reduce_command(lm, &self.interner, &term) {

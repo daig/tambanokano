@@ -144,6 +144,12 @@ fn symbol_productions(
         if m.nat_succ == Some(sym) {
             push(g, range_nt, vec![GSym::T(Terminal::SmallNat)], 0, vec![], Action::MakeNatural(sym));
         }
+        // A minus symbol additionally accepts a negative numeral: `<rangeTerm> ::= SMALL_NEG` (Maude's
+        // `MAKE_INTEGER`). `-7` is one `SMALL_NEG` token; `- 7` and `5 - 7` keep `-` as the `-_`/`_-_`
+        // operator token, so prefix negation and binary subtraction are unaffected.
+        if m.minus_sym == Some(sym) {
+            push(g, range_nt, vec![GSym::T(Terminal::SmallNeg)], 0, vec![], Action::MakeInteger(sym));
+        }
         // (Deferred B4.5: the `s_(t)` prefix form and the `f^n(t)` iter-token form.)
         return;
     }
@@ -246,8 +252,9 @@ endfm
             .iter()
             .filter(|p| {
                 matches!(p.action,
-                    Action::MakeTerm(s) | Action::MakeNatural(s) | Action::MakeIter(s)
-                    | Action::MakeFloat(s) | Action::MakeString(s) | Action::MakeQid(s) if s == sym)
+                    Action::MakeTerm(s) | Action::MakeNatural(s) | Action::MakeInteger(s)
+                    | Action::MakeIter(s) | Action::MakeFloat(s) | Action::MakeString(s)
+                    | Action::MakeQid(s) if s == sym)
             })
             .collect()
     }

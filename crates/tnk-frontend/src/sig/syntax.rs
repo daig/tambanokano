@@ -90,4 +90,7 @@ pub struct BuiltModule {
     /// The `MinusSymbol` operator (`-_`), if any — the pretty-printer renders `-(s^n(0))` compactly as
     /// `-n` (Maude-faithful), as Maude's `handleMinus` does.
     pub minus_sym: Option<SymbolId>,
+    /// The `DivisionSymbol` operator (`_/_`), if any — the pretty-printer renders a rational special
+    /// constant compactly as `num/den` (no spaces), as Maude's `handleDivision` does.
+    pub division_sym: Option<SymbolId>,
 }

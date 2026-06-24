@@ -80,6 +80,13 @@ pub fn build_term(
             let zero = m.nat_zero.ok_or("MAKE_NATURAL without a zero symbol")?;
             Ok(numeral_term(succ, zero, n))
         }
+        Action::MakeInteger(minus) => {
+            let text = tokens[tree.start].text(i);
+            let n: u64 = neg_magnitude(text)?;
+            let succ = m.nat_succ.ok_or("MAKE_INTEGER without a successor symbol")?;
+            let zero = m.nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
+            Ok(Term::op(minus, vec![numeral_term(succ, zero, n)]))
+        }
         Action::AssocList => Err("assoc-list node reached build_term directly".to_string()),
         Action::Nop => Err("sort production has no term".to_string()),
         // String/qid/float literals (B4.5) and the f^n iter-token form (deferred) — not on the milestone.
@@ -147,6 +154,16 @@ fn numeral_term(succ: SymbolId, zero: SymbolId, n: u64) -> Term {
     t
 }
 
+/// The magnitude of a `SMALL_NEG` token `-N` (Maude builds `-(s^N(0))` via `MinusSymbol::makeIntTerm`).
+/// Like [`numeral_term`]'s caller it bounds the literal to `u64` (large literals are a deferred bignum
+/// path); the lexer guarantees the `-` prefix + digits.
+fn neg_magnitude(text: &str) -> Result<u64, String> {
+    text.strip_prefix('-')
+        .unwrap_or(text)
+        .parse()
+        .map_err(|_| format!("bad negative integer `{text}`"))
+}
+
 /// Build a kernel `DagId` directly from a parse tree — the **ground command-term** path. Unlike
 /// [`build_term`] (which yields a `Term` for statements/patterns), this constructs DAG nodes through the
 /// engine, so it can build built-in **literals** (string/qid/float values a `Term` cannot carry) and a
@@ -157,16 +174,17 @@ pub fn build_dag(
     g: &CompiledGrammar,
     engine: &mut Engine,
     nat_zero: Option<SymbolId>,
+    nat_succ: Option<SymbolId>,
     tokens: &[Token],
     i: &Interner,
 ) -> Result<DagId, String> {
     match g.prods[tree.prod as usize].action {
         Action::PassThru => {
             let child = tree.nt_children.first().ok_or("PassThru without a child")?;
-            build_dag(child, g, engine, nat_zero, tokens, i)
+            build_dag(child, g, engine, nat_zero, nat_succ, tokens, i)
         }
         Action::MakeTerm(sym) => {
-            let args = dag_args(tree, g, engine, nat_zero, tokens, i)?;
+            let args = dag_args(tree, g, engine, nat_zero, nat_succ, tokens, i)?;
             Ok(engine.make_node(sym, args))
         }
         Action::MakeNatural(succ) => {
@@ -175,6 +193,15 @@ pub fn build_dag(
             let zero = nat_zero.ok_or("MAKE_NATURAL without a zero symbol")?;
             let base = engine.make_const(zero);
             Ok(engine.make_iter(succ, n, base))
+        }
+        Action::MakeInteger(minus) => {
+            let text = tokens[tree.start].text(i);
+            let n: u64 = neg_magnitude(text)?;
+            let zero = nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
+            let succ = nat_succ.ok_or("MAKE_INTEGER without a successor symbol")?;
+            let base = engine.make_const(zero);
+            let nat = engine.make_iter(succ, n, base);
+            Ok(engine.make_node(minus, vec![nat]))
         }
         Action::MakeString(sym) => Ok(engine.make_string(sym, &unquote_string(tokens[tree.start].text(i)))),
         Action::MakeQid(sym) => {
@@ -201,15 +228,16 @@ fn dag_args(
     g: &CompiledGrammar,
     engine: &mut Engine,
     nat_zero: Option<SymbolId>,
+    nat_succ: Option<SymbolId>,
     tokens: &[Token],
     i: &Interner,
 ) -> Result<Vec<DagId>, String> {
     if tree.nt_children.len() == 1 && is_assoc_list(g, &tree.nt_children[0]) {
-        return flatten_dag_assoc(&tree.nt_children[0], g, engine, nat_zero, tokens, i);
+        return flatten_dag_assoc(&tree.nt_children[0], g, engine, nat_zero, nat_succ, tokens, i);
     }
     let mut args = Vec::with_capacity(tree.nt_children.len());
     for c in &tree.nt_children {
-        args.push(build_dag(c, g, engine, nat_zero, tokens, i)?);
+        args.push(build_dag(c, g, engine, nat_zero, nat_succ, tokens, i)?);
     }
     Ok(args)
 }
@@ -219,18 +247,19 @@ fn flatten_dag_assoc(
     g: &CompiledGrammar,
     engine: &mut Engine,
     nat_zero: Option<SymbolId>,
+    nat_succ: Option<SymbolId>,
     tokens: &[Token],
     i: &Interner,
 ) -> Result<Vec<DagId>, String> {
     let mut rev = Vec::new();
     let mut cur = node;
     loop {
-        rev.push(build_dag(&cur.nt_children[1], g, engine, nat_zero, tokens, i)?);
+        rev.push(build_dag(&cur.nt_children[1], g, engine, nat_zero, nat_succ, tokens, i)?);
         let left = &cur.nt_children[0];
         if is_assoc_list(g, left) {
             cur = left;
         } else {
-            rev.push(build_dag(left, g, engine, nat_zero, tokens, i)?);
+            rev.push(build_dag(left, g, engine, nat_zero, nat_succ, tokens, i)?);
             break;
         }
     }

@@ -88,6 +88,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut float_sym = None;
     let mut qid_sym = None;
     let mut minus_sym = None;
+    let mut division_sym = None;
     let mut succ_zero: HashMap<SymbolId, SymbolId> = HashMap::new();
     for od in &pm.ops {
         let Some(spec) = &od.attrs.special else { continue };
@@ -107,6 +108,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             "FloatSymbol" => float_sym = Some(sym),
             "QuotedIdentifierSymbol" => qid_sym = Some(sym),
             "MinusSymbol" => minus_sym = Some(sym),
+            "DivisionSymbol" => division_sym = Some(sym),
             _ => {}
         }
     }
@@ -157,6 +159,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         float_sym,
         qid_sym,
         minus_sym,
+        division_sym,
     })
 }
 

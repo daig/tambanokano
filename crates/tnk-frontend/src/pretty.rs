@@ -177,9 +177,21 @@ impl Printer<'_> {
         if self.faithful
             && self.m.minus_sym == Some(symbol)
             && children.len() == 1
-            && let Some(dec) = self.numeral_decimal(children[0])
+            && let Some(dec) = self.pos_nat_decimal(children[0])
         {
             self.emit(out, Cat::Lit, &format!("-{dec}"));
+            return;
+        }
+        // Maude-faithful rational: a `DivisionSymbol` node whose numerator/denominator are integer
+        // numerals (Maude's `isRat`) prints compactly as `num/den` (no spaces), via `handleDivision`.
+        // A zero numerator is the `Zero` constant, not a numeral, so `0 / 5` is *not* a rational and
+        // falls through to the generic mixfix spacing — matching the reference binary.
+        if self.faithful
+            && self.m.division_sym == Some(symbol)
+            && children.len() == 2
+            && let Some(rat) = self.rational_text(children[0], children[1])
+        {
+            self.emit(out, Cat::Lit, &rat);
             return;
         }
         let Some(syn) = self.m.syntax.get(&symbol) else {
@@ -374,9 +386,19 @@ impl Printer<'_> {
         }
     }
 
-    /// If `d` denotes a non-negative integer numeral — the zero constant, or a SuccSymbol successor over
-    /// it — its decimal; else `None`. Used to render `-(s^n(0))` as `-n`.
-    fn numeral_decimal(&self, d: DagId) -> Option<String> {
+    /// The compact `num/den` text of a `DivisionSymbol` rational special constant (Maude's
+    /// `DivisionSymbol::isRat` + `getRat`): the denominator is a positive natural numeral, and the
+    /// numerator a positive numeral or a negated one. `None` (→ generic mixfix) otherwise — notably for a
+    /// `Zero` numerator (`0 / 5`), which Maude prints spaced.
+    fn rational_text(&self, num: DagId, den: DagId) -> Option<String> {
+        let d = self.pos_nat_decimal(den)?;
+        let n = self.signed_numeral(num)?;
+        Some(format!("{n}/{d}"))
+    }
+
+    /// The decimal of a strictly-positive natural numeral `s^count(0)` (count ≥ 1); `None` for the `Zero`
+    /// constant or any non-numeral (Maude's `SuccSymbol::isNat` on a nonzero value).
+    fn pos_nat_decimal(&self, d: DagId) -> Option<String> {
         let node = self.m.engine.node(d);
         match node.repr() {
             NodeRepr::Iter { count, arg }
@@ -384,9 +406,24 @@ impl Printer<'_> {
             {
                 Some(count)
             }
-            _ if self.m.nat_zero == Some(node.symbol()) => Some("0".to_string()),
             _ => None,
         }
+    }
+
+    /// The signed decimal of a nonzero integer numeral: a positive nat `s^n(0)` → `n`, or a negated nat
+    /// `-(s^n(0))` → `-n`. `None` for `0` or any non-numeral.
+    fn signed_numeral(&self, d: DagId) -> Option<String> {
+        if let Some(n) = self.pos_nat_decimal(d) {
+            return Some(n);
+        }
+        let symbol = self.m.engine.node(d).symbol();
+        if self.m.minus_sym == Some(symbol) {
+            let children: Vec<DagId> = self.m.engine.node(d).children().collect();
+            if let [only] = children.as_slice() {
+                return self.pos_nat_decimal(*only).map(|n| format!("-{n}"));
+            }
+        }
+        None
     }
 
     /// Append `text` for category `cat`, wrapping it in `cat`'s ANSI color when `color` is on.
@@ -439,13 +476,38 @@ fn render_string(s: &str) -> String {
     out
 }
 
-/// A float rendered so it re-lexes as a float token (always with a decimal point).
+/// Render a float exactly as Maude's `doubleToString` (`Utility/macros.cc`): 17 significant digits, the
+/// mantissa normalized to `[1, 10)` with at least one fractional digit and trailing zeros stripped, and a
+/// signed exponent shown only when nonzero — `1.0e+2`, `2.5e-1`, `3.14159265358979`, `-1.5`. Always
+/// re-lexes as a Float (our [`is_float_literal`](crate::lex) accepts the `e±` form).
 fn render_float(f: f64) -> String {
-    let s = format!("{f}");
-    if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
-        s
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return "0.0".to_string(); // also catches -0.0
+    }
+    // 16 fractional digits ⇒ 17 significant digits, mantissa in [1, 10), correctly rounded — the same
+    // value `ecvt(d, 17, …)` produces. Rust's `{:e}` writes `D.DDD…eE` (lowercase, no `+`, no padding).
+    let sci = format!("{:.*e}", 16, f.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("scientific notation has an exponent");
+    let exp: i64 = exp.parse().expect("exponent is an integer");
+    let (int_part, frac) = mantissa.split_once('.').expect("a `.16e` mantissa has a decimal point");
+    // Strip trailing zeros but keep at least one fractional digit (Maude's `next > 4` guard).
+    let frac = frac.trim_end_matches('0');
+    let frac = if frac.is_empty() { "0" } else { frac };
+    let body = match exp {
+        0 => format!("{int_part}.{frac}"),
+        e if e > 0 => format!("{int_part}.{frac}e+{e}"),
+        e => format!("{int_part}.{frac}e{e}"), // a negative exponent already carries its `-`
+    };
+    if f < 0.0 {
+        format!("-{body}")
     } else {
-        format!("{s}.0")
+        body
     }
 }
 

@@ -272,6 +272,43 @@ fn command_echo_spacing() {
     assert!(comma.contains("reduce in E : < z, s z > ."), "comma echo: {comma}");
 }
 
+/// C9 / C10 / C11: the command echo prints the *normalized, pretty-printed* parsed term (Maude's
+/// "normalize, then print"), so float / rational / negative-integer special constants collapse to their
+/// canonical surface form in the `reduce in M : … .` line — byte-for-byte as the reference binary echoes
+/// them. (The reduced *result* printing is pinned by the `conform_render` fixtures; this pins the echo,
+/// which is REPL-only.)
+#[test]
+fn faithful_special_constant_echo() {
+    // C9 — a float echo reformats via doubleToString (`100.0` → `1.0e+2`), not the raw input token.
+    let mut r = repl();
+    r.eval(conformance_file!("correctness-float-print.maude")); // enters FLTB (+ runs its reds)
+    let e = r.eval("red 100.0 * 100.0 .").output;
+    assert!(e.contains("reduce in FLTB : 1.0e+2 * 1.0e+2 ."), "float echo: {e}");
+    assert!(e.contains("result Flt: 1.0e+4"), "float result: {e}");
+
+    // C11 — a rational echo is the compact `num/den`; a `0/N` (Zero numerator) is not a rational, so it
+    // stays spaced.
+    let mut r = repl();
+    r.eval(conformance_file!("rat.maude")); // enters RATB
+    let q = r.eval("red 6 / 4 .").output;
+    assert!(q.contains("reduce in RATB : 6/4 ."), "rational echo: {q}");
+    assert!(q.contains("result NzRat: 3/2"), "rational result: {q}");
+    let z = r.eval("red 0 / 5 .").output;
+    assert!(z.contains("reduce in RATB : 0 / 5 ."), "0/N stays spaced: {z}");
+
+    // C10 — a glued `-7` echoes compactly and reduces; a spaced `- 3` also echoes the compact `-3`; and
+    // `5 -7` fails to parse, exactly as the reference binary rejects it.
+    let mut r = repl();
+    r.eval(conformance_file!("correctness-glued-minus.maude")); // enters INTB
+    let g = r.eval("red -7 quo 2 .").output;
+    assert!(g.contains("reduce in INTB : -7 quo 2 ."), "glued-minus echo: {g}");
+    assert!(g.contains("result NzInt: -3"), "glued-minus result: {g}");
+    let s = r.eval("red - 3 .").output;
+    assert!(s.contains("reduce in INTB : -3 ."), "spaced minus echoes compact: {s}");
+    let bad = r.eval("red 5 -7 .").output;
+    assert!(bad.contains("no parse"), "`5 -7` is rejected like the binary: {bad}");
+}
+
 /// Multi-fragment `:=` backtracking: when the search backtracks *through* a deterministic fragment
 /// (`g(X) = ok`) to re-solve an earlier matching fragment, Maude re-visits the deterministic fragment
 /// (`re-solving` then `failure for condition fragment`). Trace-only — the result/count are unaffected.

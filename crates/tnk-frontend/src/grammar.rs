@@ -60,6 +60,8 @@ pub enum Terminal {
     SmallNat,
     /// Any float literal token (Maude's `FLOAT_NT`).
     Float,
+    /// Any negative-integer literal token (Maude's `SMALL_NEG`); matched by [`crate::lex::TokKind::NegNumber`].
+    SmallNeg,
     /// Any string literal token (Maude's `STRING_NT`).
     Str,
     /// Any quoted-identifier token (Maude's `QUOTED_ID`).
@@ -93,6 +95,9 @@ pub enum Action {
     MakeVariable(SortId),
     /// Build `s^n(0)` from a decimal numeral, for the successor `symbol` (Maude's `MAKE_NATURAL`).
     MakeNatural(SymbolId),
+    /// Build a negative integer `-(s^n(0))` from a `SMALL_NEG` token, for the minus `symbol` (Maude's
+    /// `MAKE_INTEGER` → `MinusSymbol::makeIntTerm`).
+    MakeInteger(SymbolId),
     /// Build `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`). Deferred with [`Nt::Iter`].
     MakeIter(SymbolId),
     MakeFloat(SymbolId),

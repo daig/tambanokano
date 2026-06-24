@@ -56,6 +56,10 @@ pub enum TokKind {
     Str,
     /// A float literal `[0-9]+.[0-9]+` (exponents are a follow-up).
     Float,
+    /// A negative-integer literal `-[0-9]+` with a nonzero magnitude (Maude's `SMALL_NEG`): a `-` glued
+    /// to digits, lexed as one token. `-1.5` is a Float (checked first); a *spaced* `-` stays its own
+    /// token, so `5 - 7` is subtraction and `5 -7` fails to parse (just as in Maude).
+    NegNumber,
     /// A quoted identifier `'…`.
     Qid,
 }
@@ -141,7 +145,21 @@ fn classify(text: &str) -> TokKind {
     if is_float_literal(text) {
         return TokKind::Float;
     }
+    if is_neg_integer(text) {
+        return TokKind::NegNumber;
+    }
     TokKind::Ident
+}
+
+/// A negative-integer literal: a `-` glued to one or more digits with a nonzero magnitude — Maude's
+/// `SMALL_NEG` (`mpz_set_str(s, 10)` succeeds and is `< 0`). `-1.5` has a `.` and is classified as a Float
+/// first; `-0`/`-00` (magnitude zero) is excluded — `0` is solely the declared zero constant (Maude maps
+/// it to `ZERO`), and a glued `-0` is a degenerate input.
+fn is_neg_integer(text: &str) -> bool {
+    let Some(digits) = text.strip_prefix('-') else { return false };
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits.bytes().any(|b| b != b'0')
 }
 
 /// A float literal: an optional leading sign, an integer part, `.`, a fraction, and an optional
@@ -332,9 +350,10 @@ mod tests {
         assert_eq!(t[2].1, TokKind::Dot);
     }
 
-    /// Signed and exponent float literals (Maude prints `neg(1.5)` as `-1.5`); a *spaced* `-` stays its
-    /// own token, so binary subtraction (`5.0 - 1.5`) is unaffected. (Round-trip gap found by the whole-
-    /// conformance-suite sweep.)
+    /// Signed/exponent float literals and glued negative integers (`SMALL_NEG`). A `-` glued to a numeral
+    /// is part of the literal token (`-1.5` Float, `-7` NegNumber); a *spaced* `-` stays its own token, so
+    /// binary subtraction (`5.0 - 1.5`, `5 - 7`) is unaffected — and `5 -7` fails to parse just as Maude
+    /// rejects it. (Float gap found by the whole-conformance-suite sweep; C10 added the integer case.)
     #[test]
     fn signed_and_exponent_floats() {
         assert_eq!(classify("-1.5"), TokKind::Float);
@@ -342,8 +361,10 @@ mod tests {
         assert_eq!(classify("5.0e-1"), TokKind::Float);
         assert_eq!(classify("2.0E+3"), TokKind::Float);
         assert_eq!(classify("4.0"), TokKind::Float);
-        // Not floats: a bare integer / sign / dotless or malformed text.
-        assert_eq!(classify("-3"), TokKind::Ident, "no dot → not a float (negation is the `-_` op)");
+        // A dotless `-N` is a negative-integer literal (Maude's `SMALL_NEG`), not a float.
+        assert_eq!(classify("-3"), TokKind::NegNumber, "`-3` is a SMALL_NEG, parsed via the `-_` op");
+        assert_eq!(classify("-7"), TokKind::NegNumber);
+        assert_eq!(classify("-0"), TokKind::Ident, "`-0` (magnitude zero) is not SMALL_NEG");
         assert_eq!(classify("1."), TokKind::Ident);
         assert_eq!(classify(".5"), TokKind::Ident);
         assert_eq!(classify("1.5e"), TokKind::Ident);
@@ -351,6 +372,12 @@ mod tests {
         let (_i, t) = lex("5.0 - 1.5");
         let decoded: Vec<(&str, TokKind)> = t.iter().map(|(s, k)| (s.as_str(), *k)).collect();
         assert_eq!(decoded, [("5.0", TokKind::Float), ("-", TokKind::Ident), ("1.5", TokKind::Float)]);
+        // A glued `-7` is one `NegNumber` token; a spaced `- 7` and `5 - 7` keep `-` separate. So `5 -7`
+        // lexes as `5`, `-7` (which then fails to parse, exactly as the reference binary rejects it).
+        let toks = |s| lex(s).1;
+        assert_eq!(toks("-7 quo 2"), [("-7".into(), TokKind::NegNumber), ("quo".into(), TokKind::Ident), ("2".into(), TokKind::Number)]);
+        assert_eq!(toks("5 -7"), [("5".into(), TokKind::Number), ("-7".into(), TokKind::NegNumber)]);
+        assert_eq!(toks("5 - 7"), [("5".into(), TokKind::Number), ("-".into(), TokKind::Ident), ("7".into(), TokKind::Number)]);
     }
 
     #[test]
