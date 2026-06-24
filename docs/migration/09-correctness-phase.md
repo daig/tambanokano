@@ -12,12 +12,12 @@ pretty-printer neighborhood — so a fix made *after* rules forces re-verifying 
 block *idiomatic* code (that's why Phase 1 passed), but they are **release blockers** for a "byte-identical
 to the reference" engine, and the panicking one (C8) blocks a textbook spec class outright.
 
-> **STATUS.** **C1 (eager→lazy `mb` sort model) is DONE** (commit `160b956`) — it closed the
-> reducible-membership over-count, the `cmb`-on-reducible *termination* gap, and the membership `Whole:`
-> trace line. The as-built record is the commit + `08-full-trace-plan.md` §status + the kernel/`load.rs`
-> code; it is intentionally *not* re-documented here (this doc tracks **pending** work only). Everything
-> in §2 below is open: **C8** is the priority (a hard panic on idiomatic input); **C9–C11** are the cheap
-> frontend-fidelity cluster; **C7** is confirmed but count-only; **C2–C6** are unconfirmed probes.
+> **STATUS.** Done so far: **C1** (eager→lazy `mb` sort model, commit `160b956`), **C8** (cross-theory
+> alien matching: ACU `75454a9` / AU `f2b025d` / free `4a0cea6`), and **C5** (theory-lhs membership
+> matching — covered by C8's shared seam, confirmed differentially). Still open: **C9–C11** (the cheap
+> frontend-fidelity cluster — float / glued-minus / rational printing), **C7** (confirmed, count-only,
+> subject-DAG sharing), and the **C2 / C3 / C4 / C6** probes. The as-built records are the commits +
+> `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
 Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked B1 matcher items behind C8)
 → the cited code seams.
@@ -85,8 +85,9 @@ subproblem is the backtracking closure for `match`/conditions (set-compared, so 
 - **Residual (not C8).** A `match`/`xmatch` order caveat: AC/AU solution *sets* match the reference but the
   enumeration *order* differs in places (the deferred Diophantine order, set-compared per the B1 discipline);
   `reduce` counts conform because they use Maude's greedy first solution. **C5** (AC/`iter` *membership*-lhs
-  matching) is the membership-side cousin sharing this machinery — still open. The single-element ACU collapse
-  with identity (`s M + N <=? s e`) is a separate pre-existing deferred match-only gap (`07` §collapse).
+  matching) was the membership-side cousin sharing this machinery — now confirmed done (see §2.3 C5). The
+  single-element ACU collapse with identity (`s M + N <=? s e`) is a separate pre-existing deferred gap
+  (`07` §collapse), which also drives the C5 collapse-count residual.
 
 #### C7 — Subject-DAG sharing of repeated subterms  **[confirmed, count-only]**
 
@@ -149,8 +150,18 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
 - **C4 — Error-sort / kind computation.** `[Sort]` error-sort naming and propagation (one known cosmetic
   naming divergence, `overload.maude` task #8); audit whether kind-level results ever differ *semantically*,
   not just in the printed bracket name.
-- **C5 — AC / `iter` membership-lhs matching completeness.** Memberships whose lhs is a theory term (matching
-  modulo ACU/AU/S). The membership-side cousin of **C8** — likely the same matcher work; schedule together.
+- **C5 — AC / `iter` membership-lhs matching — DONE (covered by C8).** Memberships compile to the same
+  `LhsAutomaton` and match via the same seam as equations (`SortConstraint.lhs`, engine.rs:49/768/888), so
+  C8's cross-theory matching covers their lhs. Differentially verified vs the reference — AC (non-linear
+  `mb X + X`, alien `mb s M + N`), AU (`mb a L`, alien `mb (s M) L`), iter/S (`mb s s s X`) —
+  `conformance/correctness-membership-theory.maude`. **Two residual edges, both pre-existing / orthogonal,
+  not membership-specific:** (a) **collapse matching** — when a membership pattern collapses under an
+  identity (`mb a L : Lst` with `[id: nil]`), Maude also applies it to the collapsed sub-element (`a`,
+  `L=nil`), so the *count* is higher than ours (sort/value still correct); Maude itself warns on such
+  patterns; the deferred `07` §collapse gap, which affects equations too. (b) a **theory-rooted sub-pattern
+  under an `iter` successor** (`mb s (a + X) : Foo`) still panics (loud, `s.rs:67` — the S theory's
+  sub-pattern isn't yet composed via `match_skeleton`); exotic (an AC/AU term directly under a numeric
+  successor). Neither blocks idiomatic membership specs.
 - **C6 — Substitution-size / re-entrant reduce edge cases.** Deep/condition-nested reductions, the F-2
   engine-global GC root set (also a Phase-2 `rew`/`search` prerequisite — slot it here).
 
@@ -158,8 +169,8 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
 
 ## 3. Sequencing
 
-1. **C8 — DONE** (was the highest-severity item, a panic on idiomatic AC/AU/free specs). It shares matcher
-   machinery with **C5** (AC/`iter` membership-lhs matching), which is the natural next pickup.
+1. **C8 — DONE** (was the highest-severity item, a panic on idiomatic AC/AU/free specs), and **C5 — DONE**
+   (AC/`iter` membership-lhs matching, covered by C8's shared matcher seam; confirmed differentially).
 2. **C9–C11** (frontend fidelity) — cheap and independent; C10 (glued-minus lexer) is the smallest, C9
    (float printer) the most load-bearing for Phase 2's prelude.
 3. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is

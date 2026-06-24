@@ -632,6 +632,34 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C5 — membership axioms whose lhs is a theory term, matched modulo the theory. Since
+    /// memberships compile to the same `LhsAutomaton` as equations, the C8 cross-theory matching covers
+    /// their lhs: AC (non-linear `X + X`, alien `s M + N`), AU (`a L`, alien `(s M) L`), and iter/S
+    /// (`s s s X`) membership lhs all match the reference. (Collapse-matching under an identity — Maude
+    /// applying `mb a L` to collapsed sub-elements — is the separate deferred count-only gap.)
+    #[test]
+    fn correctness_membership_theory_conforms() {
+        conform(
+            conformance_file!("correctness-membership-theory.maude"),
+            &[
+                // AC-MB
+                e("Sym", "a + a", 1),
+                e("E", "a + b", 0),
+                e("Pair", "s a + b", 1),   // alien membership lhs `s M + N` matches modulo AC
+                e("Pair", "s a + s a", 1), // both apply; the tie-break picks Pair
+                // AU-MB
+                e("Lst", "a b c", 1),
+                e("E", "b c", 0),
+                e("Spec", "s a b c", 1),   // alien head `(s M) L` matches modulo AU
+                // S-MB
+                e("Zero", "0", 0),
+                e("NzNat", "s s 0", 0),    // too few successors
+                e("Big", "s s s 0", 1),    // iter/S membership lhs `s s s X`
+                e("Big", "s s s s 0", 1),
+            ],
+        );
+    }
+
     /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its

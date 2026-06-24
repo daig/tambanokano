@@ -1,0 +1,51 @@
+*** Phase 1.5 / C5 — membership axioms (`mb`/`cmb`) whose LEFT-HAND SIDE is a theory term, matched
+*** modulo the theory's axioms.  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-membership-theory.maude < /dev/null
+***
+*** Memberships compile to the same `LhsAutomaton` as equations and match via the same seam, so the C8
+*** cross-theory alien matching covers their lhs too: an AC/AU/iter membership lhs — including non-linear
+*** variables and alien subterms — matches modulo the theory. (Residual: a membership pattern that
+*** *collapses* under an identity, e.g. `mb a L : Lst` with `[id: nil]`, applies to collapsed sub-elements
+*** in Maude too — the deferred collapse-matching gap, count-only; Maude itself warns on such patterns.)
+
+fmod AC-MB is
+  sorts E Pair Sym .
+  subsorts Sym Pair < E .
+  ops a b c : -> E [ctor] .
+  op _+_ : E E -> E [assoc comm] .
+  op s_ : E -> E [ctor] .
+  vars X M N : E .
+  mb X + X : Sym .          *** AC lhs, non-linear variable
+  mb s M + N : Pair .       *** AC lhs with an alien (s M)
+endfm
+red a + a .                 *** Sym: a + a, 1 rewrite
+red a + b .                 *** E: a + b, 0 rewrites
+red s a + b .               *** Pair: b + s a, 1 rewrite (alien membership lhs matches modulo AC)
+red s a + s a .             *** Pair: s a + s a, 1 rewrite (both apply; the tie-break picks Pair)
+
+fmod AU-MB is
+  sorts E Lst Spec .
+  subsorts Spec Lst < E .
+  ops a b c : -> E [ctor] .
+  op s_ : E -> E [ctor] .
+  op __ : E E -> E [assoc] .   *** no identity: no collapse
+  vars M L : E .
+  mb a L : Lst .             *** AU lhs: a sequence whose head is a
+  mb (s M) L : Spec .        *** AU lhs with an alien head (s M)
+endfm
+red a b c .                  *** Lst: a b c, 1 rewrite
+red b c .                    *** E: b c, 0 rewrites
+red (s a) b c .              *** Spec: s a b c, 1 rewrite
+
+fmod S-MB is
+  sorts Zero NzNat Nat Big .
+  subsorts Zero NzNat < Nat .
+  subsort Big < NzNat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter] .
+  var X : Nat .
+  mb s s s X : Big .         *** iter/S lhs: at least three successors is Big
+endfm
+red 0 .                      *** Zero: 0, 0 rewrites
+red s s 0 .                  *** NzNat: s s 0, 0 rewrites (too few successors)
+red s s s 0 .                *** Big: s s s 0, 1 rewrite
+red s s s s 0 .              *** Big: s s s s 0, 1 rewrite
