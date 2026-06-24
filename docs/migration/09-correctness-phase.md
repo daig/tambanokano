@@ -16,12 +16,13 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > alien matching: ACU `75454a9` / AU `f2b025d` / free `4a0cea6`), **C5** (theory-lhs membership matching —
 > covered by C8's shared seam), and **C9 / C10 / C11** (the frontend-fidelity cluster — float / glued-minus /
 > rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does), and
-> **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints).
-> Still open: **C13** (long-output line-wrapping — the C12 residual, lowest priority), **C7** (confirmed,
-> count-only, subject-DAG sharing), and the **C6** probe (the substantial one — engine-global condition-reduce
-> GC roots, also a Phase-2 `rew`/`search` prerequisite). **C2** struck (Maude loops on `eq a = a` too — the
-> F-1 guard would *diverge*); **C3** verified (we match on every well-formed order-dependent case); **C4**
-> done for single-top kinds (`[Nat]`), a narrow multi-top-order residual sharing C3's root; all §2.3. The
+> **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints), and
+> **C6 / F-2** (engine-global condition-reduce GC root set — bounded-memory re-entrant conditions, a Phase-2
+> `rew`/`search` prerequisite). **Every probe is now resolved:** **C2** struck (Maude loops on `eq a = a` too —
+> the F-1 guard would *diverge*), **C3** verified (we match on every well-formed order-dependent case), **C4**
+> done for single-top kinds (`[Nat]`); all §2.3. **Open = only idiom-rare residuals:** **C13** (long-output
+> line-wrapping, lowest), **C7** (subject-DAG sharing, count-only), and the shared C3/C4 multi-top
+> component-index order (Maude's unported `ConnectedComponent` sort index). The
 > as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
@@ -50,9 +51,10 @@ Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked
 
 ## 2. Known correctness issues (pending)
 
-Fix in roughly this order: severity first (C8 panics), then the cheap frontend cluster (C9–C11), then the
-confirmed-but-narrow C7, then the unconfirmed probes (C2–C6). C-numbers are stable discovery-order IDs, not
-priority ranks.
+All confirmed items and probes are now resolved (C1/C5/C8/C9/C10/C11/C12 done, C6/F-2 done, C2 struck, C3
+verified, C4 done for single-top kinds); only idiom-rare residuals remain (C7, C13, the C3/C4 multi-top
+order). The entries below are kept as the as-built record + the residual boundaries. C-numbers are stable
+discovery-order IDs, not priority ranks.
 
 ### 2.1 Confirmed — evaluator
 
@@ -219,8 +221,24 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
   under an `iter` successor~~ — **now closed** as part of C8's uniform cross-theory composition (the S/CUI
   directions): `mb s (a + X) : Foo` matches modulo AC under the successor. So only (a), collapse matching,
   remains — and it never blocked idiomatic membership specs.
-- **C6 — Substitution-size / re-entrant reduce edge cases.** Deep/condition-nested reductions, the F-2
-  engine-global GC root set (also a Phase-2 `rew`/`search` prerequisite — slot it here).
+- **C6 / F-2 — engine-global condition-reduce GC root set — DONE (commit `0af1a93`).** A condition
+  fragment is evaluated by re-entering `reduce`; that nested reduce's `safe_point_gc` saw only its *own*
+  frame stack, so with in-reduction GC on a collection could sweep the outer reduction's live state
+  (sibling subtrees held only in ancestor frames, the match bindings, the redex). The old mitigation
+  disabled GC for the whole condition solve — correct, but it can't bound a single long-running condition,
+  and it's the wrong model for Phase-2 `rew`/`search` (which re-enter `reduce` extensively). **Fixed** by
+  keeping GC enabled and rooting the outer context (Maude marks from all active rewriting contexts): a new
+  `Runtime.protected` vec, marked by `safe_point_gc`, onto which `condition_holds` pushes the outer frames'
+  roots (each `original` — transitively its unreduced children — + strategy-reduced `args`), the match
+  bindings, and the redex (threaded via both the equation route `try_rewrite_top`→`try_equations` and the
+  `cmb` route `compute_true_sort`/`constrain_to_smaller_sort`→`membership_applies`); plus `RootGuard`s in
+  `solve_condition` for its own intermediates (the reduced `l` pinned across `r`'s reduction, with `r`
+  instantiated after; the reduced subject pinned across a `:=` recursion). Gated on `gc_interval`, so the
+  GC-off REPL/bench hot path is untouched (zero overhead). Two kernel corruption tests (equality + `:=`)
+  reduce `pair(a, cond(b))` under frequent GC and recover the result intact — **proven load-bearing**
+  (disabling just the frame-push sweeps the outer sibling; the missing intermediate root surfaced as a
+  freed-node panic before the `RootGuard`s). All condition fixtures stay byte-identical to the reference;
+  214 tests, fib(22) unregressed. **Unblocks bounded-memory Phase-2 `rew`/`search`.**
 
 ---
 
@@ -232,16 +250,15 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    echo; all differentially byte-identical, fixtures added).
 3. **C12 — DONE** (pretty-printer deep-chain overflow → iterative work-stack; evaluator was never affected).
    Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
-4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
-   already open.
-5. **C6** — the one substantial open probe (engine-global condition-reduce GC root set; also a Phase-2
-   `rew`/`search` prerequisite). Earlier sweep outcomes: **C2 struck** (Maude loops on `eq a = a` too — the
-   F-1 guard would diverge); **C3 verified** (we match on every well-formed order-dependent case); **C4 done**
-   for single-top kinds (name by maximal sort → `[Nat]`), with a narrow multi-top-order residual that shares
-   C3's root (Maude's unported `ConnectedComponent` sort index — close both together if ever needed).
-6. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
-   *and* a prerequisite for bounded-memory `rew`/`search` in Phase 2 (folded into C6).
-7. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
+4. **C6 / F-2 — DONE** (engine-global condition-reduce GC root set; keeps GC on during conditions while
+   protecting the outer context — bounded-memory re-entrant reduction, the Phase-2 `rew`/`search`
+   prerequisite). Earlier sweep outcomes: **C2 struck** (Maude loops on `eq a = a` too — the F-1 guard would
+   diverge); **C3 verified** (we match on every well-formed order-dependent case); **C4 done** for single-top
+   kinds (name by maximal sort → `[Nat]`).
+5. **Remaining = idiom-rare residuals only** (none block Phase 2): **C7** (subject-DAG sharing, count-only —
+   do when the term-builder is open); **C13** (long-output line-wrapping); the shared **C3/C4 multi-top
+   component-index order** (Maude's unported `ConnectedComponent` sort index — closes both at once).
+6. **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
 
 **Conformance discipline (unchanged):** every fix is validated against the reference binary — value, sort,
 rewrite count, and termination — not from memory. Grow `conformance/` with a `correctness-*.maude` fixture
