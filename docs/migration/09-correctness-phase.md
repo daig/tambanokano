@@ -15,8 +15,9 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > **STATUS.** Done so far: **C1** (eager→lazy `mb` sort model, commit `160b956`), **C8** (cross-theory
 > alien matching: ACU `75454a9` / AU `f2b025d` / free `4a0cea6`), **C5** (theory-lhs membership matching —
 > covered by C8's shared seam), and **C9 / C10 / C11** (the frontend-fidelity cluster — float / glued-minus /
-> rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does). Still
-> open: **C12** (recursion-depth limit on very deep ctor chains — newly surfaced), **C7** (confirmed,
+> rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does), and
+> **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints).
+> Still open: **C13** (long-output line-wrapping — the C12 residual, lowest priority), **C7** (confirmed,
 > count-only, subject-DAG sharing), and the **C2 / C3 / C4 / C6** probes. The as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
@@ -133,18 +134,27 @@ byte-identical to the reference binary (echo + result), conformance fixtures add
   **AC print-order** cosmetic difference (our `SymbolId` order vs Maude's `orderInt`; `08` §status), now also
   visible in echoes of 3+-element AC terms — multiset-identical, order-only, no conformance fixture hits it.
 
-### 2.2 Confirmed — recursion depth
+### 2.2 Confirmed — output formatting
 
-#### C12 — Deep ctor-chain stack overflow  **[confirmed, pre-existing]**
+#### C12 — Deep ctor-chain stack overflow in the pretty-printer — **DONE**
 
-A reduction whose result (or subject) is a very deep chain of *plain free* constructors overflows the stack:
-`conformance/fib.maude` (`s_` is a plain `[ctor]`, not `iter`/`SuccSymbol`) reduces `fib(s^22 0)` to
-`s^17711(0)` as a 17711-deep nested free node, and the recursive pretty-printer (`pretty.rs` `print`/
-`print_app`) — and likely the recursive `reduce`/`instantiate`/matcher paths — blow the stack. Maude prints
-it fine (iterative output). Orthogonal to C9–C11 and pre-existing (verified: the crash predates the C9–C11
-echo change). **Fix:** make the hot recursive walks (printer first; audit reduce/match/build) iterative or
-depth-bounded with an explicit work stack. Idiom-rare (only non-`iter` ctor towers this deep), so a deliberate
-item, not a rider — but a real release blocker for arbitrary specs.
+Was: rendering a very deep chain of *plain free* constructors overflowed the stack — the *evaluator* was
+always fine (verified: `reduce` is iterative since A1 and provably completes — `fib(22)` = 186579 rewrites;
+`sort_of` is a cached O(1) read; `instantiate`/`match` recurse on shallow pattern depth, not subject depth),
+but the recursive DAG printer (`print`→`print_app`→child, one frame per level) blew the ~8 MB stack on
+`fib(22)`'s 17711-deep `s^17711(0)` result. **Fixed** by converting the `pretty.rs` walk to an explicit
+heap work-stack (`Item`/`Work`, `run_stack`/`layout*`) — the same transform A1 applied to `reduce`/
+`deep_equal`; contained to the printer, no evaluator change, byte-identical on all existing render/
+round-trip/trace tests. `fib(22)` now prints its 17711-successor result (== Maude's value + rewrite count).
+
+#### C13 — Long-output line-wrapping  **[confirmed, the C12 residual]**
+
+Maude wraps a long printed term across lines at a column limit (default ~72), continuing with a 4-space
+indent; we print the whole term on one line. So `fib(22)`'s result is value-identical but laid out
+differently (Maude: many wrapped lines; ours: one ~35 KB line). Display-only, value/sort/count always
+correct, and it only triggers on very long results (idiom-rare — no conformance fixture in the byte-diff
+suite hits it). **Fix:** port Maude's output line-wrapper (the `format`/`PrintSettings` line-length logic) in
+the REPL/pretty layer. Lowest-priority of the open items.
 
 ### 2.3 Unconfirmed candidate probes  *(write the differential test first)*
 
@@ -182,8 +192,8 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    (AC/`iter` membership-lhs matching, covered by C8's shared matcher seam; confirmed differentially).
 2. **C9–C11 — DONE** (frontend fidelity: float / glued-minus / rational printing + the normalized command
    echo; all differentially byte-identical, fixtures added).
-3. **C12** (deep ctor-chain recursion limit) — newly surfaced; idiom-rare but a release blocker for arbitrary
-   specs. Make the recursive printer (and audit reduce/match/build) iterative/depth-bounded.
+3. **C12 — DONE** (pretty-printer deep-chain overflow → iterative work-stack; evaluator was never affected).
+   Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
 4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
    already open.
 5. **C2–C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has a

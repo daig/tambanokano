@@ -13,6 +13,7 @@
 use crate::grammar::{prec_gather, PREFIX_GATHER};
 use crate::lex::{Frag, Interner, Sym};
 use crate::sig::syntax::{BuiltModule, SymbolSyntax};
+use std::borrow::Cow;
 use tnk_core::dag::{DagId, NodeRepr};
 use tnk_core::sort::KindId;
 use tnk_core::symbol::SymbolId;
@@ -66,10 +67,7 @@ pub fn print_pretty(m: &BuiltModule, i: &Interner, d: DagId, color: bool) -> Str
 /// vs `dagNodePrint` split). A `Term::Var` prints as its name from `vars` (index → name, the statement's
 /// [`VarIndex`](crate::build_term::VarIndex) order); used by the trace to render `eq lhs = rhs .`.
 pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], color: bool) -> String {
-    let p = Printer { m, i, faithful: true, color, vars };
-    let mut out = String::new();
-    p.print_term(&mut out, t, UNBOUNDED, NONE_CAP, NONE_CAP);
-    out
+    Printer { m, i, faithful: true, color, vars }.print_term_top(t)
 }
 
 /// The shared printer. `m`/`i`/flags are immutable; the output buffer is threaded as a `&mut String`
@@ -84,152 +82,163 @@ struct Printer<'a> {
     vars: &'a [String],
 }
 
-/// A child of an application in either walk: a `DagId` (recurse via [`Printer::print`]) or a `&Term`
-/// (recurse via [`Printer::print_term`]). Lets the mixfix frag/hole loop be shared (Option iii).
-trait Child {
-    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap);
-}
-impl Child for DagId {
-    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap) {
-        p.print(out, *self, req_prec, lcap, rcap);
-    }
-}
-impl Child for Term {
-    fn render(&self, p: &Printer, out: &mut String, req_prec: u32, lcap: Cap, rcap: Cap) {
-        p.print_term(out, self, req_prec, lcap, rcap);
-    }
+/// A child to lay out in either walk: a reduced DAG node, or a static [`Term`] (pattern) node. Unifies the
+/// DAG printer (`print_raw`/`print_pretty`) and the `Term` printer (`print_term`, for the trace) under one
+/// iterative driver.
+#[derive(Clone, Copy)]
+enum Item<'t> {
+    Dag(DagId),
+    Term(&'t Term),
 }
 
-impl Printer<'_> {
+/// One pending unit of output on the explicit work-stack. The recursive descent of the former
+/// `print`/`print_app`/… is replaced by this stack, so a very deep subject — e.g. `s^17711(0)` from
+/// `fib(22)`, a plain-`ctor` tower — can't overflow the *call* stack (the same iterative treatment A1 gave
+/// `reduce`/`deep_equal`; the depth now lives in this heap `Vec`). `Text` is a colored emission; `Space` is
+/// a raw inter-token space (Maude never colors whitespace); `Visit` is expanded by [`Printer::layout`].
+enum Work<'a, 't> {
+    Text { cat: Cat, text: Cow<'a, str> },
+    Space,
+    Visit { item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap },
+}
+
+impl<'a> Printer<'a> {
     fn render(&self, d: DagId) -> String {
         let mut out = String::new();
-        self.print(&mut out, d, UNBOUNDED, NONE_CAP, NONE_CAP);
+        self.run_stack(&mut out, Item::Dag(d));
         out
     }
 
-    /// Print a static [`Term`]: a variable by name, or an operator application via the shared mixfix walk.
-    fn print_term(&self, out: &mut String, t: &Term, req_prec: u32, lcap: Cap, rcap: Cap) {
-        match t {
-            Term::Var(v) => {
+    /// Print a static [`Term`] (a pattern, with named variables) — the trace's `eq lhs = rhs .` renderer.
+    fn print_term_top(&self, t: &Term) -> String {
+        let mut out = String::new();
+        self.run_stack(&mut out, Item::Term(t));
+        out
+    }
+
+    /// Drive the explicit work-stack: pop a unit and emit text / a space, or expand a node into more work.
+    /// [`layout`](Self::layout) yields a node's pieces in forward order; they are pushed *reversed* so a
+    /// LIFO `pop` replays them — and, transitively, their children — in emission order. The recursion depth
+    /// of the former walk now lives in this heap `Vec`, so an arbitrarily deep subject can't overflow the
+    /// call stack.
+    fn run_stack<'t>(&self, out: &mut String, start: Item<'t>) {
+        let mut stack: Vec<Work<'a, 't>> =
+            vec![Work::Visit { item: start, req_prec: UNBOUNDED, lcap: NONE_CAP, rcap: NONE_CAP }];
+        let mut pieces: Vec<Work<'a, 't>> = Vec::new();
+        while let Some(w) = stack.pop() {
+            match w {
+                Work::Text { cat, text } => self.emit(out, cat, &text),
+                Work::Space => out.push(' '),
+                Work::Visit { item, req_prec, lcap, rcap } => {
+                    self.layout(item, req_prec, lcap, rcap, &mut pieces);
+                    stack.extend(pieces.drain(..).rev());
+                }
+            }
+        }
+    }
+
+    /// Lay out ONE node into its forward piece sequence — emitting `Text`/`Space` and pushing each child as
+    /// a `Visit` (no recursion into children). Ports the dispatch of the former `print`/`print_term`.
+    fn layout<'t>(&self, item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+        match item {
+            Item::Term(Term::Var(v)) => {
                 let name = self.vars.get(v.index as usize).map(String::as_str).unwrap_or("_");
-                self.emit(out, Cat::Op, name);
+                out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(name) });
             }
-            Term::Op { symbol, args } => self.print_app_term(out, *symbol, args, req_prec, lcap, rcap),
+            Item::Term(Term::Op { symbol, args }) => {
+                let children: Vec<Item> = args.iter().map(Item::Term).collect();
+                self.layout_app(*symbol, &children, req_prec, lcap, rcap, out);
+            }
+            Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, out),
         }
     }
 
-    /// A `Term::Op` application — the term-walk twin of [`print_app`](Self::print_app) (no DAG leaf/iter/
-    /// minus special-casing; children are `&[Term]`). Parenthesization is the same prec/gather inverse.
-    fn print_app_term(&self, out: &mut String, symbol: SymbolId, args: &[Term], req_prec: u32, lcap: Cap, rcap: Cap) {
-        let Some(syn) = self.m.syntax.get(&symbol) else {
-            self.emit(out, Cat::Op, self.m.engine.symbol(symbol).name());
-            if !args.is_empty() {
-                self.print_arg_list(out, args);
+    /// Lay out one DAG node: a leaf (numeral / string / qid / float), an `iter`, or an application (with the
+    /// faithful minus/rational special cases). The `&node` borrow is released — owned leaf data, then a
+    /// freshly-fetched child list — before the `&self` layout calls.
+    fn layout_dag<'t>(&self, d: DagId, req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+        let symbol = self.m.engine.node(d).symbol();
+        let leaf = {
+            let node = self.m.engine.node(d);
+            match node.repr() {
+                NodeRepr::App => None,
+                NodeRepr::Iter { count, arg } => Some(Leaf::Iter { count, arg }),
+                NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
+                NodeRepr::Qid(q) => Some(Leaf::Atom(format!("'{q}"))),
+                NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
             }
-            return;
-        };
-        let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
-        if !has_hole {
-            let cat = if args.is_empty() { Cat::Lit } else { Cat::Op };
-            self.emit(out, cat, self.frag_text(&syn.frags[0]));
-            if !args.is_empty() {
-                self.print_arg_list(out, args);
-            }
-            return;
-        }
-        let pg = prec_gather::compute(&syn.frags, syn.domain.len(), syn.prec, syn.gather.as_deref(), syn.assoc);
-        let paren = req_prec < pg.prec || self.captures(syn, &pg.gather, lcap, rcap);
-        if paren {
-            self.emit(out, Cat::Punct, "(");
-        }
-        let (lcap, rcap) = if paren { (NONE_CAP, NONE_CAP) } else { (lcap, rcap) };
-        self.print_mixfix(out, syn, &pg, args, lcap, rcap);
-        if paren {
-            self.emit(out, Cat::Punct, ")");
-        }
-    }
-
-    /// Print node `d` under a position whose gather bound is `req_prec`, with the given left/right
-    /// adjacency-capture contexts.
-    fn print(&self, out: &mut String, d: DagId, req_prec: u32, lcap: Cap, rcap: Cap) {
-        let node = self.m.engine.node(d);
-        let symbol = node.symbol();
-        // Extract owned leaf data so the `&node` borrow is released before the recursive `&self` calls.
-        let leaf = match node.repr() {
-            NodeRepr::App => None,
-            NodeRepr::Iter { count, arg } => Some(Leaf::Iter { count, arg }),
-            NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
-            NodeRepr::Qid(q) => Some(Leaf::Atom(format!("'{q}"))),
-            NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
         };
         match leaf {
-            Some(Leaf::Atom(text)) => self.emit(out, Cat::Lit, &text),
-            Some(Leaf::Iter { count, arg }) => self.print_iter(out, symbol, &count, arg, req_prec, rcap),
-            None => self.print_app(out, d, symbol, req_prec, lcap, rcap),
+            Some(Leaf::Atom(text)) => out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(text) }),
+            Some(Leaf::Iter { count, arg }) => self.layout_iter(symbol, &count, arg, req_prec, rcap, out),
+            None => {
+                let children: Vec<DagId> = self.m.engine.node(d).children().collect();
+                // Maude-faithful negation: `-(s^n(0))` → the compact `-n` (Maude's `handleMinus`). The raw
+                // printer instead lets the normal `- arg` mixfix handle it (which re-parses).
+                if self.faithful
+                    && self.m.minus_sym == Some(symbol)
+                    && children.len() == 1
+                    && let Some(dec) = self.pos_nat_decimal(children[0])
+                {
+                    out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(format!("-{dec}")) });
+                    return;
+                }
+                // Maude-faithful rational: a `DivisionSymbol` node over integer numerals (Maude's `isRat`)
+                // → the compact `num/den`. A zero numerator is the `Zero` constant, not a numeral, so
+                // `0 / 5` falls through to the generic mixfix spacing — matching the reference binary.
+                if self.faithful
+                    && self.m.division_sym == Some(symbol)
+                    && children.len() == 2
+                    && let Some(rat) = self.rational_text(children[0], children[1])
+                {
+                    out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(rat) });
+                    return;
+                }
+                let items: Vec<Item> = children.iter().map(|&c| Item::Dag(c)).collect();
+                self.layout_app(symbol, &items, req_prec, lcap, rcap, out);
+            }
         }
     }
 
-    /// An operator application (free / ACU / AU / CUI) — mixfix, prefix, or constant.
-    fn print_app(&self, out: &mut String, d: DagId, symbol: SymbolId, req_prec: u32, lcap: Cap, rcap: Cap) {
-        let children: Vec<DagId> = self.m.engine.node(d).children().collect();
-        // Maude-faithful negation: `-(s^n(0))` prints as the compact `-n` (Maude's `handleMinus`). The raw
-        // printer instead lets the normal `- arg` mixfix handle it (which re-parses).
-        if self.faithful
-            && self.m.minus_sym == Some(symbol)
-            && children.len() == 1
-            && let Some(dec) = self.pos_nat_decimal(children[0])
-        {
-            self.emit(out, Cat::Lit, &format!("-{dec}"));
-            return;
-        }
-        // Maude-faithful rational: a `DivisionSymbol` node whose numerator/denominator are integer
-        // numerals (Maude's `isRat`) prints compactly as `num/den` (no spaces), via `handleDivision`.
-        // A zero numerator is the `Zero` constant, not a numeral, so `0 / 5` is *not* a rational and
-        // falls through to the generic mixfix spacing — matching the reference binary.
-        if self.faithful
-            && self.m.division_sym == Some(symbol)
-            && children.len() == 2
-            && let Some(rat) = self.rational_text(children[0], children[1])
-        {
-            self.emit(out, Cat::Lit, &rat);
-            return;
-        }
+    /// Lay out an application from its symbol + already-extracted child [`Item`]s: prefix/constant, or a
+    /// mixfix form with the prec/gather parenthesization (the inverse of the parser's gather gate, plus the
+    /// adjacency-capture cases). Shared by the DAG and `Term` walks.
+    fn layout_app<'t>(&self, symbol: SymbolId, children: &[Item<'t>], req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
         let Some(syn) = self.m.syntax.get(&symbol) else {
             // No recorded syntax (should not happen for a user op): prefix-print with the kernel name.
-            self.emit(out, Cat::Op, self.m.engine.symbol(symbol).name());
-            self.print_arg_list(out, &children);
+            out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(self.m.engine.symbol(symbol).name()) });
+            if !children.is_empty() {
+                self.layout_arg_list(children, out);
+            }
             return;
         };
         let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
         if !has_hole {
             // Constant (a value → `Lit`) or prefix operator (`name(a, b, …)` → `Op` name).
             let cat = if children.is_empty() { Cat::Lit } else { Cat::Op };
-            self.emit(out, cat, self.frag_text(&syn.frags[0]));
+            out.push(Work::Text { cat, text: self.frag_cow(&syn.frags[0]) });
             if !children.is_empty() {
-                self.print_arg_list(out, &children);
+                self.layout_arg_list(children, out);
             }
             return;
         }
-        // Mixfix. Parenthesize iff this op binds looser than the position allows (the inverse of the
-        // parser's gather gate), or an adjacency-capture would re-associate it.
         let pg = prec_gather::compute(&syn.frags, syn.domain.len(), syn.prec, syn.gather.as_deref(), syn.assoc);
         let paren = req_prec < pg.prec || self.captures(syn, &pg.gather, lcap, rcap);
         if paren {
-            self.emit(out, Cat::Punct, "(");
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
         }
-        // A surrounding paren blocks inherited capture (Maude: inherit leftCapture/rightCapture only when
-        // not parenthesized).
+        // A surrounding paren blocks inherited capture (Maude inherits left/right capture only unparenthesized).
         let (lcap, rcap) = if paren { (NONE_CAP, NONE_CAP) } else { (lcap, rcap) };
-        self.print_mixfix(out, syn, &pg, &children, lcap, rcap);
+        self.layout_mixfix(syn, &pg, children, lcap, rcap, out);
         if paren {
-            self.emit(out, Cat::Punct, ")");
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
         }
     }
 
-    /// Emit a mixfix form: walk the syntax fragments, emitting literal tokens and recursing into argument
-    /// holes (each at its gather bound + adjacency context). An associative operator with more arguments
-    /// than its arity folds its flattened children over the infix tokens (`a + b + c`).
-    fn print_mixfix<C: Child>(&self, out: &mut String, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[C], lcap: Cap, rcap: Cap) {
+    /// Lay out a mixfix form: walk the syntax fragments, emitting literal tokens and pushing each argument
+    /// hole as a `Visit` (at its gather bound + adjacency context). An associative operator with more
+    /// arguments than its arity folds its flattened children over the infix tokens (`a + b + c`).
+    fn layout_mixfix<'t>(&self, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[Item<'t>], lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
         let nr_args = syn.domain.len();
         let left_bare = matches!(syn.frags.first(), Some(Frag::Hole));
         let right_bare = matches!(syn.frags.last(), Some(Frag::Hole));
@@ -241,14 +250,14 @@ impl Printer<'_> {
             for (idx, c) in children.iter().enumerate() {
                 if idx > 0 {
                     for f in &mid {
-                        out.push(' ');
-                        self.emit(out, Cat::Op, self.frag_text(f));
+                        out.push(Work::Space);
+                        out.push(Work::Text { cat: Cat::Op, text: self.frag_cow(f) });
                     }
-                    out.push(' ');
+                    out.push(Work::Space);
                 }
                 // Inner elements bind at the tighter gather[1]; left/right ends keep the outer capture.
                 let bound = if idx == 0 { pg.gather[0] } else { pg.gather[1] };
-                c.render(self, out, bound, NONE_CAP, NONE_CAP);
+                out.push(Work::Visit { item: *c, req_prec: bound, lcap: NONE_CAP, rcap: NONE_CAP });
             }
             return;
         }
@@ -260,21 +269,21 @@ impl Printer<'_> {
         let mut no_space = true;
         for (pos, frag) in syn.frags.iter().enumerate() {
             match frag {
-                Frag::Tok(_) => {
-                    let text = self.frag_text(frag);
+                Frag::Tok(s) => {
+                    let text = self.i.resolve(*s);
                     let special = matches!(text, "(" | ")" | "[" | "]" | "{" | "}");
                     if !(no_space || special || text == ",") {
-                        out.push(' ');
+                        out.push(Work::Space);
                     }
-                    self.emit(out, Cat::Op, text);
+                    out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(text) });
                     no_space = special;
                 }
                 Frag::Hole => {
                     if !no_space {
-                        out.push(' ');
+                        out.push(Work::Space);
                     }
                     let (lc, rc) = self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
-                    children[k].render(self, out, pg.gather[k], lc, rc);
+                    out.push(Work::Visit { item: children[k], req_prec: pg.gather[k], lcap: lc, rcap: rc });
                     k += 1;
                     no_space = false;
                 }
@@ -310,57 +319,54 @@ impl Printer<'_> {
             || (right_bare && rcap.prec <= gather[nr_args - 1] && rcap.kind == Some(sorts.kind_of(syn.domain[nr_args - 1])))
     }
 
-    /// Print `s^count(arg)`. A successor numeral over the zero base prints in decimal (`5`); a plain
-    /// `iter` operator prints `count` repeated mixfix applications (`s s … base`) in round-trip mode.
-    fn print_iter(&self, out: &mut String, symbol: SymbolId, count: &str, arg: DagId, req_prec: u32, rcap: Cap) {
-        // A SuccSymbol applied to the zero constant is a decimal numeral.
+    /// Lay out `s^count(arg)`. A SuccSymbol numeral over the zero base → the decimal `5`; a faithful plain
+    /// `iter` with count ≥ 2 → the compact `s_^n(arg)` power form (Maude's `makeIterName`, self-delimiting,
+    /// no precedence paren); else (raw mode, or count == 1) `count` repeated `s s … base` applications.
+    fn layout_iter<'t>(&self, symbol: SymbolId, count: &str, arg: DagId, req_prec: u32, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
         if self.m.nat_succ == Some(symbol) && self.is_zero(arg) {
-            self.emit(out, Cat::Lit, count);
+            out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(count.to_string()) });
             return;
         }
-        // Maude-faithful display of a plain iter with count >= 2: the compact `s_^n(arg)` power form
-        // (Maude's `makeIterName`). It is self-delimiting (prefix-like), so it needs no precedence paren.
         if self.faithful && count != "1" {
             let power = format!("{}^{count}", self.canonical_name(symbol));
-            self.emit(out, Cat::Op, &power);
-            self.emit(out, Cat::Punct, "(");
-            self.print(out, arg, PREFIX_GATHER, NONE_CAP, NONE_CAP);
-            self.emit(out, Cat::Punct, ")");
+            out.push(Work::Text { cat: Cat::Op, text: Cow::Owned(power) });
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
+            out.push(Work::Visit { item: Item::Dag(arg), req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP });
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
             return;
         }
-        // Otherwise (raw mode, or count == 1): `count` repeated successor applications over the base.
         let n: u64 = count.parse().expect("iter count fits u64 for the repeated form");
         let Some(syn) = self.m.syntax.get(&symbol) else { return };
         let prefix: Vec<&Frag> = syn.frags.iter().take_while(|f| !matches!(f, Frag::Hole)).collect();
         let paren = req_prec < UNARY_PREC;
         if paren {
-            self.emit(out, Cat::Punct, "(");
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
         }
         for _ in 0..n {
             for f in &prefix {
-                self.emit(out, Cat::Op, self.frag_text(f));
-                out.push(' ');
+                out.push(Work::Text { cat: Cat::Op, text: self.frag_cow(f) });
+                out.push(Work::Space);
             }
         }
         // The base sits at the successor's gather bound; its left abuts the last `s` token.
         let lc = Cap { prec: UNARY_PREC, kind: Some(self.m.engine.sorts().kind_of(syn.domain[0])) };
-        self.print(out, arg, UNARY_PREC, lc, if paren { NONE_CAP } else { rcap });
+        out.push(Work::Visit { item: Item::Dag(arg), req_prec: UNARY_PREC, lcap: lc, rcap: if paren { NONE_CAP } else { rcap } });
         if paren {
-            self.emit(out, Cat::Punct, ")");
+            out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
         }
     }
 
     /// `(a, b, …)` — a prefix argument list (shared by both walks).
-    fn print_arg_list<C: Child>(&self, out: &mut String, children: &[C]) {
-        self.emit(out, Cat::Punct, "(");
+    fn layout_arg_list<'t>(&self, children: &[Item<'t>], out: &mut Vec<Work<'a, 't>>) {
+        out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
         for (idx, c) in children.iter().enumerate() {
             if idx > 0 {
-                self.emit(out, Cat::Punct, ",");
-                out.push(' ');
+                out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(",") });
+                out.push(Work::Space);
             }
-            c.render(self, out, PREFIX_GATHER, NONE_CAP, NONE_CAP);
+            out.push(Work::Visit { item: *c, req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP });
         }
-        self.emit(out, Cat::Punct, ")");
+        out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
     }
 
     /// Whether `arg` is the module's zero constant (so a successor over it is a numeral).
@@ -372,6 +378,15 @@ impl Printer<'_> {
         match frag {
             Frag::Tok(s) => self.tok_text(*s),
             Frag::Hole => "_",
+        }
+    }
+
+    /// A fragment's text as a `Cow` borrowing the interner for the printer's lifetime `'a`, so it can sit on
+    /// the work-stack outliving the `&self` call that produced it (an argument hole renders as `_`).
+    fn frag_cow(&self, frag: &Frag) -> Cow<'a, str> {
+        match frag {
+            Frag::Tok(s) => Cow::Borrowed(self.i.resolve(*s)),
+            Frag::Hole => Cow::Borrowed("_"),
         }
     }
     fn tok_text(&self, s: Sym) -> &str {
