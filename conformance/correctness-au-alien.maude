@@ -1,0 +1,42 @@
+*** Phase 1.5 / C8 — AU matching with "alien" subterms and non-linear variables, conformance vs the
+*** reference binary:  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-au-alien.maude < /dev/null
+***
+*** AU = `assoc` (not commutative): lists / sequences. An alien (non-ground non-variable subterm under
+*** the operator, e.g. `s M`) matches one subject element recursively; a non-linear (repeated) variable
+*** must re-match the identical run. Was a loud panic (au.rs). The match order (leftmost-alien first /
+*** maximal-collector) is Maude's greedy order, fixing the reduce count. Mirrors the engine.rs C8 tests.
+
+fmod AU-ALIEN is
+  sort E .
+  ops a b c : -> E [ctor] .
+  op s_ : E -> E [ctor] .
+  op nil : -> E [ctor] .
+  op __ : E E -> E [assoc id: nil] .
+  vars M L : E .
+  eq (s M) L = M L .          *** peel a successor off the head element
+endfm
+red (s s a) b c .             *** a b c, 2 rewrites
+red a (s b) c .               *** a b c, 1 rewrite (no head successor; the s b is interior, untouched)
+red (s a) (s b) c .           *** a b c, 2 rewrites
+
+fmod AU-NONLINEAR is
+  sort E .
+  ops a b : -> E [ctor] .
+  op nil : -> E [ctor] .
+  op __ : E E -> E [assoc id: nil] .
+  var X : E .
+  eq X X = X .                *** collapse an adjacent doubled run
+endfm
+red a a .                     *** a, 1 rewrite
+red a a a .                   *** a, 2 rewrites
+
+fmod AU-MULTI-ALIEN is
+  sort E .
+  ops a b c : -> E [ctor] .
+  op s_ : E -> E [ctor] .
+  op nil : -> E [ctor] .
+  op __ : E E -> E [assoc id: nil] .
+  vars M N : E .
+  eq (s M) (s N) = s (M N) .  *** two aliens in sequence
+endfm
+red (s a) (s b) c .           *** s (a b) c, 1 rewrite (matches the leading successor pair, c is residue)

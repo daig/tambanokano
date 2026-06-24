@@ -64,16 +64,23 @@ alien to the **first (smallest) matching element**, which fixes the rewrite coun
 subproblem is the backtracking closure for `match`/conditions (set-compared, so order-free there).
 
 - **ACU direction — DONE.** Alien subterms under an ACU op (`eq s M + N = s (M + N)`, textbook commutative
-  Peano `+`/`*`) and theory-rooted subterms under an ACU op (`eq (a + b) ; c = d`) now match. `acu.rs` gained
-  an `AcuAlien` category compiled to its own automaton + a greedy-first backtracking enumerator (single
-  alien + collector, multiple aliens, multiplicities, non-linear-across-levels via binding-subtraction,
-  identity, extension). Differentially verified vs the reference — reduce **counts** and `match` solution
-  **sets** — `conformance/correctness-ac-alien.maude` (counts 2/3/3/4/4, 8/13). `fib` unregressed.
-- **REMAINING.** (1) **AU aliens + non-linear AU vars** — `au.rs` still panics on a non-ground subterm
-  under an `assoc` op and on a repeated AU variable (the ordered analog: rigid/flex parts). (2) **Theory
-  subterm under a *free* op** — `theory.rs:65` still panics on e.g. `eq f(a X) = X` (`a X` an AU term under
-  free `f`); needs the free matcher to compose alien sub-automata (Maude's `FreeLhsAutomaton::nonGroundAliens`
-  + the `Sequence` arm). Same `NonGroundAlien` mechanism, applied under AU and free tops.
+  Peano `+`/`*`) and theory-rooted subterms under an ACU op (`eq (a + b) ; c = d`) match. `acu.rs` gained an
+  `AcuAlien` category + a greedy-first backtracking enumerator (single alien + collector, multiple aliens,
+  multiplicities, non-linear-across-levels via binding-subtraction, identity, extension). Verified vs the
+  reference — reduce **counts** + `match` **sets** — `conformance/correctness-ac-alien.maude` (2/3/3/4/4, 8/13).
+- **AU direction — DONE.** Aliens under an `assoc` op (`eq (s M) L = M L`, list/sequence processing),
+  multiple aliens (`eq (s M)(s N) = …`), and **non-linear** AU variables (`eq X X = X`) match. `au.rs` gained
+  an `Alien` element + a `complex` binding-aware path (`rec_complex`) parallel to the pure positional one,
+  with the matched-size-0 identity no-op skipped (it otherwise rewrites a term to itself forever — the AU
+  analog of the ACU skip). Verified vs the reference — `conformance/correctness-au-alien.maude`. The order
+  (leftmost-alien / maximal-collector) falls out of ascending enumeration + the stable maximal-matched-first
+  sort = Maude's greedy order.
+- **REMAINING.** **Theory subterm under a *free* op** — `theory.rs:65` still panics on e.g. `eq f(a X) = X`
+  (`a X` an AU term under free `f`); needs the free matcher (`Engine::match_pattern` / the `Free` automaton)
+  to compose alien sub-automata (Maude's `FreeLhsAutomaton::nonGroundAliens` + the `Sequence` arm). Same
+  `NonGroundAlien` mechanism, now under a free top. (A `match`/`xmatch` order caveat: AC/AU solution *sets*
+  match the reference but the enumeration *order* still differs in places — the deferred Diophantine order,
+  set-compared per the B1 discipline; `reduce` counts conform because they use Maude's greedy first solution.)
 - **C5** (AC/`iter` *membership*-lhs matching) is the membership-side cousin and shares this machinery.
 
 #### C7 — Subject-DAG sharing of repeated subterms  **[confirmed, count-only]**

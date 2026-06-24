@@ -10,33 +10,45 @@
 //! **Strategy (correctness-first, mirrors `acu`).** A complete backtracking enumeration of
 //! `(start, run-lengths)`, yielded **maximal-matched-first**, so a lone (linear) variable absorbs the
 //! whole remainder — Maude's collector strategy: `eq a X = b` on `a c c` gives `b` (X → `c c`), not
-//! `b c`. Scope: ground subterms + **linear** variables + identity; non-linear variables (`X X`) and
-//! alien subterms are loud unsupported-asserts (follow-ups).
+//! `b c`. The simple case (ground subterms + linear variables + identity) takes a pure enumeration in
+//! `match_`; **aliens** (a non-ground subterm under the operator — `s M`, Maude's `NonGroundAlien`) and
+//! **non-linear** variables (`X X`) take a binding-aware backtracking path in `next` (an alien is
+//! matched recursively by its own automaton, which needs `&mut Runtime`). Same ordering convention
+//! throughout (var lengths ascending + a stable maximal-matched-first sort), so the alien binds to the
+//! **leftmost** position first — the order Maude's greedy matcher uses, fixing the reduce count.
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
+use crate::theory::LhsAutomaton;
 
 /// A compiled AU left-hand side: the flattened pattern as an ordered list of elements.
 pub(crate) struct AuLhs {
     symbol: SymbolId,
     elements: Vec<AuElem>,
     identity: Option<SymbolId>,
+    /// `true` when the pattern has an alien or a non-linear (repeated) variable — matched by the
+    /// binding-aware path in [`AuSubproblem::next`] rather than the pure positional enumeration.
+    complex: bool,
 }
 
+#[derive(Clone)]
 enum AuElem {
-    /// A ground sub-pattern: matches exactly one structurally-equal subject element.
+    /// A ground, free-matchable sub-pattern: matches exactly one structurally-equal subject element.
     Ground(Term),
-    /// A variable: matches a contiguous run (≥1, or ≥0 with identity).
+    /// A variable: matches a contiguous run (≥1, or ≥0 with identity). A repeated index is non-linear.
     Var { index: u32, sort: SortId },
+    /// An alien (non-ground, or theory-rooted) sub-pattern: matches exactly one subject element
+    /// recursively via its own automaton (Maude's `NonGroundAlien`).
+    Alien(Term),
 }
 
 impl AuLhs {
     /// Compile an AU pattern: flatten modulo associativity (order preserved), then classify each
-    /// argument. Non-linear (repeated) variables and alien subterms are not yet supported (loud
-    /// asserts, never silent).
+    /// argument as a ground (free-matchable) subterm, a variable, or an **alien** (anything else —
+    /// matched recursively). A repeated variable or any alien sets the `complex` flag.
     pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("AU lhs must be an application");
         let identity = sig.symbol(symbol).identity();
@@ -45,34 +57,26 @@ impl AuLhs {
 
         let mut elements: Vec<AuElem> = Vec::new();
         let mut seen_vars: Vec<u32> = Vec::new();
+        let mut complex = false;
         for t in flat {
-            let ground = t.is_ground();
             match t {
                 Term::Var(v) => {
-                    assert!(
-                        !seen_vars.contains(&v.index),
-                        "non-linear AU pattern (a repeated variable) is not yet supported (follow-up)"
-                    );
+                    if seen_vars.contains(&v.index) {
+                        complex = true; // a repeated (non-linear) variable
+                    }
                     seen_vars.push(v.index);
                     elements.push(AuElem::Var { index: v.index, sort: v.sort });
                 }
-                other => {
-                    assert!(
-                        ground,
-                        "an alien (non-ground, non-variable) subterm under an AU operator is not yet \
-                         supported (follow-up)"
-                    );
-                    assert!(
-                        other.is_free_matchable(sig),
-                        "a theory-rooted ground subterm under an AU operator is not yet supported: \
-                         it is matched by the free matcher, which fails silently on a theory subject \
-                         (cross-theory composition is a follow-up)"
-                    );
-                    elements.push(AuElem::Ground(other));
+                t @ Term::Op { .. } if t.is_ground() && t.is_free_matchable(sig) => {
+                    elements.push(AuElem::Ground(t))
+                }
+                alien @ Term::Op { .. } => {
+                    complex = true;
+                    elements.push(AuElem::Alien(alien));
                 }
             }
         }
-        AuLhs { symbol, elements, identity }
+        AuLhs { symbol, elements, identity, complex }
     }
 
     /// First match phase: the subject must be an AU node of this operator; enumerate every contiguous
@@ -89,6 +93,42 @@ impl AuLhs {
             NodeTerm::Au { symbol, args } if *symbol == self.symbol => args.clone(),
             _ => return None,
         };
+
+        // Aliens / non-linear variables need binding while enumerating, so defer to `next` (it has the
+        // `&mut Runtime` the alien sub-automata require).
+        if self.complex {
+            let mut all_var_indices: Vec<u32> = Vec::new();
+            for e in &self.elements {
+                match e {
+                    AuElem::Var { index, .. } => {
+                        if !all_var_indices.contains(index) {
+                            all_var_indices.push(*index);
+                        }
+                    }
+                    AuElem::Alien(t) => collect_vars(t, &mut all_var_indices),
+                    AuElem::Ground(_) => {}
+                }
+            }
+            return Some(AuSubproblem {
+                symbol: self.symbol,
+                identity: self.identity,
+                subject: seq,
+                var_at: Vec::new(),
+                candidates: Vec::new(),
+                cursor: 0,
+                complex: true,
+                elements: self.elements.clone(),
+                ext_allowed,
+                all_var_indices,
+                recorded: None,
+                rec_cursor: 0,
+                bound: Vec::new(),
+                prefix: Vec::new(),
+                suffix: Vec::new(),
+                matched_whole: true,
+            });
+        }
+
         let n = seq.len();
         let mut throwaway = Subst::new();
         throwaway.reset(0);
@@ -107,6 +147,7 @@ impl AuLhs {
             .map(|e| match e {
                 AuElem::Var { index, sort } => Some((*index, *sort)),
                 AuElem::Ground(_) => None,
+                AuElem::Alien(_) => unreachable!("the pure path has no aliens (would set `complex`)"),
             })
             .collect();
         Some(AuSubproblem {
@@ -116,6 +157,12 @@ impl AuLhs {
             var_at,
             candidates,
             cursor: 0,
+            complex: false,
+            elements: Vec::new(),
+            ext_allowed,
+            all_var_indices: Vec::new(),
+            recorded: None,
+            rec_cursor: 0,
             bound: Vec::new(),
             prefix: Vec::new(),
             suffix: Vec::new(),
@@ -164,7 +211,48 @@ impl AuLhs {
                     lengths.pop();
                 }
             }
+            AuElem::Alien(_) => unreachable!("the pure path has no aliens (would set `complex`)"),
         }
+    }
+}
+
+/// Collect the distinct variable indices in a pattern (an alien's internal bindings to capture).
+fn collect_vars(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
+    }
+}
+
+/// The run length a bound variable's value occupies in the subject sequence — its flattened element
+/// count under `symbol` (an AU node spreads into its args; the identity is 0; anything else is 1) —
+/// used to force a repeated (non-linear) variable to re-match the exact same run.
+fn au_run_len(rt: &Runtime, binding: DagId, symbol: SymbolId, identity: Option<SymbolId>) -> usize {
+    match &rt.node(binding).term {
+        NodeTerm::Au { symbol: s, args } if *s == symbol => args.len(),
+        NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == identity => 0,
+        _ => 1,
+    }
+}
+
+/// Build the AU binding for a contiguous run of the subject: empty → the identity (`None` if the
+/// operator has none, so the empty run is rejected), a single element → that element, else a fresh AU
+/// node. The canonical counterpart of the run that [`au_run_len`] measures.
+fn build_run(
+    rt: &mut Runtime,
+    sig: &Signature,
+    symbol: SymbolId,
+    identity: Option<SymbolId>,
+    run: &[DagId],
+) -> Option<DagId> {
+    match run {
+        [] => identity.map(|id| rt.make_const(sig, id)),
+        [single] => Some(*single),
+        many => Some(rt.make_au(sig, symbol, many.to_vec())),
     }
 }
 
@@ -200,15 +288,34 @@ pub(crate) struct AuSubproblem {
     symbol: SymbolId,
     identity: Option<SymbolId>,
     subject: Vec<DagId>,
+    // ---- pure path (no aliens, all-linear): precomputed `(start, run-lengths)` plans ----
     /// Per pattern element: `Some((index, sort))` for a variable, `None` for a ground.
     var_at: Vec<Option<(u32, SortId)>>,
     candidates: Vec<Candidate>,
     cursor: usize,
+    // ---- complex path (aliens / non-linear vars): lazily enumerated on the first `next` ----
+    complex: bool,
+    elements: Vec<AuElem>,
+    ext_allowed: bool,
+    /// All pattern variable indices (top + alien-internal), captured into each recorded solution.
+    all_var_indices: Vec<u32>,
+    /// Fully-built solutions, maximal-matched-first; `None` until the first `next` enumerates them.
+    recorded: Option<Vec<AuRecorded>>,
+    rec_cursor: usize,
+    // ---- shared replay state ----
     bound: Vec<u32>,
     /// The unmatched ordered prefix/suffix of the most recent solution (the extension residue).
     prefix: Vec<DagId>,
     suffix: Vec<DagId>,
     matched_whole: bool,
+}
+
+/// One fully-built complex-path solution: every pattern variable's binding and the matched span
+/// `[start, end)` (the prefix `subject[..start]` / suffix `subject[end..]` are the extension residue).
+struct AuRecorded {
+    binds: Vec<(u32, DagId)>,
+    start: usize,
+    end: usize,
 }
 
 impl AuSubproblem {
@@ -220,6 +327,10 @@ impl AuSubproblem {
             subst.unbind(idx);
         }
         self.bound.clear();
+
+        if self.complex {
+            return self.next_complex(rt, sig, subst);
+        }
 
         while self.cursor < self.candidates.len() {
             let ci = self.cursor;
@@ -267,6 +378,128 @@ impl AuSubproblem {
             return true;
         }
         false
+    }
+
+    /// The complex-path (aliens / non-linear vars) counterpart: enumerate all solutions on the first
+    /// call (driving alien sub-automata — needs `&mut Runtime`), maximal-matched-first, then replay.
+    fn next_complex(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
+        if self.recorded.is_none() {
+            let sols = self.enumerate_complex(rt, sig, subst);
+            self.recorded = Some(sols);
+        }
+        let (binds, start, end) = {
+            let recorded = self.recorded.as_ref().expect("just enumerated");
+            if self.rec_cursor >= recorded.len() {
+                return false;
+            }
+            let sol = &recorded[self.rec_cursor];
+            (sol.binds.clone(), sol.start, sol.end)
+        };
+        self.rec_cursor += 1;
+        for &(idx, b) in &binds {
+            subst.bind(idx, b);
+            self.bound.push(idx);
+        }
+        self.prefix = self.subject[..start].to_vec();
+        self.suffix = self.subject[end..].to_vec();
+        self.matched_whole = self.prefix.is_empty() && self.suffix.is_empty();
+        true
+    }
+
+    /// Enumerate every contiguous match (with extension if `ext_allowed`), binding aliens recursively
+    /// and forcing non-linear repeats; var run-lengths ascending then a stable maximal-matched-first
+    /// sort, so the lone variable absorbs the remainder and an alien binds to its leftmost position —
+    /// the order Maude's greedy matcher fixes the reduce count by.
+    fn enumerate_complex(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<AuRecorded> {
+        let n = self.subject.len();
+        let last_start = if self.ext_allowed { n } else { 0 };
+        let mut out = Vec::new();
+        for start in 0..=last_start {
+            let mut scratch = base.clone();
+            self.rec_complex(0, start, start, rt, sig, &mut scratch, &mut out);
+        }
+        out.sort_by_key(|r| std::cmp::Reverse(r.end - r.start));
+        out
+    }
+
+    /// Place `elements[elem_idx..]` against `subject[pos..]`: a ground matches one equal element, an
+    /// alien one element recursively (its automaton), a fresh variable a run of each length, a repeated
+    /// variable the (forced) run equal to its binding. Records a solution when all elements are placed.
+    #[allow(clippy::too_many_arguments)]
+    fn rec_complex(
+        &self,
+        elem_idx: usize,
+        pos: usize,
+        start: usize,
+        rt: &mut Runtime,
+        sig: &Signature,
+        scratch: &mut Subst,
+        out: &mut Vec<AuRecorded>,
+    ) {
+        let n = self.subject.len();
+        if elem_idx == self.elements.len() {
+            // Record when the residue rule allows it — and the matched span is non-empty: a zero-width
+            // match (every variable bound to the identity, nothing consumed) is the identity no-op that
+            // would rewrite a term to itself forever. Mirrors the ACU `matched > 0` skip; a ground/alien
+            // always consumes ≥ 1, so this only ever drops the all-identity case.
+            if (self.ext_allowed || pos == n) && pos > start {
+                let binds = self
+                    .all_var_indices
+                    .iter()
+                    .filter_map(|&i| scratch.get(i).map(|b| (i, b)))
+                    .collect();
+                out.push(AuRecorded { binds, start, end: pos });
+            }
+            return;
+        }
+        match &self.elements[elem_idx] {
+            AuElem::Ground(g) => {
+                if pos < n && rt.match_pattern(sig, g, self.subject[pos], scratch) {
+                    self.rec_complex(elem_idx + 1, pos + 1, start, rt, sig, scratch, out);
+                }
+            }
+            AuElem::Alien(t) => {
+                if pos < n {
+                    let automaton = LhsAutomaton::compile(t.clone(), sig);
+                    let checkpoint = scratch.clone();
+                    // An alien consumes one element — no extension on the sub-match.
+                    if let Some(mut sp) = automaton.match_(rt, sig, self.subject[pos], scratch, false) {
+                        while sp.next(rt, sig, scratch) {
+                            self.rec_complex(elem_idx + 1, pos + 1, start, rt, sig, scratch, out);
+                        }
+                    }
+                    *scratch = checkpoint;
+                }
+            }
+            AuElem::Var { index, sort } => {
+                let (index, sort) = (*index, *sort);
+                if let Some(b) = scratch.get(index) {
+                    // Repeated (non-linear) variable: the run is forced to equal the existing binding.
+                    let blen = au_run_len(rt, b, self.symbol, self.identity);
+                    if pos + blen <= n
+                        && let Some(run) = build_run(rt, sig, self.symbol, self.identity, &self.subject[pos..pos + blen])
+                        && rt.deep_equal(run, b)
+                    {
+                        self.rec_complex(elem_idx + 1, pos + blen, start, rt, sig, scratch, out);
+                    }
+                } else {
+                    let min_len = usize::from(self.identity.is_none()); // ≥1 without identity, else ≥0
+                    for len in min_len..=(n - pos) {
+                        let Some(binding) =
+                            build_run(rt, sig, self.symbol, self.identity, &self.subject[pos..pos + len])
+                        else {
+                            continue;
+                        };
+                        if !sig.sorts().leq(rt.sort_of(binding), sort) {
+                            continue;
+                        }
+                        scratch.bind(index, binding);
+                        self.rec_complex(elem_idx + 1, pos + len, start, rt, sig, scratch, out);
+                        scratch.unbind(index);
+                    }
+                }
+            }
+        }
     }
 
     /// Splice the instantiated `rhs` into the matched position: a whole match is just `rhs`; an
@@ -392,5 +625,55 @@ mod tests {
             e.make_au(cat, vec![x, y])
         };
         assert!(!e.deep_equal(ab, ba), "AU is not commutative: a b != b a");
+    }
+
+    /// C8: AU **alien** matching — `eq (s M) L = M L` peels successors off the head element. Reducing
+    /// `(s s a) b c` takes **2** rewrites (the alien `s M` binds the head, the lone variable `L` collects
+    /// the rest). Was a panic; the leftmost-alien/maximal-collector order is Maude's greedy order.
+    #[test]
+    fn au_alien_reduce() {
+        use crate::term::Equation;
+        let (mut e, s, a, b, c, nil, cat) = au_ctx();
+        let succ = e.add_op("s", vec![s], s);
+        // eq (s M) L = M L .   (M = var 0, L = var 1)
+        e.add_equation(Equation {
+            lhs: Term::op(cat, vec![Term::op(succ, vec![Term::var(0, s)]), Term::var(1, s)]),
+            rhs: Term::op(cat, vec![Term::var(0, s), Term::var(1, s)]),
+            nr_vars: 2,
+        });
+        let _ = nil;
+        // (s s a) b c
+        let ssa = {
+            let a0 = e.make_const(a);
+            let sa = e.make_free(succ, vec![a0]);
+            e.make_free(succ, vec![sa])
+        };
+        let (b0, c0) = (e.make_const(b), e.make_const(c));
+        let subject = e.make_au(cat, vec![ssa, b0, c0]);
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 2, "two successors peeled off the head");
+        let (a1, b1, c1) = (e.make_const(a), e.make_const(b), e.make_const(c));
+        let abc = e.make_au(cat, vec![a1, b1, c1]);
+        assert!(e.deep_equal(r, abc), "(s s a) b c = a b c");
+    }
+
+    /// C8: a **non-linear** AU variable — `eq X X = X` collapses an adjacent doubled run, so `a a a`
+    /// reduces to `a` in **2** rewrites. The repeated `X` must re-match the identical run; was a panic.
+    #[test]
+    fn au_nonlinear_reduce() {
+        use crate::term::Equation;
+        let (mut e, s, a, _b, _c, _nil, cat) = au_ctx();
+        // eq X X = X .
+        e.add_equation(Equation {
+            lhs: Term::op(cat, vec![Term::var(0, s), Term::var(0, s)]),
+            rhs: Term::var(0, s),
+            nr_vars: 1,
+        });
+        let (a0, a1, a2) = (e.make_const(a), e.make_const(a), e.make_const(a));
+        let aaa = e.make_au(cat, vec![a0, a1, a2]);
+        let r = e.reduce(aaa);
+        assert_eq!(e.rewrites(), 2, "a a a -> a a -> a");
+        let a3 = e.make_const(a);
+        assert!(e.deep_equal(r, a3), "a a a = a");
     }
 }

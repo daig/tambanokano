@@ -596,6 +596,25 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C8 — AU (associative, not commutative) alien subterms + non-linear variables. An
+    /// alien `s M` under `__` matches one element recursively; a repeated var `X X` re-matches the same
+    /// run. Was a panic (au.rs). Counts byte-identical to the reference; the leftmost-alien / maximal-
+    /// collector order is Maude's greedy order (so reduce counts are deterministic).
+    #[test]
+    fn correctness_au_alien_conforms() {
+        conform(
+            conformance_file!("correctness-au-alien.maude"),
+            &[
+                e("E", "a b c", 2), // (s s a) b c — peel two successors off the head
+                e("E", "a b c", 1), // a (s b) c   — interior successor untouched
+                e("E", "a b c", 2), // (s a)(s b) c
+                e("E", "a", 1),     // a a         — non-linear collapse
+                e("E", "a", 2),     // a a a
+                e("E", "s (a b) c", 1), // (s a)(s b) c — two aliens, leading pair + residue c
+            ],
+        );
+    }
+
     /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
