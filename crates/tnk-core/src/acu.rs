@@ -23,16 +23,35 @@ use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
+use crate::theory::LhsAutomaton;
 
 /// A compiled ACU left-hand side: the flattened pattern multiset partitioned into ground subterms
-/// (each consumes one structurally-equal subject element) and distinct variables.
+/// (each consumes one structurally-equal subject element), **aliens** (non-ground non-variable
+/// subterms, each matched recursively by its own automaton — Maude's `NonGroundAlien`), and distinct
+/// variables.
 pub(crate) struct AcuLhs {
     symbol: SymbolId,
-    /// Ground sub-patterns (no variables); each must match one subject element.
+    /// Ground, free-matchable sub-patterns; each must match one structurally-equal subject element
+    /// (the deterministic fast path — no sub-automaton needed).
     grounds: Vec<Term>,
+    /// Alien sub-patterns: a non-ground subterm (e.g. `s M` under `+`) or a theory-rooted subterm,
+    /// each compiled to its own [`LhsAutomaton`] and matched recursively against a subject element
+    /// (Maude's `ACU_LhsAutomaton::NonGroundAlien`). Structurally-equal aliens are merged with a
+    /// summed multiplicity, mirroring the canonical pattern multiset (`s M + s M` ⇒ one alien × 2).
+    aliens: Vec<AcuAlien>,
     /// Distinct variable occurrences under the operator (a repeated index is non-linear).
     vars: Vec<AcuVar>,
     identity: Option<SymbolId>,
+}
+
+#[derive(Clone)]
+struct AcuAlien {
+    /// The alien sub-pattern, kept as a [`Term`] (re-compiled to an automaton during enumeration —
+    /// alien patterns are small and rare, so this stays correctness-first over caching the automaton).
+    term: Term,
+    /// Copies of this exact sub-pattern in the canonical pattern multiset (it must consume that many
+    /// copies of whatever subject element it matches).
+    multiplicity: u32,
 }
 
 struct AcuVar {
@@ -40,6 +59,19 @@ struct AcuVar {
     /// How many times this variable index occurs in the pattern (the Diophantine coefficient).
     count: u32,
     sort: SortId,
+}
+
+/// Structural equality on patterns (same operator + recursively-equal args, or the same variable
+/// index) — the key that merges repeated aliens into one with a summed multiplicity, exactly as the
+/// canonical pattern multiset would. Author-shallow recursion (alien patterns are small).
+fn term_eq(a: &Term, b: &Term) -> bool {
+    match (a, b) {
+        (Term::Var(x), Term::Var(y)) => x.index == y.index,
+        (Term::Op { symbol: sa, args: aa }, Term::Op { symbol: sb, args: ab }) => {
+            sa == sb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| term_eq(x, y))
+        }
+        _ => false,
+    }
 }
 
 impl AcuLhs {
@@ -50,6 +82,7 @@ impl AcuLhs {
         let symbol = lhs.top_symbol().expect("ACU lhs must be an application");
         let identity = sig.symbol(symbol).identity();
         let mut grounds: Vec<Term> = Vec::new();
+        let mut aliens: Vec<AcuAlien> = Vec::new();
         let mut vars: Vec<AcuVar> = Vec::new();
 
         let mut stack = vec![lhs];
@@ -60,23 +93,18 @@ impl AcuLhs {
                     Some(av) => av.count += 1,
                     None => vars.push(AcuVar { index: v.index, count: 1, sort: v.sort }),
                 },
-                ground @ Term::Op { .. } => {
-                    assert!(
-                        ground.is_ground(),
-                        "an alien (non-ground, non-variable) subterm under an ACU operator is not \
-                         yet supported (B1 follow-up)"
-                    );
-                    assert!(
-                        ground.is_free_matchable(sig),
-                        "a theory-rooted ground subterm under an ACU operator is not yet supported: \
-                         it is matched by the free matcher, which fails silently on a theory subject \
-                         (cross-theory composition is a B1 follow-up)"
-                    );
-                    grounds.push(ground);
-                }
+                // A ground, free-matchable subterm consumes one structurally-equal subject element
+                // deterministically (the fast path). Everything else — a non-ground subterm (`s M`) or
+                // a theory-rooted one — is an **alien**, matched recursively by its own automaton; merge
+                // structurally-equal aliens, as the canonical pattern multiset does.
+                t @ Term::Op { .. } if t.is_ground() && t.is_free_matchable(sig) => grounds.push(t),
+                alien @ Term::Op { .. } => match aliens.iter_mut().find(|a| term_eq(&a.term, &alien)) {
+                    Some(a) => a.multiplicity += 1,
+                    None => aliens.push(AcuAlien { term: alien, multiplicity: 1 }),
+                },
             }
         }
-        AcuLhs { symbol, grounds, vars, identity }
+        AcuLhs { symbol, grounds, aliens, vars, identity }
     }
 
     /// First match phase: the subject must be an ACU node of this operator; its ground sub-patterns
@@ -114,34 +142,62 @@ impl AcuLhs {
         }
 
         let elements: Vec<DagId> = multiset.iter().map(|&(e, _)| e).collect();
-        let coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
-        // A single linear variable is the *collector*: it absorbs the entire remainder (Maude's
-        // LONE_VARIABLE strategy), giving one whole match — not a minimal binding with extension.
-        // This is a correctness rule, not just an ordering one: `eq a + X = b` on `a + c + c` must
-        // give `b` (X → c+c), not `b + c` (the system is non-confluent under extension; Maude's
-        // strategy picks the collector match).
-        let lone_linear = self.vars.len() == 1 && self.vars[0].count == 1;
-        let candidates = enumerate_distributions(
-            &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
-            &coeffs,
-            ext_allowed,
-            self.identity.is_some(),
-            !self.grounds.is_empty(),
-            lone_linear,
-        );
+        let var_coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
+        // No aliens: precompute the variable distributions eagerly (pure, the proven B1 fast path). A
+        // single linear variable is the *collector* (Maude's LONE_VARIABLE) — it absorbs the entire
+        // remainder, a correctness rule not just an ordering one (`eq a + X = b` on `a + c + c` gives
+        // `b`, not `b + c`). With aliens present we defer to `next` instead: matching an alien builds
+        // binding nodes, so it needs `&mut Runtime` the immutable first phase does not have.
+        let candidates = if self.aliens.is_empty() {
+            let lone_linear = self.vars.len() == 1 && self.vars[0].count == 1;
+            enumerate_distributions(
+                &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
+                &var_coeffs,
+                ext_allowed,
+                self.identity.is_some(),
+                !self.grounds.is_empty(),
+                lone_linear,
+            )
+        } else {
+            Vec::new()
+        };
+        let mut alien_var_indices: Vec<u32> = Vec::new();
+        for a in &self.aliens {
+            collect_vars(&a.term, &mut alien_var_indices);
+        }
 
         Some(AcuSubproblem {
             symbol: self.symbol,
             identity: self.identity,
+            ext_allowed,
             elements,
             var_indices: self.vars.iter().map(|v| v.index).collect(),
             var_sorts: self.vars.iter().map(|v| v.sort).collect(),
+            var_coeffs,
             candidates,
             cursor: 0,
+            aliens: self.aliens.clone(),
+            multiset,
+            alien_var_indices,
+            recorded: None,
+            rec_cursor: 0,
             bound: Vec::new(),
             residue: Vec::new(),
             matched_whole: true,
         })
+    }
+}
+
+/// Collect the distinct variable indices occurring in a pattern (used to capture an alien's internal
+/// bindings into a recorded solution).
+fn collect_vars(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
     }
 }
 
@@ -245,6 +301,36 @@ fn compose(k: usize, remaining: u32, coeffs: &[u32], cur: &mut Vec<u32>, residue
     cur[k] = 0;
 }
 
+/// Remove a bound top variable's contribution from the available multiset (alien path, non-linear
+/// across levels): flatten `binding` into element-multiplicities under `symbol` (an ACU node spreads
+/// into its args; anything else is a single element), then take `coeff` copies of each — `false` if
+/// any is short, meaning this branch has no solution.
+fn subtract_binding(
+    avail: &mut Vec<(DagId, u32)>,
+    rt: &Runtime,
+    binding: DagId,
+    coeff: u32,
+    symbol: SymbolId,
+) -> bool {
+    let elems: Vec<(DagId, u32)> = match &rt.node(binding).term {
+        NodeTerm::Acu { symbol: s, args } if *s == symbol => args.clone(),
+        _ => vec![(binding, 1)],
+    };
+    for (e, m) in elems {
+        let need = m * coeff;
+        match avail.iter().position(|&(a, _)| rt.deep_equal(a, e)) {
+            Some(p) if avail[p].1 >= need => {
+                avail[p].1 -= need;
+                if avail[p].1 == 0 {
+                    avail.remove(p);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Advance a mixed-radix counter; `false` when it wraps (enumeration complete). An empty counter
 /// (no elements) yields exactly one iteration then wraps.
 fn increment_mixed_radix(idx: &mut [usize], radices: &[usize]) -> bool {
@@ -266,26 +352,54 @@ fn increment_mixed_radix(idx: &mut [usize], radices: &[usize]) -> bool {
 pub(crate) struct AcuSubproblem {
     symbol: SymbolId,
     identity: Option<SymbolId>,
-    elements: Vec<DagId>,
+    ext_allowed: bool,
     var_indices: Vec<u32>,
     var_sorts: Vec<SortId>,
+    var_coeffs: Vec<u32>,
+    // ---- no-alien path: precomputed variable distributions over `elements` ----
+    elements: Vec<DagId>,
     candidates: Vec<Candidate>,
     cursor: usize,
+    // ---- alien path (when `aliens` is non-empty): lazily enumerated on the first `next` ----
+    /// Alien sub-patterns to match recursively (empty ⇒ the no-alien fast path above).
+    aliens: Vec<AcuAlien>,
+    /// The post-grounds subject multiset the aliens + variables distribute over.
+    multiset: Vec<(DagId, u32)>,
+    /// Variable indices the aliens may bind (captured into each recorded solution).
+    alien_var_indices: Vec<u32>,
+    /// Fully-built solutions (alien bindings + variable distribution), greedy-first; `None` until the
+    /// first `next` enumerates them (needs `&mut Runtime` to drive the alien sub-automata).
+    recorded: Option<Vec<RecordedSolution>>,
+    rec_cursor: usize,
+    // ---- shared replay state ----
     /// Variable indices bound by the most recent solution (unbound before the next one).
     bound: Vec<u32>,
     residue: Vec<(DagId, u32)>,
     matched_whole: bool,
 }
 
+/// One fully-built alien-path solution: every pattern variable's binding (alien-internal + top
+/// variables) and the residue (extension). Built eagerly during enumeration (the alien sub-matches
+/// already allocate binding nodes), then replayed by `next`.
+struct RecordedSolution {
+    binds: Vec<(u32, DagId)>,
+    residue: Vec<(DagId, u32)>,
+}
+
 impl AcuSubproblem {
     /// Advance to the next solution, binding its variables into `subst` and recording its residue;
     /// `false` when exhausted. Builds binding nodes (so it needs `&mut Runtime`); a candidate whose
-    /// binding violates a variable's sort is skipped.
+    /// binding violates a variable's sort is skipped. Dispatches to the alien path when the pattern has
+    /// alien subterms, else the proven no-alien variable-distribution path.
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         for &idx in &self.bound {
             subst.unbind(idx);
         }
         self.bound.clear();
+
+        if !self.aliens.is_empty() {
+            return self.next_alien(rt, sig, subst);
+        }
 
         while self.cursor < self.candidates.len() {
             let ci = self.cursor;
@@ -338,6 +452,171 @@ impl AcuSubproblem {
             return true;
         }
         false
+    }
+
+    /// The alien-path counterpart of the candidate loop: on the first call, fully enumerate the
+    /// solutions (driving each alien's sub-automaton — needs `&mut Runtime`) greedy-first, then replay
+    /// them one per `next`. The bindings are already built during enumeration, so replay just binds.
+    fn next_alien(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
+        if self.recorded.is_none() {
+            let sols = self.enumerate_aliens(rt, sig, subst);
+            self.recorded = Some(sols);
+        }
+        let (binds, residue) = {
+            let recorded = self.recorded.as_ref().expect("just enumerated");
+            if self.rec_cursor >= recorded.len() {
+                return false;
+            }
+            let sol = &recorded[self.rec_cursor];
+            (sol.binds.clone(), sol.residue.clone())
+        };
+        self.rec_cursor += 1;
+        for &(idx, b) in &binds {
+            subst.bind(idx, b);
+            self.bound.push(idx);
+        }
+        self.matched_whole = residue.is_empty();
+        self.residue = residue;
+        true
+    }
+
+    /// Enumerate every solution of the alien + variable parts against the post-grounds multiset,
+    /// **greedy-first** (Maude's `ACU_GreedyMatcher` order): each alien is tried against the subject
+    /// elements in canonical order, taking the first match before the next. `base` seeds the scratch
+    /// substitution so existing (outer / non-linear) bindings are respected.
+    fn enumerate_aliens(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<RecordedSolution> {
+        let mut out = Vec::new();
+        let mut scratch = base.clone();
+        let multiset = self.multiset.clone();
+        self.rec_alien(0, &multiset, rt, sig, &mut scratch, &mut out);
+        out
+    }
+
+    /// Match alien `ai` against each remaining subject element (canonical order, first-match-first),
+    /// recursing to the next alien; at the leaf, distribute what's left among the top variables. The
+    /// scratch substitution is checkpointed/restored around each element so backtracking is clean.
+    fn rec_alien(
+        &self,
+        ai: usize,
+        multiset: &[(DagId, u32)],
+        rt: &mut Runtime,
+        sig: &Signature,
+        scratch: &mut Subst,
+        out: &mut Vec<RecordedSolution>,
+    ) {
+        if ai == self.aliens.len() {
+            self.distribute_leaf(multiset, rt, sig, scratch, out);
+            return;
+        }
+        let alien = &self.aliens[ai];
+        let automaton = LhsAutomaton::compile(alien.term.clone(), sig);
+        for i in 0..multiset.len() {
+            let (elem, m) = multiset[i];
+            if m < alien.multiplicity {
+                continue;
+            }
+            let checkpoint = scratch.clone();
+            // An alien consumes a whole element — no extension on the sub-match.
+            if let Some(mut sp) = automaton.match_(rt, sig, elem, scratch, false) {
+                while sp.next(rt, sig, scratch) {
+                    let mut reduced = multiset.to_vec();
+                    reduced[i].1 -= alien.multiplicity;
+                    if reduced[i].1 == 0 {
+                        reduced.remove(i);
+                    }
+                    self.rec_alien(ai + 1, &reduced, rt, sig, scratch, out);
+                }
+            }
+            *scratch = checkpoint; // restore for the next candidate element
+        }
+    }
+
+    /// All aliens are placed; distribute the remaining multiset among the top variables (reusing the
+    /// no-alien enumerator). A top variable already bound by an alien (non-linear across levels) has
+    /// its value subtracted from the remainder first; the rest are free. Each accepted distribution
+    /// becomes a fully-built [`RecordedSolution`] (top-variable bindings + the aliens' internal ones).
+    fn distribute_leaf(
+        &self,
+        multiset: &[(DagId, u32)],
+        rt: &mut Runtime,
+        sig: &Signature,
+        scratch: &Subst,
+        out: &mut Vec<RecordedSolution>,
+    ) {
+        let mut avail: Vec<(DagId, u32)> = multiset.to_vec();
+        let mut prebound: Vec<(u32, DagId)> = Vec::new();
+        let mut free: Vec<usize> = Vec::new();
+        for k in 0..self.var_indices.len() {
+            match scratch.get(self.var_indices[k]) {
+                Some(b) => {
+                    if !subtract_binding(&mut avail, rt, b, self.var_coeffs[k], self.symbol) {
+                        return; // the bound variable's value isn't present in the remainder
+                    }
+                    prebound.push((self.var_indices[k], b));
+                }
+                None => free.push(k),
+            }
+        }
+
+        let free_coeffs: Vec<u32> = free.iter().map(|&k| self.var_coeffs[k]).collect();
+        let lone_linear = free.len() == 1 && free_coeffs[0] == 1;
+        let elements: Vec<DagId> = avail.iter().map(|&(e, _)| e).collect();
+        let mults: Vec<u32> = avail.iter().map(|&(_, m)| m).collect();
+        // Aliens already matched something, so a size-0 variable distribution is not the identity
+        // no-op — allow it (`has_matched = true`).
+        let cands = enumerate_distributions(
+            &mults,
+            &free_coeffs,
+            self.ext_allowed,
+            self.identity.is_some(),
+            true,
+            lone_linear,
+        );
+        for cand in cands {
+            let mut binds = prebound.clone();
+            let mut ok = true;
+            for (ci, &k) in free.iter().enumerate() {
+                let pairs: Vec<(DagId, u32)> = (0..elements.len())
+                    .filter(|&i| cand.to_var[i][ci] > 0)
+                    .map(|i| (elements[i], cand.to_var[i][ci]))
+                    .collect();
+                let binding = if pairs.is_empty() {
+                    match self.identity {
+                        Some(id_sym) => rt.make_const(sig, id_sym),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    rt.make_acu(sig, self.symbol, pairs)
+                };
+                if !sig.sorts().leq(rt.sort_of(binding), self.var_sorts[k]) {
+                    ok = false;
+                    break;
+                }
+                binds.push((self.var_indices[k], binding));
+            }
+            if !ok {
+                continue;
+            }
+            // Capture each alien's internal variable bindings (those not also a top variable).
+            for &av in &self.alien_var_indices {
+                if !self.var_indices.contains(&av)
+                    && let Some(b) = scratch.get(av)
+                {
+                    binds.push((av, b));
+                }
+            }
+            let residue: Vec<(DagId, u32)> = cand
+                .residue
+                .iter()
+                .enumerate()
+                .filter(|&(_, &r)| r > 0)
+                .map(|(i, &r)| (elements[i], r))
+                .collect();
+            out.push(RecordedSolution { binds, residue });
+        }
     }
 
     /// Splice the instantiated `rhs` into the matched position: a whole match is just `rhs`; an
@@ -508,5 +787,45 @@ mod tests {
         let subject = e.make_ac(plus, vec![a0, b0, c0]);
         let pat = Term::op(plus, vec![Term::constant(a), Term::constant(b)]);
         assert!(match_all(&mut e, pat, subject, false, 0).is_empty(), "a+b !<=? a+b+c without ext");
+    }
+
+    /// C8: ACU **alien** matching end to end. `eq s M + N = s (M + N)` reduces `s z + s s z` to
+    /// `s s s z` in **2** rewrites — the count Maude's greedy matcher fixes by binding the alien `s M`
+    /// to the canonically-smaller element `s z` (binding it to `s s z` would take 3). Was a panic
+    /// (acu.rs:64); the greedy order comes straight from `ACU_GreedyMatcher`, not from tuning.
+    #[test]
+    fn ac_alien_reduce_greedy_count() {
+        use crate::term::Equation;
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], nat);
+        let s = e.add_op("s", vec![nat], nat);
+        let plus = e.add_op_ac("+", vec![nat, nat], nat, None);
+        // eq z + N = N .
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::constant(z), Term::var(0, nat)]),
+            rhs: Term::var(0, nat),
+            nr_vars: 1,
+        });
+        // eq s M + N = s (M + N) .
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![Term::op(s, vec![Term::var(0, nat)]), Term::var(1, nat)]),
+            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            nr_vars: 2,
+        });
+        let num = |e: &mut Engine, k: u32| {
+            let mut t = e.make_const(z);
+            for _ in 0..k {
+                t = e.make_free(s, vec![t]);
+            }
+            t
+        };
+        let (one, two) = (num(&mut e, 1), num(&mut e, 2));
+        let subject = e.make_ac(plus, vec![one, two]); // s z + s s z
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 2, "greedy binds the alien to the smaller element: 2 rewrites, not 3");
+        let three = num(&mut e, 3);
+        assert!(e.deep_equal(r, three), "s z + s s z = s s s z");
     }
 }

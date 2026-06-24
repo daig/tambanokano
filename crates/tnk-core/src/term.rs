@@ -111,7 +111,12 @@ pub enum ConditionFragment {
 /// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].
 ///
 /// [`reset`]: Subst::reset
-#[derive(Debug, Default)]
+///
+/// `Clone` is the speculative-backtracking primitive for cross-theory matching: an ACU/AU matcher
+/// trying an alien sub-pattern against a subject element checkpoints the substitution before the
+/// attempt and restores it on backtrack (Maude's `local.copy(solution)` / `scratch.copy(local)` in
+/// `ACU_GreedyMatcher`). The bindings are a flat `Vec<Option<DagId>>`, so a clone is cheap.
+#[derive(Debug, Default, Clone)]
 pub struct Subst {
     bindings: Vec<Option<DagId>>,
 }

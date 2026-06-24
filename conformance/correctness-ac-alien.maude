@@ -1,0 +1,38 @@
+*** Phase 1.5 / C8 — AC matching with "alien" (non-ground, non-variable) subterms, conformance vs the
+*** reference binary:  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-ac-alien.maude < /dev/null
+***
+*** A pattern lhs with a non-ground non-variable subterm directly under an AC operator — e.g. `s M` under
+*** `+` in textbook commutative Peano addition. Maude matches each alien recursively against a subject
+*** element; for `reduce` its greedy matcher binds the alien to the canonically-FIRST (smallest) matching
+*** element (ACU_GreedyMatcher: findFirstPotentialMatch + the sorted-arg scan), which fixes the rewrite
+*** count deterministically. Was a loud panic (acu.rs:64); mirrors the engine.rs C8 tests.
+
+fmod PEANO-AC is
+  sort Nat .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op _+_ : Nat Nat -> Nat [assoc comm] .
+  vars M N : Nat .
+  eq z + N = N .
+  eq s M + N = s (M + N) .
+endfm
+red s z + s s z .          *** s s s z, 2 rewrites (alien s M -> the smaller s z)
+red s s z + s s s z .      *** s s s s s z, 3 rewrites
+red z + s z + s s z .      *** s s s z, 3 rewrites
+red s z + s z + s z .      *** s s s z, 4 rewrites
+red s s s z + s s s s z .  *** s s s s s s s z, 4 rewrites
+
+fmod PEANO-AC-MUL is
+  sort Nat .
+  op z : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op _+_ : Nat Nat -> Nat [assoc comm] .
+  op _*_ : Nat Nat -> Nat [assoc comm] .
+  vars M N : Nat .
+  eq z + N = N .
+  eq s M + N = s (M + N) .
+  eq z * N = z .
+  eq s M * N = N + (M * N) .
+endfm
+red s s z * s s s z .      *** 2 * 3 = 6
+red s s s z * s s s z .    *** 3 * 3 = 9

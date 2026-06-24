@@ -576,6 +576,26 @@ mod tests {
         );
     }
 
+    /// Phase 1.5 / C8 — AC matching with "alien" (non-ground non-variable) subterms. `eq s M + N = s
+    /// (M + N)` over a commutative `+` matches the alien `s M` recursively; Maude's greedy matcher binds
+    /// it to the canonically-smallest element, fixing the rewrite count deterministically. Was a panic
+    /// (acu.rs:64). Counts (2/3/3/4/4 and 8/13) are byte-identical to the reference binary.
+    #[test]
+    fn correctness_ac_alien_conforms() {
+        conform(
+            conformance_file!("correctness-ac-alien.maude"),
+            &[
+                e("Nat", "s s s z", 2),
+                e("Nat", "s s s s s z", 3),
+                e("Nat", "s s s z", 3),
+                e("Nat", "s s s z", 4),
+                e("Nat", "s s s s s s s z", 4),
+                e("Nat", "s s s s s s z", 8),         // 2 * 3
+                e("Nat", "s s s s s s s s s z", 13),  // 3 * 3
+            ],
+        );
+    }
+
     /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its

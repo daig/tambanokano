@@ -50,38 +50,31 @@ priority ranks.
 
 ### 2.1 Confirmed — evaluator
 
-#### C8 — AC/AU "alien subterm" matching  **[HIGH severity — panics on idiomatic input]**
+#### C8 — Cross-theory "alien subterm" matching  **[HIGH severity — was panics on idiomatic input]**
 
-A pattern lhs with a **non-ground, non-variable subterm directly under an AC/AU operator** (an "alien" in
-Maude's terms) is unsupported and hits a **loud panic** — at *module load*, so the module can't even be
-defined.
+A pattern lhs with a **non-ground, non-variable subterm under an AC/AU operator** — or a theory-rooted
+subterm under a free operator — (an "alien" in Maude's terms) was unsupported: a **loud panic at module
+load**. The parked B1 cross-theory-composition follow-up (`07-stageB-plan.md` §"Deferred follow-ups";
+loud-guarded, never silently wrong — audit F-A). Maude matches each alien recursively via its own
+`LhsAutomaton` (`NonGroundAlien`), composing the child subproblems into the shared substitution.
 
-```maude
-op _+_ : Nat Nat -> Nat [assoc comm] .
-eq s M + N = s (M + N) .          *** s M is a non-var, non-ground subterm under AC `+`
-```
-→ panic `crates/tnk-core/src/acu.rs:64: an alien (non-ground, non-variable) subterm under an ACU operator
-is not yet supported (B1 follow-up)`. Maude: `red s z + s s z` = `s s s z`, 2 rewrites. The AU sibling
-(`op __ : L L -> L [assoc] . eq f(a X) = X .`) panics at `crates/tnk-core/src/theory.rs:65` (a theory-rooted
-subterm under a free op — the F-A guard); Maude: `f(a b a)` = `b a`.
+The matching **order is from the source, not tuned**: for `reduce`, `ACU_GreedyMatcher` scans the subject's
+canonically-sorted args (`findFirstPotentialMatch` + the `partialCompare … != LESS` walk) and binds each
+alien to the **first (smallest) matching element**, which fixes the rewrite count. The full Diophantine
+subproblem is the backtracking closure for `match`/conditions (set-compared, so order-free there).
 
-- **Root cause.** Our ACU/AU `LhsAutomaton` compiler handles AC arguments that are *variables* or *ground*
-  terms only; a structured non-ground argument trips a deliberate `assert`. This is the **parked B1
-  cross-theory-composition follow-up** documented in `07-stageB-plan.md` §"Deferred follow-ups" ("a
-  non-ground/non-var alien under AC/AU … all loud-guarded now") — never silently wrong (audit F-A), but
-  never implemented and never slotted into a phase.
-- **Boundary.** Fires for *any* AC/AU op with a structured subterm in a pattern lhs — textbook commutative
-  `+`/`*` on Peano (`s M + N`, `M * s N`), AC/AU list/set/multiset processing with non-variable elements.
-  Ground subterms (`X + 0`) and variable-only AC args (`X + Y`) work today (the conformance fixtures use
-  only those — which is why this never surfaced). The free fixtures use a *free* `+`, not AC.
-- **Severity.** Highest pending item: a hard crash (not a wrong count or a misprint) on a common spec
-  shape, and at load time. Loud-guarded, so never a silent wrong answer — but it blocks a whole class.
-- **Fix.** Implement alien-subterm matching in the ACU/AU matcher (Maude does this via its bipartite +
-  Diophantine matcher with a subproblem per structured argument — `ACU_Theory/ACU_LhsAutomaton`,
-  `AU_Theory/AU_LhsAutomaton`). This is the real AC-matcher completion deferred from B1; it is the largest
-  item in the phase. **C5** (AC/`iter` *membership*-lhs matching) is the membership-side cousin and likely
-  shares the matcher work — schedule them together. Verify against captured reduce counts (AC counts are
-  solution-order-sensitive — see `07` §1.2 minimal-first/skip-no-op).
+- **ACU direction — DONE.** Alien subterms under an ACU op (`eq s M + N = s (M + N)`, textbook commutative
+  Peano `+`/`*`) and theory-rooted subterms under an ACU op (`eq (a + b) ; c = d`) now match. `acu.rs` gained
+  an `AcuAlien` category compiled to its own automaton + a greedy-first backtracking enumerator (single
+  alien + collector, multiple aliens, multiplicities, non-linear-across-levels via binding-subtraction,
+  identity, extension). Differentially verified vs the reference — reduce **counts** and `match` solution
+  **sets** — `conformance/correctness-ac-alien.maude` (counts 2/3/3/4/4, 8/13). `fib` unregressed.
+- **REMAINING.** (1) **AU aliens + non-linear AU vars** — `au.rs` still panics on a non-ground subterm
+  under an `assoc` op and on a repeated AU variable (the ordered analog: rigid/flex parts). (2) **Theory
+  subterm under a *free* op** — `theory.rs:65` still panics on e.g. `eq f(a X) = X` (`a X` an AU term under
+  free `f`); needs the free matcher to compose alien sub-automata (Maude's `FreeLhsAutomaton::nonGroundAliens`
+  + the `Sequence` arm). Same `NonGroundAlien` mechanism, applied under AU and free tops.
+- **C5** (AC/`iter` *membership*-lhs matching) is the membership-side cousin and shares this machinery.
 
 #### C7 — Subject-DAG sharing of repeated subterms  **[confirmed, count-only]**
 

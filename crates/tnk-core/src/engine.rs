@@ -3746,12 +3746,12 @@ mod tests {
         assert_eq!(e.node(r).symbol(), g, "result is g(a + b)");
     }
 
-    /// The symmetric case the same guard closes: a theory-rooted *ground* subterm under a *theory*
-    /// operator (an ACU `+` term as a ground argument of the ACU `;`) is handed to the free matcher as
-    /// a "ground" and would fail silently — so it too is rejected loudly.
+    /// C8: a theory-rooted subterm under a *theory* operator (an ACU `+` term as an argument of the ACU
+    /// `;`) is matched as an **alien** — compiled to its own automaton and matched recursively — so
+    /// `eq (a + b) ; c = d` fires on `(a + b) ; c` (and, modulo commutativity, on `(b + a) ; c`). Was a
+    /// loud guard ("theory-rooted ground subterm … not yet supported"); == the reference binary (`d`, 1).
     #[test]
-    #[should_panic(expected = "theory-rooted")]
-    fn theory_ground_subterm_under_theory_operator_is_rejected() {
+    fn theory_subterm_under_theory_operator_matches() {
         let mut e = Engine::new();
         let s = e.add_sort("S");
         e.close_sorts();
@@ -3761,13 +3761,19 @@ mod tests {
         let d = e.add_op("d", vec![], s);
         let plus = e.add_op_ac("+", vec![s, s], s, None);
         let semi = e.add_op_ac(";", vec![s, s], s, None);
-        // eq (a + b) ; c = d   — `(a + b)` is a theory-rooted ground subterm under the ACU `;`.
         let ab = Term::op(plus, vec![Term::constant(a), Term::constant(b)]);
         e.add_equation(Equation {
             lhs: Term::op(semi, vec![ab, Term::constant(c)]),
             rhs: Term::constant(d),
             nr_vars: 0,
         });
+        // Build `(b + a) ; c` (the `+` canonicalizes to `a + b`); the alien `a + b` matches it.
+        let (a0, b0, c0) = (e.make_const(a), e.make_const(b), e.make_const(c));
+        let ba = e.make_ac(plus, vec![b0, a0]);
+        let subject = e.make_ac(semi, vec![ba, c0]);
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 1, "(a + b) ; c = d fires once");
+        assert_eq!(e.node(r).symbol(), d, "result is d");
     }
 
     /// Engine with constants `a`,`b`,`c`,`d` and an `assoc` (not comm) `__` over sort `E`.
