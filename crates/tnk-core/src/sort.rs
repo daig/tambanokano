@@ -141,7 +141,18 @@ impl Sorts {
         let mut kind_of: Vec<KindId> = vec![Id::from_raw(0); n0];
         for members in groups.into_values() {
             let kid: KindId = Id::from_raw(self.kinds.len() as u32);
-            let repr = self.sorts[members[0].index()].name.clone();
+            // Name the kind after its MAXIMAL sorts (Maude's `printKind`: the component's top sorts), not the
+            // first-declared member. A maximal sort has no user supersort (empty `up`). For the common
+            // single-top kind this is exact (`[Nat]`); for multiple incomparable tops we list them in
+            // declaration (`SortId`) order — Maude lists them in its component sort-index order (a DFS
+            // topological numbering), which differs only for a kind-level term in a multi-top component
+            // (rare, cosmetic — the same unported component index underlies the C3 incomparable-mb tiebreak).
+            let repr = members
+                .iter()
+                .filter(|m| self.up[m.index()].is_empty())
+                .map(|m| self.sorts[m.index()].name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             let err: SortId = Id::from_raw(self.sorts.len() as u32);
             self.sorts.push(Sort { name: format!("[{repr}]"), is_error: true });
             self.up.push(Vec::new());

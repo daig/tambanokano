@@ -18,10 +18,11 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > rational printing; the command echo now pretty-prints the normalized parsed term, as Maude does), and
 > **C12** (the pretty-printer's deep-chain stack overflow → iterative work-stack; `fib(22)` now prints).
 > Still open: **C13** (long-output line-wrapping — the C12 residual, lowest priority), **C7** (confirmed,
-> count-only, subject-DAG sharing), and the **C4 / C6** probes (**C2** struck — Maude loops on `eq a = a`
-> too, so the F-1 no-op guard would *diverge*; **C3** verified — we match Maude on every well-formed
-> order-dependent case, only a narrow contradictory-membership residual remains; both §2.3). The as-built
-> records are the commits
+> count-only, subject-DAG sharing), and the **C6** probe (the substantial one — engine-global condition-reduce
+> GC roots, also a Phase-2 `rew`/`search` prerequisite). **C2** struck (Maude loops on `eq a = a` too — the
+> F-1 guard would *diverge*); **C3** verified (we match on every well-formed order-dependent case); **C4**
+> done for single-top kinds (`[Nat]`), a narrow multi-top-order residual sharing C3's root; all §2.3. The
+> as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
 Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked B1 matcher items behind C8)
@@ -194,10 +195,18 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
     sort-index + `sortConstraintLt`. Deferred — disproportionate to an ill-formed-spec edge.
   - The `g(a), g(a)` count-doubling found while probing (Maude 3 rw, ours 6) is **C7** (subject-DAG sharing
     of the repeated reducible subterm), not an ordering issue.
-- **C4 — Error-sort / kind computation.** `[Sort]` error-sort naming and propagation. Confirmed repro (the
-  C9–C11 sweep): `overload.maude` `red 0 + 0 .` → Maude `[Nat]`, ours `[Zero]` — the kind's *representative
-  sort* name differs (a kernel least-sort/kind concern, untouched by the frontend work). Audit whether
-  kind-level results ever differ *semantically*, not just in the printed bracket name.
+- **C4 — error-sort / kind naming — DONE (single-top kinds, the common case); narrow multi-top residual.**
+  Audited (2026-06-24): the divergence was purely the printed kind LABEL — **no semantic difference**. Both
+  engines compute the same kind/component (`g(0+0)` is kind-level in both; the equation `g(0)` does not match
+  the kind-level arg in either; the *values* are identical) — only the `[…]` representative-sort name
+  differed. **Fixed:** the kernel now names a kind after its MAXIMAL sorts (Maude's `printKind`: the
+  component's top sorts), not the first-declared member, so `overload.maude` `red 0 + 0` prints `[Nat]`
+  byte-identically (`sort.rs::close`; `overload_conforms` updated). **Residual (rare, cosmetic):** for a
+  kind-level term in a *multi-top* component the ORDER of the listed maximal sorts is Maude's component
+  sort-index — a DFS-topological numbering (declared `A B D`, all maximal → Maude `[B,D,A]`); we list them in
+  declaration order (`[A,B,D]`). **Same root cause as the C3 incomparable-membership tiebreak** — both need
+  Maude's unported `ConnectedComponent` sort index (`Core/sort.cc::registerConnectedSorts` + `appendSort`);
+  deferred together. Single-top kinds (every well-formed signature) are exact.
 - **C5 — AC / `iter` membership-lhs matching — DONE (covered by C8).** Memberships compile to the same
   `LhsAutomaton` and match via the same seam as equations (`SortConstraint.lhs`, engine.rs:49/768/888), so
   C8's cross-theory matching covers their lhs. Differentially verified vs the reference — AC (non-linear
@@ -225,11 +234,11 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
 4. **C7** (subject-DAG sharing) — confirmed but count-only and idiom-rare; do when the term-builder is
    already open.
-5. **C4 / C6 sweep** — confirm/refute each with a differential test, fix in cheapness order (C4 now has a
-   confirmed repro from the C9–C11 sweep). **C2 struck** (Maude loops on `eq a = a` too — the F-1 guard would
-   diverge). **C3 verified** — we match Maude on every well-formed order-dependent case (declaration-order
-   equation selection, comparable-membership smallest-first); only the contradictory-membership tiebreak
-   (incomparable targets, ill-formed specs) differs, deferred.
+5. **C6** — the one substantial open probe (engine-global condition-reduce GC root set; also a Phase-2
+   `rew`/`search` prerequisite). Earlier sweep outcomes: **C2 struck** (Maude loops on `eq a = a` too — the
+   F-1 guard would diverge); **C3 verified** (we match on every well-formed order-dependent case); **C4 done**
+   for single-top kinds (name by maximal sort → `[Nat]`), with a narrow multi-top-order residual that shares
+   C3's root (Maude's unported `ConnectedComponent` sort index — close both together if ever needed).
 6. **F-2 (engine-global condition-reduce GC root set)** lands in this phase too — a deferred Stage-B item
    *and* a prerequisite for bounded-memory `rew`/`search` in Phase 2 (folded into C6).
 7. Only then **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.

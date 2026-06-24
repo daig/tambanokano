@@ -776,11 +776,11 @@ mod tests {
 
     #[test]
     fn overload_conforms() {
-        // Command 8 is a kind-level (error-sort) result. COSMETIC NAMING DIVERGENCE (task #8, like the ACU
-        // order #7): the kernel names a kind's error sort `[<first-declared member>]` = `[Zero]`, whereas
-        // Maude names it after a maximal sort = `[Nat]`. Same kind, semantically irrelevant; we assert our
-        // `[Zero]`. (overload.maude is the non-preregular module; Maude also warns on preregularity, which we
-        // don't surface yet — B2.1's deferred diagnostics sink — but the reduced results/sorts still match.)
+        // Command 8 is a kind-level (error-sort) result. C4: the kernel now names a kind after its MAXIMAL
+        // sort (Maude's `printKind`), so this single-top component prints `[Nat]` byte-identically to the
+        // reference (was `[Zero]` — the first-declared member). (overload.maude is the non-preregular module;
+        // Maude also warns on preregularity, which we don't surface yet — B2.1's deferred diagnostics sink —
+        // but the reduced results/sorts match.)
         conform(
             conformance_file!("overload.maude"),
             &[
@@ -791,7 +791,7 @@ mod tests {
                 e("Nat", "0 + 0", 0),
                 e("NzNat", "s s 0", 2),
                 e("Zero", "0", 1),
-                e("[Zero]", "0 + 0", 0),
+                e("[Nat]", "0 + 0", 0),
                 e("NzNat", "s 0 + s 0", 0),
                 e("A", "f(c)", 0),
             ],
