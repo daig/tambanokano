@@ -11,14 +11,17 @@ use crate::sort::SortId;
 use crate::symbol::{SymbolId, Theory};
 
 /// A pattern variable: an index into the enclosing statement's substitution, plus its sort.
-#[derive(Debug, Clone)]
+/// `Eq`/`Hash` (structural) let an rhs be scanned for a repeated subterm (C7 `rhs_shares`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Var {
     pub index: u32,
     pub sort: SortId,
 }
 
-/// A static term / pattern.
-#[derive(Debug, Clone)]
+/// A static term / pattern. `Eq`/`Hash` are **structural** (two syntactically-identical terms compare
+/// equal), used to detect a repeated subterm in an equation's rhs (the engine's `term_has_repeated_subterm`)
+/// so the C7 dedup memo is enabled only for rhs's that actually share — `fib`'s `s(N + M)` does not.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Var(Var),
     Op { symbol: SymbolId, args: Vec<Term> },

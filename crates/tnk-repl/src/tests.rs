@@ -53,6 +53,24 @@ fn import_renaming_through_repl() {
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
 
+/// C7 structure sharing end-to-end through the REPL: a repeated reducible subterm reduces once
+/// (Maude's hash-consed subject/rhs DAG). Every result + count is the reference binary's. The strong
+/// C7-specific guard: this fixture's reference counts top out at 2, so a pre-C7 over-count (`f(a)` was
+/// 3, the deep chain and the triple were 4) would surface as a `rewrites: 3`/`4` line — assert there is
+/// none. (The dedup window is applied in `reduce_command`; forwarding makes the shared node reduce once.)
+#[test]
+fn sharing_through_repl() {
+    let out = repl().eval(conformance_file!("correctness-sharing.maude")).output;
+    assert!(out.contains("result P: < c, c >"), "deep shared chain: {out}");
+    assert!(out.contains("result P: < b, b >"), "free/rhs/triple dup: {out}");
+    assert!(out.contains("result P: < mkA, mkA >"), "mb on shared constant: {out}");
+    assert!(out.contains("result L: b b b"), "AU triple share: {out}");
+    assert!(out.contains("result E: b & b"), "CUI share: {out}");
+    assert!(out.contains("result E: b + b"), "ACU share: {out}");
+    assert!(!out.contains("rewrites: 3"), "C7: no pre-fix over-count (f(a) was 3): {out}");
+    assert!(!out.contains("rewrites: 4"), "C7: no pre-fix over-count (chain/triple were 4): {out}");
+}
+
 /// The `match` command renders solutions (a commutative pattern → two pairings).
 #[test]
 fn match_command_through_repl() {

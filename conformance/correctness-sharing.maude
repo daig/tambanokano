@@ -1,0 +1,81 @@
+*** Phase 1.5 / C7 — structure sharing (construction dedup + normal-form forwarding), conformance vs:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-sharing.maude < /dev/null
+***
+*** Maude builds the subject (and an equation's rhs) as a hash-consed DAG, so a REPEATED reducible
+*** subterm is one shared node, reduced ONCE; our out-of-place reducer used to re-reduce it per
+*** reference (over-counting `rewrites:`; result + least sort were always faithful). The fix is two
+*** halves: construction-time structural dedup (one shared node) + normal-form forwarding (the shared
+*** node, once reduced, forwards to its result instead of being re-reduced). Counts below are the
+*** reference binary's; pre-C7 ours were higher (noted per case). Mirrors the engine.rs C7 tests.
+
+fmod FREE-SHARE is
+  sorts E P .
+  ops a b c : -> E [ctor] .
+  op g : E -> E .
+  op <_,_> : E E -> P [ctor] .
+  op h : E E E -> P .
+  op f : E -> P .
+  var X : E .
+  eq g(a) = b .
+  eq g(b) = c .
+  eq f(X) = < g(X), g(X) > .
+  eq h(X, X, X) = < X, X > .
+endfm
+*** Subject duplicate under a free op: the two g(a) dedup to one node, reduced once. Pre-C7: 2.
+red < g(a), g(a) > .          *** P: < b, b >, 1 rewrite
+*** Deep shared chain: each shared g(g(a)) is g(a)->b->... no: g(g(a)) -> g(b) -> c is 2 rewrites,
+*** done once for the shared node. Pre-C7: 4.
+red < g(g(a)), g(g(a)) > .    *** P: < c, c >, 2 rewrites
+*** RHS duplicate: f(a) fires [1], then its rhs < g(a), g(a) > shares the g(a) duplicate -> reduced
+*** once [2] (Maude's RhsBuilder CSE). Pre-C7: 3.
+red f(a) .                    *** P: < b, b >, 2 rewrites
+*** Triple subject duplicate: g(a)->b once [1], then h(b,b,b) -> < b, b > [2]. Pre-C7: 4.
+red h(g(a), g(a), g(a)) .     *** P: < b, b >, 2 rewrites
+
+fmod MB-SHARE is
+  sorts Sml Big P .
+  subsort Sml < Big .
+  op mkA : -> Big [ctor] .
+  op <_,_> : Big Big -> P [ctor] .
+  mb mkA : Sml .
+endfm
+*** Membership on a shared constant: the two mkA dedup to one node; its `mb mkA : Sml` fires once at
+*** the reduce normal-form point. Pre-C7: 2 (the eager-model gap the C1 doc first surfaced).
+red < mkA, mkA > .            *** P: < mkA, mkA >, 1 rewrite
+
+fmod AU-SHARE is
+  sorts E L .
+  subsort E < L .
+  ops a b : -> E [ctor] .
+  op g : E -> E .
+  op __ : L L -> L [assoc] .
+  var X : E .
+  eq g(a) = b .
+endfm
+*** Repeated element under an associative (non-comm) op: the equal g(a) elements dedup to one node,
+*** reduced once. Pre-C7: one rewrite per occurrence.
+red g(a) g(a) .               *** L: b b, 1 rewrite
+red g(a) g(a) g(a) .          *** L: b b b, 1 rewrite
+
+fmod CUI-SHARE is
+  sorts E .
+  ops a b : -> E [ctor] .
+  op g : E -> E .
+  op _&_ : E E -> E [comm] .
+  var X : E .
+  eq g(a) = b .
+endfm
+*** Repeated element under a commutative (non-assoc) op: the two g(a) dedup, reduced once. Pre-C7: 2.
+red g(a) & g(a) .             *** E: b & b, 1 rewrite
+
+fmod ACU-SHARE is
+  sorts E .
+  ops a b : -> E [ctor] .
+  op g : E -> E .
+  op _+_ : E E -> E [assoc comm] .
+  var X : E .
+  eq g(a) = b .
+endfm
+*** Sanity: under AC a duplicate already merges to one element with multiplicity 2 (reduced once) —
+*** C7 leaves this case exactly as it was. Result keeps both copies: b + b.
+red g(a) + g(a) .             *** E: b + b, 1 rewrite

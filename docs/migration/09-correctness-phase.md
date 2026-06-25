@@ -20,9 +20,10 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > **C6 / F-2** (engine-global condition-reduce GC root set — bounded-memory re-entrant conditions, a Phase-2
 > `rew`/`search` prerequisite). **Every probe is now resolved:** **C2** struck (Maude loops on `eq a = a` too —
 > the F-1 guard would *diverge*), **C3** verified (we match on every well-formed order-dependent case), **C4**
-> done for single-top kinds (`[Nat]`); all §2.3. **Open = only idiom-rare residuals:** **C13** (long-output
-> line-wrapping, lowest), **C7** (subject-DAG sharing, count-only), and the shared C3/C4 multi-top
-> component-index order (Maude's unported `ConnectedComponent` sort index). The
+> done for single-top kinds (`[Nat]`); all §2.3. **C7** (structure sharing) **DONE** — construction dedup +
+> normal-form forwarding, byte-identical counts, ~6% fib cost accepted. **Open = only idiom-rare residuals:**
+> **C13** (long-output line-wrapping, lowest) and the shared C3/C4 multi-top component-index order (Maude's
+> unported `ConnectedComponent` sort index). The
 > as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
@@ -51,8 +52,8 @@ Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked
 
 ## 2. Known correctness issues (pending)
 
-All confirmed items and probes are now resolved (C1/C5/C8/C9/C10/C11/C12 done, C6/F-2 done, C2 struck, C3
-verified, C4 done for single-top kinds); only idiom-rare residuals remain (C7, C13, the C3/C4 multi-top
+All confirmed items and probes are now resolved (C1/C5/C7/C8/C9/C10/C11/C12 done, C6/F-2 done, C2 struck, C3
+verified, C4 done for single-top kinds); only idiom-rare residuals remain (C13, the C3/C4 multi-top
 order). The entries below are kept as the as-built record + the residual boundaries. C-numbers are stable
 discovery-order IDs, not priority ranks.
 
@@ -105,33 +106,45 @@ subproblem is the backtracking closure for `match`/conditions (set-compared, so 
   single-element ACU collapse with identity (`s M + N <=? s e`) is a separate pre-existing deferred gap
   (`07` §collapse), which also drives the C5 collapse-count residual.
 
-#### C7 — Subject-DAG sharing of repeated subterms  **[confirmed, count-only]**
+#### C7 — Subject-DAG sharing of repeated subterms  **[DONE]**
 
-Maude hash-conses identical ground subterms when it builds the subject DAG, so a membership on a *repeated*
-reducible subterm is applied (and counted) once; our `build_dag` builds a tree, so it counts once per
-occurrence. Repro: `mb mkA : Sml` over `op <_,_> : Elem Elem -> P`, `red < mkA, mkA >` = **1** rewrite in
-Maude, **2** in ours (result `< mkA, mkA > : P`, `mkA : Sml`, identical in both). Surfaced while verifying
-C1 seam 3 (`pick(tt, mkA, mkA)`), but **independent of C1** — the old eager model had the same gap, and it
-fires with or without `strat`.
-- **Boundary.** Count-only (result value + least sort always faithful). Applies to any repeated *reducible*
-  subterm — under a membership *or* an equation, in the **subject** *and* in an **RHS**: probed (2026-06-24)
-  `eq g(a)=b`, `red < g(a), g(a) >` = Maude **1** / ours **2**; `eq f(X)=< g(X), g(X) >`, `red f(a)` = Maude
-  **2** / ours **3** (Maude's `RhsBuilder` shares the RHS duplicate too). Idiom-rare: a bare-variable
-  duplicate (`X * X`) already shares via the substitution, and an ACU duplicate (`a + a`) already merges to
-  one element with multiplicity 2 — so only a repeated *compound* under a free/AU/CUI op diverges.
-- **Fix is DEEPER than first assessed — it is the out-of-place reduction model, not construction sharing.**
-  Implemented construction-time structural dedup (a `NodeTerm`-keyed memo on `alloc_node`, enabled around the
-  subject build + a flagged RHS; verified it *does* collapse the duplicates — instrumented dedup hits) and it
-  **did not move the count.** Root cause: our `reduce` is **out-of-place** — when `g(a)` rewrites to `b` the
-  frame moves to a fresh `b` and the original `g(a)` node is never stamped reduced, so a *shared* `g(a)` is
-  re-reduced once per parent reference. Maude counts once because it rewrites **in place** (the node becomes
-  `b`, marked reduced, seen by every ref). So matching the count needs either **(a) in-place reduction** —
-  a foundational reduce-loop rework that also breaks the **render-after trace** (which holds redex/result
-  *ids* and would re-render mutated nodes; it would have to snapshot terms instead) — or **(b) an id-keyed
-  reduce memo** (redex→nf), which conflicts with **bounded-memory reduction (C6)** by pinning every reduced
-  subterm and entangles with GC id-reuse. Both are disproportionate to an idiom-rare, count-only divergence,
-  so C7 stays deferred as a deliberate foundational item (bundle with any future reduce-loop work). The
-  construction-dedup exploration was reverted (no standalone payoff).
+Maude hash-conses identical ground subterms when it builds the subject (and an equation's rhs) DAG, so a
+*repeated* reducible subterm is reduced — and counted — once; our `build_dag` built a tree and our reducer is
+out-of-place, so we counted it once per occurrence. Result value + least sort were always faithful; only the
+`rewrites:` count (and the work) diverged. Repros (now byte-identical): `eq g(a)=b`, `red < g(a), g(a) >` =
+**1** (was 2); `eq f(X)=< g(X), g(X) >`, `red f(a)` = **2** (was 3); `mb mkA : Sml`, `red < mkA, mkA >` =
+**1** (was 2). Idiom-rare: a bare-variable duplicate (`X * X`) already shares via the substitution, and an
+ACU duplicate (`a + a`) already merges to one element with multiplicity 2 — so only a repeated *compound*
+under a **free/AU/CUI** op diverged. Surfaced while verifying C1 seam 3, but **independent of C1**.
+- **The fix is two halves, both required** (full plan in `10-c7-structure-sharing.md`; construction sharing
+  alone was proven inert because the gap is the reduction model, not construction):
+  - **Half 1 — construction-time structural dedup.** A `NodeTerm`-keyed memo (`Runtime.dedup`) on the single
+    `alloc_node` funnel collapses structurally-identical nodes to one shared node. Enabled (via public
+    `Engine::begin_dedup`/`end_dedup`) only around the **subject** build (`reduce_command`/`match_command`)
+    and a **sharing rhs**'s instantiate (gated by a compile-time `CompiledEquation.rhs_shares` flag set from
+    `term_has_repeated_subterm`). The default `None` path is one `is_some()` branch — the reduce hot path is
+    untouched. Bottom-up construction keeps the key shallow (children deduped first).
+  - **Half 2 — normal-form forwarding.** A node's reduced stamp gains its **normal form** (`DagNode.nf`):
+    `None` = self-normal, `Some(nf)` = the result it rewrote to (the out-of-place counterpart of Maude's
+    in-place rewrite, and the missing half of the `reduced_epoch` memo). `reduce`'s already-reduced check and
+    early return forward through `nf`, so a *shared* redex delivers its computed result instead of being
+    re-reduced. The `ReduceFrame` carries `start` (the node first pushed, preserved across the rewrite-replace)
+    and memoizes `start.nf = rebuilt` at the normal-form point. `nf` is metadata (set via `get_mut`, content
+    immutable → render-after trace unaffected); GC marks it as a pseudo-child and `safe_point_gc` roots
+    `frame.start`, so it stays GC-bounded (freed with its node — no separate pinning memo, no in-place
+    overwrite, the two alternatives rejected in `10` §2).
+- **Cost (accepted).** The `nf` field adds 8 bytes per `DagNode` (NodeTerm's 8-byte alignment makes even a
+  bare `u32` cost 8 via padding), so fib — which has no sharing — runs **~6% slower** (controlled A/B median
+  6.68 → 6.17 M rw/s). Isolated to the field's *size* (memory bandwidth on the large transient working set),
+  not the writes — so the planned "gate the writes" fallback would recover only ~1.5%, and full recovery would
+  need a sparse side-map that reintroduces the GC id-reuse hazard the field was chosen to avoid. **Decision:
+  accept the ~6% as the price of correctness** (robustness > marginal throughput in a correctness phase; the
+  sparse-map is a deliberately-deferred option). `fib(22)=186579` count unchanged.
+- **Verified** byte-identical to the reference across all five theory axes + membership + traces:
+  `conformance/correctness-sharing.maude` (+ `correctness_sharing_conforms`, `sharing_through_repl`), kernel
+  tests `forwarding_reduces_a_shared_redex_once` / `shared_reducible_redex_is_reduced_once` (re-baselined from
+  the pre-C7 "once per occurrence"), and a traced shared redex now shows ONE rewrite event (was two). 220
+  tests, `clippy -D` clean.
 
 #### C9 / C10 / C11 — frontend fidelity (parse / print) — **DONE**
 
@@ -210,7 +223,7 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
     result-sort-only (count matches), silent in both. **Fix (if ever needed):** port Maude's component
     sort-index + `sortConstraintLt`. Deferred — disproportionate to an ill-formed-spec edge.
   - The `g(a), g(a)` count-doubling found while probing (Maude 3 rw, ours 6) is **C7** (subject-DAG sharing
-    of the repeated reducible subterm), not an ordering issue.
+    of the repeated reducible subterm), not an ordering issue — now **DONE** (§2.1 C7).
 - **C4 — error-sort / kind naming — DONE (single-top kinds, the common case); narrow multi-top residual.**
   Audited (2026-06-24): the divergence was purely the printed kind LABEL — **no semantic difference**. Both
   engines compute the same kind/component (`g(0+0)` is kind-level in both; the equation `g(0)` does not match
@@ -268,10 +281,11 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    protecting the outer context — bounded-memory re-entrant reduction, the Phase-2 `rew`/`search`
    prerequisite). Earlier sweep outcomes: **C2 struck** (Maude loops on `eq a = a` too — the F-1 guard would
    diverge); **C3 verified** (we match on every well-formed order-dependent case); **C4 done** for single-top
-   kinds (name by maximal sort → `[Nat]`).
-5. **Remaining = idiom-rare residuals only** (none block Phase 2): **C7** (subject-DAG sharing, count-only —
-   do when the term-builder is open); **C13** (long-output line-wrapping); the shared **C3/C4 multi-top
-   component-index order** (Maude's unported `ConnectedComponent` sort index — closes both at once).
+   kinds (name by maximal sort → `[Nat]`); **C7 done** (structure sharing: construction dedup + normal-form
+   forwarding, byte-identical counts, ~6% fib cost accepted — `10-c7-structure-sharing.md`).
+5. **Remaining = idiom-rare residuals only** (none block Phase 2): **C13** (long-output line-wrapping); the
+   shared **C3/C4 multi-top component-index order** (Maude's unported `ConnectedComponent` sort index —
+   closes both at once).
 6. **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
 
 **Conformance discipline (unchanged):** every fix is validated against the reference binary — value, sort,

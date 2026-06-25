@@ -24,10 +24,26 @@ pub struct DagNode {
     /// has never been reduced. The engine treats the node as reduced only while this equals the
     /// current epoch, so adding equations invalidates stale results (review R2 H2).
     pub(crate) reduced_epoch: u32,
+    /// This node's **normal form** when it is reduced (`reduced_epoch == eq_epoch`): `None` means the
+    /// node *is* its own normal form, `Some(nf)` forwards to a structurally different result it rewrote
+    /// to. This is the out-of-place counterpart of Maude's in-place rewrite (C7): our `reduce` abandons
+    /// a rewritten redex rather than mutating it, so a *shared* redex would be re-reduced once per
+    /// reference; the forward lets every reference deliver the already-computed result and skip the
+    /// re-reduction (matching Maude's `rewrites:` count). Metadata only — set via `get_mut`, exactly
+    /// like `sort`/`reduced_epoch` — so the node's *content* stays immutable and the render-after trace
+    /// keeps reading the redex it was handed. Meaningful only while `reduced_epoch == eq_epoch`; a stale
+    /// `Some` from an earlier epoch is never followed (the read is epoch-guarded) and is overwritten at
+    /// the node's next normal-form point. Marked by [`Runtime::mark_reachable`](crate::engine::Runtime)
+    /// as a pseudo-child, so it stays alive only while its forwarding node is alive (freed with it).
+    pub(crate) nf: Option<DagId>,
     pub(crate) term: NodeTerm,
 }
 
-#[derive(Debug)]
+/// Two structurally-identical nodes (same theory rep, same child ids, same scalar payload) — what the
+/// C7 construction-dedup memo keys on. Built bottom-up, so identical subtrees already share child ids,
+/// keeping the key shallow (no deep structural hashing). `sort` is *not* part of the key: a node's base
+/// sort is a function of its children's sorts, so two equal `NodeTerm`s necessarily share it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum NodeTerm {
     /// A free-theory application `symbol(args...)`; `args.len()` equals the symbol's arity.
     Free { symbol: SymbolId, args: Vec<DagId> },

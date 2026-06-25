@@ -320,7 +320,14 @@ pub fn reduce_command(
     // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
     // `reduce` below is where every equation and membership application is counted (Maude's accounting).
     lm.built.engine.reset_rewrites();
-    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i)?;
+    // C7: build the subject inside a structural-dedup window so a repeated subterm (`< g(a), g(a) >`)
+    // becomes one shared node — `reduce` then normalizes it once, matching Maude's hash-consed subject
+    // DAG. The window must close before `reduce` (it spans only construction); end it even on a build
+    // error, then propagate, so a failed parse never leaks an open window into the next command.
+    lm.built.engine.begin_dedup();
+    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i);
+    lm.built.engine.end_dedup();
+    let dag = dag?;
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -358,7 +365,11 @@ pub fn match_command(
     let nr = vars.count();
 
     let subj_tree = parse_forest(subject, &lm.grammar, i)?;
-    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i)?;
+    // C7: dedup the subject's repeated subterms into shared nodes before reducing (see `reduce_command`).
+    lm.built.engine.begin_dedup();
+    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
+    lm.built.engine.end_dedup();
+    let subj = subj?;
     let subj = lm.built.engine.reduce(subj);
 
     // Enumerate while the stream borrows the engine, capturing only `DagId`s; render afterwards.
@@ -770,6 +781,28 @@ mod tests {
                 e("Big", "big", 1),  // MB-REDUCIBLE: eq g(a)=big fires; mb g(X):Small never reached
                 e("S", "g(b)", 2),   // MB-REWRITE-CHAIN: g(a)→g(b) [1] then g(b)'s mb [2]
                 e("Big", "big", 1),  // CMB-DIVERGENT: halts at big; the looping cmb condition is unreached
+            ],
+        );
+    }
+
+    /// C7 structure sharing: a repeated reducible subterm reduces once, matching Maude's hash-consed
+    /// subject/rhs DAG. Counts are byte-identical to the reference binary (pre-C7 ours over-counted the
+    /// duplicate); result + least sort were always faithful. Covers a subject duplicate, a deep shared
+    /// chain, an rhs duplicate, a triple, a membership on a shared constant, and the AU/CUI/ACU theories.
+    #[test]
+    fn correctness_sharing_conforms() {
+        conform(
+            conformance_file!("correctness-sharing.maude"),
+            &[
+                e("P", "< b, b >", 1),       // FREE subject dup: two g(a) -> one node, reduced once
+                e("P", "< c, c >", 2),       // deep shared chain g(g(a))->g(b)->c, once
+                e("P", "< b, b >", 2),       // rhs dup: f(a) [1] + shared g(a) in rhs [2]
+                e("P", "< b, b >", 2),       // triple subject dup: g(a) once [1] + h [2]
+                e("P", "< mkA, mkA >", 1),   // mb on a shared constant: fires once
+                e("L", "b b", 1),            // AU: two equal elements share, reduced once
+                e("L", "b b b", 1),          // AU: three equal elements
+                e("E", "b & b", 1),          // CUI: two equal elements share
+                e("E", "b + b", 1),          // ACU: already merges to multiplicity 2 (unchanged by C7)
             ],
         );
     }

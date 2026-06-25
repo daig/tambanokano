@@ -16,8 +16,9 @@ use malachite::{Integer, Natural};
 /// A non-negative arbitrary-precision integer (Maude's `Natural`). `Clone`/`Eq`/`Ord`/`Debug` are
 /// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) can derive `Debug` and the S-theory's
 /// equality/order can compare counts directly (the count is scalar payload, not a child id). `min`/`max`
-/// come from the derived `Ord` (`std::cmp::min`/`max`).
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+/// come from the derived `Ord` (`std::cmp::min`/`max`). `Hash` lets [`NodeTerm`](crate::dag::NodeTerm)
+/// be a construction-dedup memo key (C7), so an `S` (`iter`) successor keys on its count.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
 pub(crate) struct Nat(Natural);
 
 impl Nat {

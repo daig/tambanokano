@@ -37,6 +37,11 @@ struct CompiledEquation {
     condition: Vec<CompiledFragment>,
     /// `[owise]`: this equation is tried only if no non-owise equation of the symbol applies (B2.3b).
     owise: bool,
+    /// `true` iff [`rhs`](Self::rhs) contains a repeated compound subterm (C7): when set, the rhs is
+    /// instantiated inside a dedup window so the duplicate becomes one shared node (Maude's `RhsBuilder`
+    /// CSE), which `reduce` then normalizes once. `false` (the common case — e.g. `fib`'s `s(N + M)`,
+    /// which shares nothing) takes the plain instantiate path with zero dedup overhead.
+    rhs_shares: bool,
 }
 
 /// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
@@ -80,6 +85,12 @@ enum CompiledFragment {
 /// locals (`instantiate`'s `arg_ids`, the `Subst` bindings, the `rebuilt` node mid-rewrite) and are
 /// *not* discoverable by a stack walk, so they must not be safe points.
 struct ReduceFrame {
+    /// The node this frame was **first** pushed for — preserved across the Phase-2 rewrite-replace
+    /// (which overwrites `original` with each successive redex). When the frame reaches a normal form,
+    /// that form is recorded as `start`'s [`nf`](crate::dag::DagNode::nf) so a *shared* reference to
+    /// `start` forwards to the result instead of re-reducing it (C7). For the initial frame `start ==
+    /// original`; they diverge only once the node rewrites.
+    start: DagId,
     /// The node this frame started from; returned unchanged when no child changed (preserves the
     /// shared DAG id rather than rebuilding an identical node).
     original: DagId,
@@ -272,6 +283,15 @@ pub(crate) struct Runtime {
     /// contexts). `safe_point_gc` marks everything here in addition to the current stack. Used only when
     /// `gc_interval` is `Some` (otherwise GC never fires, so the vec stays empty — no overhead off-path).
     protected: Vec<DagId>,
+    /// Construction-time structural-dedup memo (C7 Half 1), `None` (the default) except inside a
+    /// [`begin_dedup`](Self::begin_dedup)…[`end_dedup`](Self::end_dedup) window. While `Some`, every
+    /// [`alloc_node`](Self::alloc_node) returns an existing structurally-identical node instead of a
+    /// duplicate, so a repeated subterm in the subject (or a sharing rhs) becomes **one** shared node —
+    /// which `nf`-forwarding then reduces once. Construction-scoped (never spans a GC safe point), so the
+    /// memo never holds a stale id; the default `None` path is a single `is_some()` branch on the
+    /// allocation funnel, leaving the reduce hot path untouched. Bottom-up construction keeps the
+    /// [`NodeTerm`] key shallow (children are deduped first, so identical subtrees already share ids).
+    dedup: Option<HashMap<NodeTerm, DagId>>,
 }
 
 #[derive(Default)]
@@ -292,6 +312,26 @@ impl Default for Signature {
             next_mb_id: 0,
         }
     }
+}
+
+/// Whether `t` has a repeated **compound** subterm — some `Op` term appearing (by structural value) at
+/// two or more positions. Decides an equation's `rhs_shares` flag (C7 Half 1): only such an rhs needs the
+/// dedup window, so the common non-sharing rhs (e.g. `fib`'s `s(N + M)`) keeps the plain instantiate path.
+/// Bare `Var`s are skipped — a repeated variable already shares through the substitution (`instantiate`
+/// returns the one binding), so it is not a construction duplicate. Over-approximating is safe: a false
+/// positive only enables the (idempotent) dedup window; there are no false negatives.
+fn term_has_repeated_subterm(t: &Term) -> bool {
+    let mut seen: HashSet<&Term> = HashSet::new();
+    let mut stack = vec![t];
+    while let Some(cur) = stack.pop() {
+        if let Term::Op { args, .. } = cur {
+            if !seen.insert(cur) {
+                return true; // this compound subterm was already seen elsewhere — a real duplicate
+            }
+            stack.extend(args.iter());
+        }
+    }
+    false
 }
 
 // ======================================================================================
@@ -707,6 +747,7 @@ impl Signature {
         let top = lhs.top_symbol().expect("equation lhs must be an application");
         let id = self.next_eq_id;
         self.next_eq_id += 1;
+        let rhs_shares = term_has_repeated_subterm(&rhs);
         let compiled = CompiledEquation {
             id,
             lhs: LhsAutomaton::compile(lhs, self),
@@ -714,6 +755,7 @@ impl Signature {
             nr_vars,
             condition: self.compile_condition(condition),
             owise,
+            rhs_shares,
         };
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
@@ -820,10 +862,43 @@ impl Runtime {
     /// normal-form step in [`reduce`](Self::reduce). (The alloc counter only matters when `gc_interval`
     /// is set, so the default path is a no-op increment. Reset by `safe_point_gc`, so it can't overflow.)
     fn alloc_node(&mut self, sort: SortId, term: NodeTerm) -> DagId {
+        // C7 Half 1: inside a dedup window, collapse a structurally-identical node to the existing one.
+        // A hit allocates nothing (so it must NOT bump the GC alloc counter — hence the `alloc_raw`
+        // split). The `is_some()` guard is the only cost on the default reduce path.
+        if self.dedup.is_some() {
+            if let Some(&existing) = self.dedup.as_ref().unwrap().get(&term) {
+                return existing;
+            }
+            let key = term.clone();
+            let id = self.alloc_raw(sort, term);
+            self.dedup.as_mut().unwrap().insert(key, id);
+            return id;
+        }
+        self.alloc_raw(sort, term)
+    }
+
+    /// The raw allocation funnel: account the node against the safe-point-GC interval and allocate it
+    /// fresh. Split out of [`alloc_node`](Self::alloc_node) so a dedup *hit* (which allocates nothing)
+    /// bypasses the counter bump entirely.
+    fn alloc_raw(&mut self, sort: SortId, term: NodeTerm) -> DagId {
         if self.gc_interval.is_some() {
             self.allocs_since_gc += 1;
         }
-        self.dags.alloc(DagNode { sort, reduced_epoch: 0, term })
+        self.dags.alloc(DagNode { sort, reduced_epoch: 0, nf: None, term })
+    }
+
+    /// Open a construction-time structural-dedup window (C7 Half 1): until [`end_dedup`](Self::end_dedup),
+    /// every node built via [`alloc_node`](Self::alloc_node) is deduplicated, so a repeated subterm
+    /// becomes one shared node. Must wrap a pure-construction span with **no GC safe point** inside (the
+    /// memo holds raw ids), and must be balanced by `end_dedup`. Re-opening inside an open window is
+    /// supported by save/restore at the call site (the rhs path); the bare pair simply resets to `None`.
+    fn begin_dedup(&mut self) {
+        self.dedup = Some(HashMap::new());
+    }
+
+    /// Close the dedup window opened by [`begin_dedup`](Self::begin_dedup), dropping the memo.
+    fn end_dedup(&mut self) {
+        self.dedup = None;
     }
 
     /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
@@ -1365,6 +1440,11 @@ impl Runtime {
         self.mark_registered_roots();
         for frame in frames {
             self.mark_reachable(frame.original);
+            // `start` is the node this frame will memoize at completion (C7 forwarding). Once the frame
+            // has rewritten, `start` is the *abandoned* original redex — no longer in the live structure,
+            // referenced only here — so it must be rooted, or GC reclaims it and the completion's
+            // `nf` write is a use-after-free. When `start == original` this is a redundant (deduped) mark.
+            self.mark_reachable(frame.start);
             for &r in &frame.args {
                 self.mark_reachable(r);
             }
@@ -1415,6 +1495,12 @@ impl Runtime {
         while let Some(id) = stack.pop() {
             kids.clear();
             kids.extend(self.dags.get(id).children());
+            // A reduced node's forwarding normal form (C7 `nf`) is not a structural child — `g(a)`'s
+            // child is `a`, not its result `b` — so the `children()` visitor misses it; mark it here so
+            // a node that is still reachable keeps the result it forwards to alive (freed together).
+            if let Some(nf) = self.dags.get(id).nf {
+                kids.push(nf);
+            }
             for &child in &kids {
                 if self.dags.mark(child) {
                     stack.push(child);
@@ -1441,7 +1527,9 @@ impl Runtime {
     #[must_use]
     pub(crate) fn reduce(&mut self, sig: &Signature, root: DagId) -> DagId {
         if self.node(root).reduced_epoch == sig.eq_epoch() {
-            return root;
+            // Already normal: forward to its recorded nf (C7) — `root`'s own content may be a redex that
+            // rewrote out of place, so the nf, not `root`, is its canonical form (`None` ⇒ self).
+            return self.node(root).nf.unwrap_or(root);
         }
 
         let mut stack: Vec<ReduceFrame> = Vec::new();
@@ -1482,7 +1570,10 @@ impl Runtime {
                 if let Some(pos) = sig.strat_position(f.symbol, f.cursor, f.orig.len()) {
                     let child = f.args[pos];
                     if self.node(child).reduced_epoch == sig.eq_epoch() {
-                        child_result = Some(child);
+                        // Already-reduced (a shared subterm, cached by epoch): deliver its normal form
+                        // without pushing a frame. Forward through `nf` (C7) so a shared redex that
+                        // rewrote out of place delivers its result, not its stale content (`None` ⇒ self).
+                        child_result = Some(self.node(child).nf.unwrap_or(child));
                     } else {
                         let frame = self.new_reduce_frame(child);
                         stack.push(frame);
@@ -1544,7 +1635,12 @@ impl Runtime {
                     let after = self.reconstruct_whole(sig, &stack, next);
                     self.patch_whole(before, after);
                 }
-                let frame = self.new_reduce_frame(next);
+                // Reuse this frame's slot for the rewritten term, but carry `start` over: this frame's
+                // forwarding target is still the node it was originally pushed for, not the intermediate
+                // redex `rebuilt` (which is abandoned and, being unshared, needs no memo of its own).
+                let start = stack.last().expect("empty reduce stack").start;
+                let mut frame = self.new_reduce_frame(next);
+                frame.start = start;
                 *stack.last_mut().expect("empty reduce stack") = frame;
                 continue;
             }
@@ -1566,8 +1662,23 @@ impl Runtime {
                     .then(|| self.reconstruct_whole(sig, &stack, rebuilt));
                 self.constrain_to_smaller_sort(sig, rebuilt, whole, &stack);
             }
-            // `rebuilt` is a normal form: stamp it canonical and hand it up (or return it as root).
-            self.dags.get_mut(rebuilt).reduced_epoch = sig.eq_epoch();
+            // `rebuilt` is a normal form: stamp it canonical (its own nf) and hand it up. If the frame's
+            // `start` node differs — it rewrote and/or its children changed — record `rebuilt` as
+            // `start`'s normal form too, so a *shared* reference to `start` (under C7 construction dedup)
+            // forwards straight to `rebuilt` instead of re-reducing it. Always clearing `rebuilt.nf` (not
+            // just on a fresh node) guards against a stale `Some` from an earlier epoch: `start == rebuilt`
+            // (a self-normal node, e.g. a constant refined by a membership) leaves `nf = None`.
+            let start = stack.last().expect("empty reduce stack").start;
+            {
+                let n = self.dags.get_mut(rebuilt);
+                n.nf = None;
+                n.reduced_epoch = sig.eq_epoch();
+            }
+            if start != rebuilt {
+                let n = self.dags.get_mut(start);
+                n.nf = Some(rebuilt);
+                n.reduced_epoch = sig.eq_epoch();
+            }
             stack.pop();
             if stack.is_empty() {
                 return rebuilt;
@@ -1576,11 +1687,14 @@ impl Runtime {
         }
     }
 
-    /// Build a fresh [`ReduceFrame`] positioned at the start of `id`'s children.
+    /// Build a fresh [`ReduceFrame`] positioned at the start of `id`'s children. `start` defaults to
+    /// `id`; the Phase-2 rewrite-replace copies the prior frame's `start` over so it survives a chain
+    /// of rewrites (C7 forwarding).
     fn new_reduce_frame(&self, id: DagId) -> ReduceFrame {
         let node = self.node(id);
         let orig: Vec<DagId> = node.children().collect();
         ReduceFrame {
+            start: id,
             original: id,
             symbol: node.symbol(),
             args: orig.clone(),
@@ -1759,7 +1873,19 @@ impl Runtime {
                         continue;
                     }
                 }
-                let rhs = self.instantiate(sig, &eq.rhs, &subst);
+                // C7: an rhs with a repeated compound subterm (e.g. `< g(X), g(X) >`) is built inside a
+                // dedup window so the duplicate becomes one shared node — reduced once, like Maude's CSE'd
+                // `RhsBuilder`. The flag keeps the non-sharing common case (e.g. `fib`'s rhs) on the plain
+                // path. Save/restore the outer `dedup` (`None` during reduce, but a nested rhs build could
+                // re-enter) so the window is exactly this instantiate.
+                let rhs = if eq.rhs_shares {
+                    let saved = self.dedup.replace(HashMap::new());
+                    let r = self.instantiate(sig, &eq.rhs, &subst);
+                    self.dedup = saved;
+                    r
+                } else {
+                    self.instantiate(sig, &eq.rhs, &subst)
+                };
                 // The subproblem splices the rhs into the matched position — a whole match is just the
                 // rhs; an extension match re-assembles the residue around it in the theory's normal
                 // form (ACU multiset, AU ordered prefix/suffix — Maude's `partialConstruct`).
@@ -1815,6 +1941,7 @@ impl Runtime {
             let base = self.protected.len();
             for f in frames {
                 self.protected.push(f.original);
+                self.protected.push(f.start); // C7: the outer frames' memoization targets (see safe_point_gc)
                 self.protected.extend_from_slice(&f.args);
             }
             for i in 0..subst.len() {
@@ -2337,11 +2464,26 @@ impl Engine {
         self.rt.trace.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    /// Reduce `root` to canonical form by innermost, eager equational simplification (Phase 0:
-    /// unconditional free-theory equations). A node already stamped canonical at the current epoch is
-    /// returned unchanged, so a *shared, already-reduced* subterm is never re-normalized. (A shared
-    /// subterm that is still *reducible* is normalized once per occurrence — Phase 0 has no
-    /// hash-consing/forwarding — exactly as the recursive reducer did.)
+    /// Open a construction-time structural-dedup window (C7): until [`end_dedup`](Self::end_dedup), DAG
+    /// nodes built through the `make_*`/`rebuild`/`instantiate` funnel that are structurally identical
+    /// collapse to a single shared node — so a subject like `< g(a), g(a) >` becomes one `g(a)` node,
+    /// which `reduce` then normalizes once (matching Maude's hash-consed subject DAG). The frontend wraps
+    /// the **subject build** (`build_dag`) in this; it must enclose a pure-construction span with no
+    /// reduction or GC inside, and be balanced by `end_dedup`. Idempotent for a fresh window.
+    pub fn begin_dedup(&mut self) {
+        self.rt.begin_dedup();
+    }
+
+    /// Close the dedup window opened by [`begin_dedup`](Self::begin_dedup).
+    pub fn end_dedup(&mut self) {
+        self.rt.end_dedup();
+    }
+
+    /// Reduce `root` to canonical form by innermost, eager equational simplification. A node already
+    /// stamped canonical at the current epoch is returned unchanged (forwarded to its normal form), so a
+    /// *shared, already-reduced* subterm is never re-normalized. A shared subterm that is still
+    /// *reducible* is normalized **once total** when the references share a DAG node (C7 forwarding +
+    /// construction dedup); distinct (un-shared) occurrences are each normalized, as before.
     ///
     /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
     /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
@@ -4853,14 +4995,14 @@ mod tests {
         assert_eq!(e.rewrites(), 186579, "exact rewrite count matches reference Maude");
     }
 
-    /// Faithfulness pin (review semantic-fidelity nit): a *shared, still-reducible* redex is reduced
-    /// — and counted — once per occurrence. Phase 0 has no hash-consing/forwarding, so a node that
-    /// rewrites is never stamped canonical (only its normal form is); the second occurrence of a
-    /// shared reducible subterm is therefore re-reduced, exactly as the old recursive reducer did.
-    /// This locks A1's faithfulness; if hash-consing later makes this a single rewrite the count must
-    /// be deliberately re-baselined here.
+    /// C7 forwarding, re-baselined: a *shared, still-reducible* redex is reduced — and counted — **once
+    /// total**, not once per occurrence. This test pinned the pre-C7 behaviour (2 rewrites: a rewritten
+    /// node was never stamped canonical, so a second reference re-reduced it); its own note said to
+    /// re-baseline here once forwarding lands. With the `nf` forward the rewritten node IS stamped and
+    /// carries its normal form, so the second reference delivers it without re-reducing — Maude's
+    /// shared-DAG count. (A rewrite to a subterm: `s 0 + 0 = s 0` forwards `C` to its own argument `s 0`.)
     #[test]
-    fn shared_reducible_redex_is_reduced_once_per_occurrence() {
+    fn shared_reducible_redex_is_reduced_once() {
         let mut e = Engine::new();
         let nat = e.add_sort("Nat");
         e.close_sorts();
@@ -4882,9 +5024,9 @@ mod tests {
         let root = e.make_free(f, vec![c, c]); // f(C, C), C shared
         let r = e.reduce(root);
 
-        // f(s 0, s 0): each occurrence of the shared C fired `N + 0 = N` once.
+        // f(s 0, s 0): the shared C fired `N + 0 = N` once; the second reference forwarded to the result.
         assert_eq!(e.node(r).symbol(), f);
-        assert_eq!(e.rewrites(), 2, "shared reducible redex counted once per occurrence (no hash-consing)");
+        assert_eq!(e.rewrites(), 1, "shared reducible redex reduced once total (C7 forwarding)");
     }
 
     /// A [`RootGuard`] pins its node across `gc`; dropping it releases the root (D2 amendment).
@@ -5114,5 +5256,38 @@ mod tests {
         assert_eq!(children.len(), 2, "pair keeps its two arguments");
         assert_eq!(decode(&e, children[0], zero, s), 100, "outer-frame sibling survived the condition GC");
         assert_eq!(decode(&e, children[1], zero, s), 120, "pickm(b) = b + b = 120 (matched subject survived)");
+    }
+
+    /// C7 normal-form forwarding (Half 2), in isolation — no construction dedup needed: a *manually*
+    /// shared reducible subterm (the **same** `DagId` referenced twice) is reduced **once**. `< g(a),
+    /// g(a) >` with `eq g(a) = b`: out of place, the rewritten `g(a)` node is abandoned, so the second
+    /// reference would re-reduce it (2 rewrites); the `nf` forward lets the second reference deliver the
+    /// already-computed `b` (1 rewrite, matching Maude's shared-DAG count). Result is `< b, b >` either way.
+    #[test]
+    fn forwarding_reduces_a_shared_redex_once() {
+        let mut e = Engine::new();
+        let elem = e.add_sort("E");
+        let pair_sort = e.add_sort("P");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], elem);
+        let b = e.add_op("b", vec![], elem);
+        let g = e.add_op("g", vec![elem], elem);
+        let pair = e.add_op("<_,_>", vec![elem, elem], pair_sort);
+        e.add_equation(Equation {
+            lhs: Term::op(g, vec![Term::constant(a)]),
+            rhs: Term::constant(b),
+            nr_vars: 0,
+        });
+
+        let a0 = e.make_const(a);
+        let ga = e.make_free(g, vec![a0]); // ONE g(a) node…
+        let subj = e.make_free(pair, vec![ga, ga]); // …referenced twice (a real shared DAG)
+        e.reset_rewrites();
+        let r = e.reduce(subj);
+
+        assert_eq!(e.rewrites(), 1, "a shared redex reduces once (forwarding), not once per reference");
+        let children: Vec<DagId> = e.node(r).children().collect();
+        let bsym = |id| e.node(id).symbol() == b;
+        assert!(bsym(children[0]) && bsym(children[1]), "both arguments forwarded to b: < b, b >");
     }
 }

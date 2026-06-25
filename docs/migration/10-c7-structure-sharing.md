@@ -1,5 +1,13 @@
 # 10 — C7: structure sharing (construction dedup + normal-form forwarding)
 
+> **STATUS: DONE.** Implemented per this plan (both halves). Byte-identical to the reference across all five
+> theory axes + membership + traces (`conformance/correctness-sharing.maude`, the `share.maude`/`mb mkA`
+> repros, a traced shared redex now showing ONE rewrite event). 220 tests, `clippy -D` clean,
+> `fib(22)=186579`. **One plan amendment:** the fib measurement (§5) found a real **~6% regression**, but
+> isolated it to the `nf` field's *size* (8 bytes/node), **not** the writes — so the planned write-gating
+> fallback recovers only ~1.5% and full recovery needs a sparse side-map (the rejected design). **Decision
+> (user): accept the ~6% as the price of correctness.** See `09` §2.1 C7 (now DONE) for the summary.
+
 **Bootstrap doc for a fresh session.** This is the complete plan + motivation for the Phase 1.5 **C7**
 residual (deferred from `09-correctness-phase.md` §2.1). Read 09 §2.1 C7 first for the boundary; this doc has
 the diagnosis, the two-part design, the ordered implementation plan with file anchors, and the verification.
