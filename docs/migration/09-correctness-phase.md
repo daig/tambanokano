@@ -1,5 +1,8 @@
 # Phase 1.5 — Evaluator Correctness (audit & fixes)
 
+> **✅ COMPLETE.** Every audited divergence is fixed, struck, or (for one output-only artifact with no
+> well-formed trigger) accepted as cosmetic (§2.4). Next: Phase 2.
+
 **A dedicated correctness-hardening phase between Phase 1 (complete) and Phase 2 (parameterized
 programming + rules + the real prelude).** Phase 1 made the evaluator *broad* and conformance-verified on
 idiomatic modules; this phase makes it *faithful in the corners* — it differential-audits the engine
@@ -22,9 +25,10 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > the F-1 guard would *diverge*), **C3** verified (we match on every well-formed order-dependent case), **C4**
 > done for single-top kinds (`[Nat]`); all §2.3. **C7** (structure sharing) **DONE** — construction dedup +
 > normal-form forwarding, byte-identical counts, ~6% fib cost accepted. **C13** (long-output line-wrapping)
-> **DONE** — ported Maude's `AutoWrapBuffer` at the `eval` boundary, byte-identical wrapping. **Open = one
-> idiom-rare residual:** the shared C3/C4 multi-top component-index order (Maude's unported
-> `ConnectedComponent` sort index). The
+> **DONE** — ported Maude's `AutoWrapBuffer` at the `eval` boundary, byte-identical wrapping. **Phase 1.5 is
+> complete.** The lone remaining divergence — the C3/C4 multi-top component-index order — is an **accepted
+> cosmetic** (output-only, no well-formed spec triggers it; reproducing a meaningless Maude-internal numbering),
+> **not** a to-fix item (§2.4). The
 > as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
@@ -51,12 +55,15 @@ Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked
 
 ---
 
-## 2. Known correctness issues (pending)
+## 2. Correctness issues (as-built record — all resolved or accepted)
 
-All confirmed items and probes are now resolved (C1/C5/C7/C8/C9/C10/C11/C12/C13 done, C6/F-2 done, C2 struck,
-C3 verified, C4 done for single-top kinds); only one idiom-rare residual remains (the C3/C4 multi-top
-order). The entries below are kept as the as-built record + the residual boundaries. C-numbers are stable
-discovery-order IDs, not priority ranks.
+**Phase 1.5 is complete.** All confirmed items and probes are resolved (C1/C5/C7/C8/C9/C10/C11/C12/C13 done,
+C6/F-2 done, C2 struck, C3 verified, C4 done for single-top kinds). The one remaining divergence — the
+**C3/C4 multi-top component-index order** — is **not a to-fix item**: it is an *accepted cosmetic divergence*,
+classified alongside the ACU print-order (§2.4). It is output-only (a kind *label* order / a contradictory-spec
+sort-name tiebreak), no well-formed spec triggers it, and it reproduces a meaningless Maude-internal numbering
+with no semantic content (see §2.4 for why fixing it would be over-indexing on an implementation detail). The
+entries below are the as-built record + boundaries. C-numbers are stable discovery-order IDs, not priority ranks.
 
 ### 2.1 Confirmed — evaluator
 
@@ -229,8 +236,9 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
     = largest index first; `Core/sortConstraintTable.cc::sortConstraintLt`), and for incomparable targets the
     tiebreak is Maude's *component sort index* (a topological numbering) — which our declaration-order
     `SortId` doesn't replicate. Idiom-rare (well-formed specs never assert contradictory memberships),
-    result-sort-only (count matches), silent in both. **Fix (if ever needed):** port Maude's component
-    sort-index + `sortConstraintLt`. Deferred — disproportionate to an ill-formed-spec edge.
+    result-sort-only (count matches), silent in both. **Accepted cosmetic — won't fix (§2.4):** it only
+    fires on a *contradictory* spec, where Maude's pick is itself arbitrary-but-deterministic (no "correct"
+    answer to match), and reproducing it means porting a semantically-empty internal numbering.
   - The `g(a), g(a)` count-doubling found while probing (Maude 3 rw, ours 6) is **C7** (subject-DAG sharing
     of the repeated reducible subterm), not an ordering issue — now **DONE** (§2.1 C7).
 - **C4 — error-sort / kind naming — DONE (single-top kinds, the common case); narrow multi-top residual.**
@@ -243,8 +251,10 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
   kind-level term in a *multi-top* component the ORDER of the listed maximal sorts is Maude's component
   sort-index — a DFS-topological numbering (declared `A B D`, all maximal → Maude `[B,D,A]`); we list them in
   declaration order (`[A,B,D]`). **Same root cause as the C3 incomparable-membership tiebreak** — both need
-  Maude's unported `ConnectedComponent` sort index (`Core/sort.cc::registerConnectedSorts` + `appendSort`);
-  deferred together. Single-top kinds (every well-formed signature) are exact.
+  Maude's unported `ConnectedComponent` sort index (`Core/sort.cc::registerConnectedSorts` + `appendSort`).
+  **Accepted cosmetic — won't fix (§2.4):** label-only, and only when a *multi-top* kind meets a *kind-level*
+  (error-sort) term — most naturally while you are already staring at a sort-error diagnostic. Single-top kinds
+  (every well-formed signature) are exact.
 - **C5 — AC / `iter` membership-lhs matching — DONE (covered by C8).** Memberships compile to the same
   `LhsAutomaton` and match via the same seam as equations (`SortConstraint.lhs`, engine.rs:49/768/888), so
   C8's cross-theory matching covers their lhs. Differentially verified vs the reference — AC (non-linear
@@ -276,6 +286,35 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
   freed-node panic before the `RootGuard`s). All condition fixtures stay byte-identical to the reference;
   214 tests, fib(22) unregressed. **Unblocks bounded-memory Phase-2 `rew`/`search`.**
 
+### 2.4 Accepted cosmetic divergences (output-only, won't fix)
+
+Divergences that are **output-only** (never a value / sort identity / rewrite count / termination difference)
+and that **no well-formed spec triggers**. These are deliberately *not* tracked as to-fix work: matching them
+means reproducing a semantically-empty Maude-internal artifact, and the differential harness already absorbs
+them (set-comparison for orderings; no fixture asserts the divergent surface). Recorded here so a future diff
+mismatch is recognized, not re-investigated.
+
+- **ACU print / match-solution order.** Our kernel orders AC arguments by `SymbolId`; Maude orders by
+  `Symbol::orderInt` (`08` §status). Same multiset → identical equality / normal forms / sorts / counts; only
+  the printed argument order (`5 + x` vs `x + 5`) and the AC *match-solution enumeration* order (Maude's
+  Diophantine order) differ. Match solutions are **set-compared** in the conformance harness; reduce results
+  are multiset-identical. Hits real fixtures (`nat`, `acu-*`) — the most common cosmetic delta, long accepted.
+- **Multi-top component-index order (the former C3/C4 residual).** Maude's `ConnectedComponent` "sort index"
+  (`Core/sort.cc::registerConnectedSorts` + `appendSort`) is a DFS-topological numbering used internally to
+  *encode* the subsort order. We proved it is **load-bearing for no computed result**: `findMinSortIndex`
+  picks the least sort by down-set intersection (+ op-declaration-order tiebreak, which we match), and
+  `leq`/GLB are set operations over index-encoded down-sets whose *members* are numbering-invariant. It leaks
+  into exactly two outputs: the **kind label** order `[B,D,A]` vs `[A,B,D]` (`printKind`; only for a kind-level
+  term in a multi-maximal component — a sort-error/diagnostic context) and the **incomparable-membership
+  tiebreak** (`sortConstraintLt`; only a *contradictory* spec, where Maude's own pick is arbitrary). Neither
+  arises in a well-formed spec, and matching it would be over-indexing on an implementation detail.
+  **If a future need for byte-parity ever appears** (e.g. a tool that diffs multi-top kind labels), the port is
+  a self-contained ~40-line pass in `sort.rs::close`: build declaration-order subsort (down) adjacency; per
+  component seed the DFS from the lowest-`SortId` member (error sort = index 0; maximal sorts appended in DFS
+  order; the rest via `processSubsorts` topological waves); store a `component_index: Vec<u32>`; then order the
+  kind name's maximal sorts by it (ascending) and break the `push_membership` incomparable tie by it
+  (descending, mirroring `sortConstraintLt`). The `[B,D,A]` and `result B: x` reproductions are ready oracles.
+
 ---
 
 ## 3. Sequencing
@@ -294,8 +333,10 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    kinds (name by maximal sort → `[Nat]`); **C7 done** (structure sharing: construction dedup + normal-form
    forwarding, byte-identical counts, ~6% fib cost accepted — `10-c7-structure-sharing.md`); **C13 done**
    (long-output line-wrapping: Maude's `AutoWrapBuffer` ported at the `eval` boundary).
-5. **Remaining = one idiom-rare residual** (does not block Phase 2): the shared **C3/C4 multi-top
-   component-index order** (Maude's unported `ConnectedComponent` sort index — closes both at once).
+5. **Phase 1.5 complete — no to-fix items remain.** The lone remaining divergence (the C3/C4 multi-top
+   component-index order) is reclassified as an **accepted cosmetic** (§2.4): output-only, triggered by no
+   well-formed spec, and a port would only reproduce a semantically-empty Maude-internal numbering. The
+   ~40-line recipe is recorded in §2.4 if byte-parity is ever genuinely needed.
 6. **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
 
 **Conformance discipline (unchanged):** every fix is validated against the reference binary — value, sort,
