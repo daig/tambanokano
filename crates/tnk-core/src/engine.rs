@@ -1099,8 +1099,9 @@ impl Runtime {
     /// two slots are the same node), so such a node is refined — and its membership counted — exactly
     /// once, matching Maude (whose `slowComputeTrueSort` no-ops once a node's sort is known). An
     /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
-    /// across two separate strat frames* in one reduction would be refined once per frame — a documented
-    /// edge requiring DAG sharing that `build_dag` never produces; see `docs/migration/09`.)
+    /// across two separate strat frames* in one reduction would be refined once per frame — a narrow edge
+    /// needing `strat` + `mb` + a repeated strat-skipped compound. C7's construction dedup can now produce
+    /// such sharing, but no observed case hits it; see `gaps.md`.)
     fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>, frames: &[ReduceFrame]) {
         if self.node(id).reduced_epoch == sig.eq_epoch() || !seen.insert(id) {
             return; // already at its true sort, or already refined in this pass

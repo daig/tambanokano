@@ -709,7 +709,7 @@ mod tests {
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
     /// membership counted (4 rewrites). Distinct subterms only — a repeated reducible-membership subterm
-    /// hits the orthogonal subject-DAG-sharing divergence (docs/migration/09 C7), out of scope for C1.
+    /// was, at C1 time, the separate subject-DAG-sharing divergence (C7, since resolved; see `gaps.md`).
     #[test]
     fn correctness_strat_mb_conforms() {
         conform(

@@ -7,7 +7,7 @@
 //! (prec/gather/mixfix tokens) — `tnk-core` stores only semantics — so it records its own `SymbolSyntax`
 //! tables as it drives the kernel's constructor API.
 //!
-//! See `docs/migration/reports/A4-parser-mixfix.md` and `docs/migration/07-stageB-plan.md` §2 B4.
+//! See `docs/migration/reports/A4-parser-mixfix.md` and `docs/migration/01-architecture-map.md` §2 (L5).
 
 pub mod build_term;
 pub mod cfparser;

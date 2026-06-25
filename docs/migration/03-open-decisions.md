@@ -1,9 +1,10 @@
-# Decision Record — foundational choices (Stage 1)
+# Decision Record — foundational choices (D1–D8)
 
-Status: **accepted as working defaults** (Stage 1). Each decision is deliberately revisitable at the
-phase noted under *Revisit*; agreeing now fixes the defaults so scaffolding can proceed without churn.
-Ordered by implementation blast radius (most pervasive first). See `01-architecture-map.md` §4 and
-`02-migration-plan.md` for how these are woven in.
+The load-bearing tech decisions, ordered by blast radius. **D1–D4 and D8 are in force and validated** by the
+built engine (Phase 0/1 — the `Resolution`/`Amendment` notes record how); **D5 (IO/`mio`), D6 (BDD), D7 (SMT)
+are forward decisions** that bind when their Phase-2/3 consumers land (`roadmap.md`). Each carries its
+rationale + the phase it was/will be revisited. See `01-architecture-map.md` §4 for how they thread through
+the layers.
 
 ---
 

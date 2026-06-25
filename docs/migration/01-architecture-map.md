@@ -1,7 +1,16 @@
-# Maude — Architecture & Feature Map (Stage-1 synthesis)
+# Maude — Architecture & Feature Map (the reference, + our build status)
 
 *Source of truth: `~/code/maude-lang/Maude/src` (~200k LOC C++, 24 subsystems) + the Maude 3.1
-manual. Per-subsystem deep-dives in `reports/A1`…`A8`.*
+manual. Per-subsystem deep-dives in `reports/A1`…`A8`.* This doubles as the **parity map**: the layer table
+(§2) and feature inventory (§3) describe what Maude is; the cross-cutting decisions (§4) are our porting
+strategy (now largely realized — see `03-open-decisions.md`).
+
+> **Build status (Phase 1 + 1.5 complete).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
+> Built-ins** — DONE (the matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf
+> gap, `gaps.md`). **L5 Frontend** (lexer/mixfix-grammar/Earley parser/pretty-printer) and **L6 Modules**
+> (non-parameterized: import/flatten/`+`/rename) — DONE. **L4 Operational** (rules/search/strategies/objects/
+> IO), **L6 parameterization** (theories/views/instantiation), **L7 Reflection/meta**, **L8 Symbolic** — NOT
+> STARTED (Phase 2/3, `roadmap.md`). Feature inventory (§3) = the Phase-2/3 to-do list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*
