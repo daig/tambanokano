@@ -71,6 +71,25 @@ fn sharing_through_repl() {
     assert!(!out.contains("rewrites: 4"), "C7: no pre-fix over-count (chain/triple were 4): {out}");
 }
 
+/// C13: a long result is line-wrapped through `eval` exactly as Maude's stdout wrapper (`auto_wrap`) —
+/// every line stays within 79 columns and wrapped lines carry the 4-space indent. (The differential
+/// suite pins this byte-identical to the reference binary, incl. `fib(22)`'s ~190-line numeral; this
+/// pins that `eval` applies the wrap end-to-end, and that short output is left untouched.)
+#[test]
+fn long_result_is_line_wrapped() {
+    let mut r = repl();
+    r.eval("fmod W is sort N . op z : -> N [ctor] . op s_ : N -> N [ctor] . endfm");
+    let out = r.eval(&format!("red {}z .", "s ".repeat(40))).output;
+    assert!(out.contains("\n    s"), "a wrapped continuation line carries the 4-space indent: {out}");
+    for line in out.lines() {
+        assert!(line.len() <= 79, "every line stays within 79 columns: {} cols in {line:?}", line.len());
+    }
+    // A short reduction is unaffected (no wrapping introduced).
+    let short = r.eval("red s s z .").output;
+    assert!(short.contains("result N: s s z"), "short result rendered: {short}");
+    assert!(!short.contains("\n    "), "short result is not wrapped: {short}");
+}
+
 /// The `match` command renders solutions (a commutative pattern → two pairings).
 #[test]
 fn match_command_through_repl() {

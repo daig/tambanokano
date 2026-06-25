@@ -8,6 +8,7 @@
 //! `format_matchers`, and the pretty-printer.
 
 mod trace;
+mod wrap;
 
 use std::collections::HashMap;
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
@@ -64,8 +65,18 @@ impl Repl {
         self.current.as_deref()
     }
 
-    /// Evaluate one (complete) input submission: a module, a command, or a REPL meta-command.
+    /// Evaluate one (complete) input submission: a module, a command, or a REPL meta-command. The output
+    /// is line-wrapped exactly as Maude's stdout wrapper ([`wrap::auto_wrap`]) so a long result (e.g.
+    /// `fib(22)`'s numeral) is laid out byte-for-byte like the reference binary (C13).
     pub fn eval(&mut self, input: &str) -> Eval {
+        let mut ev = self.eval_dispatch(input);
+        ev.output = wrap::auto_wrap(&ev.output);
+        ev
+    }
+
+    /// The dispatch behind [`eval`](Self::eval): produces the unwrapped output text. Split out so the
+    /// single output-wrapping step lives in one place, over every path (meta-command, module, command).
+    fn eval_dispatch(&mut self, input: &str) -> Eval {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Eval::default();

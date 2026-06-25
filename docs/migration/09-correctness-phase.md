@@ -21,9 +21,10 @@ to the reference" engine, and the panicking one (C8) blocks a textbook spec clas
 > `rew`/`search` prerequisite). **Every probe is now resolved:** **C2** struck (Maude loops on `eq a = a` too —
 > the F-1 guard would *diverge*), **C3** verified (we match on every well-formed order-dependent case), **C4**
 > done for single-top kinds (`[Nat]`); all §2.3. **C7** (structure sharing) **DONE** — construction dedup +
-> normal-form forwarding, byte-identical counts, ~6% fib cost accepted. **Open = only idiom-rare residuals:**
-> **C13** (long-output line-wrapping, lowest) and the shared C3/C4 multi-top component-index order (Maude's
-> unported `ConnectedComponent` sort index). The
+> normal-form forwarding, byte-identical counts, ~6% fib cost accepted. **C13** (long-output line-wrapping)
+> **DONE** — ported Maude's `AutoWrapBuffer` at the `eval` boundary, byte-identical wrapping. **Open = one
+> idiom-rare residual:** the shared C3/C4 multi-top component-index order (Maude's unported
+> `ConnectedComponent` sort index). The
 > as-built records are the commits
 > + `08-full-trace-plan.md` §status + the code; this doc tracks **pending** work + the confirmed residual edges.
 
@@ -52,8 +53,8 @@ Read order: this doc → `07-stageB-plan.md` §"Deferred follow-ups" (the parked
 
 ## 2. Known correctness issues (pending)
 
-All confirmed items and probes are now resolved (C1/C5/C7/C8/C9/C10/C11/C12 done, C6/F-2 done, C2 struck, C3
-verified, C4 done for single-top kinds); only idiom-rare residuals remain (C13, the C3/C4 multi-top
+All confirmed items and probes are now resolved (C1/C5/C7/C8/C9/C10/C11/C12/C13 done, C6/F-2 done, C2 struck,
+C3 verified, C4 done for single-top kinds); only one idiom-rare residual remains (the C3/C4 multi-top
 order). The entries below are kept as the as-built record + the residual boundaries. C-numbers are stable
 discovery-order IDs, not priority ranks.
 
@@ -180,14 +181,22 @@ heap work-stack (`Item`/`Work`, `run_stack`/`layout*`) — the same transform A1
 `deep_equal`; contained to the printer, no evaluator change, byte-identical on all existing render/
 round-trip/trace tests. `fib(22)` now prints its 17711-successor result (== Maude's value + rewrite count).
 
-#### C13 — Long-output line-wrapping  **[confirmed, the C12 residual]**
+#### C13 — Long-output line-wrapping — **DONE**
 
-Maude wraps a long printed term across lines at a column limit (default ~72), continuing with a 4-space
-indent; we print the whole term on one line. So `fib(22)`'s result is value-identical but laid out
-differently (Maude: many wrapped lines; ours: one ~35 KB line). Display-only, value/sort/count always
-correct, and it only triggers on very long results (idiom-rare — no conformance fixture in the byte-diff
-suite hits it). **Fix:** port Maude's output line-wrapper (the `format`/`PrintSettings` line-length logic) in
-the REPL/pretty layer. Lowest-priority of the open items.
+Maude wraps a long printed term across lines at a column limit, continuing wrapped lines with a 4-space
+indent; we printed the whole term on one line, so `fib(22)`'s result was value-identical but laid out as
+one ~35 KB line instead of Maude's ~190 wrapped lines. Display-only (value/sort/count always correct), but
+it broke the byte-for-byte differential comparison for any long result. **Fixed** by porting Maude's
+`AutoWrapBuffer` (`IO_Stuff/autoWrapBuffer.cc`, the line-wrapper it installs on stdout) as a pure function
+`tnk-repl/src/wrap.rs::auto_wrap`, applied once at the [`Repl::eval`] boundary so the *whole* output stream
+(reduce echo, result, traces, match solutions) wraps uniformly, exactly as Maude does. Faithful port:
+`lineWidth = 80` (Maude's non-TTY `DEFAULT_COLUMNS`, the value the piped reference uses), `LEFT_MARGIN = 4`,
+`RIGHT_MARGIN = 1` → lines fill to 79 columns; breaks land at a space or just after `,([{`, never inside a
+`"string"` or an `ESC … m` color sequence (per-byte width accounting, escapes uncounted). Verified
+byte-identical to the reference across `fib.maude` (the 17711-successor result + the wrapped reduce echo),
+a comma/paren/nesting stress term, and a traced long-term reduction; 4 `wrap.rs` unit tests + a REPL
+end-to-end test. The wrapping is the I/O layer (it does not touch the pretty-printer, which still emits the
+flat term), so `print_pretty`/the `renders_as` term-text tests are unchanged.
 
 ### 2.3 Unconfirmed candidate probes  *(write the differential test first)*
 
@@ -275,17 +284,18 @@ Each becomes a confirmed `C<n>` item with a repro, or is struck out, once probed
    (AC/`iter` membership-lhs matching, covered by C8's shared matcher seam; confirmed differentially).
 2. **C9–C11 — DONE** (frontend fidelity: float / glued-minus / rational printing + the normalized command
    echo; all differentially byte-identical, fixtures added).
-3. **C12 — DONE** (pretty-printer deep-chain overflow → iterative work-stack; evaluator was never affected).
-   Its residual **C13** (long-output line-wrapping) is display-only and lowest priority.
+3. **C12 — DONE** (pretty-printer deep-chain overflow → iterative work-stack; evaluator was never affected),
+   and its residual **C13 — DONE** (long-output line-wrapping: ported Maude's `AutoWrapBuffer` at the `eval`
+   boundary, byte-identical — long results now diff cleanly against the reference).
 4. **C6 / F-2 — DONE** (engine-global condition-reduce GC root set; keeps GC on during conditions while
    protecting the outer context — bounded-memory re-entrant reduction, the Phase-2 `rew`/`search`
    prerequisite). Earlier sweep outcomes: **C2 struck** (Maude loops on `eq a = a` too — the F-1 guard would
    diverge); **C3 verified** (we match on every well-formed order-dependent case); **C4 done** for single-top
    kinds (name by maximal sort → `[Nat]`); **C7 done** (structure sharing: construction dedup + normal-form
-   forwarding, byte-identical counts, ~6% fib cost accepted — `10-c7-structure-sharing.md`).
-5. **Remaining = idiom-rare residuals only** (none block Phase 2): **C13** (long-output line-wrapping); the
-   shared **C3/C4 multi-top component-index order** (Maude's unported `ConnectedComponent` sort index —
-   closes both at once).
+   forwarding, byte-identical counts, ~6% fib cost accepted — `10-c7-structure-sharing.md`); **C13 done**
+   (long-output line-wrapping: Maude's `AutoWrapBuffer` ported at the `eval` boundary).
+5. **Remaining = one idiom-rare residual** (does not block Phase 2): the shared **C3/C4 multi-top
+   component-index order** (Maude's unported `ConnectedComponent` sort index — closes both at once).
 6. **Phase 2** (parameterized programming + rules + the real prelude), built on a faithful engine.
 
 **Conformance discipline (unchanged):** every fix is validated against the reference binary — value, sort,
