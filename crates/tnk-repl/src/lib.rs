@@ -101,9 +101,39 @@ impl Repl {
         ev
     }
 
-    /// The dispatch behind [`eval`](Self::eval): produces the unwrapped output text. Split out so the
-    /// single output-wrapping step lives in one place, over every path (meta-command, module, command).
+    /// The dispatch behind [`eval`](Self::eval): produces the unwrapped output text. A submission may
+    /// hold several statements — a loaded `.maude` file freely mixes module definitions, commands, and
+    /// `set`/`show`/`select`/`quit` meta-commands — so it is split into complete statements (the same
+    /// boundary [`input_complete`](Self::input_complete) uses, so a multi-line module stays one chunk)
+    /// and each is dispatched in turn. This is why a file's mid-stream `set trace on .` is handled rather
+    /// than mis-parsed as a term.
     fn eval_dispatch(&mut self, input: &str) -> Eval {
+        let mut output = String::new();
+        let mut buffer = String::new();
+        for line in input.lines() {
+            buffer.push_str(line);
+            buffer.push('\n');
+            if self.input_complete(&buffer) {
+                let ev = self.dispatch_one(&buffer);
+                buffer.clear();
+                append_block(&mut output, &ev.output);
+                if ev.exit {
+                    return Eval { output: output.trim_end().to_string(), exit: true };
+                }
+            }
+        }
+        // A trailing statement with no terminator (e.g. a partial interactive line) — dispatch it
+        // best-effort so its parse error surfaces rather than being silently dropped.
+        if !buffer.trim().is_empty() {
+            let ev = self.dispatch_one(&buffer);
+            append_block(&mut output, &ev.output);
+        }
+        Eval { output: output.trim_end().to_string(), exit: false }
+    }
+
+    /// Dispatch ONE complete statement: a `set`/`show`/`select`/`quit` meta-command (by its first word),
+    /// or a module definition / command parsed via [`Parser::parse_top_item`].
+    fn dispatch_one(&mut self, input: &str) -> Eval {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Eval::default();
@@ -117,8 +147,8 @@ impl Repl {
             _ => {}
         }
 
-        // Otherwise: module definitions and reduce/match commands. Collect the parsed items first so the
-        // `Parser`'s shared borrow of the interner is released before we mutate it (flatten/build/reduce).
+        // Otherwise: module definitions and reduce/match/rewrite/search commands. Collect the parsed
+        // items first so the `Parser`'s shared borrow of the interner is released before we mutate it.
         let mut output = String::new();
         let toks = tokenize(input, &mut self.interner);
         let items = {
@@ -396,6 +426,17 @@ impl Repl {
         let last_txt = self.interner.resolve(last.sym);
         matches!(last_txt, "endfm" | "endm" | "endfth" | "endth")
             || (last.kind == TokKind::Dot && !open)
+    }
+}
+
+/// Append a non-empty per-statement output block to the accumulated submission output, separating
+/// consecutive blocks by a single newline.
+fn append_block(out: &mut String, block: &str) {
+    if !block.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(block);
     }
 }
 

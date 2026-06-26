@@ -577,6 +577,22 @@ fn rule_in_fmod_is_rejected() {
     assert!(out.contains("not allowed in a functional module"), "rejection: {out}");
 }
 
+/// A single `eval` of a file that mixes a module, a `set trace on .` meta-command, and a traced command
+/// — previously the mid-stream `set` broke the whole-file parse (it is now split into per-statement
+/// dispatch). The `show`/`continue` etc. across statements share the persistent REPL state.
+#[test]
+fn eval_mixed_file_with_meta_commands() {
+    let out = repl()
+        .eval(
+            "mod CH is sort S . ops a b c : -> S . rl a => b . rl b => c . endm\n\
+             set trace on .\n\
+             rewrite a .",
+        )
+        .output;
+    assert!(out.contains("*********** rule\nrl a => b ."), "traced rule from a one-shot file load:\n{out}");
+    assert!(out.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "result:\n{out}");
+}
+
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
 /// or a terminator-less line keep buffering; a bare `quit` completes.
 #[test]
