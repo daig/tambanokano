@@ -360,22 +360,29 @@ pub fn reduce_command(
     Ok((result, lm.built.engine.rewrites()))
 }
 
-/// Parse + build a ground command term and begin a `rewrite` session over it (Pillar A). Resets the
-/// rewrite counter and builds the subject in a dedup window exactly like [`reduce_command`], then returns
-/// the resumable [`Rewriting`] — the caller drives it with [`Rewriting::run`] (bound or unbounded) and
-/// stores it for `continue`.
-pub fn rewrite_command(
-    lm: &mut LoadedModule,
-    i: &Interner,
-    term: &[Token],
-) -> Result<Rewriting, String> {
+/// Parse + build a ground command subject DAG, resetting the rewrite counter and building inside a dedup
+/// window exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders.
+fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<DagId, String> {
     let tree = parse_forest(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
     let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i);
     lm.built.engine.end_dedup();
-    let dag = dag?;
+    dag
+}
+
+/// Begin a `rewrite` (rule-fair) session over `term` (Pillar A). The caller drives the returned
+/// [`Rewriting`] with [`Rewriting::run`] and stores it for `continue`.
+pub fn rewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<Rewriting, String> {
+    let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.rewrite(dag))
+}
+
+/// Begin a `frewrite` (position-fair) session over `term` (Pillar A-ii); `gas` rule applications per
+/// position per pass.
+pub fn frewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas: u64) -> Result<Rewriting, String> {
+    let dag = build_command_dag(lm, i, term)?;
+    Ok(lm.built.engine.frewrite(dag, gas))
 }
 
 /// The matched-portion id (for `xmatch`) and binding ids of one match solution, captured while the

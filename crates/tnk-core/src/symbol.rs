@@ -82,8 +82,24 @@ pub struct Symbol {
     /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
     /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
     pub(crate) strategy: Option<Vec<u32>>,
+    /// Frozen arguments (`frozen` / `frozen (…)`, Pillar A): the 0-based argument positions that
+    /// `rewrite`/`frewrite`/`search` must **not** rewrite within. `None` = no frozen args; `Some([])` =
+    /// all arguments frozen (`[frozen]`); `Some([0,2])` = those positions. Inert for equational `reduce`.
+    pub(crate) frozen: Option<Vec<u32>>,
     /// Built-in reduction rule (`special (id-hook …)`, B3), if any — tried before user equations.
     pub(crate) special: Option<SpecialOp>,
+}
+
+impl Symbol {
+    /// Whether argument position `arg` (0-based) is frozen — a rule may not rewrite within it
+    /// (Pillar A). See [`Symbol::frozen`].
+    pub(crate) fn is_frozen_arg(&self, arg: usize) -> bool {
+        match &self.frozen {
+            None => false,
+            Some(v) if v.is_empty() => true, // `[frozen]` = every argument
+            Some(v) => v.contains(&(arg as u32)),
+        }
+    }
 }
 
 /// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam

@@ -26,6 +26,15 @@ These reproduce a semantically-empty Maude-internal artifact; the differential h
 - **REPL-vs-batch framing.** The piped reference prints `====` separators between command results, a startup
   banner, and `Bye.` on exit; our REPL omits these. Structural, not term-rendering — the echo / result /
   count / trace content matches byte-for-byte (incl. line-wrapping).
+- **`frewrite` bounded-stop position order (Pillar A-ii).** Our `frewrite` ports Maude's `fairTraversal`
+  *substance* faithfully — gas-bounded position fairness, the progress/pass loop, equational-reduce-between,
+  frozen-argument skipping, `continue` — but as a clean post-order (leaves-first, left-to-right) walk rather
+  than its exact redex-stack discipline. For a terminating system the unbounded result + rewrite count are
+  order-independent (`frewrite (a|a)|a` = `(d|d)|d`, 9, byte-identical). The only place the order shows is the
+  **intermediate term of a bounded `frewrite [n]`**, and only over an **AC** operator (a free op's children
+  have a fixed order, so `frewrite [2] (a|a)|a` = `(b|b)|a` matches exactly) — there it inherits the existing
+  ACU-argument-order divergence above, surfacing through one more surface. No new concession; no well-formed
+  spec asserts it.
 
 ## 2. Deferred optimizations — correct now, perf-only, port when it matters
 
@@ -46,9 +55,17 @@ correctness fix.
 
 ## 3. Deferred sub-features (within built areas) + robustness
 
-- **Operator attributes `frozen` / `memo`.** Parsed-area attributes not yet wired into reduction (`ctor` and
-  `strat` are). `frozen` blocks reduction of listed args; `memo` caches results. Add with the rule machinery
-  (`frozen` matters most for rewriting) / as a perf cache.
+- **Operator attributes `memo`; `frozen` partial.** `frozen` (`frozen`/`frozen (…)`) is now parsed and wired
+  into the **rewriting** layer (Pillar A-ii): `rewrite`/`frewrite` (and `search`, A-iv) never apply a rule
+  within a frozen argument — note this blocks *rules*, not equational reduction, which is Maude's actual
+  semantics. `memo` (result caching) is still parsed-and-ignored — add it as a perf cache.
+- **`frewrite` over a custom `strat` (lazy positions).** Our `frewrite` reduces equationally between rule
+  steps at every position. Maude's `lazyMarker` suppresses that reduction *inside a non-eager (lazy) subtree*
+  of an operator with a custom `strat`. Only observable for the rare combination of a `strat`-annotated
+  operator that is also `frewrite`d into a lazy argument; default-strategy modules (every conformance fixture)
+  are unaffected. The eager/lazy bit is already on `Symbol` (`strategy`); threading it through the traversal is
+  a localized follow-up. (`frewrite_pass` also recurses on subject depth — shallow for object/config terms, an
+  explicit-stack rewrite is the same follow-up as C12 if a deep rule structure ever appears.)
 - **Cross-kind ad-hoc overloading.** Overload resolution handles single-kind (subsort) overloading; cross-kind
   ad-hoc overloading (arg-sort-driven kind selection) is `debug_assert`-guarded, not implemented. Idiomatic
   signatures don't need it; the prelude may.

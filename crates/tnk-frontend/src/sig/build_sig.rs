@@ -127,6 +127,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         if let Some(strat) = &od.attrs.strat {
             engine.set_strategy(sym, strat);
         }
+        if let Some(frozen) = &od.attrs.frozen {
+            engine.set_frozen(sym, frozen);
+        }
         if let Some(spec) = &od.attrs.special
             && let Some(op) = special_op(spec, arity, &name_to_sym, &succ_zero, interner)?
         {

@@ -427,6 +427,7 @@ impl Signature {
             axioms: Axioms::default(),
             identity: None,
             strategy: None,
+            frozen: None,
             special: None,
         })
     }
@@ -449,6 +450,7 @@ impl Signature {
             axioms: Axioms { assoc: true, comm: true, idem: false, iter: false },
             identity,
             strategy: None,
+            frozen: None,
             special: None,
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
@@ -472,6 +474,7 @@ impl Signature {
             axioms: Axioms { assoc: true, comm: false, idem: false, iter: false },
             identity,
             strategy: None,
+            frozen: None,
             special: None,
         })
     }
@@ -494,6 +497,7 @@ impl Signature {
             axioms: Axioms { assoc: false, comm: true, idem, iter: false },
             identity,
             strategy: None,
+            frozen: None,
             special: None,
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
@@ -516,6 +520,7 @@ impl Signature {
             axioms: Axioms { iter: true, ..Default::default() },
             identity: None,
             strategy: None,
+            frozen: None,
             special: None,
         })
     }
@@ -614,6 +619,18 @@ impl Signature {
             self.symbols.get(sym).name()
         );
         self.symbols.get_mut(sym).strategy = Some(positions.iter().map(|&p| p - 1).collect());
+    }
+
+    /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`, Pillar A). `raw` is the 1-based
+    /// positions from the source — empty for a bare `[frozen]` (all arguments); stored 0-based.
+    pub(crate) fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) {
+        let arity = self.symbols.get(sym).arity();
+        assert!(
+            raw.iter().all(|&p| p >= 1 && p as usize <= arity),
+            "frozen positions {raw:?} for `{}` reference an argument outside 1..={arity}",
+            self.symbols.get(sym).name()
+        );
+        self.symbols.get_mut(sym).frozen = Some(raw.iter().map(|&p| p - 1).collect());
     }
 
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym`. The op-hook/term-hook
@@ -2465,6 +2482,13 @@ impl Engine {
         self.sig.set_strategy(sym, raw);
     }
 
+    /// Mark `sym`'s frozen arguments (`frozen` / `frozen (raw…)`, Pillar A): `raw` is the 1-based frozen
+    /// argument positions — pass an empty slice for a bare `[frozen]` (all arguments). A frozen argument
+    /// is never rewritten by `rewrite`/`frewrite`/`search`; equational `reduce` is unaffected.
+    pub fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) {
+        self.sig.set_frozen(sym, raw);
+    }
+
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user
     /// equations. Hook references are passed already resolved to [`SymbolId`]s (the future parser does
     /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]). A
@@ -2728,6 +2752,89 @@ impl Engine {
     /// per-symbol round-robin rule cursor across steps.
     pub(crate) fn rewrite_step(&mut self, current: DagId, cursors: &mut HashMap<SymbolId, u32>) -> Option<DagId> {
         self.rt.rewrite_step(&self.sig, current, cursors)
+    }
+
+    /// Apply the first applicable rule at `node` (round-robin via `cursors`), returning the rewritten
+    /// node or `None`. Used by the position-fair `frewrite` traversal (Pillar A-ii) and `search` (A-iv),
+    /// which drive the per-position rule application themselves rather than through the top-down
+    /// [`rewrite_step`](Self::rewrite_step).
+    pub(crate) fn rewrite_at(&mut self, node: DagId, cursors: &mut HashMap<SymbolId, u32>) -> Option<DagId> {
+        self.rt.apply_first_rule_at(&self.sig, node, cursors).map(|(_, r)| r)
+    }
+
+    /// Reconstruct a node of `symbol` from `children` (the theory-aware constructor — Free/ACU/AU/CUI/S).
+    /// Used by the `frewrite` traversal to rebuild a parent after rewriting a child.
+    pub(crate) fn rebuild_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
+        self.rt.rebuild(&self.sig, symbol, children)
+    }
+
+    /// Begin a `frewrite` session over `initial` (Pillar A-ii): position-fair, `gas` rule applications
+    /// per position per traversal pass. Returns a resumable [`Rewriting`] (drive with [`Rewriting::run`]).
+    pub fn frewrite(&mut self, initial: DagId, gas: u64) -> Rewriting {
+        let root = self.root(initial);
+        Rewriting::new_position_fair(root, initial, gas)
+    }
+
+    /// One position-fair traversal pass of `node` (Pillar A-ii): post-order (leaves first, left to
+    /// right — a *clean*, well-defined order; see the `frewrite` divergence note in `gaps.md`), giving
+    /// each **non-frozen** position up to `gas` rule applications with an equational reduce between each.
+    /// `remaining` bounds the rewrites across the whole run (`None` = unbounded); `progress` records
+    /// whether any rule fired (the pass loop repeats while it does). Faithful to Maude's `fairTraversal`
+    /// substance — gas-bounded position fairness, reduce-between, frozen-skipping — without porting its
+    /// exact redex-stack discipline (the conceded clean-order divergence affects only the intermediate
+    /// term of a bounded `frewrite [n]`).
+    ///
+    /// Recurses on subject depth; `frewrite` is used over (shallow) configuration/object terms, and the
+    /// equational reductions it calls are themselves iterative — a deep-term explicit stack is a
+    /// follow-up if a pathologically deep rule structure ever appears.
+    pub(crate) fn frewrite_pass(
+        &mut self,
+        node: DagId,
+        gas: u64,
+        remaining: &mut Option<u64>,
+        progress: &mut bool,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> DagId {
+        if *remaining == Some(0) {
+            return node; // bound exhausted — leave the rest of the term as it stands
+        }
+        // 1. Recurse into the non-frozen children first (post-order), rebuilding the node if any changed.
+        let symbol = self.node(node).symbol();
+        let children: Vec<DagId> = self.node(node).children().collect();
+        let mut new_children = Vec::with_capacity(children.len());
+        let mut changed = false;
+        for (pos, &c) in children.iter().enumerate() {
+            if *remaining == Some(0) || self.symbol(symbol).is_frozen_arg(pos) {
+                new_children.push(c); // frozen (rules blocked) or budget spent — keep as-is
+            } else {
+                let nc = self.frewrite_pass(c, gas, remaining, progress, cursors);
+                changed |= nc != c;
+                new_children.push(nc);
+            }
+        }
+        let mut node = if changed { self.rebuild_node(symbol, new_children) } else { node };
+        // 2. A rewritten child can enable an equation here (Maude's `ascend` reduce of a stale parent);
+        //    reduce the rebuilt node to canonical form before trying rules at it. (`frozen` blocks rules,
+        //    not equations, so reducing a frozen child's value is correct.)
+        if changed {
+            node = self.reduce(node);
+        }
+        // 3. Apply up to `gas` rules at this node, reducing between each (Maude's `doRewriting` gas loop).
+        let mut g = gas;
+        while g > 0 && *remaining != Some(0) {
+            match self.rewrite_at(node, cursors) {
+                Some(r) => {
+                    *progress = true;
+                    node = self.reduce(r);
+                    g -= 1;
+                    if let Some(rem) = remaining {
+                        *rem -= 1;
+                    }
+                }
+                None => break,
+            }
+        }
+        node
     }
 
     /// Total equational rewrites applied so far.

@@ -93,6 +93,10 @@ pub struct Attrs {
     pub gather: Option<Vec<GatherElem>>,
     /// `strat (…)` — the raw 1-based positions (ending in `0`).
     pub strat: Option<Vec<u32>>,
+    /// `frozen` / `frozen (1 2)` — `None` = not frozen; `Some([])` = all arguments frozen (`[frozen]`);
+    /// `Some([1,3])` = those 1-based argument positions frozen. A frozen argument is never rewritten by
+    /// `rewrite`/`frewrite`/`search` (Pillar A).
+    pub frozen: Option<Vec<u32>>,
     pub special: Option<SpecialSpec>,
     pub ditto: bool,
 }
@@ -137,6 +141,8 @@ pub enum Command {
     Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
     /// `rewrite [bound] term .` — rule-fair rewriting to a normal form (or `bound` rule applications).
     Rewrite { bound: Option<u64>, term: Vec<Token> },
+    /// `frewrite [bound] term .` — position-fair rewriting (Pillar A-ii).
+    Frewrite { bound: Option<u64>, term: Vec<Token> },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
 }

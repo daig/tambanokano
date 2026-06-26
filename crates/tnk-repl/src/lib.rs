@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_core::rewrite::Rewriting;
 use tnk_frontend::load::{
-    build_loaded_module, command_echo, format_matchers, match_command, reduce_command, rewrite_command,
-    LoadedModule,
+    build_loaded_module, command_echo, format_matchers, frewrite_command, match_command, reduce_command,
+    rewrite_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
@@ -208,6 +208,23 @@ impl Repl {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                         out.push_str(&format!("rewrite{bound_str} in {cur} : {echo} .\n{body}"));
                         // `lm`'s borrow ends above; save the session so `continue` can resume it.
+                        self.last = Some((cur.clone(), rw));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::Frewrite { bound, term } => {
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
+                lm.built.engine.set_trace(self.trace.master);
+                lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
+                let bound_str = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
+                // Maude's `frewrite` default gas is one rule application per position per pass.
+                match frewrite_command(lm, &self.interner, &term, 1) {
+                    Ok(mut rw) => {
+                        let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
+                        out.push_str(&format!("frewrite{bound_str} in {cur} : {echo} .\n{body}"));
                         self.last = Some((cur.clone(), rw));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),

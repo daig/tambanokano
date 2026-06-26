@@ -138,6 +138,13 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Rewrite { bound, term })
             }
+            "frewrite" | "frew" => {
+                self.advance();
+                let bound = self.opt_bound()?;
+                let term = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::Frewrite { bound, term })
+            }
             "continue" | "cont" => {
                 // `continue n .` takes a **bare** number (unlike `rewrite [n]`'s bracketed bound); an
                 // omitted bound continues unbounded to the next normal form / solution.
@@ -481,7 +488,20 @@ impl<'a> Parser<'a> {
                 "iter" => { self.advance(); a.iter = true; }
                 "ctor" => { self.advance(); a.ctor = true; }
                 "ditto" => { self.advance(); a.ditto = true; }
-                "memo" | "frozen" | "config" | "obj" | "msg" | "portal" => { self.advance(); }
+                "memo" | "config" | "obj" | "msg" | "portal" => { self.advance(); }
+                "frozen" => {
+                    self.advance();
+                    // `frozen` = all args; `frozen (1 2)` = those 1-based positions.
+                    let positions = if self.at("(") {
+                        let toks = self.balanced()?;
+                        toks.iter()
+                            .map(|t| self.i.resolve(t.sym).parse::<u32>().map_err(|_| "bad frozen position".to_string()))
+                            .collect::<Result<_, _>>()?
+                    } else {
+                        Vec::new()
+                    };
+                    a.frozen = Some(positions);
+                }
                 "id:" => {
                     self.advance();
                     a.id = Some(self.collect_until(&["]"]));
@@ -586,6 +606,7 @@ impl Attrs {
             prec: self.prec,
             gather: self.gather.clone(),
             strat: self.strat.clone(),
+            frozen: self.frozen.clone(),
             special: self.special.clone(),
             ditto: self.ditto,
         }

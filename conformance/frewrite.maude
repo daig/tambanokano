@@ -1,0 +1,31 @@
+*** Pillar A-ii: `frewrite` (position-fair rewriting) + frozen arguments.
+*** Byte-for-byte vs the reference (modulo `====`/`Bye.`):
+***   ~/Downloads/Maude-3/maude -no-banner conformance/frewrite.maude < /dev/null
+***   ./target/debug/tnk-repl conformance/frewrite.maude < /dev/null
+***
+*** ESSENTIAL position-fairness (the reason frewrite exists): each pass gives every non-frozen position
+*** one rule application before moving on, so a bound spreads across positions rather than draining one:
+***   rewrite  [2] (a|a)|a  ->  (a|a)|c   (greedy: one position rewritten twice)
+***   frewrite [2] (a|a)|a  ->  (b|b)|a   (fair:   two positions rewritten once each)
+*** Unbounded, both reach the same normal form; frewrite (a|a)|a -> (d|d)|d in 9 rule steps.
+*** A bounded frewrite stop leaves a non-canonical term: `result (sort not calculated): ...`.
+***
+*** FROZEN: a rule never rewrites within a frozen argument (frewrite f(a) does nothing, 0 rewrites),
+*** while a non-frozen argument is rewritten (frewrite g(a) -> g(d), 3 steps).
+
+mod FR is
+  sort S .
+  ops a b c d : -> S .
+  op _|_ : S S -> S [ctor] .
+  op f : S -> S [frozen] .
+  op g : S -> S [ctor] .
+  rl a => b .
+  rl b => c .
+  rl c => d .
+endm
+
+frewrite (a | a) | a .
+rewrite [2] (a | a) | a .
+frewrite [2] (a | a) | a .
+frewrite f(a) .
+frewrite g(a) .

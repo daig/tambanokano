@@ -456,6 +456,23 @@ fn traced_rewrite_renders_rule_blocks() {
     assert!(s.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "tail:\n{s}");
 }
 
+/// Pillar A-ii: `frewrite` (position-fair) + frozen arguments, byte-matching the reference
+/// (`conformance/frewrite.maude`). The essential fairness property (a bound spreads across positions,
+/// unlike greedy `rewrite`), the unbounded normal form, the `(sort not calculated)` bounded stop, and
+/// frozen-argument skipping.
+#[test]
+fn frewrite_command_through_repl() {
+    let out = repl().eval(conformance_file!("frewrite.maude")).output;
+    // Unbounded: all three positions reach `d` in 9 steps.
+    assert!(out.contains("frewrite in FR : (a | a) | a .\nrewrites: 9 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: (d | d) | d"), "unbounded:\n{out}");
+    // Fairness: greedy `rewrite [2]` drains one position; fair `frewrite [2]` spreads across two.
+    assert!(out.contains("rewrite [2] in FR : (a | a) | a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: (a | a) | c"), "greedy:\n{out}");
+    assert!(out.contains("frewrite [2] in FR : (a | a) | a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult (sort not calculated): (b | b) | a"), "fair + sort-not-calculated:\n{out}");
+    // Frozen: a rule never rewrites inside f's (frozen) argument; g's argument IS rewritten.
+    assert!(out.contains("frewrite in FR : f(a) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: f(a)"), "frozen blocks:\n{out}");
+    assert!(out.contains("frewrite in FR : g(a) .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(d)"), "non-frozen rewrites:\n{out}");
+}
+
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
 #[test]
 fn rule_in_fmod_is_rejected() {
