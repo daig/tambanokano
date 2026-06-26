@@ -85,12 +85,22 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
         );
     }
 
-    // Declared-variable productions: `<FooTerm> ::= varName` (Maude uses on-the-fly variable terminals;
-    // we use the module's `var`/`vars` declarations directly — the milestone pre-declares its variables).
+    // Declared-variable productions: `<FooTerm> ::= varName` (from the module's `var`/`vars`).
     for (name, sort) in &m.vars {
         let nt = Nt::Comp(sorts.kind_of(*sort), NtType::Term);
         let tok = Terminal::Tok(interner.intern(name));
         push(&mut g, nt, vec![GSym::T(tok)], 0, vec![], Action::MakeVariable(*sort));
+    }
+
+    // On-the-fly variable productions: `<FooTerm> ::= name:Foo` for every sort (Maude's colon-variable
+    // syntax) — a `name:sort` token of that sort, the whole token becoming the variable name. Iterated in
+    // SortId order for a reproducible grammar.
+    let mut sort_names: Vec<(&String, SortId)> = m.sorts.iter().map(|(n, &s)| (n, s)).collect();
+    sort_names.sort_by_key(|&(_, s)| s);
+    for (sort_name, sort_id) in sort_names {
+        let nt = Nt::Comp(sorts.kind_of(sort_id), NtType::Term);
+        let name_sym = interner.intern(sort_name);
+        push(&mut g, nt, vec![GSym::T(Terminal::ColonVar(name_sym))], 0, vec![], Action::MakeVariable(sort_id));
     }
 
     // ---- symbol productions (per operator, in declaration order) ----

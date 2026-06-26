@@ -66,6 +66,15 @@ fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
         Terminal::SmallNeg => tok.kind == TokKind::NegNumber,
         Terminal::Str => tok.kind == TokKind::Str,
         Terminal::Qid => tok.kind == TokKind::Qid,
+        // `name:sort` on-the-fly variable: an identifier whose part after the last `:` is this sort's
+        // name, with a non-empty name before it. (`X:Nat` is one token; the spaced `X : Nat` is three.)
+        Terminal::ColonVar(sort_name) => {
+            tok.kind == TokKind::Ident
+                && matches!(
+                    i.resolve(tok.sym).rsplit_once(':'),
+                    Some((name, sort)) if !name.is_empty() && sort == i.resolve(sort_name)
+                )
+        }
     }
 }
 

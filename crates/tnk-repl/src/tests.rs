@@ -568,6 +568,25 @@ fn rewrite_condition_rejected_in_equation() {
     assert!(out.contains("rewrite condition (`=>`) is only allowed in a rule"), "rejection: {out}");
 }
 
+/// On-the-fly colon variables `X:Sort` (one token) parse anywhere a term is expected — in an `eq`
+/// (mixed with declared vars), a `match` pattern, and a `search` goal — without a `var` declaration. The
+/// whole token is the variable name, echoed back with its sort.
+#[test]
+fn on_the_fly_colon_variables() {
+    let mut r = repl();
+    r.eval(
+        "fmod N is sort Nat . op z : -> Nat . op s_ : Nat -> Nat [ctor] . op _+_ : Nat Nat -> Nat . \
+         op dbl : Nat -> Nat . vars M N : Nat . eq N + z = N . eq N + s M = s (N + M) . \
+         eq dbl(N:Nat) = N:Nat + N:Nat . endfm",
+    );
+    assert!(r.eval("red dbl(s s z) .").output.contains("result Nat: s s s s z"), "on-the-fly var in an eq");
+    assert!(r.eval("match X:Nat <=? s z .").output.contains("X:Nat --> s z"), "on-the-fly var in match, with sort");
+    // …and in a system module's search goal.
+    r.eval("mod S is sort T . ops p q : -> T . rl p => q . endm");
+    let s = r.eval("search p =>1 Y:T .").output;
+    assert!(s.contains("Y:T --> q"), "on-the-fly var in a search goal:\n{s}");
+}
+
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
 #[test]
 fn rule_in_fmod_is_rejected() {

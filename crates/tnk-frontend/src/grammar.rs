@@ -66,6 +66,11 @@ pub enum Terminal {
     Str,
     /// Any quoted-identifier token (Maude's `QUOTED_ID`).
     Qid,
+    /// An **on-the-fly variable** written with an explicit sort, `name:sort` (one token, e.g. `X:Nat`):
+    /// matches any identifier token whose suffix after the last `:` is this sort's name. The held `Sym`
+    /// is the interned sort name. The whole token (`X:Nat`) becomes the variable's name (so `X:Nat` and
+    /// `X:Foo` are distinct), with the production's [`Action::MakeVariable`] sort.
+    ColonVar(Sym),
 }
 
 /// A right-hand-side grammar symbol.

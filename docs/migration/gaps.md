@@ -66,13 +66,12 @@ correctness fix.
   are unaffected. The eager/lazy bit is already on `Symbol` (`strategy`); threading it through the traversal is
   a localized follow-up. (`frewrite_pass` also recurses on subject depth — shallow for object/config terms, an
   explicit-stack rewrite is the same follow-up as C12 if a deep rule structure ever appears.)
-- **On-the-fly colon variables (`X:Sort`).** The grammar only builds *declared* variables (`var`/`vars`);
-  an on-the-fly `X:Sort` written inline (the idiomatic `search` goal, and legal anywhere a term is) is not
-  parsed yet (`grammar/build.rs`). `search` goals therefore declare their variable (`var X : St .` then
-  `search a =>* X .`) — the search *engine* (state graph, arrows, `such that`, counts, `show path`/`graph`)
-  is byte-conformant (Pillar A-iv); this is a frontend parsing nicety (a colon-variable terminal class,
-  like the built-in literal terminals). Maude echoes a goal variable as written, so once added, an
-  on-the-fly `X:St` prints `X:St` and a declared `X` prints `X` (both already handled by name-only rendering).
+- **On-the-fly variables — structured-sort forms only.** Inline `name:Sort` colon variables (the
+  idiomatic `search` goal `X:St`, legal anywhere a term is) are **done** — a `Terminal::ColonVar` grammar
+  terminal matches the one-token `name:sort`, the whole token becoming the variable name (so `X:Nat` and
+  `X:Foo` are distinct), echoed back with its sort. *Residual:* a **kind** variable `X:[Foo]` or a
+  **parameterized-sort** variable `X:List{Nat}` does not lex as one token (the `[`/`{` split it), so those
+  forms aren't recognized yet — rare, and parameterized sorts are Phase 2 anyway.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite
