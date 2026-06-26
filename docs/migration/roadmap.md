@@ -21,23 +21,30 @@ prelude load.
    `X:Sort` colon variables. **Remaining for Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs
    the object system, item 5); `frozen`'s lazy-`strat` interaction + search/rewrite-condition trace
    (`gaps.md`). Reference: `reports/A6-operational.md`.
-2. **Parameterized programming (Pillar B) — NEXT, the bootstrap target.** Theories (`fth`/`th`), views,
-   parameterized modules/views, instantiation `{…}`, `X$Elt`, nested instantiation — the bulk of the module
-   work and the gate for the container prelude. **Foundation:** the pure `PreModule → PreModule` flatten in
-   `tnk-modules` (`flatten.rs`/`db.rs`) + the unchanged `build_module`; B *extends* the module-expression
-   AST (`surface/ast.rs ModuleExpr`, today: Named/Sum/Rename — add `Instantiation`) and the flatten with a
-   parameter/view algebra. **Reference:** `reports/A5-modules-parameterization-repl.md` (the C++ deep-dive:
-   `ImportModule` donation → our pure flatten, `Renaming`/`View`/`ModuleCache`, free-vs-bound instantiation).
-   **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — 39 `fmod`, 6 `fth`, **39
-   `view`**, 3 `mod`; it has **zero rules**, so parameterization — not Pillar A — is the critical path to
-   loading it). Seed fixtures from it + the manual's worked `LIST{Nat}`-style examples, diffed vs the binary.
-   **Recommended increment order (dependency-driven):** (B-i) theories `fth`/`th` (a module kind whose ops
-   are "to-be-mapped"); (B-ii) views `view V from T to M is … endv` (sort/op maps + the `Status` checks);
-   (B-iii) parameterized modules `fmod M{X :: T} is …` + the `X$Elt` parameter sorts; (B-iv) instantiation
-   `M{V}` (free-vs-bound, `Token::makeParameterInstanceName`, content-addressed cache); (B-v) the container
-   prelude (`LIST`/`SET`/`MAP`/`ARRAY`) + basic theories/views + the Diophantine solver. **Top risk** (A5
-   §4): the free-vs-bound parameter / theory-view-vs-module-view / nested-`instantiateBoundParameters`
-   corner cases — they're deeply entangled; lean on prelude differential tests early.
+2. **Parameterized programming (Pillar B) — B-i…B-iv DONE; B-v (container prelude) next.** Theories,
+   views, parameterized modules, instantiation — the whole mechanism is realized as a `tnk-modules`
+   `PreModule → PreModule` transform; the kernel (`build_module`/grammar) is **unchanged** (a structured
+   sort name `List{X}` / parameter sort `X$Elt` is just a string-keyed sort). All byte-conformant vs the
+   binary (`conformance/{theory-nonexec,theory-import,view-good,param-module,instantiation}.maude`).
+   - **(B-i) theories `fth`/`th` — DONE** (`91285d7`): reuse `PreModule` + an orthogonal `is_theory` flag;
+     `[nonexec]` axioms parse but are skipped when loading the engine (proof obligations, never fire).
+   - **(B-ii) views — DONE** (`dcc5dca`): `ViewDecl` (sort + op→op/op→term maps), `ViewDb` + signature
+     `validate_view` (the target-sort check = Maude's `failed to find sort …` warning); `show view`.
+   - **(B-iii) parameterized modules + `X$Elt` + structured sorts — DONE** (`5e01fc5`): the `{X :: T}`
+     parameter list; a `sort_name()` parser assembling `Base{args}`; the *parameter copy* flatten
+     (`s ↦ X$s`, reusing the rename machinery).
+   - **(B-iv) instantiation `M{V}` — DONE** (`ac6b30e`): `ModuleExpr::Instantiation`; the view-table threaded
+     through `flatten`; the instance substitutes `X$s ↦` the view's sort image and `Base{…X…} ↦ Base{…V…}`,
+     importing the view's target. **Common case** (single/multi-param module-view, sort-only views).
+   - **(B-v) the container prelude — NEXT:** `LIST`/`SET`/`MAP`/`ARRAY` + the basic theories
+     (`TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT`) + the 39 standard views + the Diophantine solver, on the
+     real `.maude` `NAT`/`BOOL` prelude. **This forces the B-iv deferrals** (noted in `flatten.rs`): view
+     **operator maps**, a **parameterized view target** (`to LIST{X}`), the **import-vs-view-target dedup**
+     (a base `protecting NAT` instantiated by a view targeting `NAT`), the theory-vs-module-declared sort
+     distinction in the parameter copy, and **free-vs-bound nested instantiation** (A5 §4 top risk) — plus
+     the still-unparsed structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts and structured-sort `mb`.
+   **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
+   parameterization is the critical path). **Reference:** `reports/A5-modules-parameterization-repl.md`.
 3. **The real prelude.** Wire the `.maude` prelude/library on top of (1)+(2): `BOOL`/`NAT`/`INT`/`RAT`/
    `FLOAT`/`STRING`/`QID` are built; add the containers + basic theories (`TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/
    `DEFAULT`) + standard views + the Diophantine solver. Ports as data (only the hooks are wired).
