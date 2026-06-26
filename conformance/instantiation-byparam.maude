@@ -1,0 +1,27 @@
+*** Axis-A5 kind 2: a by-parameter instantiation. PAIR{X :: TRIV} protects LIST{X}
+*** (instantiating LIST by the enclosing parameter X, not a view); USEP grounds it
+*** with PAIR{ToN}, re-instantiating the bound X to the view ToN. Reductions fire
+*** through both PAIR's and LIST's instantiated equations.
+fth TRIV is sort Elt . endfth
+fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
+view ToN from TRIV to NN is sort Elt to Nat . endv
+fmod LIST{E :: TRIV} is
+  sort List{E} .
+  op nil : -> List{E} [ctor] .
+  op cons : E$Elt List{E} -> List{E} [ctor] .
+  op app : List{E} List{E} -> List{E} .
+  var H : E$Elt .
+  vars T L : List{E} .
+  eq app(nil, L) = L .
+  eq app(cons(H, T), L) = cons(H, app(T, L)) .
+endfm
+fmod PAIR{X :: TRIV} is
+  protecting LIST{X} .
+  op two : X$Elt X$Elt -> List{X} .
+  vars A B : X$Elt .
+  eq two(A, B) = cons(A, cons(B, nil)) .
+endfm
+fmod USEP is protecting PAIR{ToN} . endfm
+red two(0, s(0)) .
+red app(two(0, 0), two(s(0), s(0))) .
+red app(nil, two(0, 0)) .

@@ -254,6 +254,22 @@ mod tests {
         );
     }
 
+    /// Axis-A5 kind 2: a **by-parameter** instantiation. `PAIR{X :: TRIV}` protects `LIST{X}` —
+    /// instantiating `LIST` by the *enclosing parameter* `X`, not a view — and `USEP` grounds it with
+    /// `PAIR{ToN}`, re-instantiating the bound `X ↦ ToN` (the import `LIST{X}` becomes `LIST{ToN}`).
+    /// Reductions fire through both modules' instantiated equations. Byte-identical to the reference.
+    #[test]
+    fn instantiation_byparam_conforms() {
+        conform(
+            conformance_file!("instantiation-byparam.maude"),
+            &[
+                e("List{ToN}", "cons(0, cons(s(0), nil))", 1),
+                e("List{ToN}", "cons(0, cons(0, cons(s(0), cons(s(0), nil))))", 5),
+                e("List{ToN}", "cons(0, cons(0, nil))", 2),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the

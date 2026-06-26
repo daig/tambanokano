@@ -135,8 +135,12 @@ fn collect_named(
     for (param, theory) in &params {
         add_parameter_copy(param, theory, db, views, acc, interner)?;
     }
+    // The module's own parameters are in scope for its imports: an import `LIST{X}` of a parameter `X`
+    // is a *by-parameter* instantiation (Axis-A5 kind 2) — `X` is not a view. Standalone (here) its
+    // parameters stay free, so the imports are collected unsubstituted with `X` in scope.
+    let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
-        collect_expr(&imp.expr, db, views, acc, visited, interner)?;
+        collect_expr(&imp.expr, db, views, acc, visited, interner, &scope)?;
     }
     let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
     acc.add(own_decls(pm)); // the module's own declarations, after its imports
@@ -214,12 +218,13 @@ fn collect_expr(
     acc: &mut Acc,
     visited: &mut HashSet<String>,
     interner: &mut Interner,
+    scope: &[String],
 ) -> Result<(), String> {
     match expr {
         ModuleExpr::Named(n) => collect_named(n, db, views, acc, visited, interner),
         ModuleExpr::Sum(a, b) => {
-            collect_expr(a, db, views, acc, visited, interner)?;
-            collect_expr(b, db, views, acc, visited, interner)
+            collect_expr(a, db, views, acc, visited, interner, scope)?;
+            collect_expr(b, db, views, acc, visited, interner, scope)
         }
         ModuleExpr::Rename(inner, items) => {
             // `A * (R)` is a distinct module from `A`: key it by its canonical form so it merges once,
@@ -229,13 +234,13 @@ fn collect_expr(
             }
             let mut tmp = Acc::default();
             let mut tmp_visited = HashSet::new();
-            collect_expr(inner, db, views, &mut tmp, &mut tmp_visited, interner)?;
+            collect_expr(inner, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
             let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
             acc.add(renamed);
             Ok(())
         }
         ModuleExpr::Instantiation(base, args) => {
-            // `M{V, …}` merges once (keyed by its canonical instance name `M{V, …}`).
+            // `M{A, …}` merges once (keyed by its canonical instance name `M{A, …}`).
             if !visited.insert(canonical_key(expr)) {
                 return Ok(());
             }
@@ -245,19 +250,19 @@ fn collect_expr(
                                  instantiation / renaming base is a follow-up)"
                     .into()),
             };
-            instantiate(mname, args, db, views, acc, visited, interner)
+            instantiate(mname, args, db, views, acc, visited, interner, scope)
         }
     }
 }
 
-/// Instantiate the parameterized module `mname` with one view per parameter (B-iv): import each view's
-/// target module, then merge `mname`'s own declarations with the parameter substitution applied —
-/// `X$s ↦ V`'s sort image of `s`, and a structured sort `Base{…X…} ↦ Base{…V…}` (the parameter name
-/// replaced by the view name, Maude's instance naming).
-///
-/// Scope (B-iv common case): single/multi-parameter **module-view** instantiation with no operator maps
-/// (`TRIV`/sort-only views). Deferred — view operator maps (`op f to g` / `op 0 to term t`), a
-/// parameterized view target (`to LIST{X}`), and free-vs-bound nested instantiation.
+/// Instantiate the parameterized module `mname` with one argument per parameter, against the enclosing
+/// parameter `scope`. Each argument is resolved ([`resolve_arg`]) to a view (kind 3) or a by-parameter
+/// binding (kind 2); a view's target is imported, `mname`'s imports are re-instantiated with the bound
+/// parameters substituted in (`LIST{X}` with `X ↦ ToN` ⇒ `LIST{ToN}`), and `mname`'s own declarations are
+/// merged under the binding — `X$s ↦` the view's sort image of `s` (or `p$s` by parameter), a structured
+/// sort `Base{…X…} ↦ Base{…argument name…}` (Maude's instance naming), the view operator maps (A1), and
+/// each variable inlined as a colon variable at its instantiated sort.
+#[allow(clippy::too_many_arguments)]
 fn instantiate(
     mname: &str,
     args: &[ModuleExpr],
@@ -266,6 +271,7 @@ fn instantiate(
     acc: &mut Acc,
     visited: &mut HashSet<String>,
     interner: &mut Interner,
+    scope: &[String],
 ) -> Result<(), String> {
     let pm = db.get(mname).ok_or_else(|| format!("instantiated module `{mname}` is not defined"))?;
     if pm.params.len() != args.len() {
@@ -276,55 +282,79 @@ fn instantiate(
         ));
     }
 
-    // Resolve each argument to a (possibly derived) view, import its target module expression, and bind the
-    // parameter: the parameter sort `X$s` to the view's sort image of `s`, the structured sort `Base{X}` to
-    // `Base{<printed name>}`, and the view's operator maps (A1) into one token-substitution.
+    // Resolve each argument (against `scope`, so an enclosing parameter is a by-parameter argument rather
+    // than a view). A view argument imports its target and binds the parameter to its sort image; a
+    // by-parameter argument imports nothing and binds the parameter to a prefix-rename `X$s ↦ p$s`.
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
+    let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
     for (param, arg) in pm.params.iter().zip(args) {
-        let r = resolve_arg(arg, views, interner)
+        let r = resolve_arg(arg, views, interner, scope)
             .map_err(|e| format!("instantiation `{mname}{{…}}`: {e}"))?;
-        collect_expr(&r.target, db, views, acc, visited, interner)?;
+        if let Some(target) = &r.target {
+            collect_expr(target, db, views, acc, visited, interner, scope)?;
+        }
         op_subst.extend(r.op_subst);
-        bindings.insert(param.name.clone(), ParamBinding {
-            view_name: r.printed_name,
-            sort_image: r.sort_image,
-        });
+        param_to_arg.insert(param.name.clone(), arg.clone());
+        bindings.insert(param.name.clone(), r.binding);
     }
 
-    // `M`'s regular imports (deduped via `visited`), then its own declarations with the substitution.
-    let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
+    // `M`'s regular imports with the parameter substitution applied (a bound parameter `X` in an import
+    // `LIST{X}` becomes its argument — `LIST{ToN}` for a view, `LIST{Y}` for an enclosing parameter), then
+    // its own declarations under the binding. Deduped via `visited`.
+    let imports: Vec<ModuleExpr> =
+        pm.imports.iter().map(|imp| subst_params_in_expr(&imp.expr, &param_to_arg)).collect();
     for imp in &imports {
-        collect_expr(imp, db, views, acc, visited, interner)?;
+        collect_expr(imp, db, views, acc, visited, interner, scope)?;
     }
     let pm = db.get(mname).expect("present");
     acc.add(instantiate_decls(own_decls(pm), &bindings, &op_subst, interner));
     Ok(())
 }
 
-/// One parameter's binding for instantiation: the view name (used to name structured sorts `Base{X}` →
-/// `Base{view}`) and the view's sort image map (`Elt ↦ Nat`, used for the parameter sort `X$Elt`).
+/// One parameter's binding for instantiation. `view_name` is the printed argument name used to name
+/// structured sorts (`Base{X} ↦ Base{<view_name>}`): the view name `V` for a view argument, or the
+/// enclosing parameter name `p` for a by-parameter argument. A view binding maps each theory sort through
+/// `sort_image` (`Elt ↦ Nat`); a [`by_param`](Self::by_param) binding instead prefix-renames `X$s ↦
+/// view_name$s` (the parameter survives, renamed — Axis-A5 kind 2).
 struct ParamBinding {
     view_name: String,
     sort_image: HashMap<String, String>,
+    by_param: bool,
 }
 
-/// A view argument resolved to a concrete (possibly *derived*, for a parameterized view) view: the target
-/// module expression to import, the sort image of each theory sort, the operator-map substitution, and the
-/// printed name used to name structured sorts at the instance (`Box{X} ↦ Box{<printed_name>}`, Maude's
-/// instance-naming rule). This is the Axis-A2/A5 generalization of B-iv's flat per-view binding.
-struct ResolvedView {
-    target: ModuleExpr,
-    sort_image: HashMap<String, String>,
+/// One instantiation argument resolved to its parameter binding plus the module expression to import for
+/// it (Axis-A2/A5). A view argument carries `target = Some(<to-module expression>)`; a **by-parameter**
+/// argument (an enclosing parameter passed straight through) carries `target = None` — nothing is imported
+/// (the enclosing module's parameter copy already supplied `p$s`).
+struct ArgResolution {
+    binding: ParamBinding,
+    target: Option<ModuleExpr>,
     op_subst: HashMap<String, Vec<Token>>,
-    printed_name: String,
 }
 
-/// Resolve one instantiation argument to a [`ResolvedView`] (Axis-A2/A5 kind 3). A bare view name resolves
-/// to the stored view. A nested instantiation `V{Arg, …}` of a *parameterized* view resolves recursively:
-/// each inner argument is resolved, then substituted through `V`'s `to` target and `sort_maps` to yield a
-/// ground derived view (`BoxV{ToColor}` ⇒ target `BOX{ToColor}`, image `Elt ↦ Box{ToColor}`).
-fn resolve_arg(arg: &ModuleExpr, views: &ViewDb, i: &Interner) -> Result<ResolvedView, String> {
+/// Resolve one instantiation argument against the enclosing parameter `scope`. A bare name in `scope` is a
+/// by-parameter argument (kind 2). Otherwise a bare view name resolves to the stored view (kind 3 base
+/// case), and a nested instantiation `V{Arg, …}` of a *parameterized* view resolves recursively — each
+/// inner argument is resolved, then substituted through `V`'s `to` target and `sort_maps` (`BoxV{ToColor}`
+/// ⇒ target `BOX{ToColor}`, image `Elt ↦ Box{ToColor}`).
+fn resolve_arg(
+    arg: &ModuleExpr,
+    views: &ViewDb,
+    i: &Interner,
+    scope: &[String],
+) -> Result<ArgResolution, String> {
+    // By-parameter: the argument is an enclosing parameter `p`. The instance keeps a parameter, renamed to
+    // `p` (`X$s ↦ p$s`, `Base{X} ↦ Base{p}`); nothing is imported.
+    if let ModuleExpr::Named(p) = arg
+        && scope.iter().any(|n| n == p)
+    {
+        return Ok(ArgResolution {
+            binding: ParamBinding { view_name: p.clone(), sort_image: HashMap::new(), by_param: true },
+            target: None,
+            op_subst: HashMap::new(),
+        });
+    }
     match arg {
         ModuleExpr::Named(view_name) => {
             let v = views.get(view_name).ok_or_else(|| format!("view `{view_name}` is not defined"))?;
@@ -333,11 +363,14 @@ fn resolve_arg(arg: &ModuleExpr, views: &ViewDb, i: &Interner) -> Result<Resolve
                     "parameterized view `{view_name}` must be instantiated with arguments"
                 ));
             }
-            Ok(ResolvedView {
-                target: v.to.clone(),
-                sort_image: v.sort_maps.iter().cloned().collect(),
+            Ok(ArgResolution {
+                binding: ParamBinding {
+                    view_name: view_name.clone(),
+                    sort_image: v.sort_maps.iter().cloned().collect(),
+                    by_param: false,
+                },
+                target: Some(v.to.clone()),
                 op_subst: op_subst_of(v, i)?,
-                printed_name: view_name.clone(),
             })
         }
         ModuleExpr::Instantiation(base, inner_args) => {
@@ -355,26 +388,26 @@ fn resolve_arg(arg: &ModuleExpr, views: &ViewDb, i: &Interner) -> Result<Resolve
                 ));
             }
             // Resolve each inner argument and bind `V`'s parameter to it, then substitute through `V`'s
-            // target/sort-image to derive a ground view. The inner views' op maps are applied when their
-            // own target is instantiated (via `collect_expr(target)`), not threaded here.
+            // target/sort-image to derive the view. The inner views' op maps are applied when their own
+            // target is instantiated (via `collect_expr(target)`), not threaded here.
             let mut inner: HashMap<String, ParamBinding> = HashMap::new();
-            let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
+            let mut inner_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
             for (vp, ia) in v.params.iter().zip(inner_args) {
-                let r = resolve_arg(ia, views, i)?;
-                param_to_arg.insert(vp.name.clone(), ia.clone());
-                inner.insert(vp.name.clone(), ParamBinding {
-                    view_name: r.printed_name,
-                    sort_image: r.sort_image,
-                });
+                let r = resolve_arg(ia, views, i, scope)?;
+                inner_to_arg.insert(vp.name.clone(), ia.clone());
+                inner.insert(vp.name.clone(), r.binding);
             }
-            let target = subst_params_in_expr(&v.to, &param_to_arg);
+            let target = subst_params_in_expr(&v.to, &inner_to_arg);
             let sort_image =
                 v.sort_maps.iter().map(|(a, b)| (a.clone(), inst_sort(b, &inner))).collect();
-            Ok(ResolvedView {
-                target,
-                sort_image,
+            Ok(ArgResolution {
+                binding: ParamBinding {
+                    view_name: canonical_key(arg),
+                    sort_image,
+                    by_param: false,
+                },
+                target: Some(target),
                 op_subst: op_subst_of(v, i)?,
-                printed_name: canonical_key(arg),
             })
         }
         ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => {
@@ -448,35 +481,43 @@ fn instantiate_decls(
         }
         op.range = inst_sort(&op.range, bindings);
     }
+    // Instantiate each declared variable's sort, and record `name ↦ instantiated sort` so the variable's
+    // occurrences in the statement bubbles can be rewritten to single-token colon variables below. (The
+    // declarations are kept for bare-variable use in commands, but the bubbles no longer reference them.)
+    let mut var_inline: HashMap<String, String> = HashMap::new();
     for v in &mut d.vars {
         v.sort = inst_sort(&v.sort, bindings);
+        for n in &v.names {
+            var_inline.insert(n.clone(), v.sort.clone());
+        }
     }
-    // Rewrite statement bubbles: the views' operator maps (A1) and parameter-sort substitution inside glued
-    // colon variables (`E:X$Elt ↦ E:Box{ToColor}`). The colon-var rewrite keeps the variable a single token
-    // so it re-parses as an on-the-fly variable against the instance's sorts — essential because a nested
-    // instantiation produces two copies of a parameterized module's equations at *different* element sorts,
-    // which a shared module-level `var` declaration could not type.
+    // Rewrite statement bubbles: the views' operator maps (A1); each declared variable inlined as a
+    // single-token colon variable at its instantiated sort (`H ↦ H:List{ToN}`); and parameter-sort
+    // substitution inside glued source colon variables (`E:X$Elt ↦ E:Box{ToColor}`). The colon-variable
+    // form keeps the sort a single token that re-parses against the instance's sorts — essential because a
+    // nested instantiation produces two copies of a parameterized module's equations at *different* element
+    // sorts, which a shared module-level `var` declaration (deduplicated by name) could not type.
     for st in &mut d.statements {
         match st {
             Statement::Eq { lhs, rhs, cond, .. } => {
-                *lhs = subst_bubble(lhs, bindings, op_subst, i);
-                *rhs = subst_bubble(rhs, bindings, op_subst, i);
+                *lhs = subst_bubble(lhs, bindings, op_subst, &var_inline, i);
+                *rhs = subst_bubble(rhs, bindings, op_subst, &var_inline, i);
                 if let Some(c) = cond {
-                    *c = subst_bubble(c, bindings, op_subst, i);
+                    *c = subst_bubble(c, bindings, op_subst, &var_inline, i);
                 }
             }
             Statement::Mb { lhs, sort, cond, .. } => {
-                *lhs = subst_bubble(lhs, bindings, op_subst, i);
-                *sort = subst_bubble(sort, bindings, op_subst, i);
+                *lhs = subst_bubble(lhs, bindings, op_subst, &var_inline, i);
+                *sort = subst_bubble(sort, bindings, op_subst, &var_inline, i);
                 if let Some(c) = cond {
-                    *c = subst_bubble(c, bindings, op_subst, i);
+                    *c = subst_bubble(c, bindings, op_subst, &var_inline, i);
                 }
             }
             Statement::Rule { lhs, rhs, cond, .. } => {
-                *lhs = subst_bubble(lhs, bindings, op_subst, i);
-                *rhs = subst_bubble(rhs, bindings, op_subst, i);
+                *lhs = subst_bubble(lhs, bindings, op_subst, &var_inline, i);
+                *rhs = subst_bubble(rhs, bindings, op_subst, &var_inline, i);
                 if let Some(c) = cond {
-                    *c = subst_bubble(c, bindings, op_subst, i);
+                    *c = subst_bubble(c, bindings, op_subst, &var_inline, i);
                 }
             }
         }
@@ -485,14 +526,17 @@ fn instantiate_decls(
 }
 
 /// Rewrite a statement bubble under an instantiation. A token that is a mapped source operator becomes its
-/// target token(s) (op→op / op→term, A1). A glued colon variable `name:sort` has its sort instantiated
-/// (`E:X$Elt ↦ E:Box{ToColor}`) and is re-interned as one token, so it re-parses as an on-the-fly variable
-/// of the instance sort; a `name:sort` whose sort is unaffected by the instantiation is left untouched (so
-/// an operator coincidentally containing a colon is safe).
+/// target token(s) (op→op / op→term, A1). A bare declared-variable token becomes a single-token colon
+/// variable at its instantiated sort (`H ↦ H:List{ToN}`, from `var_inline`). A glued source colon variable
+/// `name:sort` has its sort instantiated (`E:X$Elt ↦ E:Box{ToColor}`). Each rewritten variable stays one
+/// token, so it re-parses as an on-the-fly variable of the instance sort; a `name:sort` whose sort is
+/// unaffected by the instantiation is left untouched (so an operator coincidentally containing a colon is
+/// safe).
 fn subst_bubble(
     bubble: &[Token],
     bindings: &HashMap<String, ParamBinding>,
     op_subst: &HashMap<String, Vec<Token>>,
+    var_inline: &HashMap<String, String>,
     i: &mut Interner,
 ) -> Vec<Token> {
     let mut out = Vec::with_capacity(bubble.len());
@@ -500,6 +544,12 @@ fn subst_bubble(
         let text = i.resolve(t.sym).to_string();
         if let Some(repl) = op_subst.get(&text) {
             out.extend(repl.iter().copied());
+            continue;
+        }
+        if let Some(sort) = var_inline.get(&text) {
+            let mut nt = *t;
+            nt.sym = i.intern(&format!("{text}:{sort}"));
+            out.push(nt);
             continue;
         }
         if let Some((name, sort)) = text.rsplit_once(':')
@@ -519,15 +569,15 @@ fn subst_bubble(
     out
 }
 
-/// Instantiate one sort name. A parameter sort `X$s` becomes the view's image of `s`; a structured sort
-/// `Base{a, …}` has each argument instantiated (a bare parameter name `X` becomes its view name, the
-/// instance-naming rule); anything else is unchanged.
+/// Instantiate one sort name. A parameter sort `X$s` becomes the view's image of `s` (or `p$s` under a
+/// by-parameter binding); a structured sort `Base{a, …}` has each argument instantiated (a bare parameter
+/// name `X` becomes its view/argument name, the instance-naming rule); anything else is unchanged.
 fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some((base, args)) = split_structured(name) {
         let new_args: Vec<String> = args
             .iter()
             .map(|a| match bindings.get(a.as_str()) {
-                Some(b) => b.view_name.clone(), // a bare parameter name → the view name
+                Some(b) => b.view_name.clone(), // a bare parameter name → the view / argument name
                 None => inst_sort(a, bindings),  // nested structured / parameter sort
             })
             .collect();
@@ -536,7 +586,12 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some((param, s)) = name.split_once('$')
         && let Some(b) = bindings.get(param)
     {
-        return b.sort_image.get(s).cloned().unwrap_or_else(|| s.to_string());
+        // By-parameter: prefix-rename `X$s ↦ p$s` (the parameter survives). View: the view's sort image.
+        return if b.by_param {
+            format!("{}${s}", b.view_name)
+        } else {
+            b.sort_image.get(s).cloned().unwrap_or_else(|| s.to_string())
+        };
     }
     name.to_string()
 }
@@ -712,6 +767,25 @@ fmod TOP is protecting L . protecting R . endfm
                 .any(|(d, r)| d.as_slice() == ["Box{ToColor}"] && r.as_str() == "Box{BoxV{ToColor}}"),
             "outer wrap: {wraps:?}"
         );
+    }
+
+    /// Axis-A5 kind 2: a parameterized module `PAIR{X :: TRIV}` that protects `LIST{X}` by the *enclosing
+    /// parameter* `X`. Flattened **standalone** it stays parameterized — the `LIST{X}` import is a
+    /// by-parameter instantiation, so `LIST`'s `E$Elt` / `List{E}` are renamed to `X$Elt` / `List{X}`.
+    #[test]
+    fn by_parameter_import_stays_parameterized() {
+        let (db, views, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod LIST{E :: TRIV} is sort List{E} . op cons : E$Elt List{E} -> List{E} [ctor] . endfm\n\
+             fmod PAIR{X :: TRIV} is protecting LIST{X} . op two : X$Elt -> List{X} . endfm\n",
+        );
+        let flat = flatten("PAIR", &db, &views, &mut i).expect("flatten");
+        assert!(flat.sorts.contains(&"List{X}".to_string()), "List{{X}} present: {:?}", flat.sorts);
+        assert!(flat.sorts.contains(&"X$Elt".to_string()), "X$Elt present: {:?}", flat.sorts);
+        // `cons` came from `LIST{X}` with its parameter `E` renamed to `X`: `X$Elt List{X} -> List{X}`.
+        let cons = flat.ops.iter().find(|o| i.resolve(o.name[0].sym) == "cons").expect("cons");
+        assert_eq!(cons.domain, ["X$Elt", "List{X}"]);
+        assert_eq!(cons.range, "List{X}");
     }
 
     /// An undefined imported module is a loud error.
