@@ -473,6 +473,35 @@ fn frewrite_command_through_repl() {
     assert!(out.contains("frewrite in FR : g(a) .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(d)"), "non-frozen rewrites:\n{out}");
 }
 
+/// Pillar A-iii: conditional rules (`crl`) with equality / matching / sort-test fragments, byte-matching
+/// the reference (`conformance/crl.maude`). First-applicable selection with condition backtracking.
+#[test]
+fn crl_command_through_repl() {
+    let out = repl().eval(conformance_file!("crl.maude")).output;
+    assert!(out.contains("rewrite in CRL : f(a) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(a)"), "equality holds:\n{out}");
+    assert!(out.contains("rewrite in CRL : f(b) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: h(b)"), "backtrack to `:=`:\n{out}");
+    assert!(out.contains("rewrite in CRL : k(a) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(a)"), "sort-test holds:\n{out}");
+    assert!(out.contains("rewrite in CRL : k(b) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: k(b)"), "sort-test fails -> no rewrite:\n{out}");
+}
+
+/// A traced `crl` renders the rule trial / condition-fragment / backtrack stream exactly as the
+/// reference: trial #1 fails its `X = a` fragment, then trial #2's `Y := X` succeeds and the rule fires.
+#[test]
+fn traced_crl_backtrack() {
+    let s = run_session(
+        "mod CRL is sort S . ops a b : -> S . ops f g h : S -> S [ctor] . vars X Y : S . \
+         crl f(X) => g(X) if X = a . crl f(X) => h(Y) if Y := X . endm\n\
+         set trace on .\n\
+         rewrite f(b) .",
+    );
+    assert!(s.contains("*********** trial #1\ncrl f(X) => g(X) if X = a .\nX --> b"), "trial #1:\n{s}");
+    assert!(s.contains("*********** failure for condition fragment\nX = a"), "fragment failure:\n{s}");
+    assert!(s.contains("*********** failure #1"), "trial #1 fails:\n{s}");
+    assert!(s.contains("*********** trial #2\ncrl f(X) => h(Y) if Y := X ."), "trial #2:\n{s}");
+    assert!(s.contains("*********** success #2"), "trial #2 succeeds:\n{s}");
+    assert!(s.contains("*********** rule\ncrl f(X) => h(Y) if Y := X .\nX --> b\nY --> b\nf(b)\n--->\nh(b)"), "rule fires:\n{s}");
+}
+
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
 #[test]
 fn rule_in_fmod_is_rejected() {
