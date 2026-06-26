@@ -223,11 +223,14 @@ impl<'a> Parser<'a> {
         let is_theory = matches!(kw, "fth" | "th");
         self.advance(); // fmod / mod / fth / th
         let name = self.name()?;
+        // Optional formal parameters `{X :: T, …}` (B-iii). The stored name stays the bare base.
+        let params = if self.at("{") { self.param_list()? } else { Vec::new() };
         self.eat("is")?;
         let mut m = PreModule {
             name,
             kind,
             is_theory,
+            params,
             imports: Vec::new(),
             sorts: Vec::new(),
             subsorts: Vec::new(),
@@ -245,6 +248,50 @@ impl<'a> Parser<'a> {
     /// At a module/theory closing keyword (`endfm`/`endm`/`endfth`/`endth`).
     fn at_module_end(&self) -> bool {
         matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth"))
+    }
+
+    /// A formal parameter list `{X :: T, Y :: T', …}` (B-iii). `::` lexes as one token (`:` is not
+    /// splitting punctuation). The theory is a plain named theory.
+    fn param_list(&mut self) -> PResult<Vec<Parameter>> {
+        self.eat("{")?;
+        let mut params = Vec::new();
+        loop {
+            let name = self.name()?;
+            self.eat("::")?;
+            let theory = self.name()?;
+            params.push(Parameter { name, theory });
+            if self.at(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat("}")?;
+        Ok(params)
+    }
+
+    /// A sort name, possibly **structured** (B-iii): a base identifier optionally followed by `{ … }` of
+    /// comma-separated sort-name arguments — `Pair{X}`, `Map{X,Y}`, `List{List{X}}`. Reassembled into the
+    /// canonical no-space spelling Maude uses internally (`List{X}`), which then flows through `build_sig`
+    /// as an ordinary sort name string. A parameter sort `X$Elt` is already one token (`$` is not splitting
+    /// punctuation), so it needs no special handling. (A kind `[…]` sort is a follow-up.)
+    fn sort_name(&mut self) -> PResult<String> {
+        let base = self.name()?;
+        if !self.at("{") {
+            return Ok(base);
+        }
+        self.advance(); // {
+        let mut args = Vec::new();
+        loop {
+            args.push(self.sort_name()?);
+            if self.at(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat("}")?;
+        Ok(format!("{base}{{{}}}", args.join(",")))
     }
 
     /// A view definition `view V from <expr> to <expr> is <maps> endv` (B-ii). `from`/`to` are module
@@ -323,20 +370,20 @@ impl<'a> Parser<'a> {
             "sort" | "sorts" => {
                 self.advance();
                 while !self.at_dot() {
-                    m.sorts.push(self.name()?);
+                    m.sorts.push(self.sort_name()?);
                 }
                 self.eat_dot()?;
             }
             "subsort" | "subsorts" => {
                 self.advance();
-                // groups of sort names separated by `<`, e.g. `A B < C < D`.
+                // groups of sort names separated by `<`, e.g. `A B < C < D` (sorts may be structured).
                 let mut chain = vec![Vec::new()];
                 while !self.at_dot() {
                     if self.at("<") {
                         self.advance();
                         chain.push(Vec::new());
                     } else {
-                        chain.last_mut().unwrap().push(self.name()?);
+                        chain.last_mut().unwrap().push(self.sort_name()?);
                     }
                 }
                 self.eat_dot()?;
@@ -349,10 +396,10 @@ impl<'a> Parser<'a> {
                 self.eat(":")?;
                 let mut domain = Vec::new();
                 while !self.at("->") {
-                    domain.push(self.name()?);
+                    domain.push(self.sort_name()?);
                 }
                 self.eat("->")?;
-                let range = self.name()?;
+                let range = self.sort_name()?;
                 let attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
                 self.eat_dot()?;
                 if multi {
@@ -375,7 +422,7 @@ impl<'a> Parser<'a> {
                     names.push(self.name()?);
                 }
                 self.eat(":")?;
-                let sort = self.name()?;
+                let sort = self.sort_name()?;
                 self.eat_dot()?;
                 m.vars.push(VarDecl { names, sort });
             }
@@ -916,6 +963,40 @@ endfth
         let toks = tokenize(bad, &mut i);
         let err = Parser::new(&toks, &i).parse_source().unwrap_err();
         assert!(err.contains("functional"), "rules rejected in a functional theory: {err}");
+    }
+
+    /// B-iii: a parameterized module parses its formal parameters and structured sort names (`Ctr{X}`,
+    /// `X$Elt`, the structured subsort) — the name stays the bare base.
+    #[test]
+    fn parses_parameterized_module() {
+        let src = "\
+fmod CTR{X :: TRIV} is
+  sorts Ctr{X} NzCtr{X} .
+  subsort NzCtr{X} < Ctr{X} .
+  op put : X$Elt Ctr{X} -> NzCtr{X} [ctor] .
+endfm
+";
+        let m = &parse(src).modules[0];
+        assert_eq!(m.name, "CTR");
+        assert_eq!(m.params.len(), 1);
+        assert_eq!(m.params[0].name, "X");
+        assert_eq!(m.params[0].theory, "TRIV");
+        assert_eq!(m.sorts, ["Ctr{X}", "NzCtr{X}"]);
+        assert_eq!(m.subsorts, vec![vec![vec!["NzCtr{X}".to_string()], vec!["Ctr{X}".to_string()]]]);
+        let put = &m.ops[0];
+        assert_eq!(put.domain, ["X$Elt", "Ctr{X}"]);
+        assert_eq!(put.range, "NzCtr{X}");
+    }
+
+    /// B-iii: multiple parameters and a multi-argument structured sort `Map{X,Y}` (canonical no-space form).
+    #[test]
+    fn parses_multi_param_and_structured_sort() {
+        let src = "fmod MAP{X :: TRIV, Y :: TRIV} is sort Map{X,Y} . op e : -> Map{X,Y} . endfm\n";
+        let m = &parse(src).modules[0];
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(m.params[1].name, "Y");
+        assert_eq!(m.sorts, ["Map{X,Y}"]);
+        assert_eq!(m.ops[0].range, "Map{X,Y}");
     }
 
     /// B-ii: a view parses into a `ViewDecl` — from-theory, to-module, a sort map, and op→op / op→term maps.

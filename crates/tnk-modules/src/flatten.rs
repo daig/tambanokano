@@ -11,7 +11,9 @@
 
 use std::collections::HashSet;
 use tnk_frontend::lex::Interner;
-use tnk_frontend::surface::ast::{ModuleExpr, ModuleKind, OpDecl, PreModule, Statement, VarDecl};
+use tnk_frontend::surface::ast::{
+    ModuleExpr, ModuleKind, OpDecl, PreModule, RenameItem, Statement, VarDecl,
+};
 
 use crate::db::ModuleDb;
 use crate::rename::apply_renaming;
@@ -95,6 +97,9 @@ pub fn flatten(name: &str, db: &ModuleDb, interner: &mut Interner) -> Result<Pre
         name: name.to_string(),
         kind,
         is_theory,
+        // The flattened module is fully resolved: each parameter's copy (its `X$s` sorts) is inlined, so
+        // no formal parameters remain.
+        params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts,
         subsorts: d.subsorts,
@@ -115,10 +120,48 @@ fn collect_named(
         return Ok(()); // already merged (diamond)
     }
     let pm = db.get(name).ok_or_else(|| format!("imported module `{name}` is not defined"))?;
+    // Parameter copies first (a parameter `X :: T` behaves like an import of a renamed `T`), then the
+    // regular imports, then the module's own declarations.
+    let params: Vec<(String, String)> =
+        pm.params.iter().map(|p| (p.name.clone(), p.theory.clone())).collect();
+    for (param, theory) in &params {
+        add_parameter_copy(param, theory, db, acc, interner)?;
+    }
     for imp in &pm.imports {
         collect_expr(&imp.expr, db, acc, visited, interner)?;
     }
+    let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
     acc.add(own_decls(pm)); // the module's own declarations, after its imports
+    Ok(())
+}
+
+/// Add a parameter copy of theory `theory` under parameter name `param`: flatten the theory and rename
+/// every one of its sorts `s` to the parameter sort `param$s` (Maude's `makeParameterCopy`), so the
+/// importing module's body can refer to `X$Elt` and to parameterized sorts. The renaming runs in a fresh
+/// scope (a parameter copy is independent of any unrenamed import of the same theory).
+///
+/// Scope note (B-iii): renames *all* of the theory's flattened sorts. The reference's theory-declared- vs
+/// module-declared-sort distinction (a theory `protecting BOOL` must keep `Bool`, not `X$Bool`) is a
+/// follow-up; it does not arise for `TRIV`-style parameters (no module imports), which the container
+/// prelude uses throughout.
+fn add_parameter_copy(
+    param: &str,
+    theory: &str,
+    db: &ModuleDb,
+    acc: &mut Acc,
+    interner: &mut Interner,
+) -> Result<(), String> {
+    let mut tmp = Acc::default();
+    let mut tmp_visited = HashSet::new();
+    collect_named(theory, db, &mut tmp, &mut tmp_visited, interner)?;
+    let decls = tmp.into_decls();
+    let items: Vec<RenameItem> = decls
+        .sorts
+        .iter()
+        .map(|s| RenameItem::Sort { from: s.clone(), to: format!("{param}${s}") })
+        .collect();
+    let renamed = apply_renaming(decls, &items, interner)?;
+    acc.add(renamed);
     Ok(())
 }
 
@@ -209,6 +252,21 @@ fmod TOP is protecting L . protecting R . endfm
         let flat = flatten("M", &db, &mut i).expect("flatten");
         assert!(flat.imports.is_empty());
         assert_eq!(flat.sorts, ["S"]);
+    }
+
+    /// B-iii: a parameter `X :: TRIV` makes a parameter copy of `TRIV` — the theory sort `Elt` becomes the
+    /// parameter sort `X$Elt` in the flattened module, alongside the module's own structured sort, and no
+    /// formal parameters remain.
+    #[test]
+    fn parameter_copy_introduces_param_sort() {
+        let (db, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod BOX{X :: TRIV} is sort Box{X} . op b : X$Elt -> Box{X} [ctor] . endfm\n",
+        );
+        let flat = flatten("BOX", &db, &mut i).expect("flatten");
+        assert!(flat.sorts.contains(&"X$Elt".to_string()), "X$Elt present: {:?}", flat.sorts);
+        assert!(flat.sorts.contains(&"Box{X}".to_string()), "Box{{X}} present: {:?}", flat.sorts);
+        assert!(flat.params.is_empty(), "no formal parameters remain after flattening");
     }
 
     /// An undefined imported module is a loud error.

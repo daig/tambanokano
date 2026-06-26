@@ -18,6 +18,11 @@ pub struct PreModule {
     /// are not executed (theory axioms are `[nonexec]` proof obligations). Built with its signature like a
     /// module, but [`nonexec`](Statement) statements are not added to the engine.
     pub is_theory: bool,
+    /// Formal parameters `{X :: T, …}` (Pillar B-iii). A parameter `X :: T` makes a *parameter copy* of
+    /// theory `T`: each of `T`'s sorts `s` is imported renamed to `X$s` (a parameter sort), so the body can
+    /// refer to `X$Elt` and to parameterized sorts `List{X}`. Empty for an ordinary module. The module's
+    /// stored [`name`](Self::name) is the bare base (`LIST`, not `LIST{X}`).
+    pub params: Vec<Parameter>,
     /// Imported modules (`protecting`/`extending`/`including <module-expr> .`), in declaration order.
     pub imports: Vec<Import>,
     pub sorts: Vec<String>,
@@ -26,6 +31,14 @@ pub struct PreModule {
     pub ops: Vec<OpDecl>,
     pub vars: Vec<VarDecl>,
     pub statements: Vec<Statement>,
+}
+
+/// One formal parameter `X :: T` of a parameterized module/view: the parameter name and the theory it is
+/// bound by. (Pillar B-iii.)
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub name: String,
+    pub theory: String,
 }
 
 /// Whether a module/theory is functional (`fmod`/`fth` — equations + memberships only) or a system one

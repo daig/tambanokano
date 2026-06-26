@@ -200,6 +200,21 @@ mod tests {
         conform(conformance_file!("view-good.maude"), &[e("N", "z", 1), e("N", "s(z)", 1)]);
     }
 
+    /// B-iii: a parameterized module `fmod CTR{X :: TRIV}` builds and reduces ground terms. The parameter
+    /// copy turns the theory sort `Elt` into the parameter sort `X$Elt`; structured sorts `Ctr{X}` /
+    /// `NzCtr{X}` (and the subsort between them) drive the least-sort results. Byte-identical to the binary.
+    #[test]
+    fn param_module_conforms() {
+        conform(
+            conformance_file!("param-module.maude"),
+            &[
+                e("Ctr{X}", "zero", 1),
+                e("NzCtr{X}", "inc(inc(zero))", 3),
+                e("NzCtr{X}", "inc(zero)", 1),
+            ],
+        );
+    }
+
     /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
     /// `failed to find sort … in … to represent …` diagnostic.
     #[test]

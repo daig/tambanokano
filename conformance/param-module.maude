@@ -1,0 +1,25 @@
+*** B-iii: a parameterized module fmod M{X :: T}. The parameter X :: TRIV makes a parameter
+*** copy of TRIV, so the theory sort Elt becomes the parameter sort X$Elt; the body declares
+*** structured sorts Ctr{X} and NzCtr{X} and a structured subsort. Ground terms (zero, inc,
+*** put) reduce, and least sorts are computed over the structured sorts.
+fth TRIV is sort Elt . endfth
+
+fmod CTR{X :: TRIV} is
+  sorts Ctr{X} NzCtr{X} .
+  subsort NzCtr{X} < Ctr{X} .
+  op zero : -> Ctr{X} [ctor] .
+  op inc : Ctr{X} -> NzCtr{X} [ctor] .
+  op put : X$Elt Ctr{X} -> NzCtr{X} [ctor] .
+  op dec : NzCtr{X} -> Ctr{X} .
+  op size : Ctr{X} -> Ctr{X} .
+  var C : Ctr{X} .
+  var E : X$Elt .
+  eq dec(inc(C)) = C .
+  eq size(zero) = zero .
+  eq size(inc(C)) = inc(size(C)) .
+  eq size(put(E, C)) = inc(size(C)) .
+endfm
+
+red dec(inc(zero)) .            *** zero          (Ctr{X},   1 rewrite)
+red size(inc(inc(zero))) .      *** inc(inc(zero)) (NzCtr{X}, 3 rewrites)
+red dec(inc(inc(zero))) .       *** inc(zero)      (NzCtr{X}, 1 rewrite)

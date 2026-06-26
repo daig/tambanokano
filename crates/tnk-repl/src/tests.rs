@@ -92,6 +92,16 @@ fn view_through_repl() {
     assert_eq!(shown, "view ToNum from TRIV to NUM is\n  sort Elt to N .\nendv");
 }
 
+/// B-iii: a parameterized module builds and reduces through the REPL — it echoes as its bare base name
+/// (`CTR`, not `CTR{X}`) and its results print with structured sorts (`Ctr{X}` / least sort `NzCtr{X}`).
+#[test]
+fn parameterized_module_through_repl() {
+    let out = repl().eval(conformance_file!("param-module.maude")).output;
+    assert!(out.contains("reduce in CTR :"), "echoes as the base name: {out}");
+    assert!(out.contains("result Ctr{X}: zero"), "structured result sort: {out}");
+    assert!(out.contains("result NzCtr{X}: inc(inc(zero))"), "least sort over structured sorts: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]
