@@ -260,7 +260,7 @@ fn collect_expr(
 /// parameterized view target (`to LIST{X}`), and free-vs-bound nested instantiation.
 fn instantiate(
     mname: &str,
-    args: &[String],
+    args: &[ModuleExpr],
     db: &ModuleDb,
     views: &ViewDb,
     acc: &mut Acc,
@@ -280,14 +280,25 @@ fn instantiate(
     // operator maps (`op f to g` / `op f to term t`) into one token-substitution (A1).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
-    for (param, view_name) in pm.params.iter().zip(args) {
+    for (param, arg) in pm.params.iter().zip(args) {
+        // Increment 1 (parser): only a bare view name is supported here; a nested / parameterized
+        // instantiation argument parses but is handled in a later increment (Axis-A2/A5).
+        let view_name = match arg {
+            ModuleExpr::Named(n) => n.as_str(),
+            _ => {
+                return Err(format!(
+                    "instantiation `{mname}{{…}}`: a nested or parameterized instantiation argument \
+                     is not yet supported (Axis-A2/A5)"
+                ));
+            }
+        };
         let v = views
             .get(view_name)
             .ok_or_else(|| format!("instantiation `{mname}{{…}}`: view `{view_name}` is not defined"))?;
         let target = view_target(v)?;
         collect_named(target, db, views, acc, visited, interner)?;
         let sort_image: HashMap<String, String> = v.sort_maps.iter().cloned().collect();
-        bindings.insert(param.name.clone(), ParamBinding { view_name: view_name.clone(), sort_image });
+        bindings.insert(param.name.clone(), ParamBinding { view_name: view_name.to_string(), sort_image });
         for m in &v.op_maps {
             let (from, to) = match m {
                 OpMap::Op { from, to } | OpMap::Term { from, to } => (from, to),
@@ -466,8 +477,10 @@ fn canonical_key(expr: &ModuleExpr) -> String {
             format!("({} * ({}))", canonical_key(inner), parts.join(", "))
         }
         ModuleExpr::Instantiation(base, args) => {
-            // The canonical instance name `M{V, …}` — Maude's `makeParameterInstanceName`.
-            format!("{}{{{}}}", canonical_key(base), args.join(","))
+            // The canonical instance name `M{A, …}` — Maude's `makeParameterInstanceName`. Each argument
+            // is itself a module expression (a view name, a nested instantiation, or a parameter name).
+            let parts: Vec<String> = args.iter().map(canonical_key).collect();
+            format!("{}{{{}}}", canonical_key(base), parts.join(","))
         }
     }
 }

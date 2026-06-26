@@ -294,15 +294,14 @@ impl<'a> Parser<'a> {
         Ok(format!("{base}{{{}}}", args.join(",")))
     }
 
-    /// A view definition `view V from <expr> to <expr> is <maps> endv` (B-ii). `from`/`to` are module
-    /// expressions; a parameterized view name `V{X :: T}` is rejected (B-iv). Maps: `sort A to B .`,
+    /// A view definition `view V [{X :: T, …}] from <expr> to <expr> is <maps> endv` (B-ii / Axis-A2). An
+    /// optional parameter list after the name makes it a *parameterized* view (`view V{X :: T} … to M{X}`),
+    /// only used by a nested instantiation. `from`/`to` are module expressions. Maps: `sort A to B .`,
     /// `op f to g .`, `op f to term t .` — a disambiguated source `op f : … to …` is rejected (follow-up).
     fn view(&mut self) -> PResult<ViewDecl> {
         self.eat("view")?;
         let name = self.name()?;
-        if self.at("{") {
-            return Err(format!("parameterized view `{name}{{…}}` is a later Pillar B increment (B-iv)"));
-        }
+        let params = if self.at("{") { self.param_list()? } else { Vec::new() };
         // `module_expr` parses an atom/`*`/`+` chain and stops at the first other token (it does not
         // consume a terminator), so it ends naturally at `to` / `is`.
         self.eat("from")?;
@@ -317,9 +316,10 @@ impl<'a> Parser<'a> {
             match self.peek_text().ok_or("unexpected end of input in view")? {
                 "sort" => {
                     self.advance();
-                    let from_s = self.name()?;
+                    // Targets may be structured sorts in a parameterized view (`sort Elt to Box{X}`).
+                    let from_s = self.sort_name()?;
                     self.eat("to")?;
-                    let to_s = self.name()?;
+                    let to_s = self.sort_name()?;
                     self.eat_dot()?;
                     sort_maps.push((from_s, to_s));
                 }
@@ -350,7 +350,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.advance(); // endv
-        Ok(ViewDecl { name, from, to, sort_maps, op_maps })
+        Ok(ViewDecl { name, params, from, to, sort_maps, op_maps })
     }
 
     fn decl(&mut self, m: &mut PreModule) -> PResult<()> {
@@ -554,13 +554,14 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    /// The argument list of an instantiation `{V1, V2, …}` — view names (a nested module expression or a
-    /// bound parameter argument is a follow-up).
-    fn instantiation_args(&mut self) -> PResult<Vec<String>> {
+    /// The argument list of an instantiation `{A1, A2, …}` (Axis-A2/A5). Each argument is a full module
+    /// expression: a view name (`Nat`), a nested instantiation (`BoxV{ToColor}`, `List{Nat}`), or a bare
+    /// enclosing-parameter name (`X`). `flatten` classifies each contextually.
+    fn instantiation_args(&mut self) -> PResult<Vec<ModuleExpr>> {
         self.eat("{")?;
         let mut args = Vec::new();
         loop {
-            args.push(self.name()?);
+            args.push(self.module_expr()?);
             if self.at(",") {
                 self.advance();
             } else {
@@ -1046,30 +1047,55 @@ endv
         assert!(s.views[0].sort_maps.is_empty() && s.views[0].op_maps.is_empty());
     }
 
-    /// B-ii: a parameterized view name (`view V{X :: T} …`) is a later increment — rejected loudly.
+    /// Axis-A2: a parameterized view name (`view V{X :: T} …`) parses into `ViewDecl.params`, and its `to`
+    /// target may be a (non-`Named`) instantiation `LIST{X}`.
     #[test]
-    fn parameterized_view_rejected() {
+    fn parses_parameterized_view() {
         let mut i = Interner::new();
         let toks = tokenize("view V{X :: TRIV} from TRIV to LIST{X} is endv\n", &mut i);
-        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
-        assert!(err.contains("B-iv"), "got: {err}");
+        let s = Parser::new(&toks, &i).parse_source().expect("parse");
+        let v = &s.views[0];
+        assert_eq!(v.params.len(), 1);
+        assert_eq!((v.params[0].name.as_str(), v.params[0].theory.as_str()), ("X", "TRIV"));
+        match &v.to {
+            ModuleExpr::Instantiation(base, args) => {
+                assert!(matches!(&**base, ModuleExpr::Named(n) if n == "LIST"));
+                assert!(matches!(args.as_slice(), [ModuleExpr::Named(n)] if n == "X"));
+            }
+            other => panic!("expected Instantiation target, got {other:?}"),
+        }
     }
 
     /// B-iv: a parameterized instantiation `LIST{Nat}` parses into `ModuleExpr::Instantiation`; a
-    /// multi-argument `MAP{Nat, String}` carries one view name per parameter.
+    /// multi-argument `MAP{Nat, String}` carries one argument expression per parameter. Axis-A5: a nested
+    /// instantiation `BOX{BoxV{ToColor}}` parses its argument as an inner `Instantiation`.
     #[test]
     fn parses_instantiation() {
         let m = &parse("fmod M is protecting LIST{Nat} . endfm\n").modules[0];
         match &m.imports[0].expr {
             ModuleExpr::Instantiation(base, args) => {
                 assert!(matches!(&**base, ModuleExpr::Named(n) if n == "LIST"));
-                assert_eq!(args, &["Nat".to_string()]);
+                assert!(matches!(args.as_slice(), [ModuleExpr::Named(n)] if n == "Nat"));
             }
             other => panic!("expected Instantiation, got {other:?}"),
         }
         let m2 = &parse("fmod M is protecting MAP{Nat, String} . endfm\n").modules[0];
         match &m2.imports[0].expr {
-            ModuleExpr::Instantiation(_, args) => assert_eq!(args, &["Nat".to_string(), "String".into()]),
+            ModuleExpr::Instantiation(_, args) => {
+                assert!(matches!(&args[0], ModuleExpr::Named(n) if n == "Nat"));
+                assert!(matches!(&args[1], ModuleExpr::Named(n) if n == "String"));
+            }
+            other => panic!("expected Instantiation, got {other:?}"),
+        }
+        let m3 = &parse("fmod M is protecting BOX{BoxV{ToColor}} . endfm\n").modules[0];
+        match &m3.imports[0].expr {
+            ModuleExpr::Instantiation(_, args) => match &args[0] {
+                ModuleExpr::Instantiation(ibase, iargs) => {
+                    assert!(matches!(&**ibase, ModuleExpr::Named(n) if n == "BoxV"));
+                    assert!(matches!(iargs.as_slice(), [ModuleExpr::Named(n)] if n == "ToColor"));
+                }
+                other => panic!("expected nested Instantiation arg, got {other:?}"),
+            },
             other => panic!("expected Instantiation, got {other:?}"),
         }
     }

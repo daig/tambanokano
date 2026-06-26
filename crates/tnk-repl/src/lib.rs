@@ -674,7 +674,10 @@ fn module_expr_str(e: &ModuleExpr) -> String {
         ModuleExpr::Named(n) => n.clone(),
         ModuleExpr::Sum(a, b) => format!("{} + {}", module_expr_str(a), module_expr_str(b)),
         ModuleExpr::Rename(inner, _) => format!("{} * (…)", module_expr_str(inner)),
-        ModuleExpr::Instantiation(base, args) => format!("{}{{{}}}", module_expr_str(base), args.join(", ")),
+        ModuleExpr::Instantiation(base, args) => {
+            let parts: Vec<String> = args.iter().map(module_expr_str).collect();
+            format!("{}{{{}}}", module_expr_str(base), parts.join(", "))
+        }
     }
 }
 

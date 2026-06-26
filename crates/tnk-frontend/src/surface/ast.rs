@@ -73,9 +73,11 @@ pub enum ModuleExpr {
     Named(String),
     Sum(Box<ModuleExpr>, Box<ModuleExpr>),
     Rename(Box<ModuleExpr>, Vec<RenameItem>),
-    /// `M{arg, …}` — instantiate the parameterized module `M` with one view argument per parameter. Each
-    /// argument is a view name (a nested module expression / bound parameter is a follow-up).
-    Instantiation(Box<ModuleExpr>, Vec<String>),
+    /// `M{arg, …}` — instantiate the parameterized module `M` with one argument per parameter. Each
+    /// argument is itself a module expression (Pillar B Axis-A2/A5): a view name (`Nat`), a nested
+    /// instantiation of a parameterized view (`BoxV{ToColor}`, `List{Nat}`), or a bare enclosing-parameter
+    /// name (`X`) which `flatten` classifies contextually (a view vs. an enclosing parameter).
+    Instantiation(Box<ModuleExpr>, Vec<ModuleExpr>),
 }
 
 /// One mapping inside a renaming `* (…)`. Op renaming is by canonical name (disambiguated
@@ -88,11 +90,16 @@ pub enum RenameItem {
 
 /// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
 /// to a target module (or theory) `M`, supplying the concrete sorts/ops that satisfy `T` — the argument of
-/// a parameterized-module instantiation `M{V}` (B-iv). `from`/`to` are module expressions (named for now;
-/// a parameterized view `view V{X :: T} …` / a target `LIST{X}` is B-iv).
+/// a parameterized-module instantiation `M{V}` (B-iv). `from`/`to` are module expressions; a **parameterized
+/// view** `view V{X :: T} from T' to M{X} …` (Axis-A2) carries [`params`](Self::params) and a non-`Named`
+/// `to` target, and is exercised by a nested instantiation `M{V{Arg}}` (Axis-A5).
 #[derive(Debug, Clone)]
 pub struct ViewDecl {
     pub name: String,
+    /// Formal parameters `{X :: T, …}` of a *parameterized* view (Axis-A2). Empty for an ordinary view.
+    /// A parameterized view is only used by instantiating it (`V{Arg}`) inside a nested module
+    /// instantiation; that instantiation substitutes the args into `to`/`sort_maps`/`op_maps`.
+    pub params: Vec<Parameter>,
     pub from: ModuleExpr,
     pub to: ModuleExpr,
     /// `sort A to B .` — map a (theory-declared) sort `A` to a sort `B` of the target. Unmapped theory
