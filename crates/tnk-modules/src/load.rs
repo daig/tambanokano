@@ -270,6 +270,23 @@ mod tests {
         );
     }
 
+    /// Axis-A5: nested ground instantiation `LIST{List{ToN}}` (the `LIST{List{Nat}}` shape) — the
+    /// parameterized view `List` instantiated by `ToN` derives a view to `LIST{ToN}`, so the outer element
+    /// sort is `List{ToN}` and `cons`/`nil`/`app` are ad-hoc overloaded across the `Nat` / `List{ToN}` /
+    /// `List{List{ToN}}` kinds. Reductions fire (`app` over lists of lists) and the disambiguated constant
+    /// `(nil).List{ToN}` round-trips. Byte-identical to the reference.
+    #[test]
+    fn instantiation_nested_list_conforms() {
+        conform(
+            conformance_file!("instantiation-nested-list.maude"),
+            &[
+                e("List{List{ToN}}", "cons(cons(0, nil), nil)", 0),
+                e("List{List{ToN}}", "cons(cons(0, nil), cons(nil, nil))", 2),
+                e("List{List{ToN}}", "cons(nil, cons(cons(0, nil), nil))", 2),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the

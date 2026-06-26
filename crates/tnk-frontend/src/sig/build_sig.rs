@@ -145,6 +145,12 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         }
     }
 
+    // Ad-hoc overloading flags for print disambiguation (Maude's `entry.cc`): for each symbol, whether
+    // another symbol shares its name (`ADHOC`), its name + domain kinds (`DOMAIN`), or its name + range
+    // kind (`RANGE`). Two symbols of the same name are necessarily in different connected components (same
+    // components ⇒ one symbol with subsort-overloaded declarations), so this is the cross-kind overloading.
+    let overload = compute_overload_flags(&engine, &syntax);
+
     // Resolve declared variables `(name, sort)` for the grammar builder + `build_term`.
     let mut vars: Vec<(String, SortId)> = Vec::new();
     for vd in &pm.vars {
@@ -172,7 +178,48 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         qid_sym,
         minus_sym,
         division_sym,
+        overload,
     })
+}
+
+/// Compute the per-symbol ad-hoc overloading flags ([`BuiltModule::overload`]) by comparing every pair of
+/// symbols that share a (canonical) name: same name ⇒ `ADHOC`; same name and per-position domain kinds ⇒
+/// `DOMAIN`; same name and range kind ⇒ `RANGE`. Only symbols that pick up at least one flag are recorded.
+fn compute_overload_flags(
+    engine: &Engine,
+    syntax: &HashMap<SymbolId, SymbolSyntax>,
+) -> HashMap<SymbolId, u8> {
+    use crate::sig::syntax::{OVL_ADHOC, OVL_DOMAIN, OVL_RANGE};
+    // Group symbols by name, recording each one's domain/range *kinds*.
+    type Profile = (SymbolId, Vec<KindId>, KindId);
+    let mut by_name: HashMap<&str, Vec<Profile>> = HashMap::new();
+    for (&sym, syn) in syntax {
+        let dom: Vec<KindId> = syn.domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
+        let range = engine.sorts().kind_of(syn.range);
+        by_name.entry(engine.symbol(sym).name()).or_default().push((sym, dom, range));
+    }
+    let mut flags: HashMap<SymbolId, u8> = HashMap::new();
+    for group in by_name.values() {
+        if group.len() < 2 {
+            continue; // a unique name needs no disambiguation
+        }
+        for (sym, dom, range) in group {
+            let mut f = OVL_ADHOC; // some other symbol in the group shares the name
+            for (other, odom, orange) in group {
+                if other == sym {
+                    continue;
+                }
+                if odom == dom {
+                    f |= OVL_DOMAIN;
+                }
+                if orange == range {
+                    f |= OVL_RANGE;
+                }
+            }
+            flags.insert(*sym, f);
+        }
+    }
+    flags
 }
 
 /// Declare one operator via the kernel constructor for its theory (from the attribute flags).

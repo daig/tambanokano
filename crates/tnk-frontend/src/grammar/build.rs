@@ -17,6 +17,30 @@ use crate::sig::syntax::BuiltModule;
 use tnk_core::sort::{KindId, SortId, Sorts};
 use tnk_core::symbol::SymbolId;
 
+/// The grammar terminals of a `.Sort` qualifier, with the leading dot fused to the base token as the lexer
+/// produces it: `List{ToN}` → `.List`, `{`, `ToN`, `}`. Splits the dotted name on the structured-sort
+/// punctuation (`{ } ,`), each run an interned token.
+fn dot_sort_terminals(name: &str, interner: &mut Interner) -> Vec<GSym> {
+    let dotted = format!(".{name}");
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in dotted.chars() {
+        if matches!(c, '{' | '}' | ',') {
+            if !cur.is_empty() {
+                out.push(GSym::T(Terminal::Tok(interner.intern(&cur))));
+                cur.clear();
+            }
+            out.push(GSym::T(Terminal::Tok(interner.intern(&c.to_string()))));
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(GSym::T(Terminal::Tok(interner.intern(&cur))));
+    }
+    out
+}
+
 /// Build the per-module mixfix grammar. Interns the punctuation/sort-name tokens it needs (idempotent —
 /// they share the module's interner, so a grammar terminal's [`Sym`] equals the lexed input token's).
 pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
@@ -64,6 +88,17 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
             vec![ANY],
             Action::PassThru,
         );
+
+        // Sort disambiguation: `<FooTerm> ::= ( <FooTerm> ) .Sort` for each sort of this kind (Maude's
+        // `(t).Sort` syntax — the inverse of the printer's `(t).Sort` disambiguation of an ad-hoc-overloaded
+        // term). The `.Sort` qualifier selects this kind, so an overloaded constant like `nil` (one per
+        // kind) round-trips. The qualifier lexes with the leading dot fused to the base token
+        // (`.List{ToN}` → `.List { ToN }`); the inner term passes through unchanged.
+        for &member in &sorts.kind(k).members {
+            let mut rhs = vec![GSym::T(lp), GSym::N(term_nt), GSym::T(rp)];
+            rhs.extend(dot_sort_terminals(sorts.name(member), interner));
+            push(&mut g, term_nt, rhs, 0, vec![ANY], Action::PassThru);
+        }
 
         // Flattened assoc arg lists: `<FooAssocList> ::= <FooTerm> , <FooTerm>`
         //                           `<FooAssocList> ::= <FooAssocList> , <FooTerm>`.

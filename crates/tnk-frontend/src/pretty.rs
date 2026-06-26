@@ -99,7 +99,7 @@ enum Item<'t> {
 enum Work<'a, 't> {
     Text { cat: Cat, text: Cow<'a, str> },
     Space,
-    Visit { item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap },
+    Visit { item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap, range_known: bool },
 }
 
 impl<'a> Printer<'a> {
@@ -122,15 +122,22 @@ impl<'a> Printer<'a> {
     /// of the former walk now lives in this heap `Vec`, so an arbitrarily deep subject can't overflow the
     /// call stack.
     fn run_stack<'t>(&self, out: &mut String, start: Item<'t>) {
-        let mut stack: Vec<Work<'a, 't>> =
-            vec![Work::Visit { item: start, req_prec: UNBOUNDED, lcap: NONE_CAP, rcap: NONE_CAP }];
+        // The top-level term's range is not known from any context (Maude prints it with `rangeKnown`
+        // false), so an ambiguous top constant is disambiguated.
+        let mut stack: Vec<Work<'a, 't>> = vec![Work::Visit {
+            item: start,
+            req_prec: UNBOUNDED,
+            lcap: NONE_CAP,
+            rcap: NONE_CAP,
+            range_known: false,
+        }];
         let mut pieces: Vec<Work<'a, 't>> = Vec::new();
         while let Some(w) = stack.pop() {
             match w {
                 Work::Text { cat, text } => self.emit(out, cat, &text),
                 Work::Space => out.push(' '),
-                Work::Visit { item, req_prec, lcap, rcap } => {
-                    self.layout(item, req_prec, lcap, rcap, &mut pieces);
+                Work::Visit { item, req_prec, lcap, rcap, range_known } => {
+                    self.layout(item, req_prec, lcap, rcap, range_known, &mut pieces);
                     stack.extend(pieces.drain(..).rev());
                 }
             }
@@ -139,24 +146,26 @@ impl<'a> Printer<'a> {
 
     /// Lay out ONE node into its forward piece sequence — emitting `Text`/`Space` and pushing each child as
     /// a `Visit` (no recursion into children). Ports the dispatch of the former `print`/`print_term`.
-    fn layout<'t>(&self, item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+    fn layout<'t>(&self, item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap, range_known: bool, out: &mut Vec<Work<'a, 't>>) {
         match item {
             Item::Term(Term::Var(v)) => {
                 let name = self.vars.get(v.index as usize).map(String::as_str).unwrap_or("_");
                 out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(name) });
             }
             Item::Term(Term::Op { symbol, args }) => {
+                // A `Term` (pattern, in a trace) has no inferred sort to disambiguate with, so its
+                // children keep `range_known` true (Maude does not disambiguate inside statement printing).
                 let children: Vec<Item> = args.iter().map(Item::Term).collect();
-                self.layout_app(*symbol, &children, req_prec, lcap, rcap, out);
+                self.layout_app(*symbol, &children, req_prec, lcap, rcap, true, out);
             }
-            Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, out),
+            Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, range_known, out),
         }
     }
 
     /// Lay out one DAG node: a leaf (numeral / string / qid / float), an `iter`, or an application (with the
     /// faithful minus/rational special cases). The `&node` borrow is released — owned leaf data, then a
     /// freshly-fetched child list — before the `&self` layout calls.
-    fn layout_dag<'t>(&self, d: DagId, req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+    fn layout_dag<'t>(&self, d: DagId, req_prec: u32, lcap: Cap, rcap: Cap, range_known: bool, out: &mut Vec<Work<'a, 't>>) {
         let symbol = self.m.engine.node(d).symbol();
         let leaf = {
             let node = self.m.engine.node(d);
@@ -195,7 +204,19 @@ impl<'a> Printer<'a> {
                     return;
                 }
                 let items: Vec<Item> = children.iter().map(|&c| Item::Dag(c)).collect();
-                self.layout_app(symbol, &items, req_prec, lcap, rcap, out);
+                // Disambiguation (Maude `dagNodePrint.cc`): an ad-hoc-overloaded symbol whose range is not
+                // determined by context prints `(t).Sort` so the output round-trips. The wrap is emitted
+                // around the whole application, and the arguments inherit a possibly-unknown range.
+                let need_disambig = !range_known && self.ambiguous(symbol);
+                let arg_rk = self.range_of_args_known(symbol, range_known, need_disambig);
+                if need_disambig {
+                    out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
+                }
+                self.layout_app(symbol, &items, req_prec, lcap, rcap, arg_rk, out);
+                if need_disambig {
+                    let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
+                    out.push(Work::Text { cat: Cat::Punct, text: Cow::Owned(format!(").{sort}")) });
+                }
             }
         }
     }
@@ -203,12 +224,13 @@ impl<'a> Printer<'a> {
     /// Lay out an application from its symbol + already-extracted child [`Item`]s: prefix/constant, or a
     /// mixfix form with the prec/gather parenthesization (the inverse of the parser's gather gate, plus the
     /// adjacency-capture cases). Shared by the DAG and `Term` walks.
-    fn layout_app<'t>(&self, symbol: SymbolId, children: &[Item<'t>], req_prec: u32, lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+    #[allow(clippy::too_many_arguments)]
+    fn layout_app<'t>(&self, symbol: SymbolId, children: &[Item<'t>], req_prec: u32, lcap: Cap, rcap: Cap, arg_rk: bool, out: &mut Vec<Work<'a, 't>>) {
         let Some(syn) = self.m.syntax.get(&symbol) else {
             // No recorded syntax (should not happen for a user op): prefix-print with the kernel name.
             out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(self.m.engine.symbol(symbol).name()) });
             if !children.is_empty() {
-                self.layout_arg_list(children, out);
+                self.layout_arg_list(children, arg_rk, out);
             }
             return;
         };
@@ -218,7 +240,7 @@ impl<'a> Printer<'a> {
             let cat = if children.is_empty() { Cat::Lit } else { Cat::Op };
             out.push(Work::Text { cat, text: self.frag_cow(&syn.frags[0]) });
             if !children.is_empty() {
-                self.layout_arg_list(children, out);
+                self.layout_arg_list(children, arg_rk, out);
             }
             return;
         }
@@ -229,7 +251,7 @@ impl<'a> Printer<'a> {
         }
         // A surrounding paren blocks inherited capture (Maude inherits left/right capture only unparenthesized).
         let (lcap, rcap) = if paren { (NONE_CAP, NONE_CAP) } else { (lcap, rcap) };
-        self.layout_mixfix(syn, &pg, children, lcap, rcap, out);
+        self.layout_mixfix(syn, &pg, children, lcap, rcap, arg_rk, out);
         if paren {
             out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
         }
@@ -238,7 +260,8 @@ impl<'a> Printer<'a> {
     /// Lay out a mixfix form: walk the syntax fragments, emitting literal tokens and pushing each argument
     /// hole as a `Visit` (at its gather bound + adjacency context). An associative operator with more
     /// arguments than its arity folds its flattened children over the infix tokens (`a + b + c`).
-    fn layout_mixfix<'t>(&self, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[Item<'t>], lcap: Cap, rcap: Cap, out: &mut Vec<Work<'a, 't>>) {
+    #[allow(clippy::too_many_arguments)]
+    fn layout_mixfix<'t>(&self, syn: &SymbolSyntax, pg: &prec_gather::PrecGather, children: &[Item<'t>], lcap: Cap, rcap: Cap, arg_rk: bool, out: &mut Vec<Work<'a, 't>>) {
         let nr_args = syn.domain.len();
         let left_bare = matches!(syn.frags.first(), Some(Frag::Hole));
         let right_bare = matches!(syn.frags.last(), Some(Frag::Hole));
@@ -257,7 +280,7 @@ impl<'a> Printer<'a> {
                 }
                 // Inner elements bind at the tighter gather[1]; left/right ends keep the outer capture.
                 let bound = if idx == 0 { pg.gather[0] } else { pg.gather[1] };
-                out.push(Work::Visit { item: *c, req_prec: bound, lcap: NONE_CAP, rcap: NONE_CAP });
+                out.push(Work::Visit { item: *c, req_prec: bound, lcap: NONE_CAP, rcap: NONE_CAP, range_known: arg_rk });
             }
             return;
         }
@@ -283,7 +306,7 @@ impl<'a> Printer<'a> {
                         out.push(Work::Space);
                     }
                     let (lc, rc) = self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
-                    out.push(Work::Visit { item: children[k], req_prec: pg.gather[k], lcap: lc, rcap: rc });
+                    out.push(Work::Visit { item: children[k], req_prec: pg.gather[k], lcap: lc, rcap: rc, range_known: arg_rk });
                     k += 1;
                     no_space = false;
                 }
@@ -306,6 +329,26 @@ impl<'a> Printer<'a> {
         } else {
             (NONE_CAP, NONE_CAP)
         }
+    }
+
+    /// Whether `symbol` must be disambiguated when its range is not known from context (Maude's
+    /// `ambiguous`): another symbol shares its name *and* domain kinds, so the argument kinds alone do not
+    /// select it. (Maude additionally disambiguates built-in literal lookalikes via the `PSEUDO` flags —
+    /// a separate concern not needed by hand-rolled overloading.)
+    fn ambiguous(&self, symbol: SymbolId) -> bool {
+        self.m.overload.get(&symbol).is_some_and(|f| f & crate::sig::syntax::OVL_DOMAIN != 0)
+    }
+
+    /// Whether the arguments of `symbol` have a known range (Maude's `rangeOfArgumentsKnown`): true unless
+    /// `symbol` is ad-hoc overloaded and neither the context's range nor a just-emitted disambiguation pins
+    /// the operator — in which case the arguments must each be unambiguous, so their range is unknown.
+    fn range_of_args_known(&self, symbol: SymbolId, range_known: bool, range_disambiguated: bool) -> bool {
+        use crate::sig::syntax::{OVL_ADHOC, OVL_RANGE};
+        let f = self.m.overload.get(&symbol).copied().unwrap_or(0);
+        if f & OVL_ADHOC == 0 {
+            return true; // not overloaded ⇒ argument kinds are determined
+        }
+        f & OVL_RANGE == 0 && (range_known || range_disambiguated)
     }
 
     /// Maude's parent-side capture test: a bare end of this op would be captured by an abutting token of
@@ -331,7 +374,7 @@ impl<'a> Printer<'a> {
             let power = format!("{}^{count}", self.canonical_name(symbol));
             out.push(Work::Text { cat: Cat::Op, text: Cow::Owned(power) });
             out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
-            out.push(Work::Visit { item: Item::Dag(arg), req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP });
+            out.push(Work::Visit { item: Item::Dag(arg), req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP, range_known: true });
             out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
             return;
         }
@@ -350,21 +393,22 @@ impl<'a> Printer<'a> {
         }
         // The base sits at the successor's gather bound; its left abuts the last `s` token.
         let lc = Cap { prec: UNARY_PREC, kind: Some(self.m.engine.sorts().kind_of(syn.domain[0])) };
-        out.push(Work::Visit { item: Item::Dag(arg), req_prec: UNARY_PREC, lcap: lc, rcap: if paren { NONE_CAP } else { rcap } });
+        out.push(Work::Visit { item: Item::Dag(arg), req_prec: UNARY_PREC, lcap: lc, rcap: if paren { NONE_CAP } else { rcap }, range_known: true });
         if paren {
             out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
         }
     }
 
-    /// `(a, b, …)` — a prefix argument list (shared by both walks).
-    fn layout_arg_list<'t>(&self, children: &[Item<'t>], out: &mut Vec<Work<'a, 't>>) {
+    /// `(a, b, …)` — a prefix argument list (shared by both walks). `arg_rk` is the arguments' inherited
+    /// `range_known` (false propagates disambiguation into them under an ad-hoc-overloaded operator).
+    fn layout_arg_list<'t>(&self, children: &[Item<'t>], arg_rk: bool, out: &mut Vec<Work<'a, 't>>) {
         out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("(") });
         for (idx, c) in children.iter().enumerate() {
             if idx > 0 {
                 out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(",") });
                 out.push(Work::Space);
             }
-            out.push(Work::Visit { item: *c, req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP });
+            out.push(Work::Visit { item: *c, req_prec: PREFIX_GATHER, lcap: NONE_CAP, rcap: NONE_CAP, range_known: arg_rk });
         }
         out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed(")") });
     }
@@ -633,6 +677,12 @@ mod tests {
     #[test]
     fn iter_renders_like_binary() {
         renders_as(file!("iter.maude"), &["0", "s 0", "s 0", "s 0", "s 0"]);
+    }
+    /// An ad-hoc-overloaded constant (`nil` in two kinds) prints disambiguated as `(nil).Sort` at top
+    /// level so it round-trips; a unique constant (`a`) stays bare. Byte-identical to the reference.
+    #[test]
+    fn disambiguated_constant_renders_like_binary() {
+        renders_as(file!("correctness-disambig.maude"), &["(nil).A", "(nil).B", "a"]);
     }
     #[test]
     fn bool_renders_like_binary() {

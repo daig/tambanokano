@@ -1,0 +1,12 @@
+*** Print disambiguation of an ad-hoc-overloaded constant via Maude's dot-sort syntax: `nil` is declared
+*** in two different kinds, so a bare `nil` would not round-trip; at top level, with the range unknown, it
+*** prints with an explicit sort. A unique constant `a` stays bare.
+fmod CK is
+  sorts A B .
+  op a : -> A [ctor] .
+  op nil : -> A [ctor] .
+  op nil : -> B [ctor] .
+endfm
+red (nil).A .
+red (nil).B .
+red a .

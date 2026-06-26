@@ -110,4 +110,19 @@ pub struct BuiltModule {
     /// The `DivisionSymbol` operator (`_/_`), if any — the pretty-printer renders a rational special
     /// constant compactly as `num/den` (no spaces), as Maude's `handleDivision` does.
     pub division_sym: Option<SymbolId>,
+    /// Per-symbol ad-hoc overloading flags for print disambiguation (Maude's `SymbolInfo::iflags`
+    /// `*_OVERLOADED` bits, `entry.cc`). A symbol overloaded across connected components prints
+    /// `(t).Sort` so the output round-trips. [`OVL_ADHOC`] = another symbol shares its name;
+    /// [`OVL_DOMAIN`] = another shares its name *and* domain kinds (forces disambiguation when the range
+    /// is unknown); [`OVL_RANGE`] = another shares its name *and* range kind. Absent = unique (no
+    /// disambiguation).
+    pub overload: HashMap<SymbolId, u8>,
 }
+
+/// Another symbol shares this one's name ([`BuiltModule::overload`]).
+pub const OVL_ADHOC: u8 = 1;
+/// Another symbol shares this one's name and domain kinds — printing must disambiguate `(t).Sort` when
+/// the range is not determined by context.
+pub const OVL_DOMAIN: u8 = 2;
+/// Another symbol shares this one's name and range kind.
+pub const OVL_RANGE: u8 = 4;

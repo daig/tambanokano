@@ -1,0 +1,23 @@
+*** Axis-A5: nested ground instantiation LIST{List{ToN}} (the LIST{List{Nat}} shape).
+*** The parameterized view List instantiated by ToN gives a derived view whose target
+*** is LIST{ToN}; LIST{List{ToN}} then has element sort List{ToN}, so cons/nil/app are
+*** ad-hoc overloaded across the Nat / List{ToN} / List{List{ToN}} kinds. An overloaded
+*** constant prints disambiguated as (nil).List{ToN}, which round-trips.
+fth TRIV is sort Elt . endfth
+fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
+view ToN from TRIV to NN is sort Elt to Nat . endv
+fmod LIST{E :: TRIV} is
+  sort List{E} .
+  op nil : -> List{E} [ctor] .
+  op cons : E$Elt List{E} -> List{E} [ctor] .
+  op app : List{E} List{E} -> List{E} .
+  var H : E$Elt .
+  vars T L : List{E} .
+  eq app(nil, L) = L .
+  eq app(cons(H, T), L) = cons(H, app(T, L)) .
+endfm
+view List{E :: TRIV} from TRIV to LIST{E} is sort Elt to List{E} . endv
+fmod USEN is protecting LIST{List{ToN}} . endfm
+red cons(cons(0, nil), nil) .
+red app(cons(cons(0, nil), nil), cons(nil, nil)) .
+red app(cons(nil, nil), cons(cons(0, nil), nil)) .
