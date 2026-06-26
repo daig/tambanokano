@@ -75,7 +75,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("import conformance uses only `reduce`"),
+                _ => panic!("import conformance uses only `reduce`"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");

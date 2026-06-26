@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use tnk_frontend::lex::Interner;
-use tnk_frontend::surface::ast::{ModuleExpr, OpDecl, PreModule, Statement, VarDecl};
+use tnk_frontend::surface::ast::{ModuleExpr, ModuleKind, OpDecl, PreModule, Statement, VarDecl};
 
 use crate::db::ModuleDb;
 use crate::rename::apply_renaming;
@@ -86,9 +86,13 @@ pub fn flatten(name: &str, db: &ModuleDb, interner: &mut Interner) -> Result<Pre
     let mut acc = Acc::default();
     let mut visited = HashSet::new();
     collect_named(name, db, &mut acc, &mut visited, interner)?;
+    // The flattened module is the root module with its imports inlined, so it keeps the root's kind
+    // (`mod` stays a system module — its rules survive flattening).
+    let kind = db.get(name).map(|pm| pm.kind).unwrap_or(ModuleKind::Functional);
     let d = acc.into_decls();
     Ok(PreModule {
         name: name.to_string(),
+        kind,
         imports: Vec::new(),
         sorts: d.sorts,
         subsorts: d.subsorts,

@@ -131,6 +131,29 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Match { pattern, subject, xmatch })
             }
+            "rewrite" | "rew" => {
+                self.advance();
+                let bound = self.opt_bound()?;
+                let term = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::Rewrite { bound, term })
+            }
+            "continue" | "cont" => {
+                // `continue n .` takes a **bare** number (unlike `rewrite [n]`'s bracketed bound); an
+                // omitted bound continues unbounded to the next normal form / solution.
+                self.advance();
+                let bound = if self.at_dot() {
+                    None
+                } else {
+                    Some(
+                        self.name()?
+                            .parse::<u64>()
+                            .map_err(|_| "expected a number after `continue`".to_string())?,
+                    )
+                };
+                self.eat_dot()?;
+                TopItem::Command(Command::Continue { bound })
+            }
             _ => return Err(format!("unexpected top-level token {txt:?}")),
         };
         Ok(Some(item))
@@ -152,11 +175,14 @@ impl<'a> Parser<'a> {
     }
 
     fn module(&mut self) -> PResult<PreModule> {
+        // `mod` is a system module (rules allowed); `fmod` is functional (rules rejected in `decl`).
+        let kind = if self.at("mod") { ModuleKind::System } else { ModuleKind::Functional };
         self.advance(); // fmod / mod
         let name = self.name()?;
         self.eat("is")?;
         let mut m = PreModule {
             name,
+            kind,
             imports: Vec::new(),
             sorts: Vec::new(),
             subsorts: Vec::new(),
@@ -284,6 +310,53 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 m.statements.push(Statement::Mb { lhs, sort, cond });
             }
+            "rl" | "crl" => {
+                if m.kind == ModuleKind::Functional {
+                    return Err(format!(
+                        "rule `{kw}` is not allowed in a functional module (`fmod {}`); use `mod`",
+                        m.name
+                    ));
+                }
+                let conditional = kw == "crl";
+                self.advance();
+                // Optional leading label `[name] :` (Maude's labelled-rule syntax). `[`/`]` are splitting
+                // punctuation, so they lex as their own tokens.
+                let label = if self.at("[") {
+                    self.advance();
+                    let l = self.name()?;
+                    self.eat("]")?;
+                    self.eat(":")?;
+                    Some(l)
+                } else {
+                    None
+                };
+                // The arrow `=>` lexes as one token (a run of non-punctuation chars); an unspaced `t=>p`
+                // lexes as a single token and so will not split here — rejected exactly as Maude rejects it.
+                let lhs = self.collect_until(&["=>"]);
+                self.eat("=>")?;
+                let (rhs, cond);
+                if conditional {
+                    rhs = self.collect_until(&["if"]);
+                    self.eat("if")?;
+                    cond = Some(self.collect_until(&["["]));
+                } else {
+                    rhs = self.collect_until(&["["]);
+                    cond = None;
+                }
+                // Optional trailing statement attributes (`[nonexec]`, `[label …]`, `[metadata …]`, …) —
+                // none affect Pillar-A execution, so consume and ignore the balanced group for now.
+                if self.at("[") {
+                    self.advance();
+                    while !self.at("]") {
+                        if self.advance().is_none() {
+                            return Err("unterminated rule attribute `[`".into());
+                        }
+                    }
+                    self.eat("]")?;
+                }
+                self.eat_dot()?;
+                m.statements.push(Statement::Rule { label, lhs, rhs, cond });
+            }
             other => return Err(format!("unsupported declaration `{other}`")),
         }
         Ok(())
@@ -376,6 +449,22 @@ impl<'a> Parser<'a> {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// An optional command bound `[n]` (e.g. `rewrite [2] …`, `continue [3] .`). Returns the number, or
+    /// `None` when absent. (The `[n, m]` search bound is a Pillar A-iv extension.)
+    fn opt_bound(&mut self) -> PResult<Option<u64>> {
+        if self.at("[") {
+            self.advance();
+            let n = self
+                .name()?
+                .parse::<u64>()
+                .map_err(|_| "expected a number in command bound `[n]`".to_string())?;
+            self.eat("]")?;
+            Ok(Some(n))
+        } else {
+            Ok(None)
         }
     }
 

@@ -542,7 +542,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("milestone uses only reduce"),
+                _ => panic!("milestone uses only reduce"),
             })
             .collect();
         for (idx, (m, term)) in cmds.iter().enumerate() {
@@ -618,7 +618,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("milestone uses only reduce"),
+                _ => panic!("milestone uses only reduce"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");

@@ -1,0 +1,27 @@
+*** Pillar A-i: rules (rl) + the `rewrite` command (rule-fair), bound, and `continue`.
+*** Verified byte-for-byte against the reference (modulo the `====` separators + `Bye.`):
+***   ~/Downloads/Maude-3/maude -no-banner conformance/rewrite.maude < /dev/null
+***   ./target/debug/tnk-repl conformance/rewrite.maude < /dev/null
+***
+*** Rules thread the constants a => b => c => d; f(d) => a re-wraps. `rewrite` reduces (no eqs here)
+*** then applies the top-down-first rule, so:
+***   rewrite a .        -> d   (3 rule steps)
+***   rewrite [2] a .    -> c   (stops at the bound)
+***   rewrite f(a) .     -> d   (7 steps: f(a)->..->f(d)->a->..->d; tests BFS descent + path rebuild)
+***   rewrite [1] a . then continue 1 .  ->  b, then c  (resumable; continue resets the count)
+
+mod CHAIN is
+  sort S .
+  ops a b c d : -> S .
+  op f : S -> S [ctor] .
+  rl a => b .
+  rl b => c .
+  rl c => d .
+  rl f(d) => a .
+endm
+
+rewrite a .
+rewrite [2] a .
+rewrite f(a) .
+rewrite [1] a .
+continue 1 .

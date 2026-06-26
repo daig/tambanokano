@@ -83,6 +83,13 @@ pub fn apply_renaming(
                     subst_tokens(c, &subst, interner);
                 }
             }
+            Statement::Rule { lhs, rhs, cond, .. } => {
+                subst_tokens(lhs, &subst, interner);
+                subst_tokens(rhs, &subst, interner);
+                if let Some(c) = cond {
+                    subst_tokens(c, &subst, interner);
+                }
+            }
         }
     }
     Ok(d)

@@ -9,6 +9,8 @@ use crate::lex::Token;
 #[derive(Debug, Clone)]
 pub struct PreModule {
     pub name: String,
+    /// Functional (`fmod`) or system (`mod`). A `mod` may declare rules (`rl`/`crl`); an `fmod` may not.
+    pub kind: ModuleKind,
     /// Imported modules (`protecting`/`extending`/`including <module-expr> .`), in declaration order.
     pub imports: Vec<Import>,
     pub sorts: Vec<String>,
@@ -17,6 +19,14 @@ pub struct PreModule {
     pub ops: Vec<OpDecl>,
     pub vars: Vec<VarDecl>,
     pub statements: Vec<Statement>,
+}
+
+/// Whether a module is functional (`fmod`/`fth` — equations + memberships only) or a system module
+/// (`mod`/`th` — may additionally declare rules). The kind gates rule statements (`rl`/`crl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleKind {
+    Functional,
+    System,
 }
 
 /// An import declaration: a mode and the module expression it imports. The mode does **not** affect
@@ -109,18 +119,26 @@ pub struct SpecialSpec {
     pub term_hooks: Vec<(String, Vec<Token>)>,
 }
 
-/// A statement — `eq`/`ceq`/`owise`, `mb`/`cmb`. Term parts are raw bubbles (parsed in B4.4).
+/// A statement — `eq`/`ceq`/`owise`, `mb`/`cmb`, `rl`/`crl`. Term parts are raw bubbles (parsed in B4.4).
 #[derive(Debug, Clone)]
 pub enum Statement {
     Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool },
     Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>> },
+    /// `rl [\[label\] :] lhs => rhs .` (or `crl … if cond .`). A rule condition may carry a rewrite
+    /// fragment `t => p` (Pillar A-v) in addition to the `ceq`-style fragments.
+    Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>> },
 }
 
-/// A top-level command (functional fragment): `reduce`/`red` and `match`/`xmatch`.
+/// A top-level command (functional fragment): `reduce`/`red`, `match`/`xmatch`, and the rewriting
+/// commands `rewrite`/`rew` + `continue` (Pillar A).
 #[derive(Debug)]
 pub enum Command {
     Reduce { term: Vec<Token> },
     Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
+    /// `rewrite [bound] term .` — rule-fair rewriting to a normal form (or `bound` rule applications).
+    Rewrite { bound: Option<u64>, term: Vec<Token> },
+    /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
+    Continue { bound: Option<u64> },
 }
 
 /// One top-level item: a module definition or a command. The unit the REPL consumes one at a time

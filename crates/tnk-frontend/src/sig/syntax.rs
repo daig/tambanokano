@@ -60,6 +60,20 @@ pub struct MbTrace {
     pub var_names: Vec<String>,
 }
 
+/// Source-form trace metadata for one rule, keyed by the kernel's dense rule id
+/// (`BuiltModule::rl_traces[id]`) — the counterpart of [`EqTrace`] for `[c]rl [{label}] : {lhs} => {rhs}
+/// [ if …] .` Used by the full trace renderer (`*********** rule`) and `show path` (`===[ rl … ]===>`).
+#[derive(Debug, Clone)]
+pub struct RlTrace {
+    pub lhs: Term,
+    pub rhs: Term,
+    pub condition: Vec<ConditionFragment>,
+    pub var_names: Vec<String>,
+    /// The `[label]` of a labelled rule (`rl [foo] : …`), if any — rendered in the body and on the
+    /// `show path` arc.
+    pub label: Option<String>,
+}
+
 /// A built module: the `Engine` (sorts + ops + attributes, but **not** statements — those need the grammar,
 /// B4.4) plus the frontend's resolution tables and the still-raw statements/commands.
 pub struct BuiltModule {
@@ -81,6 +95,9 @@ pub struct BuiltModule {
     pub eq_traces: Vec<EqTrace>,
     /// Per-membership trace metadata, indexed by the kernel's dense membership id. See [`MbTrace`].
     pub mb_traces: Vec<MbTrace>,
+    /// Per-rule trace metadata, indexed by the kernel's dense rule id (populated by `load_statements`).
+    /// See [`RlTrace`].
+    pub rl_traces: Vec<RlTrace>,
     /// Built-in literal anchors (for the grammar's literal productions + `make_*` in build_term).
     pub nat_succ: Option<SymbolId>,
     pub nat_zero: Option<SymbolId>,

@@ -23,7 +23,7 @@ use tnk_core::sort::SortId;
 use tnk_core::term::{ConditionFragment, Term};
 use tnk_frontend::lex::Interner;
 use tnk_frontend::pretty::{print_pretty, print_term};
-use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace};
+use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 
 /// Maude's trace line header (`UserLevelRewritingContext::header`): eleven `*` and a space.
 const HEADER: &str = "*********** ";
@@ -41,6 +41,8 @@ pub(crate) struct TraceFlags {
     pub condition: bool,
     pub eq: bool,
     pub mb: bool,
+    /// `set trace rls` — whether rule (`rl`/`crl`) steps trace at all (Maude's `TRACE_RL`). Pillar A.
+    pub rl: bool,
     pub builtin: bool,
 }
 
@@ -57,6 +59,7 @@ impl Default for TraceFlags {
             condition: true,
             eq: true,
             mb: true,
+            rl: true,
             builtin: true,
         }
     }
@@ -86,10 +89,11 @@ impl TraceFlags {
             Some("builtin") => self.builtin = on,
             Some("eqs") => self.eq = on,
             Some("mbs") => self.mb = on,
+            Some("rls") => self.rl = on,
             Some(o) => {
                 return Err(format!(
                     "set trace: unsupported option `{o}` \
-                     (supported: condition, whole, substitution, rewrite, body, builtin, eqs, mbs)."
+                     (supported: condition, whole, substitution, rewrite, body, builtin, eqs, mbs, rls)."
                 ));
             }
         }
@@ -101,6 +105,7 @@ impl TraceFlags {
         match kind {
             StmtKind::Equation => self.eq,
             StmtKind::Membership => self.mb,
+            StmtKind::Rule => self.rl,
         }
     }
 }
@@ -159,6 +164,14 @@ impl Renderer<'_> {
                     RewriteKind::BuiltIn if self.flags.builtin => {
                         self.rewrite_builtin(*redex, *result, *whole_before, *whole_after)
                     }
+                    RewriteKind::Rule if self.flags.rl => self.rewrite_rule(
+                        eq_id.expect("rule rewrite has an id"),
+                        *redex,
+                        *result,
+                        bindings,
+                        *whole_before,
+                        *whole_after,
+                    ),
                     _ => return,
                 };
                 self.out.push_str(&text);
@@ -217,6 +230,26 @@ impl Renderer<'_> {
         } else {
             // No statement labels yet, so always the unlabeled form.
             s.push_str("(unlabeled equation)\n");
+        }
+        s.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
+        s
+    }
+
+    /// A rule step (Maude `tracePreRuleRewrite` + `tracePostRuleRewrite`): `*********** rule` + the rule
+    /// body + substitution + the `redex ---> result` tail — the rewrite counterpart of [`rewrite_eq`].
+    fn rewrite_rule(&self, rule_id: u32, redex: DagId, result: DagId, bindings: &[Option<DagId>], whole_before: Option<DagId>, whole_after: Option<DagId>) -> String {
+        let rlt = &self.m.rl_traces[rule_id as usize];
+        let mut s = String::new();
+        if self.flags.body {
+            s.push_str(HEADER);
+            s.push_str("rule\n");
+            s.push_str(&self.rl_body(rlt));
+            s.push('\n');
+            if self.flags.substitution {
+                s.push_str(&self.substitution(&rlt.var_names, bindings));
+            }
+        } else {
+            s.push_str("(unlabeled rule)\n");
         }
         s.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
         s
@@ -319,6 +352,10 @@ impl Renderer<'_> {
                 let mbt = &self.m.mb_traces[stmt_id as usize];
                 (self.mb_body(mbt), &mbt.var_names)
             }
+            StmtKind::Rule => {
+                let rlt = &self.m.rl_traces[stmt_id as usize];
+                (self.rl_body(rlt), &rlt.var_names)
+            }
         }
     }
 
@@ -326,6 +363,7 @@ impl Renderer<'_> {
         match kind {
             StmtKind::Equation => &self.m.eq_traces[stmt_id as usize].var_names,
             StmtKind::Membership => &self.m.mb_traces[stmt_id as usize].var_names,
+            StmtKind::Rule => &self.m.rl_traces[stmt_id as usize].var_names,
         }
     }
 
@@ -354,6 +392,25 @@ impl Renderer<'_> {
         s
     }
 
+    /// `[c]rl [\[label\] :] lhs => rhs [if cond] .`
+    fn rl_body(&self, rlt: &RlTrace) -> String {
+        let kw = if rlt.condition.is_empty() { "rl" } else { "crl" };
+        let label = match &rlt.label {
+            Some(l) => format!(" [{l}] :"),
+            None => String::new(),
+        };
+        let mut s = format!(
+            "{kw}{label} {} => {}",
+            self.term(&rlt.lhs, &rlt.var_names),
+            self.term(&rlt.rhs, &rlt.var_names)
+        );
+        if !rlt.condition.is_empty() {
+            s.push_str(&format!(" if {}", self.condition(&rlt.condition, &rlt.var_names)));
+        }
+        s.push_str(" .");
+        s
+    }
+
     /// The `index`-th condition fragment of a statement, on its own (the `solving/success/failure
     /// condition fragment` line).
     fn fragment_text(&self, kind: StmtKind, stmt_id: u32, index: u32) -> String {
@@ -365,6 +422,10 @@ impl Renderer<'_> {
             StmtKind::Membership => {
                 let mbt = &self.m.mb_traces[stmt_id as usize];
                 (&mbt.condition, &mbt.var_names)
+            }
+            StmtKind::Rule => {
+                let rlt = &self.m.rl_traces[stmt_id as usize];
+                (&rlt.condition, &rlt.var_names)
             }
         };
         self.fragment(&cond[index as usize], var_names)

@@ -14,6 +14,7 @@
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
 use crate::num::Nat;
+use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
@@ -59,6 +60,23 @@ struct SortConstraint {
     condition: Vec<CompiledFragment>,
 }
 
+/// A rule `rl lhs => rhs` compiled for the engine: structurally a [`CompiledEquation`] minus `[owise]`
+/// (rules have no owise phase). Unlike equations, rules live in their own [`Signature::rules`] table and
+/// are applied **only** by `rewrite`/`frewrite`/`search` (Pillar A) — never by [`reduce`](Engine::reduce),
+/// which consults only `equations`. The frontend keeps this rule's source `Term`s + variable names +
+/// label at `rl_traces[id]` for the trace renderer and `show path` (`===[ rl ... ]===>`).
+struct CompiledRule {
+    id: u32,
+    lhs: LhsAutomaton,
+    rhs: Term,
+    nr_vars: u32,
+    /// Condition fragments (empty for an unconditional `rl`); a `crl` may additionally carry a **rewrite**
+    /// fragment `t => p` (Pillar A-v) — the one fragment kind equations/memberships may not have.
+    condition: Vec<CompiledFragment>,
+    /// As [`CompiledEquation::rhs_shares`] — C7 dedup window for an rhs with a repeated compound subterm.
+    rhs_shares: bool,
+}
+
 /// A condition fragment compiled for evaluation: like the public [`ConditionFragment`] but with the
 /// matching fragment's pattern compiled to an [`LhsAutomaton`]. Built by
 /// [`Signature::compile_condition`]. The `fresh_vars` of a matching fragment are unbound before each
@@ -67,6 +85,37 @@ enum CompiledFragment {
     Equality { lhs: Term, rhs: Term },
     SortTest { term: Term, sort: SortId },
     Matching { pattern: LhsAutomaton, subject: Term, fresh_vars: Vec<u32> },
+}
+
+/// Whether [`Runtime::drive_match`]'s `accept` callback wants to stop at the first rewrite (equational
+/// reduction and `rewrite`/`frewrite`, which take the first applicable statement) or keep enumerating
+/// every solution (search successor collection, Pillar A-iv).
+enum Flow {
+    Stop,
+    /// Keep enumerating every solution — used by the search successor-collector (Pillar A-iv); `rewrite`
+    /// and equational reduction only ever return [`Flow::Stop`].
+    #[allow(dead_code)]
+    Continue,
+}
+
+/// Identifies the statement [`Runtime::drive_match`] is driving, for trace events and the F-2 condition
+/// root set. `kind` selects the trace metadata (equation vs rule) and the [`RewriteKind`]; `frames`/`redex`
+/// are threaded into [`condition_holds`](Runtime::condition_holds) for GC rooting of a conditional
+/// statement's re-entrant condition reduction (moot for unconditional statements / GC-off REPL).
+struct StmtCtx<'a> {
+    kind: StmtKind,
+    stmt_id: u32,
+    frames: &'a [ReduceFrame],
+    redex: DagId,
+}
+
+/// One position in the redex stack of [`Runtime::rewrite_step`]'s top-down traversal: the node, its
+/// parent's index in the stack (`usize::MAX` for the root), and which flattened argument of the parent
+/// it is — enough to rebuild the path to the root after a rewrite (Maude's `RedexPosition`).
+struct RedexPos {
+    node: DagId,
+    parent: usize,
+    arg_index: usize,
 }
 
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
@@ -119,6 +168,10 @@ pub(crate) struct Signature {
     /// construction (B2.2). Empty in modules without memberships — the construction hot path checks
     /// `memberships.is_empty()` before doing any per-node work, so the free reduce path is untouched.
     memberships: HashMap<SymbolId, Vec<SortConstraint>>,
+    /// Rules (`rl`/`crl`), indexed by lhs top symbol. Applied **only** by `rewrite`/`frewrite`/`search`
+    /// (Pillar A) — never by [`reduce`](Engine::reduce), so equational normal forms never apply a rule.
+    /// Adding a rule does not bump `eq_epoch` (rules don't change any equational normal form).
+    rules: HashMap<SymbolId, Vec<CompiledRule>>,
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
     /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
     /// reduced" sentinel stored on nodes, so this starts at `1`.
@@ -129,6 +182,9 @@ pub(crate) struct Signature {
     /// Next dense membership-axiom id (the count of memberships added). Assigned to each
     /// [`SortConstraint`]; the trace counterpart of `next_eq_id`.
     next_mb_id: u32,
+    /// Next dense rule id (the count of rules added). Assigned to each [`CompiledRule`]; the frontend
+    /// keys its `rl_traces` metadata by it.
+    next_rule_id: u32,
 }
 
 /// One recorded reduction event (opt-in via [`Engine::set_trace`]) — the structured stream the REPL
@@ -234,6 +290,8 @@ pub enum RewriteKind {
     Equation,
     /// A built-in (`special`) operator's reduction.
     BuiltIn,
+    /// A user rule (`rl`/`crl`), applied by `rewrite`/`frewrite`/`search` (Pillar A).
+    Rule,
 }
 
 /// Which statement table a trial / fragment / membership event refers to — selects the frontend
@@ -244,6 +302,9 @@ pub enum StmtKind {
     Equation,
     /// A (conditional) membership axiom.
     Membership,
+    /// A (conditional) rule (`rl`/`crl`) — selects the frontend `rl_traces` metadata and the `rls`
+    /// trace flag (Pillar A).
+    Rule,
 }
 
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
@@ -307,9 +368,11 @@ impl Default for Signature {
             symbols: Arena::default(),
             equations: HashMap::default(),
             memberships: HashMap::default(),
+            rules: HashMap::default(),
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
             next_eq_id: 0,
             next_mb_id: 0,
+            next_rule_id: 0,
         }
     }
 }
@@ -782,6 +845,48 @@ impl Signature {
                 }
             })
             .collect()
+    }
+
+    /// Register an unconditional rule `rl lhs => rhs` (Pillar A). Compiles the lhs to a theory
+    /// [`LhsAutomaton`] through the same A3 seam as an equation, and stores it in the [`rules`](Self::rules)
+    /// table — never consulted by [`reduce`](Engine::reduce), so equational reduction can never apply it.
+    pub(crate) fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
+        self.push_rule(lhs, rhs, nr_vars, Vec::new())
+    }
+
+    /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v): the condition is the
+    /// same [`ConditionFragment`] list as `ceq`, and a rule condition may *additionally* contain a
+    /// **rewrite** fragment `t => p` (A-v). All fragments must hold; a failure backtracks into the next
+    /// matcher solution.
+    pub(crate) fn add_conditional_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) -> u32 {
+        self.push_rule(lhs, rhs, nr_vars, condition)
+    }
+
+    /// Compile and register a rule, returning its dense per-module **id** (the index the frontend keys
+    /// its `rl_traces` metadata by). Mirrors [`push_equation`](Self::push_equation) minus the `owise`
+    /// phase and — crucially — **without** bumping `eq_epoch`: a rule cannot change any equational normal
+    /// form, so invalidating the reduced-cache would be a pure regression.
+    fn push_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32, condition: Vec<ConditionFragment>) -> u32 {
+        let top = lhs.top_symbol().expect("rule lhs must be an application");
+        let id = self.next_rule_id;
+        self.next_rule_id += 1;
+        let rhs_shares = term_has_repeated_subterm(&rhs);
+        let compiled = CompiledRule {
+            id,
+            lhs: LhsAutomaton::compile(lhs, self),
+            rhs,
+            nr_vars,
+            condition: self.compile_condition(condition),
+            rhs_shares,
+        };
+        self.rules.entry(top).or_default().push(compiled);
+        id
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort`, compiling its lhs to a theory
@@ -1835,80 +1940,237 @@ impl Runtime {
             if eq.owise != owise {
                 continue; // wrong phase
             }
-            subst.reset(eq.nr_vars);
-            let Some(mut sp) = eq.lhs.match_(self, sig, id, &mut subst, ext_allowed) else {
-                continue;
-            };
-            while sp.next(self, sig, &mut subst) {
-                // Conditional equations: each matcher solution is a *trial* — evaluate the condition,
-                // and on failure backtrack into the next solution (Maude's `solveCondition` retry).
-                // Unconditional equations short-circuit (no call) — the free reduce hot path.
-                if !eq.condition.is_empty() {
-                    let depth = self.condition_depth;
-                    if self.tracing() {
-                        let bindings = Self::snapshot_subst(&subst);
-                        self.record(TraceEvent::TrialStart {
-                            kind: StmtKind::Equation,
-                            stmt_id: eq.id,
-                            depth,
-                            bindings,
-                        });
-                    }
-                    let holds = self.condition_holds(
-                        sig,
-                        &eq.condition,
-                        &mut subst,
-                        StmtKind::Equation,
-                        eq.id,
-                        frames,
-                        id,
-                    );
-                    if self.tracing() {
-                        self.record(TraceEvent::TrialEnd {
-                            kind: StmtKind::Equation,
-                            depth,
-                            success: holds,
-                        });
-                    }
-                    if !holds {
-                        continue;
-                    }
-                }
-                // C7: an rhs with a repeated compound subterm (e.g. `< g(X), g(X) >`) is built inside a
-                // dedup window so the duplicate becomes one shared node — reduced once, like Maude's CSE'd
-                // `RhsBuilder`. The flag keeps the non-sharing common case (e.g. `fib`'s rhs) on the plain
-                // path. Save/restore the outer `dedup` (`None` during reduce, but a nested rhs build could
-                // re-enter) so the window is exactly this instantiate.
-                let rhs = if eq.rhs_shares {
-                    let saved = self.dedup.replace(HashMap::new());
-                    let r = self.instantiate(sig, &eq.rhs, &subst);
-                    self.dedup = saved;
-                    r
-                } else {
-                    self.instantiate(sig, &eq.rhs, &subst)
-                };
-                // The subproblem splices the rhs into the matched position — a whole match is just the
-                // rhs; an extension match re-assembles the residue around it in the theory's normal
-                // form (ACU multiset, AU ordered prefix/suffix — Maude's `partialConstruct`).
-                let result = sp.build_result(self, sig, rhs);
-                if self.tracing() {
-                    let depth = self.condition_depth;
-                    let bindings = Self::snapshot_subst(&subst);
-                    self.record(TraceEvent::Rewrite {
-                        kind: RewriteKind::Equation,
-                        eq_id: Some(eq.id),
-                        depth,
-                        redex: id,
-                        result,
-                        bindings,
-                        whole_before: None,
-                        whole_after: None,
-                    });
-                }
-                return Some(result);
+            // First applicable solution wins (`Flow::Stop`): equational reduction takes the first
+            // equation whose lhs matches and whose condition holds.
+            let r = self.drive_match(
+                sig,
+                id,
+                &eq.lhs,
+                eq.nr_vars,
+                &eq.condition,
+                &eq.rhs,
+                eq.rhs_shares,
+                ext_allowed,
+                &mut subst,
+                StmtCtx { kind: StmtKind::Equation, stmt_id: eq.id, frames, redex: id },
+                &mut |_, _| Flow::Stop,
+            );
+            if r.is_some() {
+                return r;
             }
         }
         None
+    }
+
+    /// Drive one statement — an equation or a rule — against `subject` as a **solution stream**, the
+    /// de-duplicated core of [`try_equations`](Self::try_equations) and the rule appliers
+    /// ([`apply_first_rule_at`](Self::apply_first_rule_at)/[`all_successors_at`](Self::all_successors_at)).
+    ///
+    /// The compiled [`LhsAutomaton`] yields a [`Subproblem`](crate::theory::Subproblem) whose `next`
+    /// enumerates solutions into `subst`; each solution is a *trial* — if `condition` holds (a failure
+    /// backtracks into the next solution, Maude's `solveCondition` retry), the rhs is built (inside the
+    /// C7 dedup window when `rhs_shares`) and spliced into the matched position by `build_result` (a
+    /// whole match = just the rhs; an extension match re-assembles the theory residue — Maude's
+    /// `partialConstruct`), then handed to `accept`. `accept` returns [`Flow::Stop`] to halt with that
+    /// result (first-applicable: equational reduce / `rewrite` / `frewrite`) or [`Flow::Continue`] to
+    /// enumerate every solution (search successor collection). Returns the first `Stop`'s result, else
+    /// `None`. The caller owns `subst` (reset here to `nr_vars`) so its capacity is reused across a
+    /// symbol's statements. The A4 borrow split lets the matched `&rhs` (a shared borrow of `sig`)
+    /// instantiate in place without a defensive clone.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_match(
+        &mut self,
+        sig: &Signature,
+        subject: DagId,
+        lhs: &LhsAutomaton,
+        nr_vars: u32,
+        condition: &[CompiledFragment],
+        rhs: &Term,
+        rhs_shares: bool,
+        ext_allowed: bool,
+        subst: &mut Subst,
+        ctx: StmtCtx<'_>,
+        accept: &mut dyn FnMut(&mut Runtime, DagId) -> Flow,
+    ) -> Option<DagId> {
+        subst.reset(nr_vars);
+        let mut sp = lhs.match_(self, sig, subject, subst, ext_allowed)?;
+        let rewrite_kind = match ctx.kind {
+            StmtKind::Equation => RewriteKind::Equation,
+            StmtKind::Rule => RewriteKind::Rule,
+            StmtKind::Membership => unreachable!("memberships are not driven through drive_match"),
+        };
+        while sp.next(self, sig, subst) {
+            // Conditional statements: each matcher solution is a *trial* — evaluate the condition, and on
+            // failure backtrack into the next solution. Unconditional statements short-circuit (no call)
+            // — the free reduce hot path.
+            if !condition.is_empty() {
+                let depth = self.condition_depth;
+                if self.tracing() {
+                    let bindings = Self::snapshot_subst(subst);
+                    self.record(TraceEvent::TrialStart {
+                        kind: ctx.kind,
+                        stmt_id: ctx.stmt_id,
+                        depth,
+                        bindings,
+                    });
+                }
+                let holds =
+                    self.condition_holds(sig, condition, subst, ctx.kind, ctx.stmt_id, ctx.frames, ctx.redex);
+                if self.tracing() {
+                    self.record(TraceEvent::TrialEnd { kind: ctx.kind, depth, success: holds });
+                }
+                if !holds {
+                    continue;
+                }
+            }
+            // C7: an rhs with a repeated compound subterm (e.g. `< g(X), g(X) >`) is built inside a dedup
+            // window so the duplicate becomes one shared node — reduced once, like Maude's CSE'd
+            // `RhsBuilder`. The flag keeps the non-sharing common case (e.g. `fib`'s rhs) on the plain
+            // path. Save/restore the outer `dedup` (`None` during reduce, but a nested rhs build could
+            // re-enter) so the window is exactly this instantiate.
+            let built = if rhs_shares {
+                let saved = self.dedup.replace(HashMap::new());
+                let r = self.instantiate(sig, rhs, subst);
+                self.dedup = saved;
+                r
+            } else {
+                self.instantiate(sig, rhs, subst)
+            };
+            let result = sp.build_result(self, sig, built);
+            if self.tracing() {
+                let depth = self.condition_depth;
+                let bindings = Self::snapshot_subst(subst);
+                self.record(TraceEvent::Rewrite {
+                    kind: rewrite_kind,
+                    eq_id: Some(ctx.stmt_id),
+                    depth,
+                    redex: ctx.redex,
+                    result,
+                    bindings,
+                    whole_before: None,
+                    whole_after: None,
+                });
+            }
+            match accept(self, result) {
+                Flow::Stop => return Some(result),
+                Flow::Continue => {}
+            }
+        }
+        None
+    }
+
+    /// Apply the first applicable rule at `node` (Pillar A): round-robin over the node's symbol's rules
+    /// from `cursors`, returning `(rule_id, result)` — the rewritten node — or `None` if no rule applies.
+    /// Round-robin fairness (Maude's `RuleTable::applyRules`/`nextRule`): the cursor advances **past** the
+    /// rule that fired, so repeatedly rewriting a symbol cycles through its rules. Each application bumps
+    /// the global `rewrite_count` (it counts toward Maude's `rewrites:` total). Reuses the shared
+    /// [`drive_match`](Self::drive_match) seam, so a `crl`'s condition is checked identically to a `ceq`'s.
+    fn apply_first_rule_at(
+        &mut self,
+        sig: &Signature,
+        node: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> Option<(u32, DagId)> {
+        let symbol = self.node(node).symbol();
+        let rules = sig.rules.get(&symbol)?;
+        let n = rules.len();
+        if n == 0 {
+            return None;
+        }
+        // Rules of ACU/AU/S symbols match *modulo* the axioms with extension (a sub-multiset / contiguous
+        // sub-sequence / successor prefix), exactly as equations do (try_rewrite_top).
+        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
+        let start = (*cursors.get(&symbol).unwrap_or(&0) as usize) % n;
+        let mut subst = Subst::new();
+        for k in 0..n {
+            let idx = (start + k) % n;
+            let rule = &rules[idx];
+            // Rule application happens outside `reduce`, so there are no outer reduce frames to root for a
+            // conditional rule's re-entrant condition reduction; the caller keeps the whole term rooted
+            // (and the REPL runs with GC off), so an empty frame slice is correct here.
+            let r = self.drive_match(
+                sig,
+                node,
+                &rule.lhs,
+                rule.nr_vars,
+                &rule.condition,
+                &rule.rhs,
+                rule.rhs_shares,
+                ext_allowed,
+                &mut subst,
+                StmtCtx { kind: StmtKind::Rule, stmt_id: rule.id, frames: &[], redex: node },
+                &mut |_, _| Flow::Stop,
+            );
+            if let Some(result) = r {
+                let rule_id = rule.id;
+                self.rewrite_count += 1;
+                cursors.insert(symbol, ((idx + 1) % n) as u32);
+                return Some((rule_id, result));
+            }
+        }
+        None
+    }
+
+    /// Find the top-down-first rewritable position of `root` and apply one rule there, returning the new
+    /// root (path rebuilt) or `None` if no rule applies anywhere (a normal form, for `rewrite`). Faithful
+    /// to Maude's `ruleRewrite` redex-stack traversal (`Core/run.cc:24`): breadth-first from the root,
+    /// trying each position in stack order; the first position whose symbol has an applicable rule
+    /// rewrites, then the path back to the root is rebuilt (Maude's `copyWithReplacement`).
+    fn rewrite_step(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> Option<DagId> {
+        let mut stack = vec![RedexPos { node: root, parent: usize::MAX, arg_index: 0 }];
+        let mut next_to_explore = 0usize;
+        let mut i = 0usize;
+        loop {
+            if i == stack.len() {
+                // No pending position at the current frontier — stack the next node's children, skipping
+                // childless leaves, until the stack grows or every node has been explored.
+                loop {
+                    if next_to_explore == stack.len() {
+                        return None; // every position explored; no rule applies (a normal form)
+                    }
+                    let parent_idx = next_to_explore;
+                    let d = stack[parent_idx].node;
+                    let before = stack.len();
+                    let children: Vec<DagId> = self.node(d).children().collect();
+                    for (ai, c) in children.into_iter().enumerate() {
+                        stack.push(RedexPos { node: c, parent: parent_idx, arg_index: ai });
+                    }
+                    next_to_explore += 1;
+                    if stack.len() > before {
+                        break; // grew the stack — new positions to try
+                    }
+                }
+            }
+            let node = stack[i].node;
+            if let Some((_rule_id, result)) = self.apply_first_rule_at(sig, node, cursors) {
+                return Some(self.rebuild_path(sig, &stack, i, result));
+            }
+            i += 1;
+        }
+    }
+
+    /// Rebuild the path from a rewritten position up to the root: starting at stack position `leaf_idx`
+    /// with `new_node` in place, reconstruct each ancestor with the one argument leading to the redex
+    /// replaced (Maude's chained `copyWithReplacement`). Ancestors' other children stay shared.
+    fn rebuild_path(&mut self, sig: &Signature, stack: &[RedexPos], leaf_idx: usize, new_node: DagId) -> DagId {
+        let mut node = new_node;
+        let mut idx = leaf_idx;
+        while stack[idx].parent != usize::MAX {
+            let parent_idx = stack[idx].parent;
+            let arg_index = stack[idx].arg_index;
+            let parent_node = stack[parent_idx].node;
+            let symbol = self.node(parent_node).symbol();
+            let mut args: Vec<DagId> = self.node(parent_node).children().collect();
+            args[arg_index] = node;
+            node = self.rebuild(sig, symbol, args);
+            idx = parent_idx;
+        }
+        node
     }
 
     /// Whether every fragment of `condition` holds under the matched substitution `subst` — the B2.3
@@ -2432,6 +2694,42 @@ impl Engine {
         self.sig.add_conditional_membership(lhs, sort, nr_vars, condition)
     }
 
+    /// Register an unconditional rule `rl lhs => rhs` (Pillar A), returning its dense per-module id (the
+    /// index the frontend keys its `rl_traces` metadata by). Rules are applied only by `rewrite`/
+    /// `frewrite`/`search`, never by [`reduce`](Self::reduce).
+    pub fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
+        self.sig.add_rule(lhs, rhs, nr_vars)
+    }
+
+    /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v). The condition is the
+    /// same [`ConditionFragment`](crate::term::ConditionFragment) list as `ceq`, and a rule condition may
+    /// additionally contain a **rewrite** fragment `t => p` (A-v).
+    pub fn add_conditional_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) -> u32 {
+        self.sig.add_conditional_rule(lhs, rhs, nr_vars, condition)
+    }
+
+    /// Begin a `rewrite` session over `initial` (Pillar A): rule-fair, reduce-to-canonical then apply the
+    /// first rule at the top-down-first redex. Returns a resumable [`Rewriting`] — drive it with
+    /// [`Rewriting::run`] (bound or unbounded) and resume with `continue`. The session keeps its current
+    /// term GC-rooted, so it can be stored between REPL commands.
+    pub fn rewrite(&mut self, initial: DagId) -> Rewriting {
+        let root = self.root(initial);
+        Rewriting::new_rule_fair(root, initial)
+    }
+
+    /// One rule-fair step (used by [`Rewriting::run`]): apply the first rule at the top-down-first redex
+    /// of `current`, returning the rebuilt root, or `None` at a normal form. `cursors` carries the
+    /// per-symbol round-robin rule cursor across steps.
+    pub(crate) fn rewrite_step(&mut self, current: DagId, cursors: &mut HashMap<SymbolId, u32>) -> Option<DagId> {
+        self.rt.rewrite_step(&self.sig, current, cursors)
+    }
+
     /// Total equational rewrites applied so far.
     pub fn rewrites(&self) -> u64 {
         self.rt.rewrites()
@@ -2674,6 +2972,60 @@ mod tests {
             p
         };
         assert_eq!(leaf_names(&e, portion), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Three constants threaded by rules `a => b => c => d`. `rewrite` drives them to the normal form
+    /// `d` in 3 rule applications, while `reduce` (which consults only the equation table) leaves `a`
+    /// untouched — the structural "equations don't rewrite" guarantee (Pillar A-i).
+    fn chain_engine() -> (Engine, SymbolId, SymbolId, SymbolId, SymbolId) {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let c = e.add_op("c", vec![], s);
+        let d = e.add_op("d", vec![], s);
+        e.add_rule(Term::constant(a), Term::constant(b), 0);
+        e.add_rule(Term::constant(b), Term::constant(c), 0);
+        e.add_rule(Term::constant(c), Term::constant(d), 0);
+        (e, a, b, c, d)
+    }
+
+    #[test]
+    fn rewrite_applies_rules_and_reduce_does_not() {
+        let (mut e, a, _b, _c, _d) = chain_engine();
+
+        // reduce never applies a rule: `a` is its own equational normal form.
+        let a0 = e.make_const(a);
+        let red = e.reduce(a0);
+        assert_eq!(e.symbol(e.node(red).symbol()).name(), "a", "reduce must not apply rules");
+
+        // rewrite drives the rules to the normal form `d` in 3 steps.
+        e.reset_rewrites();
+        let a1 = e.make_const(a);
+        let mut rw = e.rewrite(a1);
+        let step = rw.run(&mut e, None);
+        assert!(step.done, "reached a normal form");
+        assert_eq!(e.symbol(e.node(step.term).symbol()).name(), "d");
+        assert_eq!(e.rewrites(), 3, "three rule applications");
+    }
+
+    #[test]
+    fn rewrite_bound_then_continue() {
+        let (mut e, a, _b, _c, _d) = chain_engine();
+        let a0 = e.make_const(a);
+        let mut rw = e.rewrite(a0);
+
+        e.reset_rewrites();
+        let s1 = rw.run(&mut e, Some(1));
+        assert!(!s1.done, "stopped at the bound, not a normal form");
+        assert_eq!(e.symbol(e.node(s1.term).symbol()).name(), "b");
+        assert_eq!(e.rewrites(), 1, "exactly one rule application under [1]");
+
+        // `continue` (unbounded) runs to the normal form, the round-robin cursor having persisted.
+        let s2 = rw.run(&mut e, None);
+        assert!(s2.done);
+        assert_eq!(e.symbol(e.node(s2.term).symbol()).name(), "d");
     }
 
     #[test]

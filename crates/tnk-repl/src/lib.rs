@@ -12,8 +12,10 @@ mod wrap;
 
 use std::collections::HashMap;
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
+use tnk_core::rewrite::Rewriting;
 use tnk_frontend::load::{
-    build_loaded_module, command_echo, format_matchers, match_command, reduce_command, LoadedModule,
+    build_loaded_module, command_echo, format_matchers, match_command, reduce_command, rewrite_command,
+    LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
@@ -45,6 +47,11 @@ pub struct Repl {
     color: bool,
     /// The full `trace` flags (`set trace [<option>] on|off`); `master` off by default.
     trace: TraceFlags,
+    /// The last resumable `rewrite`/`frewrite` session and the module name it ran in, for `continue`.
+    /// Any non-`continue` command (or a module rebuild / `select`) clears it — Maude's continuation
+    /// invalidation. Stays valid between commands because the REPL runs with in-reduction GC off, so the
+    /// session's term is never collected.
+    last: Option<(String, Rewriting)>,
 }
 
 impl Repl {
@@ -57,6 +64,7 @@ impl Repl {
             current: None,
             color,
             trace: TraceFlags::default(),
+            last: None,
         }
     }
 
@@ -122,6 +130,7 @@ impl Repl {
     /// it current. Silent on success (as Maude is); flatten/build errors become output.
     fn enter_module(&mut self, pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
+        self.last = None; // a (re)built module invalidates any saved rewrite continuation
         self.db.insert(pm);
         let built = flatten(&name, &self.db, &mut self.interner)
             .and_then(|flat| build_loaded_module(&flat, &mut self.interner));
@@ -145,6 +154,7 @@ impl Repl {
         };
         match c {
             Command::Reduce { term } => {
+                self.last = None; // a non-continue command invalidates the saved rewrite continuation
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 // Maude echoes the *normalized, pretty-printed* parsed term (special constants collapsed,
                 // AC args canonically ordered), not the raw input; fall back to the token join if it
@@ -170,6 +180,7 @@ impl Repl {
                 }
             }
             Command::Match { pattern, subject, xmatch } => {
+                self.last = None;
                 let (pe, se) =
                     (join_tokens(&pattern, &self.interner), join_tokens(&subject, &self.interner));
                 let kw = if xmatch { "xmatch" } else { "match" };
@@ -185,6 +196,36 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
+            Command::Rewrite { bound, term } => {
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
+                lm.built.engine.set_trace(self.trace.master);
+                lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
+                let bound_str = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
+                match rewrite_command(lm, &self.interner, &term) {
+                    Ok(mut rw) => {
+                        let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
+                        out.push_str(&format!("rewrite{bound_str} in {cur} : {echo} .\n{body}"));
+                        // `lm`'s borrow ends above; save the session so `continue` can resume it.
+                        self.last = Some((cur.clone(), rw));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::Continue { bound } => match self.last.take() {
+                Some((m, mut rw)) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    lm.built.engine.set_trace(self.trace.master);
+                    lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
+                    // `continue` reports the rewrites done in this continuation (Maude resets the count).
+                    lm.built.engine.reset_rewrites();
+                    let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
+                    out.push_str(&body);
+                    self.last = Some((m, rw));
+                }
+                _ => out.push_str("No previous rewriting to continue in this module.\n"),
+            },
         }
     }
 
@@ -195,6 +236,7 @@ impl Repl {
             "select: expected a module name.".to_string()
         } else if self.modules.contains_key(name) {
             self.current = Some(name.to_string());
+            self.last = None; // switching modules invalidates the saved rewrite continuation
             String::new()
         } else {
             format!("select: no module `{name}` — enter it first.")
@@ -283,6 +325,33 @@ fn join_tokens(toks: &[Token], i: &Interner) -> String {
         no_space = open;
     }
     out
+}
+
+/// Run a `rewrite`/`continue` session and render the `rewrites: … / result …` block (shared by the
+/// `rewrite` and `continue` commands). Runs `rw` for `bound` steps, renders any recorded trace, then the
+/// count and the result — `result (sort not calculated): …` when a bounded `frewrite` stop left a
+/// non-canonical term (Pillar A-ii).
+fn render_rewriting(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    flags: TraceFlags,
+    color: bool,
+    rw: &mut Rewriting,
+    bound: Option<u64>,
+) -> String {
+    let step = rw.run(&mut lm.built.engine, bound);
+    let events = lm.built.engine.take_trace();
+    let trace = render_trace(&lm.built, i, &events, flags, color);
+    let eng = &lm.built.engine;
+    let rw_count = eng.rewrites();
+    let value = print_pretty(&lm.built, i, step.term, color);
+    let result_line = if step.sort_known {
+        let sort = eng.sorts().name(eng.sort_of(step.term)).to_string();
+        format!("result {sort}: {value}")
+    } else {
+        format!("result (sort not calculated): {value}")
+    };
+    format!("{trace}rewrites: {rw_count} in 0ms cpu (0ms real) (~ rewrites/second)\n{result_line}\n")
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the

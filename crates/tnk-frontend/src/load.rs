@@ -17,11 +17,12 @@ use crate::grammar::Nt;
 use crate::lex::{tokenize, Interner, Token};
 use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
-use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace};
+use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, PreModule, Source, Statement};
 use crate::surface::parser::Parser;
 use std::collections::BTreeSet;
 use tnk_core::dag::DagId;
+use tnk_core::rewrite::Rewriting;
 use tnk_core::sort::SortId;
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
@@ -135,6 +136,33 @@ fn load_statements(
                 };
                 assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
                 m.mb_traces.push(trace);
+            }
+            Statement::Rule { label, lhs, rhs, cond } => {
+                // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
+                // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
+                let mut vars = VarIndex::new();
+                let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+                let condition = match cond {
+                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                    None => Vec::new(),
+                };
+                let rhs_t = parse_build(rhs, g, m, i, &mut vars)?;
+                let nr = vars.count();
+                let trace = RlTrace {
+                    lhs: lhs_t.clone(),
+                    rhs: rhs_t.clone(),
+                    condition: condition.clone(),
+                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                    label: label.clone(),
+                };
+                let id = if condition.is_empty() {
+                    m.engine.add_rule(lhs_t, rhs_t, nr)
+                } else {
+                    m.engine.add_conditional_rule(lhs_t, rhs_t, nr, condition)
+                };
+                assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
+                m.rl_traces.push(trace);
             }
         }
     }
@@ -332,6 +360,24 @@ pub fn reduce_command(
     Ok((result, lm.built.engine.rewrites()))
 }
 
+/// Parse + build a ground command term and begin a `rewrite` session over it (Pillar A). Resets the
+/// rewrite counter and builds the subject in a dedup window exactly like [`reduce_command`], then returns
+/// the resumable [`Rewriting`] — the caller drives it with [`Rewriting::run`] (bound or unbounded) and
+/// stores it for `continue`.
+pub fn rewrite_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+) -> Result<Rewriting, String> {
+    let tree = parse_forest(term, &lm.grammar, i)?;
+    lm.built.engine.reset_rewrites();
+    lm.built.engine.begin_dedup();
+    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i);
+    lm.built.engine.end_dedup();
+    let dag = dag?;
+    Ok(lm.built.engine.rewrite(dag))
+}
+
 /// The matched-portion id (for `xmatch`) and binding ids of one match solution, captured while the
 /// kernel [`tnk_core::engine::Solutions`] stream is live; rendered to text only after it drops (the
 /// stream holds `&mut Engine`, the pretty-printer needs `&BuiltModule`).
@@ -470,6 +516,7 @@ mod tests {
                         subject: subject.clone(),
                         xmatch: *xmatch,
                     },
+                    _ => panic!("this conformance harness covers only reduce/match"),
                 };
                 (*m, cmd)
             })
@@ -843,7 +890,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term } => (*m, term.clone()),
-                Command::Match { .. } => panic!("conform_render handles only reduce"),
+                _ => panic!("conform_render handles only reduce"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
@@ -1171,6 +1218,7 @@ mod tests {
                             subject: subject.clone(),
                             xmatch: *xmatch,
                         },
+                        _ => panic!("this conformance harness covers only reduce/match"),
                     };
                     (*m, cmd)
                 })

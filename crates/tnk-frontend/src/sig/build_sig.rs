@@ -153,6 +153,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         statements: Vec::new(), // moved in by the caller (B4.4); kept out of `&PreModule`
         eq_traces: Vec::new(),  // populated by load_statements (full-trace metadata)
         mb_traces: Vec::new(),
+        rl_traces: Vec::new(),
         nat_succ,
         nat_zero,
         string_sym,

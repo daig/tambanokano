@@ -429,6 +429,42 @@ fn trace_fixtures_run_through_repl() {
     );
 }
 
+/// Pillar A-i: `rl` + `rewrite`/`continue` through the REPL, byte-matching the reference binary
+/// (`conformance/rewrite.maude`). Reduce-then-rule-fair, the bound, the top-down `f(a)` traversal (7
+/// steps), and the resumable `continue` (which resets the count).
+#[test]
+fn rewrite_command_through_repl() {
+    let out = repl().eval(conformance_file!("rewrite.maude")).output;
+    assert!(out.contains("rewrite in CHAIN : a .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: d"), "rewrite a:\n{out}");
+    assert!(out.contains("rewrite [2] in CHAIN : a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "rewrite [2] a:\n{out}");
+    assert!(out.contains("rewrite in CHAIN : f(a) .\nrewrites: 7 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: d"), "rewrite f(a) (7 steps):\n{out}");
+    // `rewrite [1] a .` -> b, then `continue 1 .` -> c (count reset to the 1 step done in the continue).
+    assert!(out.contains("rewrite [1] in CHAIN : a .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: b\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "[1] then continue:\n{out}");
+}
+
+/// `set trace on` + `rewrite` renders the rule step exactly as the reference: `*********** rule` + the
+/// rule body + `empty substitution` + the `redex ---> result` tail.
+#[test]
+fn traced_rewrite_renders_rule_blocks() {
+    let s = run_session(
+        "mod CHAIN is sort S . ops a b c d : -> S . rl a => b . rl b => c . endm\n\
+         set trace on .\n\
+         rewrite a .",
+    );
+    assert!(s.contains("*********** rule\nrl a => b .\nempty substitution\na\n--->\nb"), "rule block 1:\n{s}");
+    assert!(s.contains("*********** rule\nrl b => c .\nempty substitution\nb\n--->\nc"), "rule block 2:\n{s}");
+    assert!(s.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "tail:\n{s}");
+}
+
+/// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
+#[test]
+fn rule_in_fmod_is_rejected() {
+    let out = repl()
+        .eval("fmod F is sort S . ops a b : -> S . rl a => b . endfm")
+        .output;
+    assert!(out.contains("not allowed in a functional module"), "rejection: {out}");
+}
+
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
 /// or a terminator-less line keep buffering; a bare `quit` completes.
 #[test]
