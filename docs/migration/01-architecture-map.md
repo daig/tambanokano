@@ -10,9 +10,13 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > gap, `gaps.md`). **L5 Frontend** (lexer/mixfix-grammar/Earley parser/pretty-printer) and **L6 Modules**
 > (non-parameterized: import/flatten/`+`/rename) — DONE. **L4 Operational — rules + rewriting (Pillar A)
 > DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`,
-> all conformance-verified); strategies / objects / external-IO still NOT STARTED. **L6 parameterization**
-> (theories/views/instantiation), **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED (Phase 2/3,
-> `roadmap.md`). Feature inventory (§3) = the Phase-2/3 to-do list.
+> all conformance-verified); strategies / objects / external-IO still NOT STARTED. **L6 parameterization —
+> the mechanism (theories/views/parameterized-modules/instantiation `M{V}`) DONE** (Pillar B-i…iv, a pure
+> `tnk-modules` `PreModule` transform, kernel unchanged); the deferred corner cases ("Axis A": op-maps,
+> parameterized view targets, dedup, theory/module sorts, free-vs-bound nested) remain. **Loading the *real*
+> prelude additionally needs `poly`/`Universal` polymorphism** (a separate feature, `roadmap.md` item 3 —
+> empirically the blocker for the real `BOOL`/`NAT`). **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED
+> (Phase 3). Feature inventory (§3) = the Phase-2/3 to-do list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*

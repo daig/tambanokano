@@ -21,8 +21,8 @@ prelude load.
    `X:Sort` colon variables. **Remaining for Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs
    the object system, item 5); `frozen`'s lazy-`strat` interaction + search/rewrite-condition trace
    (`gaps.md`). Reference: `reports/A6-operational.md`.
-2. **Parameterized programming (Pillar B) — B-i…B-iv DONE; B-v (container prelude) next.** Theories,
-   views, parameterized modules, instantiation — the whole mechanism is realized as a `tnk-modules`
+2. **Parameterized programming (Pillar B) — the *mechanism* (B-i…B-iv) is DONE; "Axis A" finishes it.**
+   Theories, views, parameterized modules, instantiation — the whole mechanism is a `tnk-modules`
    `PreModule → PreModule` transform; the kernel (`build_module`/grammar) is **unchanged** (a structured
    sort name `List{X}` / parameter sort `X$Elt` is just a string-keyed sort). All byte-conformant vs the
    binary (`conformance/{theory-nonexec,theory-import,view-good,param-module,instantiation}.maude`).
@@ -36,18 +36,44 @@ prelude load.
    - **(B-iv) instantiation `M{V}` — DONE** (`ac6b30e`): `ModuleExpr::Instantiation`; the view-table threaded
      through `flatten`; the instance substitutes `X$s ↦` the view's sort image and `Base{…X…} ↦ Base{…V…}`,
      importing the view's target. **Common case** (single/multi-param module-view, sort-only views).
-   - **(B-v) the container prelude — NEXT:** `LIST`/`SET`/`MAP`/`ARRAY` + the basic theories
-     (`TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT`) + the 39 standard views + the Diophantine solver, on the
-     real `.maude` `NAT`/`BOOL` prelude. **This forces the B-iv deferrals** (noted in `flatten.rs`): view
-     **operator maps**, a **parameterized view target** (`to LIST{X}`), the **import-vs-view-target dedup**
-     (a base `protecting NAT` instantiated by a view targeting `NAT`), the theory-vs-module-declared sort
-     distinction in the parameter copy, and **free-vs-bound nested instantiation** (A5 §4 top risk) — plus
-     the still-unparsed structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts and structured-sort `mb`.
+
+   **Axis A — the remaining *parameterization* work (the deferred B-iv corner cases). NEXT.** Each is
+   **self-contained** — provable with hand-rolled modules (no real prelude), so each is a small increment in
+   the B-i…iv rhythm. Noted inline in `flatten.rs`:
+   - **A1 view operator maps** (`op f to g`, `op 0 to term 0.0`) — small; extend `instantiate_decls` to
+     rewrite op names + statement bubbles. Forced by `DEFAULT`/`Float0`, `ARRAY`.
+   - **A2 parameterized view target** (`view List{X} … to LIST{X}`) — medium. Forced by nested containers.
+   - **A3 import-vs-view-target dedup** (a base `protecting NAT` instantiated by a view targeting `NAT`) —
+     small; *probably already handled* by the shared `visited` set, but **unverified** (needs a clean,
+     well-typed differential test). Forced by every real `LIST{Nat}`.
+   - **A4 theory- vs module-declared sorts** in the parameter copy (a theory `protecting BOOL` must keep
+     `Bool`, not `X$Bool`) — medium; needs sort provenance. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
+   - **A5 free-vs-bound nested instantiation** (`LIST{List{Nat}}`; a param-module importing a param-module)
+     — **the hard one** (A5 §4 top risk); deserves real care.
+   - Related parser gaps: the structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts, and `mb` over a
+     structured sort.
+   - **Built-engine edge already found** (`gaps.md`): instantiation flattens `M`'s statement *bubbles* into
+     the instance and builds them there, so it never builds `M` standalone — a statement ill-typed in `M`
+     but well-typed after instantiation is wrongly accepted (Maude builds+rejects `M` once). Ill-formed-spec
+     only; well-formed prelude modules typecheck in `M`.
+
    **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
-   parameterization is the critical path). **Reference:** `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude.** Wire the `.maude` prelude/library on top of (1)+(2): `BOOL`/`NAT`/`INT`/`RAT`/
-   `FLOAT`/`STRING`/`QID` are built; add the containers + basic theories (`TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/
-   `DEFAULT`) + standard views + the Diophantine solver. Ports as data (only the hooks are wired).
+   parameterization is the critical path to it). **Reference:** `reports/A5-modules-parameterization-repl.md`.
+3. **The real prelude — loading the actual library. Depends on a NEW substrate, not just Pillar B.** The
+   container prelude (`LIST`/`SET`/`MAP`/`ARRAY` + `TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT` + the 39
+   standard views) needs **Axis A** *and* this item's substrate — empirically, the real `BOOL` (base of
+   everything) does **not** load today, blocked on two distinct features:
+   - **Polymorphic operators (`poly` / the `Universal` sort)** — `op if_then_else_fi : Bool Universal
+     Universal -> Universal [poly (2 3 0)]`, `_==_`/`_=/=_ : Universal Universal -> Bool [poly (1 2)]`. A
+     `Universal`-typed op is instantiated per connected component. This is the actual `BOOL`→`NAT`→`LIST`
+     blocker and unlocks far more than containers (`==`/`=/=`/`if_then_else_fi` everywhere). The
+     `SystemTrue`/`SystemFalse` hooks and kind variables (`var B : [Bool]`) come with it.
+   - **Wiring the `.maude` prelude as data** — our `BOOL`/`NAT`/`INT`/`RAT`/`FLOAT`/`STRING`/`QID` are built
+     from hand-rolled per-fixture signatures today; this loads Maude's actual modules (only the hooks wired).
+   - The **Diophantine solver** is *separable* — an AC-matcher throughput optimization (`gaps.md`); the naive
+     matcher already gives correct counts. Needed for heavy AC `search` at scale, not for the prelude to load.
+
+   So **"load `LIST{Nat}` from the real prelude" = Axis A ∩ this substrate** — it is not a pure-Pillar-B task.
 4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). Reference:
    `reports/A6-operational.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
@@ -90,9 +116,13 @@ cross-checks.
 
 ## Risk register (forward items)
 
-1. **Parameterization corner cases** (Phase 2) — the bulk of the module work; free vs bound params,
-   theory/module views, parameterized views, nested instantiation. → Conformance from the prelude + manual.
-2. **AC/collapse matching at scale** — the naive matcher is correct but un-optimized; porting Maude's
+1. **Parameterization corner cases** (Phase 2, "Axis A" — the B-iv deferrals) — free vs bound params (A5,
+   the deepest), theory/module-declared sorts (A4), parameterized views (A2), op-maps (A1), the
+   import/target dedup (A3). Each is self-contained (hand-rolled fixtures, no real prelude). → Differential.
+2. **`poly`/`Universal` polymorphism** (Phase 2 item 3) gates loading the *real* `BOOL`→`NAT`→`LIST` chain
+   (a `Universal`-typed op instantiated per connected component); a separate feature from parameterization.
+   → Differential against `prelude.maude`'s `TRUTH`/`BOOL`/`NAT`.
+3. **AC/collapse matching at scale** — the naive matcher is correct but un-optimized; porting Maude's
    bipartite/Diophantine matcher is a perf prerequisite for heavy AC search. → Differential `xmatch`/`search`.
 3. **BDD backend maturity** (Phase 3) gates all symbolic features. → Prototype `biodivine-lib-bdd` early
    (the `SortBdds` sort-function + AllSat path) before committing.

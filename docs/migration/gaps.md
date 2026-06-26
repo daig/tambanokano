@@ -91,6 +91,14 @@ correctness fix.
   reduction (a signal-checked reduce loop — the real concern once `rew`/`search` can diverge). Note: this is
   *not* the rejected F-1 "no-op rewrite guard" — Maude itself loops on `eq a = a`, and we match that; adding a
   guard would *introduce* a divergence.
+- **Parameterized-module statements built only at the instance (Pillar B-iv).** Instantiation `M{V}` flattens
+  `M`'s statement *bubbles* into the instance and builds them there; we never build the parameterized module
+  `M` standalone. So a statement that is **ill-typed in `M` but well-typed after the substitution** is
+  wrongly accepted, where Maude builds-and-rejects `M` once (the rejected statement never reaches the
+  instance). Ill-formed-spec only — every well-formed prelude module typechecks in `M` — but it is a genuine
+  architectural asymmetry vs. Maude's build-then-instantiate. (The rest of the Pillar-B "Axis A" deferrals —
+  view op-maps, parameterized view targets, the import/target dedup, theory/module-declared sorts, free-vs-
+  bound nested instantiation — are *unbuilt features*, tracked in `roadmap.md` item 2, not built-engine gaps.)
 
 ## Resolved (here for cross-reference; detail in git history)
 

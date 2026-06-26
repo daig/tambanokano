@@ -21,8 +21,12 @@ decisions doc).
 
 **Phase 2 in progress.** Pillar A (the *rewriting* layer) is **done**: rules (`rl`/`crl` incl. the rewrite
 `=>` condition), `rewrite`/`frewrite`, `search` (+ state graph, `such that`, `show path`/`graph`),
-`continue` — all conformance-verified, so system modules (`mod`) run. **Next:** parameterized programming
-(theories/views/instantiation → the container prelude), then strategies + objects/IO. See `roadmap.md`.
+`continue` — all conformance-verified, so system modules (`mod`) run. Pillar B's parameterization
+**mechanism** is **done** (B-i…iv: theories `fth`/`th`, views, parameterized modules + `X$Elt` + structured
+sorts, instantiation `M{V}` — all conformance-verified, all as a pure `tnk-modules` `PreModule` transform).
+**Next:** "Axis A" — the deferred B-iv corner cases (op-maps, parameterized view targets, dedup, theory/
+module sorts, free-vs-bound nested). Loading the *real* container prelude additionally needs `poly`/
+`Universal` polymorphism (a separate feature). Then strategies + objects/IO. See `roadmap.md`.
 
 ## Crate layout
 
