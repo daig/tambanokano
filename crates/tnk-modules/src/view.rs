@@ -70,9 +70,11 @@ pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Re
         .ok_or_else(|| format!("view `{}`: target module `{to_name}` is not defined", v.name))?;
 
     // Flatten both so imported sorts (e.g. `Elt` from an `including TRIV`, `Bool` from `protecting BOOL`)
-    // are in scope for the checks.
-    let from_flat = flatten(from_name, db, interner)?;
-    let to_flat = flatten(to_name, db, interner)?;
+    // are in scope for the checks. A view's `from`/`to` are non-instantiated modules (a parameterized view
+    // target is a follow-up), so an empty view table suffices for these flattens.
+    let no_views = ViewDb::new();
+    let from_flat = flatten(from_name, db, &no_views, interner)?;
+    let to_flat = flatten(to_name, db, &no_views, interner)?;
     let from_sorts: HashSet<&str> = from_flat.sorts.iter().map(String::as_str).collect();
     let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
 

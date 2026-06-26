@@ -102,6 +102,16 @@ fn parameterized_module_through_repl() {
     assert!(out.contains("result NzCtr{X}: inc(inc(zero))"), "least sort over structured sorts: {out}");
 }
 
+/// B-iv: parameterized-module instantiation through the REPL end-to-end — a single-parameter `BOX{ToColor}`
+/// (structured instance sort `Box{ToColor}`, view-image sort `Hue`) and a multi-parameter `PR{VA, VB}`.
+#[test]
+fn instantiation_through_repl() {
+    let out = repl().eval(conformance_file!("instantiation.maude")).output;
+    assert!(out.contains("result Box{ToColor}: wrap(green)"), "structured instance sort: {out}");
+    assert!(out.contains("result Hue: green"), "view-image sort: {out}");
+    assert!(out.contains("result SA: a"), "multi-parameter instantiation: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

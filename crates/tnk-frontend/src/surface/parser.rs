@@ -538,7 +538,8 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    /// `NAME | '(' module_expr ')'`. A `{` after a name is parameterized instantiation (Phase 2).
+    /// `NAME ('{' arg (',' arg)* '}')? | '(' module_expr ')'`. A `{…}` after a name is a parameterized
+    /// instantiation `M{V, …}` (B-iv) — one view-name argument per parameter.
     fn module_atom(&mut self) -> PResult<ModuleExpr> {
         if self.at("(") {
             self.advance();
@@ -546,13 +547,28 @@ impl<'a> Parser<'a> {
             self.eat(")")?;
             return Ok(e);
         }
-        let name = self.name()?;
+        let mut e = ModuleExpr::Named(self.name()?);
         if self.at("{") {
-            return Err(format!(
-                "parameterized module instantiation `{name}{{…}}` is Phase 2 (theories/views)"
-            ));
+            e = ModuleExpr::Instantiation(Box::new(e), self.instantiation_args()?);
         }
-        Ok(ModuleExpr::Named(name))
+        Ok(e)
+    }
+
+    /// The argument list of an instantiation `{V1, V2, …}` — view names (a nested module expression or a
+    /// bound parameter argument is a follow-up).
+    fn instantiation_args(&mut self) -> PResult<Vec<String>> {
+        self.eat("{")?;
+        let mut args = Vec::new();
+        loop {
+            args.push(self.name()?);
+            if self.at(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat("}")?;
+        Ok(args)
     }
 
     /// A renaming `( sort A to B , op f to g , … )`. Disambiguated op renaming (`op f : A -> B to g`) is
@@ -1039,13 +1055,22 @@ endv
         assert!(err.contains("B-iv"), "got: {err}");
     }
 
-    /// Parameterized instantiation is Phase 2 — rejected loudly.
+    /// B-iv: a parameterized instantiation `LIST{Nat}` parses into `ModuleExpr::Instantiation`; a
+    /// multi-argument `MAP{Nat, String}` carries one view name per parameter.
     #[test]
-    fn parameterized_instantiation_rejected() {
-        let src = "fmod M is protecting LIST { Nat } . endfm\n";
-        let mut i = Interner::new();
-        let toks = tokenize(src, &mut i);
-        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
-        assert!(err.contains("Phase 2"), "got: {err}");
+    fn parses_instantiation() {
+        let m = &parse("fmod M is protecting LIST{Nat} . endfm\n").modules[0];
+        match &m.imports[0].expr {
+            ModuleExpr::Instantiation(base, args) => {
+                assert!(matches!(&**base, ModuleExpr::Named(n) if n == "LIST"));
+                assert_eq!(args, &["Nat".to_string()]);
+            }
+            other => panic!("expected Instantiation, got {other:?}"),
+        }
+        let m2 = &parse("fmod M is protecting MAP{Nat, String} . endfm\n").modules[0];
+        match &m2.imports[0].expr {
+            ModuleExpr::Instantiation(_, args) => assert_eq!(args, &["Nat".to_string(), "String".into()]),
+            other => panic!("expected Instantiation, got {other:?}"),
+        }
     }
 }

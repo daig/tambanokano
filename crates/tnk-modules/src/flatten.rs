@@ -9,14 +9,15 @@
 //! same-name op declarations into overloads). The combined module's own `imports` is empty — it is fully
 //! resolved — so the unchanged frontend `build_loaded_module` builds it directly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::Interner;
 use tnk_frontend::surface::ast::{
-    ModuleExpr, ModuleKind, OpDecl, PreModule, RenameItem, Statement, VarDecl,
+    ModuleExpr, ModuleKind, OpDecl, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
 };
 
 use crate::db::ModuleDb;
 use crate::rename::apply_renaming;
+use crate::view::ViewDb;
 
 /// The renamable declaration bundle of a (sub-)module expression — everything a renaming `* (…)` rewrites.
 #[derive(Debug)]
@@ -84,10 +85,16 @@ fn own_decls(pm: &PreModule) -> FlatDecls {
 }
 
 /// Flatten module `name`'s import closure into one combined [`PreModule`] named `name` (empty imports).
-pub fn flatten(name: &str, db: &ModuleDb, interner: &mut Interner) -> Result<PreModule, String> {
+/// `views` resolves any parameterized instantiation `M{V}` reached in the closure (B-iv).
+pub fn flatten(
+    name: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<PreModule, String> {
     let mut acc = Acc::default();
     let mut visited = HashSet::new();
-    collect_named(name, db, &mut acc, &mut visited, interner)?;
+    collect_named(name, db, views, &mut acc, &mut visited, interner)?;
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
     let (kind, is_theory) =
@@ -112,6 +119,7 @@ pub fn flatten(name: &str, db: &ModuleDb, interner: &mut Interner) -> Result<Pre
 fn collect_named(
     name: &str,
     db: &ModuleDb,
+    views: &ViewDb,
     acc: &mut Acc,
     visited: &mut HashSet<String>,
     interner: &mut Interner,
@@ -125,10 +133,10 @@ fn collect_named(
     let params: Vec<(String, String)> =
         pm.params.iter().map(|p| (p.name.clone(), p.theory.clone())).collect();
     for (param, theory) in &params {
-        add_parameter_copy(param, theory, db, acc, interner)?;
+        add_parameter_copy(param, theory, db, views, acc, interner)?;
     }
     for imp in &pm.imports {
-        collect_expr(&imp.expr, db, acc, visited, interner)?;
+        collect_expr(&imp.expr, db, views, acc, visited, interner)?;
     }
     let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
     acc.add(own_decls(pm)); // the module's own declarations, after its imports
@@ -148,12 +156,13 @@ fn add_parameter_copy(
     param: &str,
     theory: &str,
     db: &ModuleDb,
+    views: &ViewDb,
     acc: &mut Acc,
     interner: &mut Interner,
 ) -> Result<(), String> {
     let mut tmp = Acc::default();
     let mut tmp_visited = HashSet::new();
-    collect_named(theory, db, &mut tmp, &mut tmp_visited, interner)?;
+    collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
     let decls = tmp.into_decls();
     let items: Vec<RenameItem> = decls
         .sorts
@@ -168,15 +177,16 @@ fn add_parameter_copy(
 fn collect_expr(
     expr: &ModuleExpr,
     db: &ModuleDb,
+    views: &ViewDb,
     acc: &mut Acc,
     visited: &mut HashSet<String>,
     interner: &mut Interner,
 ) -> Result<(), String> {
     match expr {
-        ModuleExpr::Named(n) => collect_named(n, db, acc, visited, interner),
+        ModuleExpr::Named(n) => collect_named(n, db, views, acc, visited, interner),
         ModuleExpr::Sum(a, b) => {
-            collect_expr(a, db, acc, visited, interner)?;
-            collect_expr(b, db, acc, visited, interner)
+            collect_expr(a, db, views, acc, visited, interner)?;
+            collect_expr(b, db, views, acc, visited, interner)
         }
         ModuleExpr::Rename(inner, items) => {
             // `A * (R)` is a distinct module from `A`: key it by its canonical form so it merges once,
@@ -186,12 +196,163 @@ fn collect_expr(
             }
             let mut tmp = Acc::default();
             let mut tmp_visited = HashSet::new();
-            collect_expr(inner, db, &mut tmp, &mut tmp_visited, interner)?;
+            collect_expr(inner, db, views, &mut tmp, &mut tmp_visited, interner)?;
             let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
             acc.add(renamed);
             Ok(())
         }
+        ModuleExpr::Instantiation(base, args) => {
+            // `M{V, …}` merges once (keyed by its canonical instance name `M{V, …}`).
+            if !visited.insert(canonical_key(expr)) {
+                return Ok(());
+            }
+            let mname = match &**base {
+                ModuleExpr::Named(n) => n.as_str(),
+                _ => return Err("the base of an instantiation must be a named module (a nested \
+                                 instantiation / renaming base is a follow-up)"
+                    .into()),
+            };
+            instantiate(mname, args, db, views, acc, visited, interner)
+        }
     }
+}
+
+/// Instantiate the parameterized module `mname` with one view per parameter (B-iv): import each view's
+/// target module, then merge `mname`'s own declarations with the parameter substitution applied —
+/// `X$s ↦ V`'s sort image of `s`, and a structured sort `Base{…X…} ↦ Base{…V…}` (the parameter name
+/// replaced by the view name, Maude's instance naming).
+///
+/// Scope (B-iv common case): single/multi-parameter **module-view** instantiation with no operator maps
+/// (`TRIV`/sort-only views). Deferred — view operator maps (`op f to g` / `op 0 to term t`), a
+/// parameterized view target (`to LIST{X}`), and free-vs-bound nested instantiation.
+fn instantiate(
+    mname: &str,
+    args: &[String],
+    db: &ModuleDb,
+    views: &ViewDb,
+    acc: &mut Acc,
+    visited: &mut HashSet<String>,
+    interner: &mut Interner,
+) -> Result<(), String> {
+    let pm = db.get(mname).ok_or_else(|| format!("instantiated module `{mname}` is not defined"))?;
+    if pm.params.len() != args.len() {
+        return Err(format!(
+            "instantiation `{mname}{{…}}` has {} argument(s) but `{mname}` has {} parameter(s)",
+            args.len(),
+            pm.params.len()
+        ));
+    }
+
+    // Bind each parameter to its view, importing the view's target module.
+    let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
+    for (param, view_name) in pm.params.iter().zip(args) {
+        let v = views
+            .get(view_name)
+            .ok_or_else(|| format!("instantiation `{mname}{{…}}`: view `{view_name}` is not defined"))?;
+        let target = view_target(v)?;
+        collect_named(target, db, views, acc, visited, interner)?;
+        let sort_image: HashMap<String, String> = v.sort_maps.iter().cloned().collect();
+        bindings.insert(param.name.clone(), ParamBinding { view_name: view_name.clone(), sort_image });
+    }
+
+    // `M`'s regular imports (deduped via `visited`), then its own declarations with the substitution.
+    let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
+    for imp in &imports {
+        collect_expr(imp, db, views, acc, visited, interner)?;
+    }
+    let pm = db.get(mname).expect("present");
+    acc.add(instantiate_decls(own_decls(pm), &bindings));
+    Ok(())
+}
+
+/// One parameter's binding for instantiation: the view name (used to name structured sorts `Base{X}` →
+/// `Base{view}`) and the view's sort image map (`Elt ↦ Nat`, used for the parameter sort `X$Elt`).
+struct ParamBinding {
+    view_name: String,
+    sort_image: HashMap<String, String>,
+}
+
+/// The target module name of a (B-iv common-case) view — a plain named module.
+fn view_target(v: &ViewDecl) -> Result<&str, String> {
+    match &v.to {
+        ModuleExpr::Named(n) => Ok(n),
+        _ => Err(format!("view `{}`: a parameterized view target is a follow-up", v.name)),
+    }
+}
+
+/// Apply the instantiation substitution to a module's own declarations: rewrite every sort name through
+/// [`inst_sort`].
+fn instantiate_decls(mut d: FlatDecls, bindings: &HashMap<String, ParamBinding>) -> FlatDecls {
+    for s in &mut d.sorts {
+        *s = inst_sort(s, bindings);
+    }
+    for chain in &mut d.subsorts {
+        for group in chain {
+            for s in group {
+                *s = inst_sort(s, bindings);
+            }
+        }
+    }
+    for op in &mut d.ops {
+        for s in &mut op.domain {
+            *s = inst_sort(s, bindings);
+        }
+        op.range = inst_sort(&op.range, bindings);
+    }
+    for v in &mut d.vars {
+        v.sort = inst_sort(&v.sort, bindings);
+    }
+    // Statement bubbles reference operators and variables, not sort names, in the common case; operator
+    // maps (which would rewrite bubbles) are a deferred follow-up.
+    d
+}
+
+/// Instantiate one sort name. A parameter sort `X$s` becomes the view's image of `s`; a structured sort
+/// `Base{a, …}` has each argument instantiated (a bare parameter name `X` becomes its view name, the
+/// instance-naming rule); anything else is unchanged.
+fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
+    if let Some((base, args)) = split_structured(name) {
+        let new_args: Vec<String> = args
+            .iter()
+            .map(|a| match bindings.get(a.as_str()) {
+                Some(b) => b.view_name.clone(), // a bare parameter name → the view name
+                None => inst_sort(a, bindings),  // nested structured / parameter sort
+            })
+            .collect();
+        return format!("{base}{{{}}}", new_args.join(","));
+    }
+    if let Some((param, s)) = name.split_once('$')
+        && let Some(b) = bindings.get(param)
+    {
+        return b.sort_image.get(s).cloned().unwrap_or_else(|| s.to_string());
+    }
+    name.to_string()
+}
+
+/// Split a structured sort name `Base{arg, …}` into its base and top-level (comma-separated, brace-balanced)
+/// arguments; `None` if it is not structured.
+fn split_structured(name: &str) -> Option<(&str, Vec<String>)> {
+    let open = name.find('{')?;
+    if !name.ends_with('}') {
+        return None;
+    }
+    let base = &name[..open];
+    let inner = &name[open + 1..name.len() - 1];
+    let mut args = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (k, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(inner[start..k].to_string());
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    args.push(inner[start..].to_string());
+    Some((base, args))
 }
 
 /// A canonical string for a module expression, used as the `visited` dedup key.
@@ -210,6 +371,10 @@ fn canonical_key(expr: &ModuleExpr) -> String {
                 .collect();
             format!("({} * ({}))", canonical_key(inner), parts.join(", "))
         }
+        ModuleExpr::Instantiation(base, args) => {
+            // The canonical instance name `M{V, …}` — Maude's `makeParameterInstanceName`.
+            format!("{}{{{}}}", canonical_key(base), args.join(","))
+        }
     }
 }
 
@@ -219,11 +384,17 @@ mod tests {
     use tnk_frontend::lex::tokenize;
     use tnk_frontend::surface::parser::Parser;
 
-    fn db_of(src: &str) -> (ModuleDb, Interner) {
+    fn db_of(src: &str) -> (ModuleDb, ViewDb, Interner) {
         let mut i = Interner::new();
         let toks = tokenize(src, &mut i);
         let s = Parser::new(&toks, &i).parse_source().expect("parse");
-        (ModuleDb::from_modules(s.modules), i)
+        let db = ModuleDb::from_modules(s.modules);
+        let mut views = ViewDb::new();
+        for v in s.views {
+            crate::view::validate_view(&v, &db, &mut i).expect("valid view");
+            views.insert(v);
+        }
+        (db, views, i)
     }
 
     /// A diamond (`TOP` imports `L` and `R`, both protecting `BASE`) includes `BASE`'s declarations
@@ -236,8 +407,8 @@ fmod L is protecting BASE . op l : S -> S . endfm
 fmod R is protecting BASE . op r : S -> S . endfm
 fmod TOP is protecting L . protecting R . endfm
 ";
-        let (db, mut i) = db_of(src);
-        let flat = flatten("TOP", &db, &mut i).expect("flatten");
+        let (db, views, mut i) = db_of(src);
+        let flat = flatten("TOP", &db, &views, &mut i).expect("flatten");
         assert_eq!(flat.sorts, ["S"], "BASE's sort S appears once despite two import paths");
         assert_eq!(flat.statements.len(), 1, "BASE's single equation is not duplicated");
         let opnames: Vec<String> =
@@ -248,8 +419,8 @@ fmod TOP is protecting L . protecting R . endfm
     /// An import-free module flattens to itself (so `load_program` handles single-module files).
     #[test]
     fn import_free_flattens_to_itself() {
-        let (db, mut i) = db_of("fmod M is sort S . op a : -> S [ctor] . endfm\n");
-        let flat = flatten("M", &db, &mut i).expect("flatten");
+        let (db, views, mut i) = db_of("fmod M is sort S . op a : -> S [ctor] . endfm\n");
+        let flat = flatten("M", &db, &views, &mut i).expect("flatten");
         assert!(flat.imports.is_empty());
         assert_eq!(flat.sorts, ["S"]);
     }
@@ -259,21 +430,44 @@ fmod TOP is protecting L . protecting R . endfm
     /// formal parameters remain.
     #[test]
     fn parameter_copy_introduces_param_sort() {
-        let (db, mut i) = db_of(
+        let (db, views, mut i) = db_of(
             "fth TRIV is sort Elt . endfth\n\
              fmod BOX{X :: TRIV} is sort Box{X} . op b : X$Elt -> Box{X} [ctor] . endfm\n",
         );
-        let flat = flatten("BOX", &db, &mut i).expect("flatten");
+        let flat = flatten("BOX", &db, &views, &mut i).expect("flatten");
         assert!(flat.sorts.contains(&"X$Elt".to_string()), "X$Elt present: {:?}", flat.sorts);
         assert!(flat.sorts.contains(&"Box{X}".to_string()), "Box{{X}} present: {:?}", flat.sorts);
         assert!(flat.params.is_empty(), "no formal parameters remain after flattening");
     }
 
+    /// B-iv: instantiation `BOX{V}` resolves to the parameter sort's view image and the structured sort's
+    /// instance name — `X$Elt ↦ Hue` (the view's `sort Elt to Hue`) and `Box{X} ↦ Box{V}`. The view's
+    /// target module's sorts (`Hue`) are imported.
+    #[test]
+    fn instantiation_substitutes_param_and_structured_sorts() {
+        let (db, views, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod COLOR is sort Hue . op red : -> Hue [ctor] . endfm\n\
+             view V from TRIV to COLOR is sort Elt to Hue . endv\n\
+             fmod BOX{X :: TRIV} is sort Box{X} . op wrap : X$Elt -> Box{X} [ctor] . endfm\n\
+             fmod USE is protecting BOX{V} . endfm\n",
+        );
+        let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
+        assert!(flat.sorts.contains(&"Box{V}".to_string()), "structured instance sort: {:?}", flat.sorts);
+        assert!(flat.sorts.contains(&"Hue".to_string()), "view target sort imported: {:?}", flat.sorts);
+        assert!(!flat.sorts.contains(&"X$Elt".to_string()), "parameter sort is substituted away");
+        assert!(!flat.sorts.contains(&"Box{X}".to_string()), "parameterized sort is instantiated");
+        // `wrap` now has domain `Hue` (the view image of `X$Elt`).
+        let wrap = flat.ops.iter().find(|o| i.resolve(o.name[0].sym) == "wrap").expect("wrap op");
+        assert_eq!(wrap.domain, ["Hue"], "X$Elt domain substituted to the view image");
+        assert_eq!(wrap.range, "Box{V}");
+    }
+
     /// An undefined imported module is a loud error.
     #[test]
     fn unknown_import_errors() {
-        let (db, mut i) = db_of("fmod M is protecting NOPE . endfm\n");
-        let err = flatten("M", &db, &mut i).unwrap_err();
+        let (db, views, mut i) = db_of("fmod M is protecting NOPE . endfm\n");
+        let err = flatten("M", &db, &views, &mut i).unwrap_err();
         assert!(err.contains("not defined"), "got: {err}");
     }
 }

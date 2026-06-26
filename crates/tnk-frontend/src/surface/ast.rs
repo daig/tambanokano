@@ -66,13 +66,16 @@ pub enum ImportMode {
     Including,
 }
 
-/// A (non-parameterized) module expression: a named module, a summation `A + B` (the union), or a
-/// renaming `M * (sort A to B, op f to g)`. Parameterized instantiation (`LIST{Nat}`) is Phase 2.
+/// A module expression: a named module, a summation `A + B` (the union), a renaming `M * (sort A to B, op f
+/// to g)`, or a parameterized **instantiation** `M{V1, …}` (Pillar B-iv) supplying a view per parameter.
 #[derive(Debug, Clone)]
 pub enum ModuleExpr {
     Named(String),
     Sum(Box<ModuleExpr>, Box<ModuleExpr>),
     Rename(Box<ModuleExpr>, Vec<RenameItem>),
+    /// `M{arg, …}` — instantiate the parameterized module `M` with one view argument per parameter. Each
+    /// argument is a view name (a nested module expression / bound parameter is a follow-up).
+    Instantiation(Box<ModuleExpr>, Vec<String>),
 }
 
 /// One mapping inside a renaming `* (…)`. Op renaming is by canonical name (disambiguated

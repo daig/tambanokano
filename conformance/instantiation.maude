@@ -1,0 +1,46 @@
+*** B-iv: parameterized-module instantiation M{V}. A view V supplies the concrete sorts for a
+*** parameter; the instance substitutes the parameter sort X$Elt by the view's sort image and
+*** names structured sorts Box{X} as Box{V}, importing the view's target module.
+
+*** -- single parameter --
+fth TRIV is sort Elt . endfth
+fmod COLOR is sort Hue . ops red green : -> Hue [ctor] . endfm
+view ToColor from TRIV to COLOR is sort Elt to Hue . endv
+
+fmod BOX{X :: TRIV} is
+  sort Box{X} .
+  op wrap : X$Elt -> Box{X} [ctor] .
+  op pick : Box{X} -> X$Elt .
+  var E : X$Elt .
+  eq pick(wrap(E)) = E .
+endfm
+
+fmod USE is
+  protecting BOX{ToColor} .
+  op recolor : Box{ToColor} -> Box{ToColor} .
+  var B : Box{ToColor} .
+  eq recolor(B) = wrap(green) .
+endfm
+
+red pick(wrap(red)) .                  *** red             (Hue,           1 rewrite)
+red recolor(wrap(red)) .               *** wrap(green)     (Box{ToColor},  1 rewrite)
+red pick(recolor(wrap(red))) .         *** green           (Hue,           2 rewrites)
+
+*** -- multiple parameters --
+fmod LEFT is sort SA . op a : -> SA [ctor] . endfm
+fmod RIGHT is sort SB . op b : -> SB [ctor] . endfm
+view VA from TRIV to LEFT is sort Elt to SA . endv
+view VB from TRIV to RIGHT is sort Elt to SB . endv
+
+fmod PR{X :: TRIV, Y :: TRIV} is
+  sort Pr{X,Y} .
+  op pr : X$Elt Y$Elt -> Pr{X,Y} [ctor] .
+  op fst : Pr{X,Y} -> X$Elt .
+  var P : X$Elt .
+  var Q : Y$Elt .
+  eq fst(pr(P, Q)) = P .
+endfm
+
+fmod U is protecting PR{VA, VB} . endfm
+
+red fst(pr(a, b)) .                    *** a               (SA,            1 rewrite)

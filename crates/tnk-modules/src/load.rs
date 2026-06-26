@@ -38,20 +38,22 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     let names: Vec<String> = pre.iter().map(|m| m.name.clone()).collect();
     let db = ModuleDb::from_modules(pre);
 
-    let mut modules = Vec::with_capacity(names.len());
-    let mut module_index = HashMap::new();
-    for (idx, name) in names.iter().enumerate() {
-        let flat = flatten(name, &db, &mut interner)?;
-        modules.push(build_loaded_module(&flat, &mut interner)?);
-        module_index.insert(name.clone(), idx);
-    }
-
-    // Views (B-ii): validate each against the module DB, then store. A bad view aborts the load with the
-    // reference binary's diagnostic.
+    // Views first (B-ii): validate each against the module DB, then store — so a parameterized
+    // instantiation `M{V}` reached while flattening a module can resolve its view (B-iv). A bad view aborts
+    // the load with the reference binary's diagnostic.
     let mut views = ViewDb::new();
     for v in pre_views {
         validate_view(&v, &db, &mut interner)?;
         views.insert(v);
+    }
+
+    // Then flatten + build each module (instantiations resolve against `views`).
+    let mut modules = Vec::with_capacity(names.len());
+    let mut module_index = HashMap::new();
+    for (idx, name) in names.iter().enumerate() {
+        let flat = flatten(name, &db, &views, &mut interner)?;
+        modules.push(build_loaded_module(&flat, &mut interner)?);
+        module_index.insert(name.clone(), idx);
     }
     Ok(Program { interner, modules, module_index, views, commands })
 }
@@ -211,6 +213,23 @@ mod tests {
                 e("Ctr{X}", "zero", 1),
                 e("NzCtr{X}", "inc(inc(zero))", 3),
                 e("NzCtr{X}", "inc(zero)", 1),
+            ],
+        );
+    }
+
+    /// B-iv: parameterized-module instantiation `M{V}`. The single-parameter `BOX{ToColor}` substitutes
+    /// the parameter sort (`X$Elt ↦ Hue`) and names structured sorts (`Box{X} ↦ Box{ToColor}`), importing
+    /// the view's target; the multi-parameter `PR{VA, VB}` binds each parameter independently. All four
+    /// results/sorts/counts are byte-identical to the reference binary.
+    #[test]
+    fn instantiation_conforms() {
+        conform(
+            conformance_file!("instantiation.maude"),
+            &[
+                e("Hue", "red", 1),
+                e("Box{ToColor}", "wrap(green)", 1),
+                e("Hue", "green", 2),
+                e("SA", "a", 1),
             ],
         );
     }

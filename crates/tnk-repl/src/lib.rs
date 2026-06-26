@@ -189,7 +189,7 @@ impl Repl {
         let name = pm.name.clone();
         self.last = None; // a (re)built module invalidates any saved rewrite continuation
         self.db.insert(pm);
-        let built = flatten(&name, &self.db, &mut self.interner)
+        let built = flatten(&name, &self.db, &self.views, &mut self.interner)
             .and_then(|flat| build_loaded_module(&flat, &mut self.interner));
         match built {
             Ok(lm) => {
@@ -674,6 +674,7 @@ fn module_expr_str(e: &ModuleExpr) -> String {
         ModuleExpr::Named(n) => n.clone(),
         ModuleExpr::Sum(a, b) => format!("{} + {}", module_expr_str(a), module_expr_str(b)),
         ModuleExpr::Rename(inner, _) => format!("{} * (…)", module_expr_str(inner)),
+        ModuleExpr::Instantiation(base, args) => format!("{}{{{}}}", module_expr_str(base), args.join(", ")),
     }
 }
 
