@@ -37,19 +37,28 @@ prelude load.
      through `flatten`; the instance substitutes `X$s ↦` the view's sort image and `Base{…X…} ↦ Base{…V…}`,
      importing the view's target. **Common case** (single/multi-param module-view, sort-only views).
 
-   **Axis A — the remaining *parameterization* work (the deferred B-iv corner cases). NEXT.** Each is
-   **self-contained** — provable with hand-rolled modules (no real prelude), so each is a small increment in
-   the B-i…iv rhythm. Noted inline in `flatten.rs`:
-   - **A1 view operator maps** (`op f to g`, `op 0 to term 0.0`) — small; extend `instantiate_decls` to
-     rewrite op names + statement bubbles. Forced by `DEFAULT`/`Float0`, `ARRAY`.
-   - **A2 parameterized view target** (`view List{X} … to LIST{X}`) — medium. Forced by nested containers.
+   **Axis A — the remaining *parameterization* work (the deferred B-iv corner cases).** Each is
+   **self-contained** — provable with hand-rolled modules (no real prelude), a small increment in the
+   B-i…iv rhythm. Noted inline in `flatten.rs`.
+   - **A1 view operator maps** (`op f to g`, `op 0 to term 0.0`) — **DONE** (`a35dbaf`): `instantiate_decls`
+     substitutes the views' op-maps into the instance's statement bubbles (`subst_ops`).
    - **A3 import-vs-view-target dedup** (a base `protecting NAT` instantiated by a view targeting `NAT`) —
-     small; *probably already handled* by the shared `visited` set, but **unverified** (needs a clean,
-     well-typed differential test). Forced by every real `LIST{Nat}`.
-   - **A4 theory- vs module-declared sorts** in the parameter copy (a theory `protecting BOOL` must keep
-     `Bool`, not `X$Bool`) — medium; needs sort provenance. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
-   - **A5 free-vs-bound nested instantiation** (`LIST{List{Nat}}`; a param-module importing a param-module)
-     — **the hard one** (A5 §4 top risk); deserves real care.
+     **DONE / verified** (`74aaf2e`): already handled by the shared `visited` set; pinned with a
+     membership-bearing differential fixture (a double-merge would inflate the count — it doesn't).
+   - **A4 theory- vs module-declared sorts** in the parameter copy (a theory `protecting BOOL` keeps `Bool`,
+     not `X$Bool`) — **DONE** (`afc8987`): `module_origin_sorts` excludes module-imported sorts from the
+     `X$` qualifier. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
+   - **A2 + A5 — parameterized views + free-vs-bound nested instantiation. NEXT, and the hard pair.** These
+     are one entangled feature: a parameterized view `view List{X :: TRIV} … to LIST{X}` can only be
+     *exercised* by a nested instantiation (`LIST{List{Nat}}` = `LIST` instantiated with the view `List`
+     applied to `Nat`). The **parsing** is tractable (parameterized view names via the existing `param_list`;
+     nested instantiation args become a module/view *expression*, not a bare name). The **algebra** is the
+     genuinely fragile part (A5 §4 "top risk / bulk of the work"): a parameterized view `BoxV{ToColor}`
+     derives a view whose target `BOX{X}` becomes `BOX{ToColor}`, which then feeds the outer instantiation,
+     with the **free-vs-bound** parameter resolution and the **instance-name composition** (`Box{X}` ↦
+     `Box{BoxV{ToColor}}` while `X$Elt` ↦ `Box{ToColor}`). Probe (binary): `peek(wrap(wrap(red)))` in
+     `BOX{BoxV{ToColor}}` → `wrap(red)` : `Box{ToColor}`, 1 rw. Deserves a fresh-context design pass, not an
+     end-of-budget rush. Reference: `instantiateModuleWith{Free,Bound}Parameters.cc` + `parameterization.cc`.
    - Related parser gaps: the structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts, and `mb` over a
      structured sort.
    - **Built-engine edge already found** (`gaps.md`): instantiation flattens `M`'s statement *bubbles* into
