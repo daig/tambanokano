@@ -502,6 +502,46 @@ fn traced_crl_backtrack() {
     assert!(s.contains("*********** rule\ncrl f(X) => h(Y) if Y := X .\nX --> b\nY --> b\nf(b)\n--->\nh(b)"), "rule fires:\n{s}");
 }
 
+/// Pillar A-iv: `search` over the state-transition graph, byte-matching the reference
+/// (`conformance/search.maude`). The four arrows, hash-consing (b,c collapse onto one d state),
+/// `such that`, and a lazy bounded `[1]` + `continue` (c generated post-reset shows rewrites 1).
+#[test]
+fn search_command_through_repl() {
+    let out = repl().eval(conformance_file!("search.maude")).output;
+    // =>1: exactly the one-step successors b, c (states 3, rewrites 2 at the end).
+    assert!(out.contains("search in NDET : a =>1 X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> b"), "=>1 sol1:\n{out}");
+    assert!(out.contains("Solution 2 (state 2)\nstates: 3  rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> c\n\nNo more solutions.\nstates: 3  rewrites: 2"), "=>1 sol2+end:\n{out}");
+    // =>* includes the initial state 0 at rewrites 0.
+    assert!(out.contains("search in NDET : a =>* X .\n\nSolution 1 (state 0)\nstates: 1  rewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> a"), "=>* state 0:\n{out}");
+    // =>! finds only the normal form e (whole graph explored: states 5, rewrites 5).
+    assert!(out.contains("search in NDET : a =>! X .\n\nSolution 1 (state 4)\nstates: 5  rewrites: 5 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> e\n\nNo more solutions."), "=>! e:\n{out}");
+    // such that filters to state 3 (d), but exploration still finishes the whole graph.
+    assert!(out.contains("such that X = d .\n\nSolution 1 (state 3)\nstates: 4  rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> d\n\nNo more solutions.\nstates: 5  rewrites: 5"), "such-that:\n{out}");
+    // [1] then continue: the second solution c is generated lazily during continue, so rewrites: 1.
+    assert!(out.contains("search [1] in NDET : a =>+ X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> b\n\nSolution 2 (state 2)\nstates: 3  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> c"), "bounded+continue:\n{out}");
+}
+
+/// `show path N` and `show search graph` for the last search, byte-matching the reference.
+#[test]
+fn search_show_path_and_graph() {
+    let s = run_session(
+        "mod NDET is sort St . ops a b c d e : -> St . var X : St . \
+         rl a => b . rl a => c . rl b => d . rl c => d . rl d => e . endm\n\
+         search a =>! X .\n\
+         show path 4 .\n\
+         show search graph .",
+    );
+    assert!(
+        s.contains("state 0, St: a\n===[ rl a => b . ]===>\nstate 1, St: b\n===[ rl b => d . ]===>\nstate 3, St: d\n===[ rl d => e . ]===>\nstate 4, St: e"),
+        "show path:\n{s}"
+    );
+    assert!(
+        s.contains("state 0, St: a\narc 0 ===> state 1 (rl a => b .)\narc 1 ===> state 2 (rl a => c .)"),
+        "show graph state 0:\n{s}"
+    );
+    assert!(s.contains("state 3, St: d\narc 0 ===> state 4 (rl d => e .)"), "show graph state 3:\n{s}");
+}
+
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
 #[test]
 fn rule_in_fmod_is_rejected() {

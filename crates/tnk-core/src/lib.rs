@@ -17,6 +17,8 @@ pub mod id;
 pub mod root;
 // Pillar A: resumable `rewrite`/`frewrite` sessions over the rule machinery in `engine`.
 pub mod rewrite;
+// Pillar A-iv: the reachable-state graph + breadth-first `search`.
+pub mod search;
 pub mod sort;
 pub mod symbol;
 pub mod term;

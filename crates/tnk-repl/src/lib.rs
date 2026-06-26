@@ -12,13 +12,16 @@ mod wrap;
 
 use std::collections::HashMap;
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
+use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
+use tnk_core::search::Search;
+use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::load::{
     build_loaded_module, command_echo, format_matchers, frewrite_command, match_command, reduce_command,
-    rewrite_command, LoadedModule,
+    rewrite_command, search_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
-use tnk_frontend::surface::ast::{Command, PreModule, TopItem};
+use tnk_frontend::surface::ast::{Command, PreModule, SearchArrow, TopItem};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::flatten::flatten;
@@ -47,11 +50,27 @@ pub struct Repl {
     color: bool,
     /// The full `trace` flags (`set trace [<option>] on|off`); `master` off by default.
     trace: TraceFlags,
-    /// The last resumable `rewrite`/`frewrite` session and the module name it ran in, for `continue`.
-    /// Any non-`continue` command (or a module rebuild / `select`) clears it — Maude's continuation
-    /// invalidation. Stays valid between commands because the REPL runs with in-reduction GC off, so the
-    /// session's term is never collected.
-    last: Option<(String, Rewriting)>,
+    /// The last resumable session (`rewrite`/`frewrite` or `search`) and the module name it ran in, for
+    /// `continue` (and `show path`/`show search graph`). Any non-`continue` command (or a module rebuild /
+    /// `select`) clears it — Maude's continuation invalidation. Stays valid between commands because the
+    /// REPL runs with in-reduction GC off, so the session's terms are never collected.
+    last: Option<(String, Continuation)>,
+}
+
+/// A resumable session stored for `continue` / `show`.
+enum Continuation {
+    /// A `rewrite`/`frewrite` session.
+    Rewrite(Rewriting),
+    /// A `search` session (the state graph + the goal's variable index for rendering). Boxed: the search
+    /// state graph is much larger than a `Rewriting`, so this keeps the enum (and the `last` slot) small.
+    Search(Box<SearchSession>),
+}
+
+/// A `search` session plus what the REPL needs to render and resume it.
+struct SearchSession {
+    search: Search,
+    /// The goal pattern's variables (for the `X:Sort --> value` solution lines).
+    vars: VarIndex,
 }
 
 impl Repl {
@@ -208,7 +227,7 @@ impl Repl {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                         out.push_str(&format!("rewrite{bound_str} in {cur} : {echo} .\n{body}"));
                         // `lm`'s borrow ends above; save the session so `continue` can resume it.
-                        self.last = Some((cur.clone(), rw));
+                        self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
@@ -225,13 +244,34 @@ impl Repl {
                     Ok(mut rw) => {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                         out.push_str(&format!("frewrite{bound_str} in {cur} : {echo} .\n{body}"));
-                        self.last = Some((cur.clone(), rw));
+                        self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that } => {
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.set_trace(false); // search is not traced (yet)
+                lm.built.engine.set_record_whole(false);
+                let header = search_header(lm, &self.interner, &subject, arrow, &pattern, such_that.as_deref(), self.color);
+                let bound_str = match (max_solutions, max_depth) {
+                    (None, None) => String::new(),
+                    (Some(n), None) => format!(" [{n}]"),
+                    (Some(n), Some(m)) => format!(" [{n}, {m}]"),
+                    (None, Some(m)) => format!(" [, {m}]"),
+                };
+                match search_command(lm, &self.interner, &subject, arrow, &pattern, such_that.as_deref(), max_depth) {
+                    Ok((search, vars)) => {
+                        let mut session = SearchSession { search, vars };
+                        let body = render_search(&mut session, lm, &self.interner, self.color, max_solutions);
+                        out.push_str(&format!("search{bound_str} in {cur} : {header} .\n{body}"));
+                        self.last = Some((cur.clone(), Continuation::Search(Box::new(session))));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
             Command::Continue { bound } => match self.last.take() {
-                Some((m, mut rw)) if m == cur => {
+                Some((m, Continuation::Rewrite(mut rw))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.set_trace(self.trace.master);
                     lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
@@ -239,9 +279,19 @@ impl Repl {
                     lm.built.engine.reset_rewrites();
                     let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                     out.push_str(&body);
-                    self.last = Some((m, rw));
+                    self.last = Some((m, Continuation::Rewrite(rw)));
                 }
-                _ => out.push_str("No previous rewriting to continue in this module.\n"),
+                Some((m, Continuation::Search(mut session))) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    // `continue` reports the rewrites done in this continuation (Maude resets the count),
+                    // so states generated now snapshot a fresh count.
+                    lm.built.engine.reset_rewrites();
+                    let body = render_search(&mut session, lm, &self.interner, self.color, bound);
+                    out.push_str(&body);
+                    self.last = Some((m, Continuation::Search(session)));
+                }
+                // (`session` is a `Box<SearchSession>`; `&mut session` derefs to the inner session.)
+                _ => out.push_str("No previous rewriting or search to continue in this module.\n"),
             },
         }
     }
@@ -277,7 +327,35 @@ impl Repl {
                     None => "show module: no such module (and no current module).".into(),
                 }
             }
-            _ => "show: try `show module .` or `show modules .`".into(),
+            // `show path N .` — the transition path from the initial state to state N of the last search.
+            Some("path") => {
+                let n: Option<usize> = words.get(2).and_then(|s| s.parse().ok());
+                match (n, self.current.as_deref()) {
+                    (Some(n), Some(cur)) => match &self.last {
+                        Some((m, Continuation::Search(session))) if m == cur => {
+                            let lm = self.modules.get(cur).expect("current module is built");
+                            render_path(&session.search, lm, &self.interner, n, self.color)
+                        }
+                        _ => "show path: no current search (run `search` first).".into(),
+                    },
+                    (None, _) => "show path: expected a state number.".into(),
+                    _ => "show path: no current module.".into(),
+                }
+            }
+            // `show search graph .` — the whole reachable-state graph of the last search.
+            Some("search") if words.get(3).copied() == Some("graph") || words.get(2).copied() == Some("graph") => {
+                match self.current.as_deref() {
+                    Some(cur) => match &self.last {
+                        Some((m, Continuation::Search(session))) if m == cur => {
+                            let lm = self.modules.get(cur).expect("current module is built");
+                            render_graph(&session.search, lm, &self.interner, self.color)
+                        }
+                        _ => "show search graph: no current search.".into(),
+                    },
+                    None => "show search graph: no current module.".into(),
+                }
+            }
+            _ => "show: try `show module .` / `show modules .` / `show path N .` / `show search graph .`".into(),
         };
         Eval { output: out, exit: false }
     }
@@ -369,6 +447,125 @@ fn render_rewriting(
         format!("result (sort not calculated): {value}")
     };
     format!("{trace}rewrites: {rw_count} in 0ms cpu (0ms real) (~ rewrites/second)\n{result_line}\n")
+}
+
+/// The `search` command's echoed query: `{subject} {arrow} {pattern}[ such that {cond}]`.
+fn search_header(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    subject: &[Token],
+    arrow: SearchArrow,
+    pattern: &[Token],
+    such_that: Option<&[Token]>,
+    color: bool,
+) -> String {
+    let subj = command_echo(lm, i, subject, color).unwrap_or_else(|_| join_tokens(subject, i));
+    let arrow_str = match arrow {
+        SearchArrow::One => "=>1",
+        SearchArrow::Plus => "=>+",
+        SearchArrow::Star => "=>*",
+        SearchArrow::Bang => "=>!",
+    };
+    let mut h = format!("{subj} {arrow_str} {}", join_tokens(pattern, i));
+    if let Some(c) = such_that {
+        h.push_str(&format!(" such that {}", join_tokens(c, i)));
+    }
+    h
+}
+
+/// Pull up to `limit` more solutions from a search session, rendering each `Solution N (state K)` block;
+/// on exhaustion append `No more solutions.` + the final stats. Shared by `search` and `continue`.
+fn render_search(
+    session: &mut SearchSession,
+    lm: &mut LoadedModule,
+    i: &Interner,
+    color: bool,
+    limit: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0u64;
+    loop {
+        if limit == Some(shown) {
+            return out; // hit the per-invocation solution bound — continuable, no "No more solutions"
+        }
+        match session.search.next_solution(&mut lm.built.engine) {
+            Some(sol) => {
+                shown += 1;
+                let bindings = render_search_bindings(lm, i, &session.vars, &sol.bindings, color);
+                out.push_str(&format!(
+                    "\nSolution {} (state {})\nstates: {}  rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n{bindings}\n",
+                    sol.number, sol.state, sol.states, sol.rewrites
+                ));
+            }
+            None => {
+                let states = session.search.states();
+                let rewrites = lm.built.engine.rewrites();
+                out.push_str(&format!(
+                    "\nNo more solutions.\nstates: {states}  rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)\n"
+                ));
+                return out;
+            }
+        }
+    }
+}
+
+/// `Var --> value` lines for a search solution. The variable is rendered by its written name (Maude
+/// echoes a goal variable as written: a declared `X` prints `X`, an on-the-fly `X:Sort` prints
+/// `X:Sort` — the colon form is part of the variable name once on-the-fly variables are supported).
+fn render_search_bindings(lm: &LoadedModule, i: &Interner, vars: &VarIndex, bindings: &[DagId], color: bool) -> String {
+    if vars.count() == 0 {
+        return "empty substitution".to_string();
+    }
+    (0..vars.count())
+        .map(|k| {
+            let value = print_pretty(&lm.built, i, bindings[k as usize], color);
+            format!("{} --> {value}", vars.name(k))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render `show path N`: the transition sequence from state 0 to state `n` — `state K, Sort: value`
+/// lines separated by `===[ rule ]===>` arcs.
+fn render_path(search: &Search, lm: &LoadedModule, i: &Interner, n: usize, color: bool) -> String {
+    let steps = search.path(n);
+    if steps.is_empty() {
+        return format!("show path: no state {n}.");
+    }
+    let mut out = String::new();
+    for (idx, step) in steps.iter().enumerate() {
+        if idx > 0 {
+            let rb = step.via.map(|r| trace::rule_body(&lm.built, i, r, color)).unwrap_or_default();
+            out.push_str(&format!("===[ {rb} ]===>\n"));
+        }
+        let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(step.term));
+        let value = print_pretty(&lm.built, i, step.term, color);
+        out.push_str(&format!("state {}, {sort}: {value}\n", step.state));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render `show search graph`: every state and its forward arcs (`arc N ===> state T (rule)`).
+fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -> String {
+    let graph = search.graph();
+    let mut out = String::new();
+    for (idx, (sidx, term, arcs)) in graph.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(*term));
+        let value = print_pretty(&lm.built, i, *term, color);
+        out.push_str(&format!("state {sidx}, {sort}: {value}\n"));
+        let mut arc_n = 0;
+        for (target, rules) in arcs {
+            for rid in rules {
+                let rb = trace::rule_body(&lm.built, i, *rid, color);
+                out.push_str(&format!("arc {arc_n} ===> state {target} ({rb})\n"));
+                arc_n += 1;
+            }
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the

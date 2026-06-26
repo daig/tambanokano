@@ -66,6 +66,15 @@ correctness fix.
   are unaffected. The eager/lazy bit is already on `Symbol` (`strategy`); threading it through the traversal is
   a localized follow-up. (`frewrite_pass` also recurses on subject depth — shallow for object/config terms, an
   explicit-stack rewrite is the same follow-up as C12 if a deep rule structure ever appears.)
+- **On-the-fly colon variables (`X:Sort`).** The grammar only builds *declared* variables (`var`/`vars`);
+  an on-the-fly `X:Sort` written inline (the idiomatic `search` goal, and legal anywhere a term is) is not
+  parsed yet (`grammar/build.rs`). `search` goals therefore declare their variable (`var X : St .` then
+  `search a =>* X .`) — the search *engine* (state graph, arrows, `such that`, counts, `show path`/`graph`)
+  is byte-conformant (Pillar A-iv); this is a frontend parsing nicety (a colon-variable terminal class,
+  like the built-in literal terminals). Maude echoes a goal variable as written, so once added, an
+  on-the-fly `X:St` prints `X:St` and a declared `X` prints `X` (both already handled by name-only rendering).
+- **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
+  trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Cross-kind ad-hoc overloading.** Overload resolution handles single-kind (subsort) overloading; cross-kind
   ad-hoc overloading (arg-sort-driven kind selection) is `debug_assert`-guarded, not implemented. Idiomatic
   signatures don't need it; the prelude may.

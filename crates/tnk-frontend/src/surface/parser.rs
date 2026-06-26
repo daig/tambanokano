@@ -145,6 +145,30 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Frewrite { bound, term })
             }
+            "search" => {
+                self.advance();
+                let (max_solutions, max_depth) = self.opt_search_bound()?;
+                // The arrows `=>1`/`=>+`/`=>*`/`=>!` lex as single tokens (runs of non-punctuation).
+                let subject = self.collect_until(&["=>1", "=>+", "=>*", "=>!"]);
+                let arrow = match self.peek_text() {
+                    Some("=>1") => SearchArrow::One,
+                    Some("=>+") => SearchArrow::Plus,
+                    Some("=>*") => SearchArrow::Star,
+                    Some("=>!") => SearchArrow::Bang,
+                    other => return Err(format!("search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}")),
+                };
+                self.advance(); // the arrow
+                let pattern = self.collect_until(&["such"]);
+                let such_that = if self.at("such") {
+                    self.advance();
+                    self.eat("that")?;
+                    Some(self.collect_until(&[]))
+                } else {
+                    None
+                };
+                self.eat_dot()?;
+                TopItem::Command(Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that })
+            }
             "continue" | "cont" => {
                 // `continue n .` takes a **bare** number (unlike `rewrite [n]`'s bracketed bound); an
                 // omitted bound continues unbounded to the next normal form / solution.
@@ -473,6 +497,24 @@ impl<'a> Parser<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    /// An optional `search` bound `[n]` (max solutions) or `[n, m]` (max solutions, max depth). Returns
+    /// `(max_solutions, max_depth)`, both `None` when absent.
+    fn opt_search_bound(&mut self) -> PResult<(Option<u64>, Option<u64>)> {
+        if !self.at("[") {
+            return Ok((None, None));
+        }
+        self.advance();
+        let n = self.name()?.parse::<u64>().map_err(|_| "expected a number in search bound".to_string())?;
+        let m = if self.at(",") {
+            self.advance();
+            Some(self.name()?.parse::<u64>().map_err(|_| "expected a depth in search bound".to_string())?)
+        } else {
+            None
+        };
+        self.eat("]")?;
+        Ok((Some(n), m))
     }
 
     // ---- operator attributes ----

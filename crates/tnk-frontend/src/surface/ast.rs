@@ -143,8 +143,27 @@ pub enum Command {
     Rewrite { bound: Option<u64>, term: Vec<Token> },
     /// `frewrite [bound] term .` — position-fair rewriting (Pillar A-ii).
     Frewrite { bound: Option<u64>, term: Vec<Token> },
+    /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
+    /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
+    Search {
+        max_solutions: Option<u64>,
+        max_depth: Option<u64>,
+        subject: Vec<Token>,
+        arrow: SearchArrow,
+        pattern: Vec<Token>,
+        such_that: Option<Vec<Token>>,
+    },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
+}
+
+/// The reachability arrow of a `search` command (`=>1` / `=>+` / `=>*` / `=>!`).
+#[derive(Debug, Clone, Copy)]
+pub enum SearchArrow {
+    One,
+    Plus,
+    Star,
+    Bang,
 }
 
 /// One top-level item: a module definition or a command. The unit the REPL consumes one at a time

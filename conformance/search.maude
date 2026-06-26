@@ -1,0 +1,32 @@
+*** Pillar A-iv: `search` over a state-transition graph — the four arrows, `such that`, bounded `[n]`
+*** + `continue`. Byte-for-byte vs the reference (rate normalized):
+***   ~/Downloads/Maude-3/maude -no-banner conformance/search.maude < /dev/null
+***   ./target/debug/tnk-repl conformance/search.maude < /dev/null
+***
+*** Branching system: a => {b, c}; b,c => d (hash-consed to ONE state); d => e (e is a normal form).
+***   =>1  one step:        b, c                         (states 3, rewrites 2)
+***   =>+  one-or-more:     b, c, d, e                   (rewrites count every rule app, incl. c=>d to a
+***                                                        seen state: 1,2,3,_,5)
+***   =>*  zero-or-more:    a (state 0), b, c, d, e
+***   =>!  normal forms:    e only
+***   such that X = d:      only state 3 (d); the whole graph is still explored (final states 5)
+***   [1] + continue:       lazy — `continue` generates c AFTER a count reset, so c shows rewrites 1
+
+mod NDET is
+  sort St .
+  ops a b c d e : -> St .
+  var X : St .
+  rl a => b .
+  rl a => c .
+  rl b => d .
+  rl c => d .
+  rl d => e .
+endm
+
+search a =>1 X .
+search a =>+ X .
+search a =>* X .
+search a =>! X .
+search a =>* X such that X = d .
+search [1] a =>+ X .
+continue 1 .

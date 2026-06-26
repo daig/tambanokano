@@ -126,6 +126,21 @@ pub(crate) fn render_trace(
     r.out
 }
 
+/// Render a rule's body (`rl lhs => rhs .`) from `rl_traces[rule_id]` — used by `show path` /
+/// `show search graph` to annotate a state-graph arc. Reuses the trace body rendering.
+pub(crate) fn rule_body(m: &BuiltModule, i: &Interner, rule_id: u32, color: bool) -> String {
+    let r = Renderer {
+        m,
+        i,
+        flags: TraceFlags::default(),
+        color,
+        out: String::new(),
+        trial_counter: 0,
+        trial_stack: Vec::new(),
+    };
+    r.rl_body(&m.rl_traces[rule_id as usize])
+}
+
 struct Renderer<'a> {
     m: &'a BuiltModule,
     i: &'a Interner,

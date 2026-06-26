@@ -18,11 +18,12 @@ use crate::lex::{tokenize, Interner, Token};
 use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
-use crate::surface::ast::{Command, PreModule, Source, Statement};
+use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
 use std::collections::BTreeSet;
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
+use tnk_core::search::{Arrow, Search};
 use tnk_core::sort::SortId;
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
@@ -383,6 +384,46 @@ pub fn rewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> R
 pub fn frewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas: u64) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.frewrite(dag, gas))
+}
+
+/// Begin a `search` (Pillar A-iv): build the subject DAG + the goal pattern (a [`Term`], its variable
+/// names tracked for rendering) + the optional `such that` condition over the goal's variables, then
+/// open the [`Search`] for `arrow` up to `max_depth`. Returns the session and the goal's [`VarIndex`]
+/// (for the `Var:Sort --> value` solution lines).
+#[allow(clippy::too_many_arguments)]
+pub fn search_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    subject: &[Token],
+    arrow: SearchArrow,
+    pattern: &[Token],
+    such_that: Option<&[Token]>,
+    max_depth: Option<u64>,
+) -> Result<(Search, VarIndex), String> {
+    // Goal pattern + such-that condition share one variable index.
+    let mut vars = VarIndex::new();
+    let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
+    let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+    let cond = match such_that {
+        Some(c) => parse_condition(c, &lm.grammar, &lm.built, i, &mut vars, &mut bound)?,
+        None => Vec::new(),
+    };
+    let nr = vars.count();
+    // Subject as a ground DAG (reset the counter so the search's rewrites start clean).
+    lm.built.engine.reset_rewrites();
+    let subj_tree = parse_forest(subject, &lm.grammar, i)?;
+    lm.built.engine.begin_dedup();
+    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
+    lm.built.engine.end_dedup();
+    let subj = subj?;
+    let arrow = match arrow {
+        SearchArrow::One => Arrow::One,
+        SearchArrow::Plus => Arrow::Plus,
+        SearchArrow::Star => Arrow::Star,
+        SearchArrow::Bang => Arrow::Bang,
+    };
+    let search = lm.built.engine.search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32));
+    Ok((search, vars))
 }
 
 /// The matched-portion id (for `xmatch`) and binding ids of one match solution, captured while the

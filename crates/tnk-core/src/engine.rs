@@ -16,6 +16,7 @@ use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
 use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
+use crate::search::{Arrow, Search};
 use crate::sort::{SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
@@ -81,7 +82,7 @@ struct CompiledRule {
 /// matching fragment's pattern compiled to an [`LhsAutomaton`]. Built by
 /// [`Signature::compile_condition`]. The `fresh_vars` of a matching fragment are unbound before each
 /// match attempt so backtracking re-binds cleanly.
-enum CompiledFragment {
+pub(crate) enum CompiledFragment {
     Equality { lhs: Term, rhs: Term },
     SortTest { term: Term, sort: SortId },
     Matching { pattern: LhsAutomaton, subject: Term, fresh_vars: Vec<u32> },
@@ -2190,6 +2191,138 @@ impl Runtime {
         node
     }
 
+    /// Collect **every** one-step successor of `root` (Pillar A-iv `search`): each `(rule_id, term)` where
+    /// some rule, at some non-frozen position, rewrites `root` to `term` (path rebuilt to the root). Every
+    /// successor counts as one rewrite (Maude's search statistic). Unlike [`rewrite_step`](Self::rewrite_step)
+    /// (first applicable), this enumerates all rules × all matcher solutions at all positions.
+    fn state_successors(&mut self, sig: &Signature, root: DagId, out: &mut Vec<(u32, DagId)>) {
+        // Enumerate all non-frozen positions (a flattened parent/arg-index list for the path rebuild).
+        let mut positions = vec![RedexPos { node: root, parent: usize::MAX, arg_index: 0 }];
+        let mut i = 0;
+        while i < positions.len() {
+            let node = positions[i].node;
+            let symbol = self.node(node).symbol();
+            let children: Vec<DagId> = self.node(node).children().collect();
+            for (ai, c) in children.into_iter().enumerate() {
+                if !sig.symbol(symbol).is_frozen_arg(ai) {
+                    positions.push(RedexPos { node: c, parent: i, arg_index: ai });
+                }
+            }
+            i += 1;
+        }
+        // At each position, collect every (rule, result), splicing the result back to the root.
+        for pos_idx in 0..positions.len() {
+            let node = positions[pos_idx].node;
+            let mut local: Vec<(u32, DagId)> = Vec::new();
+            self.all_successors_at(sig, node, &mut local);
+            for (rule_id, result) in local {
+                let spliced = self.rebuild_path(sig, &positions, pos_idx, result);
+                out.push((rule_id, spliced));
+            }
+        }
+    }
+
+    /// Every `(rule_id, result)` of applying any of `node`'s symbol's rules (every matcher solution) at
+    /// `node` itself — the per-node enumerator behind [`state_successors`](Self::state_successors). Each
+    /// accepted result bumps the rewrite count.
+    fn all_successors_at(&mut self, sig: &Signature, node: DagId, out: &mut Vec<(u32, DagId)>) {
+        let symbol = self.node(node).symbol();
+        let Some(rules) = sig.rules.get(&symbol) else {
+            return;
+        };
+        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
+        let mut subst = Subst::new();
+        for rule in rules {
+            let rid = rule.id;
+            self.drive_match(
+                sig,
+                node,
+                &rule.lhs,
+                rule.nr_vars,
+                &rule.condition,
+                &rule.rhs,
+                rule.rhs_shares,
+                ext_allowed,
+                &mut subst,
+                StmtCtx { kind: StmtKind::Rule, stmt_id: rule.id, frames: &[], redex: node },
+                &mut |_rt, result| {
+                    // The rewrite is counted (and the state reduced) by `reduce_successor` when the
+                    // search commits this successor — so the per-state count snapshot stays interleaved.
+                    out.push((rid, result));
+                    Flow::Continue
+                },
+            );
+        }
+    }
+
+    /// A structural hash of the DAG at `id`, **consistent with [`deep_equal`](Self::deep_equal)**: equal
+    /// terms hash equal (the hash-cons contract for `search` states). Iterative post-order with a per-call
+    /// memo (so shared subterms hash once and deep terms don't overflow). Mixes the symbol, the scalar
+    /// payload `deep_equal` special-cases (S `count` / NA `value`, via [`DagNode::repr`]), and the child
+    /// hashes in canonical order.
+    fn dag_hash(&self, id: DagId) -> u64 {
+        use crate::dag::NodeRepr;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut memo: HashMap<DagId, u64> = HashMap::new();
+        let mut stack: Vec<(DagId, bool)> = vec![(id, false)];
+        while let Some((nid, processed)) = stack.pop() {
+            if memo.contains_key(&nid) {
+                continue;
+            }
+            let node = self.node(nid);
+            if !processed {
+                stack.push((nid, true));
+                for c in node.children() {
+                    if !memo.contains_key(&c) {
+                        stack.push((c, false));
+                    }
+                }
+            } else {
+                let mut h = DefaultHasher::new();
+                node.symbol().hash(&mut h);
+                match node.repr() {
+                    NodeRepr::App => {}
+                    NodeRepr::Iter { count, .. } => count.hash(&mut h),
+                    NodeRepr::Str(s) => s.hash(&mut h),
+                    NodeRepr::Qid(q) => q.hash(&mut h),
+                    NodeRepr::Float(f) => f.to_bits().hash(&mut h),
+                }
+                for c in node.children() {
+                    memo[&c].hash(&mut h);
+                }
+                memo.insert(nid, h.finish());
+            }
+        }
+        memo[&id]
+    }
+
+    /// Enumerate the solutions of matching the compiled `goal` against `state` whose `such_that` condition
+    /// holds (Pillar A-iv `search` ... `such that`): one binding vector (the goal's variables `0..nr_vars`)
+    /// per solution, in matcher order. `search` runs with tracing off, so the condition check records
+    /// nothing (its dummy `stmt_id` is never rendered).
+    fn eval_goal(
+        &mut self,
+        sig: &Signature,
+        goal: &LhsAutomaton,
+        nr_vars: u32,
+        such_that: &[CompiledFragment],
+        state: DagId,
+    ) -> Vec<Vec<DagId>> {
+        let mut solutions = Vec::new();
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        let Some(mut sp) = goal.match_(self, sig, state, &mut subst, false) else {
+            return solutions;
+        };
+        while sp.next(self, sig, &mut subst) {
+            if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state) {
+                solutions.push((0..nr_vars).map(|k| subst.get(k).expect("goal variable bound")).collect());
+            }
+        }
+        solutions
+    }
+
     /// Whether every fragment of `condition` holds under the matched substitution `subst` — the B2.3
     /// condition check the rewrite driver runs before accepting a solution (empty condition ⇒ `true`).
     ///
@@ -2766,6 +2899,63 @@ impl Engine {
     /// Used by the `frewrite` traversal to rebuild a parent after rewriting a child.
     pub(crate) fn rebuild_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
         self.rt.rebuild(&self.sig, symbol, children)
+    }
+
+    /// Begin a `search` from `initial` (Pillar A-iv): build the reachable-state graph on the fly,
+    /// matching each state against `goal` (compiled here, with its `nr_vars` variables) filtered by
+    /// `such_that`, for the reachability relation `arrow` up to `max_depth`. Returns a lazy
+    /// [`Search`] — pull solutions with [`Search::next_solution`].
+    pub fn search(
+        &mut self,
+        initial: DagId,
+        goal: Term,
+        nr_vars: u32,
+        such_that: Vec<ConditionFragment>,
+        arrow: Arrow,
+        max_depth: Option<u32>,
+    ) -> Search {
+        let goal = LhsAutomaton::compile(goal, &self.sig);
+        let such_that = self.sig.compile_condition(such_that);
+        // State 0 is the reduced initial term; its reduction's rewrites count toward the search total.
+        let reduced = self.reduce(initial);
+        let rewrites = self.rewrites();
+        let root = self.root(reduced);
+        Search::new(root, reduced, rewrites, goal, nr_vars, such_that, arrow, max_depth)
+    }
+
+    /// Structural hash of the DAG at `id`, consistent with [`deep_equal`](Self::deep_equal) — the `search`
+    /// state-graph hash-cons key.
+    pub(crate) fn dag_hash(&self, id: DagId) -> u64 {
+        self.rt.dag_hash(id)
+    }
+
+    /// Every `(rule_id, successor)` one rule step from `root` (all rules × positions) — the `search`
+    /// state-expansion primitive. Successors are uncounted/unreduced; [`reduce_successor`](Self::reduce_successor)
+    /// counts and canonicalizes each as the search commits it (so per-state rewrite snapshots interleave).
+    pub(crate) fn state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
+        let mut out = Vec::new();
+        self.rt.state_successors(&self.sig, root, &mut out);
+        out
+    }
+
+    /// Count one rule application (the search successor `succ` was just produced) and reduce it to the
+    /// canonical state form. Bumping here, interleaved with the reduce, keeps each discovered state's
+    /// rewrite-count snapshot faithful to Maude's incremental accounting.
+    pub(crate) fn reduce_successor(&mut self, succ: DagId) -> DagId {
+        self.rt.rewrite_count += 1;
+        self.reduce(succ)
+    }
+
+    /// Match the compiled `goal` (filtered by `such_that`) against `state`, returning a binding vector per
+    /// solution — the `search` goal test.
+    pub(crate) fn eval_goal(
+        &mut self,
+        goal: &LhsAutomaton,
+        nr_vars: u32,
+        such_that: &[CompiledFragment],
+        state: DagId,
+    ) -> Vec<Vec<DagId>> {
+        self.rt.eval_goal(&self.sig, goal, nr_vars, such_that, state)
     }
 
     /// Begin a `frewrite` session over `initial` (Pillar A-ii): position-fair, `gas` rule applications

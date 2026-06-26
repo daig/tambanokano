@@ -49,6 +49,12 @@ impl VarIndex {
     pub fn name(&self, index: u32) -> &str {
         &self.entries[index as usize].0
     }
+
+    /// The declared sort of the variable at `index` — for a `search` solution's `X:Sort --> …` lines,
+    /// which (unlike `match`) annotate the variable with its sort.
+    pub fn sort(&self, index: u32) -> SortId {
+        self.entries[index as usize].1
+    }
 }
 
 /// Build a kernel [`Term`] from a parse tree. `vars` accumulates the statement-local variable indices
