@@ -463,6 +463,9 @@ impl Renderer<'_> {
             ConditionFragment::Matching { pattern, subject, .. } => {
                 format!("{} := {}", self.term(pattern, var_names), self.term(subject, var_names))
             }
+            ConditionFragment::Rewrite { lhs, pattern, .. } => {
+                format!("{} => {}", self.term(lhs, var_names), self.term(pattern, var_names))
+            }
         }
     }
 

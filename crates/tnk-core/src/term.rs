@@ -93,10 +93,9 @@ pub struct Membership {
     pub nr_vars: u32,
 }
 
-/// One fragment of a conditional statement's condition (`ceq`/`cmb` ... `if` ...). The fragments are a
-/// conjunction evaluated left-to-right; a failure backtracks into the previous fragment's next solution
-/// (and ultimately into the next matcher solution of the statement). Closed set (decision D3) — the
-/// **rewrite** fragment `term => pattern` (Phase 2, rules) is the remaining follow-up.
+/// One fragment of a conditional statement's condition (`ceq`/`cmb`/`crl` ... `if` ...). The fragments
+/// are a conjunction evaluated left-to-right; a failure backtracks into the previous fragment's next
+/// solution (and ultimately into the next matcher solution of the statement). Closed set (decision D3).
 #[derive(Debug, Clone)]
 pub enum ConditionFragment {
     /// `lhs = rhs` — holds iff both sides, instantiated under the match and reduced, are equal modulo
@@ -109,6 +108,12 @@ pub enum ConditionFragment {
     /// match backtracks: a later fragment's failure retries the next match. The pattern's non-fresh
     /// variables are checked (non-linearly) against their existing bindings.
     Matching { pattern: Term, subject: Term, fresh_vars: Vec<u32> },
+    /// `lhs => pattern` (a **rewrite** condition, legal **only** in a rule `crl` — Pillar A-v): holds iff
+    /// `lhs`, instantiated and reduced, can reach (via `=>*`, zero or more rule steps) a state matching
+    /// `pattern`, binding its **fresh** variables `fresh_vars`. The reachable states are searched
+    /// breadth-first (the first match wins; a later fragment's failure retries the next reachable state),
+    /// and each rule step counts as a rewrite.
+    Rewrite { lhs: Term, pattern: Term, fresh_vars: Vec<u32> },
 }
 
 /// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].

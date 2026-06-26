@@ -97,6 +97,7 @@ fn load_statements(
                 let nr = vars.count();
                 // Capture the source-form trace metadata before the Terms are moved into the kernel; the
                 // kernel returns the dense equation id, which must index `eq_traces` (asserted).
+                reject_rewrite_fragment(&condition, "equation")?;
                 let trace = EqTrace {
                     lhs: lhs_t.clone(),
                     rhs: rhs_t.clone(),
@@ -124,6 +125,7 @@ fn load_statements(
                     None => Vec::new(),
                 };
                 let nr = vars.count();
+                reject_rewrite_fragment(&condition, "membership")?;
                 let trace = MbTrace {
                     lhs: lhs_t.clone(),
                     sort: sort_id,
@@ -178,6 +180,8 @@ enum Connective {
     Eq,
     /// `term : sort` (sort test).
     Sort,
+    /// `lhs => pattern` (rewrite condition — rules only, Pillar A-v).
+    Rewrite,
 }
 
 /// Parse a condition bubble (the tokens after `if`) into kernel [`ConditionFragment`]s: split on `/\` at
@@ -209,6 +213,17 @@ fn parse_condition(
                 lhs: parse_build(left, g, m, i, vars)?,
                 rhs: parse_build(right, g, m, i, vars)?,
             },
+            Connective::Rewrite => {
+                // `lhs => pattern`: build the source (its variables already bound), then the target
+                // pattern — whose variables not yet bound are fresh (the `=>*` search binds them).
+                let lhs = parse_build(left, g, m, i, vars)?;
+                let pattern = parse_build(right, g, m, i, vars)?;
+                let mut pat_vars = Vec::new();
+                term_var_indices(&pattern, &mut pat_vars);
+                let fresh: Vec<u32> = pat_vars.iter().copied().filter(|v| !bound.contains(v)).collect();
+                bound.extend(pat_vars);
+                ConditionFragment::Rewrite { lhs, pattern, fresh_vars: fresh }
+            }
             Connective::Sort => ConditionFragment::SortTest {
                 term: parse_build(left, g, m, i, vars)?,
                 sort: resolve_sort(right, m, i)?,
@@ -255,6 +270,8 @@ fn split_connective<'a>(
                 None
             }
             ":=" if depth == 0 => Some(Connective::Match),
+            // `=>` lexes as a single token, distinct from `=`, so the order of these arms is irrelevant.
+            "=>" if depth == 0 => Some(Connective::Rewrite),
             "=" if depth == 0 => Some(Connective::Eq),
             ":" if depth == 0 => Some(Connective::Sort),
             _ => None,
@@ -263,7 +280,17 @@ fn split_connective<'a>(
             return Ok((&toks[..k], conn, &toks[k + 1..]));
         }
     }
-    Err("condition fragment has no connective (`=` / `:=` / `:`)".into())
+    Err("condition fragment has no connective (`=` / `:=` / `:` / `=>`)".into())
+}
+
+/// Reject a rewrite (`=>`) fragment in a non-rule condition — `=>` conditions are legal only in rules
+/// (`crl`), never in an `ceq`/`cmb` (Pillar A-v). The clean user-facing guard ahead of the kernel's
+/// defensive `compile_condition` assert.
+fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Result<(), String> {
+    if condition.iter().any(|f| matches!(f, ConditionFragment::Rewrite { .. })) {
+        return Err(format!("a rewrite condition (`=>`) is only allowed in a rule (`crl`), not an {owner}"));
+    }
+    Ok(())
 }
 
 /// Collect a term's distinct variable indices, in first-seen order.

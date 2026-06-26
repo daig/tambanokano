@@ -542,6 +542,32 @@ fn search_show_path_and_graph() {
     assert!(s.contains("state 3, St: d\narc 0 ===> state 4 (rl d => e .)"), "show graph state 3:\n{s}");
 }
 
+/// Pillar A-v: the rewrite-condition fragment `crl ... if t => p` (a nested =>* reachability search),
+/// byte-matching the reference (`conformance/rewrite-cond.maude`). =>* semantics (0-step match), the
+/// search rewrite count, and a fresh variable bound from the reached state.
+#[test]
+fn rewrite_condition_through_repl() {
+    let out = repl().eval(conformance_file!("rewrite-cond.maude")).output;
+    // X => c holds via a->b->c (2 search rewrites) + the rule itself = 3.
+    assert!(out.contains("rewrite in REACH : f(a) .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: done"), "reach a:\n{out}");
+    // c matches c at 0 steps -> just the rule fires (1 rewrite).
+    assert!(out.contains("rewrite in REACH : f(c) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: done"), "reach c (0 steps):\n{out}");
+    // stuck reaches nothing matching c -> condition fails, no rewrite.
+    assert!(out.contains("rewrite in REACH : f(stuck) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: f(stuck)"), "unreachable:\n{out}");
+    // The target pattern s(Y) binds Y from a reached state — matching the reference byte-for-byte (Y = z,
+    // 2 rewrites). The exact `=>` search order is Maude's; we reproduce it (verified across cases).
+    assert!(out.contains("rewrite in BIND : f(s(s(z))) .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult N: g(z)"), "binding:\n{out}");
+}
+
+/// A rewrite condition (`=>`) in an equation/membership is rejected — it is legal only in a rule.
+#[test]
+fn rewrite_condition_rejected_in_equation() {
+    let out = repl()
+        .eval("fmod E is sort S . ops a b : -> S . var X : S . ceq a = b if X => b . endfm")
+        .output;
+    assert!(out.contains("rewrite condition (`=>`) is only allowed in a rule"), "rejection: {out}");
+}
+
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
 #[test]
 fn rule_in_fmod_is_rejected() {

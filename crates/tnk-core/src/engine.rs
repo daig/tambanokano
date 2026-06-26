@@ -22,7 +22,7 @@ use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
 /// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
@@ -86,6 +86,17 @@ pub(crate) enum CompiledFragment {
     Equality { lhs: Term, rhs: Term },
     SortTest { term: Term, sort: SortId },
     Matching { pattern: LhsAutomaton, subject: Term, fresh_vars: Vec<u32> },
+    /// `lhs => pattern` — a rewrite condition (rule-only, Pillar A-v): a nested `=>*` reachability search
+    /// from `lhs`'s instance, matching `pattern` against each reachable state.
+    Rewrite { lhs: Term, pattern: LhsAutomaton, fresh_vars: Vec<u32> },
+}
+
+/// Which statement a condition belongs to — gates the `=>` (rewrite) fragment, which is legal **only** in
+/// a rule (`crl`) condition, never in an equation/membership (`ceq`/`cmb`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CondOwner {
+    EqOrMb,
+    Rule,
 }
 
 /// Whether [`Runtime::drive_match`]'s `accept` callback wants to stop at the first rewrite (equational
@@ -834,7 +845,7 @@ impl Signature {
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
-            condition: self.compile_condition(condition),
+            condition: self.compile_condition(condition, CondOwner::EqOrMb),
             owise,
             rhs_shares,
         };
@@ -845,10 +856,12 @@ impl Signature {
         id
     }
 
-    /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test
-    /// fragments are stored as-is; a matching fragment's pattern is compiled to an [`LhsAutomaton`]
-    /// (B2.3d) through the same A3 seam (and F-A guard) as an equation lhs.
-    fn compile_condition(&self, condition: Vec<ConditionFragment>) -> Vec<CompiledFragment> {
+    /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test fragments
+    /// are stored as-is; a matching (`:=`) or rewrite (`=>`) fragment's pattern is compiled to an
+    /// [`LhsAutomaton`] through the same A3 seam (and F-A guard) as an equation lhs. `owner` gates the
+    /// **rewrite** (`=>`) fragment, which is legal only in a rule condition — the frontend rejects it in
+    /// an `ceq`/`cmb` (this is the defensive kernel backstop, A-v).
+    fn compile_condition(&self, condition: Vec<ConditionFragment>, owner: CondOwner) -> Vec<CompiledFragment> {
         condition
             .into_iter()
             .map(|frag| match frag {
@@ -858,6 +871,17 @@ impl Signature {
                     CompiledFragment::Matching {
                         pattern: LhsAutomaton::compile(pattern, self),
                         subject,
+                        fresh_vars,
+                    }
+                }
+                ConditionFragment::Rewrite { lhs, pattern, fresh_vars } => {
+                    assert!(
+                        owner == CondOwner::Rule,
+                        "a rewrite (`=>`) condition fragment is legal only in a rule (`crl`)"
+                    );
+                    CompiledFragment::Rewrite {
+                        lhs,
+                        pattern: LhsAutomaton::compile(pattern, self),
                         fresh_vars,
                     }
                 }
@@ -900,7 +924,7 @@ impl Signature {
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
-            condition: self.compile_condition(condition),
+            condition: self.compile_condition(condition, CondOwner::Rule),
             rhs_shares,
         };
         self.rules.entry(top).or_default().push(compiled);
@@ -941,7 +965,7 @@ impl Signature {
             lhs: LhsAutomaton::compile(lhs, self),
             sort,
             nr_vars,
-            condition: self.compile_condition(condition),
+            condition: self.compile_condition(condition, CondOwner::EqOrMb),
         };
         let sorts = &self.sorts;
         let v = self.memberships.entry(top).or_default();
@@ -2530,7 +2554,73 @@ impl Runtime {
                 }
                 satisfied
             }
+            CompiledFragment::Rewrite { lhs, pattern, fresh_vars } => {
+                // Instantiate + reduce the search origin, then explore its `=>*` reachable states for a
+                // matching `pattern` that lets the rest of the condition succeed (Pillar A-v).
+                let start = self.instantiate(sig, lhs, subst);
+                self.condition_depth += 1;
+                let start = self.reduce(sig, start);
+                self.condition_depth -= 1;
+                self.solve_rewrite_condition(sig, start, pattern, fresh_vars, subst, condition, i, kind, stmt_id, depth)
+            }
         }
+    }
+
+    /// Solve a rewrite condition `lhs => pattern` (Pillar A-v): breadth-first over the `=>*` reachable
+    /// states from `start` (hash-consed by `deep_equal`; the start itself is tried first, as `=>*`
+    /// includes zero steps), match `pattern` against each — binding `fresh_vars` — and recurse into the
+    /// rest of the condition, backtracking to the next reachable state on failure. Every rule step counts
+    /// as a rewrite (Maude accounting). Non-termination on an infinite reachable space is inherited from
+    /// Maude. (The REPL runs with GC off, so the discovered states stay live; a GC-rooted variant is the
+    /// same follow-up as the other re-entrant condition reductions, F-2.)
+    #[allow(clippy::too_many_arguments)]
+    fn solve_rewrite_condition(
+        &mut self,
+        sig: &Signature,
+        start: DagId,
+        pattern: &LhsAutomaton,
+        fresh_vars: &[u32],
+        subst: &mut Subst,
+        condition: &[CompiledFragment],
+        i: usize,
+        kind: StmtKind,
+        stmt_id: u32,
+        depth: u32,
+    ) -> bool {
+        let _root = self.root(start);
+        let mut seen: Vec<DagId> = vec![start];
+        let mut frontier: VecDeque<DagId> = VecDeque::from([start]);
+        while let Some(state) = frontier.pop_front() {
+            for &fv in fresh_vars {
+                subst.unbind(fv);
+            }
+            if let Some(mut sp) = pattern.match_(self, sig, state, subst, false) {
+                while sp.next(self, sig, subst) {
+                    self.end_fragment(kind, stmt_id, i, depth, true, subst);
+                    if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
+                        return true;
+                    }
+                }
+            }
+            // Expand: every rule step is a rewrite; reduce each successor and hash-cons new states.
+            let mut succs: Vec<(u32, DagId)> = Vec::new();
+            self.state_successors(sig, state, &mut succs);
+            for (_rule_id, succ) in succs {
+                self.rewrite_count += 1;
+                self.condition_depth += 1;
+                let reduced = self.reduce(sig, succ);
+                self.condition_depth -= 1;
+                if !seen.iter().any(|&s| self.deep_equal(s, reduced)) {
+                    seen.push(reduced);
+                    frontier.push_back(reduced);
+                }
+            }
+        }
+        self.end_fragment(kind, stmt_id, i, depth, false, subst);
+        for &fv in fresh_vars {
+            subst.unbind(fv);
+        }
+        false
     }
 }
 
@@ -2915,7 +3005,9 @@ impl Engine {
         max_depth: Option<u32>,
     ) -> Search {
         let goal = LhsAutomaton::compile(goal, &self.sig);
-        let such_that = self.sig.compile_condition(such_that);
+        // A `such that` condition may contain a rewrite (`=>`) fragment (a nested search), so it compiles
+        // with the rule owner.
+        let such_that = self.sig.compile_condition(such_that, CondOwner::Rule);
         // State 0 is the reduced initial term; its reduction's rewrites count toward the search total.
         let reduced = self.reduce(initial);
         let rewrites = self.rewrites();

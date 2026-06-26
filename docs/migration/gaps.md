@@ -75,6 +75,10 @@ correctness fix.
   on-the-fly `X:St` prints `X:St` and a declared `X` prints `X` (both already handled by name-only rendering).
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
+- **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite
+  count* are byte-conformant (Pillar A-v), but the detailed trace of its **nested `=>*` search** (the
+  per-state trial stream) is not pinned to Maude — the fragment renders, but the inner search steps
+  aren't traced. Same family as `search` tracing above.
 - **Cross-kind ad-hoc overloading.** Overload resolution handles single-kind (subsort) overloading; cross-kind
   ad-hoc overloading (arg-sort-driven kind selection) is `debug_assert`-guarded, not implemented. Idiomatic
   signatures don't need it; the prelude may.

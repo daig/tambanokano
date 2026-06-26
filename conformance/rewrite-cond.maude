@@ -1,0 +1,38 @@
+*** Pillar A-v: the rewrite-condition fragment `crl ... if t => p` — a nested `=>*` reachability search
+*** from t's instance, matching p against each reachable state (the one remaining condition kind).
+*** Byte-for-byte vs the reference (rate normalized):
+***   ~/Downloads/Maude-3/maude -no-banner conformance/rewrite-cond.maude < /dev/null
+***   ./target/debug/tnk-repl conformance/rewrite-cond.maude < /dev/null
+***
+*** REACH (specific target): `if X => c` holds iff X reaches c via =>* (0 or more steps).
+***   f(a)     -> done   (a =>* c via a->b->c; 2 search rewrites + the rule = 3)
+***   f(c)     -> done   (c matches c at 0 steps; just the rule = 1 rewrite)
+***   f(stuck) -> f(stuck) (stuck reaches nothing matching c; 0 rewrites)
+*** BIND (the target pattern binds a fresh var from the reached state): `if X => s(Y)` binds Y.
+***   f(s(s(z))) -> g(s(z))   (s(s(z)) matches s(Y) at 0 steps, Y = s(z))
+
+mod REACH is
+  sort S .
+  ops a b c done stuck : -> S .
+  op f : S -> S [ctor] .
+  var X : S .
+  rl a => b .
+  rl b => c .
+  crl f(X) => done if X => c .
+endm
+
+rewrite f(a) .
+rewrite f(c) .
+rewrite f(stuck) .
+
+mod BIND is
+  sort N .
+  op z : -> N .
+  op s : N -> N [ctor] .
+  ops f g : N -> N [ctor] .
+  vars X Y : N .
+  rl s(X) => X .
+  crl f(X) => g(Y) if X => s(Y) .
+endm
+
+rewrite f(s(s(z))) .
