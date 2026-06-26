@@ -80,6 +80,34 @@ fn theory_entry_is_one_submission_and_current() {
     assert_eq!(r.current(), Some("TRIV"));
 }
 
+/// B-ii: a view loads through the REPL — the target module still reduces, `show views` lists it, and
+/// `show view` renders its maps (byte-matching the reference binary's `show view`).
+#[test]
+fn view_through_repl() {
+    let mut r = repl();
+    let out = r.eval(conformance_file!("view-good.maude")).output;
+    assert!(out.contains("result N: z"), "target module reduces: {out}");
+    assert!(r.eval("show views .").output.contains("ToNum"), "show views lists it");
+    let shown = r.eval("show view ToNum .").output;
+    assert_eq!(shown, "view ToNum from TRIV to NUM is\n  sort Elt to N .\nendv");
+}
+
+/// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
+/// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
+#[test]
+fn bad_view_reports_error_through_repl() {
+    let mut r = repl();
+    assert!(!r.input_complete("view V from TRIV to NUM is\n"), "open view keeps buffering");
+    assert!(r.input_complete("view V from TRIV to NUM is endv\n"), "`endv` completes the submission");
+    r.eval("fth TRIV is sort Elt . endfth");
+    r.eval("fmod NUM is sort N . endfm");
+    let out = r.eval("view Bad from TRIV to NUM is sort Elt to NoSuch . endv").output;
+    assert!(out.contains("failed to find sort NoSuch in NUM"), "got: {out}");
+    // The session survives — a following module still enters.
+    r.eval("fmod OK is sort Z . endfm");
+    assert_eq!(r.current(), Some("OK"));
+}
+
 /// C7 structure sharing end-to-end through the REPL: a repeated reducible subterm reduces once
 /// (Maude's hash-consed subject/rhs DAG). Every result + count is the reference binary's. The strong
 /// C7-specific guard: this fixture's reference counts top out at 2, so a pre-C7 over-count (`f(a)` was

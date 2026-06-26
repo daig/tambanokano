@@ -21,10 +21,11 @@ use tnk_frontend::load::{
     rewrite_command, search_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
-use tnk_frontend::surface::ast::{Command, PreModule, SearchArrow, TopItem};
+use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::flatten::flatten;
+use tnk_modules::view::{validate_view, ViewDb};
 use trace::{render_trace, TraceFlags};
 
 /// The result of evaluating one input submission: the text to print, and whether to exit the loop.
@@ -42,8 +43,12 @@ pub struct Repl {
     db: ModuleDb,
     /// Flattened + built modules, keyed by name.
     modules: HashMap<String, LoadedModule>,
+    /// Validated view definitions (B-ii), keyed by name.
+    views: ViewDb,
     /// Module names in entry order (for `show modules`).
     order: Vec<String>,
+    /// View names in entry order (for `show views`).
+    view_order: Vec<String>,
     /// The current module commands run against (Maude's selected module).
     current: Option<String>,
     /// Colorize printed results (true interactively, false in tests).
@@ -79,7 +84,9 @@ impl Repl {
             interner: Interner::new(),
             db: ModuleDb::new(),
             modules: HashMap::new(),
+            views: ViewDb::new(),
             order: Vec::new(),
+            view_order: Vec::new(),
             current: None,
             color,
             trace: TraceFlags::default(),
@@ -169,6 +176,7 @@ impl Repl {
         for item in items {
             match item {
                 TopItem::Module(pm) => self.enter_module(pm, &mut output),
+                TopItem::View(v) => self.enter_view(v, &mut output),
                 TopItem::Command(c) => self.run_command(c, &mut output),
             }
         }
@@ -192,6 +200,21 @@ impl Repl {
                 self.current = Some(name);
             }
             Err(e) => out.push_str(&format!("error in module `{name}`: {e}\n")),
+        }
+    }
+
+    /// Define (or redefine) a view (B-ii): validate it against the module DB and store it. Silent on
+    /// success (as Maude is); a validation error becomes output. A view is the argument of an
+    /// instantiation `M{V}` (B-iv); on its own it is just validated and shown (`show view`).
+    fn enter_view(&mut self, v: ViewDecl, out: &mut String) {
+        match validate_view(&v, &self.db, &mut self.interner) {
+            Ok(()) => {
+                if !self.views.contains(&v.name) {
+                    self.view_order.push(v.name.clone());
+                }
+                self.views.insert(v);
+            }
+            Err(e) => out.push_str(&format!("error: {e}\n")),
         }
     }
 
@@ -357,6 +380,15 @@ impl Repl {
                     None => "show module: no such module (and no current module).".into(),
                 }
             }
+            Some("views") => {
+                let list =
+                    if self.view_order.is_empty() { "(none)".into() } else { self.view_order.join(" ") };
+                format!("views: {list}")
+            }
+            Some("view") => match words.get(2).and_then(|n| self.views.get(n)) {
+                Some(v) => render_view(v, &self.interner),
+                None => "show view: no such view (usage: `show view NAME .`).".into(),
+            },
             // `show path N .` — the transition path from the initial state to state N of the last search.
             Some("path") => {
                 let n: Option<usize> = words.get(2).and_then(|s| s.parse().ok());
@@ -385,7 +417,7 @@ impl Repl {
                     None => "show search graph: no current module.".into(),
                 }
             }
-            _ => "show: try `show module .` / `show modules .` / `show path N .` / `show search graph .`".into(),
+            _ => "show: try `show module .` / `show modules .` / `show view NAME .` / `show views .` / `show path N .` / `show search graph .`".into(),
         };
         Eval { output: out, exit: false }
     }
@@ -418,13 +450,13 @@ impl Repl {
         let mut open = false;
         for t in &toks {
             match self.interner.resolve(t.sym) {
-                "fmod" | "mod" | "fth" | "th" => open = true,
-                "endfm" | "endm" | "endfth" | "endth" => open = false,
+                "fmod" | "mod" | "fth" | "th" | "view" => open = true,
+                "endfm" | "endm" | "endfth" | "endth" | "endv" => open = false,
                 _ => {}
             }
         }
         let last_txt = self.interner.resolve(last.sym);
-        matches!(last_txt, "endfm" | "endm" | "endfth" | "endth")
+        matches!(last_txt, "endfm" | "endm" | "endfth" | "endth" | "endv")
             || (last.kind == TokKind::Dot && !open)
     }
 }
@@ -607,6 +639,42 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
         }
     }
     out.trim_end().to_string()
+}
+
+/// A `show view` rendering (B-ii): the `view N from T to M is … endv` form, sort maps then op maps. Close
+/// to the reference binary's layout (two-space indent); the exact-spacing fidelity of `show` is a REPL
+/// concern, like `show module`.
+fn render_view(v: &ViewDecl, i: &Interner) -> String {
+    let mut s = format!(
+        "view {} from {} to {} is\n",
+        v.name,
+        module_expr_str(&v.from),
+        module_expr_str(&v.to)
+    );
+    for (a, b) in &v.sort_maps {
+        s.push_str(&format!("  sort {a} to {b} .\n"));
+    }
+    for m in &v.op_maps {
+        match m {
+            OpMap::Op { from, to } => {
+                s.push_str(&format!("  op {} to {} .\n", join_tokens(from, i), join_tokens(to, i)));
+            }
+            OpMap::Term { from, to } => {
+                s.push_str(&format!("  op {} to term {} .\n", join_tokens(from, i), join_tokens(to, i)));
+            }
+        }
+    }
+    s.push_str("endv");
+    s
+}
+
+/// Render a module expression as text (for `show view`'s from/to). B-ii from/to are named modules.
+fn module_expr_str(e: &ModuleExpr) -> String {
+    match e {
+        ModuleExpr::Named(n) => n.clone(),
+        ModuleExpr::Sum(a, b) => format!("{} + {}", module_expr_str(a), module_expr_str(b)),
+        ModuleExpr::Rename(inner, _) => format!("{} * (…)", module_expr_str(inner)),
+    }
 }
 
 /// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the

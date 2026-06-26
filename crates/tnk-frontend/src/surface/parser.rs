@@ -124,6 +124,7 @@ impl<'a> Parser<'a> {
         let Some(txt) = self.peek_text() else { return Ok(None) };
         let item = match txt {
             "fmod" | "mod" | "fth" | "th" => TopItem::Module(self.module()?),
+            "view" => TopItem::View(self.view()?),
             "reduce" | "red" => {
                 self.advance();
                 let term = self.collect_until(&[]);
@@ -203,6 +204,7 @@ impl<'a> Parser<'a> {
         while let Some(item) = self.parse_top_item()? {
             match item {
                 TopItem::Module(m) => src.modules.push(m),
+                TopItem::View(v) => src.views.push(v),
                 // A command runs against the most recently entered module (Maude's current module).
                 TopItem::Command(c) => {
                     let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
@@ -243,6 +245,65 @@ impl<'a> Parser<'a> {
     /// At a module/theory closing keyword (`endfm`/`endm`/`endfth`/`endth`).
     fn at_module_end(&self) -> bool {
         matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth"))
+    }
+
+    /// A view definition `view V from <expr> to <expr> is <maps> endv` (B-ii). `from`/`to` are module
+    /// expressions; a parameterized view name `V{X :: T}` is rejected (B-iv). Maps: `sort A to B .`,
+    /// `op f to g .`, `op f to term t .` — a disambiguated source `op f : … to …` is rejected (follow-up).
+    fn view(&mut self) -> PResult<ViewDecl> {
+        self.eat("view")?;
+        let name = self.name()?;
+        if self.at("{") {
+            return Err(format!("parameterized view `{name}{{…}}` is a later Pillar B increment (B-iv)"));
+        }
+        // `module_expr` parses an atom/`*`/`+` chain and stops at the first other token (it does not
+        // consume a terminator), so it ends naturally at `to` / `is`.
+        self.eat("from")?;
+        let from = self.module_expr()?;
+        self.eat("to")?;
+        let to = self.module_expr()?;
+        self.eat("is")?;
+
+        let mut sort_maps = Vec::new();
+        let mut op_maps = Vec::new();
+        while !self.at("endv") {
+            match self.peek_text().ok_or("unexpected end of input in view")? {
+                "sort" => {
+                    self.advance();
+                    let from_s = self.name()?;
+                    self.eat("to")?;
+                    let to_s = self.name()?;
+                    self.eat_dot()?;
+                    sort_maps.push((from_s, to_s));
+                }
+                "op" => {
+                    self.advance();
+                    let from = self.collect_until(&["to"]);
+                    if from.iter().any(|t| self.i.resolve(t.sym) == ":") {
+                        return Err("disambiguated view op map `op f : … to …` is a B-ii follow-up".into());
+                    }
+                    self.eat("to")?;
+                    if self.at("term") {
+                        self.advance();
+                        let term = self.collect_until(&[]);
+                        self.eat_dot()?;
+                        op_maps.push(OpMap::Term { from, to: term });
+                    } else {
+                        let to = self.collect_until(&[]);
+                        self.eat_dot()?;
+                        op_maps.push(OpMap::Op { from, to });
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "view map must be `sort … to …` or `op … to …`, found `{other}` \
+                         (strat/var/class maps are a follow-up)"
+                    ));
+                }
+            }
+        }
+        self.advance(); // endv
+        Ok(ViewDecl { name, from, to, sort_maps, op_maps })
     }
 
     fn decl(&mut self, m: &mut PreModule) -> PResult<()> {
@@ -855,6 +916,46 @@ endfth
         let toks = tokenize(bad, &mut i);
         let err = Parser::new(&toks, &i).parse_source().unwrap_err();
         assert!(err.contains("functional"), "rules rejected in a functional theory: {err}");
+    }
+
+    /// B-ii: a view parses into a `ViewDecl` — from-theory, to-module, a sort map, and op→op / op→term maps.
+    #[test]
+    fn parses_view() {
+        let src = "\
+view ToNum from TRIV to NUM is
+  sort Elt to N .
+  op e to z .
+  op 0 to term zero .
+endv
+";
+        let s = parse(src);
+        assert!(s.modules.is_empty());
+        assert_eq!(s.views.len(), 1);
+        let v = &s.views[0];
+        assert_eq!(v.name, "ToNum");
+        assert!(matches!(&v.from, ModuleExpr::Named(n) if n == "TRIV"));
+        assert!(matches!(&v.to, ModuleExpr::Named(n) if n == "NUM"));
+        assert_eq!(v.sort_maps, vec![("Elt".to_string(), "N".to_string())]);
+        assert_eq!(v.op_maps.len(), 2);
+        assert!(matches!(&v.op_maps[0], OpMap::Op { .. }), "op e to z");
+        assert!(matches!(&v.op_maps[1], OpMap::Term { .. }), "op 0 to term zero");
+    }
+
+    /// B-ii: an empty view (`view V from T to M is endv`) parses with no maps.
+    #[test]
+    fn parses_empty_view() {
+        let s = parse("view Id from TRIV to TRIV is endv\n");
+        assert_eq!(s.views.len(), 1);
+        assert!(s.views[0].sort_maps.is_empty() && s.views[0].op_maps.is_empty());
+    }
+
+    /// B-ii: a parameterized view name (`view V{X :: T} …`) is a later increment — rejected loudly.
+    #[test]
+    fn parameterized_view_rejected() {
+        let mut i = Interner::new();
+        let toks = tokenize("view V{X :: TRIV} from TRIV to LIST{X} is endv\n", &mut i);
+        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
+        assert!(err.contains("B-iv"), "got: {err}");
     }
 
     /// Parameterized instantiation is Phase 2 — rejected loudly.

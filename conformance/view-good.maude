@@ -1,0 +1,22 @@
+*** B-ii: a view maps a theory TRIV to a module NUM. On its own, before instantiation
+*** [B-iv], a view is validated and stored; the target module reduces as usual. This pins
+*** that a file carrying a valid view loads end-to-end and the reduce is unaffected.
+fth TRIV is
+  sort Elt .
+endfth
+
+fmod NUM is
+  sort N .
+  op z : -> N [ctor] .
+  op s : N -> N [ctor] .
+  op p : N -> N .
+  var X : N .
+  eq p(s(X)) = X .
+endfm
+
+view ToNum from TRIV to NUM is
+  sort Elt to N .
+endv
+
+red p(s(z)) .       *** z (1 rewrite)
+red p(s(s(z))) .    *** s(z) (1 rewrite)

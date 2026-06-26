@@ -8,9 +8,9 @@ fth ELT-ORD is
   op _<_ : Elt Elt -> Bool .
   op id : Elt -> Elt .
   vars X Y : Elt .
-  eq X < X = ff [nonexec label irreflexive] .   *** obligation — must NOT fire
-  eq id(X) = X .                                  *** ordinary — fires
+  eq X < X = ff [nonexec label irreflexive] .   *** obligation - must NOT fire
+  eq id(X) = X .                                  *** ordinary - fires
 endfth
 
-red e < e .    *** e < e   (0 rewrites — the nonexec axiom is not applied)
-red id(e) .    *** e        (1 rewrite — the ordinary equation fires)
+red e < e .    *** e < e   (0 rewrites - the nonexec axiom is not applied)
+red id(e) .    *** e        (1 rewrite - the ordinary equation fires)

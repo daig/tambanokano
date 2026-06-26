@@ -13,14 +13,16 @@ use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten;
+use crate::view::{validate_view, ViewDb};
 
 /// A loaded program: the shared interner, every module **flattened** (one [`LoadedModule`] per top-level
-/// `fmod`, in file order), a name→index map (for the REPL's `select`), and the commands tagged with the
-/// index of the module they run against (the most recently entered one, as in Maude).
+/// `fmod`, in file order), a name→index map (for the REPL's `select`), the validated views (B-ii), and the
+/// commands tagged with the index of the module they run against (the most recently entered one).
 pub struct Program {
     pub interner: Interner,
     pub modules: Vec<LoadedModule>,
     pub module_index: HashMap<String, usize>,
+    pub views: ViewDb,
     pub commands: Vec<(usize, Command)>,
 }
 
@@ -29,7 +31,8 @@ pub struct Program {
 pub fn load_program(src: &str) -> Result<Program, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
-    let Source { modules: pre, commands } = Parser::new(&toks, &interner).parse_source()?;
+    let Source { modules: pre, views: pre_views, commands } =
+        Parser::new(&toks, &interner).parse_source()?;
 
     // Names in file order (the command-index basis), and the database for import resolution.
     let names: Vec<String> = pre.iter().map(|m| m.name.clone()).collect();
@@ -42,7 +45,15 @@ pub fn load_program(src: &str) -> Result<Program, String> {
         modules.push(build_loaded_module(&flat, &mut interner)?);
         module_index.insert(name.clone(), idx);
     }
-    Ok(Program { interner, modules, module_index, commands })
+
+    // Views (B-ii): validate each against the module DB, then store. A bad view aborts the load with the
+    // reference binary's diagnostic.
+    let mut views = ViewDb::new();
+    for v in pre_views {
+        validate_view(&v, &db, &mut interner)?;
+        views.insert(v);
+    }
+    Ok(Program { interner, modules, module_index, views, commands })
 }
 
 #[cfg(test)]
@@ -180,5 +191,26 @@ mod tests {
             conformance_file!("theory-import.maude"),
             &[e("B", "f", 1), e("B", "t", 2)],
         );
+    }
+
+    /// B-ii: a file carrying a *valid* view loads end-to-end — the view is validated and stored, and the
+    /// target module's reduces are unaffected (`p(s(z)) = z`). The view itself is exercised in B-iv.
+    #[test]
+    fn view_good_conforms() {
+        conform(conformance_file!("view-good.maude"), &[e("N", "z", 1), e("N", "s(z)", 1)]);
+    }
+
+    /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
+    /// `failed to find sort … in … to represent …` diagnostic.
+    #[test]
+    fn bad_view_rejected_by_load() {
+        let src = "fth TRIV is sort Elt . endfth\n\
+                   fmod NUM is sort N . endfm\n\
+                   view Bad from TRIV to NUM is sort Elt to NoSuch . endv\n";
+        let err = match load_program(src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected the bad view to be rejected"),
+        };
+        assert!(err.contains("failed to find sort NoSuch in NUM"), "got: {err}");
     }
 }

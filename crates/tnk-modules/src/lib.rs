@@ -14,3 +14,4 @@ pub mod db;
 pub mod flatten;
 pub mod load;
 pub mod rename;
+pub mod view;

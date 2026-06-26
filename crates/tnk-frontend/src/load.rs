@@ -59,7 +59,9 @@ pub fn build_loaded_module(pm: &PreModule, interner: &mut Interner) -> Result<Lo
 pub fn load_source(src: &str) -> Result<Loaded, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
-    let Source { modules: pre, commands } = Parser::new(&toks, &interner).parse_source()?;
+    // The frontend loader is import-free and view-free (the module system, `tnk-modules`, handles both);
+    // any `view` in the source is ignored here.
+    let Source { modules: pre, commands, .. } = Parser::new(&toks, &interner).parse_source()?;
 
     let mut modules = Vec::with_capacity(pre.len());
     for pm in &pre {

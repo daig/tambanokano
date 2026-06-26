@@ -70,6 +70,31 @@ pub enum RenameItem {
     Op { from: String, to: String },
 }
 
+/// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
+/// to a target module (or theory) `M`, supplying the concrete sorts/ops that satisfy `T` — the argument of
+/// a parameterized-module instantiation `M{V}` (B-iv). `from`/`to` are module expressions (named for now;
+/// a parameterized view `view V{X :: T} …` / a target `LIST{X}` is B-iv).
+#[derive(Debug, Clone)]
+pub struct ViewDecl {
+    pub name: String,
+    pub from: ModuleExpr,
+    pub to: ModuleExpr,
+    /// `sort A to B .` — map a (theory-declared) sort `A` to a sort `B` of the target. Unmapped theory
+    /// sorts default to identity (must exist in the target).
+    pub sort_maps: Vec<(String, String)>,
+    /// `op … to … .` mappings.
+    pub op_maps: Vec<OpMap>,
+}
+
+/// One operator mapping in a view: `op f to g .` (to another operator) or `op f to term t .` (to a target
+/// term, e.g. `op 0 to term 0.0`). Names/terms are raw token bubbles (the mixfix parse runs against the
+/// target module later). Disambiguated source `op f : A -> B to …` is a B-ii follow-up (rejected loudly).
+#[derive(Debug, Clone)]
+pub enum OpMap {
+    Op { from: Vec<Token>, to: Vec<Token> },
+    Term { from: Vec<Token>, to: Vec<Token> },
+}
+
 /// One operator declaration `op <name> : <domain> -> <range> [<attrs>] .` (or `ops …` expanded to one
 /// `OpDecl` per name).
 #[derive(Debug, Clone)]
@@ -177,18 +202,21 @@ pub enum SearchArrow {
     Bang,
 }
 
-/// One top-level item: a module definition or a command. The unit the REPL consumes one at a time
-/// (a command here is *untagged* — the REPL binds it to its persistent current module).
+/// One top-level item: a module definition, a view definition, or a command. The unit the REPL consumes
+/// one at a time (a command here is *untagged* — the REPL binds it to its persistent current module).
 #[derive(Debug)]
 pub enum TopItem {
     Module(PreModule),
+    View(ViewDecl),
     Command(Command),
 }
 
-/// The result of surface-parsing a source file: the modules and the top-level commands, each tagged with
-/// the index (into `modules`) of the module it runs against — the most recently entered one, as in Maude.
+/// The result of surface-parsing a source file: the modules, the view definitions, and the top-level
+/// commands, each tagged with the index (into `modules`) of the module it runs against — the most recently
+/// entered one, as in Maude.
 #[derive(Debug, Default)]
 pub struct Source {
     pub modules: Vec<PreModule>,
+    pub views: Vec<ViewDecl>,
     pub commands: Vec<(usize, Command)>,
 }
