@@ -1,0 +1,25 @@
+*** B-i: a theory imports a module (`protecting`) and another theory (`including`), and those
+*** imports flatten into it exactly as for a module — the imported ops/equations are visible and
+*** (when not nonexec) executable inside the theory.
+fth TRIV is
+  sort Elt .
+endfth
+
+fmod TINY is
+  sort B .
+  ops t f : -> B [ctor] .
+  op neg : B -> B .
+  eq neg(t) = f .
+  eq neg(f) = t .
+endfm
+
+fth ORD is
+  protecting TINY .
+  including TRIV .
+  op cmp : Elt Elt -> B .
+  vars X Y : Elt .
+  eq cmp(X, X) = f [nonexec] .
+endfth
+
+red neg(t) .         *** f   (1 rewrite — TINY's equation fires through the theory's flatten)
+red neg(neg(t)) .    *** t   (2 rewrites)

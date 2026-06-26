@@ -76,7 +76,7 @@ pub fn apply_renaming(
                     subst_tokens(c, &subst, interner);
                 }
             }
-            Statement::Mb { lhs, sort, cond } => {
+            Statement::Mb { lhs, sort, cond, .. } => {
                 subst_tokens(lhs, &subst, interner);
                 subst_tokens(sort, &subst, interner);
                 if let Some(c) = cond {

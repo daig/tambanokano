@@ -82,8 +82,14 @@ fn load_statements(
     i: &Interner,
 ) -> Result<(), String> {
     for stmt in &pm.statements {
+        // Skip `nonexec` axioms — proof obligations never applied during reduction/rewriting (every
+        // theory axiom is `[nonexec]`; a module statement may be too). They still carry through parsing
+        // and flattening (for later view-obligation checking) but are not registered in the engine.
+        if stmt_is_nonexec(stmt) {
+            continue;
+        }
         match stmt {
-            Statement::Eq { lhs, rhs, cond, owise } => {
+            Statement::Eq { lhs, rhs, cond, owise, .. } => {
                 // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
                 // one variable index. Then add via the matching kernel facade.
                 let mut vars = VarIndex::new();
@@ -115,7 +121,7 @@ fn load_statements(
                 assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
                 m.eq_traces.push(trace);
             }
-            Statement::Mb { lhs, sort, cond } => {
+            Statement::Mb { lhs, sort, cond, .. } => {
                 let mut vars = VarIndex::new();
                 let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
                 let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -140,7 +146,7 @@ fn load_statements(
                 assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
                 m.mb_traces.push(trace);
             }
-            Statement::Rule { label, lhs, rhs, cond } => {
+            Statement::Rule { label, lhs, rhs, cond, .. } => {
                 // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
                 // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
                 let mut vars = VarIndex::new();
@@ -281,6 +287,15 @@ fn split_connective<'a>(
         }
     }
     Err("condition fragment has no connective (`=` / `:=` / `:` / `=>`)".into())
+}
+
+/// Whether a statement is `[nonexec]` (a proof obligation not applied during execution).
+fn stmt_is_nonexec(s: &Statement) -> bool {
+    match s {
+        Statement::Eq { nonexec, .. }
+        | Statement::Mb { nonexec, .. }
+        | Statement::Rule { nonexec, .. } => *nonexec,
+    }
 }
 
 /// Reject a rewrite (`=>`) fragment in a non-rule condition — `=>` conditions are legal only in rules

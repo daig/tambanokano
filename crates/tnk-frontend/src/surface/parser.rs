@@ -8,6 +8,14 @@ use crate::surface::ast::*;
 
 pub type PResult<T> = Result<T, String>;
 
+/// The execution-relevant trailing attributes of a statement (`[owise]`, `[nonexec]`). Other attributes
+/// (`label`, `metadata`, `print`, …) are parsed but not retained — see [`Parser::stmt_attrs`].
+#[derive(Debug, Default, Clone, Copy)]
+struct StmtAttrs {
+    owise: bool,
+    nonexec: bool,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
@@ -115,7 +123,7 @@ impl<'a> Parser<'a> {
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
         let Some(txt) = self.peek_text() else { return Ok(None) };
         let item = match txt {
-            "fmod" | "mod" => TopItem::Module(self.module()?),
+            "fmod" | "mod" | "fth" | "th" => TopItem::Module(self.module()?),
             "reduce" | "red" => {
                 self.advance();
                 let term = self.collect_until(&[]);
@@ -206,14 +214,18 @@ impl<'a> Parser<'a> {
     }
 
     fn module(&mut self) -> PResult<PreModule> {
-        // `mod` is a system module (rules allowed); `fmod` is functional (rules rejected in `decl`).
-        let kind = if self.at("mod") { ModuleKind::System } else { ModuleKind::Functional };
-        self.advance(); // fmod / mod
+        // System (`mod`/`th`) allows rules; functional (`fmod`/`fth`) rejects them (in `decl`). `fth`/`th`
+        // are theories (the `is_theory` axis — a view source / parameter bound, statements not executed).
+        let kw = self.peek_text().unwrap_or("");
+        let kind = if matches!(kw, "mod" | "th") { ModuleKind::System } else { ModuleKind::Functional };
+        let is_theory = matches!(kw, "fth" | "th");
+        self.advance(); // fmod / mod / fth / th
         let name = self.name()?;
         self.eat("is")?;
         let mut m = PreModule {
             name,
             kind,
+            is_theory,
             imports: Vec::new(),
             sorts: Vec::new(),
             subsorts: Vec::new(),
@@ -221,11 +233,16 @@ impl<'a> Parser<'a> {
             vars: Vec::new(),
             statements: Vec::new(),
         };
-        while !self.at("endfm") && !self.at("endm") {
+        while !self.at_module_end() {
             self.decl(&mut m)?;
         }
-        self.advance(); // endfm
+        self.advance(); // endfm / endm / endfth / endth
         Ok(m)
+    }
+
+    /// At a module/theory closing keyword (`endfm`/`endm`/`endfth`/`endth`).
+    fn at_module_end(&self) -> bool {
+        matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth"))
     }
 
     fn decl(&mut self, m: &mut PreModule) -> PResult<()> {
@@ -319,27 +336,30 @@ impl<'a> Parser<'a> {
                     rhs = self.collect_until(&["["]);
                     cond = None;
                 }
-                let owise = self.opt_owise()?;
+                let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                m.statements.push(Statement::Eq { lhs, rhs, cond, owise });
+                m.statements.push(Statement::Eq { lhs, rhs, cond, owise: sa.owise, nonexec: sa.nonexec });
             }
             "mb" | "cmb" => {
                 let conditional = kw == "cmb";
                 self.advance();
                 let lhs = self.collect_until(&[":"]);
                 self.eat(":")?;
+                // The sort (and a condition) end at the optional trailing attribute `[ … ]` or `.` — stop
+                // the bubble at `[` so a `[nonexec]`/`[label …]` is not swallowed into the sort.
                 let sort;
                 let cond;
                 if conditional {
                     sort = self.collect_until(&["if"]);
                     self.eat("if")?;
-                    cond = Some(self.collect_until(&[]));
+                    cond = Some(self.collect_until(&["["]));
                 } else {
-                    sort = self.collect_until(&[]);
+                    sort = self.collect_until(&["["]);
                     cond = None;
                 }
+                let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                m.statements.push(Statement::Mb { lhs, sort, cond });
+                m.statements.push(Statement::Mb { lhs, sort, cond, nonexec: sa.nonexec });
             }
             "rl" | "crl" => {
                 if m.kind == ModuleKind::Functional {
@@ -374,19 +394,11 @@ impl<'a> Parser<'a> {
                     rhs = self.collect_until(&["["]);
                     cond = None;
                 }
-                // Optional trailing statement attributes (`[nonexec]`, `[label …]`, `[metadata …]`, …) —
-                // none affect Pillar-A execution, so consume and ignore the balanced group for now.
-                if self.at("[") {
-                    self.advance();
-                    while !self.at("]") {
-                        if self.advance().is_none() {
-                            return Err("unterminated rule attribute `[`".into());
-                        }
-                    }
-                    self.eat("]")?;
-                }
+                // Optional trailing statement attributes (`[nonexec]`, `[label …]`, `[metadata …]`, …):
+                // `nonexec` blocks execution; the rest don't affect it.
+                let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                m.statements.push(Statement::Rule { label, lhs, rhs, cond });
+                m.statements.push(Statement::Rule { label, lhs, rhs, cond, nonexec: sa.nonexec });
             }
             other => return Err(format!("unsupported declaration `{other}`")),
         }
@@ -471,16 +483,38 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
-    /// A trailing `[owise]` on an equation (the only attribute statements carry in the functional subset).
-    fn opt_owise(&mut self) -> PResult<bool> {
-        if self.at("[") {
-            self.advance();
-            self.eat("owise")?;
-            self.eat("]")?;
-            Ok(true)
-        } else {
-            Ok(false)
+    /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. Only `owise` and `nonexec`
+    /// affect execution and are returned; `label`/`metadata` (and their argument) plus any other attribute
+    /// (`print`, `format`, …) are parsed and ignored. Absent `[` ⇒ both `false`.
+    fn stmt_attrs(&mut self) -> PResult<StmtAttrs> {
+        let mut sa = StmtAttrs::default();
+        if !self.at("[") {
+            return Ok(sa);
         }
+        self.advance(); // [
+        while !self.at("]") {
+            match self.peek_text().ok_or("unterminated statement attribute `[`")? {
+                "owise" => {
+                    sa.owise = true;
+                    self.advance();
+                }
+                "nonexec" => {
+                    sa.nonexec = true;
+                    self.advance();
+                }
+                "label" | "metadata" => {
+                    self.advance(); // the keyword
+                    if !self.at("]") {
+                        self.advance(); // its single argument (label name / metadata string)
+                    }
+                }
+                _ => {
+                    self.advance(); // any other attribute (print, format, …): ignore token-by-token
+                }
+            }
+        }
+        self.eat("]")?;
+        Ok(sa)
     }
 
     /// An optional command bound `[n]` (e.g. `rewrite [2] …`, `continue [3] .`). Returns the number, or
@@ -772,6 +806,55 @@ endfm
             }
             other => panic!("expected Sum(A, Rename(B,…)), got {other:?}"),
         }
+    }
+
+    /// B-i: a theory (`fth`) parses into a `PreModule` flagged `is_theory` (kind Functional), with
+    /// `[nonexec]` captured on its axiom and an ordinary equation left executable.
+    #[test]
+    fn parses_functional_theory_with_nonexec() {
+        let src = "\
+fth ORD is
+  sort Elt .
+  op _<_ : Elt Elt -> Elt .
+  vars X Y : Elt .
+  eq X < X = X [nonexec label irreflexive] .
+  eq X < Y = Y .
+endfth
+";
+        let m = &parse(src).modules[0];
+        assert!(m.is_theory, "fth is a theory");
+        assert_eq!(m.kind, ModuleKind::Functional);
+        assert_eq!(m.name, "ORD");
+        assert_eq!(m.sorts, ["Elt"]);
+        assert_eq!(m.statements.len(), 2);
+        match &m.statements[0] {
+            Statement::Eq { nonexec, owise, .. } => {
+                assert!(*nonexec, "the `[nonexec]` axiom is flagged");
+                assert!(!*owise);
+            }
+            other => panic!("expected Eq, got {other:?}"),
+        }
+        match &m.statements[1] {
+            Statement::Eq { nonexec, .. } => assert!(!*nonexec, "an ordinary equation is executable"),
+            other => panic!("expected Eq, got {other:?}"),
+        }
+    }
+
+    /// B-i: `th` is a *system* theory (rules allowed); a functional theory (`fth`) rejects rules exactly
+    /// as `fmod` does. Closing keywords `endth`/`endfth` are matched.
+    #[test]
+    fn system_theory_allows_rules_functional_rejects() {
+        let ok = "th T is sort S . ops a b : -> S . rl a => b . endth\n";
+        let m = &parse(ok).modules[0];
+        assert!(m.is_theory && m.kind == ModuleKind::System);
+        assert_eq!(m.statements.len(), 1);
+        assert!(matches!(&m.statements[0], Statement::Rule { .. }));
+
+        let bad = "fth T is sort S . ops a b : -> S . rl a => b . endfth\n";
+        let mut i = Interner::new();
+        let toks = tokenize(bad, &mut i);
+        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
+        assert!(err.contains("functional"), "rules rejected in a functional theory: {err}");
     }
 
     /// Parameterized instantiation is Phase 2 — rejected loudly.

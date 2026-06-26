@@ -160,4 +160,25 @@ mod tests {
             &[e("Item", "e", 2), e("Item", "e", 1)],
         );
     }
+
+    /// B-i: a theory (`fth`) builds its signature like a module, but a `[nonexec]` axiom is a proof
+    /// obligation that is never applied (`e < e` stays, 0 rewrites) while an ordinary theory equation does
+    /// fire (`id(e) = e`, 1 rewrite). Differentially verified against the reference binary.
+    #[test]
+    fn theory_nonexec_conforms() {
+        conform(
+            conformance_file!("theory-nonexec.maude"),
+            &[e("Bool", "e < e", 0), e("Elt", "e", 1)],
+        );
+    }
+
+    /// B-i: a theory flattens its `protecting`/`including` imports exactly as a module does — `TINY`'s
+    /// equation `neg(t) = f` fires inside the theory `ORD` that protects it.
+    #[test]
+    fn theory_import_conforms() {
+        conform(
+            conformance_file!("theory-import.maude"),
+            &[e("B", "f", 1), e("B", "t", 2)],
+        );
+    }
 }

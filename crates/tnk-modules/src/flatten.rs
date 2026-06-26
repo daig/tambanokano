@@ -87,12 +87,14 @@ pub fn flatten(name: &str, db: &ModuleDb, interner: &mut Interner) -> Result<Pre
     let mut visited = HashSet::new();
     collect_named(name, db, &mut acc, &mut visited, interner)?;
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
-    // (`mod` stays a system module — its rules survive flattening).
-    let kind = db.get(name).map(|pm| pm.kind).unwrap_or(ModuleKind::Functional);
+    // (`mod` stays a system module — its rules survive flattening) and its theory flag.
+    let (kind, is_theory) =
+        db.get(name).map(|pm| (pm.kind, pm.is_theory)).unwrap_or((ModuleKind::Functional, false));
     let d = acc.into_decls();
     Ok(PreModule {
         name: name.to_string(),
         kind,
+        is_theory,
         imports: Vec::new(),
         sorts: d.sorts,
         subsorts: d.subsorts,

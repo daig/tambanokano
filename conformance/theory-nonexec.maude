@@ -1,0 +1,16 @@
+*** B-i: theories (fth). A theory is a SPECIFICATION (a view source / parameter bound). Its
+*** `[nonexec]` axioms are proof obligations, NEVER applied during reduction; ordinary
+*** equations in a theory DO fire. Self-contained (no imports), ground reduce subjects.
+fth ELT-ORD is
+  sorts Elt Bool .
+  ops tt ff : -> Bool [ctor] .
+  op e : -> Elt [ctor] .
+  op _<_ : Elt Elt -> Bool .
+  op id : Elt -> Elt .
+  vars X Y : Elt .
+  eq X < X = ff [nonexec label irreflexive] .   *** obligation — must NOT fire
+  eq id(X) = X .                                  *** ordinary — fires
+endfth
+
+red e < e .    *** e < e   (0 rewrites — the nonexec axiom is not applied)
+red id(e) .    *** e        (1 rewrite — the ordinary equation fires)

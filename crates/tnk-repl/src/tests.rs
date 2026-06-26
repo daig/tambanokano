@@ -53,6 +53,33 @@ fn import_renaming_through_repl() {
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
 
+/// B-i: a theory loads through the REPL end-to-end — it becomes current, its `[nonexec]` axiom does NOT
+/// fire (`e < e` stays, 0 rewrites), and an ordinary theory equation does (`id(e) = e`, 1 rewrite).
+/// Values/counts are the reference binary's.
+#[test]
+fn theory_nonexec_through_repl() {
+    let out = repl().eval(conformance_file!("theory-nonexec.maude")).output;
+    assert!(out.contains("reduce in ELT-ORD :"), "header: {out}");
+    assert!(out.contains("result Bool: e < e"), "nonexec not applied: {out}");
+    assert!(out.contains("result Elt: e"), "exec eq fires: {out}");
+    assert!(out.contains("rewrites: 0"), "nonexec count: {out}");
+    assert!(out.contains("rewrites: 1"), "exec count: {out}");
+}
+
+/// B-i: a multi-line theory is buffered as ONE submission by `input_complete` (which recognizes
+/// `fth`/`endfth`), then entered and made current — the interactive multi-line boundary for theories.
+#[test]
+fn theory_entry_is_one_submission_and_current() {
+    let mut r = repl();
+    assert!(!r.input_complete("fth TRIV is\n"), "open theory keeps buffering");
+    assert!(!r.input_complete("fth TRIV is\n  sort Elt .\n"), "a `.` inside an open theory is not the end");
+    let src = "fth TRIV is\n  sort Elt .\nendfth\n";
+    assert!(r.input_complete(src), "`endfth` completes the submission");
+    let ev = r.eval(src);
+    assert!(!ev.exit);
+    assert_eq!(r.current(), Some("TRIV"));
+}
+
 /// C7 structure sharing end-to-end through the REPL: a repeated reducible subterm reduces once
 /// (Maude's hash-consed subject/rhs DAG). Every result + count is the reference binary's. The strong
 /// C7-specific guard: this fixture's reference counts top out at 2, so a pre-C7 over-count (`f(a)` was

@@ -9,8 +9,15 @@ use crate::lex::Token;
 #[derive(Debug, Clone)]
 pub struct PreModule {
     pub name: String,
-    /// Functional (`fmod`) or system (`mod`). A `mod` may declare rules (`rl`/`crl`); an `fmod` may not.
+    /// Functional (`fmod`/`fth`) or system (`mod`/`th`). A system module/theory may declare rules
+    /// (`rl`/`crl`); a functional one may not. This is the *rule-gating* axis only.
     pub kind: ModuleKind,
+    /// Whether this is a **theory** (`fth`/`th`) rather than a module (`fmod`/`mod`). Orthogonal to
+    /// [`kind`](Self::kind) (Maude's `ModuleType` is a bitfield: functional/system ⊥ theory). A theory is
+    /// a *specification* — the source of a view and the bound of a parameter (`X :: T`); its statements
+    /// are not executed (theory axioms are `[nonexec]` proof obligations). Built with its signature like a
+    /// module, but [`nonexec`](Statement) statements are not added to the engine.
+    pub is_theory: bool,
     /// Imported modules (`protecting`/`extending`/`including <module-expr> .`), in declaration order.
     pub imports: Vec<Import>,
     pub sorts: Vec<String>,
@@ -21,8 +28,9 @@ pub struct PreModule {
     pub statements: Vec<Statement>,
 }
 
-/// Whether a module is functional (`fmod`/`fth` — equations + memberships only) or a system module
-/// (`mod`/`th` — may additionally declare rules). The kind gates rule statements (`rl`/`crl`).
+/// Whether a module/theory is functional (`fmod`/`fth` — equations + memberships only) or a system one
+/// (`mod`/`th` — may additionally declare rules). The kind gates rule statements (`rl`/`crl`). Whether it
+/// is a *theory* is the orthogonal [`PreModule::is_theory`] flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleKind {
     Functional,
@@ -124,13 +132,16 @@ pub struct SpecialSpec {
 }
 
 /// A statement — `eq`/`ceq`/`owise`, `mb`/`cmb`, `rl`/`crl`. Term parts are raw bubbles (parsed in B4.4).
+/// `nonexec` ([`nonexec`] statement attribute) marks an axiom that is *not* applied during
+/// reduction/rewriting — a proof obligation (theory axioms are all `[nonexec]`, but a module statement may
+/// be too). Such statements parse and carry through flattening, but are skipped when loading the engine.
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool },
-    Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>> },
+    Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool, nonexec: bool },
+    Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },
     /// `rl [\[label\] :] lhs => rhs .` (or `crl … if cond .`). A rule condition may carry a rewrite
     /// fragment `t => p` (Pillar A-v) in addition to the `ceq`-style fragments.
-    Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>> },
+    Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },
 }
 
 /// A top-level command (functional fragment): `reduce`/`red`, `match`/`xmatch`, and the rewriting
