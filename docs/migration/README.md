@@ -49,6 +49,7 @@ tnk-repl      the interactive shell (lib + bin); reuses everything below
 | `decisions`<br>(`03-open-decisions.md`) | motivation | the foundational decisions **D1–D8** (engine model, GC, dispatch, bignum, IO, BDD, SMT, naming) + why |
 | `gaps.md` | known gaps | where the **built** engine differs from / simplifies Maude — accepted cosmetic divergences + deferred optimizations |
 | `roadmap.md` | remaining plan | Phase 2 (system modules + parameterization + strategies + prelude) and Phase 3 (reflection + symbolic + verification) |
+| `A2-A5-nested-instantiation.md` | bootstrap (transient) | self-contained design doc for the next task — parameterized views + free/bound nested instantiation; retire once it lands |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 
 The detailed **current behavior** lives in the code (the crates carry thorough module/function doc comments);

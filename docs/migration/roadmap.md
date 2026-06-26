@@ -49,16 +49,10 @@ prelude load.
      not `X$Bool`) — **DONE** (`afc8987`): `module_origin_sorts` excludes module-imported sorts from the
      `X$` qualifier. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
    - **A2 + A5 — parameterized views + free-vs-bound nested instantiation. NEXT, and the hard pair.** These
-     are one entangled feature: a parameterized view `view List{X :: TRIV} … to LIST{X}` can only be
-     *exercised* by a nested instantiation (`LIST{List{Nat}}` = `LIST` instantiated with the view `List`
-     applied to `Nat`). The **parsing** is tractable (parameterized view names via the existing `param_list`;
-     nested instantiation args become a module/view *expression*, not a bare name). The **algebra** is the
-     genuinely fragile part (A5 §4 "top risk / bulk of the work"): a parameterized view `BoxV{ToColor}`
-     derives a view whose target `BOX{X}` becomes `BOX{ToColor}`, which then feeds the outer instantiation,
-     with the **free-vs-bound** parameter resolution and the **instance-name composition** (`Box{X}` ↦
-     `Box{BoxV{ToColor}}` while `X$Elt` ↦ `Box{ToColor}`). Probe (binary): `peek(wrap(wrap(red)))` in
-     `BOX{BoxV{ToColor}}` → `wrap(red)` : `Box{ToColor}`, 1 rw. Deserves a fresh-context design pass, not an
-     end-of-budget rush. Reference: `instantiateModuleWith{Free,Bound}Parameters.cc` + `parameterization.cc`.
+     are one entangled feature (a parameterized view is only *exercised* by a nested instantiation). The
+     parsing is tractable; the free/bound substitution-composition algebra is the A5 §4 top risk and deserves
+     a fresh-context design pass. **→ Full self-contained bootstrap (current state, the C++ three-argument-kind
+     model, worked examples, increment order, gotchas) in `A2-A5-nested-instantiation.md` — start there.**
    - Related parser gaps: the structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts, and `mb` over a
      structured sort.
    - **Built-engine edge already found** (`gaps.md`): instantiation flattens `M`'s statement *bubbles* into
