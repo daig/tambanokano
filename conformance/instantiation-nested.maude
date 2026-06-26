@@ -1,0 +1,20 @@
+*** Axis-A2/A5: a parameterized view (BoxV) instantiated by a module-view (ToColor),
+*** used as the argument of a nested module instantiation BOX{BoxV{ToColor}}.
+*** The element sort of the outer BOX is Box{ToColor}, so wrap/peek are ad-hoc
+*** overloaded across the Hue / Box{ToColor} / Box{BoxV{ToColor}} kinds.
+fth TRIV is sort Elt . endfth
+fmod COLOR is sort Hue . op red : -> Hue [ctor] . endfm
+view ToColor from TRIV to COLOR is sort Elt to Hue . endv
+fmod BOX{X :: TRIV} is
+  sort Box{X} .
+  op wrap : X$Elt -> Box{X} [ctor] .
+  op peek : Box{X} -> X$Elt .
+  eq peek(wrap(E:X$Elt)) = E:X$Elt .
+endfm
+view BoxV{X :: TRIV} from TRIV to BOX{X} is sort Elt to Box{X} . endv
+fmod USE is protecting BOX{BoxV{ToColor}} . endfm
+red wrap(red) .
+red wrap(wrap(red)) .
+red peek(wrap(red)) .
+red peek(wrap(wrap(red))) .
+red peek(peek(wrap(wrap(red)))) .

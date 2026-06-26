@@ -234,6 +234,26 @@ mod tests {
         );
     }
 
+    /// Axis-A2/A5: a *parameterized view* `BoxV{X :: TRIV}` instantiated by a module-view `ToColor`, used
+    /// as the argument of a **nested instantiation** `BOX{BoxV{ToColor}}`. The outer element sort is
+    /// `Box{ToColor}`, so `wrap`/`peek` are ad-hoc overloaded across the `Hue` / `Box{ToColor}` /
+    /// `Box{BoxV{ToColor}}` kinds and the equation `peek(wrap(E:X$Elt)) = E:X$Elt` is instantiated at two
+    /// different element sorts (the colon variable's sort is rewritten per copy). Byte-identical to the
+    /// reference binary across all five reduces.
+    #[test]
+    fn instantiation_nested_conforms() {
+        conform(
+            conformance_file!("instantiation-nested.maude"),
+            &[
+                e("Box{ToColor}", "wrap(red)", 0),
+                e("Box{BoxV{ToColor}}", "wrap(wrap(red))", 0),
+                e("Hue", "red", 1),
+                e("Box{ToColor}", "wrap(red)", 1),
+                e("Hue", "red", 2),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the
@@ -264,6 +284,28 @@ mod tests {
     #[test]
     fn param_theory_module_sorts_conforms() {
         conform(conformance_file!("param-theory-module-sorts.maude"), &[e("Bool", "tt", 2)]);
+    }
+
+    /// Cross-kind ad-hoc operator overloading (the kernel prerequisite nested instantiation surfaced):
+    /// `f : A -> B` and `f : B -> C` are the *same* name+arity in *different* connected components, so they
+    /// are distinct symbols (the argument kind selects the declaration), and `f(f(a))` types as `C`.
+    /// Byte-identical to the reference binary.
+    #[test]
+    fn cross_kind_overload_conforms() {
+        conform(
+            "fmod CK is\n\
+               sorts A B C .\n\
+               op a : -> A [ctor] .\n\
+               op f : A -> B [ctor] .\n\
+               op f : B -> C [ctor] .\n\
+               op g : C -> A .\n\
+               eq g(f(f(a))) = a .\n\
+             endfm\n\
+             red f(a) .\n\
+             red f(f(a)) .\n\
+             red g(f(f(a))) .\n",
+            &[e("B", "f(a)", 0), e("C", "f(f(a))", 0), e("A", "a", 1)],
+        );
     }
 
     /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's

@@ -276,42 +276,20 @@ fn instantiate(
         ));
     }
 
-    // Bind each parameter to its view, importing the view's target module, and collect the views'
-    // operator maps (`op f to g` / `op f to term t`) into one token-substitution (A1).
+    // Resolve each argument to a (possibly derived) view, import its target module expression, and bind the
+    // parameter: the parameter sort `X$s` to the view's sort image of `s`, the structured sort `Base{X}` to
+    // `Base{<printed name>}`, and the view's operator maps (A1) into one token-substitution.
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
     for (param, arg) in pm.params.iter().zip(args) {
-        // Increment 1 (parser): only a bare view name is supported here; a nested / parameterized
-        // instantiation argument parses but is handled in a later increment (Axis-A2/A5).
-        let view_name = match arg {
-            ModuleExpr::Named(n) => n.as_str(),
-            _ => {
-                return Err(format!(
-                    "instantiation `{mname}{{…}}`: a nested or parameterized instantiation argument \
-                     is not yet supported (Axis-A2/A5)"
-                ));
-            }
-        };
-        let v = views
-            .get(view_name)
-            .ok_or_else(|| format!("instantiation `{mname}{{…}}`: view `{view_name}` is not defined"))?;
-        let target = view_target(v)?;
-        collect_named(target, db, views, acc, visited, interner)?;
-        let sort_image: HashMap<String, String> = v.sort_maps.iter().cloned().collect();
-        bindings.insert(param.name.clone(), ParamBinding { view_name: view_name.to_string(), sort_image });
-        for m in &v.op_maps {
-            let (from, to) = match m {
-                OpMap::Op { from, to } | OpMap::Term { from, to } => (from, to),
-            };
-            // The source op is a single-token name (a mixfix op map is a follow-up). Its references in
-            // `M`'s body are rewritten to the target op (`g`) or term (`0.0`).
-            match from.as_slice() {
-                [tok] => {
-                    op_subst.insert(interner.resolve(tok.sym).to_string(), to.clone());
-                }
-                _ => return Err(format!("view `{}`: a mixfix operator map is a follow-up", v.name)),
-            }
-        }
+        let r = resolve_arg(arg, views, interner)
+            .map_err(|e| format!("instantiation `{mname}{{…}}`: {e}"))?;
+        collect_expr(&r.target, db, views, acc, visited, interner)?;
+        op_subst.extend(r.op_subst);
+        bindings.insert(param.name.clone(), ParamBinding {
+            view_name: r.printed_name,
+            sort_image: r.sort_image,
+        });
     }
 
     // `M`'s regular imports (deduped via `visited`), then its own declarations with the substitution.
@@ -331,11 +309,117 @@ struct ParamBinding {
     sort_image: HashMap<String, String>,
 }
 
-/// The target module name of a (B-iv common-case) view — a plain named module.
-fn view_target(v: &ViewDecl) -> Result<&str, String> {
-    match &v.to {
-        ModuleExpr::Named(n) => Ok(n),
-        _ => Err(format!("view `{}`: a parameterized view target is a follow-up", v.name)),
+/// A view argument resolved to a concrete (possibly *derived*, for a parameterized view) view: the target
+/// module expression to import, the sort image of each theory sort, the operator-map substitution, and the
+/// printed name used to name structured sorts at the instance (`Box{X} ↦ Box{<printed_name>}`, Maude's
+/// instance-naming rule). This is the Axis-A2/A5 generalization of B-iv's flat per-view binding.
+struct ResolvedView {
+    target: ModuleExpr,
+    sort_image: HashMap<String, String>,
+    op_subst: HashMap<String, Vec<Token>>,
+    printed_name: String,
+}
+
+/// Resolve one instantiation argument to a [`ResolvedView`] (Axis-A2/A5 kind 3). A bare view name resolves
+/// to the stored view. A nested instantiation `V{Arg, …}` of a *parameterized* view resolves recursively:
+/// each inner argument is resolved, then substituted through `V`'s `to` target and `sort_maps` to yield a
+/// ground derived view (`BoxV{ToColor}` ⇒ target `BOX{ToColor}`, image `Elt ↦ Box{ToColor}`).
+fn resolve_arg(arg: &ModuleExpr, views: &ViewDb, i: &Interner) -> Result<ResolvedView, String> {
+    match arg {
+        ModuleExpr::Named(view_name) => {
+            let v = views.get(view_name).ok_or_else(|| format!("view `{view_name}` is not defined"))?;
+            if !v.params.is_empty() {
+                return Err(format!(
+                    "parameterized view `{view_name}` must be instantiated with arguments"
+                ));
+            }
+            Ok(ResolvedView {
+                target: v.to.clone(),
+                sort_image: v.sort_maps.iter().cloned().collect(),
+                op_subst: op_subst_of(v, i)?,
+                printed_name: view_name.clone(),
+            })
+        }
+        ModuleExpr::Instantiation(base, inner_args) => {
+            let ModuleExpr::Named(view_name) = &**base else {
+                return Err("an instantiation argument must be a view name or a parameterized-view \
+                            instantiation"
+                    .into());
+            };
+            let v = views.get(view_name).ok_or_else(|| format!("view `{view_name}` is not defined"))?;
+            if v.params.len() != inner_args.len() {
+                return Err(format!(
+                    "view `{view_name}{{…}}` has {} argument(s) but `{view_name}` has {} parameter(s)",
+                    inner_args.len(),
+                    v.params.len()
+                ));
+            }
+            // Resolve each inner argument and bind `V`'s parameter to it, then substitute through `V`'s
+            // target/sort-image to derive a ground view. The inner views' op maps are applied when their
+            // own target is instantiated (via `collect_expr(target)`), not threaded here.
+            let mut inner: HashMap<String, ParamBinding> = HashMap::new();
+            let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
+            for (vp, ia) in v.params.iter().zip(inner_args) {
+                let r = resolve_arg(ia, views, i)?;
+                param_to_arg.insert(vp.name.clone(), ia.clone());
+                inner.insert(vp.name.clone(), ParamBinding {
+                    view_name: r.printed_name,
+                    sort_image: r.sort_image,
+                });
+            }
+            let target = subst_params_in_expr(&v.to, &param_to_arg);
+            let sort_image =
+                v.sort_maps.iter().map(|(a, b)| (a.clone(), inst_sort(b, &inner))).collect();
+            Ok(ResolvedView {
+                target,
+                sort_image,
+                op_subst: op_subst_of(v, i)?,
+                printed_name: canonical_key(arg),
+            })
+        }
+        ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => {
+            Err("an instantiation argument must be a view name or a parameterized-view instantiation \
+                 (a sum/renaming argument is not supported)"
+                .into())
+        }
+    }
+}
+
+/// The op-map substitution of a view: each single-token source operator `f` to its target token(s)
+/// (`op f to g` / `op f to term t`, A1). A mixfix source op map is a follow-up, rejected loudly.
+fn op_subst_of(v: &ViewDecl, i: &Interner) -> Result<HashMap<String, Vec<Token>>, String> {
+    let mut op_subst = HashMap::new();
+    for m in &v.op_maps {
+        let (from, to) = match m {
+            OpMap::Op { from, to } | OpMap::Term { from, to } => (from, to),
+        };
+        match from.as_slice() {
+            [tok] => {
+                op_subst.insert(i.resolve(tok.sym).to_string(), to.clone());
+            }
+            _ => return Err(format!("view `{}`: a mixfix operator map is a follow-up", v.name)),
+        }
+    }
+    Ok(op_subst)
+}
+
+/// Substitute view parameters into a module expression (a parameterized view's `to` target): replace each
+/// `Named(p)` that is a parameter with its argument expression, recursing through sums/renamings/nested
+/// instantiations. `BoxV`'s target `BOX{X}` with `X ↦ ToColor` becomes `BOX{ToColor}`.
+fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) -> ModuleExpr {
+    match expr {
+        ModuleExpr::Named(n) => map.get(n).cloned().unwrap_or_else(|| expr.clone()),
+        ModuleExpr::Sum(a, b) => ModuleExpr::Sum(
+            Box::new(subst_params_in_expr(a, map)),
+            Box::new(subst_params_in_expr(b, map)),
+        ),
+        ModuleExpr::Rename(inner, items) => {
+            ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map)), items.clone())
+        }
+        ModuleExpr::Instantiation(base, args) => ModuleExpr::Instantiation(
+            Box::new(subst_params_in_expr(base, map)),
+            args.iter().map(|a| subst_params_in_expr(a, map)).collect(),
+        ),
     }
 }
 
@@ -346,7 +430,7 @@ fn instantiate_decls(
     mut d: FlatDecls,
     bindings: &HashMap<String, ParamBinding>,
     op_subst: &HashMap<String, Vec<Token>>,
-    i: &Interner,
+    i: &mut Interner,
 ) -> FlatDecls {
     for s in &mut d.sorts {
         *s = inst_sort(s, bindings);
@@ -367,31 +451,32 @@ fn instantiate_decls(
     for v in &mut d.vars {
         v.sort = inst_sort(&v.sort, bindings);
     }
-    // Apply the operator maps to the statement bubbles (A1). Sort-name substitution into bubbles
-    // (`mb t : Sort`, structured colon variables) remains a follow-up.
-    if !op_subst.is_empty() {
-        for st in &mut d.statements {
-            match st {
-                Statement::Eq { lhs, rhs, cond, .. } => {
-                    *lhs = subst_ops(lhs, op_subst, i);
-                    *rhs = subst_ops(rhs, op_subst, i);
-                    if let Some(c) = cond {
-                        *c = subst_ops(c, op_subst, i);
-                    }
+    // Rewrite statement bubbles: the views' operator maps (A1) and parameter-sort substitution inside glued
+    // colon variables (`E:X$Elt ↦ E:Box{ToColor}`). The colon-var rewrite keeps the variable a single token
+    // so it re-parses as an on-the-fly variable against the instance's sorts — essential because a nested
+    // instantiation produces two copies of a parameterized module's equations at *different* element sorts,
+    // which a shared module-level `var` declaration could not type.
+    for st in &mut d.statements {
+        match st {
+            Statement::Eq { lhs, rhs, cond, .. } => {
+                *lhs = subst_bubble(lhs, bindings, op_subst, i);
+                *rhs = subst_bubble(rhs, bindings, op_subst, i);
+                if let Some(c) = cond {
+                    *c = subst_bubble(c, bindings, op_subst, i);
                 }
-                Statement::Mb { lhs, sort, cond, .. } => {
-                    *lhs = subst_ops(lhs, op_subst, i);
-                    *sort = subst_ops(sort, op_subst, i);
-                    if let Some(c) = cond {
-                        *c = subst_ops(c, op_subst, i);
-                    }
+            }
+            Statement::Mb { lhs, sort, cond, .. } => {
+                *lhs = subst_bubble(lhs, bindings, op_subst, i);
+                *sort = subst_bubble(sort, bindings, op_subst, i);
+                if let Some(c) = cond {
+                    *c = subst_bubble(c, bindings, op_subst, i);
                 }
-                Statement::Rule { lhs, rhs, cond, .. } => {
-                    *lhs = subst_ops(lhs, op_subst, i);
-                    *rhs = subst_ops(rhs, op_subst, i);
-                    if let Some(c) = cond {
-                        *c = subst_ops(c, op_subst, i);
-                    }
+            }
+            Statement::Rule { lhs, rhs, cond, .. } => {
+                *lhs = subst_bubble(lhs, bindings, op_subst, i);
+                *rhs = subst_bubble(rhs, bindings, op_subst, i);
+                if let Some(c) = cond {
+                    *c = subst_bubble(c, bindings, op_subst, i);
                 }
             }
         }
@@ -399,15 +484,37 @@ fn instantiate_decls(
     d
 }
 
-/// Rewrite a statement bubble under an operator-map substitution: each token whose text is a mapped source
-/// operator is replaced by the target token(s) (one token for `op f to g`, several for `op f to term t`).
-fn subst_ops(bubble: &[Token], op_subst: &HashMap<String, Vec<Token>>, i: &Interner) -> Vec<Token> {
+/// Rewrite a statement bubble under an instantiation. A token that is a mapped source operator becomes its
+/// target token(s) (op→op / op→term, A1). A glued colon variable `name:sort` has its sort instantiated
+/// (`E:X$Elt ↦ E:Box{ToColor}`) and is re-interned as one token, so it re-parses as an on-the-fly variable
+/// of the instance sort; a `name:sort` whose sort is unaffected by the instantiation is left untouched (so
+/// an operator coincidentally containing a colon is safe).
+fn subst_bubble(
+    bubble: &[Token],
+    bindings: &HashMap<String, ParamBinding>,
+    op_subst: &HashMap<String, Vec<Token>>,
+    i: &mut Interner,
+) -> Vec<Token> {
     let mut out = Vec::with_capacity(bubble.len());
     for t in bubble {
-        match op_subst.get(i.resolve(t.sym)) {
-            Some(repl) => out.extend(repl.iter().copied()),
-            None => out.push(*t),
+        let text = i.resolve(t.sym).to_string();
+        if let Some(repl) = op_subst.get(&text) {
+            out.extend(repl.iter().copied());
+            continue;
         }
+        if let Some((name, sort)) = text.rsplit_once(':')
+            && !name.is_empty()
+            && !sort.is_empty()
+        {
+            let new_sort = inst_sort(sort, bindings);
+            if new_sort.as_str() != sort {
+                let mut nt = *t;
+                nt.sym = i.intern(&format!("{name}:{new_sort}"));
+                out.push(nt);
+                continue;
+            }
+        }
+        out.push(*t);
     }
     out
 }
@@ -568,6 +675,43 @@ fmod TOP is protecting L . protecting R . endfm
         let wrap = flat.ops.iter().find(|o| i.resolve(o.name[0].sym) == "wrap").expect("wrap op");
         assert_eq!(wrap.domain, ["Hue"], "X$Elt domain substituted to the view image");
         assert_eq!(wrap.range, "Box{V}");
+    }
+
+    /// Axis-A2/A5: a nested instantiation `BOX{BoxV{ToColor}}` resolves the parameterized-view argument
+    /// `BoxV{ToColor}` to a derived ground view (target `BOX{ToColor}`, sort image `Elt ↦ Box{ToColor}`),
+    /// so the flattened module carries both element-level instances of `Box` and both `wrap` overloads —
+    /// `wrap : Hue -> Box{ToColor}` (the inner target) and `wrap : Box{ToColor} -> Box{BoxV{ToColor}}`.
+    #[test]
+    fn nested_instantiation_resolves_derived_view() {
+        let (db, views, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod COLOR is sort Hue . op red : -> Hue [ctor] . endfm\n\
+             view ToColor from TRIV to COLOR is sort Elt to Hue . endv\n\
+             fmod BOX{X :: TRIV} is sort Box{X} . op wrap : X$Elt -> Box{X} [ctor] . endfm\n\
+             view BoxV{X :: TRIV} from TRIV to BOX{X} is sort Elt to Box{X} . endv\n\
+             fmod USE is protecting BOX{BoxV{ToColor}} . endfm\n",
+        );
+        let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
+        for s in ["Hue", "Box{ToColor}", "Box{BoxV{ToColor}}"] {
+            assert!(flat.sorts.contains(&s.to_string()), "sort {s} present: {:?}", flat.sorts);
+        }
+        // Both `wrap` overloads: the inner `Hue -> Box{ToColor}` and the outer `Box{ToColor} -> Box{…}`.
+        let wraps: Vec<(&Vec<String>, &String)> = flat
+            .ops
+            .iter()
+            .filter(|o| i.resolve(o.name[0].sym) == "wrap")
+            .map(|o| (&o.domain, &o.range))
+            .collect();
+        assert!(
+            wraps.iter().any(|(d, r)| d.as_slice() == ["Hue"] && r.as_str() == "Box{ToColor}"),
+            "inner wrap: {wraps:?}"
+        );
+        assert!(
+            wraps
+                .iter()
+                .any(|(d, r)| d.as_slice() == ["Box{ToColor}"] && r.as_str() == "Box{BoxV{ToColor}}"),
+            "outer wrap: {wraps:?}"
+        );
     }
 
     /// An undefined imported module is a loud error.

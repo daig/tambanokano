@@ -10,7 +10,7 @@ use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use crate::surface::ast::{Attrs, PreModule, SpecialSpec};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
-use tnk_core::sort::SortId;
+use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
     BoolHooks, FltOp, NatHooks, NumOp, SpecialOp, StrOp, SymbolId,
 };
@@ -48,6 +48,14 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut ops: HashMap<(String, usize), SymbolId> = HashMap::new();
     let mut name_to_sym: HashMap<String, SymbolId> = HashMap::new();
     let mut syntax: HashMap<SymbolId, SymbolSyntax> = HashMap::new();
+    // Symbol identity is the **kind-profile** (name + domain/range connected components), not just
+    // (name, arity): subsort overloading (same components, different sorts — `_+_ : NzNat Nat -> NzNat`
+    // and `_+_ : Nat Nat -> Nat`) adds a declaration to the *same* symbol, but **ad-hoc** overloading
+    // across different components (`wrap : Hue -> Box{ToColor}` and `wrap : Box{ToColor} -> Box{V}` from a
+    // nested instantiation) makes **distinct** symbols, as in Maude — the argument kind, not the range,
+    // selects the declaration group. `op_syms[i]` is the symbol declaration `pm.ops[i]` landed on.
+    let mut sym_by_profile: HashMap<(String, Vec<KindId>, KindId), SymbolId> = HashMap::new();
+    let mut op_syms: Vec<SymbolId> = Vec::with_capacity(pm.ops.len());
 
     // Pass A: declare every op (theory-dispatched), record name→id + syntax.
     for od in &pm.ops {
@@ -56,13 +64,16 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let domain: Vec<SortId> =
             od.domain.iter().map(|s| sort_id(&sorts, s)).collect::<R<_>>()?;
         let range = sort_id(&sorts, &od.range)?;
+        let dom_kinds: Vec<KindId> = domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
+        let profile = (cname.clone(), dom_kinds, engine.sorts().kind_of(range));
 
-        let sym = if let Some(&existing) = ops.get(&(cname.clone(), arity)) {
-            engine.add_op_decl(existing, domain.clone(), range); // overload / `ditto`
+        let sym = if let Some(&existing) = sym_by_profile.get(&profile) {
+            engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
             existing
         } else {
             let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
-            ops.insert((cname.clone(), arity), sym);
+            sym_by_profile.insert(profile, sym);
+            ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
             name_to_sym.entry(cname.clone()).or_insert(sym);
             let frags = split_mixfix(&cname, interner);
             syntax.insert(
@@ -78,7 +89,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             );
             sym
         };
-        let _ = sym;
+        op_syms.push(sym);
     }
 
     // Pass A2: record the built-in anchors (now every name resolves).
@@ -90,12 +101,10 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut minus_sym = None;
     let mut division_sym = None;
     let mut succ_zero: HashMap<SymbolId, SymbolId> = HashMap::new();
-    for od in &pm.ops {
+    for (idx, od) in pm.ops.iter().enumerate() {
         let Some(spec) = &od.attrs.special else { continue };
         let Some((class, _)) = &spec.id_hook else { continue };
-        let cname = canonical_name(&od.name, interner);
-        let arity = od.domain.len();
-        let sym = ops[&(cname, arity)];
+        let sym = op_syms[idx];
         match class.as_str() {
             "SuccSymbol" => {
                 nat_succ = Some(sym);
@@ -114,13 +123,12 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     }
 
     // Pass B: attach ctor / strat / special.
-    for od in &pm.ops {
+    for (idx, od) in pm.ops.iter().enumerate() {
         if od.attrs.ditto {
             continue; // attributes inherited from the prior declaration (shared symbol)
         }
-        let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
-        let sym = ops[&(cname, arity)];
+        let sym = op_syms[idx];
         if od.attrs.ctor {
             engine.set_ctor(sym);
         }

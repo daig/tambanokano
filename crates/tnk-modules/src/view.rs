@@ -42,13 +42,14 @@ impl ViewDb {
     }
 }
 
-/// The name of a module expression that must be a plain named module/theory. A B-ii view maps between
-/// named modules; a parameterized target (`LIST{X}`) or a `+`/`*` expression is a later increment.
-fn expr_name(e: &ModuleExpr) -> Result<&str, String> {
+/// The base module/theory name of a view's `from`/`to`: a plain name, or the base of an instantiation
+/// target (`LIST{X}` → `LIST`, Axis-A2). Sums/renamings as a view target are a later increment.
+fn expr_base_name(e: &ModuleExpr) -> Result<&str, String> {
     match e {
         ModuleExpr::Named(n) => Ok(n),
-        _ => Err("a view's `from`/`to` must be a named module/theory (sums/renamings/instantiations are a \
-                  later increment)"
+        ModuleExpr::Instantiation(base, _) => expr_base_name(base),
+        _ => Err("a view's `from`/`to` must be a named module/theory or an instantiation \
+                  (sums/renamings are a later increment)"
             .into()),
     }
 }
@@ -57,8 +58,8 @@ fn expr_name(e: &ModuleExpr) -> Result<&str, String> {
 /// stored and (later) used in an instantiation; on failure returns a diagnostic mirroring the reference
 /// binary's wording.
 pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Result<(), String> {
-    let from_name = expr_name(&v.from)?;
-    let to_name = expr_name(&v.to)?;
+    let from_name = expr_base_name(&v.from)?;
+    let to_name = expr_base_name(&v.to)?;
 
     let from_pm = db
         .get(from_name)
@@ -69,39 +70,48 @@ pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Re
     db.get(to_name)
         .ok_or_else(|| format!("view `{}`: target module `{to_name}` is not defined", v.name))?;
 
-    // Flatten both so imported sorts (e.g. `Elt` from an `including TRIV`, `Bool` from `protecting BOOL`)
-    // are in scope for the checks. A view's `from`/`to` are non-instantiated modules (a parameterized view
-    // target is a follow-up), so an empty view table suffices for these flattens.
+    // Flatten the source theory so its imported sorts (`Elt` from `including TRIV`, `Bool` from
+    // `protecting BOOL`) are in scope; a theory has no instantiations, so an empty view table suffices.
     let no_views = ViewDb::new();
     let from_flat = flatten(from_name, db, &no_views, interner)?;
-    let to_flat = flatten(to_name, db, &no_views, interner)?;
     let from_sorts: HashSet<&str> = from_flat.sorts.iter().map(String::as_str).collect();
-    let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
 
-    // Explicit sort maps: the source is a sort of the theory, the target a sort of the module.
+    // Sort-map sources must be sorts of the theory.
     let mut mapped: HashSet<&str> = HashSet::new();
-    for (a, b) in &v.sort_maps {
+    for (a, _b) in &v.sort_maps {
         if !from_sorts.contains(a.as_str()) {
             return Err(format!("view `{}`: sort `{a}` is not a sort of `{from_name}`", v.name));
         }
-        if !to_sorts.contains(b.as_str()) {
-            return Err(format!(
-                "view `{}`: failed to find sort {b} in {to_name} to represent sort {a} from {from_name}",
-                v.name
-            ));
-        }
         mapped.insert(a.as_str());
     }
-    // Every unmapped theory sort defaults to identity — that same-named sort must exist in the target.
-    for a in &from_flat.sorts {
-        if mapped.contains(a.as_str()) {
-            continue;
+
+    // Target-sort existence (Maude's `failed to find sort …`) needs a *flattenable* target. A parameterized
+    // view's target references the view's own parameters (`to LIST{X}`) and so cannot be flattened
+    // standalone — its sorts are checked when the view is used in an instantiation. For a plain named target
+    // (the B-ii common case) keep the full check, including the identity default for unmapped theory sorts.
+    if v.params.is_empty()
+        && let ModuleExpr::Named(_) = &v.to
+    {
+        let to_flat = flatten(to_name, db, &no_views, interner)?;
+        let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
+        for (a, b) in &v.sort_maps {
+            if !to_sorts.contains(b.as_str()) {
+                return Err(format!(
+                    "view `{}`: failed to find sort {b} in {to_name} to represent sort {a} from {from_name}",
+                    v.name
+                ));
+            }
         }
-        if !to_sorts.contains(a.as_str()) {
-            return Err(format!(
-                "view `{}`: failed to find sort {a} in {to_name} to represent sort {a} from {from_name}",
-                v.name
-            ));
+        for a in &from_flat.sorts {
+            if mapped.contains(a.as_str()) {
+                continue;
+            }
+            if !to_sorts.contains(a.as_str()) {
+                return Err(format!(
+                    "view `{}`: failed to find sort {a} in {to_name} to represent sort {a} from {from_name}",
+                    v.name
+                ));
+            }
         }
     }
     Ok(())
