@@ -16,15 +16,28 @@ prelude load.
    `continue` — all byte-conformant against the reference (`conformance/{rewrite,frewrite,crl,search,
    rewrite-cond}.maude`). The kernel grew a separate rule table (never consulted by `reduce`), a shared
    `drive_match` seam, a lazy hash-consed state-transition graph (`search.rs`), and the rewrite-condition's
-   nested `=>*` search. Built on the bounded-memory re-entrant reduction C6/F-2 unblocked. **Remaining for
-   Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs the object system, item 5); `frozen`'s
-   lazy-`strat` interaction + on-the-fly colon variables + search/rewrite-condition trace (`gaps.md`).
-   Reference: `reports/A6-operational.md`.
-2. **Parameterized programming.** Theories (`fth`/`th`), views, parameterized modules/views, instantiation,
-   `X$Elt`, nested instantiation — the bulk of the module work, and the gate for the container prelude
-   (`LIST`/`SET`/`MAP`/`ARRAY`). Builds on the existing pure-flatten transform (`tnk-modules`). Reference:
-   `reports/A5-modules-parameterization-repl.md`. **Risk:** parameterization corner cases (free vs bound
-   params, theory/module views, parameterized views) — differential-test from the prelude.
+   nested `=>*` search. Built on the bounded-memory re-entrant reduction C6/F-2 unblocked. The two frontend
+   niceties surfaced during A are also cleared — file-load mixing `set`/`show` mid-file, and on-the-fly
+   `X:Sort` colon variables. **Remaining for Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs
+   the object system, item 5); `frozen`'s lazy-`strat` interaction + search/rewrite-condition trace
+   (`gaps.md`). Reference: `reports/A6-operational.md`.
+2. **Parameterized programming (Pillar B) — NEXT, the bootstrap target.** Theories (`fth`/`th`), views,
+   parameterized modules/views, instantiation `{…}`, `X$Elt`, nested instantiation — the bulk of the module
+   work and the gate for the container prelude. **Foundation:** the pure `PreModule → PreModule` flatten in
+   `tnk-modules` (`flatten.rs`/`db.rs`) + the unchanged `build_module`; B *extends* the module-expression
+   AST (`surface/ast.rs ModuleExpr`, today: Named/Sum/Rename — add `Instantiation`) and the flatten with a
+   parameter/view algebra. **Reference:** `reports/A5-modules-parameterization-repl.md` (the C++ deep-dive:
+   `ImportModule` donation → our pure flatten, `Renaming`/`View`/`ModuleCache`, free-vs-bound instantiation).
+   **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — 39 `fmod`, 6 `fth`, **39
+   `view`**, 3 `mod`; it has **zero rules**, so parameterization — not Pillar A — is the critical path to
+   loading it). Seed fixtures from it + the manual's worked `LIST{Nat}`-style examples, diffed vs the binary.
+   **Recommended increment order (dependency-driven):** (B-i) theories `fth`/`th` (a module kind whose ops
+   are "to-be-mapped"); (B-ii) views `view V from T to M is … endv` (sort/op maps + the `Status` checks);
+   (B-iii) parameterized modules `fmod M{X :: T} is …` + the `X$Elt` parameter sorts; (B-iv) instantiation
+   `M{V}` (free-vs-bound, `Token::makeParameterInstanceName`, content-addressed cache); (B-v) the container
+   prelude (`LIST`/`SET`/`MAP`/`ARRAY`) + basic theories/views + the Diophantine solver. **Top risk** (A5
+   §4): the free-vs-bound parameter / theory-view-vs-module-view / nested-`instantiateBoundParameters`
+   corner cases — they're deeply entangled; lean on prelude differential tests early.
 3. **The real prelude.** Wire the `.maude` prelude/library on top of (1)+(2): `BOOL`/`NAT`/`INT`/`RAT`/
    `FLOAT`/`STRING`/`QID` are built; add the containers + basic theories (`TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/
    `DEFAULT`) + standard views + the Diophantine solver. Ports as data (only the hooks are wired).
