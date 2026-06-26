@@ -257,6 +257,15 @@ mod tests {
         );
     }
 
+    /// Axis-A4: a parameter theory `ORD` that `protecting`s a module `B` (sort `Bool`) and `including`s
+    /// `TRIV` (sort `Elt`). The parameter copy qualifies only the theory-declared `Elt` (→ `X$Elt`) and
+    /// keeps the module-declared `Bool`, so `USE-ORD`'s `-> Bool` resolves; instantiation `USE-ORD{ToNN}`
+    /// maps `Elt ↦ N`, `cmp ↦ le`, so `check(w(n0),w(n0)) = tt`. Byte-identical to the binary.
+    #[test]
+    fn param_theory_module_sorts_conforms() {
+        conform(conformance_file!("param-theory-module-sorts.maude"), &[e("Bool", "tt", 2)]);
+    }
+
     /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
     /// `failed to find sort … in … to represent …` diagnostic.
     #[test]

@@ -121,6 +121,14 @@ fn view_opmap_through_repl() {
     assert!(out.contains("result F: box(f0)"), "op->op over op->term: {out}");
 }
 
+/// Axis-A4: a parameter theory that imports a module — the module-declared sort `Bool` is kept (not
+/// renamed to `X$Bool`), so the parameterized module builds and the instance reduces.
+#[test]
+fn theory_module_sorts_through_repl() {
+    let out = repl().eval(conformance_file!("param-theory-module-sorts.maude")).output;
+    assert!(out.contains("result Bool: tt"), "module-declared sort kept: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

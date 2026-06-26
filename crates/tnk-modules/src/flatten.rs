@@ -148,10 +148,9 @@ fn collect_named(
 /// importing module's body can refer to `X$Elt` and to parameterized sorts. The renaming runs in a fresh
 /// scope (a parameter copy is independent of any unrenamed import of the same theory).
 ///
-/// Scope note (B-iii): renames *all* of the theory's flattened sorts. The reference's theory-declared- vs
-/// module-declared-sort distinction (a theory `protecting BOOL` must keep `Bool`, not `X$Bool`) is a
-/// follow-up; it does not arise for `TRIV`-style parameters (no module imports), which the container
-/// prelude uses throughout.
+/// Only **theory-declared** sorts are renamed (A4): a sort the theory gets from an imported *module*
+/// (`protecting BOOL` → `Bool`) keeps its name (Maude only qualifies theory-declared sorts as `X$s`), so the
+/// body's references to it resolve to the shared module sort.
 fn add_parameter_copy(
     param: &str,
     theory: &str,
@@ -164,13 +163,47 @@ fn add_parameter_copy(
     let mut tmp_visited = HashSet::new();
     collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
     let decls = tmp.into_decls();
+    // The sorts that came from an imported module — not renamed.
+    let mut module_sorts = HashSet::new();
+    module_origin_sorts(theory, db, views, interner, &mut HashSet::new(), &mut module_sorts)?;
     let items: Vec<RenameItem> = decls
         .sorts
         .iter()
+        .filter(|s| !module_sorts.contains(s.as_str()))
         .map(|s| RenameItem::Sort { from: s.clone(), to: format!("{param}${s}") })
         .collect();
     let renamed = apply_renaming(decls, &items, interner)?;
     acc.add(renamed);
+    Ok(())
+}
+
+/// Collect the sorts theory `name` inherits from an imported **module** (vs. a theory) — recursively, so a
+/// theory that includes another theory inherits *that* theory's module-origin sorts. These are excluded
+/// from the parameter-copy renaming (A4). Only `Named` imports are considered (a renamed/instantiated
+/// theory import is a follow-up).
+fn module_origin_sorts(
+    name: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+    seen: &mut HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<(), String> {
+    if !seen.insert(name.to_string()) {
+        return Ok(());
+    }
+    let Some(pm) = db.get(name) else { return Ok(()) };
+    let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
+    for imp in &imports {
+        let ModuleExpr::Named(n) = imp else { continue };
+        if db.get(n).is_some_and(|m| m.is_theory) {
+            module_origin_sorts(n, db, views, interner, seen, out)?; // an imported theory
+        } else {
+            // An imported module: every sort in its closure is module-origin.
+            let flat = flatten(n, db, views, interner)?;
+            out.extend(flat.sorts);
+        }
+    }
     Ok(())
 }
 

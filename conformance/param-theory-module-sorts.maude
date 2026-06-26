@@ -1,0 +1,42 @@
+*** B-iv / Axis-A4: a parameter theory that imports a MODULE. The theory ORD protects B (a module
+*** with sort Bool) and includes TRIV (sort Elt). When ORD is used as a parameter X, the parameter
+*** copy must qualify only the THEORY-declared sort (Elt -> X$Elt) and KEEP the module-declared sort
+*** Bool unchanged -- otherwise the body's "-> Bool" references a renamed X$Bool that does not exist.
+*** The instantiation ToNN maps Elt -> N and cmp -> le. Byte-identical to the binary.
+fth TRIV is sort Elt . endfth
+
+fmod B is
+  sort Bool .
+  ops tt ff : -> Bool [ctor] .
+endfm
+
+fth ORD is
+  protecting B .
+  including TRIV .
+  op cmp : Elt Elt -> Bool .
+endfth
+
+fmod NN is
+  protecting B .
+  sort N .
+  op n0 : -> N [ctor] .
+  op le : N N -> Bool .
+  eq le(n0, n0) = tt .
+endfm
+
+view ToNN from ORD to NN is
+  sort Elt to N .
+  op cmp to le .
+endv
+
+fmod USE-ORD{X :: ORD} is
+  sort Wrap{X} .
+  op w : X$Elt -> Wrap{X} [ctor] .
+  op check : Wrap{X} Wrap{X} -> Bool .
+  vars P Q : X$Elt .
+  eq check(w(P), w(Q)) = cmp(P, Q) .
+endfm
+
+fmod USE is protecting USE-ORD{ToNN} . endfm
+
+red check(w(n0), w(n0)) .       *** tt  (Bool, 2 rewrites: check -> cmp=le -> tt)
