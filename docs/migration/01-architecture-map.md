@@ -8,9 +8,11 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > **Build status (Phase 1 + 1.5 complete).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
 > Built-ins** — DONE (the matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf
 > gap, `gaps.md`). **L5 Frontend** (lexer/mixfix-grammar/Earley parser/pretty-printer) and **L6 Modules**
-> (non-parameterized: import/flatten/`+`/rename) — DONE. **L4 Operational** (rules/search/strategies/objects/
-> IO), **L6 parameterization** (theories/views/instantiation), **L7 Reflection/meta**, **L8 Symbolic** — NOT
-> STARTED (Phase 2/3, `roadmap.md`). Feature inventory (§3) = the Phase-2/3 to-do list.
+> (non-parameterized: import/flatten/`+`/rename) — DONE. **L4 Operational — rules + rewriting (Pillar A)
+> DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`,
+> all conformance-verified); strategies / objects / external-IO still NOT STARTED. **L6 parameterization**
+> (theories/views/instantiation), **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED (Phase 2/3,
+> `roadmap.md`). Feature inventory (§3) = the Phase-2/3 to-do list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*

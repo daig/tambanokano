@@ -1,5 +1,5 @@
 *** Pillar A-iii: conditional rules (crl) with the equality / matching / sort-test condition fragments
-*** (the rewrite `=>` fragment is A-v). Byte-for-byte vs the reference (rate normalized):
+*** The rewrite `=>` fragment is A-v. Byte-for-byte vs the reference, rate normalized:
 ***   ~/Downloads/Maude-3/maude -no-banner conformance/crl.maude < /dev/null
 ***   ./target/debug/tnk-repl conformance/crl.maude < /dev/null
 ***

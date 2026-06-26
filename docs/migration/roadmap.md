@@ -10,10 +10,16 @@ subsystem detail behind each item is in `reports/A1–A8`; the foundational tech
 The jump from a *functional* engine to a *rewriting* one, plus the module algebra that lets the real
 prelude load.
 
-1. **Rules + rewriting.** `rl`/`crl` (incl. rewrite `=>` conditions, the one condition kind not yet built),
-   `rewrite`/`frewrite` (position- and object-message-fair), `search` (`=>1`/`=>+`/`=>*`/`=>!`, `such that`,
-   bounds, `show path`/`graph`), `continue`. Builds on the bounded-memory re-entrant reduction that C6/F-2
-   already unblocked. Reference: `reports/A6-operational.md`.
+1. **Rules + rewriting (Pillar A) — DONE.** `rl`/`crl` (incl. the rewrite `=>` condition, the one
+   condition kind that had been missing), `rewrite` (rule-fair) / `frewrite` (position-fair, frozen-aware),
+   `search` (`=>1`/`=>+`/`=>*`/`=>!`, `such that`, bound `[n,m]`, `show path`/`show search graph`),
+   `continue` — all byte-conformant against the reference (`conformance/{rewrite,frewrite,crl,search,
+   rewrite-cond}.maude`). The kernel grew a separate rule table (never consulted by `reduce`), a shared
+   `drive_match` seam, a lazy hash-consed state-transition graph (`search.rs`), and the rewrite-condition's
+   nested `=>*` search. Built on the bounded-memory re-entrant reduction C6/F-2 unblocked. **Remaining for
+   Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs the object system, item 5); `frozen`'s
+   lazy-`strat` interaction + on-the-fly colon variables + search/rewrite-condition trace (`gaps.md`).
+   Reference: `reports/A6-operational.md`.
 2. **Parameterized programming.** Theories (`fth`/`th`), views, parameterized modules/views, instantiation,
    `X$Elt`, nested instantiation — the bulk of the module work, and the gate for the container prelude
    (`LIST`/`SET`/`MAP`/`ARRAY`). Builds on the existing pure-flatten transform (`tnk-modules`). Reference:

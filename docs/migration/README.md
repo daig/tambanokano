@@ -19,8 +19,10 @@ decisions doc).
 - **Modules** (`tnk-modules`): import/flatten (`protecting`/`extending`/`including`), summation `+`, renaming.
 - **REPL** (`tnk-repl`): `reduce`/`match`/`xmatch`, `show`/`select`/`set trace`, file load, output line-wrapping.
 
-**Next: Phase 2** — parameterized programming, rules (`rl`/`crl`/`rew`/`search`), the real prelude. See
-`roadmap.md`.
+**Phase 2 in progress.** Pillar A (the *rewriting* layer) is **done**: rules (`rl`/`crl` incl. the rewrite
+`=>` condition), `rewrite`/`frewrite`, `search` (+ state graph, `such that`, `show path`/`graph`),
+`continue` — all conformance-verified, so system modules (`mod`) run. **Next:** parameterized programming
+(theories/views/instantiation → the container prelude), then strategies + objects/IO. See `roadmap.md`.
 
 ## Crate layout
 
