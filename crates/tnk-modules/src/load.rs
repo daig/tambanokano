@@ -234,6 +234,18 @@ mod tests {
         );
     }
 
+    /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
+    /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
+    /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the
+    /// pre-existing dedup already handles it — this pins it as a regression guard).
+    #[test]
+    fn param_shared_import_conforms() {
+        conform(
+            conformance_file!("param-shared-import.maude"),
+            &[e("NzN", "s(s(z))", 3), e("NzN", "s(s(s(z)))", 3)],
+        );
+    }
+
     /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
     /// `failed to find sort … in … to represent …` diagnostic.
     #[test]

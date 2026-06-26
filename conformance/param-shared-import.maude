@@ -1,0 +1,29 @@
+*** B-iv / Axis-A3: a parameterized module BOX{X :: TRIV} protects NUM, and is instantiated by a
+*** view whose target IS NUM. The shared module must be merged EXACTLY ONCE (the flatten visited-set),
+*** not once via the import and again via the view target. A membership (mb s(W) : NzN, which counts as
+*** a rewrite) makes a double-merge observable: it would inflate the count. Byte-identical to the binary.
+fth TRIV is sort Elt . endfth
+
+fmod NUM is
+  sorts N NzN .
+  subsort NzN < N .
+  op z : -> N [ctor] .
+  op s : N -> N [ctor] .
+  mb s(W:N) : NzN .
+endfm
+
+view ToNum from TRIV to NUM is sort Elt to N . endv
+
+fmod BOX{X :: TRIV} is
+  protecting NUM .
+  sort Box{X} .
+  op wrap : X$Elt -> Box{X} [ctor] .
+  op two : Box{X} -> N .
+  var B : Box{X} .
+  eq two(B) = s(s(z)) .
+endfm
+
+fmod USE is protecting BOX{ToNum} . endfm
+
+red two(wrap(z)) .       *** s(s(z))    (NzN, 3 rewrites: 1 eq + a membership on s(z) and on s(s(z)))
+red s(s(s(z))) .         *** s(s(s(z)))  (NzN, 3 rewrites: a membership at each successor)
