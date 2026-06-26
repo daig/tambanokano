@@ -246,6 +246,17 @@ mod tests {
         );
     }
 
+    /// Axis-A1: view operator maps. `ToFL` maps `op zero to term f0` (op→term) and `op wrap to box`
+    /// (op→op); at instantiation both are substituted into `ARR`'s statements, so `d0(mk) = zero = f0` and
+    /// `d1(mk) = wrap(zero) = box(f0)`. Byte-identical to the binary.
+    #[test]
+    fn param_view_opmap_conforms() {
+        conform(
+            conformance_file!("param-view-opmap.maude"),
+            &[e("F", "f0", 1), e("F", "box(f0)", 1)],
+        );
+    }
+
     /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
     /// `failed to find sort … in … to represent …` diagnostic.
     #[test]

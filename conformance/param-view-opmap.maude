@@ -1,0 +1,36 @@
+*** B-iv / Axis-A1: view operator maps. A view may map a theory operator to another operator
+*** via "op wrap to box", or to a target term via "op zero to term f0". At instantiation the
+*** maps are substituted into the parameterized module's statements, so the theory operators
+*** the body uses become the target's operators/terms. Self-contained; byte-identical to binary.
+fth DFLT is
+  sort Elt .
+  op zero : -> Elt .
+  op wrap : Elt -> Elt .
+endfth
+
+fmod FL is
+  sort F .
+  op f0 : -> F [ctor] .
+  op box : F -> F [ctor] .
+endfm
+
+view ToFL from DFLT to FL is
+  sort Elt to F .
+  op zero to term f0 .
+  op wrap to box .
+endv
+
+fmod ARR{X :: DFLT} is
+  sort Arr{X} .
+  op mk : -> Arr{X} [ctor] .
+  op d0 : Arr{X} -> X$Elt .
+  op d1 : Arr{X} -> X$Elt .
+  var A : Arr{X} .
+  eq d0(A) = zero .
+  eq d1(A) = wrap(zero) .
+endfm
+
+fmod USE is protecting ARR{ToFL} . endfm
+
+red d0(mk) .       *** f0        (F, 1 rewrite -- op->term)
+red d1(mk) .       *** box(f0)   (F, 1 rewrite -- op->op applied to op->term)

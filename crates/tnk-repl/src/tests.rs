@@ -112,6 +112,15 @@ fn instantiation_through_repl() {
     assert!(out.contains("result SA: a"), "multi-parameter instantiation: {out}");
 }
 
+/// Axis-A1: view operator maps applied at instantiation through the REPL — `op zero to term f0` (op→term)
+/// and `op wrap to box` (op→op), so `ARR{ToFL}`'s `d0`/`d1` reduce to the target's terms.
+#[test]
+fn view_opmap_through_repl() {
+    let out = repl().eval(conformance_file!("param-view-opmap.maude")).output;
+    assert!(out.contains("result F: f0"), "op->term: {out}");
+    assert!(out.contains("result F: box(f0)"), "op->op over op->term: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

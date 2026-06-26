@@ -10,9 +10,9 @@
 //! resolved — so the unchanged frontend `build_loaded_module` builds it directly.
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::Interner;
+use tnk_frontend::lex::{Interner, Token};
 use tnk_frontend::surface::ast::{
-    ModuleExpr, ModuleKind, OpDecl, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
+    ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
 };
 
 use crate::db::ModuleDb;
@@ -243,8 +243,10 @@ fn instantiate(
         ));
     }
 
-    // Bind each parameter to its view, importing the view's target module.
+    // Bind each parameter to its view, importing the view's target module, and collect the views'
+    // operator maps (`op f to g` / `op f to term t`) into one token-substitution (A1).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
+    let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
     for (param, view_name) in pm.params.iter().zip(args) {
         let v = views
             .get(view_name)
@@ -253,6 +255,19 @@ fn instantiate(
         collect_named(target, db, views, acc, visited, interner)?;
         let sort_image: HashMap<String, String> = v.sort_maps.iter().cloned().collect();
         bindings.insert(param.name.clone(), ParamBinding { view_name: view_name.clone(), sort_image });
+        for m in &v.op_maps {
+            let (from, to) = match m {
+                OpMap::Op { from, to } | OpMap::Term { from, to } => (from, to),
+            };
+            // The source op is a single-token name (a mixfix op map is a follow-up). Its references in
+            // `M`'s body are rewritten to the target op (`g`) or term (`0.0`).
+            match from.as_slice() {
+                [tok] => {
+                    op_subst.insert(interner.resolve(tok.sym).to_string(), to.clone());
+                }
+                _ => return Err(format!("view `{}`: a mixfix operator map is a follow-up", v.name)),
+            }
+        }
     }
 
     // `M`'s regular imports (deduped via `visited`), then its own declarations with the substitution.
@@ -261,7 +276,7 @@ fn instantiate(
         collect_expr(imp, db, views, acc, visited, interner)?;
     }
     let pm = db.get(mname).expect("present");
-    acc.add(instantiate_decls(own_decls(pm), &bindings));
+    acc.add(instantiate_decls(own_decls(pm), &bindings, &op_subst, interner));
     Ok(())
 }
 
@@ -281,8 +296,14 @@ fn view_target(v: &ViewDecl) -> Result<&str, String> {
 }
 
 /// Apply the instantiation substitution to a module's own declarations: rewrite every sort name through
-/// [`inst_sort`].
-fn instantiate_decls(mut d: FlatDecls, bindings: &HashMap<String, ParamBinding>) -> FlatDecls {
+/// [`inst_sort`], and rewrite the view's operator maps (A1) into the statement bubbles — each reference to
+/// a mapped theory operator `f` becomes the target operator `g` or term `t`.
+fn instantiate_decls(
+    mut d: FlatDecls,
+    bindings: &HashMap<String, ParamBinding>,
+    op_subst: &HashMap<String, Vec<Token>>,
+    i: &Interner,
+) -> FlatDecls {
     for s in &mut d.sorts {
         *s = inst_sort(s, bindings);
     }
@@ -302,9 +323,49 @@ fn instantiate_decls(mut d: FlatDecls, bindings: &HashMap<String, ParamBinding>)
     for v in &mut d.vars {
         v.sort = inst_sort(&v.sort, bindings);
     }
-    // Statement bubbles reference operators and variables, not sort names, in the common case; operator
-    // maps (which would rewrite bubbles) are a deferred follow-up.
+    // Apply the operator maps to the statement bubbles (A1). Sort-name substitution into bubbles
+    // (`mb t : Sort`, structured colon variables) remains a follow-up.
+    if !op_subst.is_empty() {
+        for st in &mut d.statements {
+            match st {
+                Statement::Eq { lhs, rhs, cond, .. } => {
+                    *lhs = subst_ops(lhs, op_subst, i);
+                    *rhs = subst_ops(rhs, op_subst, i);
+                    if let Some(c) = cond {
+                        *c = subst_ops(c, op_subst, i);
+                    }
+                }
+                Statement::Mb { lhs, sort, cond, .. } => {
+                    *lhs = subst_ops(lhs, op_subst, i);
+                    *sort = subst_ops(sort, op_subst, i);
+                    if let Some(c) = cond {
+                        *c = subst_ops(c, op_subst, i);
+                    }
+                }
+                Statement::Rule { lhs, rhs, cond, .. } => {
+                    *lhs = subst_ops(lhs, op_subst, i);
+                    *rhs = subst_ops(rhs, op_subst, i);
+                    if let Some(c) = cond {
+                        *c = subst_ops(c, op_subst, i);
+                    }
+                }
+            }
+        }
+    }
     d
+}
+
+/// Rewrite a statement bubble under an operator-map substitution: each token whose text is a mapped source
+/// operator is replaced by the target token(s) (one token for `op f to g`, several for `op f to term t`).
+fn subst_ops(bubble: &[Token], op_subst: &HashMap<String, Vec<Token>>, i: &Interner) -> Vec<Token> {
+    let mut out = Vec::with_capacity(bubble.len());
+    for t in bubble {
+        match op_subst.get(i.resolve(t.sym)) {
+            Some(repl) => out.extend(repl.iter().copied()),
+            None => out.push(*t),
+        }
+    }
+    out
 }
 
 /// Instantiate one sort name. A parameter sort `X$s` becomes the view's image of `s`; a structured sort
