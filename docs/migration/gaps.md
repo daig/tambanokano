@@ -82,16 +82,24 @@ correctness fix.
   not a loose end of it.
 - **Lexer parity (vs `lexer.ll`/`token.cc`).** Our tokenizer is stateless (whitespace + the same special
   splitters `()[]{},`, the same terminator-dot rule); Maude's is parser-driven and stateful (ID/CMD/BUBBLE
-  modes, the bubble handshake) — replaced by our explicit surface parser. **Bracketed comments `***( … )` /
-  `---( … )`** (balanced parens across newlines, backquoted parens excluded) are now handled, matching Maude
-  (verified — Maude warns on a stray-`(` line comment like `*** (foo).`, and so do we now). Remaining minor
-  divergences, all rare and unexercised by the prelude/conformance: (a) a backquote before a *normal* char
-  (`a`b`) is kept by Maude in the token name and dropped by us — escaped *specials* in op names (`` `[_`] ``)
-  work identically either way; (b) a string literal embedded *inside* a maudeId (`foo"bar"`) — Maude's
-  `normal` admits `{string}`, we always split `"`; (c) leading-zero/degenerate numerals (`00`) — we classify
-  any digit run as a number, Maude's `0|[1-9][0-9]*` does not; (d) the terminator-dot heuristic
-  (`is_terminator_dot`) approximates Maude's mode-based SEEN_DOT rule and could differ on the idiom-rare
-  *two-commands-on-one-line* case. The `latex`/file-name lexer sub-modes are for unbuilt features.
+  modes, the bubble handshake) — replaced by our explicit surface parser. Audited differentially against the
+  reference; **bracketed comments `***( … )` / `---( … )`** (balanced parens across newlines, backquoted
+  parens excluded — Maude warns on a stray-`(` line comment like `*** (foo).`, and so do we) and **strings
+  glued into a maudeId** (`foo"bar"`/`"x"y` are one identifier; a lone `"hi"` is a `Str` constant — Maude's
+  `Token::computeSpecialProperty`) are both now handled, byte-identically. Two divergences remain, both rare
+  and unexercised by the prelude/conformance: (a) a backquote before a *normal* char (`a`b`) is a token
+  **separator** in Maude (`a`b` ≡ the two-token name `a b`, printed `a b`); we drop the backquote → `ab`,
+  which mis-prints *and* silently **merges** a distinct `a`b` and `ab` (a wrong *result*, not just a name).
+  This is a special case of multi-token prefix op names, which our term parser does not support at all
+  (`op a b : -> S` likewise fails to parse), so it is not fixable standalone; the sole real occurrence is the
+  prelude's `op_to`term_.` (a view op-to-term map, behind the deferred view op-maps). Escaped *specials*
+  (`` `[_`] ``, `<_`,_>`) are byte-identical either way — both engines map the backquoted special to the
+  bare-char grammar terminal. (b) the terminator-dot heuristic (`is_terminator_dot`) approximates Maude's
+  mode-based SEEN_DOT rule and could differ on the idiom-rare *two-commands-on-one-line* case. (Leading-zero
+  numerals like `00`/`01` are **not** a divergence — verified: both engines lex them as one token then
+  reclassify by value, so `00` fails to parse and `01` reduces to `1`; our `classify`→`Number` +
+  `SmallNat`-grammar-terminal two-stage split reproduces Maude's exactly.) The `latex`/file-name lexer
+  sub-modes are for unbuilt features.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite

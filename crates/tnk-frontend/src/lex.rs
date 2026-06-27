@@ -53,7 +53,9 @@ pub enum TokKind {
     Dot,
     /// A natural-number literal `0 | [1-9][0-9]*`.
     Number,
-    /// A string literal `"…"`.
+    /// A string literal `"…"` — a token that is *exactly* one string (its unescaped close-quote is the
+    /// last char). A string merely *glued into* a longer maudeId (`"x"y`, `foo"bar"`) is an `Ident`, not
+    /// a `Str` — Maude's `Token::computeSpecialProperty` (`token.cc:478`).
     Str,
     /// A float literal `[0-9]+.[0-9]+` (exponents are a follow-up).
     Float,
@@ -144,8 +146,31 @@ fn is_terminator_dot(chars: &[char], i: usize) -> bool {
     is_top_level_keyword(&word)
 }
 
+/// A token is a STRING literal iff it starts with `"` and the matching *unescaped* close-quote is its
+/// LAST character — Maude's `Token::computeSpecialProperty` (`token.cc:478`). A token that merely
+/// *contains* a string (`"x"y`, `foo"bar"`) is an ordinary identifier, not a string constant. (The quote
+/// and backslash are ASCII, so byte-scanning is faithful even across multibyte string content.)
+fn is_string_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return false;
+    }
+    let mut seen_backslash = false;
+    for (idx, &c) in bytes.iter().enumerate().skip(1) {
+        match c {
+            b'\\' => seen_backslash = !seen_backslash,
+            b'"' if !seen_backslash => return idx == bytes.len() - 1,
+            _ => seen_backslash = false,
+        }
+    }
+    false // unterminated
+}
+
 /// The class of a scanned maudeId text.
 fn classify(text: &str) -> TokKind {
+    if is_string_literal(text) {
+        return TokKind::Str;
+    }
     if text.starts_with('\'') && text.len() > 1 {
         return TokKind::Qid;
     }
@@ -261,36 +286,43 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             i += 1;
             continue;
         }
-        if c == '"' {
-            let start = i;
-            i += 1;
-            while i < n && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < n {
-                    i += 2;
-                } else {
-                    if chars[i] == '\n' {
-                        line += 1;
-                    }
-                    i += 1;
-                }
-            }
-            i += 1; // closing quote (or EOF)
-            let text: String = chars[start..i.min(n)].iter().collect();
-            let sym = interner.intern(&text);
-            out.push(Token { sym, line, kind: TokKind::Str });
-            continue;
-        }
         if c == '.' && is_terminator_dot(&chars, i) {
             let sym = interner.intern(".");
             out.push(Token { sym, line, kind: TokKind::Dot });
             i += 1;
             continue;
         }
-        // A maudeId: a run of non-whitespace, non-punctuation, non-`"` chars (with backquote escaping),
-        // stopping at a terminator `.`.
+        // A maudeId: a run of non-whitespace, non-punctuation chars (with backquote escaping), stopping at
+        // a terminator `.`. A string literal `"…"` is a `normal` char in Maude's grammar (`lexer.ll`), so
+        // it is consumed *into* the maudeId — a glued `foo"bar"`/`"x"y` stays one token; classify then
+        // sorts a lone-string token (`"hi"`) into `Str` and a glued one into `Ident`.
         let mut text = String::new();
         while i < n {
             let ch = chars[i];
+            // A string literal is a `normal`: consume the whole `"…"` (with `\`-escapes) and keep scanning,
+            // so it glues into the surrounding maudeId rather than splitting it (`a"b"c`, `"x"y` = 1 token).
+            if ch == '"' {
+                text.push(ch);
+                i += 1;
+                while i < n && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < n {
+                        text.push(chars[i]);
+                        text.push(chars[i + 1]);
+                        i += 2;
+                    } else {
+                        if chars[i] == '\n' {
+                            line += 1;
+                        }
+                        text.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if i < n {
+                    text.push(chars[i]); // closing quote
+                    i += 1;
+                }
+                continue;
+            }
             // A structured-sort colon variable keeps its braces in one token: `L:List{Nat}` (and the chained
             // `X:Box{ToT2}{C2}`) — consume the balanced `{ … }` group rather than letting `{` split it off.
             if ch == '{' && colon_var_shape(&text) {
@@ -315,7 +347,7 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                 }
                 continue;
             }
-            if ch.is_whitespace() || is_punct(ch) || ch == '"' {
+            if ch.is_whitespace() || is_punct(ch) {
                 break;
             }
             if ch == '.' && is_terminator_dot(&chars, i) {
@@ -435,6 +467,62 @@ mod tests {
         use TokKind::*;
         assert_eq!(kinds, [Number, Number, Float, Str, Qid, Ident]);
         assert_eq!(t[3].0, "\"abc\"", "the string keeps its quotes");
+    }
+
+    /// Maude's grammar admits a string literal as a `normal` char (`lexer.ll`: `normal = […|{string}]`),
+    /// so a string can be glued INTO a maudeId — `a"b"c`, `foo"bar"`, `"x"y` are each ONE identifier
+    /// token, while a bare `"hello"`/`""` is a `Str` constant (its unescaped close-quote is the last char —
+    /// `Token::computeSpecialProperty`, `token.cc:478`). Verified byte-identical to the reference binary:
+    /// `op a"b"c : -> S .` ⇒ `result S: a"b"c`. Bare strings around space/paren/comma still split.
+    #[test]
+    fn string_glued_into_identifier() {
+        use TokKind::*;
+        let t = |s| lex(s).1;
+        // A token that is exactly one string is `Str` (close-quote is the last char).
+        assert_eq!(t(r#""hello""#), [("\"hello\"".into(), Str)]);
+        assert_eq!(t(r#""""#), [("\"\"".into(), Str)], "the empty string is a Str");
+        // A string glued into an identifier is ONE `Ident` token (Maude keeps the whole maudeId).
+        assert_eq!(t(r#"a"b"c"#), [("a\"b\"c".into(), Ident)]);
+        assert_eq!(t(r#"foo"bar""#), [("foo\"bar\"".into(), Ident)]);
+        assert_eq!(t(r#""x"y"#), [("\"x\"y".into(), Ident)], "leading string + glued suffix = Ident");
+        // An escaped quote inside the string does not end it; the trailing `"` does.
+        assert_eq!(t(r#""a\"b""#), [("\"a\\\"b\"".into(), Str)]);
+        // Bare strings separated by space/paren/comma still split (the only form real specs use).
+        assert_eq!(t(r#"len("hello")"#), [
+            ("len".into(), Ident),
+            ("(".into(), Punct),
+            ("\"hello\"".into(), Str),
+            (")".into(), Punct),
+        ]);
+        // `"ab" . "cd"` is `_._` String concat: the middle `.` (followed by `"cd"`, not a keyword) is an
+        // ordinary `Ident` operator token, not a terminator — exactly as in `red "ab" . "cd" .`.
+        assert_eq!(t(r#""ab" . "cd""#), [
+            ("\"ab\"".into(), Str),
+            (".".into(), Ident),
+            ("\"cd\"".into(), Str),
+        ]);
+    }
+
+    /// Leading-zero numerals stay the broad `Number` kind. `classify` assigns `Number` to *every*
+    /// all-digit run (`0`, `00`, `01`, `007`, `123`) — mirroring Maude's two-stage design: flex first
+    /// lexes `00`/`01` as a single identifier (`maudeId`) token, and the term parser *then* re-classifies
+    /// it by text via `Token::specialProperty` (`mpz_set_str(text, 10)` → `ZERO` / `SMALL_NAT`). The
+    /// ZERO-vs-SMALL_NAT split — so `0` is the zero constant, all-zero runs `00`/`000` fail to parse, and
+    /// `01`/`007` reduce to the numbers `1`/`7` with leading zeros stripped — is reproduced *downstream*
+    /// at the grammar terminal (`cfparser/earley.rs`: `SmallNat` matches a `Number` token only when it has
+    /// a non-zero digit). Reclassifying a leading-zero run as `Ident` *here* would regress `01`→1 / `007`→7,
+    /// which the reference binary accepts. (Differentially verified vs `~/Downloads/Maude-3/maude`.)
+    #[test]
+    fn leading_zero_numerals_stay_number() {
+        use TokKind::*;
+        assert_eq!(classify("0"), Number, "the bare zero constant");
+        assert_eq!(classify("00"), Number, "all-zero run: Number here; rejected at the grammar terminal");
+        assert_eq!(classify("000"), Number);
+        assert_eq!(classify("01"), Number, "leading-zero numeral: Number, becomes `1` (zeros stripped)");
+        assert_eq!(classify("007"), Number);
+        assert_eq!(classify("123"), Number);
+        // A glued negative-zero is not a numeral at all — Maude excludes it (`-0` → no parse) and so do we.
+        assert_eq!(classify("-0"), Ident);
     }
 
     #[test]
