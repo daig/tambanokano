@@ -66,39 +66,49 @@ correctness fix.
   are unaffected. The eager/lazy bit is already on `Symbol` (`strategy`); threading it through the traversal is
   a localized follow-up. (`frewrite_pass` also recurses on subject depth — shallow for object/config terms, an
   explicit-stack rewrite is the same follow-up as C12 if a deep rule structure ever appears.)
-- **On-the-fly variables — structured-sort forms only.** Inline `name:Sort` colon variables (the
+- **On-the-fly variables — user-typed structured-sort forms only.** Inline `name:Sort` colon variables (the
   idiomatic `search` goal `X:St`, legal anywhere a term is) are **done** — a `Terminal::ColonVar` grammar
   terminal matches the one-token `name:sort`, the whole token becoming the variable name (so `X:Nat` and
-  `X:Foo` are distinct), echoed back with its sort. *Residual:* a **kind** variable `X:[Foo]` or a
-  **parameterized-sort** variable `X:List{Nat}` does not lex as one token (the `[`/`{` split it), so those
-  forms aren't recognized yet — rare, and parameterized sorts are Phase 2 anyway.
+  `X:Foo` are distinct), echoed back with its sort. A structured-sort form `name:List{Nat}` *is* recognized
+  when it reaches the engine as a single token — instantiation produces exactly that (a parameterized
+  module's variables are inlined as single-token colon variables at their instance sorts, `flatten.rs`). The
+  *residual* is purely lexical: a **user typing** `X:List{Nat}` / a **kind** variable `X:[Foo]` splits on the
+  `{`/`[`, so the surface form isn't lexed as one token — rare, and orthogonal to the instantiation path.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite
   count* are byte-conformant (Pillar A-v), but the detailed trace of its **nested `=>*` search** (the
   per-state trial stream) is not pinned to Maude — the fragment renders, but the inner search steps
   aren't traced. Same family as `search` tracing above.
-- **Cross-kind ad-hoc overloading.** Overload resolution handles single-kind (subsort) overloading; cross-kind
-  ad-hoc overloading (arg-sort-driven kind selection) is `debug_assert`-guarded, not implemented. Idiomatic
-  signatures don't need it; the prelude may.
 - **Diagnostics sink.** Maude warns on non-preregular signatures, collapse-prone membership patterns, etc. We
   compute the preregularity bit but emit no warning (no diagnostics surface yet). Results are unaffected; the
   user-facing advisory text is missing.
-- **Membership collapse matching.** A membership lhs that collapses under an identity (`mb a L : Lst` with
-  `[id: nil]`) — Maude applies it to the collapsed sub-element too (and warns on such patterns); we don't.
-  Pre-existing edge, affects ill-formed-ish patterns only.
+- **Collapse matching under an identity.** A pattern whose top operator has an identity element (`id:`) can
+  *collapse* — `S , S` matches a bare `empty` with `S = empty` (both sides the identity), and `mb a L : Lst`
+  with `[id: nil]` matches the collapsed sub-element. Maude applies such an equation/membership to the
+  collapsed case too (and **warns**: *"collapse at top of … may cause it to match more than you expect"*); we
+  don't. The visible effect is a rewrite **count** one higher in Maude — e.g. `eq (S , S) = S` fires once more
+  on the `empty` an accumulator like `makeSet(nil) = empty` produces (`conformance/instantiation-list-and-set`
+  reduces to the right value but counts one low per such `empty`). **Reproduces in a non-parameterized
+  module** — orthogonal to parameterization, a property of the AC/collapse matcher — and Maude itself flags
+  the pattern. Result/sort always faithful.
 - **Interruptibility.** Maude's Ctrl-C aborts a runaway reduce; our REPL can't yet interrupt an in-progress
   reduction (a signal-checked reduce loop — the real concern once `rew`/`search` can diverge). Note: this is
   *not* the rejected F-1 "no-op rewrite guard" — Maude itself loops on `eq a = a`, and we match that; adding a
   guard would *introduce* a divergence.
 - **Parameterized-module statements built only at the instance (Pillar B-iv).** Instantiation `M{V}` flattens
   `M`'s statement *bubbles* into the instance and builds them there; we never build the parameterized module
-  `M` standalone. So a statement that is **ill-typed in `M` but well-typed after the substitution** is
-  wrongly accepted, where Maude builds-and-rejects `M` once (the rejected statement never reaches the
-  instance). Ill-formed-spec only — every well-formed prelude module typechecks in `M` — but it is a genuine
-  architectural asymmetry vs. Maude's build-then-instantiate. (The rest of the Pillar-B "Axis A" deferrals —
-  view op-maps, parameterized view targets, the import/target dedup, theory/module-declared sorts, free-vs-
-  bound nested instantiation — are *unbuilt features*, tracked in `roadmap.md` item 2, not built-engine gaps.)
+  `M` standalone (with one exception: a *standalone* `flatten` of a parameterized module — e.g. for
+  `show module` — does build `M`'s own statements, but using `M`'s own parameter copy). So a statement that is
+  **ill-typed in `M` but well-typed after the substitution** is wrongly accepted at the instance, where Maude
+  builds-and-rejects `M` once. Ill-formed-spec only — every well-formed prelude module typechecks in `M` — but
+  it is a genuine architectural asymmetry vs. Maude's build-then-instantiate.
+- **Chained-instantiation import substitution (Axis-A5 kind 1).** A theory-view chain `M{ToT2}{C2}` composes
+  the view chain into one binding (correct sort images, target, and the chained structured-sort name
+  `Box{ToT2}{C2}`). When `M`'s *imports* mention the parameter (`M{…}` importing `FOO{X}`), the re-instantiated
+  import uses only the **last** chain level's argument (`FOO{C2}`), dropping the intervening theory-view level.
+  No conformance fixture reaches this corner (a theory-view whose module *also* re-exports the parameter
+  through a parameterized import); the single-level and direct cases are exact.
 
 ## Resolved (here for cross-reference; detail in git history)
 
@@ -106,3 +116,11 @@ The Phase-1.5 sweep closed: eager→lazy membership timing (C1), cross-theory al
 the engine-global condition-reduce GC root set (C6/F-2), structure sharing (C7), the frontend-fidelity cluster
 (float/glued-minus/rational/echo, C9–C11), the deep-chain pretty-printer overflow (C12), and long-output
 line-wrapping (C13). The F-3 (ExtensionInfo) / F-4 (`Subst` unbind) matcher-seam gaps were closed in B1.
+
+The Pillar-B "Axis A" parameterization corner cases all landed: view op-maps (A1), import/view-target dedup
+(A3), theory-vs-module-declared sorts (A4), and — the entangled hard pair — parameterized views + free-vs-
+bound nested instantiation (A2/A5: all three argument kinds — module-view, by-parameter, theory-view —
+including `LIST{List{Nat}}`-style nesting). That work also closed **cross-kind ad-hoc operator overloading**
+in the kernel (a constructor spanning several connected components, e.g. nested-container `cons`/`nil` — now
+distinct symbols selected by argument kind, with Maude's `(t).Sort` print/parse disambiguation) and
+**memberships over structured sorts** (`mb t : NeList{X}`).

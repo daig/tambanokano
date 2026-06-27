@@ -21,12 +21,14 @@ decisions doc).
 
 **Phase 2 in progress.** Pillar A (the *rewriting* layer) is **done**: rules (`rl`/`crl` incl. the rewrite
 `=>` condition), `rewrite`/`frewrite`, `search` (+ state graph, `such that`, `show path`/`graph`),
-`continue` — all conformance-verified, so system modules (`mod`) run. Pillar B's parameterization
-**mechanism** is **done** (B-i…iv: theories `fth`/`th`, views, parameterized modules + `X$Elt` + structured
-sorts, instantiation `M{V}` — all conformance-verified, all as a pure `tnk-modules` `PreModule` transform).
-**Next:** "Axis A" — the deferred B-iv corner cases (op-maps, parameterized view targets, dedup, theory/
-module sorts, free-vs-bound nested). Loading the *real* container prelude additionally needs `poly`/
-`Universal` polymorphism (a separate feature). Then strategies + objects/IO. See `roadmap.md`.
+`continue` — all conformance-verified, so system modules (`mod`) run. Pillar B (parameterized programming) is
+**done**, mechanism and corner cases: theories `fth`/`th`, views, parameterized modules + `X$Elt` + structured
+sorts, instantiation `M{V}`, and the whole "Axis A" — view op-maps, import/target dedup, theory/module sorts,
+and the entangled hard pair **parameterized views + free-vs-bound nested instantiation** (all three argument
+kinds — module-view, by-parameter, theory-view — incl. `LIST{List{Nat}}` nesting, cross-kind ad-hoc
+overloading with `(t).Sort` disambiguation, and structured-sort memberships). All a pure `tnk-modules`
+`PreModule` transform, all conformance-verified. **Next:** the *real* container prelude additionally needs
+`poly`/`Universal` polymorphism (a separate feature). Then strategies + objects/IO. See `roadmap.md`.
 
 ## Crate layout
 
@@ -49,7 +51,6 @@ tnk-repl      the interactive shell (lib + bin); reuses everything below
 | `decisions`<br>(`03-open-decisions.md`) | motivation | the foundational decisions **D1–D8** (engine model, GC, dispatch, bignum, IO, BDD, SMT, naming) + why |
 | `gaps.md` | known gaps | where the **built** engine differs from / simplifies Maude — accepted cosmetic divergences + deferred optimizations |
 | `roadmap.md` | remaining plan | Phase 2 (system modules + parameterization + strategies + prelude) and Phase 3 (reflection + symbolic + verification) |
-| `A2-A5-nested-instantiation.md` | bootstrap (transient) | self-contained design doc for the next task — parameterized views + free/bound nested instantiation; retire once it lands |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 
 The detailed **current behavior** lives in the code (the crates carry thorough module/function doc comments);

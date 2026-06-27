@@ -21,7 +21,7 @@ prelude load.
    `X:Sort` colon variables. **Remaining for Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs
    the object system, item 5); `frozen`'s lazy-`strat` interaction + search/rewrite-condition trace
    (`gaps.md`). Reference: `reports/A6-operational.md`.
-2. **Parameterized programming (Pillar B) — the *mechanism* (B-i…B-iv) is DONE; "Axis A" finishes it.**
+2. **Parameterized programming (Pillar B) — DONE (mechanism B-i…B-iv + all of "Axis A").**
    Theories, views, parameterized modules, instantiation — the whole mechanism is a `tnk-modules`
    `PreModule → PreModule` transform; the kernel (`build_module`/grammar) is **unchanged** (a structured
    sort name `List{X}` / parameter sort `X$Elt` is just a string-keyed sort). All byte-conformant vs the
@@ -37,9 +37,8 @@ prelude load.
      through `flatten`; the instance substitutes `X$s ↦` the view's sort image and `Base{…X…} ↦ Base{…V…}`,
      importing the view's target. **Common case** (single/multi-param module-view, sort-only views).
 
-   **Axis A — the remaining *parameterization* work (the deferred B-iv corner cases).** Each is
-   **self-contained** — provable with hand-rolled modules (no real prelude), a small increment in the
-   B-i…iv rhythm. Noted inline in `flatten.rs`.
+   **Axis A — the B-iv corner cases — all DONE.** Each was **self-contained** — proven with hand-rolled
+   modules (no real prelude), a small increment in the B-i…iv rhythm; detail inline in `flatten.rs`.
    - **A1 view operator maps** (`op f to g`, `op 0 to term 0.0`) — **DONE** (`a35dbaf`): `instantiate_decls`
      substitutes the views' op-maps into the instance's statement bubbles (`subst_ops`).
    - **A3 import-vs-view-target dedup** (a base `protecting NAT` instantiated by a view targeting `NAT`) —
@@ -48,17 +47,24 @@ prelude load.
    - **A4 theory- vs module-declared sorts** in the parameter copy (a theory `protecting BOOL` keeps `Bool`,
      not `X$Bool`) — **DONE** (`afc8987`): `module_origin_sorts` excludes module-imported sorts from the
      `X$` qualifier. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
-   - **A2 + A5 — parameterized views + free-vs-bound nested instantiation. NEXT, and the hard pair.** These
-     are one entangled feature (a parameterized view is only *exercised* by a nested instantiation). The
-     parsing is tractable; the free/bound substitution-composition algebra is the A5 §4 top risk and deserves
-     a fresh-context design pass. **→ Full self-contained bootstrap (current state, the C++ three-argument-kind
-     model, worked examples, increment order, gotchas) in `A2-A5-nested-instantiation.md` — start there.**
-   - Related parser gaps: the structured colon-var `X:List{Nat}` / kind `[Y$Elt]` sorts, and `mb` over a
-     structured sort.
-   - **Built-engine edge already found** (`gaps.md`): instantiation flattens `M`'s statement *bubbles* into
-     the instance and builds them there, so it never builds `M` standalone — a statement ill-typed in `M`
-     but well-typed after instantiation is wrongly accepted (Maude builds+rejects `M` once). Ill-formed-spec
-     only; well-formed prelude modules typecheck in `M`.
+   - **A2 + A5 — parameterized views + free-vs-bound nested instantiation — DONE** (`a8ff07c`…`cbfc70e`):
+     the entangled hard pair, all three C++ argument kinds, as a pure `tnk-modules` view *composition* (no
+     stored partially-instantiated modules). **Kind 3 module-view + nested parameterized view**
+     (`BOX{BoxV{ToColor}}`, `LIST{List{Nat}}`): `resolve_arg` derives a ground view by substituting the inner
+     args through the view's `to`/`sort_maps`. **Kind 2 by-parameter** (`PAIR{X}` protecting `LIST{X}`,
+     grounded as `PAIR{ToN}`): an enclosing-parameter argument is a prefix-rename binding `X$s ↦ p$s`; a
+     module's imports are re-instantiated by substituting its bound parameters. **Kind 1 theory-view** chain
+     (`BOX{ToT2}{C2}`): `module_atom` parses the chain, `instantiate` composes the levels (only the last
+     target imported, sort images composed, the chained structured name `Box{ToT2}{C2}`). Two kernel/frontend
+     prerequisites it forced are also done: **cross-kind ad-hoc operator overloading** (a constructor spanning
+     connected components — `build_sig` groups symbols by kind-profile, with Maude's `(t).Sort` print/parse
+     disambiguation of the resulting overloaded constants) and **memberships over structured sorts**
+     (`mb t : NeList{X}`). The re-parse-from-bubbles build needed each parameterized module's variables
+     inlined as single-token colon variables so a doubly-instantiated module's equations self-type. Fixtures:
+     `conformance/instantiation-{nested,byparam,nested-list,theory-view,membership,set-ac,map}.maude` +
+     `correctness-disambig.maude`, all byte-identical. *Residuals* (in `gaps.md`): identity-collapse rewrite
+     **count** (orthogonal — the AC matcher, reproduces non-parameterized), the chained-import last-level
+     substitution, and the user-typed (not instantiation-produced) structured colon-var lexing.
 
    **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
    parameterization is the critical path to it). **Reference:** `reports/A5-modules-parameterization-repl.md`.
@@ -119,9 +125,9 @@ cross-checks.
 
 ## Risk register (forward items)
 
-1. **Parameterization corner cases** (Phase 2, "Axis A" — the B-iv deferrals) — free vs bound params (A5,
-   the deepest), theory/module-declared sorts (A4), parameterized views (A2), op-maps (A1), the
-   import/target dedup (A3). Each is self-contained (hand-rolled fixtures, no real prelude). → Differential.
+1. **Parameterization corner cases** (Phase 2, "Axis A" — the B-iv deferrals) — **RESOLVED**: A1–A5 all
+   landed, differentially verified with hand-rolled fixtures. The one residual is a rewrite-**count** delta
+   from identity-collapse matching (item 3 below — orthogonal to parameterization, reproduces without it).
 2. **`poly`/`Universal` polymorphism** (Phase 2 item 3) gates loading the *real* `BOOL`→`NAT`→`LIST` chain
    (a `Universal`-typed op instantiated per connected component); a separate feature from parameterization.
    → Differential against `prelude.maude`'s `TRUTH`/`BOOL`/`NAT`.
