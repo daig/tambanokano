@@ -53,6 +53,47 @@ fn import_renaming_through_repl() {
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
 
+/// M2 milestone — the real prelude's `LIST{Nat}` (over BOOL+NAT) loads and every list operation
+/// reduces byte-identically to the reference. Proves AU **identity-collapse matching**: each recursion
+/// (`occurs`/`size`/`reverse`) peels `E L` off the front and must match the final singleton `c` as
+/// `c nil`. Values/sorts/counts are the reference binary's (`red in T : …`, `T = LIST{Nat}`).
+#[test]
+fn prelude_list_m2_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-list.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "LIST builds: {out}");
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
+        .collect();
+    // Pair each `rewrites:`/`result` into `[count] sort: value`, then compare the whole sequence.
+    let got: Vec<String> = lines
+        .chunks(2)
+        .map(|c| {
+            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
+            format!("[{n}] {}", c[1].trim_start_matches("result "))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "[6] Bool: true",          // occurs(2, 1 2 3)
+            "[9] Bool: true",          // occurs(3, 1 2 3)  — recurses to the singleton
+            "[10] Bool: false",        // occurs(5, 1 2 3)  — recurses past the singleton to nil
+            "[3] Bool: true",          // occurs(7, 7)      — singleton subject
+            "[12] NzNat: 5",           // size(1 2 3 4 5)
+            "[4] NzNat: 1",            // size(7)           — collapse
+            "[2] Zero: 0",             // size(nil)
+            "[6] NeList{Nat}: 4 3 2 1", // reverse(1 2 3 4)
+            "[3] NzNat: 7",            // reverse(7)
+            "[2] List{Nat}: nil",      // reverse(nil)
+            "[1] NzNat: 3",            // last(1 2 3)
+            "[1] NeList{Nat}: 1 2",    // front(1 2 3)
+            "[1] NeList{Nat}: 1 2 3 4", // append(1 2, 3 4)
+        ],
+        "LIST ops: {out}"
+    );
+}
+
 /// Variable aliases are module-local (Blocker B): `M` and its import `P` both declare a variable `A`
 /// at different sorts; `M`'s own equation must use `M`'s `A`, even though flattening collects `P`'s `A`
 /// first. Without module-local scoping the name-dedup mistypes `f(A, L)` → no parse (the real `LIST`'s

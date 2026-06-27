@@ -89,9 +89,20 @@ impl AuLhs {
         subject: DagId,
         ext_allowed: bool,
     ) -> Option<AuSubproblem> {
-        let seq: Vec<DagId> = match &rt.node(subject).term {
-            NodeTerm::Au { symbol, args } if *symbol == self.symbol => args.clone(),
-            _ => return None,
+        // **Collapse matching.** A subject not rooted at this operator is a one-element sequence — or,
+        // if it is the operator's identity, the empty sequence. So a pattern like `E L` (with `__
+        // [assoc id: nil]`) matches a singleton `c` as `E = c, L = nil`, and matching down to / against
+        // the identity falls out of the existing identity-aware enumeration (`build_run [] => identity`)
+        // and the per-binding sort check in `next` (a bad collapse like `E:Elt = nil` is rejected).
+        // A collapsed subject (singleton / identity) is the *whole* sequence: there is no surrounding
+        // AU context to extend into, so extension is off for it even when `ext_allowed` (else `xmatch`
+        // would enumerate spurious residue splits of a one-element subject).
+        let (seq, ext): (Vec<DagId>, bool) = match &rt.node(subject).term {
+            NodeTerm::Au { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
+            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == self.identity => {
+                (Vec::new(), false)
+            }
+            _ => (vec![subject], false),
         };
 
         // Aliens / non-linear variables need binding while enumerating, so defer to `next` (it has the
@@ -118,7 +129,7 @@ impl AuLhs {
                 cursor: 0,
                 complex: true,
                 elements: self.elements.clone(),
-                ext_allowed,
+                ext_allowed: ext,
                 all_var_indices,
                 recorded: None,
                 rec_cursor: 0,
@@ -133,10 +144,10 @@ impl AuLhs {
         let mut throwaway = Subst::new();
         throwaway.reset(0);
         let mut candidates: Vec<Candidate> = Vec::new();
-        let last_start = if ext_allowed { n } else { 0 };
+        let last_start = if ext { n } else { 0 };
         for start in 0..=last_start {
             let mut lengths = Vec::with_capacity(self.elements.len());
-            self.walk(rt, sig, &seq, start, 0, start, ext_allowed, &mut lengths, &mut throwaway, &mut candidates);
+            self.walk(rt, sig, &seq, start, 0, start, ext, &mut lengths, &mut throwaway, &mut candidates);
         }
         // Maximal matched portion first → a lone linear variable absorbs the remainder (collector).
         candidates.sort_by_key(|c| std::cmp::Reverse(c.matched()));
@@ -159,7 +170,7 @@ impl AuLhs {
             cursor: 0,
             complex: false,
             elements: Vec::new(),
-            ext_allowed,
+            ext_allowed: ext,
             all_var_indices: Vec::new(),
             recorded: None,
             rec_cursor: 0,

@@ -56,8 +56,14 @@ correctness fix.
 
 - **AC / AU / CUI matcher.** We match modulo the axioms by **naive backtracking enumeration** (greedy
   smallest-first for reduce, full enumeration for `match`), not Maude's optimized **bipartite + Diophantine**
-  solver. Correct (reduce counts conform; match sets conform) but un-optimized; the optimized matcher is a
-  prerequisite for heavy AC `search`.
+  solver. Reduce values/counts conform, including **AU identity-collapse** (a pattern `E L` matches a
+  singleton `c` as `E=c, L=nil` via `__ [id: nil]` — what `LIST`/M2 needs). Two known gaps here, both off the
+  M2 *reduce* path: (a) **ACU/CUI identity-collapse is not yet wired** — `acu`/`cui` `match_` still reject a
+  non-theory-rooted subject (the same `_ => return None` the AU matcher had), so `SET`/`MAP` (ACU `id: empty`)
+  will need the same small collapse fix when they land (they are gated on `EXT-BOOL` first); (b) **`xmatch`
+  with extension over-enumerates** on a multi-element AU subject (residue splits Maude does not report at the
+  top level) — pre-existing, affects only the `xmatch` command's solution *set*, not reduce/rewrite. The
+  optimized matcher is also a prerequisite for heavy AC `search`.
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.

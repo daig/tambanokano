@@ -85,7 +85,7 @@ guard forbids an *explicit* strat — the prelude's `if_then_else_fi` declares n
 |---|---|---|
 | **M0 ✅ DONE** — `BOOL` loads; `red true and false .` byte-identical | TRUTH-VALUE, BOOL-OPS, TRUTH, BOOL | §1 poly, §2 SystemTrue/False, §4 `set` skip |
 | **M1 ✅ DONE** — `NAT` loads; `red 2 + 3 .`/`7 quo 2`/`5 xor 3` byte-identical | NAT | §4 `~>`; NAT codes — `ACU_NumberOpSymbol` `xor`/`&`/`\|`, `CUI_NumberOpSymbol` `sd`, `NumberOpSymbol` `modExp`/`>>`/`<<` |
-| **M2** — `LIST{Nat}` loads; `occurs`/`size`/`reverse` byte-identical | LIST (+SET/MAP/ARRAY) | resilient loading (§5); containers reuse only BOOL+NAT+TRIV |
+| **M2 ✅ DONE** — `LIST{Nat}` loads; `occurs`/`size`/`reverse` byte-identical | LIST | module-local var aliases (Blocker B); **AU identity-collapse matching** (Blocker A); containers reuse only BOOL+NAT+TRIV |
 
 `LIST{X}` `protecting NAT` ⇒ M1 is a hard prerequisite for M2. INT/RAT/FLOAT/STRING/QID are **off the
 `LIST{Nat}` path** — defer them.
@@ -118,19 +118,22 @@ startup is an M3+ convenience, not required for M0-M2.
 
 ## 6. Increment order (each self-contained + differentially verifiable)
 
-**Status: increments 1–5 ✅ DONE — M0 + M1 reached.** BOOL and NAT both load and reduce byte-identically
-to the reference (`conformance/prelude-bool.maude`, `prelude-nat.maude`, `bare-condition.maude`, plus the
-2-kind `poly-multikind.maude`). **Next: increment 6 — the container milestone (M2, `LIST{Nat}`).** Probing
-the full prelude after M1, the frontier is now INT (`abs`), STRING/QID (`ascii`), RANDOM (`RandomOpSymbol`)
-— all off the `LIST{Nat}` path — plus the M2 container work itself (LIST's `no parse: append(A,L)` and the
-parameterized-view `expected 'to', found "{"` errors). **New off-path blockers** beyond §0 (all leaves /
-later increments): `var B : [Bool]` kind notation (EXT-BOOL — the §4.3 / `X:[Foo]` follow-up);
-`CommutativeDecomposeEqualitySymbol` (INITIAL-EQUALITY-PREDICATE); `abs`/`ascii`/`RandomOpSymbol`
-(INT/STRING/RANDOM). Two API/infra notes: `Sorts::kinds()` was added (sort.rs — `Id::from_raw` is
-`pub(crate)`, so the frontend couldn't build a `KindId`; not reduction code). And a **count divergence**
-was characterized (gaps.md): a ≥3-operand *infix* built-in number fold counts 1 rewrite (our eager-flat
-ACU) vs Maude's k−1 (nested infix) — value/sort always identical, 2-operand & prefix-N-ary match exactly,
-fix tied to the AC-matcher rework.
+**Status: increments 1–6 ✅ DONE — M0 + M1 + M2 reached.** BOOL, NAT, and `LIST{Nat}` all load and reduce
+byte-identically to the reference (`conformance/prelude-bool.maude`, `prelude-nat.maude`, `prelude-list.maude`,
+`bare-condition.maude`, `var-shadowing.maude`, plus the 2-kind `poly-multikind.maude`). **Next: the
+container siblings — `SET`/`MAP`/`ARRAY`** (each gated on its own remaining piece). Increment 6 turned out
+to be **two contained blockers**, not loader wiring: **(B) module-local variable aliases** — the flattener's
+var-name dedup let an import's `A:Bool` shadow `LIST`'s `var A : List{X}`, so `append(A, L)` mistyped → no
+parse; fixed by inlining only *shadowed* vars (flatten.rs, + a colon-var rename fix). **(A) AU
+identity-collapse matching** — the AU matcher rejected a non-AU subject, so `$size(E L, C)` couldn't match a
+singleton `3` as `3 nil`; fixed in `au.rs` `match_` (a non-AU subject is a 1-element / identity-empty
+sequence, extension off for it). **Discovered, off the M2 path (gaps.md):** ACU/CUI collapse isn't wired yet
+(same `_ => return None`; `SET`/`MAP` will need it, but they're gated on `EXT-BOOL`); and `xmatch`-with-
+extension over-enumerates on a multi-element AU subject (pre-existing; affects the `xmatch` solution set
+only, not reduce). Frontier for the rest of the prelude: `var B : [Bool]` (EXT-BOOL), INT `abs`, STRING
+`ascii`, RANDOM `RandomOpSymbol`, `CommutativeDecomposeEqualitySymbol` — all off the `LIST{Nat}` path. Two
+earlier notes still stand: `Sorts::kinds()` was added (sort.rs); the ≥3-operand-infix number-fold count
+divergence (gaps.md).
 
 1. ✅ **`set` skip** — parse-and-ignore arm in `parse_top_item`, recurses to the next item.
 2. ✅ **SystemTrue/False markers + anchors** — `special_op` marker arm (`Ok(None)`); Pass A2 records
@@ -150,8 +153,13 @@ fix tied to the AC-matcher rework.
    even multiplicity → identity); `num.rs` gains `bitxor`/`bitand`/`bitor`/`shl`/`shr`/`mod_pow`; build_sig
    maps the codes + `CUI_NumberOpSymbol`. *Verified:* `conformance/prelude-nat.maude` (24 reduces, every
    built-in incl. all new ops + bignum `1<<64`) byte-identical. (Decimal numerals already parse.)
-6. **Container milestone** — resilient loader (§5) or trimmed fixture; `protecting LIST{Nat}`. *Verify (M2):*
-   `occurs`/`size`/`reverse` byte-identical.
+6. ✅ **Container milestone (`LIST{Nat}`)** — two contained kernel/frontend fixes, *not* loader wiring:
+   **(B)** `flatten::inline_shadowed_vars` — inline a module's *shadowed* statement variables as colon
+   variables so an import's same-named var at a different sort can't mistype them (+ `rename::subst_tokens`
+   rewrites colon-var sorts); **(A)** `au::match_` collapse — a non-AU subject is a 1-element (or
+   identity-empty) sequence, extension off for it, so `E L` matches a singleton `c` as `E=c, L=nil`.
+   *Verified:* `conformance/{prelude-list,var-shadowing}.maude` — 13 LIST ops + the shadow scenario,
+   byte-identical (value/sort/count). (SET/MAP need ACU/CUI collapse + EXT-BOOL — gaps.md.)
 7. **Follow-ups (non-blocking):** `[Sort]` kind notation + kind vars (EXT-BOOL / the `X:[Foo]` gap);
    `show module` poly print (keep templates, suppress concrete instances — §7); `load_program` resilience as
    a public API; INT/RAT/FLOAT/STRING completions; eventually the MetaLevel layer.
