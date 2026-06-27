@@ -1,0 +1,19 @@
+*** A two-parameter module MAP{K :: TRIV, V :: TRIV} instantiated by two distinct views (ToN, ToS); each
+*** parameter binds independently and the structured sorts use both arguments (Map{ToN,ToS}). Byte-identical.
+fth TRIV is sort Elt . endfth
+fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
+fmod STR is sort Str . op a : -> Str [ctor] . op b : -> Str [ctor] . endfm
+view ToN from TRIV to NN is sort Elt to Nat . endv
+view ToS from TRIV to STR is sort Elt to Str . endv
+fmod MAP{K :: TRIV, V :: TRIV} is
+  sort Map{K,V} . sort Pair{K,V} .
+  op _|->_ : K$Elt V$Elt -> Pair{K,V} [ctor] .
+  op mt : -> Map{K,V} [ctor] .
+  op put : Pair{K,V} Map{K,V} -> Map{K,V} [ctor] .
+  op key : Pair{K,V} -> K$Elt .
+  var K0 : K$Elt .  var V0 : V$Elt .
+  eq key(K0 |-> V0) = K0 .
+endfm
+fmod USEMAP is protecting MAP{ToN, ToS} . endfm
+red key(0 |-> a) .
+red put(0 |-> a, put(s(0) |-> b, mt)) .

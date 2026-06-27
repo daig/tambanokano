@@ -1,0 +1,19 @@
+*** A parameterized SET{X} with an associative-commutative union (id: empty) and an idempotence equation,
+*** instantiated by ToN. Exercises a theory operator (assoc/comm/id) and AC matching inside a parameterized
+*** module: duplicate singletons collapse via eq (S , S) = S. Byte-identical to the reference.
+fth TRIV is sort Elt . endfth
+fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
+view ToN from TRIV to NN is sort Elt to Nat . endv
+fmod SET{X :: TRIV} is
+  sorts Set{X} NeSet{X} .
+  subsort NeSet{X} < Set{X} .
+  op empty : -> Set{X} [ctor] .
+  op _,_ : Set{X} Set{X} -> Set{X} [ctor assoc comm id: empty] .
+  op _,_ : NeSet{X} NeSet{X} -> NeSet{X} [ctor ditto] .
+  op sing : X$Elt -> NeSet{X} [ctor] .
+  var S : Set{X} .
+  eq (S, S) = S .
+endfm
+fmod USESET is protecting SET{ToN} . endfm
+red (sing(0), sing(s(0)), sing(0)) .
+red (sing(0), sing(0), sing(0)) .

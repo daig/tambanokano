@@ -319,6 +319,30 @@ mod tests {
         );
     }
 
+    /// A parameterized `SET{X}` with an associative-commutative union (`id: empty`) instantiated by `ToN`:
+    /// a theory operator and AC matching inside a parameterized module, with duplicate singletons collapsing
+    /// via the idempotence equation. Byte-identical to the reference.
+    #[test]
+    fn instantiation_set_ac_conforms() {
+        conform(
+            conformance_file!("instantiation-set-ac.maude"),
+            &[e("NeSet{ToN}", "sing(0), sing(s(0))", 1), e("NeSet{ToN}", "sing(0)", 2)],
+        );
+    }
+
+    /// A two-parameter `MAP{K, V}` instantiated by two distinct views (`ToN`, `ToS`): each parameter binds
+    /// independently and the structured sorts use both arguments (`Map{ToN,ToS}`). Byte-identical.
+    #[test]
+    fn instantiation_map_multiparam_conforms() {
+        conform(
+            conformance_file!("instantiation-map.maude"),
+            &[
+                e("Nat", "0", 1),
+                e("Map{ToN,ToS}", "put(0 |-> a, put(s(0) |-> b, mt))", 0),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the
