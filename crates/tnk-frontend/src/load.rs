@@ -352,16 +352,12 @@ fn parse_build(
     build_term(&parse_forest(tokens, g, i)?, g, m, tokens, i, vars)
 }
 
-/// Resolve a sort token bubble to a [`SortId`] (single token only; structured sorts are B4.5).
+/// Resolve a sort token bubble to a [`SortId`]. A plain sort is one token; a **structured** sort
+/// (`NeList{X}`) lexes as several tokens (`NeList`, `{`, `X`, `}`) which reassemble — no spaces — into the
+/// canonical sort name the signature stored.
 fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortId, String> {
-    match tokens {
-        [t] => m
-            .sorts
-            .get(t.text(i))
-            .copied()
-            .ok_or_else(|| format!("unknown sort `{}`", t.text(i))),
-        _ => Err("structured sort in membership: B4.5".into()),
-    }
+    let name: String = tokens.iter().map(|t| t.text(i)).collect();
+    m.sorts.get(&name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
 }
 
 /// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`. Builds the term

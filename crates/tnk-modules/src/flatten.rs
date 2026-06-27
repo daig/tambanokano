@@ -10,7 +10,7 @@
 //! resolved — so the unchanged frontend `build_loaded_module` builds it directly.
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::{Interner, Token};
+use tnk_frontend::lex::{tokenize, Interner, Token};
 use tnk_frontend::surface::ast::{
     ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
 };
@@ -554,7 +554,9 @@ fn instantiate_decls(
             }
             Statement::Mb { lhs, sort, cond, .. } => {
                 *lhs = subst_bubble(lhs, bindings, op_subst, &var_inline, i);
-                *sort = subst_bubble(sort, bindings, op_subst, &var_inline, i);
+                // The membership's *sort* is a whole sort name (possibly structured, `NeList{X}`):
+                // instantiate it as a sort, not as a term bubble.
+                *sort = inst_sort_bubble(sort, bindings, i);
                 if let Some(c) = cond {
                     *c = subst_bubble(c, bindings, op_subst, &var_inline, i);
                 }
@@ -569,6 +571,15 @@ fn instantiate_decls(
         }
     }
     d
+}
+
+/// Instantiate a membership's sort bubble: reassemble the (possibly structured) sort name, run it through
+/// [`inst_sort`] (`NeList{X} ↦ NeList{ToN}`, `X$Elt ↦ Nat`), and re-tokenize. Unchanged sorts keep their
+/// original tokens.
+fn inst_sort_bubble(sort: &[Token], bindings: &HashMap<String, ParamBinding>, i: &mut Interner) -> Vec<Token> {
+    let name: String = sort.iter().map(|t| i.resolve(t.sym)).collect();
+    let new = inst_sort(&name, bindings);
+    if new == name { sort.to_vec() } else { tokenize(&new, i) }
 }
 
 /// Rewrite a statement bubble under an instantiation. A token that is a mapped source operator becomes its

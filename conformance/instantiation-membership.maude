@@ -1,0 +1,21 @@
+*** A membership over a structured/parameterized sort in a parameterized module: mb cons(H,T) : NeList{E}.
+*** The membership's lhs uses inline-typed variables and its target sort NeList{E} is structured; both
+*** instantiate (E to ToN) so cons(0, nil) has least sort NeList{ToN}. Byte-identical to the reference.
+fth TRIV is sort Elt . endfth
+fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
+view ToN from TRIV to NN is sort Elt to Nat . endv
+fmod LIST{E :: TRIV} is
+  sorts List{E} NeList{E} .
+  subsort NeList{E} < List{E} .
+  op nil : -> List{E} [ctor] .
+  op cons : E$Elt List{E} -> List{E} [ctor] .
+  op head : NeList{E} -> E$Elt .
+  var H : E$Elt .
+  var T : List{E} .
+  mb cons(H, T) : NeList{E} .
+  eq head(cons(H, T)) = H .
+endfm
+fmod USEM is protecting LIST{ToN} . endfm
+red cons(0, nil) .
+red cons(0, cons(s(0), nil)) .
+red head(cons(s(0), nil)) .

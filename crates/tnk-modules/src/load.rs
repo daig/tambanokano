@@ -303,6 +303,22 @@ mod tests {
         );
     }
 
+    /// A membership over a **structured** sort in a parameterized module (`mb cons(H, T) : NeList{E}`):
+    /// both the inline-typed lhs and the structured target sort instantiate (`E ↦ ToN`), so `cons(0, nil)`
+    /// has least sort `NeList{ToN}`. Byte-identical to the reference (the structured membership sort and the
+    /// multi-token sort resolution are exercised end-to-end).
+    #[test]
+    fn instantiation_membership_conforms() {
+        conform(
+            conformance_file!("instantiation-membership.maude"),
+            &[
+                e("NeList{ToN}", "cons(0, nil)", 1),
+                e("NeList{ToN}", "cons(0, cons(s(0), nil))", 2),
+                e("Nat", "s(0)", 2),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the
