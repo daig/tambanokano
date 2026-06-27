@@ -288,6 +288,15 @@ impl<'a> Parser<'a> {
     /// as an ordinary sort name string. A parameter sort `X$Elt` is already one token (`$` is not splitting
     /// punctuation), so it needs no special handling. (A kind `[…]` sort is a follow-up.)
     fn sort_name(&mut self) -> PResult<String> {
+        if self.at("[") {
+            // A **kind** sort `[S]` — the top (error) sort of S's connected component (`var B : [Bool]`,
+            // `op undefined : -> [Y$Elt]`). `build_sig` resolves the canonical `[S]` spelling to
+            // `error_sort(kind_of(S))`. The inner is a full sort name (so `[List{Nat}]` nests).
+            self.advance(); // [
+            let inner = self.sort_name()?;
+            self.eat("]")?;
+            return Ok(format!("[{inner}]"));
+        }
         let base = self.name()?;
         if !self.at("{") {
             return Ok(base);

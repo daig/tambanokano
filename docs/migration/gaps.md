@@ -56,14 +56,24 @@ correctness fix.
 
 - **AC / AU / CUI matcher.** We match modulo the axioms by **naive backtracking enumeration** (greedy
   smallest-first for reduce, full enumeration for `match`), not Maude's optimized **bipartite + Diophantine**
-  solver. Reduce values/counts conform, including **AU identity-collapse** (a pattern `E L` matches a
-  singleton `c` as `E=c, L=nil` via `__ [id: nil]` — what `LIST`/M2 needs). Two known gaps here, both off the
-  M2 *reduce* path: (a) **ACU/CUI identity-collapse is not yet wired** — `acu`/`cui` `match_` still reject a
-  non-theory-rooted subject (the same `_ => return None` the AU matcher had), so `SET`/`MAP` (ACU `id: empty`)
-  will need the same small collapse fix when they land (they are gated on `EXT-BOOL` first); (b) **`xmatch`
-  with extension over-enumerates** on a multi-element AU subject (residue splits Maude does not report at the
-  top level) — pre-existing, affects only the `xmatch` command's solution *set*, not reduce/rewrite. The
-  optimized matcher is also a prerequisite for heavy AC `search`.
+  solver. Reduce values/counts conform, including **AU and ACU identity-collapse** (a pattern `E L` / `(E, S)`
+  matches a singleton `c` as `E=c, L=nil` / `S=empty` via the `id:` axiom — what `LIST`/`SET` need) and
+  **non-linear** matching across arguments (`E in (E, S)` — a variable already bound by an outer subterm must
+  agree with its multiset binding; the ACU pure path now deep-equal-checks pre-bound vars, as the free matcher
+  does). Remaining gaps, off the reduce path of what's landed: (a) **CUI identity-collapse** is still
+  `_ => return None` — no comm-only-with-identity op needs it yet (`sd` has no identity; `SET`/`MAP`'s `_,_` is
+  assoc-comm = ACU), so it is wired only when one does; (b) **`xmatch` with extension over-enumerates** on a
+  multi-element AU subject (residue splits Maude does not report at the top level) — pre-existing, affects only
+  the `xmatch` command's solution *set*, not reduce/rewrite. The optimized matcher is also a prerequisite for
+  heavy AC `search`.
+- **Assoc-comm op with `id:` + an infix-application argument doesn't parse (`MAP`/`ARRAY` blocker).** `SET`
+  loads and reduces, but `MAP`/`ARRAY` do not yet: their `_,_`/`_;_ [assoc comm id: empty]` constructor fails
+  to *parse* an argument that is itself an infix application — `a |-> a, a |-> a` is rejected, while `a, a`
+  (atomic args) and the same op *without* `id:` both parse. Bisected to the **identity**: with `id:`, an infix
+  argument over the constructor mis-parses (the grammar build reads no identity field, so it is a subtler
+  identity interaction — likely spurious ambiguity in the on-the-fly grammar). Values are unaffected (the term
+  builds and reduces correctly when parsed); it is a front-end parse gap, not a kernel one. `SET` is unaffected
+  because its elements are atomic (`X$Elt`), not constructor applications.
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.

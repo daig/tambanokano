@@ -682,6 +682,10 @@ fn subst_bubble(
 /// by-parameter binding); a structured sort `Base{a, …}` has each argument instantiated (a bare parameter
 /// name `X` becomes its view/argument name, the instance-naming rule); anything else is unchanged.
 fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
+    // A kind sort `[S]` instantiates its inner sort (`[Y$Elt] ↦ [Nat]`, MAP's `op undefined : -> [Y$Elt]`).
+    if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return format!("[{}]", inst_sort(inner, bindings));
+    }
     if let Some((base, args)) = split_structured(name) {
         let new_args: Vec<String> = args
             .iter()

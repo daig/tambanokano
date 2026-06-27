@@ -94,6 +94,47 @@ fn prelude_list_m2_through_repl() {
     );
 }
 
+/// Container milestone (cont.) — the real prelude's EXT-BOOL + SET{Nat} load and reduce
+/// byte-identically. Proves the `[Sort]` kind notation (EXT-BOOL `var B : [Bool]`), ACU
+/// identity-collapse matching (SET recursions to a singleton), non-linear ACU matching (`E in (E, S)`),
+/// and the assoc-list separator spacing. Values/sorts/counts are the reference binary's.
+#[test]
+fn prelude_set_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-set.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "SET builds: {out}");
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
+        .collect();
+    let got: Vec<String> = lines
+        .chunks(2)
+        .map(|c| {
+            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
+            format!("[{n}] {}", c[1].trim_start_matches("result "))
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "[1] Bool: false",          // true and-then false
+            "[1] Bool: true",           // false or-else true
+            "[1] Bool: true",           // 2 in (1, 2, 3)
+            "[1] Bool: false",          // 5 in (1, 2, 3)   — absent, recurses to singleton (non-linear)
+            "[1] Bool: true",           // 7 in 7           — singleton subject (collapse)
+            "[8] NzNat: 3",             // | (1, 2, 3) |
+            "[4] NzNat: 1",             // | 7 |
+            "[6] Bool: false",          // (1, 5) subset (1, 2, 3)
+            "[7] Bool: true",           // (1, 2) subset (1, 2, 3)
+            "[2] NeSet{Nat}: 1, 3",     // delete(2, (1, 2, 3))
+            "[1] NeSet{Nat}: 1, 2, 3, 4", // insert(4, (1, 2, 3))
+            "[1] NeSet{Nat}: 1, 2, 3, 4", // union((1, 2), (3, 4))
+            "[11] NeSet{Nat}: 2, 3",    // intersection((1, 2, 3), (2, 3, 4))
+            "[11] NeSet{Nat}: 1, 3",    // (1, 2, 3) \ (2, 4)
+        ],
+        "SET ops: {out}"
+    );
+}
+
 /// Variable aliases are module-local (Blocker B): `M` and its import `P` both declare a variable `A`
 /// at different sorts; `M`'s own equation must use `M`'s `A`, even though flattening collects `P`'s `A`
 /// first. Without module-local scoping the name-dedup mistypes `f(A, L)` → no parse (the real `LIST`'s

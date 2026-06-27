@@ -122,12 +122,17 @@ impl AcuLhs {
         subject: DagId,
         ext_allowed: bool,
     ) -> Option<AcuSubproblem> {
-        // The subject must be a canonical ACU node of this operator. (A collapsed single-element
-        // subject is a follow-up; it never arises in reduction, where the top symbol selects the
-        // equation set.)
-        let mut multiset: Vec<(DagId, u32)> = match &rt.node(subject).term {
-            NodeTerm::Acu { symbol, args } if *symbol == self.symbol => args.clone(),
-            _ => return None,
+        // **Collapse matching** (mirrors `au`): a subject not rooted at this operator is a one-element
+        // multiset — or the empty multiset if it is the operator's identity. So an ACU pattern `(E, S)`
+        // (e.g. SET's `_,_ [assoc comm id: empty]`) matches a singleton set `c` as `E = c, S = empty`,
+        // which arises whenever the pattern is an *argument* (`$intersect((E, S), …)` on a singleton),
+        // not only at the top. A collapsed subject is the whole multiset, so extension is off for it.
+        let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
+            NodeTerm::Acu { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
+            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == self.identity => {
+                (Vec::new(), false)
+            }
+            _ => (vec![(subject, 1)], false),
         };
 
         // Consume each ground subterm against a structurally-equal element (deterministic).
@@ -153,7 +158,7 @@ impl AcuLhs {
             enumerate_distributions(
                 &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
                 &var_coeffs,
-                ext_allowed,
+                ext,
                 self.identity.is_some(),
                 !self.grounds.is_empty(),
                 lone_linear,
@@ -169,7 +174,7 @@ impl AcuLhs {
         Some(AcuSubproblem {
             symbol: self.symbol,
             identity: self.identity,
-            ext_allowed,
+            ext_allowed: ext,
             elements,
             var_indices: self.vars.iter().map(|v| v.index).collect(),
             var_sorts: self.vars.iter().map(|v| v.sort).collect(),
@@ -443,9 +448,32 @@ impl AcuSubproblem {
             if !ok {
                 continue;
             }
+            // Apply the bindings, honoring any variable **already bound** by an outer subterm — a
+            // non-linear occurrence across arguments, e.g. `E in (E, S)` binds `E` from the first
+            // argument, so the enumerated multiset binding must equal it (else this candidate is no
+            // solution). The free matcher does the same deep-equal check (`term.rs`); the alien path
+            // already seeds from the incoming subst.
+            let mut consistent = true;
             for &(idx, b) in &to_bind {
-                subst.bind(idx, b);
-                self.bound.push(idx);
+                match subst.get(idx) {
+                    Some(existing) => {
+                        if !rt.deep_equal(existing, b) {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        subst.bind(idx, b);
+                        self.bound.push(idx);
+                    }
+                }
+            }
+            if !consistent {
+                for &idx in &self.bound {
+                    subst.unbind(idx);
+                }
+                self.bound.clear();
+                continue;
             }
             self.matched_whole = residue.is_empty();
             self.residue = residue;

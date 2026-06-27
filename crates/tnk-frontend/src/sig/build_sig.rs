@@ -22,6 +22,22 @@ fn canonical_name(name: &[Token], i: &Interner) -> String {
     name.iter().map(|t| i.resolve(t.sym)).collect()
 }
 
+/// Resolve a sort name, handling the **kind** form `[S]` — the top (error) sort of S's connected
+/// component, `error_sort(kind_of(S))` (`var B : [Bool]`, `op undefined : -> [Y$Elt]`). A plain name is
+/// a direct lookup. The `[S]` form requires `close_sorts()` to have run (kinds exist), so it is used for
+/// op domains/ranges and variable sorts (Pass A onward), never for subsorts (resolved before close).
+fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) -> R<SortId> {
+    if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let inner_id = sorts
+            .get(inner)
+            .copied()
+            .ok_or_else(|| format!("unknown sort `{inner}` in kind `[{inner}]`"))?;
+        Ok(engine.sorts().error_sort(engine.sorts().kind_of(inner_id)))
+    } else {
+        sorts.get(name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
+    }
+}
+
 pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut engine = Engine::new();
     let mut sorts: HashMap<String, SortId> = HashMap::new();
@@ -74,8 +90,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
             None => {
                 let domain: Vec<SortId> =
-                    od.domain.iter().map(|s| sort_id(&sorts, s)).collect::<R<_>>()?;
-                vec![(domain, sort_id(&sorts, &od.range)?)]
+                    od.domain.iter().map(|s| resolve_sort(&engine, &sorts, s)).collect::<R<_>>()?;
+                vec![(domain, resolve_sort(&engine, &sorts, &od.range)?)]
             }
             Some(poly) => {
                 let s = engine.sorts();
@@ -203,7 +219,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // Resolve declared variables `(name, sort)` for the grammar builder + `build_term`.
     let mut vars: Vec<(String, SortId)> = Vec::new();
     for vd in &pm.vars {
-        let sort = sort_id(&sorts, &vd.sort)?;
+        let sort = resolve_sort(&engine, &sorts, &vd.sort)?;
         for name in &vd.names {
             vars.push((name.clone(), sort));
         }

@@ -273,7 +273,13 @@ impl<'a> Printer<'a> {
             for (idx, c) in children.iter().enumerate() {
                 if idx > 0 {
                     for f in &mid {
-                        out.push(Work::Space);
+                        // Same spacing rule as the binary path below: no space precedes a `,` or a
+                        // bracket (so SET's `_,_` folds to `1, 2, 3`, not `1 , 2 , 3`).
+                        let suppress = matches!(f, Frag::Tok(s)
+                            if matches!(self.i.resolve(*s), "," | "(" | ")" | "[" | "]" | "{" | "}"));
+                        if !suppress {
+                            out.push(Work::Space);
+                        }
                         out.push(Work::Text { cat: Cat::Op, text: self.frag_cow(f) });
                     }
                     out.push(Work::Space);

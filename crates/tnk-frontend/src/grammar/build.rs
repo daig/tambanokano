@@ -136,6 +136,13 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
         let nt = Nt::Comp(sorts.kind_of(sort_id), NtType::Term);
         let name_sym = interner.intern(sort_name);
         push(&mut g, nt, vec![GSym::T(Terminal::ColonVar(name_sym))], 0, vec![], Action::MakeVariable(sort_id));
+        // The **kind** colon-variable `name:[S]` — an error-sort (kind-level) on-the-fly variable
+        // (`var B : [Bool]` flattens to `B:[Bool]`; also a user-typed `X:[Foo]`). `[S]` resolves to S's
+        // component's error sort, into that component's term NT. Any sort of a multi-sort kind spells the
+        // same kind (`[Zero]` = `[Nat]`); the distinct tokens each get a production to the one error sort.
+        let err = sorts.error_sort(sorts.kind_of(sort_id));
+        let kind_sym = interner.intern(&format!("[{sort_name}]"));
+        push(&mut g, nt, vec![GSym::T(Terminal::ColonVar(kind_sym))], 0, vec![], Action::MakeVariable(err));
     }
 
     // ---- symbol productions (per operator, in declaration order) ----
