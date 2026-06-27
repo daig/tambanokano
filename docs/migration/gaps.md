@@ -66,14 +66,15 @@ correctness fix.
   are unaffected. The eager/lazy bit is already on `Symbol` (`strategy`); threading it through the traversal is
   a localized follow-up. (`frewrite_pass` also recurses on subject depth — shallow for object/config terms, an
   explicit-stack rewrite is the same follow-up as C12 if a deep rule structure ever appears.)
-- **On-the-fly variables — user-typed structured-sort forms only.** Inline `name:Sort` colon variables (the
-  idiomatic `search` goal `X:St`, legal anywhere a term is) are **done** — a `Terminal::ColonVar` grammar
-  terminal matches the one-token `name:sort`, the whole token becoming the variable name (so `X:Nat` and
-  `X:Foo` are distinct), echoed back with its sort. A structured-sort form `name:List{Nat}` *is* recognized
-  when it reaches the engine as a single token — instantiation produces exactly that (a parameterized
-  module's variables are inlined as single-token colon variables at their instance sorts, `flatten.rs`). The
-  *residual* is purely lexical: a **user typing** `X:List{Nat}` / a **kind** variable `X:[Foo]` splits on the
-  `{`/`[`, so the surface form isn't lexed as one token — rare, and orthogonal to the instantiation path.
+- **On-the-fly variables — kind form only.** Inline `name:Sort` colon variables (the idiomatic `search` goal
+  `X:St`, legal anywhere a term is) are **done**, including **structured** sorts: the lexer keeps a
+  `name:Base{…}` colon variable in one token (`L:List{Nat}`, and the chained `X:Box{A}{B}`) — a plain sort
+  `List{Nat}` with no colon still splits on the braces — and a `Terminal::ColonVar` grammar terminal matches
+  the whole token, the part before `:` becoming the variable name (so `X:Nat`/`X:Foo`/`X:List{Nat}` are
+  distinct), echoed back with its sort. The instantiation path produces the same single-token form (a
+  parameterized module's variables are inlined as single-token colon variables at their instance sorts,
+  `flatten.rs`). The *residual* is the **kind** variable `X:[Foo]` (square brackets) — `:[` doesn't fit the
+  `name:base` fusion shape, so it isn't lexed as one token yet; rare, and orthogonal.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite

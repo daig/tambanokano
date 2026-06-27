@@ -62,9 +62,10 @@ prelude load.
      (`mb t : NeList{X}`). The re-parse-from-bubbles build needed each parameterized module's variables
      inlined as single-token colon variables so a doubly-instantiated module's equations self-type. Fixtures:
      `conformance/instantiation-{nested,byparam,nested-list,theory-view,membership,set-ac,map}.maude` +
-     `correctness-disambig.maude`, all byte-identical. *Residuals* (in `gaps.md`): identity-collapse rewrite
-     **count** (orthogonal — the AC matcher, reproduces non-parameterized), the chained-import last-level
-     substitution, and the user-typed (not instantiation-produced) structured colon-var lexing.
+     `correctness-{disambig,colon-var-structured}.maude`, all byte-identical (incl. user-typed structured
+     colon variables `L:List{Nat}`). *Residuals* (in `gaps.md`): identity-collapse rewrite **count**
+     (orthogonal — the AC matcher, reproduces non-parameterized), the chained-import last-level substitution,
+     and the `X:[Foo]` *kind*-variable lexing.
 
    **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
    parameterization is the critical path to it). **Reference:** `reports/A5-modules-parameterization-repl.md`.

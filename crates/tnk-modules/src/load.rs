@@ -303,6 +303,17 @@ mod tests {
         );
     }
 
+    /// A **user-typed** colon variable over a structured sort (`L:List{Nat}`, written inline in an equation):
+    /// the lexer keeps the braces in one token, so it resolves to a variable of sort `List{Nat}` and the
+    /// equation fires. Byte-identical to the reference.
+    #[test]
+    fn structured_colon_var_conforms() {
+        conform(
+            conformance_file!("correctness-colon-var-structured.maude"),
+            &[e("List{Nat}", "c(0, nil)", 1), e("List{Nat}", "hd(nil)", 0)],
+        );
+    }
+
     /// A membership over a **structured** sort in a parameterized module (`mb cons(H, T) : NeList{E}`):
     /// both the inline-typed lhs and the structured target sort instantiate (`E ↦ ToN`), so `cons(0, nil)`
     /// has least sort `NeList{ToN}`. Byte-identical to the reference (the structured membership sort and the

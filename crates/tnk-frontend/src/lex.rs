@@ -84,6 +84,14 @@ fn is_punct(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
 }
 
+/// Whether the maudeId built so far is the prefix of a colon variable `name:base` — a non-empty variable
+/// name and a non-empty sort base after the last `:`. When it is, a following `{ … }` is part of the
+/// (structured) sort name, so the lexer keeps `L:List{Nat}` one token rather than splitting `L:List` off
+/// from `{ Nat }`. (A plain sort `List{Nat}` has no `:`, so it still tokenizes as `List { Nat }`.)
+fn colon_var_shape(text: &str) -> bool {
+    matches!(text.rsplit_once(':'), Some((name, base)) if !name.is_empty() && !base.is_empty())
+}
+
 /// A line comment `***`/`---` begins at `chars[j]`.
 fn is_line_comment_start(chars: &[char], j: usize) -> bool {
     matches!(chars.get(j), Some('*') | Some('-'))
@@ -251,6 +259,30 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
         let mut text = String::new();
         while i < n {
             let ch = chars[i];
+            // A structured-sort colon variable keeps its braces in one token: `L:List{Nat}` (and the chained
+            // `X:Box{ToT2}{C2}`) — consume the balanced `{ … }` group rather than letting `{` split it off.
+            if ch == '{' && colon_var_shape(&text) {
+                let mut depth = 0u32;
+                while i < n {
+                    let cj = chars[i];
+                    if cj == '\n' {
+                        line += 1;
+                    }
+                    text.push(cj);
+                    i += 1;
+                    match cj {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             if ch.is_whitespace() || is_punct(ch) || ch == '"' {
                 break;
             }
@@ -323,6 +355,21 @@ mod tests {
         let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(texts, ["op", "_+_", ":", "Nat", "Nat", "->", "Nat", "."]);
         assert_eq!(t.last().unwrap().1, TokKind::Dot, "trailing . is the terminator");
+    }
+
+    /// A structured-sort colon variable keeps its braces in one token (`L:List{Nat}`, and the chained
+    /// `X:Box{A}{B}`), so it matches the `ColonVar` grammar terminal — but a *plain* structured sort
+    /// (`List{Nat}`, no colon) still splits on the braces. `N:Nat` (unstructured) is one token as before.
+    #[test]
+    fn structured_colon_variable_is_one_token() {
+        let (_i, t) = lex("hd(c(N:Nat, L:List{Nat}), X:Box{A}{B}) List{Nat}");
+        let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(texts, [
+            "hd", "(", "c", "(", "N:Nat", ",", "L:List{Nat}", ")", ",", "X:Box{A}{B}", ")",
+            // a plain structured sort (no colon) is unaffected — still `List { Nat }`.
+            "List", "{", "Nat", "}",
+        ]);
+        assert_eq!(t[6].1, TokKind::Ident, "the colon-var token classifies as an identifier");
     }
 
     #[test]
