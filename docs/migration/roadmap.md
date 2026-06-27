@@ -43,12 +43,15 @@ prelude load.
      `c` as `c nil`) — the two things `LIST{Nat}` needed beyond the existing Pillar-B module algebra. **(M2)**
 
    **Remaining prelude work, in dependency order:**
-   - **(a) Finish the container library** — `EXT-BOOL` → `SET` → `MAP` → `ARRAY` (+ `LIST-AND-SET`). Two small,
-     well-understood capabilities unblock all of them: the **`[Sort]` kind notation** (`var B : [Bool]`,
-     `op undefined : -> [Y$Elt]` — resolve `[S]` to S's kind/error sort; the long-noted `X:[Foo]` gap), and
-     **ACU/CUI identity-collapse matching** — the direct analog of the AU collapse just done (`(E, S)` against a
-     singleton set; `acu.rs`/`cui.rs` carry the identical `_ => return None`). ARRAY also leans on the DEFAULT
-     theory/views (already building). This completes the parameterized data-structure library.
+   - **(a) Container library — ✅ DONE (the data structures).** `EXT-BOOL`, `SET{Nat}`, `MAP{Nat,Nat}`,
+     `ARRAY{Nat,Nat0}` all load and reduce byte-identically (`conformance/prelude-{set,map,array}.maude`). It
+     took the **`[Sort]` kind notation** (`var B : [Bool]`, `op undefined : -> [Y$Elt]` → `error_sort(kind_of
+     S)`), **ACU identity-collapse matching** (the AU analog), and three problems they surfaced: **non-linear
+     ACU** matching (`E in (E, S)` — the pure path now deep-equal-checks pre-bound vars), the **assoc-list
+     separator spacing**, and the **`id:`-attribute parse** bug (`collect_until(["]"])` swallowed `prec`/
+     `format`, defaulting the constructor precedence). CUI collapse is unneeded (no comm-only-with-`id:` op).
+     *Remaining:* the parameterized container **views** (`view List{X :: TRIV} … to LIST{X}`, Set/Map/Array,
+     sortable-list) that let containers nest — a view-frontend follow-up (`gaps.md`).
    - **(b) The remaining built-in data types** — `INT` (`abs`, signed `-_`), `RAT`, `FLOAT` (more float codes),
      `STRING`/`QID` (`ascii`/`find`/`upperCase`/…), `CONVERSION`; plus the leaf special ops
      (`CommutativeDecomposeEqualitySymbol` for INITIAL-EQUALITY-PREDICATE, `RandomOpSymbol`/`CounterSymbol`).
