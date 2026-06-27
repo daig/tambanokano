@@ -186,6 +186,63 @@ fn poly_multikind_through_repl() {
     );
 }
 
+/// Increment 4 — a bare boolean condition `if b` abbreviates `if b = true`. The conditional
+/// `ceq f(X) = b if X == a` fires for `f(a)` (a == a = true, 2 rewrites → b) and not for `f(b)`
+/// (b == a = false, 1 rewrite, stays). Values/counts are the reference binary's (`red in T : …`).
+#[test]
+fn bare_condition_through_repl() {
+    let out = repl().eval(conformance_file!("bare-condition.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(results, vec!["result Foo: b", "result Foo: f(b)"], "bare-cond values: {out}");
+    // f(a): == eval + eq application = 2; f(b): == eval only (condition false) = 1.
+    assert_eq!(out.matches("rewrites: 2 ").count(), 1, "fired count: {out}");
+    assert_eq!(out.matches("rewrites: 1 ").count(), 1, "not-fired count: {out}");
+}
+
+/// M1 milestone — the real prelude's NAT (with its BOOL substrate) loads and every built-in reduces
+/// byte-identically to Maude's built-in NAT, incl. the increment-5 additions: the `~>` partial arrow
+/// (modExp parses), the ACU bitwise folds `xor`/`&`/`|` (multiplicity-aware — `5 xor 5 = 0`), the CUI
+/// `sd` (`|m−n|`, commutative), `modExp` (modpow), and the `>>`/`<<` shifts (incl. the bignum
+/// `1 << 64`). Each value/sort/count is the reference binary's (`red in NAT : …`); all cases are
+/// 2-operand or prefix N-ary, whose counts match exactly (see gaps.md for the ≥3-operand-infix delta).
+#[test]
+fn prelude_nat_m1_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-nat.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result NzNat: 5",                    // 2 + 3
+            "result NzNat: 3",                    // 7 quo 2
+            "result NzNat: 1",                    // 7 rem 2
+            "result NzNat: 1024",                 // 2 ^ 10
+            "result NzNat: 6",                    // gcd(12, 18)
+            "result NzNat: 2",                    // gcd(12, 18, 8)  — prefix N-ary folds to 1 rewrite
+            "result NzNat: 12",                   // lcm(4, 6)
+            "result NzNat: 3",                    // min(3, 5)
+            "result NzNat: 5",                    // max(3, 5)
+            "result NzNat: 5",                    // sd(3, 8)
+            "result NzNat: 5",                    // sd(8, 3)  — commutative
+            "result NzNat: 6",                    // 5 xor 3
+            "result Zero: 0",                     // 5 xor 5   — multiplicity cancels
+            "result NzNat: 8",                    // 12 & 10
+            "result NzNat: 14",                   // 12 | 10
+            "result NzNat: 24",                   // modExp(2, 10, 1000)
+            "result NzNat: 40",                   // 5 << 3
+            "result NzNat: 18446744073709551616", // 1 << 64  — bignum shift
+            "result NzNat: 5",                    // 40 >> 3
+            "result Bool: true",                  // 3 < 5
+            "result Bool: true",                  // 5 <= 5
+            "result Bool: true",                  // 7 > 2
+            "result Bool: false",                 // 2 >= 7
+            "result Bool: true",                  // 3 divides 12
+        ],
+        "NAT values/sorts: {out}"
+    );
+    // Every reduce here is a single built-in rewrite (2-operand / prefix N-ary).
+    assert_eq!(out.matches("rewrites: 1 ").count(), 24, "NAT counts: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

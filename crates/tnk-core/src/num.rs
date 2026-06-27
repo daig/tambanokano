@@ -8,7 +8,7 @@
 //! consumer lands (this slice is what the S theory needs; NAT/INT arithmetic is added with those ops).
 
 use malachite::base::num::arithmetic::traits::{
-    CheckedSub, DivRem, DivisibleBy, Gcd, Lcm, Pow, UnsignedAbs,
+    CheckedSub, DivRem, DivisibleBy, Gcd, Lcm, ModPow, Pow, UnsignedAbs,
 };
 use malachite::base::num::basic::traits::{One, Zero};
 use malachite::{Integer, Natural};
@@ -65,6 +65,36 @@ impl Nat {
     /// As a machine `usize` if it fits — the S-theory sort-path index (always small).
     pub(crate) fn to_usize(&self) -> Option<usize> {
         usize::try_from(&self.0).ok()
+    }
+    /// As a machine `u64` if it fits — `NAT` shift amounts (`_<<_`/`_>>_`).
+    pub(crate) fn to_u64(&self) -> Option<u64> {
+        u64::try_from(&self.0).ok()
+    }
+
+    /// Bitwise `_xor_` / `_&_` / `_|_` over non-negative integers (Maude's `ACU_NumberOpSymbol`
+    /// `xor`/`&`/`|`, folding a multiset — see `builtin::acu_fold`). Naturals have no sign bit, so these
+    /// are the ordinary unsigned bit operations.
+    pub(crate) fn bitxor(&self, other: &Nat) -> Nat {
+        Nat(&self.0 ^ &other.0)
+    }
+    pub(crate) fn bitand(&self, other: &Nat) -> Nat {
+        Nat(&self.0 & &other.0)
+    }
+    pub(crate) fn bitor(&self, other: &Nat) -> Nat {
+        Nat(&self.0 | &other.0)
+    }
+    /// `self << amount` / `self >> amount` (`_<<_` / `_>>_`); `>>` floors toward zero (shifts away the
+    /// low bits). `amount` is a machine `u64` (the shift count fits — a bignum count is unrepresentable).
+    pub(crate) fn shl(&self, amount: u64) -> Nat {
+        Nat(&self.0 << amount)
+    }
+    pub(crate) fn shr(&self, amount: u64) -> Nat {
+        Nat(&self.0 >> amount)
+    }
+    /// `self ^ exp mod modulus` (Maude's `modExp` — efficient modular exponentiation). The caller
+    /// guards `modulus != 0` (`modExp`'s third argument is `NzNat`).
+    pub(crate) fn mod_pow(&self, exp: &Nat, modulus: &Nat) -> Nat {
+        Nat((&self.0).mod_pow(&exp.0, &modulus.0))
     }
     /// Base-10 rendering — for the pretty-printer's decimal numerals / iter counts (a `usize` would
     /// truncate a bignum count). Malachite's `Natural` is `Display`.
@@ -174,6 +204,24 @@ mod tests {
     fn divides() {
         assert!(n(3).divides(&n(12)) && !n(5).divides(&n(12)));
         assert!(n(1).divides(&n(7)) && !n(7).divides(&n(1)));
+    }
+
+    #[test]
+    fn bitwise_shifts_modpow() {
+        // Bitwise on non-negative naturals (NAT's `_&_`/`_|_`/`_xor_`).
+        assert_eq!(n(12).bitand(&n(10)), n(8)); // 1100 & 1010 = 1000
+        assert_eq!(n(12).bitor(&n(10)), n(14)); // 1100 | 1010 = 1110
+        assert_eq!(n(5).bitxor(&n(3)), n(6)); // 101 ^ 011 = 110
+        assert_eq!(n(5).bitxor(&n(5)), n(0)); // xor is self-inverse
+        // Shifts (`_<<_`/`_>>_`); `>>` floors, a huge shift clears all bits.
+        assert_eq!(n(5).shl(3), n(40)); // 5 * 8
+        assert_eq!(n(40).shr(3), n(5)); // 40 / 8
+        assert_eq!(n(5).shr(100), n(0));
+        assert_eq!(n(1).shl(64), n(u64::MAX).add(&n(1)), "1 << 64 = 2^64 (bignum)");
+        // Modular exponentiation (`modExp`).
+        assert_eq!(n(2).mod_pow(&n(10), &n(1000)), n(24)); // 1024 mod 1000
+        assert_eq!(n(7).mod_pow(&n(0), &n(13)), n(1)); // x^0 = 1
+        assert_eq!(n(3).mod_pow(&n(100), &n(7)), n(4)); // 3^100 ≡ 4 (mod 7)
     }
 
     #[test]

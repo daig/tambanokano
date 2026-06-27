@@ -16,6 +16,19 @@ These reproduce a semantically-empty Maude-internal artifact; the differential h
   argument order (`5 + x` vs `x + 5`) and the AC **match-solution enumeration** order (Maude's Diophantine
   order) differ. Match solutions are **set-compared** in the conformance harness. Hits `nat`, `acu-*` — the
   most common cosmetic delta.
+- **Multi-operand infix built-in number fold — rewrite *count* (the one count divergence here, noted).**
+  Same eager-flatten root as the ACU-order bullet above: our kernel flattens an ACU term at construction,
+  so an infix chain `2 + 3 + 4` becomes one flat node `+(2,3,4)` and the built-in `ACU_NumberOpSymbol`
+  fold combines *all* numeric operands in **one** rewrite. Maude keeps the surface parse **nested**
+  (`2 + (3 + 4)`) and folds each binary node separately, counting **k−1** rewrites for k infix operands
+  (trace: `2 + 3 + 4 → 2 + 7 → 9`, 2 rewrites). **Value and sort are always identical** (`9 : NzNat`); only
+  the count differs, and only for a **≥3-operand infix chain of a built-in number op** — a 2-operand op
+  (`5 xor 3`; every M1 example) and a **prefix** N-ary form (`gcd(12,18,8)` folds to 1 in *both*) match
+  exactly, and **user-equation** AC reduction is unaffected (`a+a+a+a ⇒ a` is 3 in both, pairwise on the
+  flat multiset). A faithful count needs the surface-preserving AC representation that comes with the
+  **bipartite/Diophantine matcher** rework (§2) — a flat node can't distinguish infix-nested from
+  prefix-flat post-parse, so it is not a built-in-fold tweak. No conformance fixture asserts the divergent
+  case.
 - **Multi-top component sort-index order.** Maude's `ConnectedComponent` "sort index" (a DFS-topological
   numbering, `Core/sort.cc`) leaks into two outputs: the **kind label** order (`[B,D,A]` vs our declaration-
   order `[A,B,D]`, only for a kind-level term in a multi-maximal component) and the **incomparable-membership

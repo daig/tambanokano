@@ -407,10 +407,17 @@ impl<'a> Parser<'a> {
                 let names = self.collect_until(&[":"]);
                 self.eat(":")?;
                 let mut domain = Vec::new();
-                while !self.at("->") {
+                while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
                 }
-                self.eat("->")?;
+                // `~>` is the partial (kind-level) arrow (`op modExp : Nat Nat NzNat ~> Nat`); treat it
+                // like `->` — we don't track partiality, and a kind-level result falls out of the sort
+                // machinery anyway.
+                if self.at("~>") {
+                    self.advance();
+                } else {
+                    self.eat("->")?;
+                }
                 let range = self.sort_name()?;
                 let attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
                 self.eat_dot()?;

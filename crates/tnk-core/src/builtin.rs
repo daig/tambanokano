@@ -22,6 +22,7 @@ impl Runtime {
             SpecialOp::NumberOp { op, nat, bool_ } => {
                 self.reduce_number_op(sig, id, *op, nat, bool_.as_ref())
             }
+            SpecialOp::CuiNumberOp { op, nat } => self.reduce_cui_number_op(sig, id, *op, nat),
             SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
             SpecialOp::StringOp { op, str_sym, nat, bool_ } => {
                 self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref())
@@ -215,10 +216,46 @@ impl Runtime {
                 let e = a[1].magnitude().to_usize()? as u64; // too-large exponent ⇒ fall through
                 self.make_int(sig, nat, a[0].pow_u64(e))
             }
-            // ACU ops never reach the free path (the seam pairs each op with the right SpecialOp arm).
-            NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => {
-                unreachable!("ACU number op `{op:?}` reached the free NumberOp path")
+            // `modExp(b, e, m) = b^e mod m` (`modExp : Nat Nat NzNat ~> Nat`): non-negative operands.
+            NumOp::ModExp => {
+                if a[2].is_zero() {
+                    return None; // modulus 0 (the `NzNat` arg guards this; defend anyway)
+                }
+                let r = a[0].magnitude().mod_pow(&a[1].magnitude(), &a[2].magnitude());
+                self.make_int(sig, nat, Int::from_nat(&r))
             }
+            // `_>>_` / `_<<_ : Nat Nat -> Nat`: shift by a machine-width amount (a bignum shift count is
+            // unrepresentable ⇒ fall through). Non-negative operands.
+            NumOp::Shr | NumOp::Shl => {
+                let amount = a[1].magnitude().to_u64()?;
+                let base = a[0].magnitude();
+                let r = if matches!(op, NumOp::Shr) { base.shr(amount) } else { base.shl(amount) };
+                self.make_int(sig, nat, Int::from_nat(&r))
+            }
+            // ACU / CUI ops never reach the free path (the seam pairs each op with the right arm).
+            NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max
+            | NumOp::Xor | NumOp::And | NumOp::Or | NumOp::Sd => {
+                unreachable!("non-free number op `{op:?}` reached the free NumberOp path")
+            }
+        }
+    }
+
+    /// `CUI_NumberOpSymbol` (`sd`): a **commutative** 2-argument numeric op. `sd(m, n) = |m − n|` — read
+    /// the two (already-reduced) operands from the CUI node and build the non-negative difference. A
+    /// non-numeric argument falls through (`None`).
+    fn reduce_cui_number_op(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: NumOp,
+        nat: &NatHooks,
+    ) -> Option<DagId> {
+        let kids: Vec<DagId> = self.node(id).children().collect();
+        let a = self.as_int(kids[0], nat)?;
+        let b = self.as_int(kids[1], nat)?;
+        match op {
+            NumOp::Sd => self.make_int(sig, nat, Int::from_nat(&a.sub(&b).magnitude())),
+            _ => unreachable!("non-CUI number op `{op:?}` reached the CUI path"),
         }
     }
 
@@ -363,6 +400,9 @@ fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
         NumOp::Mul => n.pow_u64(u64::from(m)),                            // n multiplied m times
         // gcd/lcm/min/max are idempotent in multiplicity; their operands are non-negative.
         NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => Int::from_nat(&n.magnitude()),
+        // Bitwise: `xor` cancels in pairs (even multiplicity ⇒ 0); `&`/`|` are idempotent (m ⩾ 1 ⇒ n).
+        NumOp::Xor if m % 2 == 0 => Int::from_nat(&Nat::zero()),
+        NumOp::Xor | NumOp::And | NumOp::Or => Int::from_nat(&n.magnitude()),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
 }
@@ -377,6 +417,11 @@ fn acu_fold(op: NumOp, acc: &Int, n: &Int, m: u32) -> Int {
         NumOp::Lcm => Int::from_nat(&acc.magnitude().lcm(&n.magnitude())),
         NumOp::Min => core::cmp::min(acc.clone(), n.clone()),
         NumOp::Max => core::cmp::max(acc.clone(), n.clone()),
+        // Bitwise folds on magnitudes; an even-multiplicity `xor` operand leaves `acc` unchanged.
+        NumOp::Xor if m % 2 == 0 => acc.clone(),
+        NumOp::Xor => Int::from_nat(&acc.magnitude().bitxor(&n.magnitude())),
+        NumOp::And => Int::from_nat(&acc.magnitude().bitand(&n.magnitude())),
+        NumOp::Or => Int::from_nat(&acc.magnitude().bitor(&n.magnitude())),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
 }

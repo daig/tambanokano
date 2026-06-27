@@ -84,7 +84,7 @@ guard forbids an *explicit* strat — the prelude's `if_then_else_fi` declares n
 | Milestone | Modules | New feature |
 |---|---|---|
 | **M0 ✅ DONE** — `BOOL` loads; `red true and false .` byte-identical | TRUTH-VALUE, BOOL-OPS, TRUTH, BOOL | §1 poly, §2 SystemTrue/False, §4 `set` skip |
-| **M1** — `NAT` loads; `red 2 + 3 .`/`7 quo 2`/`5 xor 3` byte-identical | NAT | §4 `~>`; NAT codes — `ACU_NumberOpSymbol` `xor`/`&`/`\|`, `CUI_NumberOpSymbol` `sd`, `NumberOpSymbol` `modExp`/`>>`/`<<` |
+| **M1 ✅ DONE** — `NAT` loads; `red 2 + 3 .`/`7 quo 2`/`5 xor 3` byte-identical | NAT | §4 `~>`; NAT codes — `ACU_NumberOpSymbol` `xor`/`&`/`\|`, `CUI_NumberOpSymbol` `sd`, `NumberOpSymbol` `modExp`/`>>`/`<<` |
 | **M2** — `LIST{Nat}` loads; `occurs`/`size`/`reverse` byte-identical | LIST (+SET/MAP/ARRAY) | resilient loading (§5); containers reuse only BOOL+NAT+TRIV |
 
 `LIST{X}` `protecting NAT` ⇒ M1 is a hard prerequisite for M2. INT/RAT/FLOAT/STRING/QID are **off the
@@ -118,16 +118,19 @@ startup is an M3+ convenience, not required for M0-M2.
 
 ## 6. Increment order (each self-contained + differentially verifiable)
 
-**Status: increments 1–3 ✅ DONE — M0 reached** (the four BOOL modules build; the five
-`conformance/prelude-bool.maude` reduces are byte-identical to the reference binary, plus a 2-kind
-`conformance/poly-multikind.maude` proving real multi-instance dispatch). Next: increment 4 (bare
-conditions, consuming the §2 anchors), then increment 5 (`~>` + NAT codes) for M1. Two **new off-path
-blockers** surfaced beyond §0 (both leaves, neither on BOOL→NAT→LIST): `var B : [Bool]` kind notation
-(EXT-BOOL — already the §4.3 / `X:[Foo]` follow-up) and a `CommutativeDecomposeEqualitySymbol` special
-id-hook (INITIAL-EQUALITY-PREDICATE — a new special op, defer with INT/RAT). One **API addition** was
-needed: `Sorts::kinds()` (sort.rs) — an iterator over kind ids, since `Id::from_raw` is `pub(crate)` so
-the frontend couldn't build a `KindId` to drive the per-kind loop. (Not reduction code; the "no new
-kernel reduction code" claim holds.)
+**Status: increments 1–5 ✅ DONE — M0 + M1 reached.** BOOL and NAT both load and reduce byte-identically
+to the reference (`conformance/prelude-bool.maude`, `prelude-nat.maude`, `bare-condition.maude`, plus the
+2-kind `poly-multikind.maude`). **Next: increment 6 — the container milestone (M2, `LIST{Nat}`).** Probing
+the full prelude after M1, the frontier is now INT (`abs`), STRING/QID (`ascii`), RANDOM (`RandomOpSymbol`)
+— all off the `LIST{Nat}` path — plus the M2 container work itself (LIST's `no parse: append(A,L)` and the
+parameterized-view `expected 'to', found "{"` errors). **New off-path blockers** beyond §0 (all leaves /
+later increments): `var B : [Bool]` kind notation (EXT-BOOL — the §4.3 / `X:[Foo]` follow-up);
+`CommutativeDecomposeEqualitySymbol` (INITIAL-EQUALITY-PREDICATE); `abs`/`ascii`/`RandomOpSymbol`
+(INT/STRING/RANDOM). Two API/infra notes: `Sorts::kinds()` was added (sort.rs — `Id::from_raw` is
+`pub(crate)`, so the frontend couldn't build a `KindId`; not reduction code). And a **count divergence**
+was characterized (gaps.md): a ≥3-operand *infix* built-in number fold counts 1 rewrite (our eager-flat
+ACU) vs Maude's k−1 (nested infix) — value/sort always identical, 2-operand & prefix-N-ary match exactly,
+fix tied to the AC-matcher rework.
 
 1. ✅ **`set` skip** — parse-and-ignore arm in `parse_top_item`, recurses to the next item.
 2. ✅ **SystemTrue/False markers + anchors** — `special_op` marker arm (`Ok(None)`); Pass A2 records
@@ -137,11 +140,16 @@ kernel reduction code" claim holds.)
    per instance in Pass B. The refactor landed as: **`op_syms: Vec<Vec<SymbolId>>`** (1 entry per decl,
    length 1 for ordinary ops / N for poly), Pass A2 indexes `op_syms[idx][0]` (anchors are concrete),
    Pass B resolves `special` once and iterates the instances. `Universal` never reaches `sort_id`.
-4. **Bare-condition `= true` desugar** — `split_connective` on no-connective → `ConditionFragment::Equality
-   { lhs: cond, rhs: true_sym }`. *Verify:* a `ceq r = … if pred(x) .` fires. Precondition for containers.
-5. **`~>` arrow + NAT arithmetic codes** — parser `~>`; extend `NumOp`/`num_op` with `xor`/`&`/`|` (ACU
-   bignum bitwise, multiplicity-aware), `sd` (new `CUI_NumberOpSymbol` → CUI fold), `modExp` (3-arg bignum
-   modpow), `>>`/`<<` (free bignum shifts). *Verify (M1):* NAT builds; each new op byte-identical.
+4. ✅ **Bare-condition `= true` desugar** — `split_connective` now returns `Option` (`None` = no
+   connective); `parse_condition` desugars a bare fragment to `Equality { lhs: cond, rhs: true_sym }`
+   (load.rs). *Verified:* `conformance/bare-condition.maude` (`ceq f(X)=b if X==a` fires for `f(a)`, not
+   `f(b)`), byte-identical.
+5. ✅ **`~>` arrow + NAT arithmetic codes** — parser op-domain loop stops at `->`|`~>`; `NumOp` +
+   `Xor`/`And`/`Or`/`Sd`/`ModExp`/`Shr`/`Shl`; new `SpecialOp::CuiNumberOp` (+ `reduce_cui_number_op`) for
+   `sd`; `reduce_number_op` gains `modExp`/`>>`/`<<`; `acu_fold{,_first}` gain the bitwise arms (xor with
+   even multiplicity → identity); `num.rs` gains `bitxor`/`bitand`/`bitor`/`shl`/`shr`/`mod_pow`; build_sig
+   maps the codes + `CUI_NumberOpSymbol`. *Verified:* `conformance/prelude-nat.maude` (24 reduces, every
+   built-in incl. all new ops + bignum `1<<64`) byte-identical. (Decimal numerals already parse.)
 6. **Container milestone** — resilient loader (§5) or trimmed fixture; `protecting LIST{Nat}`. *Verify (M2):*
    `occurs`/`size`/`reverse` byte-identical.
 7. **Follow-ups (non-blocking):** `[Sort]` kind notation + kind vars (EXT-BOOL / the `X:[Foo]` gap);

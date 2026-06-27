@@ -206,7 +206,17 @@ fn parse_condition(
 ) -> Result<Vec<ConditionFragment>, String> {
     let mut frags = Vec::new();
     for ftoks in split_on_text(bubble, "/\\", i) {
-        let (left, conn, right) = split_connective(ftoks, i)?;
+        let Some((left, conn, right)) = split_connective(ftoks, i) else {
+            // A bare boolean fragment `b` abbreviates `b = true` (Maude's abbreviated condition). The
+            // `true` anchor (SystemTrue) is present whenever BOOL is in scope — which it must be for a
+            // boolean-valued condition to typecheck.
+            let lhs = parse_build(ftoks, g, m, i, vars)?;
+            let true_sym = m
+                .true_sym
+                .ok_or("bare boolean condition, but no `true` is in scope (import BOOL)")?;
+            frags.push(ConditionFragment::Equality { lhs, rhs: Term::constant(true_sym) });
+            continue;
+        };
         let frag = match conn {
             Connective::Match => {
                 let pattern = parse_build(left, g, m, i, vars)?;
@@ -261,11 +271,13 @@ fn split_on_text<'a>(toks: &'a [Token], sep: &str, i: &Interner) -> Vec<&'a [Tok
     parts
 }
 
-/// Find a fragment's connective token (`:=` / `=` / `:`) at paren-depth 0 and split around it.
+/// Find a fragment's connective token (`:=` / `=` / `:` / `=>`) at paren-depth 0 and split around it.
+/// `None` if the fragment has no connective — a **bare boolean** condition `b`, which the caller
+/// desugars to `b = true` (Maude's abbreviated condition, e.g. `ceq X < Z = true if X < Y /\ Y < Z`).
 fn split_connective<'a>(
     toks: &'a [Token],
     i: &Interner,
-) -> Result<(&'a [Token], Connective, &'a [Token]), String> {
+) -> Option<(&'a [Token], Connective, &'a [Token])> {
     let mut depth = 0i32;
     for (k, t) in toks.iter().enumerate() {
         let conn = match i.resolve(t.sym) {
@@ -285,10 +297,10 @@ fn split_connective<'a>(
             _ => None,
         };
         if let Some(conn) = conn {
-            return Ok((&toks[..k], conn, &toks[k + 1..]));
+            return Some((&toks[..k], conn, &toks[k + 1..]));
         }
     }
-    Err("condition fragment has no connective (`=` / `:=` / `:` / `=>`)".into())
+    None
 }
 
 /// Whether a statement is `[nonexec]` (a proof obligation not applied during execution).

@@ -127,6 +127,10 @@ pub enum SpecialOp {
     /// rewrite to a Bool constant; arithmetic ops to a Nat. A non-numeric argument, division by zero, or
     /// a would-be-negative result falls through to user equations (`None`).
     NumberOp { op: NumOp, nat: NatHooks, bool_: Option<BoolHooks> },
+    /// `sd` (Maude's `CUI_NumberOpSymbol`): a **commutative** 2-argument op over numeric arguments —
+    /// symmetric difference `sd(m, n) = |m − n|`. The two operands come from the CUI node; the result is
+    /// a Nat. A non-numeric argument falls through (`None`).
+    CuiNumberOp { op: NumOp, nat: NatHooks },
     /// `-_` (Maude's `MinusSymbol`): integer negation. `-(s^n(0))` is the canonical negative (no
     /// rewrite); `-(-x)` reduces to `x` and `-0` to `0`. `nat.minus` is this operator.
     Minus { nat: NatHooks },
@@ -194,8 +198,7 @@ pub struct BoolHooks {
 
 /// The arithmetic / relational operation a numeric built-in performs (Maude packs these as a 2-char
 /// `CODE` int in `numberOpSymbol.cc`; a typed enum here — decision #6). The arithmetic ops return a
-/// `Nat`, the relational ops a `Bool`. Bit ops (`_xor_`/`_&_`/`_|_`) and shifts (`_<<_`/`_>>_`) are a
-/// follow-up (xor needs the ACU-multiplicity parity, shifts are free).
+/// `Nat`, the relational ops a `Bool`.
 #[derive(Debug, Clone, Copy)]
 pub enum NumOp {
     // ACU (fold the multiset) — `_+_` `_*_` `gcd` `lcm` `min` `max`.
@@ -205,11 +208,21 @@ pub enum NumOp {
     Lcm,
     Min,
     Max,
-    // free arithmetic → Nat/Int — `_-_` (INT) `_quo_` `_rem_` `_^_`.
+    // ACU **bitwise** (fold the multiset, multiplicity-aware) — `_xor_` `_&_` `_|_`. `xor` cancels in
+    // pairs (an element folded an even number of times contributes nothing); `&`/`|` are idempotent.
+    Xor,
+    And,
+    Or,
+    // CUI (commutative 2-arg) — `sd` (symmetric difference `|m − n|`).
+    Sd,
+    // free arithmetic → Nat/Int — `_-_` (INT) `_quo_` `_rem_` `_^_` `modExp` `_>>_` `_<<_`.
     Sub,
     Quo,
     Rem,
     Pow,
+    ModExp,
+    Shr,
+    Shl,
     // free relational → Bool — `_<_` `_<=_` `_>_` `_>=_` `_divides_`.
     Lt,
     Le,

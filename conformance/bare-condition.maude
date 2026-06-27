@@ -1,0 +1,23 @@
+*** Increment 4 — a bare boolean condition `if b` abbreviates `if b = true` (Maude's abbreviated
+*** condition; used pervasively in the prelude's order theories, e.g. `ceq X < Z = true if X < Y /\
+*** Y < Z`). Here the conditional equation `ceq f(X) = b if X == a` fires for `f(a)` (a == a = true)
+*** and not for `f(b)` (b == a = false). BOOL is inlined (true/false/== — the M0 substrate).
+***
+*** Oracle: `protecting BOOL .` + the Foo signature in stock Maude, `red in T : <term> .`.
+
+fmod T is
+  sort Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op false : -> Bool [ctor special (id-hook SystemFalse)] .
+  op _==_ : Universal Universal -> Bool
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol term-hook equalTerm (true) term-hook notEqualTerm (false))] .
+  sort Foo .
+  ops a b : -> Foo [ctor] .
+  op f : Foo -> Foo .
+  var X : Foo .
+  ceq f(X) = b if X == a .
+endfm
+
+red f(a) .   *** condition a == a = true  ⇒ fires ⇒ b   (2 rewrites)
+red f(b) .   *** condition b == a = false ⇒ no fire ⇒ f(b) (1 rewrite)
