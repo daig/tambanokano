@@ -15,10 +15,12 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > instantiation `M{V}` + all of "Axis A": op-maps, parameterized views, dedup, theory/module sorts, and
 > free-vs-bound nested instantiation — all three argument kinds — incl. cross-kind ad-hoc overloading) — a
 > pure `tnk-modules` `PreModule` transform, kernel unchanged. Everything above is conformance-verified.
-> **→ IMMEDIATE NEXT (the only thing between us and running the real Maude library): `poly`/`Universal`
-> polymorphism + wiring the real prelude (`roadmap.md` item 3; bootstrap in `poly-universal-prelude.md`).**
-> Empirically the blocker for the real `BOOL`/`NAT`. **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED
-> (Phase 3). Feature inventory (§3) = the Phase-2/3 to-do list.
+> **The real Maude prelude now loads: `BOOL`, `NAT`, `LIST{Nat}` reduce byte-identically** (poly/`Universal`
+> per-kind expansion, NAT bignum codes, module-local var aliases, AU identity-collapse — `roadmap.md` item 3).
+> **→ IMMEDIATE NEXT: finish the container library** (`EXT-BOOL`/`SET`/`MAP`/`ARRAY` — needs the `[Sort]` kind
+> notation + ACU/CUI collapse), then the remaining built-in data types (`INT`/`RAT`/`FLOAT`/`STRING`/`QID`,
+> mostly more op codes). **L7 Reflection/meta** (the prelude's `META-LEVEL` wall), **L8 Symbolic** — NOT
+> STARTED (Phase 3). Feature inventory (§3) = the Phase-2/3 to-do list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*

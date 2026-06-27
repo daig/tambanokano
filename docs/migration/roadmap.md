@@ -28,25 +28,39 @@ prelude load.
    (`conformance/{theory-*,view-*,param-*,instantiation-*}.maude`). Residuals (orthogonal, in `gaps.md`):
    identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized) + the chained-import
    last-level substitution. Reference: `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude — `poly`/`Universal` + loading the actual library. ← THE NEXT TASK** (the only thing
-   between us and running the real Maude library; a self-contained, well-oracled feature). **→ Full bootstrap
-   — exact blockers, the C++ poly/Universal model, the prelude milestone ladder (BOOL→NAT→`LIST{Nat}`),
-   increment order, gotchas — in `poly-universal-prelude.md`; start there.** Empirically the real `BOOL`
-   (base of everything) does **not** load today; the `~/Downloads/Maude-3/prelude.maude` oracle (3,234 lines,
-   **zero rules**) blocks on a substrate distinct from Pillar B (so the container prelude
-   `LIST`/`SET`/`MAP`/`ARRAY` + `TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT` + the 39 standard views needs
-   **Axis A ∩ this substrate**), and on two distinct features:
-   - **Polymorphic operators (`poly` / the `Universal` sort)** — `op if_then_else_fi : Bool Universal
-     Universal -> Universal [poly (2 3 0)]`, `_==_`/`_=/=_ : Universal Universal -> Bool [poly (1 2)]`. A
-     `Universal`-typed op is instantiated per connected component. This is the actual `BOOL`→`NAT`→`LIST`
-     blocker and unlocks far more than containers (`==`/`=/=`/`if_then_else_fi` everywhere). The
-     `SystemTrue`/`SystemFalse` hooks and kind variables (`var B : [Bool]`) come with it.
-   - **Wiring the `.maude` prelude as data** — our `BOOL`/`NAT`/`INT`/`RAT`/`FLOAT`/`STRING`/`QID` are built
-     from hand-rolled per-fixture signatures today; this loads Maude's actual modules (only the hooks wired).
-   - The **Diophantine solver** is *separable* — an AC-matcher throughput optimization (`gaps.md`); the naive
-     matcher already gives correct counts. Needed for heavy AC `search` at scale, not for the prelude to load.
+3. **The real prelude — `poly`/`Universal` + loading the actual library. ← IN PROGRESS: the gateway is DONE
+   (M0–M2).** The real `BOOL`, `NAT`, and `LIST{Nat}` now load and reduce **byte-identically** to the
+   reference (`conformance/prelude-{bool,nat,list}.maude`). The poly/Universal + container substrate that was
+   the gateway is built; `poly-universal-prelude.md` is now mostly a record of it. What landed:
+   - **`poly` / the `Universal` sort** — a `Universal`-typed op (`_==_`/`_=/=_`/`if_then_else_fi`) is expanded
+     into one concrete instance **per connected component** (eager per-kind, in `build_sig` after
+     `close_sorts`); no new kernel reduction code (the existing `Equality`/`Branch` special ops reduce each
+     instance). The `SystemTrue`/`SystemFalse` anchors and bare-boolean conditions came with it. **(M0)**
+   - **NAT built-ins** — the `~>` partial arrow + the arithmetic / bitwise / shift codes
+     (`xor`/`&`/`|`/`sd`/`modExp`/`>>`/`<<`) over `malachite` bignums. **(M1)**
+   - **The container substrate** — module-local variable aliases (the flattener was leaking imported `var`s,
+     mistyping `LIST`'s `append`) and **AU identity-collapse matching** (a pattern `E L` matches a singleton
+     `c` as `c nil`) — the two things `LIST{Nat}` needed beyond the existing Pillar-B module algebra. **(M2)**
 
-   So **"load `LIST{Nat}` from the real prelude" = Axis A ∩ this substrate** — it is not a pure-Pillar-B task.
+   **Remaining prelude work, in dependency order:**
+   - **(a) Finish the container library** — `EXT-BOOL` → `SET` → `MAP` → `ARRAY` (+ `LIST-AND-SET`). Two small,
+     well-understood capabilities unblock all of them: the **`[Sort]` kind notation** (`var B : [Bool]`,
+     `op undefined : -> [Y$Elt]` — resolve `[S]` to S's kind/error sort; the long-noted `X:[Foo]` gap), and
+     **ACU/CUI identity-collapse matching** — the direct analog of the AU collapse just done (`(E, S)` against a
+     singleton set; `acu.rs`/`cui.rs` carry the identical `_ => return None`). ARRAY also leans on the DEFAULT
+     theory/views (already building). This completes the parameterized data-structure library.
+   - **(b) The remaining built-in data types** — `INT` (`abs`, signed `-_`), `RAT`, `FLOAT` (more float codes),
+     `STRING`/`QID` (`ascii`/`find`/`upperCase`/…), `CONVERSION`; plus the leaf special ops
+     (`CommutativeDecomposeEqualitySymbol` for INITIAL-EQUALITY-PREDICATE, `RandomOpSymbol`/`CounterSymbol`).
+     Each is mostly *wiring a few more built-in op codes* — the same NAT-codes pattern (a typed `enum` arm +
+     bignum/string op, differentially verified per code). Breadth, not depth.
+   - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
+     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. This is where
+     "load the prelude" meets reflection; the prelude's `.maude` source ports as-is once the hooks exist.
+   - Residuals, off the reduce path (`gaps.md`): the parameterized **sortable-list views** parse gap
+     (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
+     number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput
+     optimization; the naive matcher already gives correct counts), needed for heavy AC `search`, not to load.
 4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). Reference:
    `reports/A6-operational.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard

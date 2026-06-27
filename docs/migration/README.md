@@ -27,8 +27,11 @@ sorts, instantiation `M{V}`, and the whole "Axis A" — view op-maps, import/tar
 and the entangled hard pair **parameterized views + free-vs-bound nested instantiation** (all three argument
 kinds — module-view, by-parameter, theory-view — incl. `LIST{List{Nat}}` nesting, cross-kind ad-hoc
 overloading with `(t).Sort` disambiguation, and structured-sort memberships). All a pure `tnk-modules`
-`PreModule` transform, all conformance-verified. **Next:** the *real* container prelude additionally needs
-`poly`/`Universal` polymorphism (a separate feature). Then strategies + objects/IO. See `roadmap.md`.
+`PreModule` transform, all conformance-verified. **The real Maude prelude now loads** through `BOOL` → `NAT`
+→ `LIST{Nat}` (byte-identical reductions): `poly`/`Universal` per-kind expansion, the NAT bignum codes,
+module-local variable aliases, and AU identity-collapse matching. **Next:** finish the container library
+(`EXT-BOOL`/`SET`/`MAP`/`ARRAY` — the `[Sort]` kind notation + ACU/CUI collapse), then the remaining built-in
+data types, then strategies + objects/IO. See `roadmap.md`.
 
 ## Crate layout
 
