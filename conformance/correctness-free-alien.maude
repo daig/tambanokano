@@ -4,7 +4,7 @@
 *** The cross-theory `Sequence` arm: a free operator wrapping an AC/AU argument pattern (`f(a X)`,
 *** `g(a ; X)`). The free skeleton binds deterministically; each theory-rooted "alien" subterm is matched
 *** recursively by its own automaton and composed (Maude's SubproblemSequence). Was a loud panic
-*** (theory.rs:65). Mirrors the engine.rs C8 test.
+*** at theory.rs:65. Mirrors the engine.rs C8 test.
 
 fmod FREE-ALIEN is
   sort E .

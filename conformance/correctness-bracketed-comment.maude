@@ -1,0 +1,14 @@
+***( A bracketed comment that spans
+     several lines and contains ( balanced ) parens,
+     a backquoted `) paren, and code-looking text: op x : -> Bogus . )
+*** A plain line comment with an unbalanced ( paren that must be ignored.
+fmod M is
+  sort S .                 ***( inline bracketed comment )
+  op a : -> S [ctor] .
+  op f : S -> S [ctor] .
+  ---( a dashed bracketed
+       comment too )
+  eq f(a) = a .
+endfm
+red f(a) .
+red f(f(a)) .

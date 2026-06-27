@@ -6,7 +6,7 @@
 *** equation reduces away is never constrained. The previous eager model (apply at node construction)
 *** over-counted such redexes and could DIVERGE on a `cmb` whose condition loops. These fixtures pin the
 *** faithful counts/termination; the membership.maude / cmb.maude fixtures cover the constructor case
-*** (where eager and lazy agree). Mirrors the engine.rs C1 tests.
+*** where eager and lazy agree. Mirrors the engine.rs C1 tests.
 
 fmod MB-REDUCIBLE is
   sorts Small Big Top .

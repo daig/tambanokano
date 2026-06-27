@@ -6,9 +6,10 @@
 //! `.` inside a float (`1.5`) or a structured sort. Strings are `"…"`, quoted-ids start with `'`, and a
 //! backquote escapes a splitting char into a maudeId. (`lexer.ll` / `token.{hh,cc}` in the reference.)
 //!
-//! Tokens are interned ([`Interner`]) so equality is a `u32` compare. This slice is the functional-fragment
-//! subset; bracketed comments (`***( … )`), LaTeX/file-name modes, and the lexer↔parser bubble handshake
-//! (replaced by an explicit surface-parser API in B4.2) are follow-ups.
+//! Line comments (`***`/`---` to end of line) and **bracketed** comments (`***( … )` / `---( … )`, balanced
+//! parens across newlines) are both handled. Tokens are interned ([`Interner`]) so equality is a `u32`
+//! compare. This slice is the functional-fragment subset; LaTeX/file-name lexer modes and the
+//! lexer↔parser bubble handshake (replaced by an explicit surface-parser API in B4.2) are follow-ups.
 
 use std::collections::HashMap;
 
@@ -213,13 +214,44 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             i += 1;
             continue;
         }
-        // `***` / `---` line comments → skip to end of line.
+        // `***` / `---` comments. If the first non-blank character after the marker is `(`, it is a
+        // **bracketed** comment `***( … )` that runs until its parentheses balance — across newlines
+        // (Maude's `eatComment` parenMode, `lexerAux.cc`); a backquoted paren does not count. Otherwise it
+        // is a line comment to end of line. (The `***>`/`--->` echo forms have `>` as the first character,
+        // so they fall through to the line-comment case — never bracketed — just as in Maude.)
         let is_comment = |k: char| {
             chars[i] == k && chars.get(i + 1) == Some(&k) && chars.get(i + 2) == Some(&k)
         };
         if is_comment('*') || is_comment('-') {
-            while i < n && chars[i] != '\n' {
-                i += 1;
+            i += 3;
+            let mut j = i;
+            while matches!(chars.get(j), Some(' ') | Some('\t') | Some('\r')) {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'(') {
+                i = j;
+                let (mut depth, mut bq) = (0u32, false);
+                while i < n {
+                    let ch = chars[i];
+                    if ch == '\n' {
+                        line += 1;
+                    }
+                    if !bq && ch == '(' {
+                        depth += 1;
+                    } else if !bq && ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    bq = !bq && ch == '`';
+                    i += 1;
+                }
+            } else {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
             }
             continue;
         }
@@ -370,6 +402,22 @@ mod tests {
             "List", "{", "Nat", "}",
         ]);
         assert_eq!(t[6].1, TokKind::Ident, "the colon-var token classifies as an identifier");
+    }
+
+    /// A bracketed comment `***( … )` / `---( … )` (the first non-blank after the marker is `(`) runs until
+    /// its parentheses balance — across newlines, with backquoted parens not counting; a plain `***`/`---`
+    /// comment runs to end of line. (Maude's `eatComment` parenMode.)
+    #[test]
+    fn bracketed_and_line_comments() {
+        let texts = |s| {
+            let (_i, t) = lex(s);
+            t.into_iter().map(|(x, _)| x).collect::<Vec<_>>()
+        };
+        assert_eq!(texts("a\n***( c1\nc2 )\nb"), ["a", "b"]); // multi-line bracketed
+        assert_eq!(texts("a ***(x) b"), ["a", "b"]); // `***(` with no space
+        assert_eq!(texts("a *** line ( unbalanced\nb"), ["a", "b"]); // line comment: `(` ignored
+        assert_eq!(texts("a ***( p `) q ) b"), ["a", "b"]); // a backquoted `)` does not close early
+        assert_eq!(texts("a ---> echo ( x\nb"), ["a", "b"]); // `--->` echo form is a line comment
     }
 
     #[test]

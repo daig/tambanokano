@@ -80,6 +80,18 @@ correctness fix.
   productions exclude it). Making `[Kind]` sorts first-class is the kind-variable machinery Maude bundles with
   **`poly`/`Universal`** (`var B : [Bool]`) — roadmap item 3 / Axis B, a separate feature from parameterization,
   not a loose end of it.
+- **Lexer parity (vs `lexer.ll`/`token.cc`).** Our tokenizer is stateless (whitespace + the same special
+  splitters `()[]{},`, the same terminator-dot rule); Maude's is parser-driven and stateful (ID/CMD/BUBBLE
+  modes, the bubble handshake) — replaced by our explicit surface parser. **Bracketed comments `***( … )` /
+  `---( … )`** (balanced parens across newlines, backquoted parens excluded) are now handled, matching Maude
+  (verified — Maude warns on a stray-`(` line comment like `*** (foo).`, and so do we now). Remaining minor
+  divergences, all rare and unexercised by the prelude/conformance: (a) a backquote before a *normal* char
+  (`a`b`) is kept by Maude in the token name and dropped by us — escaped *specials* in op names (`` `[_`] ``)
+  work identically either way; (b) a string literal embedded *inside* a maudeId (`foo"bar"`) — Maude's
+  `normal` admits `{string}`, we always split `"`; (c) leading-zero/degenerate numerals (`00`) — we classify
+  any digit run as a number, Maude's `0|[1-9][0-9]*` does not; (d) the terminator-dot heuristic
+  (`is_terminator_dot`) approximates Maude's mode-based SEEN_DOT rule and could differ on the idiom-rare
+  *two-commands-on-one-line* case. The `latex`/file-name lexer sub-modes are for unbuilt features.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite

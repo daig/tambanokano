@@ -303,6 +303,17 @@ mod tests {
         );
     }
 
+    /// Bracketed comments `***( … )` / `---( … )` — balanced parens across newlines, with a backquoted paren
+    /// not counting and code-looking text inside ignored — plus inline ones and plain line comments with a
+    /// stray `(`. The module builds past all of them and reduces. Byte-identical to the reference.
+    #[test]
+    fn bracketed_comment_conforms() {
+        conform(
+            conformance_file!("correctness-bracketed-comment.maude"),
+            &[e("S", "a", 1), e("S", "a", 2)],
+        );
+    }
+
     /// A **user-typed** colon variable over a structured sort (`L:List{Nat}`, written inline in an equation):
     /// the lexer keeps the braces in one token, so it resolves to a variable of sort `List{Nat}` and the
     /// equation fires. Byte-identical to the reference.
