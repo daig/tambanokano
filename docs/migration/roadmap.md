@@ -10,71 +10,32 @@ subsystem detail behind each item is in `reports/A1–A8`; the foundational tech
 The jump from a *functional* engine to a *rewriting* one, plus the module algebra that lets the real
 prelude load.
 
-1. **Rules + rewriting (Pillar A) — DONE.** `rl`/`crl` (incl. the rewrite `=>` condition, the one
-   condition kind that had been missing), `rewrite` (rule-fair) / `frewrite` (position-fair, frozen-aware),
-   `search` (`=>1`/`=>+`/`=>*`/`=>!`, `such that`, bound `[n,m]`, `show path`/`show search graph`),
-   `continue` — all byte-conformant against the reference (`conformance/{rewrite,frewrite,crl,search,
-   rewrite-cond}.maude`). The kernel grew a separate rule table (never consulted by `reduce`), a shared
-   `drive_match` seam, a lazy hash-consed state-transition graph (`search.rs`), and the rewrite-condition's
-   nested `=>*` search. Built on the bounded-memory re-entrant reduction C6/F-2 unblocked. The two frontend
-   niceties surfaced during A are also cleared — file-load mixing `set`/`show` mid-file, and on-the-fly
-   `X:Sort` colon variables. **Remaining for Phase 2:** *object-message-fair* `frewrite`/`erewrite` (needs
-   the object system, item 5); `frozen`'s lazy-`strat` interaction + search/rewrite-condition trace
-   (`gaps.md`). Reference: `reports/A6-operational.md`.
-2. **Parameterized programming (Pillar B) — DONE (mechanism B-i…B-iv + all of "Axis A").**
-   Theories, views, parameterized modules, instantiation — the whole mechanism is a `tnk-modules`
-   `PreModule → PreModule` transform; the kernel (`build_module`/grammar) is **unchanged** (a structured
-   sort name `List{X}` / parameter sort `X$Elt` is just a string-keyed sort). All byte-conformant vs the
-   binary (`conformance/{theory-nonexec,theory-import,view-good,param-module,instantiation}.maude`).
-   - **(B-i) theories `fth`/`th` — DONE** (`91285d7`): reuse `PreModule` + an orthogonal `is_theory` flag;
-     `[nonexec]` axioms parse but are skipped when loading the engine (proof obligations, never fire).
-   - **(B-ii) views — DONE** (`dcc5dca`): `ViewDecl` (sort + op→op/op→term maps), `ViewDb` + signature
-     `validate_view` (the target-sort check = Maude's `failed to find sort …` warning); `show view`.
-   - **(B-iii) parameterized modules + `X$Elt` + structured sorts — DONE** (`5e01fc5`): the `{X :: T}`
-     parameter list; a `sort_name()` parser assembling `Base{args}`; the *parameter copy* flatten
-     (`s ↦ X$s`, reusing the rename machinery).
-   - **(B-iv) instantiation `M{V}` — DONE** (`ac6b30e`): `ModuleExpr::Instantiation`; the view-table threaded
-     through `flatten`; the instance substitutes `X$s ↦` the view's sort image and `Base{…X…} ↦ Base{…V…}`,
-     importing the view's target. **Common case** (single/multi-param module-view, sort-only views).
-
-   **Axis A — the B-iv corner cases — all DONE.** Each was **self-contained** — proven with hand-rolled
-   modules (no real prelude), a small increment in the B-i…iv rhythm; detail inline in `flatten.rs`.
-   - **A1 view operator maps** (`op f to g`, `op 0 to term 0.0`) — **DONE** (`a35dbaf`): `instantiate_decls`
-     substitutes the views' op-maps into the instance's statement bubbles (`subst_ops`).
-   - **A3 import-vs-view-target dedup** (a base `protecting NAT` instantiated by a view targeting `NAT`) —
-     **DONE / verified** (`74aaf2e`): already handled by the shared `visited` set; pinned with a
-     membership-bearing differential fixture (a double-merge would inflate the count — it doesn't).
-   - **A4 theory- vs module-declared sorts** in the parameter copy (a theory `protecting BOOL` keeps `Bool`,
-     not `X$Bool`) — **DONE** (`afc8987`): `module_origin_sorts` excludes module-imported sorts from the
-     `X$` qualifier. Forced by `SORTABLE-LIST` (STRICT-TOTAL-ORDER).
-   - **A2 + A5 — parameterized views + free-vs-bound nested instantiation — DONE** (`a8ff07c`…`cbfc70e`):
-     the entangled hard pair, all three C++ argument kinds, as a pure `tnk-modules` view *composition* (no
-     stored partially-instantiated modules). **Kind 3 module-view + nested parameterized view**
-     (`BOX{BoxV{ToColor}}`, `LIST{List{Nat}}`): `resolve_arg` derives a ground view by substituting the inner
-     args through the view's `to`/`sort_maps`. **Kind 2 by-parameter** (`PAIR{X}` protecting `LIST{X}`,
-     grounded as `PAIR{ToN}`): an enclosing-parameter argument is a prefix-rename binding `X$s ↦ p$s`; a
-     module's imports are re-instantiated by substituting its bound parameters. **Kind 1 theory-view** chain
-     (`BOX{ToT2}{C2}`): `module_atom` parses the chain, `instantiate` composes the levels (only the last
-     target imported, sort images composed, the chained structured name `Box{ToT2}{C2}`). Two kernel/frontend
-     prerequisites it forced are also done: **cross-kind ad-hoc operator overloading** (a constructor spanning
-     connected components — `build_sig` groups symbols by kind-profile, with Maude's `(t).Sort` print/parse
-     disambiguation of the resulting overloaded constants) and **memberships over structured sorts**
-     (`mb t : NeList{X}`). The re-parse-from-bubbles build needed each parameterized module's variables
-     inlined as single-token colon variables so a doubly-instantiated module's equations self-type. Fixtures:
-     `conformance/instantiation-{nested,byparam,nested-list,theory-view,membership,set-ac,map}.maude` +
-     `correctness-{disambig,colon-var-structured}.maude`, all byte-identical (incl. user-typed structured
-     colon variables `L:List{Nat}`). *Residuals* (in `gaps.md`): identity-collapse rewrite **count**
-     (orthogonal — the AC matcher, reproduces non-parameterized) and the chained-import last-level
-     substitution. (`X:[Foo]` kind variables are *not* a residual of this work — kind-level bracket sorts are
-     unsupported surface-wide, e.g. `op g : [B]` already fails to parse; that is the `poly`/`Universal`
-     kind-variable feature, item 3 below.)
-
-   **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
-   parameterization is the critical path to it). **Reference:** `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude — loading the actual library. Depends on a NEW substrate, not just Pillar B.** The
-   container prelude (`LIST`/`SET`/`MAP`/`ARRAY` + `TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT` + the 39
-   standard views) needs **Axis A** *and* this item's substrate — empirically, the real `BOOL` (base of
-   everything) does **not** load today, blocked on two distinct features:
+1. **Rules + rewriting (Pillar A) — DONE.** `rl`/`crl` (incl. the `=>` rewrite-condition), `rewrite`
+   (rule-fair) / `frewrite` (position-fair, frozen-aware), `search` (`=>1`/`=>+`/`=>*`/`=>!`, `such that`,
+   bounds, `show path`/`graph`), `continue` — all byte-conformant (`conformance/{rewrite,frewrite,crl,
+   search,rewrite-cond}.maude`). Built on a separate rule table (never read by `reduce`), the shared
+   `drive_match` seam, and a lazy hash-consed state-transition graph (`search.rs`). **Still open (Phase 2):**
+   object-message-fair `frewrite`/`erewrite` (needs objects, item 5); `frozen`'s lazy-`strat` interaction +
+   search/rewrite-condition trace (`gaps.md`). Reference: `reports/A6-operational.md`.
+2. **Parameterized programming (Pillar B) — DONE (mechanism + all of "Axis A").** Theories `fth`/`th`,
+   views (sort + op→op/op→term maps), parameterized modules (`{X :: T}`, `X$Elt`, structured sorts `List{X}`),
+   and instantiation `M{V}` — including every Axis-A corner case: view op-maps (A1), import/target dedup (A3),
+   theory/module-declared sorts (A4), and the entangled hard pair **parameterized views + free-vs-bound nested
+   instantiation** (A2/A5 — all three C++ argument kinds: module-view, by-parameter, theory-view; incl.
+   `LIST{List{Nat}}` nesting, cross-kind ad-hoc overloading with `(t).Sort` disambiguation, and structured-sort
+   memberships). The whole layer is a pure `tnk-modules` `PreModule → PreModule` transform — the kernel
+   (`build_module`/grammar) is **unchanged** (`List{X}` / `X$Elt` are string-keyed sorts). All byte-conformant
+   (`conformance/{theory-*,view-*,param-*,instantiation-*}.maude`). Residuals (orthogonal, in `gaps.md`):
+   identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized) + the chained-import
+   last-level substitution. Reference: `reports/A5-modules-parameterization-repl.md`.
+3. **The real prelude — `poly`/`Universal` + loading the actual library. ← THE NEXT TASK** (the only thing
+   between us and running the real Maude library; a self-contained, well-oracled feature). **→ Full bootstrap
+   — exact blockers, the C++ poly/Universal model, the prelude milestone ladder (BOOL→NAT→`LIST{Nat}`),
+   increment order, gotchas — in `poly-universal-prelude.md`; start there.** Empirically the real `BOOL`
+   (base of everything) does **not** load today; the `~/Downloads/Maude-3/prelude.maude` oracle (3,234 lines,
+   **zero rules**) blocks on a substrate distinct from Pillar B (so the container prelude
+   `LIST`/`SET`/`MAP`/`ARRAY` + `TRIV`/`STRICT-*-ORDER`/`TOTAL-*`/`DEFAULT` + the 39 standard views needs
+   **Axis A ∩ this substrate**), and on two distinct features:
    - **Polymorphic operators (`poly` / the `Universal` sort)** — `op if_then_else_fi : Bool Universal
      Universal -> Universal [poly (2 3 0)]`, `_==_`/`_=/=_ : Universal Universal -> Bool [poly (1 2)]`. A
      `Universal`-typed op is instantiated per connected component. This is the actual `BOOL`→`NAT`→`LIST`

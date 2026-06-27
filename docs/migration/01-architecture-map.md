@@ -5,17 +5,19 @@ manual. Per-subsystem deep-dives in `reports/A1`…`A8`.* This doubles as the **
 (§2) and feature inventory (§3) describe what Maude is; the cross-cutting decisions (§4) are our porting
 strategy (now largely realized — see `03-open-decisions.md`).
 
-> **Build status (Phase 1 + 1.5 complete).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
-> Built-ins** — DONE (the matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf
-> gap, `gaps.md`). **L5 Frontend** (lexer/mixfix-grammar/Earley parser/pretty-printer) and **L6 Modules**
-> (non-parameterized: import/flatten/`+`/rename) — DONE. **L4 Operational — rules + rewriting (Pillar A)
-> DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`,
-> all conformance-verified); strategies / objects / external-IO still NOT STARTED. **L6 parameterization —
-> the mechanism (theories/views/parameterized-modules/instantiation `M{V}`) DONE** (Pillar B-i…iv, a pure
-> `tnk-modules` `PreModule` transform, kernel unchanged); the deferred corner cases ("Axis A": op-maps,
-> parameterized view targets, dedup, theory/module sorts, free-vs-bound nested) remain. **Loading the *real*
-> prelude additionally needs `poly`/`Universal` polymorphism** (a separate feature, `roadmap.md` item 3 —
-> empirically the blocker for the real `BOOL`/`NAT`). **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED
+> **Build status.** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3 Built-ins** — DONE (the
+> matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf gap, `gaps.md`). **L5
+> Frontend** (lexer incl. bracketed comments / structured colon-vars, mixfix grammar, Earley parser,
+> pretty-printer incl. `(t).Sort` disambiguation) — DONE. **L4 Operational — rules + rewriting (Pillar A)
+> DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`);
+> strategies / objects / external-IO **NOT STARTED**. **L6 Modules + parameterization — DONE**: import /
+> flatten / `+` / rename, *and* the whole parameterization layer (theories/views/parameterized-modules/
+> instantiation `M{V}` + all of "Axis A": op-maps, parameterized views, dedup, theory/module sorts, and
+> free-vs-bound nested instantiation — all three argument kinds — incl. cross-kind ad-hoc overloading) — a
+> pure `tnk-modules` `PreModule` transform, kernel unchanged. Everything above is conformance-verified.
+> **→ IMMEDIATE NEXT (the only thing between us and running the real Maude library): `poly`/`Universal`
+> polymorphism + wiring the real prelude (`roadmap.md` item 3; bootstrap in `poly-universal-prelude.md`).**
+> Empirically the blocker for the real `BOOL`/`NAT`. **L7 Reflection/meta**, **L8 Symbolic** — NOT STARTED
 > (Phase 3). Feature inventory (§3) = the Phase-2/3 to-do list.
 
 ## 1. What Maude is (the spine)
