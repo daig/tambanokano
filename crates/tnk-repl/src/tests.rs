@@ -53,6 +53,18 @@ fn import_renaming_through_repl() {
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
 
+/// Variable aliases are module-local (Blocker B): `M` and its import `P` both declare a variable `A`
+/// at different sorts; `M`'s own equation must use `M`'s `A`, even though flattening collects `P`'s `A`
+/// first. Without module-local scoping the name-dedup mistypes `f(A, L)` → no parse (the real `LIST`'s
+/// `var A : List{X}` shadowed by BOOL-OPS' `vars A B C : Bool`). Values are the reference binary's.
+#[test]
+fn var_shadowing_through_repl() {
+    let out = repl().eval(conformance_file!("var-shadowing.maude")).output;
+    assert!(!out.contains("no parse"), "the shadowed prefix application must parse: {out}");
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(results, vec!["result T: e e", "result T: e", "result S: a"], "shadow values: {out}");
+}
+
 /// B-i: a theory loads through the REPL end-to-end — it becomes current, its `[nonexec]` axiom does NOT
 /// fire (`e < e` stays, 0 rewrites), and an ordinary theory equation does (`id(e) = e`, 1 rewrite).
 /// Values/counts are the reference binary's.

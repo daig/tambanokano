@@ -110,6 +110,14 @@ fn subst_tokens(bubble: &mut [Token], map: &HashMap<String, String>, interner: &
         let text = interner.resolve(t.sym).to_string();
         if let Some(to) = map.get(&text) {
             t.sym = interner.intern(to);
+        } else if let Some((name, sort)) = text.rsplit_once(':')
+            && !name.is_empty()
+            && let Some(to) = map.get(sort)
+        {
+            // A glued colon variable `name:sort` (e.g. a statement variable inlined by the flattener's
+            // `inline_own_vars`): rename its sort component (`A:Elt ↦ A:Item`), as the instantiation
+            // path does. The whole-token branch above can't see the sort buried after the `:`.
+            t.sym = interner.intern(&format!("{name}:{to}"));
         }
     }
 }

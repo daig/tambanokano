@@ -1,0 +1,31 @@
+*** Blocker B on the M2 path -- variable aliases are MODULE-LOCAL. M imports P, and both declare a
+*** variable named A at DIFFERENT sorts: A is S in P, A is T in M. M's own equation f(A, L) = A L must
+*** use M's A:T, even though the flattener collects P's A:S first. Without module-local scoping the
+*** name-dedup keeps A:S and f(A, L) sees A:S in a T position, giving "no parse" -- the exact failure
+*** the real LIST hit: its var A : List{X} was shadowed by BOOL-OPS' vars A B C : Bool reached through
+*** protecting NAT then BOOL then BOOL-OPS. Each module's statements still reduce with its own A.
+***
+*** Oracle: stock Maude, same file -- variable aliases are module-local there too.
+
+fmod P is
+  sort S .
+  op a : -> S [ctor] .
+  op g : S -> S .
+  var A : S .
+  eq g(A) = A .
+endfm
+
+fmod M is
+  protecting P .
+  sort T .
+  op e : -> T [ctor] .
+  op nil : -> T [ctor] .
+  op __ : T T -> T [ctor assoc id: nil] .
+  op f : T T -> T .
+  var A L : T .
+  eq f(A, L) = A L .
+endfm
+
+red f(e, e) .
+red f(nil, e) .
+red g(a) .

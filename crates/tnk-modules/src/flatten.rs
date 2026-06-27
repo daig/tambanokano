@@ -84,6 +84,56 @@ fn own_decls(pm: &PreModule) -> FlatDecls {
     }
 }
 
+/// Inline a module's **shadowed** statement variables as single-token colon variables at their
+/// declared sort (`A` ↦ `A:List{X}`). Variable aliases are **module-local** in Maude, but our flattener
+/// re-parses statements against one *shared* var namespace where [`Acc::add`] keeps the first
+/// declaration of each name. So when a module's own variable collides with an **earlier-collected**
+/// import's same-named variable at a *different* sort, the module's declaration is dropped and its
+/// statements would mistype: the real `LIST` declares `var A : List{X}`, but `protecting NAT → BOOL →
+/// BOOL-OPS` brings `vars A B C : Bool` first, so `append(A, L)` sees `A : Bool` in a `List` position →
+/// no parse. We inline *only* such shadowed variables (imports are always collected before a module's
+/// own decls, so the shadower is already in `prior`), leaving every non-colliding variable bare so
+/// traces/printing are unchanged. Same device as the instantiation path, here with no bindings/op maps;
+/// the declarations are kept (for bare variables in commands).
+fn inline_shadowed_vars(d: &mut FlatDecls, prior: &Acc, i: &mut Interner) {
+    let mut declared: HashMap<&str, &str> = HashMap::new();
+    for v in &prior.vars {
+        for n in &v.names {
+            declared.entry(n.as_str()).or_insert(v.sort.as_str());
+        }
+    }
+    let mut var_inline: HashMap<String, String> = HashMap::new();
+    for v in &d.vars {
+        for n in &v.names {
+            if declared.get(n.as_str()).is_some_and(|s| *s != v.sort.as_str()) {
+                var_inline.insert(n.clone(), v.sort.clone()); // this module's var loses the name-dedup
+            }
+        }
+    }
+    if var_inline.is_empty() {
+        return;
+    }
+    let (no_bindings, no_ops) = (HashMap::new(), HashMap::new());
+    let go = |b: &[Token], i: &mut Interner| subst_bubble(b, &no_bindings, &no_ops, &var_inline, i);
+    for st in &mut d.statements {
+        match st {
+            Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => {
+                *lhs = go(lhs, i);
+                *rhs = go(rhs, i);
+                if let Some(c) = cond {
+                    *c = go(c, i);
+                }
+            }
+            Statement::Mb { lhs, cond, .. } => {
+                *lhs = go(lhs, i);
+                if let Some(c) = cond {
+                    *c = go(c, i);
+                }
+            }
+        }
+    }
+}
+
 /// Flatten module `name`'s import closure into one combined [`PreModule`] named `name` (empty imports).
 /// `views` resolves any parameterized instantiation `M{V}` reached in the closure (B-iv).
 pub fn flatten(
@@ -143,7 +193,9 @@ fn collect_named(
         collect_expr(&imp.expr, db, views, acc, visited, interner, &scope)?;
     }
     let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
-    acc.add(own_decls(pm)); // the module's own declarations, after its imports
+    let mut own = own_decls(pm);
+    inline_shadowed_vars(&mut own, acc, interner); // module-local aliases vs imports (see fn doc)
+    acc.add(own); // the module's own declarations, after its imports
     Ok(())
 }
 
