@@ -1,0 +1,65 @@
+*** M0 milestone — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL), copied
+*** verbatim from ~/Downloads/Maude-3/prelude.maude (lines 33-82). Exercises the poly/Universal
+*** expansion (`_==_`/`_=/=_`/`if_then_else_fi`) and the SystemTrue/SystemFalse anchors.
+***
+*** Oracle: the reduces below run byte-identically against Maude's BUILT-IN BOOL — i.e.
+***   ~/Downloads/Maude-3/maude -no-banner   with   `red in BOOL : <term> .`
+*** (the modules can't be redefined verbatim in stock Maude — they clash with its preloaded prelude,
+*** so the reference is run against the built-in BOOL, our defs being that same source verbatim).
+
+fmod TRUTH-VALUE is
+  sort Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op false : -> Bool [ctor special (id-hook SystemFalse)] .
+endfm
+
+fmod BOOL-OPS is
+  protecting TRUTH-VALUE .
+  op _and_ : Bool Bool -> Bool [assoc comm prec 55] .
+  op _or_ : Bool Bool -> Bool [assoc comm prec 59] .
+  op _xor_ : Bool Bool -> Bool [assoc comm prec 57] .
+  op not_ : Bool -> Bool [prec 53] .
+  op _implies_ : Bool Bool -> Bool [gather (e E) prec 61] .
+  vars A B C : Bool .
+  eq true and A = A .
+  eq false and A = false .
+  eq A and A = A .
+  eq false xor A = A .
+  eq A xor A = false .
+  eq A and (B xor C) = A and B xor A and C .
+  eq not A = A xor true .
+  eq A or B = A and B xor A xor B .
+  eq A implies B = not(A xor A and B) .
+endfm
+
+fmod TRUTH is
+  protecting TRUTH-VALUE .
+  op if_then_else_fi : Bool Universal Universal -> Universal
+        [poly (2 3 0)
+         special (id-hook BranchSymbol
+                  term-hook 1 (true)
+                  term-hook 2 (false))] .
+
+  op _==_ : Universal Universal -> Bool
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol
+                  term-hook equalTerm (true)
+                  term-hook notEqualTerm (false))] .
+
+  op _=/=_ : Universal Universal -> Bool
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol
+                  term-hook equalTerm (false)
+                  term-hook notEqualTerm (true))] .
+endfm
+
+fmod BOOL is
+  protecting BOOL-OPS .
+  protecting TRUTH .
+endfm
+
+red true and false .
+red true == true .
+red true =/= false .
+red if true then false else true fi .
+red false or true and not false .

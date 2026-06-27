@@ -1,0 +1,29 @@
+*** Increment-3 core: poly/Universal expansion over MORE THAN ONE kind. The M0 BOOL stack has a single
+*** kind (Bool), so it only exercises the degenerate 1-instance case; this module adds a second,
+*** unrelated kind (Color) so `_==_` and `if_then_else_fi` each instantiate twice — proving distinct
+*** per-kind instances, correct dispatch, grammar disambiguation, and the `if`-result sort over a
+*** non-Bool kind.
+***
+*** Oracle: reduce against Maude's BUILT-IN poly `==`/`if_then_else_fi` —
+***   fmod MK is protecting BOOL . sort Color . ops c0 c1 c2 : -> Color [ctor] . endfm
+***   ~/Downloads/Maude-3/maude -no-banner   with   `red in MK : <term> .`
+
+fmod MK is
+  sort Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op false : -> Bool [ctor special (id-hook SystemFalse)] .
+  op if_then_else_fi : Bool Universal Universal -> Universal
+        [poly (2 3 0) special (id-hook BranchSymbol term-hook 1 (true) term-hook 2 (false))] .
+  op _==_ : Universal Universal -> Bool
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol term-hook equalTerm (true) term-hook notEqualTerm (false))] .
+  sort Color .
+  ops c0 c1 c2 : -> Color [ctor] .
+endfm
+
+red true == true .                          *** Bool-kind ==
+red true == false .                         *** Bool-kind ==
+red c0 == c0 .                              *** Color-kind ==
+red c0 == c2 .                              *** Color-kind ==
+red if true then c0 else c2 fi .            *** Color-kind if (branches are Color)
+red if (c1 == c2) then c0 else c2 fi .      *** nested: Color-kind == feeds Color-kind if

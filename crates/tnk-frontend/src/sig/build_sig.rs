@@ -53,43 +53,82 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // and `_+_ : Nat Nat -> Nat`) adds a declaration to the *same* symbol, but **ad-hoc** overloading
     // across different components (`wrap : Hue -> Box{ToColor}` and `wrap : Box{ToColor} -> Box{V}` from a
     // nested instantiation) makes **distinct** symbols, as in Maude — the argument kind, not the range,
-    // selects the declaration group. `op_syms[i]` is the symbol declaration `pm.ops[i]` landed on.
+    // selects the declaration group.
     let mut sym_by_profile: HashMap<(String, Vec<KindId>, KindId), SymbolId> = HashMap::new();
-    let mut op_syms: Vec<SymbolId> = Vec::with_capacity(pm.ops.len());
+    // Each source declaration maps to its kernel symbol(s): one for an ordinary op, or — for a
+    // `poly`/`Universal` op — one per kind (the per-kind expansion below). Later passes iterate it.
+    let mut op_syms: Vec<Vec<SymbolId>> = Vec::with_capacity(pm.ops.len());
 
-    // Pass A: declare every op (theory-dispatched), record name→id + syntax.
+    // Pass A: declare every op (theory-dispatched), record name→id + syntax. A `poly` op is expanded
+    // here — necessarily after `close_sorts`, which is what creates the kinds/error sorts. Each
+    // polymorphic position (the `poly` list: arguments 1-based, range `0`) becomes its kind's error
+    // (top) sort, yielding one concrete declaration per kind — exactly Maude's `instantiatePolymorph`,
+    // but eager over all kinds rather than lazy over used ones (reduction-identical; cf. `show module`).
+    // `Universal` is never resolved as a sort: the `poly` list drives the substitution, so it can
+    // never reach `sort_id` to become "unknown".
     for od in &pm.ops {
         let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
-        let domain: Vec<SortId> =
-            od.domain.iter().map(|s| sort_id(&sorts, s)).collect::<R<_>>()?;
-        let range = sort_id(&sorts, &od.range)?;
-        let dom_kinds: Vec<KindId> = domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
-        let profile = (cname.clone(), dom_kinds, engine.sorts().kind_of(range));
 
-        let sym = if let Some(&existing) = sym_by_profile.get(&profile) {
-            engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
-            existing
-        } else {
-            let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
-            sym_by_profile.insert(profile, sym);
-            ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
-            name_to_sym.entry(cname.clone()).or_insert(sym);
-            let frags = split_mixfix(&cname, interner);
-            syntax.insert(
-                sym,
-                SymbolSyntax {
-                    frags,
-                    domain: domain.clone(),
-                    range,
-                    prec: od.attrs.prec,
-                    gather: od.attrs.gather.clone(),
-                    assoc: od.attrs.assoc,
-                },
-            );
-            sym
+        // The (domain, range) profile(s) this declaration expands to.
+        let profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
+            None => {
+                let domain: Vec<SortId> =
+                    od.domain.iter().map(|s| sort_id(&sorts, s)).collect::<R<_>>()?;
+                vec![(domain, sort_id(&sorts, &od.range)?)]
+            }
+            Some(poly) => {
+                let s = engine.sorts();
+                let err_sorts: Vec<SortId> = s.kinds().map(|k| s.error_sort(k)).collect();
+                err_sorts
+                    .into_iter()
+                    .map(|err| {
+                        // poly position → this kind's error sort; otherwise the declared sort.
+                        let domain: Vec<SortId> = od
+                            .domain
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sn)| {
+                                if poly.contains(&(i as u32 + 1)) { Ok(err) } else { sort_id(&sorts, sn) }
+                            })
+                            .collect::<R<_>>()?;
+                        let range = if poly.contains(&0) { err } else { sort_id(&sorts, &od.range)? };
+                        Ok((domain, range))
+                    })
+                    .collect::<R<_>>()?
+            }
         };
-        op_syms.push(sym);
+
+        let mut decl_syms: Vec<SymbolId> = Vec::with_capacity(profiles.len());
+        for (domain, range) in profiles {
+            let dom_kinds: Vec<KindId> = domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
+            let profile = (cname.clone(), dom_kinds, engine.sorts().kind_of(range));
+
+            let sym = if let Some(&existing) = sym_by_profile.get(&profile) {
+                engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
+                existing
+            } else {
+                let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
+                sym_by_profile.insert(profile, sym);
+                ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
+                name_to_sym.entry(cname.clone()).or_insert(sym);
+                let frags = split_mixfix(&cname, interner);
+                syntax.insert(
+                    sym,
+                    SymbolSyntax {
+                        frags,
+                        domain: domain.clone(),
+                        range,
+                        prec: od.attrs.prec,
+                        gather: od.attrs.gather.clone(),
+                        assoc: od.attrs.assoc,
+                    },
+                );
+                sym
+            };
+            decl_syms.push(sym);
+        }
+        op_syms.push(decl_syms);
     }
 
     // Pass A2: record the built-in anchors (now every name resolves).
@@ -100,11 +139,13 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut qid_sym = None;
     let mut minus_sym = None;
     let mut division_sym = None;
+    let mut true_sym = None;
+    let mut false_sym = None;
     let mut succ_zero: HashMap<SymbolId, SymbolId> = HashMap::new();
     for (idx, od) in pm.ops.iter().enumerate() {
         let Some(spec) = &od.attrs.special else { continue };
         let Some((class, _)) = &spec.id_hook else { continue };
-        let sym = op_syms[idx];
+        let sym = op_syms[idx][0]; // anchors are concrete (non-poly) ⇒ exactly one instance
         match class.as_str() {
             "SuccSymbol" => {
                 nat_succ = Some(sym);
@@ -118,30 +159,38 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             "QuotedIdentifierSymbol" => qid_sym = Some(sym),
             "MinusSymbol" => minus_sym = Some(sym),
             "DivisionSymbol" => division_sym = Some(sym),
+            "SystemTrue" => true_sym = Some(sym),
+            "SystemFalse" => false_sym = Some(sym),
             _ => {}
         }
     }
 
-    // Pass B: attach ctor / strat / special.
+    // Pass B: attach ctor / strat / special. A `poly` op's per-kind instances share the same
+    // attributes — including the special op, whose hooks resolve to the same constants for every kind
+    // (this is the re-attach-per-instance Maude does in `instantiatePolymorph`) — so resolve `special`
+    // once and apply to each instance.
     for (idx, od) in pm.ops.iter().enumerate() {
         if od.attrs.ditto {
             continue; // attributes inherited from the prior declaration (shared symbol)
         }
         let arity = od.domain.len();
-        let sym = op_syms[idx];
-        if od.attrs.ctor {
-            engine.set_ctor(sym);
-        }
-        if let Some(strat) = &od.attrs.strat {
-            engine.set_strategy(sym, strat);
-        }
-        if let Some(frozen) = &od.attrs.frozen {
-            engine.set_frozen(sym, frozen);
-        }
-        if let Some(spec) = &od.attrs.special
-            && let Some(op) = special_op(spec, arity, &name_to_sym, &succ_zero, interner)?
-        {
-            engine.set_special(sym, op);
+        let special = match &od.attrs.special {
+            Some(spec) => special_op(spec, arity, &name_to_sym, &succ_zero, interner)?,
+            None => None,
+        };
+        for &sym in &op_syms[idx] {
+            if od.attrs.ctor {
+                engine.set_ctor(sym);
+            }
+            if let Some(strat) = &od.attrs.strat {
+                engine.set_strategy(sym, strat);
+            }
+            if let Some(frozen) = &od.attrs.frozen {
+                engine.set_frozen(sym, frozen);
+            }
+            if let Some(op) = &special {
+                engine.set_special(sym, op.clone());
+            }
         }
     }
 
@@ -178,6 +227,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         qid_sym,
         minus_sym,
         division_sym,
+        true_sym,
+        false_sym,
         overload,
     })
 }
@@ -311,8 +362,13 @@ fn special_op(
     let Some((class, data)) = &spec.id_hook else { return Ok(None) };
     let code = data.first().map(String::as_str);
     let op = match class.as_str() {
-        // Markers (no reduction rule).
-        "SuccSymbol" | "StringSymbol" | "FloatSymbol" | "QuotedIdentifierSymbol" => return Ok(None),
+        // Markers (no reduction rule): the constant/successor literals, and the `true`/`false`
+        // boolean anchors (`SystemTrue`/`SystemFalse` — Maude's `trueSymbol`/`falseSymbol`). A marker
+        // carries no behaviour; `true`/`false` stand for themselves. They are *recorded* (Pass A2) so
+        // later passes — bare boolean conditions (`if pred` ⇒ `pred = true`), sort-test predicates —
+        // can reference the canonical truth constants.
+        "SuccSymbol" | "StringSymbol" | "FloatSymbol" | "QuotedIdentifierSymbol" | "SystemTrue"
+        | "SystemFalse" => return Ok(None),
         "MinusSymbol" => SpecialOp::Minus { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "DivisionSymbol" => SpecialOp::Division { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "EqualitySymbol" => SpecialOp::Equality {

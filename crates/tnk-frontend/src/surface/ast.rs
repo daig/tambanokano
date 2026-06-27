@@ -155,6 +155,11 @@ pub struct Attrs {
     pub frozen: Option<Vec<u32>>,
     pub special: Option<SpecialSpec>,
     pub ditto: bool,
+    /// `poly (<positions>)` — the polymorphic argument/range positions (Maude's `Polymorph`),
+    /// numbered with arguments `1..n` and the range as `0`. A position listed here is `Universal`:
+    /// `build_sig` expands the op into one concrete declaration per kind, substituting that kind's
+    /// error (top) sort at each listed position. `None` = an ordinary, monomorphic op.
+    pub poly: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -83,7 +83,7 @@ guard forbids an *explicit* strat — the prelude's `if_then_else_fi` declares n
 
 | Milestone | Modules | New feature |
 |---|---|---|
-| **M0** — `BOOL` loads; `red true and false .` byte-identical | TRUTH-VALUE, BOOL-OPS, TRUTH, BOOL | §1 poly, §2 SystemTrue/False, §4 `set` skip |
+| **M0 ✅ DONE** — `BOOL` loads; `red true and false .` byte-identical | TRUTH-VALUE, BOOL-OPS, TRUTH, BOOL | §1 poly, §2 SystemTrue/False, §4 `set` skip |
 | **M1** — `NAT` loads; `red 2 + 3 .`/`7 quo 2`/`5 xor 3` byte-identical | NAT | §4 `~>`; NAT codes — `ACU_NumberOpSymbol` `xor`/`&`/`\|`, `CUI_NumberOpSymbol` `sd`, `NumberOpSymbol` `modExp`/`>>`/`<<` |
 | **M2** — `LIST{Nat}` loads; `occurs`/`size`/`reverse` byte-identical | LIST (+SET/MAP/ARRAY) | resilient loading (§5); containers reuse only BOOL+NAT+TRIV |
 
@@ -118,14 +118,25 @@ startup is an M3+ convenience, not required for M0-M2.
 
 ## 6. Increment order (each self-contained + differentially verifiable)
 
-1. **`set` skip** — parse-and-ignore. *Verify:* prelude:31 no longer errors.
-2. **SystemTrue/False markers + anchors** — marker arm + Pass A2 records `true_sym`/`false_sym`. *Verify:*
-   `fmod TRUTH-VALUE …` builds; `red true .` echoes `true`.
-3. **poly/Universal expansion** — `Attrs.poly` capture; per-kind expansion in Pass A via `error_sort(k)`;
-   attach existing `Branch`/`Equality`. *Verify (M0):* `red true and false .` → `Bool: false`, `1 rewrite`;
-   `red true == true .` → `true`; `red if true then false else true fi .` → `false`; byte-identical.
-   **Refactor caution:** Pass A's body must run once (non-poly) or N times (poly), and the per-instance
-   special-attach moves into that loop (Pass B's `op_syms[idx]` assumes 1 symbol/decl).
+**Status: increments 1–3 ✅ DONE — M0 reached** (the four BOOL modules build; the five
+`conformance/prelude-bool.maude` reduces are byte-identical to the reference binary, plus a 2-kind
+`conformance/poly-multikind.maude` proving real multi-instance dispatch). Next: increment 4 (bare
+conditions, consuming the §2 anchors), then increment 5 (`~>` + NAT codes) for M1. Two **new off-path
+blockers** surfaced beyond §0 (both leaves, neither on BOOL→NAT→LIST): `var B : [Bool]` kind notation
+(EXT-BOOL — already the §4.3 / `X:[Foo]` follow-up) and a `CommutativeDecomposeEqualitySymbol` special
+id-hook (INITIAL-EQUALITY-PREDICATE — a new special op, defer with INT/RAT). One **API addition** was
+needed: `Sorts::kinds()` (sort.rs) — an iterator over kind ids, since `Id::from_raw` is `pub(crate)` so
+the frontend couldn't build a `KindId` to drive the per-kind loop. (Not reduction code; the "no new
+kernel reduction code" claim holds.)
+
+1. ✅ **`set` skip** — parse-and-ignore arm in `parse_top_item`, recurses to the next item.
+2. ✅ **SystemTrue/False markers + anchors** — `special_op` marker arm (`Ok(None)`); Pass A2 records
+   `true_sym`/`false_sym` on `BuiltModule`.
+3. ✅ **poly/Universal expansion** — `Attrs.poly` capture (own parser arm, mirrors `strat`); per-kind
+   expansion in Pass A via `Sorts::kinds()` + `error_sort(k)`; existing `Branch`/`Equality` re-attached
+   per instance in Pass B. The refactor landed as: **`op_syms: Vec<Vec<SymbolId>>`** (1 entry per decl,
+   length 1 for ordinary ops / N for poly), Pass A2 indexes `op_syms[idx][0]` (anchors are concrete),
+   Pass B resolves `special` once and iterates the instances. `Universal` never reaches `sort_id`.
 4. **Bare-condition `= true` desugar** — `split_connective` on no-connective → `ConditionFragment::Equality
    { lhs: cond, rhs: true_sym }`. *Verify:* a `ceq r = … if pred(x) .` fires. Precondition for containers.
 5. **`~>` arrow + NAT arithmetic codes** — parser `~>`; extend `NumOp`/`num_op` with `xor`/`&`/`|` (ACU

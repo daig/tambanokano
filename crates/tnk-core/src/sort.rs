@@ -87,6 +87,14 @@ impl Sorts {
         self.kinds.len()
     }
 
+    /// Every kind id (connected component) in declaration order. Lets a frontend enumerate kinds to,
+    /// e.g., expand a `poly`/`Universal` operator into one concrete instance per kind
+    /// ([`error_sort`](Self::error_sort) gives each kind's top sort). Requires [`close`](Self::close).
+    pub fn kinds(&self) -> impl Iterator<Item = KindId> + '_ {
+        debug_assert!(self.closed);
+        (0..self.kinds.len()).map(|i| KindId::from_raw(i as u32))
+    }
+
     /// `a <= b` in the subsort order. Requires [`close`](Self::close).
     pub fn leq(&self, a: SortId, b: SortId) -> bool {
         debug_assert!(self.closed, "leq before close()");

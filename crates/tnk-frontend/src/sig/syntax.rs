@@ -110,6 +110,11 @@ pub struct BuiltModule {
     /// The `DivisionSymbol` operator (`_/_`), if any — the pretty-printer renders a rational special
     /// constant compactly as `num/den` (no spaces), as Maude's `handleDivision` does.
     pub division_sym: Option<SymbolId>,
+    /// The boolean truth anchors (`true`/`false`, tagged `SystemTrue`/`SystemFalse` — Maude's
+    /// `trueSymbol`/`falseSymbol`). Used to desugar a bare boolean condition `if p` into `p = true`
+    /// and by sort-test predicates; `None` until a module declares them (the prelude's `TRUTH-VALUE`).
+    pub true_sym: Option<SymbolId>,
+    pub false_sym: Option<SymbolId>,
     /// Per-symbol ad-hoc overloading flags for print disambiguation (Maude's `SymbolInfo::iflags`
     /// `*_OVERLOADED` bits, `entry.cc`). A symbol overloaded across connected components prints
     /// `(t).Sort` so the output round-trips. [`OVL_ADHOC`] = another symbol shares its name;

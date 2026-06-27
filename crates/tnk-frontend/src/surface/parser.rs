@@ -194,6 +194,18 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Continue { bound })
             }
+            "set" => {
+                // An interpreter directive, e.g. `set include BOOL off .` (prelude:31). A no-op for
+                // us: we never auto-import a module (every import is explicit in the source), and
+                // interactive `set` (e.g. `set trace on`) is intercepted by the REPL before the
+                // parser runs. Consume through the `.` and parse the next item.
+                self.advance(); // `set`
+                while !self.at_dot() && self.peek_text().is_some() {
+                    self.advance();
+                }
+                self.eat_dot()?;
+                return self.parse_top_item();
+            }
             _ => return Err(format!("unexpected top-level token {txt:?}")),
         };
         Ok(Some(item))
@@ -730,7 +742,17 @@ impl<'a> Parser<'a> {
                     self.advance();
                     a.special = Some(self.special()?);
                 }
-                "format" | "metadata" | "poly" | "latex" => {
+                "poly" => {
+                    // `poly ( <positions> )` — the polymorphic positions (args 1-based, range `0`).
+                    self.advance();
+                    let toks = self.balanced()?;
+                    a.poly = Some(
+                        toks.iter()
+                            .map(|t| self.i.resolve(t.sym).parse::<u32>().map_err(|_| "bad poly position".to_string()))
+                            .collect::<Result<_, _>>()?,
+                    );
+                }
+                "format" | "metadata" | "latex" => {
                     // skip the keyword and its `( … )` / token argument (not modelled in the subset).
                     self.advance();
                     if self.at("(") {
@@ -811,6 +833,7 @@ impl Attrs {
             frozen: self.frozen.clone(),
             special: self.special.clone(),
             ditto: self.ditto,
+            poly: self.poly.clone(),
         }
     }
 }

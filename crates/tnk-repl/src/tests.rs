@@ -129,6 +129,63 @@ fn theory_module_sorts_through_repl() {
     assert!(out.contains("result Bool: tt"), "module-declared sort kept: {out}");
 }
 
+/// M0 milestone — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL, verbatim)
+/// loads and reduces byte-identically to Maude's built-in BOOL. Proves the poly/Universal expansion
+/// (`_==_`/`_=/=_`/`if_then_else_fi` instantiated over the Bool kind) and the SystemTrue/SystemFalse
+/// anchors. Each value + count is the reference binary's (`red in BOOL : …`).
+#[test]
+fn prelude_bool_m0_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-bool.maude")).output;
+    // The poly ops parse and pretty-print — the headers round-trip the mixfix.
+    assert!(out.contains("reduce in BOOL : true == true ."), "== header: {out}");
+    assert!(out.contains("reduce in BOOL : if true then false else true fi ."), "if header: {out}");
+    // Result value + sort, in order.
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result Bool: false", // true and false
+            "result Bool: true",  // true == true
+            "result Bool: true",  // true =/= false
+            "result Bool: false", // if true then false else true fi
+            "result Bool: true",  // false or true and not false
+        ],
+        "values: {out}"
+    );
+    // Distinctive rewrite counts: four single-rewrite reduces + the 7-rewrite xor expansion.
+    assert_eq!(out.matches("rewrites: 1 ").count(), 4, "1-rewrite reduces: {out}");
+    assert!(out.contains("rewrites: 7 "), "xor-expansion count: {out}");
+}
+
+/// Increment-3 core: poly/Universal expansion over TWO kinds (Bool + an unrelated Color). `_==_` and
+/// `if_then_else_fi` each instantiate per kind; this proves distinct per-kind dispatch, grammar
+/// disambiguation, and the `if`-result sort over a non-Bool kind. Values/counts are the reference
+/// binary's (built-in poly `==`/`if`, `red in MK : …`).
+#[test]
+fn poly_multikind_through_repl() {
+    let out = repl().eval(conformance_file!("poly-multikind.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result Bool: true",  // true == true     (Bool-kind ==)
+            "result Bool: false", // true == false    (Bool-kind ==)
+            "result Bool: true",  // c0 == c0         (Color-kind ==)
+            "result Bool: false", // c0 == c2         (Color-kind ==)
+            "result Color: c0",   // if true then c0 else c2 fi          (Color-kind if)
+            "result Color: c2",   // if (c1 == c2) then c0 else c2 fi    (nested == then if)
+        ],
+        "multikind values: {out}"
+    );
+    // The nested reduce is exactly 2 rewrites (inner Color-kind == → false, then the if selects c2).
+    // The header echoes with the redundant parens elided — `if c1 == c2 then …` — exactly as the
+    // reference binary prints it (==' s prec 51 makes them unnecessary).
+    assert!(
+        out.contains("reduce in MK : if c1 == c2 then c0 else c2 fi .") && out.contains("rewrites: 2 "),
+        "nested ==/if count: {out}"
+    );
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]
