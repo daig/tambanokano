@@ -538,8 +538,9 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    /// `NAME ('{' arg (',' arg)* '}')? | '(' module_expr ')'`. A `{…}` after a name is a parameterized
-    /// instantiation `M{V, …}` (B-iv) — one view-name argument per parameter.
+    /// `NAME ('{' arg (',' arg)* '}')* | '(' module_expr ')'`. Each `{…}` after a name is a parameterized
+    /// instantiation `M{A, …}`; a *chain* `M{A}{B}` (Axis-A5 kind 1) re-instantiates the free parameters a
+    /// theory-view argument leaves behind.
     fn module_atom(&mut self) -> PResult<ModuleExpr> {
         if self.at("(") {
             self.advance();
@@ -548,7 +549,7 @@ impl<'a> Parser<'a> {
             return Ok(e);
         }
         let mut e = ModuleExpr::Named(self.name()?);
-        if self.at("{") {
+        while self.at("{") {
             e = ModuleExpr::Instantiation(Box::new(e), self.instantiation_args()?);
         }
         Ok(e)
@@ -1096,6 +1097,22 @@ endv
                 }
                 other => panic!("expected nested Instantiation arg, got {other:?}"),
             },
+            other => panic!("expected Instantiation, got {other:?}"),
+        }
+        // Axis-A5 kind 1: a *chain* `BOX{ToT2}{C2}` parses as an instantiation whose base is itself an
+        // instantiation (the inner `{ToT2}` applied, then the outer `{C2}`).
+        let m4 = &parse("fmod M is protecting BOX{ToT2}{C2} . endfm\n").modules[0];
+        match &m4.imports[0].expr {
+            ModuleExpr::Instantiation(base, args) => {
+                assert!(matches!(args.as_slice(), [ModuleExpr::Named(n)] if n == "C2"));
+                match &**base {
+                    ModuleExpr::Instantiation(ibase, iargs) => {
+                        assert!(matches!(&**ibase, ModuleExpr::Named(n) if n == "BOX"));
+                        assert!(matches!(iargs.as_slice(), [ModuleExpr::Named(n)] if n == "ToT2"));
+                    }
+                    other => panic!("expected chained Instantiation base, got {other:?}"),
+                }
+            }
             other => panic!("expected Instantiation, got {other:?}"),
         }
     }

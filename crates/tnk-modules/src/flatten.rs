@@ -239,33 +239,50 @@ fn collect_expr(
             acc.add(renamed);
             Ok(())
         }
-        ModuleExpr::Instantiation(base, args) => {
-            // `M{A, …}` merges once (keyed by its canonical instance name `M{A, …}`).
+        ModuleExpr::Instantiation(..) => {
+            // `M{A, …}` (or a chain `M{A}{B}`) merges once, keyed by its canonical instance name.
             if !visited.insert(canonical_key(expr)) {
                 return Ok(());
             }
-            let mname = match &**base {
-                ModuleExpr::Named(n) => n.as_str(),
-                _ => return Err("the base of an instantiation must be a named module (a nested \
-                                 instantiation / renaming base is a follow-up)"
-                    .into()),
-            };
-            instantiate(mname, args, db, views, acc, visited, interner, scope)
+            let (mname, arg_lists) = unchain(expr).ok_or(
+                "the base of an instantiation must be a named module (a renaming/sum base is a follow-up)",
+            )?;
+            instantiate(mname, &arg_lists, db, views, acc, visited, interner, scope)
         }
     }
 }
 
-/// Instantiate the parameterized module `mname` with one argument per parameter, against the enclosing
-/// parameter `scope`. Each argument is resolved ([`resolve_arg`]) to a view (kind 3) or a by-parameter
-/// binding (kind 2); a view's target is imported, `mname`'s imports are re-instantiated with the bound
-/// parameters substituted in (`LIST{X}` with `X ↦ ToN` ⇒ `LIST{ToN}`), and `mname`'s own declarations are
-/// merged under the binding — `X$s ↦` the view's sort image of `s` (or `p$s` by parameter), a structured
-/// sort `Base{…X…} ↦ Base{…argument name…}` (Maude's instance naming), the view operator maps (A1), and
-/// each variable inlined as a colon variable at its instantiated sort.
+/// Flatten an instantiation expression (possibly a chain `M{A}{B}`) into the base module name and the
+/// argument lists, **outermost last**: `M{A}{B}` ⇒ `(M, [[A], [B]])`. `None` if the base is not a chain of
+/// instantiations rooted at a named module.
+fn unchain(expr: &ModuleExpr) -> Option<(&str, Vec<&[ModuleExpr]>)> {
+    match expr {
+        ModuleExpr::Instantiation(base, args) => match &**base {
+            ModuleExpr::Named(m) => Some((m, vec![args.as_slice()])),
+            ModuleExpr::Instantiation(..) => {
+                let (m, mut lists) = unchain(base)?;
+                lists.push(args.as_slice());
+                Some((m, lists))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Instantiate the parameterized module `mname` with the argument-list chain `arg_lists` (one list per
+/// `{…}` in a chain `M{A}{B}`, outermost last), against the enclosing parameter `scope`. Each parameter's
+/// arguments across the chain are *composed* ([`resolve_arg`] per level): a module-view (kind 3) imports its
+/// target and binds the parameter to its sort image, a by-parameter argument (kind 2) prefix-renames
+/// `X$s ↦ p$s`, and a theory-view (kind 1) leaves the parameter free for the next level to bind — so a
+/// chain `BOX{ToT2}{C2}` composes the theory-view `ToT2` with the module-view `C2` into one binding
+/// (`X$Elt ↦ Hue`, `Box{X} ↦ Box{ToT2}{C2}`). `mname`'s imports are re-instantiated with the bound
+/// parameters substituted in, and its own declarations merged under the binding (with variables inlined as
+/// colon variables at their instantiated sorts).
 #[allow(clippy::too_many_arguments)]
 fn instantiate(
     mname: &str,
-    args: &[ModuleExpr],
+    arg_lists: &[&[ModuleExpr]],
     db: &ModuleDb,
     views: &ViewDb,
     acc: &mut Acc,
@@ -274,29 +291,58 @@ fn instantiate(
     scope: &[String],
 ) -> Result<(), String> {
     let pm = db.get(mname).ok_or_else(|| format!("instantiated module `{mname}` is not defined"))?;
-    if pm.params.len() != args.len() {
-        return Err(format!(
-            "instantiation `{mname}{{…}}` has {} argument(s) but `{mname}` has {} parameter(s)",
-            args.len(),
-            pm.params.len()
-        ));
+    let nparams = pm.params.len();
+    for lvl in arg_lists {
+        if lvl.len() != nparams {
+            return Err(format!(
+                "instantiation `{mname}{{…}}` has {} argument(s) but `{mname}` has {nparams} parameter(s)",
+                lvl.len()
+            ));
+        }
     }
 
-    // Resolve each argument (against `scope`, so an enclosing parameter is a by-parameter argument rather
-    // than a view). A view argument imports its target and binds the parameter to its sort image; a
-    // by-parameter argument imports nothing and binds the parameter to a prefix-rename `X$s ↦ p$s`.
+    // For each parameter, resolve and compose its chain of arguments. Only the *last* level's target is
+    // imported (an earlier theory-view's target is a theory, contributing only a sort/op mapping); the
+    // sort images compose left-to-right; the structured-sort name is the whole chain (`ToT2}{C2`).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
     let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
-    for (param, arg) in pm.params.iter().zip(args) {
-        let r = resolve_arg(arg, views, interner, scope)
+    for (i, param) in pm.params.iter().enumerate() {
+        let chain: Vec<&ModuleExpr> = arg_lists.iter().map(|lvl| &lvl[i]).collect();
+        let resolutions: Vec<ArgResolution> = chain
+            .iter()
+            .map(|a| resolve_arg(a, views, interner, scope))
+            .collect::<Result<_, _>>()
             .map_err(|e| format!("instantiation `{mname}{{…}}`: {e}"))?;
-        if let Some(target) = &r.target {
+        // Import the grounding (last) target; compose op maps across the chain.
+        let last = resolutions.last().expect("at least one level");
+        if let Some(target) = &last.target {
             collect_expr(target, db, views, acc, visited, interner, scope)?;
         }
-        op_subst.extend(r.op_subst);
-        param_to_arg.insert(param.name.clone(), arg.clone());
-        bindings.insert(param.name.clone(), r.binding);
+        for r in &resolutions {
+            op_subst.extend(r.op_subst.clone());
+        }
+        // Compose the sort image: each source sort threaded through every level's map in order.
+        let mut sort_image: HashMap<String, String> = HashMap::new();
+        let sources: HashSet<String> =
+            resolutions.iter().flat_map(|r| r.binding.sort_image.keys().cloned()).collect();
+        for s in sources {
+            let mut cur = s.clone();
+            for r in &resolutions {
+                cur = r.binding.sort_image.get(&cur).cloned().unwrap_or(cur);
+            }
+            sort_image.insert(s, cur);
+        }
+        let view_name =
+            chain.iter().map(|a| canonical_key(a)).collect::<Vec<_>>().join("}{");
+        bindings.insert(param.name.clone(), ParamBinding {
+            view_name,
+            sort_image,
+            by_param: last.binding.by_param,
+        });
+        // For re-instantiating `mname`'s imports that mention the parameter, the last level's argument is
+        // the effective binding (an intervening theory-view changes only the theory, not the value).
+        param_to_arg.insert(param.name.clone(), (**chain.last().expect("at least one level")).clone());
     }
 
     // `M`'s regular imports with the parameter substitution applied (a bound parameter `X` in an import

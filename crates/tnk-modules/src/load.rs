@@ -287,6 +287,22 @@ mod tests {
         );
     }
 
+    /// Axis-A5 kind 1: a **theory-view** argument. `ToT2`'s target `T2` is a theory, so `BOX{ToT2}` keeps a
+    /// free parameter retyped to `T2`; the chain `BOX{ToT2}{C2}` grounds it with the module-view `C2`. The
+    /// composition maps `X$Elt ↦ Hue` and names the structured sort `Box{X} ↦ Box{ToT2}{C2}` (the whole
+    /// chain). Byte-identical to the reference across the element- and box-typed results.
+    #[test]
+    fn instantiation_theory_view_conforms() {
+        conform(
+            conformance_file!("instantiation-theory-view.maude"),
+            &[
+                e("Box{ToT2}{C2}", "wrap(red)", 0),
+                e("Hue", "red", 1),
+                e("Hue", "sentinel", 1),
+            ],
+        );
+    }
+
     /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
     /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the

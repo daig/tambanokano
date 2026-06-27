@@ -1,0 +1,19 @@
+*** Axis-A5 kind 1: a theory-view argument. ToT2 is a view whose target T2 is a theory, so
+*** BOX{ToT2} keeps a free parameter retyped to T2; the chain BOX{ToT2}{C2} then grounds it with
+*** the module-view C2. The composition gives X$Elt to Hue, and the structured sort Box{X} to the
+*** chained name Box{ToT2}{C2}. Byte-identical to the reference.
+fth T1 is sort Elt . endfth
+fth T2 is sort Elt . op sentinel : -> Elt . endfth
+view ToT2 from T1 to T2 is sort Elt to Elt . endv
+fmod COLOR is sort Hue . op red : -> Hue [ctor] . op sentinel : -> Hue [ctor] . endfm
+view C2 from T2 to COLOR is sort Elt to Hue . endv
+fmod BOX{X :: T1} is
+  sort Box{X} .
+  op wrap : X$Elt -> Box{X} [ctor] .
+  op peek : Box{X} -> X$Elt .
+  eq peek(wrap(E:X$Elt)) = E:X$Elt .
+endfm
+fmod USE is protecting BOX{ToT2}{C2} . endfm
+red wrap(red) .
+red peek(wrap(red)) .
+red peek(wrap(sentinel)) .
