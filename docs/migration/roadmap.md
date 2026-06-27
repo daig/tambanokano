@@ -64,8 +64,10 @@ prelude load.
      `conformance/instantiation-{nested,byparam,nested-list,theory-view,membership,set-ac,map}.maude` +
      `correctness-{disambig,colon-var-structured}.maude`, all byte-identical (incl. user-typed structured
      colon variables `L:List{Nat}`). *Residuals* (in `gaps.md`): identity-collapse rewrite **count**
-     (orthogonal — the AC matcher, reproduces non-parameterized), the chained-import last-level substitution,
-     and the `X:[Foo]` *kind*-variable lexing.
+     (orthogonal — the AC matcher, reproduces non-parameterized) and the chained-import last-level
+     substitution. (`X:[Foo]` kind variables are *not* a residual of this work — kind-level bracket sorts are
+     unsupported surface-wide, e.g. `op g : [B]` already fails to parse; that is the `poly`/`Universal`
+     kind-variable feature, item 3 below.)
 
    **Conformance source:** `~/Downloads/Maude-3/prelude.maude` (3,234 lines — **zero rules**, so
    parameterization is the critical path to it). **Reference:** `reports/A5-modules-parameterization-repl.md`.

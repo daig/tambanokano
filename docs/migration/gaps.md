@@ -73,8 +73,13 @@ correctness fix.
   the whole token, the part before `:` becoming the variable name (so `X:Nat`/`X:Foo`/`X:List{Nat}` are
   distinct), echoed back with its sort. The instantiation path produces the same single-token form (a
   parameterized module's variables are inlined as single-token colon variables at their instance sorts,
-  `flatten.rs`). The *residual* is the **kind** variable `X:[Foo]` (square brackets) — `:[` doesn't fit the
-  `name:base` fusion shape, so it isn't lexed as one token yet; rare, and orthogonal.
+  `flatten.rs`). The *remaining* form is the **kind** variable `X:[Foo]` (sort = a kind/error sort, square
+  brackets) — but this is **not** a colon-var lexing gap: kind-level bracket sorts are unsupported across the
+  whole surface, so even `op g : [B] -> [B]` fails to parse (`sort_name` has no `[…]` case; the error sort,
+  which exists internally and is named `[B]`, is not registered as a parseable sort; the per-kind grammar
+  productions exclude it). Making `[Kind]` sorts first-class is the kind-variable machinery Maude bundles with
+  **`poly`/`Universal`** (`var B : [Bool]`) — roadmap item 3 / Axis B, a separate feature from parameterization,
+  not a loose end of it.
 - **`search` tracing.** `search` runs with `trace` off; `set trace` + a traced search (per-state rewrite
   trace, `set trace select`/`rls`) is a follow-up. Results/counts are unaffected.
 - **Rewrite-condition (`=>`) trace.** A `crl ... if t => p` condition's *result, bindings, and rewrite
