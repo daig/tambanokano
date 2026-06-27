@@ -66,14 +66,14 @@ correctness fix.
   multi-element AU subject (residue splits Maude does not report at the top level) — pre-existing, affects only
   the `xmatch` command's solution *set*, not reduce/rewrite. The optimized matcher is also a prerequisite for
   heavy AC `search`.
-- **Assoc-comm op with `id:` + an infix-application argument doesn't parse (`MAP`/`ARRAY` blocker).** `SET`
-  loads and reduces, but `MAP`/`ARRAY` do not yet: their `_,_`/`_;_ [assoc comm id: empty]` constructor fails
-  to *parse* an argument that is itself an infix application — `a |-> a, a |-> a` is rejected, while `a, a`
-  (atomic args) and the same op *without* `id:` both parse. Bisected to the **identity**: with `id:`, an infix
-  argument over the constructor mis-parses (the grammar build reads no identity field, so it is a subtler
-  identity interaction — likely spurious ambiguity in the on-the-fly grammar). Values are unaffected (the term
-  builds and reduces correctly when parsed); it is a front-end parse gap, not a kernel one. `SET` is unaffected
-  because its elements are atomic (`X$Elt`), not constructor applications.
+- **Parameterized *container views* (`view List{X :: TRIV} … to LIST{X}`) don't parse yet.** All four
+  container **modules** load and reduce (`EXT-BOOL`/`SET`/`MAP`/`ARRAY`, `conformance/prelude-{set,map,array}`),
+  but the prelude's parameterized *views* that let containers nest (`LIST{Set{Nat}}`) — `view List{X :: TRIV}`,
+  `Set{…}`, `Map{…}`, `Array{…}`, and the sortable-list views — hit a view-parser gap (`expected 'to', found
+  "{"` / `view map must be sort/op…`). A view-frontend follow-up, orthogonal to the data structures
+  themselves. *(The earlier `id:`-attribute parse bug that blocked `MAP`/`ARRAY` — `collect_until(["]"])`
+  swallowed `prec`/`format` into the identity bubble, defaulting the constructor's precedence and mis-parsing
+  a `_|->_`-entry argument — is **fixed**: `id:` now stops at the next attribute keyword.)*
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.

@@ -135,6 +135,60 @@ fn prelude_set_through_repl() {
     );
 }
 
+/// Helper for the prelude container fixtures: pair each `rewrites:`/`result` line into `[count] value`.
+fn prelude_results(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .map(|c| {
+            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
+            format!("[{n}] {}", c[1].trim_start_matches("result "))
+        })
+        .collect()
+}
+
+/// Container milestone — the real prelude's `MAP{Nat, Nat}` loads and reduces byte-identically. Proves
+/// two-parameter instantiation, the `[Y$Elt]` kind range (via `inst_sort`), and the `id:`-attribute
+/// parse fix (an `_,_ [assoc comm id: empty prec 121]` keeps its prec, so a `_|->_` entry parses as an
+/// argument). Values/sorts/counts are the reference binary's.
+#[test]
+fn prelude_map_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-map.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "MAP builds: {out}");
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[2] Map{Nat,Nat}: 1 |-> 10, 2 |-> 20", // insert(1,10,insert(2,20,empty))
+            "[3] NzNat: 10",                        // (… )[1]
+            "[3] NzNat: 20",                        // (… )[2]
+            "[1] [Nat]: undefined",                 // (… )[3] — miss → kind-level undefined
+            "[1] Bool: true",                       // $hasMapping(…, 1)
+            "[1] Bool: false",                      // $hasMapping((1|->10), 3)
+        ],
+        "MAP ops: {out}"
+    );
+}
+
+/// Container milestone — the real prelude's `ARRAY{Nat, Nat0}` loads and reduces byte-identically.
+/// Two-parameter (`X :: TRIV`, `Y :: DEFAULT`); the `_;_` array constructor; a missing index returns the
+/// DEFAULT element `0`. Values/sorts/counts are the reference binary's.
+#[test]
+fn prelude_array_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-array.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "ARRAY builds: {out}");
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[6] Array{Nat,Nat0}: 1 |-> 10 ; 2 |-> 20", // insert(1,10,insert(2,20,empty))
+            "[3] NzNat: 10",                            // (… )[1]
+            "[1] Zero: 0",                              // (… )[3] — miss → DEFAULT 0
+            "[1] Bool: true",                           // $hasMapping((1|->10), 1)
+        ],
+        "ARRAY ops: {out}"
+    );
+}
+
 /// Variable aliases are module-local (Blocker B): `M` and its import `P` both declare a variable `A`
 /// at different sorts; `M`'s own equation must use `M`'s `A`, even though flattening collects `P`'s `A`
 /// first. Without module-local scoping the name-dedup mistypes `f(A, L)` → no parse (the real `LIST`'s

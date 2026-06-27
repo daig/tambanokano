@@ -734,7 +734,16 @@ impl<'a> Parser<'a> {
                 }
                 "id:" => {
                     self.advance();
-                    a.id = Some(self.collect_until(&["]"]));
+                    // The identity is a single term; collect up to the next attribute keyword (or `]`).
+                    // NOT `collect_until(["]"])`, which swallows following attributes (`prec`, `format`,
+                    // …) into the identity bubble — leaving the op with no `prec`, so e.g. SET/MAP's
+                    // `_,_ [assoc comm id: empty prec 121]` defaulted to prec 41 and mis-parsed a
+                    // constructor-application argument (`a |-> a, a |-> a`).
+                    a.id = Some(self.collect_until(&[
+                        "assoc", "comm", "idem", "iter", "ctor", "ditto", "memo", "config", "obj", "msg",
+                        "portal", "frozen", "id:", "prec", "gather", "strat", "special", "poly", "format",
+                        "metadata", "latex", "]",
+                    ]));
                 }
                 "prec" => {
                     self.advance();

@@ -1,0 +1,249 @@
+*** Container milestone (cont.) -- the real prelude's ARRAY{Nat, Nat0}, over BOOL+NAT, verbatim from
+*** ~/Downloads/Maude-3/prelude.maude: BOOL 33-82, NAT 110-243, TRIV + Nat view, DEFAULT theory + Nat0
+*** view, ARRAY 1535-1566. Two-parameter (X :: TRIV, Y :: DEFAULT); the `_;_ [assoc comm id: empty]`
+*** array constructor; a missing index returns the DEFAULT element `0` (not a kind term, unlike MAP).
+***
+*** Oracle: stock Maude, `red in T :` with T = ARRAY{Nat, Nat0}.
+
+fmod TRUTH-VALUE is
+  sort Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op false : -> Bool [ctor special (id-hook SystemFalse)] .
+endfm
+
+fmod BOOL-OPS is
+  protecting TRUTH-VALUE .
+  op _and_ : Bool Bool -> Bool [assoc comm prec 55] .
+  op _or_ : Bool Bool -> Bool [assoc comm prec 59] .
+  op _xor_ : Bool Bool -> Bool [assoc comm prec 57] .
+  op not_ : Bool -> Bool [prec 53] .
+  op _implies_ : Bool Bool -> Bool [gather (e E) prec 61] .
+  vars A B C : Bool .
+  eq true and A = A .
+  eq false and A = false .
+  eq A and A = A .
+  eq false xor A = A .
+  eq A xor A = false .
+  eq A and (B xor C) = A and B xor A and C .
+  eq not A = A xor true .
+  eq A or B = A and B xor A xor B .
+  eq A implies B = not(A xor A and B) .
+endfm
+
+fmod TRUTH is
+  protecting TRUTH-VALUE .
+  op if_then_else_fi : Bool Universal Universal -> Universal 
+        [poly (2 3 0)
+         special (id-hook BranchSymbol
+                  term-hook 1 (true)
+                  term-hook 2 (false))] .
+
+  op _==_ : Universal Universal -> Bool 
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol
+                  term-hook equalTerm (true)
+                  term-hook notEqualTerm (false))] .
+
+  op _=/=_ : Universal Universal -> Bool 
+        [prec 51 poly (1 2)
+         special (id-hook EqualitySymbol
+                  term-hook equalTerm (false)
+                  term-hook notEqualTerm (true))] .
+endfm
+
+fmod BOOL is
+  protecting BOOL-OPS .
+  protecting TRUTH .
+endfm
+
+fmod NAT is
+  protecting BOOL .
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+
+  op s_ : Nat -> NzNat
+        [ctor iter
+         special (id-hook SuccSymbol
+                  term-hook zeroTerm (0))] .
+
+  op _+_ : NzNat Nat -> NzNat
+        [assoc comm prec 33
+         special (id-hook ACU_NumberOpSymbol (+)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+
+  op sd : Nat Nat -> Nat
+        [comm
+         special (id-hook CUI_NumberOpSymbol (sd)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _*_ : NzNat NzNat -> NzNat
+        [assoc comm prec 31
+         special (id-hook ACU_NumberOpSymbol (*)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _*_ : Nat Nat -> Nat [ditto] .
+
+  op _quo_ : Nat NzNat -> Nat
+        [prec 31 gather (E e)
+         special (id-hook NumberOpSymbol (quo)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _rem_ : Nat NzNat -> Nat
+        [prec 31 gather (E e)
+         special (id-hook NumberOpSymbol (rem)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _^_ : Nat Nat -> Nat
+        [prec 29  gather (E e)
+         special (id-hook NumberOpSymbol (^)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _^_ : NzNat Nat -> NzNat [ditto] .
+
+  op modExp : Nat Nat NzNat ~> Nat
+        [special (id-hook NumberOpSymbol (modExp)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+ 
+  op gcd : NzNat Nat -> NzNat
+        [assoc comm
+         special (id-hook ACU_NumberOpSymbol (gcd)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op gcd : Nat Nat -> Nat [ditto] .
+
+  op lcm : NzNat NzNat -> NzNat
+        [assoc comm
+         special (id-hook ACU_NumberOpSymbol (lcm)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op lcm : Nat Nat -> Nat [ditto] .
+
+  op min : NzNat NzNat -> NzNat
+        [assoc comm
+         special (id-hook ACU_NumberOpSymbol (min)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op min : Nat Nat -> Nat [ditto] .
+
+  op max : NzNat Nat -> NzNat
+        [assoc comm
+         special (id-hook ACU_NumberOpSymbol (max)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op max : Nat Nat -> Nat [ditto] .
+
+  op _xor_ : Nat Nat -> Nat
+        [assoc comm prec 55
+         special (id-hook ACU_NumberOpSymbol (xor)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _&_ : Nat Nat -> Nat
+        [assoc comm prec 53
+         special (id-hook ACU_NumberOpSymbol (&)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _|_ : NzNat Nat -> NzNat
+        [assoc comm prec 57
+         special (id-hook ACU_NumberOpSymbol (|)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _|_ : Nat Nat -> Nat [ditto] .
+
+  op _>>_ : Nat Nat -> Nat
+        [prec 35 gather (E e)
+         special (id-hook NumberOpSymbol (>>)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _<<_ : Nat Nat -> Nat
+        [prec 35 gather (E e)
+         special (id-hook NumberOpSymbol (<<)
+                  op-hook succSymbol (s_ : Nat ~> NzNat))] .
+
+  op _<_ : Nat Nat -> Bool
+        [prec 37
+         special (id-hook NumberOpSymbol (<)
+                  op-hook succSymbol (s_ : Nat ~> NzNat)
+                  term-hook trueTerm (true)
+                  term-hook falseTerm (false))] .
+
+  op _<=_ : Nat Nat -> Bool
+        [prec 37
+         special (id-hook NumberOpSymbol (<=)
+                  op-hook succSymbol (s_ : Nat ~> NzNat)
+                  term-hook trueTerm (true)
+                  term-hook falseTerm (false))] .
+
+  op _>_ : Nat Nat -> Bool
+        [prec 37
+         special (id-hook NumberOpSymbol (>)
+                  op-hook succSymbol (s_ : Nat ~> NzNat)
+                  term-hook trueTerm (true)
+                  term-hook falseTerm (false))] .
+
+  op _>=_ : Nat Nat -> Bool
+        [prec 37
+         special (id-hook NumberOpSymbol (>=)
+                  op-hook succSymbol (s_ : Nat ~> NzNat)
+                  term-hook trueTerm (true)
+                  term-hook falseTerm (false))] .
+
+  op _divides_ : NzNat Nat -> Bool
+        [prec 51
+         special (id-hook NumberOpSymbol (divides)
+                  op-hook succSymbol (s_ : Nat ~> NzNat)
+                  term-hook trueTerm (true)
+                  term-hook falseTerm (false))] .
+endfm
+
+
+fth TRIV is
+  sort Elt .
+endfth
+
+view Nat from TRIV to NAT is
+  sort Elt to Nat .
+endv
+
+fth DEFAULT is
+  including TRIV .
+  op 0 : -> Elt .
+endfth
+
+
+view Nat0 from DEFAULT to NAT is
+  sort Elt to Nat .
+endv
+
+fmod ARRAY{X :: TRIV, Y :: DEFAULT} is
+  protecting BOOL .
+  sorts Entry{X,Y} Array{X,Y} .
+  subsort Entry{X,Y} < Array{X,Y} .
+
+  op _|->_ : X$Elt Y$Elt -> Entry{X,Y} [ctor] .
+  op empty : -> Array{X,Y} [ctor] .
+  op _;_ : Array{X,Y} Array{X,Y} -> Array{X,Y} [ctor assoc comm id: empty prec 71 format (d r os d)] .
+
+  var D : X$Elt .
+  vars R R' : Y$Elt .
+  var A : Array{X,Y} .
+
+  op insert : X$Elt Y$Elt Array{X,Y} -> Array{X,Y} .
+  eq insert(D, R, (A ; D |-> R')) =
+     if $hasMapping(A, D) then insert(D, R, A)
+     else if R == 0 then A else (A ; D |-> R) fi
+     fi .
+
+  eq insert(D, R, A) = if R == 0 then A else (A ; D |-> R) fi [owise] .
+
+  op _[_] : Array{X,Y} X$Elt -> Y$Elt [prec 23] .
+  eq (A ; D |-> R)[D] =
+     if $hasMapping(A, D) then 0
+     else R
+     fi .
+  eq A[D] = 0 [owise] .
+
+  op $hasMapping : Array{X,Y} X$Elt -> Bool .
+  eq $hasMapping((A ; D |-> R), D) = true .
+  eq $hasMapping(A, D) = false [owise] .
+endfm
+
+fmod T is protecting ARRAY{Nat, Nat0} . endfm
+red insert(1, 10, insert(2, 20, empty)) .
+red (1 |-> 10 ; 2 |-> 20)[1] .
+red (1 |-> 10 ; 2 |-> 20)[3] .
+red $hasMapping((1 |-> 10), 1) .
