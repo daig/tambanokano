@@ -181,8 +181,9 @@ correctness fix.
   `xmatch`-over-enumerates note in §2); a whole-subject match (context `[]`) is handled, a partial AC match
   stays inert rather than report a wrong context. (d) The **exhausted-search count** — asking `metaSearch`/
   `metaSearchPath` for a solution past the last over-counts the sibling expansion (a `search.rs`
-  solution-enumeration snapshot detail, off every success path). The `format`-attribute *display* of a
-  descent result is the Stage-3.5 pretty-printer item, not a corner here.
+  solution-enumeration snapshot detail, off every success path). (The `format`-attribute *display* of a
+  descent result — the substitution/trace/rule layout — is **done**, Stage 3.5: `print_pretty` honors the
+  `format` attribute, so these results render byte-identically including newlines/indent.)
 
 ## Resolved (here for cross-reference; detail in git history)
 

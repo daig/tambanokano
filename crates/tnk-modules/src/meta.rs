@@ -17,12 +17,12 @@
 //! `down_term_to_term` (a `Term`-producing down-translation). Term-level up (`up_term`) and the first of
 //! the declaration-level up maps (`up_pattern`/`up_rule`) live here; the rest of the `up*` family
 //! (`upModule`/`upSorts`/…) + the sort/kind queries + `metaParse`/`metaPrettyPrint` are Stage 4. Symbolic/
-//! SMT/strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3). Every descent function's **value and rewrite
-//! count conform**; what is deferred is sequenced by concern (see the roadmap's item 3(c)): the
-//! `format`-attribute *display* of a result is **Stage 3.5** (the pretty-printer prerequisite for Stage 4's
-//! `upModule`/`metaPrettyPrint`), and four orthogonal compute corners — conditional-rule `metaApply` +
-//! conditioned `metaMatch` (the condition evaluator), a non-empty partial substitution, the AC-residue
-//! `metaXmatch` context, and the exhausted-search count — ride their own subsystems (`gaps.md`).
+//! SMT/strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3). Every descent function now conforms on
+//! **value, rewrite count, *and* layout** (Stage 3.5 taught `print_pretty` the `format` attribute, so a
+//! substitution/result-tuple/trace renders byte-identically). The remaining residuals are four orthogonal
+//! compute corners, each riding its own subsystem (`gaps.md`): conditional-rule `metaApply` + conditioned
+//! `metaMatch` (the condition evaluator), a non-empty partial substitution, the AC-residue `metaXmatch`
+//! context, and the exhausted-search count.
 
 use std::collections::BTreeSet;
 

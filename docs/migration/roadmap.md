@@ -125,15 +125,20 @@ prelude load.
      outer quoting parens are stripped, fixing both the grammar production and the by-profile hook resolve),
      and **constants-first op ordering** (an `id(c)` identity resolves against an already-declared `c`). The
      **`[]`/`{}` constant pretty-printer** (all name fragments, not just the first) came with the hole.
-     **Stage 3.5 — the `format` display layer (the one prerequisite between Stages 3 and 4).** A single,
-     cross-cutting concern: `print_pretty` honoring the **`format`-attribute mixfix layout** (and the
-     bracket/dot spacing of names like `rl_=>_[_].`). It is the genuine prerequisite for Stage 4's
-     `upModule`/`metaPrettyPrint` **display** conformance — a whole `Module` term (`mod 'FOO is … rl … endm`)
-     only renders byte-identically with it — and it closes Stage 3's two display residuals (the
-     `_<-_`/`{_,_,_}` substitution layout, `metaSearchPath`'s rule spacing). Doing it *here* keeps Stage 4 a
-     clean compute surface — its up-results conform on display from the start — rather than landing value-only
-     and retrofitting layout. It is the **only** deferred item with a hard ordering constraint relative to
-     Stage 4; every descent function's value and rewrite count already conform, so this is layout-only.
+     **Stage 3.5 — the `format` display layer — DONE.** `print_pretty` now honors the `format (…)` operator
+     attribute: one directive word per mixfix **gap** (`d` = the existing default spacing, `s` space, `t`
+     tab, `n` newline, `i` indent to the current level, `+`/`-` indent-level — composing as `n++i`/`ni`/`--`),
+     applied on both the binary and the assoc-fold print paths (the work-stack gained newline/indent items +
+     an indent counter); an op whose format uses an unmodelled directive (`r`/`o`, on some IO/array ops)
+     falls back to the default, so a partial model never mis-renders. The whole META descent family now
+     renders **byte-identically to the reference — value, rewrite count, *and* layout**: `_<-_`'s
+     `format (n++i d d --)` newline-indents each substitution binding (so an `Assignment` / a
+     `ResultTriple`-with-substitution / a `MatchPair` break onto continuation lines), `rl_=>_[_].`'s `s`
+     directives space `[attrs]`/`.` (so `metaSearchPath`'s up-rule prints `'c.Elt [label('ab)] .`), and
+     `__`'s `format (d n d)` newlines each element of a folded list (a two-step `metaSearchPath` `Trace` —
+     the same fold path `upModule`'s declaration lists will reuse in Stage 4). The conformance test now
+     captures each result's full multi-line value, pinned to the reference's exact bytes. So Stage 4 starts
+     on a clean compute surface — its `up*` results conform on display from the first reduce.
      **Stage 4 (the `up*` family — originally planned, now un-conflated):** `upModule`/`upTerm`/`downTerm`,
      `upSorts`/`upOpDecls`/`upEqs`/`upRls`/… (extending Stage 3's `up_pattern`/`up_rule` seam with iter-chain
      collapse + literals + conditional rules); the sort/kind queries (`metaSortLeq`/`metaLeastSort`/
