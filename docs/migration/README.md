@@ -27,11 +27,13 @@ sorts, instantiation `M{V}`, and the whole "Axis A" — view op-maps, import/tar
 and the entangled hard pair **parameterized views + free-vs-bound nested instantiation** (all three argument
 kinds — module-view, by-parameter, theory-view — incl. `LIST{List{Nat}}` nesting, cross-kind ad-hoc
 overloading with `(t).Sort` disambiguation, and structured-sort memberships). All a pure `tnk-modules`
-`PreModule` transform, all conformance-verified. **The real Maude prelude now loads** through `BOOL` → `NAT`
-→ `LIST{Nat}` (byte-identical reductions): `poly`/`Universal` per-kind expansion, the NAT bignum codes,
-module-local variable aliases, and AU identity-collapse matching. **Next:** finish the container library
-(`EXT-BOOL`/`SET`/`MAP`/`ARRAY` — the `[Sort]` kind notation + ACU/CUI collapse), then the remaining built-in
-data types, then strategies + objects/IO. See `roadmap.md`.
+`PreModule` transform, all conformance-verified. **The real Maude prelude loads and reduces byte-identically**
+— the whole data library (`BOOL`/`NAT`/`INT`/`RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION`, and the container
+library `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* **the reflection core**: `META-LEVEL` builds, and its descent
+family (`metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/`metaSearchPath`/… + the
+`format`-attribute display) computes byte-identically (`roadmap.md` item 3(c), Stages 1–3.5). **Next:** the
+META `up*`/query/parse layer (`upModule`/`metaParse`/`metaPrettyPrint`/the sort-kind queries — Stage 4),
+then the strategy language, then objects/IO. See `roadmap.md`.
 
 ## Crate layout
 

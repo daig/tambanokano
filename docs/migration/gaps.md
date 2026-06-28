@@ -220,6 +220,7 @@ are parameter-substituted so the chain name collapses level by level. So `NAT-LI
 build & reduce, the `[_]`-list `LIST*`/`SET*` build, and the `SORTABLE-LIST` family loads — `SORTABLE-LIST
 {Nat<}` sorts byte-identically. A duplicate `if_then_else_fi` (a parameter theory's `protecting BOOL` and a
 regular `BOOL` import) is folded by an idempotent Branch re-attach. Verified by
-`conformance/{instantiation-chained,view-parameterized,eq-bracket-rhs}.maude`. The only prelude modules that
-still don't build are `META-LEVEL` (Tier 3) and the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the
-`[object]` attribute (Phase 2 item 5).
+`conformance/{instantiation-chained,view-parameterized,eq-bracket-rhs}.maude`. `META-LEVEL` (Tier 3) now
+builds too, and its reflection core computes byte-identically (roadmap item 3(c), Stages 1–3.5); the only
+prelude modules that still don't build are the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]`
+attribute (Phase 2 item 5).

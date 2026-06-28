@@ -15,12 +15,15 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > instantiation `M{V}` + all of "Axis A": op-maps, parameterized views, dedup, theory/module sorts, and
 > free-vs-bound nested instantiation — all three argument kinds — incl. cross-kind ad-hoc overloading) — a
 > pure `tnk-modules` `PreModule` transform, kernel unchanged. Everything above is conformance-verified.
-> **The real Maude prelude now loads: `BOOL`, `NAT`, `LIST{Nat}` reduce byte-identically** (poly/`Universal`
-> per-kind expansion, NAT bignum codes, module-local var aliases, AU identity-collapse — `roadmap.md` item 3).
-> **→ IMMEDIATE NEXT: finish the container library** (`EXT-BOOL`/`SET`/`MAP`/`ARRAY` — needs the `[Sort]` kind
-> notation + ACU/CUI collapse), then the remaining built-in data types (`INT`/`RAT`/`FLOAT`/`STRING`/`QID`,
-> mostly more op codes). **L7 Reflection/meta** (the prelude's `META-LEVEL` wall), **L8 Symbolic** — NOT
-> STARTED (Phase 3). Feature inventory (§3) = the Phase-2/3 to-do list.
+> **The real Maude prelude loads and reduces byte-identically** — the whole data library (`BOOL`/`NAT`/`INT`/
+> `RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION` + the containers `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* the
+> reflection core: `META-LEVEL` builds, and its descent family (`metaReduce`/`metaRewrite`/`metaApply`/
+> `metaMatch`/`metaSearch`/`metaSearchPath`/… + the `format`-attribute display) computes byte-identically
+> (`roadmap.md` item 3(c), Stages 1–3.5).
+> **→ IMMEDIATE NEXT: the META `up*`/query/parse layer** (`upModule`/`metaParse`/`metaPrettyPrint`/the
+> sort-kind queries — Stage 4), then the strategy language, then objects/IO. **L7 Reflection/meta** core is
+> done; its **symbolic** half (unify/variant/narrow) and **L8 Symbolic** are Phase 3.2/3.3 (NOT STARTED).
+> Feature inventory (§3) = the remaining to-do list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*
