@@ -6,10 +6,21 @@
 //! flatten+build pipeline), down-translate the subject meta-term into that module, run the engine
 //! operation, and **up**-translate the result back into the meta-level engine (via `ctx`).
 //!
-//! Scope so far: `metaReduce`/`metaNormalize` over a module given as an **import expression**
-//! (`[Q]` = `sth Q is including Q . … endsth`, the `['NAT]`/`['BOOL]` form) — its sorts/ops/equations come
-//! from the imported, db-resolved modules. A meta-module with *inline* declarations (what `upModule`
-//! emits) is a follow-on (`down_module` returns `None` for it → the redex stays at the kind level).
+//! Scope (Stages 1–3): the whole **rewriting/matching/search family** computes over a down-translated
+//! object module — `metaReduce`/`metaNormalize` (→ `ResultPair`), `metaRewrite`/`metaFrewrite` (rule-/
+//! position-fair), `metaMatch`/`metaXmatch` (→ `Substitution?`/`MatchPair?` + the hole context),
+//! `metaApply`/`metaXapply` (a labelled rule at the top / any position → `ResultTriple?`/`Result4Tuple?`),
+//! `metaSearch`/`metaSearchPath` (BFS reachability → `ResultTriple?` / the witness `Trace`). The module
+//! argument may be an **import expression** (`[Q]` = `sth Q is including Q . … endsth`) *or* a module with
+//! **inline declarations** (sorts/subsorts/attributed ops/membs/eqs/rules) — `down_module` reconstructs the
+//! full `PreModule`, runs the ordinary flatten+build, then installs the inline statements via
+//! `down_term_to_term` (a `Term`-producing down-translation). Term-level up (`up_term`) and the first of
+//! the declaration-level up maps (`up_pattern`/`up_rule`) live here; the rest of the `up*` family
+//! (`upModule`/`upSorts`/…) + the sort/kind queries + `metaParse`/`metaPrettyPrint` are Stage 4. Symbolic/
+//! SMT/strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3). Residuals (`gaps.md` / the roadmap):
+//! conditional-rule `metaApply` + conditioned `metaMatch` (the condition solver), a non-empty partial
+//! substitution, the AC-residue `metaXmatch` context, and `format`-attribute mixfix layout — values and
+//! rewrite counts conform throughout.
 
 use std::collections::BTreeSet;
 
