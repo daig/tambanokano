@@ -67,18 +67,19 @@ correctness fix.
   the `xmatch` command's solution *set*, not reduce/rewrite. The optimized matcher is also a prerequisite for
   heavy AC `search`.
 - **Chained multi-level instantiation (`LIST{STRICT-WEAK-ORDER}{X}`) — the SORTABLE-LIST family.** The
-  parameterized *view declarations* now parse (`view List{X :: TRIV} from TRIV to LIST{X}`), and a renaming
-  over a **structured** sort now parses too (`* (sort NeList{Qid} to NeQidList)`), so the metalevel's simple
-  container instantiations build and reduce byte-identically — `NAT-LIST`/`QID-LIST`/`QID-SET` (verified vs
-  the loaded prelude; `conformance/view-parameterized.maude` + `view_parameterized_through_repl` cover the
-  mechanism on hand-rolled modules). What remains is the **chained** form `M{A}{B}` (and triple `M{A}{B}{C}`)
-  that the `WEAKLY-SORTABLE-LIST`/`SORTABLE-LIST`/`SORTABLE-LIST-AND-SET`/`LIST*`/`SET*` modules use: it
-  parses but `flatten` produces a malformed sort name (`unknown sort STRICT-WEAK-ORDER}{X$Elt`) — the Axis-A5
-  *last-level substitution* residual (a `tnk-modules` flatten gap, not the kernel — the kernel already nests
-  containers). Off the data path and off the `META-LEVEL` path (the metalevel uses only the simple
-  instantiations). *(The earlier `id:`-attribute parse bug that blocked `MAP`/`ARRAY` is **fixed**; so is the
-  structured-sort **renaming** parse — `renaming()` now uses `sort_name`, and `sort_name` reads a chain of
-  `{…}` groups.)*
+  view-frontend is otherwise done: parameterized *view declarations* parse (`view List{X :: TRIV} from TRIV
+  to LIST{X}`), renamings over a **structured** sort parse (`* (sort NeList{Qid} to NeQidList)`, via
+  `renaming()` → `sort_name`, which reads a chain of `{…}` groups), and the eq parser handles a `[_]`-list
+  rhs / a trailing `[owise]` (split at the last top-level `=`, peel `[attrs]` only when it really is
+  attributes). So the metalevel's simple container instantiations build & reduce byte-identically
+  (`NAT-LIST`/`QID-LIST`/`QID-SET`), the standalone `[_]`-list modules `LIST*`/`SET*` build, and the
+  data-type containers are unaffected. **What remains** is the **chained** form `M{A}{B}` (and triple
+  `M{A}{B}{C}`) used by `WEAKLY-SORTABLE-LIST`/`SORTABLE-LIST`/`SORTABLE-LIST-AND-SET` (+ their `'`
+  variants): it *parses* but `flatten` produces a malformed sort name (`unknown sort
+  STRICT-WEAK-ORDER}{X$Elt`) — the **Axis-A5 last-level-substitution residual** (a `tnk-modules` flatten
+  gap; the kernel already nests containers). This is the same residual already tracked under "Chained-
+  instantiation import substitution (Axis-A5 kind 1)" below and on roadmap item 2. Off the data path and
+  off the `META-LEVEL` path. Coverage: `conformance/view-parameterized.maude`, `conformance/eq-bracket-rhs.maude`.
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.

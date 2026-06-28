@@ -53,12 +53,13 @@ prelude load.
      ACU** matching (`E in (E, S)` — the pure path now deep-equal-checks pre-bound vars), the **assoc-list
      separator spacing**, and the **`id:`-attribute parse** bug (`collect_until(["]"])` swallowed `prec`/
      `format`, defaulting the constructor precedence). CUI collapse is unneeded (no comm-only-with-`id:` op).
-     The parameterized container **views** now **parse** (`view List{X :: TRIV} … to LIST{X}`) and a renaming
-     over a **structured** sort parses (`* (sort NeList{Qid} to NeQidList)`), so the metalevel's simple
-     container instantiations build & reduce byte-identically — `NAT-LIST`/`QID-LIST`/`QID-SET`
-     (`conformance/view-parameterized.maude` covers the mechanism). *Remaining:* **chained** multi-level
-     instantiation `M{A}{B}` (the SORTABLE-LIST family / `LIST*`/`SET*`) — it parses but `flatten` mangles the
-     last-level sort substitution (Axis-A5 residual, `gaps.md`); off the data + `META-LEVEL` paths.
+     The parameterized container **views** parse (`view List{X :: TRIV} … to LIST{X}`), renamings over a
+     **structured** sort parse (`* (sort NeList{Qid} to NeQidList)`), and the eq parser handles a `[_]`-list
+     rhs / trailing `[owise]` — so the metalevel's simple container instantiations build & reduce
+     byte-identically (`NAT-LIST`/`QID-LIST`/`QID-SET`) and the standalone `[_]`-list `LIST*`/`SET*` build
+     (`conformance/view-parameterized.maude`, `eq-bracket-rhs.maude`). *Remaining:* **chained** multi-level
+     instantiation `M{A}{B}` (the SORTABLE-LIST family) — it parses but `flatten` mangles the last-level sort
+     substitution (the Axis-A5 residual on item 2 / `gaps.md`); off the data + `META-LEVEL` paths.
    - **(b) The remaining built-in data types — ✅ DONE.** `INT` (`abs`, `~`, signed two's-complement
      bitwise), `RAT`, `FLOAT` (the full op set — `rem`/`^`/`floor`/`ceiling`/`min`/`max`/`exp`/`log`/trig —
      and Maude's **partiality**: `/0` and out-of-domain NaN don't reduce, leaving the term at kind `[Float]`,

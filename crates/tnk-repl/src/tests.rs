@@ -489,6 +489,26 @@ fn view_parameterized_through_repl() {
     );
 }
 
+/// The eq parser splits a statement body at the **last** top-level `=` and peels a trailing `[attrs]`
+/// only when its first inner token is an attribute keyword — so an equation with a `[_]`-list rhs
+/// (`eq rev([X] L) = rev(L) [X] .`) keeps its bracketed term, and one ending in `[owise]` is still
+/// recognised as an owise equation. (This is what the `[_]`-list modules `LIST*`/`SET*` need; it also
+/// fixed a Tier-2 regression where the `=[`-of-`_=[_]_` heuristic wrongly skipped a separator `= [`.)
+#[test]
+fn eq_bracket_rhs_through_repl() {
+    let out = repl().eval(conformance_file!("eq-bracket-rhs.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result BList: [c] [b] [a]", // rev([a] [b] [c]) — `[X]`-rhs equation
+            "result Elt: a",             // headOr([a] [b], c) — `[X] L` pattern matches
+            "result Elt: c",             // headOr(nil, c) — falls to the `[owise]` equation
+        ],
+        "`[_]`-list rhs + `[owise]` peel: {out}"
+    );
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

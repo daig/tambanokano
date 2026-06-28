@@ -1,0 +1,26 @@
+*** Regression: the eq parser splits at the LAST top-level `=` and peels a trailing `[attrs]` only when
+*** it really is attributes — so an equation with a `[_]`-list rhs (`= rev(L) [X]`) and one ending in
+*** `[owise]` both parse (a `[_]`-list term is not mistaken for an attribute group, and `= [..]` is not
+*** mistaken for the `=[` of `_=[_]_`). Self-contained; oracle is this file through Maude 3.
+
+fmod BLIST is
+  sorts Elt BList .
+  ops a b c : -> Elt [ctor] .
+  op nil : -> BList [ctor] .
+  op [_] : Elt -> BList [ctor] .
+  op __ : BList BList -> BList [ctor assoc id: nil prec 25] .
+  var X Y : Elt .
+  var L : BList .
+
+  op rev : BList -> BList .
+  eq rev(nil) = nil .
+  eq rev([X] L) = rev(L) [X] .
+
+  op headOr : BList Elt -> Elt .
+  eq headOr([X] L, Y) = X .
+  eq headOr(L, Y) = Y [owise] .
+endfm
+
+red in BLIST : rev([a] [b] [c]) .
+red in BLIST : headOr([a] [b], c) .
+red in BLIST : headOr(nil, c) .

@@ -22,6 +22,71 @@ pub struct Parser<'a> {
     i: &'a Interner,
 }
 
+/// The index of a top-level token (depth 0 over `()`/`[]`/`{}`) whose text is `kw` — the `last`
+/// occurrence (the equation separator `=`, *past* the `=[` of a `_=[_]_` in the lhs) or the first (the
+/// `ceq` `if`). Used to split a [`Parser::collect_to_dot`] statement body.
+fn top_level_find(toks: &[Token], i: &Interner, kw: &str, last: bool) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut found = None;
+    for (idx, t) in toks.iter().enumerate() {
+        match i.resolve(t.sym) {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth -= 1,
+            s if depth == 0 && s == kw => {
+                found = Some(idx);
+                if !last {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Peel a trailing top-level statement-attribute group `[ owise | nonexec | metadata … ]` off `body`,
+/// returning the execution-relevant flags. A trailing `[ … ]` is attributes **only** when its first
+/// inner token is a statement-attribute keyword — otherwise it is a `[_]`-list / `{_}`-set *term* (e.g.
+/// the rhs of `eq reverse([E P]) = [$reverse(P, E)] .`), which is left in `body`.
+fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
+    let mut sa = StmtAttrs::default();
+    if body.last().map(|t| i.resolve(t.sym)) != Some("]") {
+        return sa;
+    }
+    // The matching `[` of the trailing `]` (scan from the end).
+    let mut depth = 0i32;
+    let mut open = None;
+    for idx in (0..body.len()).rev() {
+        match i.resolve(body[idx].sym) {
+            "]" | ")" | "}" => depth += 1,
+            "[" | "(" | "{" => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = open else { return sa };
+    let is_attr_kw = |s: &str| {
+        matches!(s, "owise" | "nonexec" | "label" | "metadata" | "print" | "format" | "variant" | "narrowing")
+    };
+    if !body.get(open + 1).map(|t| i.resolve(t.sym)).is_some_and(is_attr_kw) {
+        return sa; // a `[_]`-list / `{_}`-set term, not attributes
+    }
+    for t in &body[open + 1..body.len() - 1] {
+        match i.resolve(t.sym) {
+            "owise" => sa.owise = true,
+            "nonexec" => sa.nonexec = true,
+            _ => {}
+        }
+    }
+    body.truncate(open);
+    sa
+}
+
 impl<'a> Parser<'a> {
     pub fn new(toks: &'a [Token], i: &'a Interner) -> Self {
         Parser { toks, pos: 0, i }
@@ -33,9 +98,6 @@ impl<'a> Parser<'a> {
     }
     fn peek_text(&self) -> Option<&'a str> {
         self.peek().map(|t| self.i.resolve(t.sym))
-    }
-    fn peek_nth_text(&self, n: usize) -> Option<&'a str> {
-        self.toks.get(self.pos + n).map(|t| self.i.resolve(t.sym))
     }
     fn at(&self, kw: &str) -> bool {
         self.peek_text() == Some(kw)
@@ -96,16 +158,33 @@ impl<'a> Parser<'a> {
         while let Some(t) = self.peek() {
             let txt = self.i.resolve(t.sym);
             if depth == 0 && (t.kind == TokKind::Dot || terms.contains(&txt)) {
-                // A `=` glued to a following `[` is the `=[` fragment of the `_=[_]_` operator (the only
-                // prelude operator name that yields a bare `=` token — `==`/`=/=`/`=>` lex whole), not the
-                // equation separator. Keep collecting so `eq X =[Z] Y = …` splits at the *second* `=`.
-                if !(txt == "=" && self.peek_nth_text(1) == Some("[")) {
-                    break;
-                }
+                break;
             }
             match txt {
                 "(" => depth += 1,
                 ")" => depth -= 1,
+                _ => {}
+            }
+            out.push(t);
+            self.advance();
+        }
+        out
+    }
+
+    /// Collect a whole statement body up to the top-level terminator `.` (left unconsumed), tracking
+    /// `()`/`[]`/`{}` depth so a bracketed sub-term — a `[_]`-list rhs, a `{_}` set, a structured sort —
+    /// does not look like a delimiter. The caller then splits the body (separator `=`, `if`, attributes)
+    /// with [`top_level_find`] / [`peel_stmt_attrs`].
+    fn collect_to_dot(&mut self) -> Vec<Token> {
+        let mut depth = 0i32;
+        let mut out = Vec::new();
+        while let Some(t) = self.peek() {
+            if depth == 0 && t.kind == TokKind::Dot {
+                break;
+            }
+            match self.i.resolve(t.sym) {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth -= 1,
                 _ => {}
             }
             out.push(t);
@@ -488,24 +567,27 @@ impl<'a> Parser<'a> {
             "eq" | "ceq" => {
                 let conditional = kw == "ceq";
                 self.advance();
-                let lhs = self.collect_until(&["="]);
-                self.eat("=")?;
-                // The rhs (and a condition) end at the optional trailing attribute `[ … ]` (e.g.
-                // `[owise]`) or the terminator `.`; stop the bubble at `[` so the attribute is not
-                // swallowed into the term. (A rhs term containing a top-level `[` would need smarter
-                // delimiting — none in the conformance suite.)
-                let (rhs, cond);
-                if conditional {
-                    rhs = self.collect_until(&["if"]);
-                    self.eat("if")?;
-                    cond = Some(self.collect_until(&["["]));
-                } else {
-                    rhs = self.collect_until(&["["]);
-                    cond = None;
-                }
-                let sa = self.stmt_attrs()?;
+                // Collect the whole statement body (depth-aware over `()[]{}`) and split it, rather than
+                // streaming to the first `=`/`[`: a `[_]`-list term (`eq reverse([]) = [] .`) has top-level
+                // brackets in the rhs, and the `_=[_]_` operator (`eq X =[Z] Y = … .`) puts a top-level `=`
+                // in the lhs. So: peel a trailing `[attrs]` (only when it really is attributes, not a list),
+                // split a `ceq` at the top-level `if`, and split lhs/rhs at the **last** top-level `=`.
+                let mut body = self.collect_to_dot();
                 self.eat_dot()?;
-                m.statements.push(Statement::Eq { lhs, rhs, cond, owise: sa.owise, nonexec: sa.nonexec });
+                let sa = peel_stmt_attrs(&mut body, self.i);
+                let cond = if conditional {
+                    let i = top_level_find(&body, self.i, "if", false)
+                        .ok_or("`ceq` is missing its `if` condition")?;
+                    let c = body.split_off(i + 1);
+                    body.pop(); // the `if`
+                    Some(c)
+                } else {
+                    None
+                };
+                let eq = top_level_find(&body, self.i, "=", true).ok_or("equation is missing `=`")?;
+                let rhs = body.split_off(eq + 1);
+                body.pop(); // the `=`
+                m.statements.push(Statement::Eq { lhs: body, rhs, cond, owise: sa.owise, nonexec: sa.nonexec });
             }
             "mb" | "cmb" => {
                 let conditional = kw == "cmb";
