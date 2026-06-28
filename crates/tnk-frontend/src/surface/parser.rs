@@ -324,22 +324,25 @@ impl<'a> Parser<'a> {
             self.eat("]")?;
             return Ok(format!("[{inner}]"));
         }
-        let base = self.name()?;
-        if !self.at("{") {
-            return Ok(base);
-        }
-        self.advance(); // {
-        let mut args = Vec::new();
-        loop {
-            args.push(self.sort_name()?);
-            if self.at(",") {
-                self.advance();
-            } else {
-                break;
+        let mut name = self.name()?;
+        // A *chain* of `{ … }` groups, not just one: a nested instantiation's renaming names the inner
+        // structured sort `NeList{STRICT-WEAK-ORDER}{X}` (Axis-A5), and `List{List{X}}` nests via the
+        // recursive arg parse. Reassembled into Maude's canonical no-space spelling.
+        while self.at("{") {
+            self.advance(); // {
+            let mut args = Vec::new();
+            loop {
+                args.push(self.sort_name()?);
+                if self.at(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
             }
+            self.eat("}")?;
+            name = format!("{name}{{{}}}", args.join(","));
         }
-        self.eat("}")?;
-        Ok(format!("{base}{{{}}}", args.join(",")))
+        Ok(name)
     }
 
     /// A view definition `view V [{X :: T, …}] from <expr> to <expr> is <maps> endv` (B-ii / Axis-A2). An
@@ -637,9 +640,11 @@ impl<'a> Parser<'a> {
         loop {
             match self.name()?.as_str() {
                 "sort" => {
-                    let from = self.name()?;
+                    // Structured sorts on both sides — a nested-instantiation renaming strips the inner
+                    // label: `sort NeList{STRICT-WEAK-ORDER}{X} to NeList{X}`.
+                    let from = self.sort_name()?;
                     self.eat("to")?;
-                    let to = self.name()?;
+                    let to = self.sort_name()?;
                     items.push(RenameItem::Sort { from, to });
                 }
                 "op" => {

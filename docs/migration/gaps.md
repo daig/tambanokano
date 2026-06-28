@@ -66,14 +66,19 @@ correctness fix.
   multi-element AU subject (residue splits Maude does not report at the top level) — pre-existing, affects only
   the `xmatch` command's solution *set*, not reduce/rewrite. The optimized matcher is also a prerequisite for
   heavy AC `search`.
-- **Parameterized *container views* (`view List{X :: TRIV} … to LIST{X}`) don't parse yet.** All four
-  container **modules** load and reduce (`EXT-BOOL`/`SET`/`MAP`/`ARRAY`, `conformance/prelude-{set,map,array}`),
-  but the prelude's parameterized *views* that let containers nest (`LIST{Set{Nat}}`) — `view List{X :: TRIV}`,
-  `Set{…}`, `Map{…}`, `Array{…}`, and the sortable-list views — hit a view-parser gap (`expected 'to', found
-  "{"` / `view map must be sort/op…`). A view-frontend follow-up, orthogonal to the data structures
-  themselves. *(The earlier `id:`-attribute parse bug that blocked `MAP`/`ARRAY` — `collect_until(["]"])`
-  swallowed `prec`/`format` into the identity bubble, defaulting the constructor's precedence and mis-parsing
-  a `_|->_`-entry argument — is **fixed**: `id:` now stops at the next attribute keyword.)*
+- **Chained multi-level instantiation (`LIST{STRICT-WEAK-ORDER}{X}`) — the SORTABLE-LIST family.** The
+  parameterized *view declarations* now parse (`view List{X :: TRIV} from TRIV to LIST{X}`), and a renaming
+  over a **structured** sort now parses too (`* (sort NeList{Qid} to NeQidList)`), so the metalevel's simple
+  container instantiations build and reduce byte-identically — `NAT-LIST`/`QID-LIST`/`QID-SET` (verified vs
+  the loaded prelude; `conformance/view-parameterized.maude` + `view_parameterized_through_repl` cover the
+  mechanism on hand-rolled modules). What remains is the **chained** form `M{A}{B}` (and triple `M{A}{B}{C}`)
+  that the `WEAKLY-SORTABLE-LIST`/`SORTABLE-LIST`/`SORTABLE-LIST-AND-SET`/`LIST*`/`SET*` modules use: it
+  parses but `flatten` produces a malformed sort name (`unknown sort STRICT-WEAK-ORDER}{X$Elt`) — the Axis-A5
+  *last-level substitution* residual (a `tnk-modules` flatten gap, not the kernel — the kernel already nests
+  containers). Off the data path and off the `META-LEVEL` path (the metalevel uses only the simple
+  instantiations). *(The earlier `id:`-attribute parse bug that blocked `MAP`/`ARRAY` is **fixed**; so is the
+  structured-sort **renaming** parse — `renaming()` now uses `sort_name`, and `sort_name` reads a chain of
+  `{…}` groups.)*
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.

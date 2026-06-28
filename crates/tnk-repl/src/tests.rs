@@ -468,6 +468,27 @@ fn prelude_tier2_through_repl() {
     assert!(out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5 in"), "counter: {out}");
 }
 
+/// The view-gap parser fix: a *parameterized* view declaration (`view V{X :: T} from T to M{X}`) and a
+/// renaming over a **structured** sort (`* (sort Box{ColorE} to ColorBox)`) both parse, so a parameterized
+/// module instantiated on a view + renamed builds and reduces. This is the pattern the metalevel's
+/// container helpers use on the builtin chain — `protecting LIST{Qid} * (sort NeList{Qid} to NeQidList)`
+/// (`QID-LIST`/`NAT-LIST`/`QID-SET`, verified byte-identical against the loaded prelude). Byte-identical to
+/// the reference. (Chained multi-level instantiation — `LIST{A}{B}`, the SORTABLE-LIST family — is the
+/// separate Axis-A5 residual in `gaps.md`.)
+#[test]
+fn view_parameterized_through_repl() {
+    let out = repl().eval(conformance_file!("view-parameterized.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result ColorBox: b(red, green)", // b(red, green)
+            "result ColorBox: b(red, green)", // b(green, red) — comm, same canonical form
+        ],
+        "parameterized-view instantiation + structured renaming: {out}"
+    );
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]
