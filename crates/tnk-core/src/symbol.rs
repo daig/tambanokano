@@ -177,6 +177,73 @@ pub enum SpecialOp {
     /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
     /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
     Division { nat: NatHooks },
+    /// A META-LEVEL **descent function** (Maude's `MetaLevelOpSymbol`): `metaReduce`/`metaApply`/… — a
+    /// reflective operator that down-translates its meta-term arguments into an object module, runs an
+    /// engine operation in it, and up-translates the result. The meta-representation symbols it needs are
+    /// resolved from the op's `op-hook` list into [`MetaHooks`]; `op` selects which descent function.
+    /// Symbolic / SMT / strategy descent ([`MetaOp::Deferred`]) is declared but stays at the kind level
+    /// (Phase 3.2/3.3).
+    Meta { op: MetaOp, hooks: std::rc::Rc<MetaHooks> },
+}
+
+/// Which META-LEVEL descent function a [`SpecialOp::Meta`] performs (Maude's `MetaLevelOpSymbol` code).
+/// The reflection-core functions (Phase 3.1) have their own variants; the symbolic/variant/narrowing,
+/// SMT, and strategy descent functions — gated on the BDD (D6) and Z3 (D7) backends and the strategy
+/// language (Phase 2 item 4) — collapse to [`MetaOp::Deferred`] (declared, inert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaOp {
+    Reduce,
+    Normalize,
+    Rewrite,
+    Frewrite,
+    Apply,
+    Xapply,
+    Match,
+    Xmatch,
+    Search,
+    SearchPath,
+    SortLeq,
+    SameKind,
+    LesserSorts,
+    GlbSorts,
+    LeastSort,
+    CompleteName,
+    GetKind,
+    GetKinds,
+    MaximalSorts,
+    MinimalSorts,
+    MaximalAritySet,
+    Parse,
+    PrettyPrint,
+    PrintToString,
+    WellFormedModule,
+    WellFormedTerm,
+    WellFormedSubstitution,
+    UpModule,
+    UpImports,
+    UpSorts,
+    UpSubsortDecls,
+    UpOpDecls,
+    UpMbs,
+    UpEqs,
+    UpRls,
+    UpStratDecls,
+    UpSds,
+    UpView,
+    UpTerm,
+    DownTerm,
+    /// Symbolic / SMT / strategy descent — declared so the tower loads, but inert (kind-level).
+    Deferred,
+}
+
+/// The meta-representation symbols a [`SpecialOp::Meta`] descent function needs, resolved from its
+/// operator's `op-hook`/`term-hook` list at module-build time and keyed by hook purpose
+/// (`qidSymbol`, `metaTermSymbol`, `succSymbol`, …). The down/up maps look these up to read and build
+/// meta-terms. (Populated in the reflection-core stage; empty while descent is inert.)
+#[derive(Debug, Clone, Default)]
+pub struct MetaHooks {
+    pub ops: std::collections::HashMap<String, SymbolId>,
+    pub terms: std::collections::HashMap<String, SymbolId>,
 }
 
 /// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes): IEEE `f64`

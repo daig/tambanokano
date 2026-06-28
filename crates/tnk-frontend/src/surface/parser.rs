@@ -730,13 +730,21 @@ impl<'a> Parser<'a> {
                     items.push(RenameItem::Sort { from, to });
                 }
                 "op" => {
-                    let from = self.name()?;
+                    // The from-name is a full mixfix name (may contain `,`, e.g. `_,_`): collect its
+                    // tokens up to the standalone `to` keyword, joined with no spaces into the canonical
+                    // name (`_` `,` `_` → `_,_`). A disambiguated `op f : dom -> range to g` is a
+                    // follow-up, rejected loudly.
+                    let from_toks = self.collect_until(&["to", ":"]);
                     if self.at(":") {
                         return Err("disambiguated op renaming `op f : … to g` is a B5 follow-up".into());
                     }
                     self.eat("to")?;
-                    let to = self.name()?;
-                    items.push(RenameItem::Op { from, to });
+                    // The to-name runs to the next item separator `,`, the attribute `[`, or `)`.
+                    let to_toks = self.collect_until(&[",", "[", ")"]);
+                    let attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
+                    let from: String = from_toks.iter().map(|t| self.i.resolve(t.sym)).collect();
+                    let to: String = to_toks.iter().map(|t| self.i.resolve(t.sym)).collect();
+                    items.push(RenameItem::Op { from, to, attrs });
                 }
                 other => {
                     return Err(format!("renaming item must start with `sort` or `op`, found `{other}`"));
@@ -1075,7 +1083,7 @@ endfm
                 assert!(matches!(&**base, ModuleExpr::Named(n) if n == "BAZ"));
                 assert_eq!(items.len(), 2);
                 assert!(matches!(&items[0], RenameItem::Sort { from, to } if from == "S" && to == "T"));
-                assert!(matches!(&items[1], RenameItem::Op { from, to } if from == "f" && to == "g"));
+                assert!(matches!(&items[1], RenameItem::Op { from, to, .. } if from == "f" && to == "g"));
             }
             other => panic!("expected Rename, got {other:?}"),
         }

@@ -148,6 +148,34 @@ fn prelude_results(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Stage 1 of META-LEVEL — the whole reflective tower loads. The real prelude through `META-LEVEL`
+/// (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL) parses and builds with **no errors** (the descent
+/// functions are declared via `MetaLevelOpSymbol`, inert for now). Three reduces prove the parse/flatten
+/// fixes this needed, byte-identically (value + 1-rewrite count) to the reference's preloaded modules:
+///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
+///     (grammar-aware, applied to QID-SET's `_,_` occurrences) gives a working idempotent `_;_` (`N ; N`).
+///   * `getName(fmod 'FOO is nil sorts none . none none none none endfm)` → `'FOO` — the **module
+///     constructor** `fmod_is_sorts_.____endfm`, whose name carries `.`/`is`/`endfm` fragments, parses
+///     inside an equation (the `input_complete` chunker no longer mistakes those fragments for module
+///     delimiters) and the projection equation fires.
+///   * `getRls(…)` → `(none).RuleSet` — a bare **overloaded `none`** on the rhs, disambiguated by the
+///     lhs kind (kind-homogeneous equation parsing).
+#[test]
+fn prelude_meta_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "META tower builds: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[1] NeSortSet: 'a ; 'b",
+            "[1] Sort: 'FOO",
+            "[1] RuleSet: (none).RuleSet",
+        ],
+        "META tower reduces: {out}"
+    );
+}
+
 /// Container milestone — the real prelude's `MAP{Nat, Nat}` loads and reduces byte-identically. Proves
 /// two-parameter instantiation, the `[Y$Elt]` kind range (via `inst_sort`), and the `id:`-attribute
 /// parse fix (an `_,_ [assoc comm id: empty prec 121]` keeps its prec, so a `_|->_` entry parses as an

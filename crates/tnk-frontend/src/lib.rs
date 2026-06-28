@@ -15,5 +15,6 @@ pub mod grammar;
 pub mod lex;
 pub mod load;
 pub mod pretty;
+pub mod rename_terms;
 pub mod sig;
 pub mod surface;

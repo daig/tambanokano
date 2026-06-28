@@ -13,7 +13,7 @@ use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
-use crate::grammar::Nt;
+use crate::grammar::{Nt, NtType};
 use crate::lex::{tokenize, Interner, Token};
 use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::{Arrow, Search};
-use tnk_core::sort::SortId;
+use tnk_core::sort::{KindId, SortId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
 /// A fully loaded module: its kernel state (signature + statements) and its mixfix grammar (for parsing
@@ -101,7 +101,7 @@ fn load_statements(
                     Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                     None => Vec::new(),
                 };
-                let rhs_t = parse_build(rhs, g, m, i, &mut vars)?;
+                let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
                 let nr = vars.count();
                 // Capture the source-form trace metadata before the Terms are moved into the kernel; the
                 // kernel returns the dense equation id, which must index `eq_traces` (asserted).
@@ -158,7 +158,7 @@ fn load_statements(
                     Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                     None => Vec::new(),
                 };
-                let rhs_t = parse_build(rhs, g, m, i, &mut vars)?;
+                let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
                 let nr = vars.count();
                 let trace = RlTrace {
                     lhs: lhs_t.clone(),
@@ -363,6 +363,48 @@ fn parse_build(
     vars: &mut VarIndex,
 ) -> Result<Term, String> {
     build_term(&parse_forest(tokens, g, i)?, g, m, tokens, i, vars)
+}
+
+/// The kind of a built term's top — its top symbol's range, or `None` for a bare variable (whose kind we
+/// don't constrain against). Used to parse an equation's rhs in the *same* kind as its lhs.
+fn term_kind(t: &Term, m: &BuiltModule) -> Option<KindId> {
+    t.top_symbol().map(|s| m.engine.symbol_kind(s))
+}
+
+/// Parse + build the rhs of an equation/rule **kind-homogeneously** with its lhs: an equation's two sides
+/// share one kind, so a bare overloaded constant (`none` — declared at a dozen sorts across META-MODULE)
+/// is disambiguated by the lhs's kind, exactly as Maude parses `eq … = none .`. The rhs is parsed at the
+/// lhs kind's term nonterminal; if that yields no parse (a malformed/cross-kind rhs), we fall back to the
+/// unconstrained universal start so the original error surfaces.
+fn parse_build_rhs(
+    rhs: &[Token],
+    lhs: &Term,
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<Term, String> {
+    if let Some(k) = term_kind(lhs, m) {
+        let start = Nt::Comp(k, NtType::Term);
+        if let Ok(tree) = parse_forest_at(rhs, g, i, start) {
+            return build_term(&tree, g, m, rhs, i, vars);
+        }
+    }
+    parse_build(rhs, g, m, i, vars)
+}
+
+/// Like [`parse_forest`] but starting at an arbitrary nonterminal (a per-kind term nonterminal), to parse
+/// a bubble constrained to one kind.
+fn parse_forest_at(tokens: &[Token], g: &CompiledGrammar, i: &Interner, start: Nt) -> Result<PTree, String> {
+    if tokens.is_empty() {
+        return Err("empty term".into());
+    }
+    let chart = earley::parse(g, tokens, start, i);
+    let parsed = forest::extract(g, &chart, tokens.len(), start).map_err(|e| format!("{e}"))?;
+    if parsed.ambiguous {
+        return Err("ambiguous parse".into());
+    }
+    Ok(parsed.tree)
 }
 
 /// Resolve a sort token bubble to a [`SortId`]. A plain sort is one token; a **structured** sort

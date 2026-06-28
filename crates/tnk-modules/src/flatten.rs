@@ -575,9 +575,10 @@ fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) ->
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
                     },
-                    RenameItem::Op { from, to } => RenameItem::Op {
+                    RenameItem::Op { from, to, attrs } => RenameItem::Op {
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
+                        attrs: attrs.clone(),
                     },
                 })
                 .collect();
@@ -808,7 +809,7 @@ fn canonical_key(expr: &ModuleExpr) -> String {
                 .iter()
                 .map(|it| match it {
                     RenameItem::Sort { from, to } => format!("sort {from} to {to}"),
-                    RenameItem::Op { from, to } => format!("op {from} to {to}"),
+                    RenameItem::Op { from, to, .. } => format!("op {from} to {to}"),
                 })
                 .collect();
             format!("({} * ({}))", canonical_key(inner), parts.join(", "))

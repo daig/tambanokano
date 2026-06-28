@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
-    BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -467,9 +467,66 @@ fn special_op(
                 bool_: bool_hooks(spec, name_to_sym, i),
             },
         },
+        // META-LEVEL descent functions (`metaReduce`/`metaApply`/…). The reflection core computes; the
+        // symbolic/SMT/strategy descent is declared but inert (Phase 3.2/3.3). Hooks are resolved in the
+        // reflection-core stage; here they are left empty (descent stays at the kind level).
+        "MetaLevelOpSymbol" => SpecialOp::Meta {
+            op: meta_op(code.ok_or("MetaLevelOpSymbol code")?),
+            hooks: std::rc::Rc::new(MetaHooks::default()),
+        },
         other => return Err(format!("unsupported special id-hook `{other}`")),
     };
     Ok(Some(op))
+}
+
+/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. The reflection-core
+/// functions have dedicated variants; symbolic/variant/narrowing, SMT, and strategy descent map to
+/// [`MetaOp::Deferred`] (declared, inert — Phase 3.2/3.3).
+fn meta_op(code: &str) -> MetaOp {
+    match code {
+        "metaReduce" => MetaOp::Reduce,
+        "metaNormalize" => MetaOp::Normalize,
+        "metaRewrite" => MetaOp::Rewrite,
+        "metaFrewrite" => MetaOp::Frewrite,
+        "metaApply" => MetaOp::Apply,
+        "metaXapply" => MetaOp::Xapply,
+        "metaMatch" => MetaOp::Match,
+        "metaXmatch" => MetaOp::Xmatch,
+        "metaSearch" => MetaOp::Search,
+        "metaSearchPath" => MetaOp::SearchPath,
+        "metaSortLeq" => MetaOp::SortLeq,
+        "metaSameKind" => MetaOp::SameKind,
+        "metaLesserSorts" => MetaOp::LesserSorts,
+        "metaGlbSorts" => MetaOp::GlbSorts,
+        "metaLeastSort" => MetaOp::LeastSort,
+        "metaCompleteName" => MetaOp::CompleteName,
+        "metaGetKind" => MetaOp::GetKind,
+        "metaGetKinds" => MetaOp::GetKinds,
+        "metaMaximalSorts" => MetaOp::MaximalSorts,
+        "metaMinimalSorts" => MetaOp::MinimalSorts,
+        "metaMaximalAritySet" => MetaOp::MaximalAritySet,
+        "metaParse" => MetaOp::Parse,
+        "metaPrettyPrint" => MetaOp::PrettyPrint,
+        "metaPrintToString" => MetaOp::PrintToString,
+        "metaWellFormedModule" => MetaOp::WellFormedModule,
+        "metaWellFormedTerm" => MetaOp::WellFormedTerm,
+        "metaWellFormedSubstitution" => MetaOp::WellFormedSubstitution,
+        "metaUpModule" => MetaOp::UpModule,
+        "metaUpImports" => MetaOp::UpImports,
+        "metaUpSorts" => MetaOp::UpSorts,
+        "metaUpSubsortDecls" => MetaOp::UpSubsortDecls,
+        "metaUpOpDecls" => MetaOp::UpOpDecls,
+        "metaUpMbs" => MetaOp::UpMbs,
+        "metaUpEqs" => MetaOp::UpEqs,
+        "metaUpRls" => MetaOp::UpRls,
+        "metaUpStratDecls" => MetaOp::UpStratDecls,
+        "metaUpSds" => MetaOp::UpSds,
+        "metaUpView" => MetaOp::UpView,
+        "metaUpTerm" => MetaOp::UpTerm,
+        "metaDownTerm" => MetaOp::DownTerm,
+        // Symbolic (unification/variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
+        _ => MetaOp::Deferred,
+    }
 }
 
 fn num_op(code: &str) -> R<NumOp> {

@@ -463,17 +463,40 @@ impl Repl {
         }
         let toks = tokenize(input, &mut self.interner);
         let Some(last) = toks.last().copied() else { return false };
+        // Track module nesting, but only count a module keyword (`fmod`/`endfm`/…) when it is a real
+        // delimiter: at bracket depth 0 and in statement-leading position. The meta-level's
+        // module-constructor operators put `fmod`/`is`/`sorts`/`endfm` *inside* a term
+        // (`getName(fmod Q is … endfm) = Q`), where they are operator-name fragments, not delimiters —
+        // counting those would close the module early and submit it without its `endfm`.
+        let is_close = |s: &str| matches!(s, "endfm" | "endm" | "endfth" | "endth" | "endv");
         let mut open = false;
+        let mut saw_open = false;
+        let mut depth = 0i32;
+        let mut leading = true; // start, just after a depth-0 `.`, or just after a module delimiter
         for t in &toks {
-            match self.interner.resolve(t.sym) {
-                "fmod" | "mod" | "fth" | "th" | "view" => open = true,
-                "endfm" | "endm" | "endfth" | "endth" | "endv" => open = false,
+            let txt = self.interner.resolve(t.sym);
+            // An *open* keyword only starts a module in statement-leading position at depth 0: this keeps
+            // a command's module-constructor term (`reduce metaReduce(['NAT], …)` / `red fmod … endfm .`)
+            // from looking like a module. A *close* keyword only counts at depth 0, so the meta-level's
+            // module-constructor operators (`getName(fmod Q is … endfm)`) — whose `endfm` is an
+            // operator-name fragment inside brackets — never close the surrounding module early.
+            if depth == 0 && leading && matches!(txt, "fmod" | "mod" | "fth" | "th" | "view") {
+                open = true;
+                saw_open = true;
+            }
+            if depth == 0 && is_close(txt) {
+                open = false;
+            }
+            match txt {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth -= 1,
                 _ => {}
             }
+            leading = (t.kind == TokKind::Dot && depth == 0) || is_close(txt);
         }
         let last_txt = self.interner.resolve(last.sym);
-        matches!(last_txt, "endfm" | "endm" | "endfth" | "endth" | "endv")
-            || (last.kind == TokKind::Dot && !open)
+        let module_closed = is_close(last_txt) && saw_open && !open && depth == 0;
+        module_closed || (last.kind == TokKind::Dot && depth == 0 && !open)
     }
 }
 

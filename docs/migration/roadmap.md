@@ -79,8 +79,28 @@ prelude load.
      range is its kind); and a **punctuation-aware `split_mixfix`** (so the `_=[_]_` / `<_,_,_>` / `[]` / `{}`
      operators whose names lex with brackets parse and print). Breadth, plus that handful of seams.
    - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
-     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. This is where
-     "load the prelude" meets reflection; the prelude's `.maude` source ports as-is once the hooks exist.
+     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **Stage 1
+     — the whole tower now parses and loads with no errors** (`conformance/prelude-meta.maude`,
+     `prelude_meta_through_repl`): the descent functions are declared via a new `SpecialOp::Meta`
+     (`MetaLevelOpSymbol` → `MetaOp`), currently **inert** (a `metaReduce(…)` stays at kind `[ResultPair]`,
+     like an unreduced partial op — the reflection-core stage fills in the behaviour). Getting there closed
+     five general parse/flatten gaps the meta-modules are the first to hit (none specific to reflection):
+     **grammar-aware mixfix op renaming** (`op _,_ to _;_ [prec 43]` over QID-SET — an operator comma vs an
+     argument separator can only be told apart by parsing, so the source module's parser marks the operator
+     occurrences; the optional `[…]` overrides the target op's attributes); **two-instantiation constant
+     disambiguation** (NAT-LIST + QID-LIST both inline LIST's `nil`, so a bare `nil` is sort-qualified
+     `(nil).NatList`/`(nil).QidList` on inline — the constant analogue of the existing variable inlining);
+     the **`input_complete` chunker** counting `fmod`/`endfm` only as real delimiters (depth-0, statement-
+     leading), not as the meta module-constructor operators' name fragments (`getName(fmod Q is … endfm)`);
+     **kind-homogeneous equation parsing** (a bare overloaded `none` rhs parses at the lhs's kind); and the
+     module-constructor operators whose names carry `.`/`is`/`endfm` fragments. **Stage 2+ (the reflection
+     core):** the up/down maps (`upTerm`/`downTerm`, `upModule`/`downModule`, the `up*` family) and the
+     computing descent functions — `metaReduce`/`metaNormalize`, the rewriting/matching/search family, the
+     sort/kind queries, `metaParse`/`metaPrettyPrint`, `metaWellFormed*`. The symbolic (unify/variant/
+     narrow), SMT, and strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3, the D6/D7 backends).
+     Reflection-core prerequisites surfaced in Stage 1 (`gaps.md`): the `<Qids>` Qid→Sort/Constant/Variable
+     classification, ad-hoc-overloaded-constant resolution at the command top level, and `format`-attribute
+     pretty-printing.
    - Residuals, off the reduce path (`gaps.md`): the parameterized **sortable-list views** parse gap
      (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
      number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput

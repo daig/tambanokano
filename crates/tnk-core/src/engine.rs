@@ -17,7 +17,7 @@ use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
-use crate::sort::{SortId, Sorts};
+use crate::sort::{KindId, SortId, Sorts};
 use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
@@ -543,6 +543,11 @@ impl Signature {
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
+    }
+
+    /// The kind of `id`'s first declaration's range.
+    pub(crate) fn symbol_range_kind(&self, id: SymbolId) -> KindId {
+        self.sorts.kind_of(self.symbols.get(id).decls[0].range)
     }
 
     /// Attach an additional declaration to an existing operator (ad-hoc / subsort overloading). All
@@ -2811,6 +2816,13 @@ impl Engine {
     }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
+    }
+
+    /// The kind (connected component) of `sym`'s result — its first declaration's range kind. Used by the
+    /// frontend to parse an equation's rhs in the same kind as its lhs (overloads that span kinds fall
+    /// back to unconstrained parsing).
+    pub fn symbol_kind(&self, id: SymbolId) -> KindId {
+        self.sig.symbol_range_kind(id)
     }
 
     // ---- DAG construction ----

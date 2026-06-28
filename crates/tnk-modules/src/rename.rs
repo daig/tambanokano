@@ -1,43 +1,66 @@
 //! Apply a renaming `* (sort A to B, op f to g)` to a flattened declaration bundle.
 //!
 //! Sort renaming substitutes the sort name everywhere it can appear: the `sorts`/`subsorts` lists, op
-//! domains/ranges, variable sorts, and (as a token) inside statement bubbles. Op renaming is scoped to
-//! **single-token** op names (prefix operators and constants), substituting the name token in op
-//! declarations and statement bubbles; renaming a **mixfix** op (`_+_`, `s_`) is a B5 follow-up and is
-//! rejected loudly. Substitution into raw statement bubbles is by exact token-text match, so a variable
-//! coincidentally named like a renamed sort/op would be caught too — self-contained tests avoid that.
+//! domains/ranges, variable sorts, and (as a token) inside statement bubbles. **Single-token** op
+//! renaming (prefix operators and constants, `empty to none`) substitutes the name token in op
+//! declarations and statement bubbles by exact text. A **mixfix** op renaming (`_,_ to _;_`) cannot be
+//! done by text — an operator comma and an argument separator are the same token (`delete(E, (E, S))`,
+//! `if E in S' then E, A else A fi`) — so it is done *grammar-aware*: build the source module's parser
+//! ([`OpRenamer`]), parse each term bubble, and replace only the literal fragment tokens at the
+//! parse-identified operator positions. The renaming's optional `[ … ]` overrides the target op's
+//! attributes (the prelude's `op _,_ to _;_ [prec 43]`).
 
-use std::collections::HashMap;
-use tnk_frontend::lex::{split_mixfix, Frag, Interner, Token};
-use tnk_frontend::surface::ast::{RenameItem, Statement};
+use std::collections::{HashMap, HashSet};
+use tnk_frontend::lex::{split_mixfix, tokenize, Frag, Interner, Token};
+use tnk_frontend::rename_terms::{literal_frags, OpRenamer};
+use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement};
 
 use crate::flatten::FlatDecls;
 
-/// Rewrite `d` under the renaming `items`. Returns an error if a mixfix op rename is requested.
+/// Rewrite `d` under the renaming `items`. The grammar-aware mixfix path may fail to build the source
+/// module's parser, which is surfaced as an `Err`.
 pub fn apply_renaming(
     mut d: FlatDecls,
     items: &[RenameItem],
     interner: &mut Interner,
 ) -> Result<FlatDecls, String> {
     let mut sort_map: HashMap<String, String> = HashMap::new();
-    let mut op_map: HashMap<String, String> = HashMap::new();
+    // Every op rename, as (from canonical name, to canonical name, attribute override).
+    let mut op_renames: Vec<(String, String, Attrs)> = Vec::new();
     for item in items {
         match item {
             RenameItem::Sort { from, to } => {
                 sort_map.insert(from.clone(), to.clone());
             }
-            RenameItem::Op { from, to } => {
-                let frags = split_mixfix(from, interner);
-                if frags.len() != 1 || !matches!(frags[0], Frag::Tok(_)) {
-                    return Err(format!(
-                        "renaming the mixfix op `{from}` is a B5 follow-up — only single-token op names \
-                         (prefix operators and constants) can be renamed"
-                    ));
-                }
-                op_map.insert(from.clone(), to.clone());
+            RenameItem::Op { from, to, attrs } => {
+                op_renames.push((from.clone(), to.clone(), attrs.clone()));
             }
         }
     }
+
+    // Single-token op renames (constants/prefix ops) substitute textually everywhere; a mixfix op
+    // rename needs grammar-aware term rewriting (only the parser can tell an operator fragment from an
+    // argument separator). Build that renamer over the **pre-rename** declarations, before any mutation.
+    let mixfix_pairs: Vec<(String, String)> = op_renames
+        .iter()
+        .filter(|(from, ..)| !is_single_token(from, interner))
+        .map(|(from, to, _)| (from.clone(), to.clone()))
+        .collect();
+    let renamer = OpRenamer::new(&premodule_of(&d), &mixfix_pairs, interner)?;
+
+    // Single-token op map (textual). Applied to statement bubbles and `id:` identity bubbles.
+    let single_op_map: HashMap<String, String> = op_renames
+        .iter()
+        .filter(|(from, ..)| is_single_token(from, interner))
+        .map(|(from, to, _)| (from.clone(), to.clone()))
+        .collect();
+    // Op-declaration rename map: canonical name → (target literal fragments, attribute override). Covers
+    // single + mixfix (literal-fragment surgery on the name tokens handles a constant `empty → none` and
+    // a mixfix `_,_ → _;_` alike).
+    let op_decl_map: HashMap<String, (Vec<String>, Attrs)> = op_renames
+        .iter()
+        .map(|(from, to, a)| (from.clone(), (literal_frags(to, interner), a.clone())))
+        .collect();
 
     // Declarations.
     rename_each(&mut d.sorts, &sort_map);
@@ -51,11 +74,25 @@ pub fn apply_renaming(
         if let Some(t) = sort_map.get(&op.range) {
             op.range = t.clone();
         }
-        if op.name.len() == 1 {
-            let text = interner.resolve(op.name[0].sym).to_string();
-            if let Some(t) = op_map.get(&text) {
-                op.name[0].sym = interner.intern(t);
+        let canon: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
+        if let Some((to_lits, ovr)) = op_decl_map.get(&canon) {
+            // Replace each literal (non-hole) fragment token of the name with the target's, in order;
+            // holes (`_`) are left in place.
+            let mut li = 0;
+            for t in &mut op.name {
+                if interner.resolve(t.sym) != "_" {
+                    if let Some(text) = to_lits.get(li) {
+                        t.sym = interner.intern(text);
+                    }
+                    li += 1;
+                }
             }
+            apply_attr_override(&mut op.attrs, ovr);
+        }
+        // The `id:` identity element is a constant — rename it like any other (single-token op / sort).
+        if let Some(idb) = &mut op.attrs.id {
+            subst_tokens(idb, &single_op_map, interner);
+            subst_tokens(idb, &sort_map, interner);
         }
     }
     for v in &mut d.vars {
@@ -64,35 +101,153 @@ pub fn apply_renaming(
         }
     }
 
-    // Statement bubbles: substitute by token text (sort and op names together — they don't collide).
-    let mut subst = sort_map;
-    subst.extend(op_map);
+    // Constants whose (final) range sort is a rename *target* are instance-specific (`nil : -> NatList`,
+    // the renamed `none : -> QidSet`): two instantiations of the same parameterized module (`NAT-LIST` +
+    // `QID-LIST` in `META-MODULE`) share the constant's name across distinct kinds, so a bare `nil` in an
+    // inlined equation parses ambiguously once both are merged. Sort-qualify each such occurrence as
+    // `(nil).NatList` — the parse-time kind selector is a no-op on the built term but disambiguates the
+    // overload. (The flattener already inlines *variables* as colon-vars for the same reason; this is the
+    // constant analogue.) Only renamed-sort constants are touched, so base constants (`true`, `0`) are not.
+    let targets: HashSet<&String> = sort_map.values().collect();
+    let const_qual: HashMap<String, Vec<Token>> = d
+        .ops
+        .iter()
+        .filter(|op| op.domain.is_empty() && targets.contains(&op.range))
+        .map(|op| {
+            let name: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
+            // `c` → `( c ) .Sort` with the dotted sort lexed as the qualifier grammar expects
+            // (`.NatList`, or `.List`,`{`,`Nat`,`}` for a structured target).
+            let suffix = tokenize(&format!(") .{}", op.range), interner);
+            (name, suffix)
+        })
+        .collect();
+    let lparen = tokenize("(", interner);
+
+    // Statement bubbles: op renames (mixfix grammar-aware, then textual sorts/single ops), then constant
+    // qualification.
     for st in &mut d.statements {
         match st {
             Statement::Eq { lhs, rhs, cond, .. } => {
-                subst_tokens(lhs, &subst, interner);
-                subst_tokens(rhs, &subst, interner);
+                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
+                rewrite_term(rhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 if let Some(c) = cond {
-                    subst_tokens(c, &subst, interner);
+                    rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
             }
             Statement::Mb { lhs, sort, cond, .. } => {
-                subst_tokens(lhs, &subst, interner);
-                subst_tokens(sort, &subst, interner);
+                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
+                subst_tokens(sort, &sort_map, interner);
                 if let Some(c) = cond {
-                    subst_tokens(c, &subst, interner);
+                    rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
             }
             Statement::Rule { lhs, rhs, cond, .. } => {
-                subst_tokens(lhs, &subst, interner);
-                subst_tokens(rhs, &subst, interner);
+                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
+                rewrite_term(rhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 if let Some(c) = cond {
-                    subst_tokens(c, &subst, interner);
+                    rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
             }
         }
     }
     Ok(d)
+}
+
+/// Expand each bare constant occurrence `c` (a key of `const_qual`) into the sort-qualified `( c ) .Sort`
+/// — disambiguating an overload shared across two instantiations. A single left-to-right pass: the
+/// emitted constant token is the original (never re-scanned).
+fn qualify_constants(
+    b: &[Token],
+    const_qual: &HashMap<String, Vec<Token>>,
+    lparen: &[Token],
+    interner: &Interner,
+) -> Vec<Token> {
+    if const_qual.is_empty() {
+        return b.to_vec();
+    }
+    let mut out = Vec::with_capacity(b.len());
+    for t in b {
+        if let Some(suffix) = const_qual.get(interner.resolve(t.sym)) {
+            out.extend_from_slice(lparen);
+            out.push(*t);
+            out.extend_from_slice(suffix);
+        } else {
+            out.push(*t);
+        }
+    }
+    out
+}
+
+/// Rewrite one term bubble: grammar-aware mixfix op renames first (on the pre-rename bubble, via the
+/// source parser), then textual sort + single-token op renames, then constant qualification.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_term(
+    b: &mut Vec<Token>,
+    renamer: Option<&OpRenamer>,
+    sort_map: &HashMap<String, String>,
+    single_op_map: &HashMap<String, String>,
+    const_qual: &HashMap<String, Vec<Token>>,
+    lparen: &[Token],
+    interner: &mut Interner,
+) {
+    if let Some(r) = renamer {
+        *b = r.rewrite(b, interner);
+    }
+    subst_tokens(b, sort_map, interner);
+    subst_tokens(b, single_op_map, interner);
+    *b = qualify_constants(b, const_qual, lparen, interner);
+}
+
+/// Rewrite a condition bubble (textual sort + single-token op; constant qualification). A mixfix op
+/// rename inside a condition fragment is not reached — the prelude has none.
+fn rewrite_cond(
+    b: &mut Vec<Token>,
+    sort_map: &HashMap<String, String>,
+    single_op_map: &HashMap<String, String>,
+    const_qual: &HashMap<String, Vec<Token>>,
+    lparen: &[Token],
+    interner: &mut Interner,
+) {
+    subst_tokens(b, sort_map, interner);
+    subst_tokens(b, single_op_map, interner);
+    *b = qualify_constants(b, const_qual, lparen, interner);
+}
+
+/// A `PreModule` carrying `d`'s declarations (for building the source parser). Fully flattened, so it has
+/// no imports/parameters; system-kind so any rule bubbles parse.
+fn premodule_of(d: &FlatDecls) -> PreModule {
+    PreModule {
+        name: "$RENAME-SRC".to_string(),
+        kind: ModuleKind::System,
+        is_theory: false,
+        params: Vec::new(),
+        imports: Vec::new(),
+        sorts: d.sorts.clone(),
+        subsorts: d.subsorts.clone(),
+        ops: d.ops.clone(),
+        vars: d.vars.clone(),
+        statements: d.statements.clone(),
+    }
+}
+
+/// Whether `name` is a single-token op name (a constant or prefix operator — no holes).
+fn is_single_token(name: &str, interner: &mut Interner) -> bool {
+    let frags = split_mixfix(name, interner);
+    frags.len() == 1 && matches!(frags[0], Frag::Tok(_))
+}
+
+/// Overlay the renaming's attribute overrides onto the target op's attributes (the prelude uses
+/// `[prec 43]`; `gather`/`strat` are carried for completeness).
+fn apply_attr_override(attrs: &mut Attrs, ovr: &Attrs) {
+    if ovr.prec.is_some() {
+        attrs.prec = ovr.prec;
+    }
+    if ovr.gather.is_some() {
+        attrs.gather = ovr.gather.clone();
+    }
+    if ovr.strat.is_some() {
+        attrs.strat = ovr.strat.clone();
+    }
 }
 
 /// Replace each string in `xs` that is a key of `map` with its mapped value.
@@ -131,15 +286,12 @@ mod tests {
         FlatDecls { sorts: vec![], subsorts: vec![], ops: vec![], vars: vec![], statements: vec![] }
     }
 
-    /// Renaming a mixfix op (name with holes) is a loud B5 follow-up; a single-token op is fine.
+    /// A single-token op rename (a constant / prefix op) needs no grammar and applies textually.
     #[test]
-    fn mixfix_op_rename_rejected_single_token_ok() {
+    fn single_token_op_rename_ok() {
         let mut i = Interner::new();
-        let mixfix = [RenameItem::Op { from: "_+_".into(), to: "_plus_".into() }];
-        let err = apply_renaming(empty(), &mixfix, &mut i).unwrap_err();
-        assert!(err.contains("mixfix"), "got: {err}");
-
-        let single = [RenameItem::Op { from: "f".into(), to: "g".into() }];
+        let single =
+            [RenameItem::Op { from: "f".into(), to: "g".into(), attrs: Attrs::default() }];
         assert!(apply_renaming(empty(), &single, &mut i).is_ok());
     }
 

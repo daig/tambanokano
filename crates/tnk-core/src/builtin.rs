@@ -43,6 +43,11 @@ impl Runtime {
                 self.reduce_qid_op(sig, id, *op, *qid_sym, *str_sym)
             }
             SpecialOp::Division { nat } => self.reduce_division(sig, id, nat),
+            // META-LEVEL descent: handled by the reflection layer (`try_descent`), not the local
+            // term-rewriting `try_special`. Inert here until that layer lands — a descent application
+            // stays at the kind level (`metaReduce(…)` is `[ResultPair]`), exactly as an unreduced
+            // partial op.
+            SpecialOp::Meta { .. } => None,
         }
     }
 

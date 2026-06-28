@@ -80,12 +80,13 @@ pub enum ModuleExpr {
     Instantiation(Box<ModuleExpr>, Vec<ModuleExpr>),
 }
 
-/// One mapping inside a renaming `* (…)`. Op renaming is by canonical name (disambiguated
-/// `op f : A -> B to g` and mixfix renaming are B5 follow-ups, rejected loudly).
+/// One mapping inside a renaming `* (…)`. Op renaming is by canonical mixfix name (`_,_ to _;_`);
+/// the optional `[ … ]` carries attribute *overrides* for the target op (the prelude uses `[prec 43]`
+/// on `op _,_ to _;_`). Disambiguated `op f : A -> B to g` is still a follow-up, rejected loudly.
 #[derive(Debug, Clone)]
 pub enum RenameItem {
     Sort { from: String, to: String },
-    Op { from: String, to: String },
+    Op { from: String, to: String, attrs: Attrs },
 }
 
 /// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
