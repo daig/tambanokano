@@ -23,6 +23,10 @@ pub struct SymbolSyntax {
     /// keeps the theory `pub(crate)`); the grammar builder uses it to choose the flattened assoc-list
     /// prefix form `f(<assocList>)` over the positional `f(a, …)` form, and the right-associating gather.
     pub assoc: bool,
+    /// The `format (…)` directive words (one per mixfix gap), if declared — the pretty-printer's per-gap
+    /// spacing/indent layout (`_<-_` substitutions, `rl_=>_[_].`, the `__` declaration/trace lists). `None`
+    /// = Maude's default spacing.
+    pub format: Option<Vec<String>>,
 }
 
 impl SymbolSyntax {

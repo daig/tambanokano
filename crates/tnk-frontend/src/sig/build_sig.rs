@@ -176,6 +176,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                         prec: od.attrs.prec,
                         gather: od.attrs.gather.clone(),
                         assoc: od.attrs.assoc,
+                        format: od.attrs.format.clone(),
                     },
                 );
                 sym

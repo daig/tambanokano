@@ -136,16 +136,31 @@ fn prelude_set_through_repl() {
 }
 
 /// Helper for the prelude container fixtures: pair each `rewrites:`/`result` line into `[count] value`.
+/// Each `[rewrite-count] sort: value` result, with the **full** value — a `format`-attribute result spans
+/// continuation lines (a substitution's `_<-_` newline-indents each binding), captured up to the next
+/// command echo / `rewrites:` line, so the multi-line layout is compared verbatim against the reference.
 fn prelude_results(out: &str) -> Vec<String> {
-    out.lines()
-        .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
-        .collect::<Vec<_>>()
-        .chunks(2)
-        .map(|c| {
-            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
-            format!("[{n}] {}", c[1].trim_start_matches("result "))
-        })
-        .collect()
+    let lines: Vec<&str> = out.lines().collect();
+    let mut results = Vec::new();
+    let mut rw = "?";
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(rest) = lines[i].strip_prefix("rewrites: ") {
+            rw = rest.split(' ').next().unwrap_or("?");
+        } else if let Some(value) = lines[i].strip_prefix("result ") {
+            let mut block = vec![value.to_string()];
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].starts_with("reduce ") && !lines[j].starts_with("rewrites:") {
+                block.push(lines[j].to_string());
+                j += 1;
+            }
+            results.push(format!("[{rw}] {}", block.join("\n")));
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    results
 }
 
 /// META-LEVEL Stages 1–2. The whole reflective tower (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL,
@@ -191,33 +206,37 @@ fn prelude_meta_through_repl() {
             "[3] ResultPair: {'s_^6['0.Zero], 'NzNat}",
             "[8] ResultPair: {'s_^3['0.Zero], 'NzNat}",
             // Stage 3 — the rewriting/matching/search family over the rule-bearing FOO (and `[NAT]`).
-            // Values + rewrite counts are byte-identical to the reference; the substitution/result-triple
-            // *layout* differs only by the `format`-attribute newline (a documented printing gap — the
-            // reference indents the `_<-_`/`{_,_,_}` onto continuation lines, we render one line).
+            // Stage 3.5 — value, rewrite count, AND the `format`-attribute layout are now byte-identical to
+            // the reference: a substitution's `_<-_` (`format (n++i d d --)`) newline-indents each binding,
+            // and `rl_=>_[_].` (`format (… s … s …)`) spaces its `[attrs]`/`.`.
             "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaRewrite unbounded: a=>b=>c
             "[2] ResultPair: {'b.Elt, 'Elt}",                          // metaRewrite [1]: one step a=>b
             "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaFrewrite gas 1: a=>b=>c
-            "[2] Assignment: 'N:Nat <- 's_^4['0.Zero]",                // metaMatch: s_(N) <-> s^5(0)
+            "[2] Assignment: \n  'N:Nat <- 's_^4['0.Zero]",            // metaMatch: s_(N) <-> s^5(0)
             "[2] Substitution?: (noMatch).Substitution?",              // metaMatch: _+_ vs s^5 — no match
-            "[2] ResultTriple: {'b.Elt, 'Elt, 'X:Elt <- 'b.Elt}",      // metaSearch =>+ sol 0: a=>b
-            "[3] ResultTriple: {'c.Elt, 'Elt, 'X:Elt <- 'c.Elt}",      // metaSearch =>+ sol 1: a=>c (ab)
+            "[2] ResultTriple: {'b.Elt, 'Elt, \n  'X:Elt <- 'b.Elt}",  // metaSearch =>+ sol 0: a=>b
+            "[3] ResultTriple: {'c.Elt, 'Elt, \n  'X:Elt <- 'c.Elt}",  // metaSearch =>+ sol 1: a=>c (ab)
             "[3] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! to normal form c
             // metaApply: the labelled rule `unwrap` (f(N) => N) at the top, its binding, or failure.
-            "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, 'N:Nat <- 's_^3['0.Zero]}", // apply at top
+            "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, \n  'N:Nat <- 's_^3['0.Zero]}", // apply at top
             "[1] ResultTriple?: (failure).ResultTriple?",              // solution 1 — past the last
             "[1] ResultTriple?: (failure).ResultTriple?",              // no top match (subject is s^3(0))
             // metaXmatch (extension match → {subst, context}) and metaXapply (rule at a position →
-            // {term, type, subst, context}). The hole `[]` (now printed in full, both bracket fragments)
-            // marks the matched/rewritten position: `[]` at the top, `'f[[]]` at the inner f.
-            "[2] MatchPair: {'N:Nat <- 's_^4['0.Zero], []}",           // metaXmatch s_(N) <-> s^5(0)
+            // {term, type, subst, context}). The hole `[]` marks the matched/rewritten position: `[]` at
+            // the top, `'f[[]]` at the inner f; the substitution's `_<-_` newline-indents (`format`).
+            "[2] MatchPair: {\n  'N:Nat <- 's_^4['0.Zero], []}",       // metaXmatch s_(N) <-> s^5(0)
             "[2] MatchPair?: (noMatch).MatchPair?",                    // metaXmatch _+_ vs s^5 — no match
-            "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- 'f['0.Zero], []}",   // xapply at top
-            "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- '0.Zero, 'f[[]]}",   // xapply at inner f
-            // metaSearchPath: the path to the first =>* solution is one TraceStep {a, Elt, ab-rule}, the
-            // rule up-translated. Count + trace structure are the reference's; the up-rule's mixfix spacing
-            // (around `[label(…)]` and the trailing `.`) is the format-attribute gap (finished with
-            // upModule's rule rendering in Stage 4 — the reference prints `'c.Elt [label('ab)] .`).
-            "[3] TraceStep: {'a.Elt, 'Elt, rl 'a.Elt => 'c.Elt[label('ab)].}",
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- 'f['0.Zero], []}",   // xapply at top
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- '0.Zero, 'f[[]]}",   // xapply at inner f
+            // metaSearchPath: the path to the first =>* solution is one TraceStep {a, Elt, ab-rule}. Stage
+            // 3.5 closes the rule layout — `rl_=>_[_].`'s `format` spaces the `[label(…)]` and trailing `.`,
+            // so the up-translated rule prints `'c.Elt [label('ab)] .` byte-identically to the reference.
+            "[3] TraceStep: {'a.Elt, 'Elt, rl 'a.Elt => 'c.Elt [label('ab)] .}",
+            // A two-step path (a => b => c) is a `__`-folded two-element Trace; `__`'s `format (d n d)`
+            // newlines each TraceStep — exercising the assoc-fold format path (and what upModule's
+            // declaration lists need). Byte-identical to the reference.
+            "[3] Trace: {'a.Elt, 'Elt, rl 'a.Elt => 'b.Elt [label('r1)] .}\n\
+             {'b.Elt, 'Elt, rl 'b.Elt => 'c.Elt [label('r2)] .}",
         ],
         "META tower reduces: {out}"
     );

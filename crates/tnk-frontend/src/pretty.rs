@@ -99,6 +99,12 @@ enum Item<'t> {
 enum Work<'a, 't> {
     Text { cat: Cat, text: Cow<'a, str> },
     Space,
+    /// A `format`-attribute newline (`n`) — `\n` with no trailing space.
+    Newline,
+    /// A `format`-attribute indent (`i`) — spaces to the current indentation level.
+    Indent,
+    /// A `format`-attribute indent-level change (`+`/`-`) — no output, shifts later `Indent`s.
+    IndentDelta(i32),
     Visit { item: Item<'t>, req_prec: u32, lcap: Cap, rcap: Cap, range_known: bool },
 }
 
@@ -132,10 +138,21 @@ impl<'a> Printer<'a> {
             range_known: false,
         }];
         let mut pieces: Vec<Work<'a, 't>> = Vec::new();
+        // The `format`-attribute indentation level (in spaces), shifted by `+`/`-` directives as the walk
+        // proceeds; an `Indent` emits this many spaces. `+`/`-` are balanced within each format op, so it
+        // returns to 0 between top-level pieces.
+        let mut indent: i32 = 0;
         while let Some(w) = stack.pop() {
             match w {
                 Work::Text { cat, text } => self.emit(out, cat, &text),
                 Work::Space => out.push(' '),
+                Work::Newline => out.push('\n'),
+                Work::Indent => {
+                    for _ in 0..indent.max(0) {
+                        out.push(' ');
+                    }
+                }
+                Work::IndentDelta(d) => indent += d,
                 Work::Visit { item, req_prec, lcap, rcap, range_known } => {
                     self.layout(item, req_prec, lcap, rcap, range_known, &mut pieces);
                     stack.extend(pieces.drain(..).rev());
@@ -279,56 +296,72 @@ impl<'a> Printer<'a> {
         let right_bare = matches!(syn.frags.last(), Some(Frag::Hole));
 
         // Associative fold for the pure binary infix `_ OP _` with > 2 flattened children (the DAG case;
-        // a `Term` pattern is nested binary, so prec/gather alone handles `a + b + c`).
+        // a `Term` pattern is nested binary, so prec/gather alone handles `a + b + c`). The between-section
+        // (mid fragments + the gap before the next element) repeats per element, with the same default
+        // spacing as the binary path — and the same `format`-attribute override (the META `__`
+        // declaration/trace lists put each element on a new line, `format (d ni d)` / `(d n d)`).
         if syn.assoc && nr_args == 2 && left_bare && right_bare && children.len() > 2 {
-            let mid: Vec<&Frag> = syn.frags[1..syn.frags.len() - 1].iter().collect();
+            let format =
+                syn.format.as_deref().filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f));
+            let m = syn.frags.len() - 1; // the trailing Hole's index (`f0`/`f_m` are the two arg holes)
+            emit_gap(format.map(|f| f[0].as_str()), false, out); // leading gap (before the first element)
             for (idx, c) in children.iter().enumerate() {
                 if idx > 0 {
-                    for f in &mid {
-                        // Same spacing rule as the binary path below: no space precedes a `,` or a
-                        // bracket (so SET's `_,_` folds to `1, 2, 3`, not `1 , 2 , 3`).
-                        let suppress = matches!(f, Frag::Tok(s)
-                            if matches!(self.i.resolve(*s), "," | "(" | ")" | "[" | "]" | "{" | "}"));
-                        if !suppress {
-                            out.push(Work::Space);
-                        }
-                        out.push(Work::Text { cat: Cat::Op, text: self.frag_cow(f) });
+                    let mut no_space = false; // just emitted the previous element
+                    for k in 1..m {
+                        let text = self.frag_cow(&syn.frags[k]);
+                        let special = matches!(&*text, "(" | ")" | "[" | "]" | "{" | "}");
+                        emit_gap(format.map(|f| f[k].as_str()), !(no_space || special || &*text == ","), out);
+                        out.push(Work::Text { cat: Cat::Op, text });
+                        no_space = special;
                     }
-                    out.push(Work::Space);
+                    emit_gap(format.map(|f| f[m].as_str()), !no_space, out); // gap before the next element
                 }
                 // Inner elements bind at the tighter gather[1]; left/right ends keep the outer capture.
                 let bound = if idx == 0 { pg.gather[0] } else { pg.gather[1] };
                 out.push(Work::Visit { item: *c, req_prec: bound, lcap: NONE_CAP, rcap: NONE_CAP, range_known: arg_rk });
             }
+            if let Some(f) = format {
+                emit_gap(Some(f[m + 1].as_str()), false, out); // trailing gap
+            }
             return;
         }
 
-        // Maude's mixfix spacing (`prettyPrint.cc::printTokens`, no `format` attribute): a space precedes
-        // each fragment EXCEPT at the very start, before a `,`, and around the brackets `()[]{}` (which
-        // also suppress the following space). So `<_,_>` prints `< M, N >`, not `< M , N >`.
+        // Maude's mixfix spacing (`prettyPrint.cc::printTokens`). Default (no `format` attribute): a space
+        // precedes each fragment EXCEPT at the very start, before a `,`, and around the brackets `()[]{}`
+        // (which also suppress the following space) — so `<_,_>` prints `< M, N >`, not `< M , N >`. With a
+        // `format` attribute (the META result/declaration constructors — `_<-_`, `rl_=>_[_].`, …): one
+        // directive word per **gap** (before each fragment, plus a trailing one), where `d` is exactly that
+        // default, `s`/`n`/`i`/`+`/`-` the explicit space/newline/indent/level. An op whose format uses a
+        // directive we don't model (`r`/`o`, on some IO/array ops) falls back to the default.
+        let format =
+            syn.format.as_deref().filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f));
         let mut k = 0;
         let mut no_space = true;
         for (pos, frag) in syn.frags.iter().enumerate() {
+            let word = format.map(|f| f[pos].as_str());
             match frag {
                 Frag::Tok(s) => {
                     let text = self.i.resolve(*s);
                     let special = matches!(text, "(" | ")" | "[" | "]" | "{" | "}");
-                    if !(no_space || special || text == ",") {
-                        out.push(Work::Space);
-                    }
+                    let default_space = !(no_space || special || text == ",");
+                    emit_gap(word, default_space, out);
                     out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(text) });
                     no_space = special;
                 }
                 Frag::Hole => {
-                    if !no_space {
-                        out.push(Work::Space);
-                    }
+                    emit_gap(word, !no_space, out);
                     let (lc, rc) = self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
                     out.push(Work::Visit { item: children[k], req_prec: pg.gather[k], lcap: lc, rcap: rc, range_known: arg_rk });
                     k += 1;
                     no_space = false;
                 }
             }
+        }
+        // The trailing gap (after the last fragment): only its non-spacing directives matter (the `--` that
+        // closes `_<-_`'s indent). A trailing default contributes nothing (no following token).
+        if let Some(f) = format {
+            emit_gap(Some(f[syn.frags.len()].as_str()), false, out);
         }
     }
 
@@ -511,6 +544,37 @@ impl<'a> Printer<'a> {
             out.push_str(ANSI_RESET);
         } else {
             out.push_str(text);
+        }
+    }
+}
+
+/// Whether every directive in `format` is one the printer interprets (`d s t n i + -`). If not — an `r`/`o`
+/// or numeric directive, used by a few IO/array ops — the operator falls back to default spacing rather
+/// than mis-render, so a partial format model never produces wrong output.
+fn format_supported(format: &[String]) -> bool {
+    format.iter().all(|w| w.chars().all(|c| matches!(c, 'd' | 's' | 't' | 'n' | 'i' | '+' | '-')))
+}
+
+/// Push the [`Work`] for one `format` gap (or the no-format default if `word` is `None`): `d` is the
+/// default space (`default_space`), `s` a space, `t` a tab, `n` a newline, `i` an indent to the current
+/// level, `+`/`-` a level change. A multi-directive word (`n++i`, `ni`) emits each in turn.
+fn emit_gap<'a, 't>(word: Option<&str>, default_space: bool, out: &mut Vec<Work<'a, 't>>) {
+    let Some(w) = word else {
+        if default_space {
+            out.push(Work::Space);
+        }
+        return;
+    };
+    for c in w.chars() {
+        match c {
+            'd' if default_space => out.push(Work::Space),
+            's' => out.push(Work::Space),
+            't' => out.push(Work::Text { cat: Cat::Punct, text: Cow::Borrowed("\t") }),
+            'n' => out.push(Work::Newline),
+            'i' => out.push(Work::Indent),
+            '+' => out.push(Work::IndentDelta(1)),
+            '-' => out.push(Work::IndentDelta(-1)),
+            _ => {} // `d` with no default space, or an unmodelled directive (filtered upstream)
         }
     }
 }

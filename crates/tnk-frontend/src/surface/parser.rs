@@ -900,7 +900,15 @@ impl<'a> Parser<'a> {
                             .collect::<Result<_, _>>()?,
                     );
                 }
-                "format" | "metadata" | "latex" => {
+                "format" => {
+                    // `format ( <word> … )` — one directive word per mixfix gap, each a single token
+                    // (`+`/`-`/`d`/… are not splitting punctuation, so `n++i` lexes as one). Stored for
+                    // the pretty-printer; the words are interpreted there.
+                    self.advance();
+                    let toks = self.balanced()?;
+                    a.format = Some(toks.iter().map(|t| self.i.resolve(t.sym).to_string()).collect());
+                }
+                "metadata" | "latex" => {
                     // skip the keyword and its `( … )` / token argument (not modelled in the subset).
                     self.advance();
                     if self.at("(") {
@@ -982,6 +990,7 @@ impl Attrs {
             special: self.special.clone(),
             ditto: self.ditto,
             poly: self.poly.clone(),
+            format: self.format.clone(),
         }
     }
 }

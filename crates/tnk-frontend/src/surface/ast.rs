@@ -165,6 +165,11 @@ pub struct Attrs {
     /// `build_sig` expands the op into one concrete declaration per kind, substituting that kind's
     /// error (top) sort at each listed position. `None` = an ordinary, monomorphic op.
     pub poly: Option<Vec<u32>>,
+    /// `format (<word> …)` — one format directive word per **gap** of the operator's mixfix form (gaps =
+    /// tokens + 1: before each token/hole, plus a trailing one). Each word is a directive string (`d`
+    /// default, `s` space, `t` tab, `n` newline, `i` indent, `+`/`-` indent level — e.g. `n++i`, `ni`).
+    /// The pretty-printer uses it for `_<-_`/`{_,_,_}`/`rl_=>_[_].` layout; `None` = Maude's default spacing.
+    pub format: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

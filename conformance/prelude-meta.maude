@@ -3224,3 +3224,6 @@ red in META-LEVEL : metaXapply(mod 'G is including 'NAT . sorts none . none op '
 *** up-translated rule's mixfix layout (the spacing around the [attrs] and trailing dot of `rl_=>_[_].`)
 *** is the format-attribute gap, the same rule rendering upModule will finish in Stage 4.
 red in META-LEVEL : metaSearchPath(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 'c.Elt, nil, '*, unbounded, 0) .
+*** H reaches c only via a => b => c (no direct a => c), so the first =>* path is two arcs — a folded
+*** two-step Trace. The `__` trace constructor's `format (d n d)` puts each TraceStep on its own line.
+red in META-LEVEL : metaSearchPath(mod 'H is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . endm, 'a.Elt, 'c.Elt, nil, '*, unbounded, 0) .
