@@ -330,6 +330,7 @@ fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
                 out.push(v.index);
             }
         }
+        Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => {
             for a in args {
                 term_var_indices(a, out);
@@ -610,8 +611,8 @@ mod tests {
             .iter()
             .map(|(m, c)| {
                 let cmd = match c {
-                    Command::Reduce { term } => Cmd::Reduce(term.clone()),
-                    Command::Match { pattern, subject, xmatch } => Cmd::Match {
+                    Command::Reduce { term, .. } => Cmd::Reduce(term.clone()),
+                    Command::Match { pattern, subject, xmatch, .. } => Cmd::Match {
                         pattern: pattern.clone(),
                         subject: subject.clone(),
                         xmatch: *xmatch,
@@ -989,7 +990,7 @@ mod tests {
             .commands
             .iter()
             .map(|(m, c)| match c {
-                Command::Reduce { term } => (*m, term.clone()),
+                Command::Reduce { term, .. } => (*m, term.clone()),
                 _ => panic!("conform_render handles only reduce"),
             })
             .collect();
@@ -1312,8 +1313,8 @@ mod tests {
                 .iter()
                 .map(|(m, c)| {
                     let cmd = match c {
-                        Command::Reduce { term } => Cmd::Reduce(term.clone()),
-                        Command::Match { pattern, subject, xmatch } => Cmd::Match {
+                        Command::Reduce { term, .. } => Cmd::Reduce(term.clone()),
+                        Command::Match { pattern, subject, xmatch, .. } => Cmd::Match {
                             pattern: pattern.clone(),
                             subject: subject.clone(),
                             xmatch: *xmatch,

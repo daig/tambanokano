@@ -5,10 +5,11 @@
 //! structural match over the free theory with sort-checked variable binding; the compiled
 //! discrimination-net `LhsAutomaton` (A2) is a Phase-1 performance optimization.
 
-use crate::dag::{DagId, NodeTerm};
+use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::{SymbolId, Theory};
+use std::rc::Rc;
 
 /// A pattern variable: an index into the enclosing statement's substitution, plus its sort.
 /// `Eq`/`Hash` (structural) let an rhs be scanned for a repeated subterm (C7 `rhs_shares`).
@@ -25,6 +26,11 @@ pub struct Var {
 pub enum Term {
     Var(Var),
     Op { symbol: SymbolId, args: Vec<Term> },
+    /// A built-in atomic literal — a string / quoted-id / float constant (the `NA` theory). Its `symbol`
+    /// is the pseudo-constructor (`<Strings>`/`<Qids>`/`<Floats>`); the `value` carries the payload a
+    /// plain `Op` constant cannot (two `<Floats>` constants differ only by value). A leaf — ground, and
+    /// matched only by an equal `Na` subject (Maude's `NA_Term`).
+    Na { symbol: SymbolId, value: NaValue },
 }
 
 impl Term {
@@ -37,20 +43,35 @@ impl Term {
     pub fn constant(symbol: SymbolId) -> Self {
         Term::Op { symbol, args: Vec::new() }
     }
+    /// A float literal (`<Floats>`), stored as IEEE bits like [`NaValue::Float`].
+    pub fn float(symbol: SymbolId, value: f64) -> Self {
+        Term::Na { symbol, value: NaValue::Float(value.to_bits()) }
+    }
+    /// A string literal (`<Strings>`).
+    pub fn string(symbol: SymbolId, value: &str) -> Self {
+        Term::Na { symbol, value: NaValue::Str(Rc::from(value)) }
+    }
+    /// A quoted-identifier literal (`<Qids>`), stored without the leading quote.
+    pub fn qid(symbol: SymbolId, value: &str) -> Self {
+        Term::Na { symbol, value: NaValue::Qid(Rc::from(value)) }
+    }
 
-    /// Top symbol, if this is an application (used to index equations by their lhs head).
+    /// Top symbol, if this is an application or a built-in literal (used to index equations by their lhs
+    /// head — an `Na` literal heads on its pseudo-constructor symbol).
     pub fn top_symbol(&self) -> Option<SymbolId> {
         match self {
-            Term::Op { symbol, .. } => Some(*symbol),
+            Term::Op { symbol, .. } | Term::Na { symbol, .. } => Some(*symbol),
             Term::Var(_) => None,
         }
     }
 
     /// True if this term contains no variables. The ACU compiler classifies pattern arguments into
-    /// ground subterms (matched against an equal subject element), variables, and aliens.
+    /// ground subterms (matched against an equal subject element), variables, and aliens. A literal is
+    /// ground.
     pub(crate) fn is_ground(&self) -> bool {
         match self {
             Term::Var(_) => false,
+            Term::Na { .. } => true,
             Term::Op { args, .. } => args.iter().all(Term::is_ground),
         }
     }
@@ -67,6 +88,9 @@ impl Term {
     pub(crate) fn is_free_matchable(&self, sig: &Signature) -> bool {
         match self {
             Term::Var(_) => true,
+            // A built-in literal is a leaf matched only by an equal literal subject (the free matcher's
+            // `Na` arm handles it) — like a free constant, it is free-matchable.
+            Term::Na { .. } => true,
             Term::Op { symbol, args } => {
                 sig.symbol(*symbol).theory() == Theory::Free
                     && args.iter().all(|a| a.is_free_matchable(sig))
@@ -193,6 +217,11 @@ impl Runtime {
                     }
                 }
             },
+            // A literal pattern matches an identical literal subject (same pseudo-constructor + value).
+            Term::Na { symbol, value } => match &self.node(subject).term {
+                NodeTerm::Na { symbol: ssym, value: sval } => *ssym == *symbol && *sval == *value,
+                _ => false,
+            },
             Term::Op { symbol, args } => match &self.node(subject).term {
                 NodeTerm::Free { symbol: ssym, args: sargs } => {
                     *ssym == *symbol
@@ -239,6 +268,11 @@ impl Runtime {
                         false
                     }
                 }
+            },
+            // A literal pattern matches an identical literal subject (a ground leaf, never an alien).
+            Term::Na { symbol, value } => match &self.node(subject).term {
+                NodeTerm::Na { symbol: ssym, value: sval } => *ssym == *symbol && *sval == *value,
+                _ => false,
             },
             // A theory-rooted sub-pattern is an alien: record it (with its subject subterm) for the
             // Sequence to match recursively; the recursive free matcher can't enumerate its solutions.
@@ -335,6 +369,7 @@ impl Runtime {
     pub(crate) fn instantiate(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
         match term {
             Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
+            Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
             Term::Op { symbol, args } => {
                 let arg_ids: Vec<DagId> =
                     args.iter().map(|a| self.instantiate(sig, a, subst)).collect();

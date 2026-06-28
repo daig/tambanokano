@@ -384,13 +384,30 @@ pub enum Frag {
 pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
     let mut frags = Vec::new();
     let mut pending = String::new();
-    for ch in name.chars() {
-        if ch == '_' {
+    let mut chars = name.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // A backquote escapes the next char: it is a *literal* part of the surrounding token (a
+        // non-structural `_`/`[`/`,`), so `` _`[_ `` is one bracket op, not a structural `[`.
+        if ch == '`' {
+            if let Some(next) = chars.next() {
+                pending.push(next);
+            }
+            continue;
+        }
+        // A hole (`_`) or a punctuation char (`( ) [ ] { } ,`) ends the pending literal and becomes its
+        // own fragment. Splitting on punctuation — like the main lexer — is what makes an op name whose
+        // tokens glue punctuation to text (`_=[_]_` → `= [ ]`) align with how a *term* tokenizes (`=[Z]`
+        // lexes as `= [ Z ]`); without it the grammar terminal `=[` could never match.
+        if ch == '_' || is_punct(ch) {
             if !pending.is_empty() {
                 frags.push(Frag::Tok(interner.intern(&pending)));
                 pending.clear();
             }
-            frags.push(Frag::Hole);
+            if ch == '_' {
+                frags.push(Frag::Hole);
+            } else {
+                frags.push(Frag::Tok(interner.intern(ch.encode_utf8(&mut [0u8; 4]))));
+            }
         } else {
             pending.push(ch);
         }

@@ -34,6 +34,9 @@ impl<'a> Parser<'a> {
     fn peek_text(&self) -> Option<&'a str> {
         self.peek().map(|t| self.i.resolve(t.sym))
     }
+    fn peek_nth_text(&self, n: usize) -> Option<&'a str> {
+        self.toks.get(self.pos + n).map(|t| self.i.resolve(t.sym))
+    }
     fn at(&self, kw: &str) -> bool {
         self.peek_text() == Some(kw)
     }
@@ -63,6 +66,20 @@ impl<'a> Parser<'a> {
             Err(format!("expected `.`, found {:?}", self.peek_text()))
         }
     }
+    /// An optional `in <MODULE-EXPR> :` qualifier after a command keyword (Maude's `red in NAT : t .`).
+    /// The module expression runs to the `:` that precedes the term — module names / instantiations have
+    /// no top-level `:` (a colon variable `X:Nat` lexes as one token, so its `:` is invisible here). The
+    /// tokens are concatenated (module names contain no spaces: `NAT`, `META-LEVEL`, `LIST{Nat}`).
+    fn opt_in_module(&mut self) -> PResult<Option<String>> {
+        if !self.at("in") {
+            return Ok(None);
+        }
+        self.advance(); // `in`
+        let toks = self.collect_until(&[":"]);
+        self.eat(":")?;
+        Ok(Some(toks.iter().map(|t| self.i.resolve(t.sym)).collect()))
+    }
+
     /// An identifier token's text (any non-Dot token), consumed.
     fn name(&mut self) -> PResult<String> {
         match self.advance() {
@@ -79,7 +96,12 @@ impl<'a> Parser<'a> {
         while let Some(t) = self.peek() {
             let txt = self.i.resolve(t.sym);
             if depth == 0 && (t.kind == TokKind::Dot || terms.contains(&txt)) {
-                break;
+                // A `=` glued to a following `[` is the `=[` fragment of the `_=[_]_` operator (the only
+                // prelude operator name that yields a bare `=` token — `==`/`=/=`/`=>` lex whole), not the
+                // equation separator. Keep collecting so `eq X =[Z] Y = …` splits at the *second* `=`.
+                if !(txt == "=" && self.peek_nth_text(1) == Some("[")) {
+                    break;
+                }
             }
             match txt {
                 "(" => depth += 1,
@@ -127,36 +149,41 @@ impl<'a> Parser<'a> {
             "view" => TopItem::View(self.view()?),
             "reduce" | "red" => {
                 self.advance();
+                let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Reduce { term })
+                TopItem::Command(Command::Reduce { module, term })
             }
             "match" | "xmatch" => {
                 let xmatch = txt == "xmatch";
                 self.advance();
+                let module = self.opt_in_module()?;
                 let pattern = self.collect_until(&["<=?"]);
                 self.eat("<=?")?;
                 let subject = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Match { pattern, subject, xmatch })
+                TopItem::Command(Command::Match { module, pattern, subject, xmatch })
             }
             "rewrite" | "rew" => {
                 self.advance();
                 let bound = self.opt_bound()?;
+                let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Rewrite { bound, term })
+                TopItem::Command(Command::Rewrite { module, bound, term })
             }
             "frewrite" | "frew" => {
                 self.advance();
                 let bound = self.opt_bound()?;
+                let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Frewrite { bound, term })
+                TopItem::Command(Command::Frewrite { module, bound, term })
             }
             "search" => {
                 self.advance();
                 let (max_solutions, max_depth) = self.opt_search_bound()?;
+                let module = self.opt_in_module()?;
                 // The arrows `=>1`/`=>+`/`=>*`/`=>!` lex as single tokens (runs of non-punctuation).
                 let subject = self.collect_until(&["=>1", "=>+", "=>*", "=>!"]);
                 let arrow = match self.peek_text() {
@@ -176,7 +203,7 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.eat_dot()?;
-                TopItem::Command(Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that })
+                TopItem::Command(Command::Search { module, max_solutions, max_depth, subject, arrow, pattern, such_that })
             }
             "continue" | "cont" => {
                 // `continue n .` takes a **bare** number (unlike `rewrite [n]`'s bracketed bound); an
@@ -419,10 +446,10 @@ impl<'a> Parser<'a> {
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
                 }
-                // `~>` is the partial (kind-level) arrow (`op modExp : Nat Nat NzNat ~> Nat`); treat it
-                // like `->` — we don't track partiality, and a kind-level result falls out of the sort
-                // machinery anyway.
-                if self.at("~>") {
+                // `~>` is the partial (kind-level) arrow (`op modExp : Nat Nat NzNat ~> Nat`): its range
+                // is the kind, so an unreduced application sits at the kind level (recorded in `partial`).
+                let partial = self.at("~>");
+                if partial {
                     self.advance();
                 } else {
                     self.eat("->")?;
@@ -436,11 +463,12 @@ impl<'a> Parser<'a> {
                             name: vec![t],
                             domain: domain.clone(),
                             range: range.clone(),
+                            partial,
                             attrs: attrs.clone_shallow(),
                         });
                     }
                 } else {
-                    m.ops.push(OpDecl { name: names, domain, range, attrs });
+                    m.ops.push(OpDecl { name: names, domain, range, partial, attrs });
                 }
             }
             "var" | "vars" => {

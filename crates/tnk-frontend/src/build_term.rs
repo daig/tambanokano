@@ -93,10 +93,22 @@ pub fn build_term(
             let zero = m.nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
             Ok(Term::op(minus, vec![numeral_term(succ, zero, n)]))
         }
+        Action::MakeString(sym) => {
+            Ok(Term::string(sym, &unquote_string(tokens[tree.start].text(i))))
+        }
+        Action::MakeQid(sym) => {
+            let text = tokens[tree.start].text(i);
+            Ok(Term::qid(sym, text.strip_prefix('\'').unwrap_or(text)))
+        }
+        Action::MakeFloat(sym) => {
+            let text = tokens[tree.start].text(i);
+            let v: f64 = text.parse().map_err(|_| format!("bad float `{text}`"))?;
+            Ok(Term::float(sym, v))
+        }
         Action::AssocList => Err("assoc-list node reached build_term directly".to_string()),
         Action::Nop => Err("sort production has no term".to_string()),
-        // String/qid/float literals (B4.5) and the f^n iter-token form (deferred) — not on the milestone.
-        other => Err(format!("unsupported action {other:?} (B4.5)")),
+        // The f^n iter-token form is the one remaining deferred literal action.
+        Action::MakeIter(_) => Err("the f^n iter-token form is deferred".into()),
     }
 }
 

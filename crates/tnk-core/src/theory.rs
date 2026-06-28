@@ -276,6 +276,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 out.push(v.index);
             }
         }
+        Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
     }
 }

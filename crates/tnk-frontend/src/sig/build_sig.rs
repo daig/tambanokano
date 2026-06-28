@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
-    BoolHooks, FltOp, NatHooks, NumOp, SpecialOp, StrOp, SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -87,7 +87,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let arity = od.domain.len();
 
         // The (domain, range) profile(s) this declaration expands to.
-        let profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
+        let mut profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
             None => {
                 let domain: Vec<SortId> =
                     od.domain.iter().map(|s| resolve_sort(&engine, &sorts, s)).collect::<R<_>>()?;
@@ -114,6 +114,15 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                     .collect::<R<_>>()?
             }
         };
+
+        // A partial (`~>`) op ranges over the **kind** (error sort): an unreduced application is
+        // kind-level, the built-in/equational result refining it when defined. (kind_of(range) is the
+        // same component whether or not we already lifted it, so this is idempotent.)
+        if od.partial {
+            for (_, range) in profiles.iter_mut() {
+                *range = engine.sorts().error_sort(engine.sorts().kind_of(*range));
+            }
+        }
 
         let mut decl_syms: Vec<SymbolId> = Vec::with_capacity(profiles.len());
         for (domain, range) in profiles {
@@ -330,7 +339,12 @@ fn op_hook_sym(
     i: &Interner,
 ) -> Option<SymbolId> {
     let (_, sig) = spec.op_hooks.iter().find(|(p, _)| p == purpose)?;
-    name_to_sym.get(i.resolve(sig.first()?.sym)).copied()
+    // The operator name is the run of tokens before the `:` of `(name : domain ~> range)`. A *mixfix*
+    // name can be several tokens — `<_,_,_>` lexes as `<_ , _ , _>` — so join them (canonical form), not
+    // just the first (which sufficed for the single-token names `_and_`/`_/_`/`<Strings>`).
+    let name: String =
+        sig.iter().take_while(|t| i.resolve(t.sym) != ":").map(|t| i.resolve(t.sym)).collect();
+    name_to_sym.get(&name).copied()
 }
 
 fn term_hook_sym(
@@ -387,9 +401,12 @@ fn special_op(
         | "SystemFalse" => return Ok(None),
         "MinusSymbol" => SpecialOp::Minus { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "DivisionSymbol" => SpecialOp::Division { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
-        "EqualitySymbol" => SpecialOp::Equality {
-            eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("EqualitySymbol equalTerm")?,
-            neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("EqualitySymbol notEqualTerm")?,
+        // `_==_`/`_=/=_` and the initial-equality predicate `_.=._` (the latter is `comm`/`poly` and, for
+        // symbolic terms, decomposes into `_and_`/`_or_` — but on the **ground, reduced** terms a
+        // functional reduce produces, both are decided by structural equality → `equalTerm`/`notEqualTerm`).
+        "EqualitySymbol" | "CommutativeDecomposeEqualitySymbol" => SpecialOp::Equality {
+            eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("equalTerm")?,
+            neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("notEqualTerm")?,
         },
         "BranchSymbol" => {
             // term-hooks "1", "2", … are the test constants, in order.
@@ -415,18 +432,34 @@ fn special_op(
             nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
             bool_: bool_hooks(spec, name_to_sym, i),
         },
-        "StringOpSymbol" => SpecialOp::StringOp {
-            op: str_op(code.ok_or("StringOpSymbol code")?)?,
-            str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
-                .ok_or("StringOpSymbol stringSymbol")?,
-            nat: nat_hooks(spec, name_to_sym, succ_zero, i).ok(),
-            bool_: bool_hooks(spec, name_to_sym, i),
+        "StringOpSymbol" => match conv_op("StringOpSymbol", code.unwrap_or(""), arity) {
+            Some(op) => conversion(op, spec, name_to_sym, succ_zero, i),
+            None => SpecialOp::StringOp {
+                op: str_op(code.ok_or("StringOpSymbol code")?)?,
+                str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
+                    .ok_or("StringOpSymbol stringSymbol")?,
+                nat: nat_hooks(spec, name_to_sym, succ_zero, i).ok(),
+                bool_: bool_hooks(spec, name_to_sym, i),
+                not_found: term_hook_sym(spec, "notFoundTerm", name_to_sym, i),
+            },
         },
-        "FloatOpSymbol" => SpecialOp::FloatOp {
-            op: flt_op(code.ok_or("FloatOpSymbol code")?, arity)?,
-            float_sym: op_hook_sym(spec, "floatSymbol", name_to_sym, i)
-                .ok_or("FloatOpSymbol floatSymbol")?,
-            bool_: bool_hooks(spec, name_to_sym, i),
+        "RandomOpSymbol" => SpecialOp::Random { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
+        "CounterSymbol" => SpecialOp::Counter { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
+        "QuotedIdentifierOpSymbol" => SpecialOp::QidOp {
+            op: qid_op(code.ok_or("QuotedIdentifierOpSymbol code")?)?,
+            qid_sym: op_hook_sym(spec, "quotedIdentifierSymbol", name_to_sym, i)
+                .ok_or("QuotedIdentifierOpSymbol quotedIdentifierSymbol")?,
+            str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
+                .ok_or("QuotedIdentifierOpSymbol stringSymbol")?,
+        },
+        "FloatOpSymbol" => match conv_op("FloatOpSymbol", code.unwrap_or(""), arity) {
+            Some(op) => conversion(op, spec, name_to_sym, succ_zero, i),
+            None => SpecialOp::FloatOp {
+                op: flt_op(code.ok_or("FloatOpSymbol code")?, arity)?,
+                float_sym: op_hook_sym(spec, "floatSymbol", name_to_sym, i)
+                    .ok_or("FloatOpSymbol floatSymbol")?,
+                bool_: bool_hooks(spec, name_to_sym, i),
+            },
         },
         other => return Err(format!("unsupported special id-hook `{other}`")),
     };
@@ -452,6 +485,8 @@ fn num_op(code: &str) -> R<NumOp> {
         "modExp" => NumOp::ModExp,
         ">>" => NumOp::Shr,
         "<<" => NumOp::Shl,
+        "abs" => NumOp::Abs,
+        "~" => NumOp::BitNot,
         "<" => NumOp::Lt,
         "<=" => NumOp::Le,
         ">" => NumOp::Gt,
@@ -461,11 +496,76 @@ fn num_op(code: &str) -> R<NumOp> {
     })
 }
 
+/// A CONVERSION coercion code, distinguished by id-hook class + code + arity (since `float`/`rat`/
+/// `string` are overloaded across argument types — e.g. `string : Rat NzNat` vs `string : Float`).
+/// `None` ⇒ not a conversion (an ordinary `FloatOp`/`StringOp` arithmetic/string code).
+fn conv_op(class: &str, code: &str, arity: usize) -> Option<ConvOp> {
+    Some(match (class, code, arity) {
+        ("FloatOpSymbol", "float", 1) => ConvOp::RatToFloat,
+        ("FloatOpSymbol", "rat", 1) => ConvOp::FloatToRat,
+        ("StringOpSymbol", "string", 2) => ConvOp::RatToString,
+        ("StringOpSymbol", "string", 1) => ConvOp::FloatToString,
+        ("StringOpSymbol", "rat", 2) => ConvOp::StringToRat,
+        ("StringOpSymbol", "float", 1) => ConvOp::StringToFloat,
+        ("StringOpSymbol", "decFloat", 2) => ConvOp::DecFloat,
+        _ => return None,
+    })
+}
+
+/// Build a [`SpecialOp::Conversion`], resolving each (optional) hook a conversion might need.
+fn conversion(
+    op: ConvOp,
+    spec: &SpecialSpec,
+    name_to_sym: &HashMap<String, SymbolId>,
+    succ_zero: &HashMap<SymbolId, SymbolId>,
+    i: &Interner,
+) -> SpecialOp {
+    SpecialOp::Conversion {
+        op,
+        float_sym: op_hook_sym(spec, "floatSymbol", name_to_sym, i),
+        str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i),
+        nat: nat_hooks(spec, name_to_sym, succ_zero, i).ok(),
+        division: op_hook_sym(spec, "divisionSymbol", name_to_sym, i),
+        dec_float: op_hook_sym(spec, "decFloatSymbol", name_to_sym, i),
+    }
+}
+
+fn qid_op(code: &str) -> R<QidOp> {
+    Ok(match code {
+        "string" => QidOp::String,
+        "qid" => QidOp::Qid,
+        other => return Err(format!("unsupported quoted-id op `{other}`")),
+    })
+}
+
 fn str_op(code: &str) -> R<StrOp> {
     Ok(match code {
         "+" => StrOp::Concat,
         "length" => StrOp::Length,
         "substr" => StrOp::Substr,
+        "ascii" => StrOp::Ascii,
+        "char" => StrOp::Char,
+        "find" => StrOp::Find,
+        "rfind" => StrOp::Rfind,
+        "upperCase" => StrOp::UpperCase,
+        "lowerCase" => StrOp::LowerCase,
+        "cntrl" => StrOp::IsClass(CharClass::Control),
+        "print" => StrOp::IsClass(CharClass::Printable),
+        "space" => StrOp::IsClass(CharClass::Space),
+        "blank" => StrOp::IsClass(CharClass::Blank),
+        "graph" => StrOp::IsClass(CharClass::Graphic),
+        "punct" => StrOp::IsClass(CharClass::Punct),
+        "alnum" => StrOp::IsClass(CharClass::Alnum),
+        "alpha" => StrOp::IsClass(CharClass::Alpha),
+        "isupper" => StrOp::IsClass(CharClass::Upper),
+        "islower" => StrOp::IsClass(CharClass::Lower),
+        "digit" => StrOp::IsClass(CharClass::Digit),
+        "xdigit" => StrOp::IsClass(CharClass::XDigit),
+        "startsWith" => StrOp::StartsWith,
+        "endsWith" => StrOp::EndsWith,
+        "ltrim" => StrOp::TrimStart,
+        "rtrim" => StrOp::TrimEnd,
+        "trim" => StrOp::Trim,
         "<" => StrOp::Lt,
         "<=" => StrOp::Le,
         ">" => StrOp::Gt,
@@ -479,10 +579,25 @@ fn flt_op(code: &str, arity: usize) -> R<FltOp> {
         ("-", 1) => FltOp::Neg,
         ("abs", _) => FltOp::Abs,
         ("sqrt", _) => FltOp::Sqrt,
+        ("floor", _) => FltOp::Floor,
+        ("ceiling", _) => FltOp::Ceiling,
+        ("exp", _) => FltOp::Exp,
+        ("log", _) => FltOp::Log,
+        ("sin", _) => FltOp::Sin,
+        ("cos", _) => FltOp::Cos,
+        ("tan", _) => FltOp::Tan,
+        ("asin", _) => FltOp::Asin,
+        ("acos", _) => FltOp::Acos,
+        ("atan", 1) => FltOp::Atan,
+        ("atan", _) => FltOp::Atan2, // binary `atan(y, x)`
         ("+", _) => FltOp::Add,
         ("-", _) => FltOp::Sub,
         ("*", _) => FltOp::Mul,
         ("/", _) => FltOp::Div,
+        ("rem", _) => FltOp::Rem,
+        ("^", _) => FltOp::Pow,
+        ("min", _) => FltOp::Min,
+        ("max", _) => FltOp::Max,
         ("<", _) => FltOp::Lt,
         ("<=", _) => FltOp::Le,
         (">", _) => FltOp::Gt,

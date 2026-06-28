@@ -67,6 +67,8 @@ impl AuLhs {
                     seen_vars.push(v.index);
                     elements.push(AuElem::Var { index: v.index, sort: v.sort });
                 }
+                // A built-in literal is a ground, free-matchable leaf — same fast path as a ground Op.
+                t @ Term::Na { .. } => elements.push(AuElem::Ground(t)),
                 t @ Term::Op { .. } if t.is_ground() && t.is_free_matchable(sig) => {
                     elements.push(AuElem::Ground(t))
                 }
@@ -235,6 +237,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 out.push(v.index);
             }
         }
+        Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
     }
 }

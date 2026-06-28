@@ -391,6 +391,83 @@ fn prelude_nat_m1_through_repl() {
     assert_eq!(out.matches("rewrites: 1 ").count(), 24, "NAT counts: {out}");
 }
 
+/// Tier 2 — the remaining built-in data types + leaf special ops: INT (`abs`/`~`, signed bignum +
+/// two's-complement bitwise), RAT (rationals on the Division op), FLOAT (full op set + partiality:
+/// `/0`/NaN don't reduce, but `log(0.0) = -Infinity` does), STRING/QID (`ascii`/`char`/`find`/case +
+/// STRING-OPS classification/trim; value-dependent `Char`/`String` sort; qid backquote-escaping),
+/// CONVERSION (float↔rat↔string + `decFloat`), INITIAL-EQUALITY-PREDICATE, RANDOM (MT19937 seed 0),
+/// COUNTER (stateful — inert under `reduce`, advancing under `rewrite`). One fixture defines the whole
+/// chain and reduces in each module via the `in <MODULE> :` qualifier; values, sorts, and rewrite counts
+/// are byte-identical to the reference binary's built-in modules.
+#[test]
+fn prelude_tier2_through_repl() {
+    let out = repl().eval(conformance_file!("prelude-tier2.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            // INT — abs, ~, (-1)&12, (-5) xor 3, -7 quo 2, (-3)*(-4), gcd(-12,18)
+            "result NzNat: 5",
+            "result NzInt: -6",
+            "result NzNat: 12",
+            "result NzInt: -8",
+            "result NzInt: -3",
+            "result NzNat: 12",
+            "result NzNat: 6",
+            // RAT
+            "result PosRat: 5/6",
+            "result PosRat: 2/3",
+            "result PosRat: 3/4",
+            "result NzNat: 3",
+            // FLOAT — 2^10, sqrt 2, floor 3.7, atan2; then partiality: /0 and sqrt(-1) stay [Float],
+            // log(0) = -Infinity; `=[ ]` approx-equality
+            "result FiniteFloat: 1.024e+3",
+            "result FiniteFloat: 1.4142135623730951",
+            "result FiniteFloat: 3.0",
+            "result FiniteFloat: 7.8539816339744828e-1",
+            "result [Float]: 1.0 / 0.0",
+            "result [Float]: sqrt(-1.0)",
+            "result Float: -Infinity",
+            "result Bool: true",
+            // STRING — concat, ascii, char, find, rfind, upperCase (Char vs String sort is value-dependent)
+            "result String: \"foobar\"",
+            "result NzNat: 65",
+            "result Char: \"A\"",
+            "result NzNat: 2",
+            "result NzNat: 2",
+            "result String: \"HELLO\"",
+            // STRING-OPS — isDigit, isAlphabetic, startsWith, trim
+            "result Bool: true",
+            "result Bool: true",
+            "result Bool: true",
+            "result String: \"hi\"",
+            // QID — string('foo); qid("a b") escapes the space as a backquote
+            "result String: \"foo\"",
+            "result Qid: 'a`b",
+            // CONVERSION — float, rat (exact), string-in-base, rat-from-base, float→string, string→float,
+            // decFloat
+            "result FiniteFloat: 5.0e-1",
+            "result PosRat: 3602879701896397/36028797018963968",
+            "result String: \"ff\"",
+            "result NzNat: 255",
+            "result String: \"-2.75\"",
+            "result FiniteFloat: 3.1400000000000001",
+            "result DecFloat: < 1, \"123456\", 3 >",
+            // INITIAL-EQUALITY-PREDICATE, RANDOM, COUNTER (reduce leaves it; rewrite below advances it)
+            "result Bool: true",
+            "result NzNat: 2357136044",
+            "result NzNat: 2774094101",
+            "result [Nat]: counter",
+            "result NzNat: 3",
+        ],
+        "Tier 2 values/sorts: {out}"
+    );
+    // COUNTER under `rewrite` yields 0, 1, 2 → 0 + 1 + 2 = 3 in 5 rewrites (3 counter steps + 2 ACU
+    // folds) — the only multi-rewrite command here (the kind-sorted `[Float]`/`counter` results above
+    // already attest the partial-op / inert-counter non-reductions).
+    assert!(out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5 in"), "counter: {out}");
+}
+
 /// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
 /// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
 #[test]

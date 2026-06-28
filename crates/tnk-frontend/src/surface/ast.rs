@@ -126,6 +126,10 @@ pub struct OpDecl {
     pub name: Vec<Token>,
     pub domain: Vec<String>,
     pub range: String,
+    /// Whether the declaration used the **partial** arrow `~>` (`op _/_ : Float Float ~> Float`). A
+    /// partial op's range is the *kind* (error sort): an application that does not reduce sits at the
+    /// kind level (`1.0 / 0.0` is `[Float]`), and the built-in/equational result refines it when defined.
+    pub partial: bool,
     pub attrs: Attrs,
 }
 
@@ -201,15 +205,18 @@ pub enum Statement {
 /// commands `rewrite`/`rew` + `continue` (Pillar A).
 #[derive(Debug)]
 pub enum Command {
-    Reduce { term: Vec<Token> },
-    Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
+    /// `reduce [in M :] term .`. The optional `module` is Maude's `in <MODULE> :` qualifier — reduce in
+    /// that module instead of the current one (a one-shot override; the current module is unchanged).
+    Reduce { module: Option<String>, term: Vec<Token> },
+    Match { module: Option<String>, pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
     /// `rewrite [bound] term .` — rule-fair rewriting to a normal form (or `bound` rule applications).
-    Rewrite { bound: Option<u64>, term: Vec<Token> },
+    Rewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
     /// `frewrite [bound] term .` — position-fair rewriting (Pillar A-ii).
-    Frewrite { bound: Option<u64>, term: Vec<Token> },
+    Frewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
     /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
     /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
     Search {
+        module: Option<String>,
         max_solutions: Option<u64>,
         max_depth: Option<u64>,
         subject: Vec<Token>,

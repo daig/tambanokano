@@ -33,5 +33,8 @@ pub(crate) mod cui;
 // B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
 // named outside `num`.
 pub(crate) mod num;
+// The one number utility a consumer needs by value: Maude's `doubleToString` float rendering, shared by
+// the frontend pretty-printer and the `string(Float)` conversion (so display and conversion agree).
+pub use num::double_to_string;
 pub(crate) mod s;
 pub(crate) mod theory;

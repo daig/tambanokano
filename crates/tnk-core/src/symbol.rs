@@ -134,13 +134,44 @@ pub enum SpecialOp {
     /// `-_` (Maude's `MinusSymbol`): integer negation. `-(s^n(0))` is the canonical negative (no
     /// rewrite); `-(-x)` reduces to `x` and `-0` to `0`. `nat.minus` is this operator.
     Minus { nat: NatHooks },
-    /// `_+_` (concat) / `length` / `substr` / `_<_`/`_<=_`/`_>_`/`_>=_` over strings (Maude's
-    /// `StringOpSymbol`): operate on `NodeTerm::Na` string values. `str_sym` builds string results;
-    /// `nat` (length/substr) and `bool_` (comparisons) are the result-type hooks.
-    StringOp { op: StrOp, str_sym: SymbolId, nat: Option<NatHooks>, bool_: Option<BoolHooks> },
+    /// `_+_` (concat) / `length` / `substr` / `ascii` / `char` / `find` / `rfind` / `upperCase` /
+    /// `lowerCase` / `_<_`/`_<=_`/`_>_`/`_>=_` over strings (Maude's `StringOpSymbol`): operate on
+    /// `NodeTerm::Na` string values. `str_sym` builds string/char results; `nat` (length/substr/ascii/
+    /// find), `bool_` (comparisons), and `not_found` (the `notFound` constant for find/rfind) are the
+    /// result-type hooks.
+    StringOp {
+        op: StrOp,
+        str_sym: SymbolId,
+        nat: Option<NatHooks>,
+        bool_: Option<BoolHooks>,
+        not_found: Option<SymbolId>,
+    },
     /// Float arithmetic / functions / comparisons (Maude's `FloatOpSymbol`): operate on `NodeTerm::Na`
     /// float (`f64`) values. `float_sym` builds float results; `bool_` is the comparison result hook.
     FloatOp { op: FltOp, float_sym: SymbolId, bool_: Option<BoolHooks> },
+    /// `random : Nat -> Nat` (Maude's `RandomOpSymbol`): the n-th 32-bit output of MT19937 (Mersenne
+    /// Twister) seeded with 0 — a deterministic pure function of `n`.
+    Random { nat: NatHooks },
+    /// `counter : -> [Nat]` (Maude's `CounterSymbol`): a **stateful rule-special** — inert under `reduce`
+    /// (left as the kind constant), but each `rewrite`/`frewrite` step that meets a `counter` redex yields
+    /// the next natural (0, 1, 2, …), reset per top-level rewriting command. Handled in the rewrite
+    /// traversal, not `try_special`.
+    Counter { nat: NatHooks },
+    /// `string : Qid -> String` / `qid : String ~> Qid` (Maude's `QuotedIdentifierOpSymbol`): convert
+    /// between a quoted identifier and its text. `qid_sym`/`str_sym` build the respective NA results.
+    QidOp { op: QidOp, qid_sym: SymbolId, str_sym: SymbolId },
+    /// The CONVERSION module's cross-type coercions (`float`/`rat`/`string`/`decFloat`, under Maude's
+    /// `FloatOpSymbol`/`StringOpSymbol` with conversion codes). Each `op` uses the subset of hooks it
+    /// needs: `float_sym` builds floats, `str_sym` strings, `nat` reads/builds numerals, `division` the
+    /// rational `_/_`, `dec_float` the `<_,_,_>` triple.
+    Conversion {
+        op: ConvOp,
+        float_sym: Option<SymbolId>,
+        str_sym: Option<SymbolId>,
+        nat: Option<NatHooks>,
+        division: Option<SymbolId>,
+        dec_float: Option<SymbolId>,
+    },
     /// `_/_` (Maude's `DivisionSymbol`): canonicalise a rational `I / N` to lowest terms — divide by
     /// `gcd(|I|, N)`, reducing to the integer `I/g` when the denominator becomes 1. RAT's arithmetic
     /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
@@ -148,34 +179,120 @@ pub enum SpecialOp {
     Division { nat: NatHooks },
 }
 
-/// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes). This slice has
-/// arithmetic, negation/abs/sqrt, and comparisons; the rest (`rem`/`floor`/`exp`/trig/…) are follow-ups.
+/// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes): IEEE `f64`
+/// arithmetic, the unary functions (`floor`/`ceiling`/`exp`/`log`/`sqrt`/trig), `rem`/`^`/`min`/`max`,
+/// and comparisons. (`float`/`rat` conversions are CONVERSION ops, handled separately.)
 #[derive(Debug, Clone, Copy)]
 pub enum FltOp {
+    // Unary.
     Neg,
     Abs,
     Sqrt,
+    Floor,
+    Ceiling,
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    // Binary arithmetic.
     Add,
     Sub,
     Mul,
     Div,
+    Rem,
+    Pow,
+    Min,
+    Max,
+    Atan2,
+    // Binary comparison → Bool.
     Lt,
     Le,
     Gt,
     Ge,
 }
 
-/// The string operation a [`SpecialOp::StringOp`] performs (Maude's `StringOpSymbol` codes). This slice
-/// has concat / length / substr / comparisons; `find`/`rfind`/`upperCase`/`ascii`/… are follow-ups.
+/// A CONVERSION coercion a [`SpecialOp::Conversion`] performs (distinguished by code + arity at build
+/// time, since `float`/`rat`/`string` are overloaded across argument types).
+#[derive(Debug, Clone, Copy)]
+pub enum ConvOp {
+    /// `float : Rat -> Float` — the nearest double to a rational.
+    RatToFloat,
+    /// `rat : FiniteFloat -> Rat` — the exact rational value of a double.
+    FloatToRat,
+    /// `string : Rat NzNat -> String` — a rational rendered in a base.
+    RatToString,
+    /// `rat : String NzNat -> Rat` — a rational parsed from a base.
+    StringToRat,
+    /// `string : Float -> String` — a float's canonical decimal string.
+    FloatToString,
+    /// `float : String -> Float` — a float parsed from a string.
+    StringToFloat,
+    /// `decFloat : Float Nat -> DecFloat` — a float decomposed into `< sign·int, "digits", exp >`.
+    DecFloat,
+}
+
+/// The quoted-identifier conversion a [`SpecialOp::QidOp`] performs (Maude's `QuotedIdentifierOpSymbol`
+/// codes `string`/`qid`).
+#[derive(Debug, Clone, Copy)]
+pub enum QidOp {
+    /// `string : Qid -> String` — the identifier text (without the leading quote).
+    String,
+    /// `qid : String ~> Qid` — a quoted identifier from text (partial: a single-token identifier).
+    Qid,
+}
+
+/// The string operation a [`SpecialOp::StringOp`] performs (Maude's `StringOpSymbol` codes): concat /
+/// length / substr / ascii / char / find / rfind / case-mapping / comparisons.
 #[derive(Debug, Clone, Copy)]
 pub enum StrOp {
     Concat,
     Length,
     Substr,
+    /// `ascii : Char -> Nat` — the code of a single-character string.
+    Ascii,
+    /// `char : Nat ~> Char` — the one-character string for a code (partial: a valid scalar value).
+    Char,
+    /// `find : String String Nat -> FindResult` — first index of the pattern at/after the start.
+    Find,
+    /// `rfind : String String Nat -> FindResult` — last index of the pattern at/before the start.
+    Rfind,
+    UpperCase,
+    LowerCase,
+    /// A character-class predicate `isX : Char -> Bool` (STRING-OPS — C `iscntrl`/`isalpha`/…).
+    IsClass(CharClass),
+    /// `startsWith` / `endsWith : String String -> Bool`.
+    StartsWith,
+    EndsWith,
+    /// `trimStart` / `trimEnd` / `trim : String -> String` (strip C-whitespace).
+    TrimStart,
+    TrimEnd,
+    Trim,
     Lt,
     Le,
     Gt,
     Ge,
+}
+
+/// A C `ctype` character class (STRING-OPS's `isControl`/`isAlphabetic`/… predicates), tested per byte in
+/// the C locale (a non-ASCII char is in no class).
+#[derive(Debug, Clone, Copy)]
+pub enum CharClass {
+    Control,
+    Printable,
+    Space,
+    Blank,
+    Graphic,
+    Punct,
+    Alnum,
+    Alpha,
+    Upper,
+    Lower,
+    Digit,
+    XDigit,
 }
 
 /// The `op-hook succSymbol` (an `iter` successor) and its `Zero` constant (the successor's `zeroTerm`),
@@ -215,7 +332,7 @@ pub enum NumOp {
     Or,
     // CUI (commutative 2-arg) — `sd` (symmetric difference `|m − n|`).
     Sd,
-    // free arithmetic → Nat/Int — `_-_` (INT) `_quo_` `_rem_` `_^_` `modExp` `_>>_` `_<<_`.
+    // free arithmetic → Nat/Int — `_-_` (INT) `_quo_` `_rem_` `_^_` `modExp` `_>>_` `_<<_` `abs` `~`.
     Sub,
     Quo,
     Rem,
@@ -223,6 +340,10 @@ pub enum NumOp {
     ModExp,
     Shr,
     Shl,
+    /// `abs : Int -> Nat` — magnitude. Free unary.
+    Abs,
+    /// `~_ : Int -> Int` — bitwise complement (`~x = -(x+1)`, two's complement). Free unary.
+    BitNot,
     // free relational → Bool — `_<_` `_<=_` `_>_` `_>=_` `_divides_`.
     Lt,
     Le,

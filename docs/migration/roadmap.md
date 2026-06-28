@@ -28,10 +28,13 @@ prelude load.
    (`conformance/{theory-*,view-*,param-*,instantiation-*}.maude`). Residuals (orthogonal, in `gaps.md`):
    identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized) + the chained-import
    last-level substitution. Reference: `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude — `poly`/`Universal` + loading the actual library. ← IN PROGRESS: the gateway is DONE
-   (M0–M2).** The real `BOOL`, `NAT`, and `LIST{Nat}` now load and reduce **byte-identically** to the
-   reference (`conformance/prelude-{bool,nat,list}.maude`). The poly/Universal + container substrate that was
-   the gateway is built; `poly-universal-prelude.md` is now mostly a record of it. What landed:
+3. **The real prelude — `poly`/`Universal` + loading the actual library. ← IN PROGRESS: everything but the
+   reflective wall now loads.** The real `BOOL`, `NAT`, `LIST{Nat}`, the container library, **and all the
+   built-in data types** (`INT`/`RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION` + the leaf specials) load and
+   reduce **byte-identically** to the reference. The only prelude modules that still don't build are
+   `META-LEVEL` (Tier 3, item (c)) and the few that import `QID-LIST`/objects (the parameterized-view gap +
+   the `[object]` attribute — both off the data path). `poly-universal-prelude.md` is a record of the
+   gateway. What landed:
    - **`poly` / the `Universal` sort** — a `Universal`-typed op (`_==_`/`_=/=_`/`if_then_else_fi`) is expanded
      into one concrete instance **per connected component** (eager per-kind, in `build_sig` after
      `close_sorts`); no new kernel reduction code (the existing `Equality`/`Branch` special ops reduce each
@@ -52,11 +55,22 @@ prelude load.
      `format`, defaulting the constructor precedence). CUI collapse is unneeded (no comm-only-with-`id:` op).
      *Remaining:* the parameterized container **views** (`view List{X :: TRIV} … to LIST{X}`, Set/Map/Array,
      sortable-list) that let containers nest — a view-frontend follow-up (`gaps.md`).
-   - **(b) The remaining built-in data types** — `INT` (`abs`, signed `-_`), `RAT`, `FLOAT` (more float codes),
-     `STRING`/`QID` (`ascii`/`find`/`upperCase`/…), `CONVERSION`; plus the leaf special ops
-     (`CommutativeDecomposeEqualitySymbol` for INITIAL-EQUALITY-PREDICATE, `RandomOpSymbol`/`CounterSymbol`).
-     Each is mostly *wiring a few more built-in op codes* — the same NAT-codes pattern (a typed `enum` arm +
-     bignum/string op, differentially verified per code). Breadth, not depth.
+   - **(b) The remaining built-in data types — ✅ DONE.** `INT` (`abs`, `~`, signed two's-complement
+     bitwise), `RAT`, `FLOAT` (the full op set — `rem`/`^`/`floor`/`ceiling`/`min`/`max`/`exp`/`log`/trig —
+     and Maude's **partiality**: `/0` and out-of-domain NaN don't reduce, leaving the term at kind `[Float]`,
+     while `log(0.0) = -Infinity` does), `STRING`/`QID` (`ascii`/`char`/`find`/`rfind`/case, the STRING-OPS
+     `ctype` predicates + `startsWith`/`endsWith`/`trim`, `string`/`qid`), `CONVERSION` (`float`/`rat` —
+     exact float↔rational — `string`/`rat` base conversion, `string`/`float`, `decFloat`); plus the leaf
+     special ops `CommutativeDecomposeEqualitySymbol` (INITIAL-EQUALITY-PREDICATE), `RandomOpSymbol`
+     (RANDOM — MT19937 seed 0), and `CounterSymbol` (COUNTER — a stateful *rule*-special: inert under
+     `reduce`, advancing 0,1,2,… under `rewrite`/`frewrite`, reset per command). All byte-identical to the
+     reference (`conformance/prelude-tier2.maude`, 43 reduces; `prelude_tier2_through_repl`). This needed
+     four cross-cutting pieces beyond "more codes": the **`in <MODULE> :` command qualifier** (reduce in any
+     loaded module — the natural way to exercise the real prelude); a **`Term::Na` literal** (so a float/
+     string/qid constant can sit in an equation rhs — `eq pi = 3.14…`); **value-dependent NA sorts**
+     (length-1 string → `Char`, finite float → `FiniteFloat`); **`~>` partiality tracking** (a partial op's
+     range is its kind); and a **punctuation-aware `split_mixfix`** (so the `_=[_]_` / `<_,_,_>` / `[]` / `{}`
+     operators whose names lex with brackets parse and print). Breadth, plus that handful of seams.
    - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
      `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. This is where
      "load the prelude" meets reflection; the prelude's `.maude` source ports as-is once the hooks exist.

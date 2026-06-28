@@ -14,7 +14,7 @@ use crate::grammar::{prec_gather, PREFIX_GATHER};
 use crate::lex::{Frag, Interner, Sym};
 use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use std::borrow::Cow;
-use tnk_core::dag::{DagId, NodeRepr};
+use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::sort::KindId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
@@ -158,6 +158,15 @@ impl<'a> Printer<'a> {
                 let children: Vec<Item> = args.iter().map(Item::Term).collect();
                 self.layout_app(*symbol, &children, req_prec, lcap, rcap, true, out);
             }
+            // A built-in literal renders exactly as its DAG leaf would (string/qid/float).
+            Item::Term(Term::Na { value, .. }) => {
+                let text = match value {
+                    NaValue::Str(s) => render_string(s),
+                    NaValue::Qid(q) => render_qid(q),
+                    NaValue::Float(bits) => render_float(f64::from_bits(*bits)),
+                };
+                out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(text) });
+            }
             Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, range_known, out),
         }
     }
@@ -173,7 +182,7 @@ impl<'a> Printer<'a> {
                 NodeRepr::App => None,
                 NodeRepr::Iter { count, arg } => Some(Leaf::Iter { count, arg }),
                 NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
-                NodeRepr::Qid(q) => Some(Leaf::Atom(format!("'{q}"))),
+                NodeRepr::Qid(q) => Some(Leaf::Atom(render_qid(q))),
                 NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
             }
         };
@@ -524,6 +533,25 @@ enum Leaf {
     Atom(String),
 }
 
+/// A quoted identifier rendered with its leading `'` and Maude's name escaping: a space becomes a lone
+/// backquote, and each of `( ) [ ] { } ,` is preceded by a backquote (Maude's `Token` name encoding);
+/// everything else (letters, digits, `_`, `.`, …) is verbatim. So `qid("a b")` prints as `'a`b`.
+fn render_qid(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 1);
+    out.push('\'');
+    for c in q.chars() {
+        match c {
+            ' ' => out.push('`'),
+            '(' | ')' | '[' | ']' | '{' | '}' | ',' => {
+                out.push('`');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// A string constant rendered with surrounding quotes and the usual escapes.
 fn render_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -541,39 +569,10 @@ fn render_string(s: &str) -> String {
     out
 }
 
-/// Render a float exactly as Maude's `doubleToString` (`Utility/macros.cc`): 17 significant digits, the
-/// mantissa normalized to `[1, 10)` with at least one fractional digit and trailing zeros stripped, and a
-/// signed exponent shown only when nonzero — `1.0e+2`, `2.5e-1`, `3.14159265358979`, `-1.5`. Always
-/// re-lexes as a Float (our [`is_float_literal`](crate::lex) accepts the `e±` form).
+/// Render a float exactly as Maude's `doubleToString` — delegated to the kernel so the pretty-printer and
+/// the `string(Float)` conversion render identically (see [`tnk_core::double_to_string`]).
 fn render_float(f: f64) -> String {
-    if f.is_nan() {
-        return "NaN".to_string();
-    }
-    if f.is_infinite() {
-        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
-    }
-    if f == 0.0 {
-        return "0.0".to_string(); // also catches -0.0
-    }
-    // 16 fractional digits ⇒ 17 significant digits, mantissa in [1, 10), correctly rounded — the same
-    // value `ecvt(d, 17, …)` produces. Rust's `{:e}` writes `D.DDD…eE` (lowercase, no `+`, no padding).
-    let sci = format!("{:.*e}", 16, f.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("scientific notation has an exponent");
-    let exp: i64 = exp.parse().expect("exponent is an integer");
-    let (int_part, frac) = mantissa.split_once('.').expect("a `.16e` mantissa has a decimal point");
-    // Strip trailing zeros but keep at least one fractional digit (Maude's `next > 4` guard).
-    let frac = frac.trim_end_matches('0');
-    let frac = if frac.is_empty() { "0" } else { frac };
-    let body = match exp {
-        0 => format!("{int_part}.{frac}"),
-        e if e > 0 => format!("{int_part}.{frac}e+{e}"),
-        e => format!("{int_part}.{frac}e{e}"), // a negative exponent already carries its `-`
-    };
-    if f < 0.0 {
-        format!("-{body}")
-    } else {
-        body
-    }
+    tnk_core::double_to_string(f)
 }
 
 #[cfg(test)]
@@ -591,7 +590,7 @@ mod tests {
             .commands
             .iter()
             .map(|(m, c)| match c {
-                Command::Reduce { term } => (*m, term.clone()),
+                Command::Reduce { term, .. } => (*m, term.clone()),
                 _ => panic!("milestone uses only reduce"),
             })
             .collect();
@@ -667,7 +666,7 @@ mod tests {
             .commands
             .iter()
             .map(|(m, c)| match c {
-                Command::Reduce { term } => (*m, term.clone()),
+                Command::Reduce { term, .. } => (*m, term.clone()),
                 _ => panic!("milestone uses only reduce"),
             })
             .collect();
@@ -721,7 +720,7 @@ mod tests {
     fn colored_strips_to_plain() {
         let mut loaded = load_source(file!("nat.maude")).expect("load");
         let term = match &loaded.commands[0].1 {
-            Command::Reduce { term } => term.clone(),
+            Command::Reduce { term, .. } => term.clone(),
             _ => unreachable!(),
         };
         let (result, _) = reduce_command(&mut loaded.modules[0], &loaded.interner, &term).expect("reduce");

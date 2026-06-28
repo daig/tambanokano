@@ -11,7 +11,9 @@ use malachite::base::num::arithmetic::traits::{
     CheckedSub, DivRem, DivisibleBy, Gcd, Lcm, ModPow, Pow, UnsignedAbs,
 };
 use malachite::base::num::basic::traits::{One, Zero};
-use malachite::{Integer, Natural};
+use malachite::base::num::conversion::traits::{FromStringBase, RoundingFrom, ToStringBase};
+use malachite::base::rounding_modes::RoundingMode;
+use malachite::{Integer, Natural, Rational};
 
 /// A non-negative arbitrary-precision integer (Maude's `Natural`). `Clone`/`Eq`/`Ord`/`Debug` are
 /// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) can derive `Debug` and the S-theory's
@@ -71,18 +73,6 @@ impl Nat {
         u64::try_from(&self.0).ok()
     }
 
-    /// Bitwise `_xor_` / `_&_` / `_|_` over non-negative integers (Maude's `ACU_NumberOpSymbol`
-    /// `xor`/`&`/`|`, folding a multiset — see `builtin::acu_fold`). Naturals have no sign bit, so these
-    /// are the ordinary unsigned bit operations.
-    pub(crate) fn bitxor(&self, other: &Nat) -> Nat {
-        Nat(&self.0 ^ &other.0)
-    }
-    pub(crate) fn bitand(&self, other: &Nat) -> Nat {
-        Nat(&self.0 & &other.0)
-    }
-    pub(crate) fn bitor(&self, other: &Nat) -> Nat {
-        Nat(&self.0 | &other.0)
-    }
     /// `self << amount` / `self >> amount` (`_<<_` / `_>>_`); `>>` floors toward zero (shifts away the
     /// low bits). `amount` is a machine `u64` (the shift count fits — a bignum count is unrepresentable).
     pub(crate) fn shl(&self, amount: u64) -> Nat {
@@ -156,6 +146,94 @@ impl Int {
     pub(crate) fn pow_u64(&self, exp: u64) -> Int {
         Int((&self.0).pow(exp))
     }
+
+    /// Base-`base` rendering with a leading `-` for negatives (Maude's `string(Int, base)` — `mpz_get_str`,
+    /// lowercase digits). `base` in 2..=36.
+    pub(crate) fn to_string_base(&self, base: u8) -> String {
+        self.0.to_string_base(base)
+    }
+    /// Parse a signed integer written in `base` (Maude's `rat(String, base)` on an integer); `None` if the
+    /// text is not a valid base-`base` integer.
+    pub(crate) fn from_string_base(base: u8, s: &str) -> Option<Int> {
+        Integer::from_string_base(base, s).map(Int)
+    }
+
+    /// Signed bitwise `_&_` / `_|_` / `_xor_` / `~_` (INT's `ACU_NumberOpSymbol` folds + `NumberOpSymbol
+    /// (~)`). malachite's `Integer` uses two's-complement semantics with infinite sign extension —
+    /// exactly Maude's GMP `mpz` bit ops — so `~x = -(x+1)` and a negative operand sign-extends. For
+    /// non-negative operands these agree with the [`Nat`] magnitude versions (NAT rides the same fold).
+    pub(crate) fn bitand(&self, other: &Int) -> Int {
+        Int(&self.0 & &other.0)
+    }
+    pub(crate) fn bitor(&self, other: &Int) -> Int {
+        Int(&self.0 | &other.0)
+    }
+    pub(crate) fn bitxor(&self, other: &Int) -> Int {
+        Int(&self.0 ^ &other.0)
+    }
+    /// `~self = -(self + 1)` (bitwise NOT under two's complement).
+    pub(crate) fn bitnot(&self) -> Int {
+        Int(!&self.0)
+    }
+}
+
+/// The exact rational value of a finite `f64` as `(signed numerator, positive denominator)` — Maude's
+/// `rat(FiniteFloat)` (`mpq_set_d`: a double is `m · 2^e` exactly). `None` for NaN / infinite. The result
+/// is fully reduced (malachite's `Rational` is canonical).
+pub(crate) fn rational_of_f64(f: f64) -> Option<(Int, Nat)> {
+    let r = Rational::try_from(f.abs()).ok()?; // magnitude; the sign is reapplied below
+    let (num, den) = r.into_numerator_and_denominator();
+    let num = Integer::from(num);
+    Some((Int(if f < 0.0 { -num } else { num }), Nat(den)))
+}
+
+/// The `f64` nearest to the rational `num / den` (round-to-nearest-even) — Maude's `float(Rat)`
+/// (`mpq_get_d`). `den` must be non-zero (the rational `_/_` constructor guarantees it).
+pub(crate) fn f64_of_rational(num: &Int, den: &Nat) -> f64 {
+    let r = Rational::from_integers(num.0.clone(), Integer::from(den.0.clone()));
+    f64::rounding_from(&r, RoundingMode::Nearest).0
+}
+
+/// Parse a string to an `f64` (Maude's `float(String)` — `strtod`): the usual decimal / `e`-notation
+/// forms our float lexer also accepts. `None` if the whole string is not a float.
+pub(crate) fn parse_double(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok()
+}
+
+/// Render an `f64` exactly as Maude's `doubleToString` (`Utility/macros.cc`): 17 significant digits, the
+/// mantissa normalized to `[1, 10)` with at least one fractional digit and trailing zeros stripped, and a
+/// signed exponent shown only when nonzero — `1.0e+2`, `2.5e-1`, `3.14159265358979`, `-1.5`. `inf`/`nan`
+/// print as `Infinity`/`-Infinity`/`NaN`. Shared by the pretty-printer (display) and the `string(Float)`
+/// conversion, so both agree byte-for-byte.
+pub fn double_to_string(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if f == 0.0 {
+        return "0.0".to_string(); // also catches -0.0
+    }
+    // 16 fractional digits ⇒ 17 significant digits, mantissa in [1, 10), correctly rounded — the same
+    // value `ecvt(d, 17, …)` produces. Rust's `{:e}` writes `D.DDD…eE` (lowercase, no `+`, no padding).
+    let sci = format!("{:.*e}", 16, f.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("scientific notation has an exponent");
+    let exp: i64 = exp.parse().expect("exponent is an integer");
+    let (int_part, frac) = mantissa.split_once('.').expect("a `.16e` mantissa has a decimal point");
+    // Strip trailing zeros but keep at least one fractional digit (Maude's `next > 4` guard).
+    let frac = frac.trim_end_matches('0');
+    let frac = if frac.is_empty() { "0" } else { frac };
+    let body = match exp {
+        0 => format!("{int_part}.{frac}"),
+        e if e > 0 => format!("{int_part}.{frac}e+{e}"),
+        e => format!("{int_part}.{frac}e{e}"), // a negative exponent already carries its `-`
+    };
+    if f < 0.0 {
+        format!("-{body}")
+    } else {
+        body
+    }
 }
 
 #[cfg(test)]
@@ -208,11 +286,6 @@ mod tests {
 
     #[test]
     fn bitwise_shifts_modpow() {
-        // Bitwise on non-negative naturals (NAT's `_&_`/`_|_`/`_xor_`).
-        assert_eq!(n(12).bitand(&n(10)), n(8)); // 1100 & 1010 = 1000
-        assert_eq!(n(12).bitor(&n(10)), n(14)); // 1100 | 1010 = 1110
-        assert_eq!(n(5).bitxor(&n(3)), n(6)); // 101 ^ 011 = 110
-        assert_eq!(n(5).bitxor(&n(5)), n(0)); // xor is self-inverse
         // Shifts (`_<<_`/`_>>_`); `>>` floors, a huge shift clears all bits.
         assert_eq!(n(5).shl(3), n(40)); // 5 * 8
         assert_eq!(n(40).shr(3), n(5)); // 40 / 8
@@ -241,5 +314,24 @@ mod tests {
         let (q, r) = neg(7).div_rem(&i(2));
         assert_eq!((q, r), (neg(3), neg(1)), "-7 quo 2 = -3, -7 rem 2 = -1");
         assert!(neg(2) < i(3) && i(3) > neg(2), "-2 < 3");
+    }
+
+    #[test]
+    fn signed_bitwise() {
+        use super::Int;
+        let i = |x: u64| Int::from_nat(&n(x));
+        let neg = |x: u64| i(x).sub(&i(2 * x)); // -x
+        // Non-negative operands agree with ordinary unsigned bit ops (NAT rides this).
+        assert_eq!(i(12).bitand(&i(10)), i(8)); // 1100 & 1010 = 1000
+        assert_eq!(i(12).bitor(&i(10)), i(14)); // 1100 | 1010 = 1110
+        assert_eq!(i(5).bitxor(&i(3)), i(6)); // 101 ^ 011 = 110
+        assert_eq!(i(5).bitxor(&i(5)), i(0), "xor is self-inverse");
+        // Two's-complement complement: ~x = -(x+1).
+        assert_eq!(i(0).bitnot(), neg(1), "~0 = -1");
+        assert_eq!(i(3).bitnot(), neg(4), "~3 = -4");
+        assert_eq!(neg(1).bitnot(), i(0), "~(-1) = 0");
+        // Signed operands sign-extend: -1 is all-ones, so (-1) & x = x, (-1) | x = -1.
+        assert_eq!(neg(1).bitand(&i(12)), i(12), "(-1) & 12 = 12");
+        assert_eq!(neg(1).bitor(&i(12)), neg(1), "(-1) | 12 = -1");
     }
 }

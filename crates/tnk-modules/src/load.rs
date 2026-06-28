@@ -87,7 +87,7 @@ mod tests {
             .commands
             .iter()
             .map(|(m, c)| match c {
-                Command::Reduce { term } => (*m, term.clone()),
+                Command::Reduce { term, .. } => (*m, term.clone()),
                 _ => panic!("import conformance uses only `reduce`"),
             })
             .collect();

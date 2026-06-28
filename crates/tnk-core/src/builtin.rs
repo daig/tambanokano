@@ -9,7 +9,10 @@
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::num::{Int, Nat};
-use crate::symbol::{BoolHooks, FltOp, NatHooks, NumOp, SpecialOp, StrOp, SymbolId};
+use crate::num;
+use crate::symbol::{
+    BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
+};
 use std::rc::Rc;
 
 impl Runtime {
@@ -24,13 +27,211 @@ impl Runtime {
             }
             SpecialOp::CuiNumberOp { op, nat } => self.reduce_cui_number_op(sig, id, *op, nat),
             SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
-            SpecialOp::StringOp { op, str_sym, nat, bool_ } => {
-                self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref())
+            SpecialOp::StringOp { op, str_sym, nat, bool_, not_found } => {
+                self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref(), *not_found)
             }
             SpecialOp::FloatOp { op, float_sym, bool_ } => {
                 self.reduce_float_op(sig, id, *op, *float_sym, bool_.as_ref())
             }
+            SpecialOp::Random { nat } => self.reduce_random(sig, id, nat),
+            SpecialOp::Conversion { op, float_sym, str_sym, nat, division, dec_float } => self
+                .reduce_conversion(sig, id, *op, *float_sym, *str_sym, nat.as_ref(), *division, *dec_float),
+            // `counter` is inert under equational reduction — it only advances under `rewrite`/`frewrite`
+            // (see `try_counter`), so a `reduce` leaves it as the kind constant `[Nat]: counter`.
+            SpecialOp::Counter { .. } => None,
+            SpecialOp::QidOp { op, qid_sym, str_sym } => {
+                self.reduce_qid_op(sig, id, *op, *qid_sym, *str_sym)
+            }
             SpecialOp::Division { nat } => self.reduce_division(sig, id, nat),
+        }
+    }
+
+    /// `string : Qid -> String` / `qid : String ~> Qid` (Maude's `QuotedIdentifierOpSymbol`): convert
+    /// between a quoted identifier (stored without its leading `'`) and its text. `qid` is partial — a
+    /// string that is not a single identifier token (empty or containing whitespace) does not reduce.
+    fn reduce_qid_op(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: QidOp,
+        qid_sym: SymbolId,
+        str_sym: SymbolId,
+    ) -> Option<DagId> {
+        let arg = self.node(id).children().next().expect("string/qid is unary");
+        match op {
+            QidOp::String => {
+                let q = self.as_qid(arg)?;
+                Some(self.make_na(sig, str_sym, NaValue::Str(q)))
+            }
+            QidOp::Qid => {
+                // `qid` accepts any string (even empty or with spaces) — the raw text is stored and the
+                // printer backquote-escapes special characters (`qid("a b")` prints as `'a`b`).
+                let s = self.as_str(arg)?;
+                Some(self.make_na(sig, qid_sym, NaValue::Qid(s)))
+            }
+        }
+    }
+
+    /// Read a rational from `id`: an integer numeral → `(i, 1)`, or a `_/_` node `I / N` → `(I, N)`.
+    /// `None` if `id` is neither.
+    fn as_rational(&self, id: DagId, nat: &NatHooks, division: Option<SymbolId>) -> Option<(Int, Nat)> {
+        if let Some(i) = self.as_int(id, nat) {
+            return Some((i, Nat::one()));
+        }
+        let div = division?;
+        match &self.node(id).term {
+            NodeTerm::Free { symbol, args } if *symbol == div && args.len() == 2 => {
+                Some((self.as_int(args[0], nat)?, self.as_nat(args[1], nat)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Build the canonical rational `num / den` (already in lowest terms): the integer `num` when
+    /// `den == 1`, else the `_/_` node.
+    fn make_rational(
+        &mut self,
+        sig: &Signature,
+        nat: &NatHooks,
+        division: Option<SymbolId>,
+        num: Int,
+        den: Nat,
+    ) -> Option<DagId> {
+        if den == Nat::one() {
+            return self.make_int(sig, nat, num);
+        }
+        let div = division?;
+        let n = self.make_int(sig, nat, num)?;
+        let d = self.make_int(sig, nat, Int::from_nat(&den))?;
+        Some(self.make_free(sig, div, vec![n, d]))
+    }
+
+    /// The CONVERSION coercions (`float`/`rat`/`string`/`decFloat`). Each reads/builds the value types it
+    /// bridges; a malformed argument (non-numeral, bad base/string, non-finite where exact) falls through.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_conversion(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: ConvOp,
+        float_sym: Option<SymbolId>,
+        str_sym: Option<SymbolId>,
+        nat: Option<&NatHooks>,
+        division: Option<SymbolId>,
+        dec_float: Option<SymbolId>,
+    ) -> Option<DagId> {
+        let kids: Vec<DagId> = self.node(id).children().collect();
+        match op {
+            // `float : Rat -> Float` — the nearest double to the rational.
+            ConvOp::RatToFloat => {
+                let (num, den) = self.as_rational(kids[0], nat?, division)?;
+                let f = num::f64_of_rational(&num, &den);
+                Some(self.make_na(sig, float_sym?, NaValue::Float(f.to_bits())))
+            }
+            // `rat : FiniteFloat -> Rat` — the exact rational of the double.
+            ConvOp::FloatToRat => {
+                let (num, den) = num::rational_of_f64(self.as_float(kids[0])?)?;
+                self.make_rational(sig, nat?, division, num, den)
+            }
+            // `string : Rat NzNat -> String` — the rational in the given base (`I` or `I/N`).
+            ConvOp::RatToString => {
+                let nat = nat?;
+                let (num, den) = self.as_rational(kids[0], nat, division)?;
+                let base = conv_base(self.as_nat(kids[1], nat)?)?;
+                let s = if den == Nat::one() {
+                    num.to_string_base(base)
+                } else {
+                    format!("{}/{}", num.to_string_base(base), Int::from_nat(&den).to_string_base(base))
+                };
+                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into())))
+            }
+            // `rat : String NzNat -> Rat` — a rational parsed from the base (`I` or `I/N`).
+            ConvOp::StringToRat => {
+                let nat = nat?;
+                let s = self.as_str(kids[0])?;
+                let base = conv_base(self.as_nat(kids[1], nat)?)?;
+                let (num, den) = match s.split_once('/') {
+                    Some((n, d)) => {
+                        (Int::from_string_base(base, n)?, Int::from_string_base(base, d)?.magnitude())
+                    }
+                    None => (Int::from_string_base(base, &s)?, Nat::one()),
+                };
+                if den.is_zero() {
+                    return None;
+                }
+                self.make_rational(sig, nat, division, num, den)
+            }
+            // `string : Float -> String` — the float's canonical decimal string (Maude's `doubleToString`).
+            ConvOp::FloatToString => {
+                let s = num::double_to_string(self.as_float(kids[0])?);
+                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into())))
+            }
+            // `float : String -> Float` — parse the string (partial: not every string is a float).
+            ConvOp::StringToFloat => {
+                let f = num::parse_double(&self.as_str(kids[0])?)?;
+                Some(self.make_na(sig, float_sym?, NaValue::Float(f.to_bits())))
+            }
+            // `decFloat : Float Nat -> DecFloat` — decompose into `< sign, "digits", exp >` with the value
+            // `sign · 0.digits · 10^exp` (precision 0 ⇒ the exact full expansion).
+            ConvOp::DecFloat => {
+                let nat = nat?;
+                let f = self.as_float(kids[0])?;
+                let prec = self.as_nat(kids[1], nat)?.to_usize()?;
+                let (sign, digits, exp) = dec_float_parts(f, prec)?;
+                let one = Int::from_nat(&Nat::one());
+                let sign_val = match sign {
+                    1 => one,
+                    -1 => one.neg(),
+                    _ => Int::from_nat(&Nat::zero()),
+                };
+                let exp_val = if exp < 0 {
+                    Int::from_nat(&Nat::from_u64(exp.unsigned_abs())).neg()
+                } else {
+                    Int::from_nat(&Nat::from_u64(exp as u64))
+                };
+                let sign_dag = self.make_int(sig, nat, sign_val)?;
+                let digits_dag = self.make_na(sig, str_sym?, NaValue::Str(digits.into()));
+                let exp_dag = self.make_int(sig, nat, exp_val)?;
+                Some(self.make_free(sig, dec_float?, vec![sign_dag, digits_dag, exp_dag]))
+            }
+        }
+    }
+
+    /// Fire a `counter` redex (Maude's `CounterSymbol`) at `node` during rewriting: if `node` is a
+    /// counter op, yield the next natural and advance the counter, counting one rewrite. `None` if `node`
+    /// is not a counter. Called from the `rewrite`/`frewrite` traversals — never from `reduce`.
+    pub(crate) fn try_counter(&mut self, sig: &Signature, node: DagId) -> Option<DagId> {
+        let symbol = self.node(node).symbol();
+        let nat = match sig.symbol(symbol).special() {
+            Some(SpecialOp::Counter { nat }) => *nat,
+            _ => return None,
+        };
+        let v = self.counter_value;
+        self.counter_value += 1;
+        self.rewrite_count += 1;
+        self.make_int(sig, &nat, Int::from_nat(&Nat::from_u64(v)))
+    }
+
+    /// Reset the `counter` built-in to 0 — called at the start of each top-level `rewrite`/`frewrite`
+    /// command (not on `continue`, which resumes the running count).
+    pub(crate) fn reset_counter(&mut self) {
+        self.counter_value = 0;
+    }
+
+    /// `random : Nat -> Nat` (Maude's `RandomOpSymbol`): the n-th output of MT19937 seeded with 0. A
+    /// non-numeral argument falls through.
+    fn reduce_random(&mut self, sig: &Signature, id: DagId, nat: &NatHooks) -> Option<DagId> {
+        let arg = self.node(id).children().next().expect("random is unary");
+        let n = self.as_nat(arg, nat)?.to_u64()?;
+        let r = mt19937_nth(n);
+        self.make_int(sig, nat, Int::from_nat(&Nat::from_u64(u64::from(r))))
+    }
+
+    /// Read a quoted-identifier value from a `NodeTerm::Na::Qid` (the text without its `'`), or `None`.
+    fn as_qid(&self, id: DagId) -> Option<Rc<str>> {
+        match &self.node(id).term {
+            NodeTerm::Na { value: NaValue::Qid(q), .. } => Some(q.clone()),
+            _ => None,
         }
     }
 
@@ -202,6 +403,10 @@ impl Runtime {
                 Some(self.make_const(sig, if b { h.true_ } else { h.false_ }))
             }
             NumOp::Sub => self.make_int(sig, nat, a[0].sub(&a[1])),
+            // `abs : Int -> Nat` — magnitude (always non-negative, so no `minus` hook needed).
+            NumOp::Abs => self.make_int(sig, nat, Int::from_nat(&a[0].magnitude())),
+            // `~_ : Int -> Int` — bitwise complement `~x = -(x+1)` (needs the INT `minus` hook).
+            NumOp::BitNot => self.make_int(sig, nat, a[0].bitnot()),
             NumOp::Quo | NumOp::Rem => {
                 if a[1].is_zero() {
                     return None; // division by zero ⇒ fall through to user equations
@@ -269,6 +474,7 @@ impl Runtime {
 
     /// `StringOpSymbol` (concat / length / substr / comparisons): operate on string `NodeTerm::Na`
     /// values, building a string (`str_sym`), a Nat (`nat`), or a Bool (`bool_`) result.
+    #[allow(clippy::too_many_arguments)]
     fn reduce_string_op(
         &mut self,
         sig: &Signature,
@@ -277,13 +483,14 @@ impl Runtime {
         str_sym: SymbolId,
         nat: Option<&NatHooks>,
         bool_: Option<&BoolHooks>,
+        not_found: Option<SymbolId>,
     ) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
+        let make_str = |this: &mut Self, s: String| this.make_na(sig, str_sym, NaValue::Str(s.into()));
         match op {
             StrOp::Concat => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
-                let r: Rc<str> = format!("{a}{b}").into();
-                Some(self.make_na(sig, str_sym, NaValue::Str(r)))
+                Some(make_str(self, format!("{a}{b}")))
             }
             StrOp::Length => {
                 let len = self.as_str(kids[0])?.chars().count();
@@ -298,7 +505,92 @@ impl Runtime {
                 }
                 let (start, len) = (start.magnitude().to_usize()?, len.magnitude().to_usize()?);
                 let r: String = a.chars().skip(start).take(len).collect();
-                Some(self.make_na(sig, str_sym, NaValue::Str(r.into())))
+                Some(make_str(self, r))
+            }
+            // `ascii : Char -> Nat` — the code of a one-character string (else fall through). For an ASCII
+            // char the scalar value equals Maude's byte value (the strings here are byte/ASCII-oriented).
+            StrOp::Ascii => {
+                let s = self.as_str(kids[0])?;
+                let mut cs = s.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(c), None) => {
+                        self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(u32::from(c) as u64)))
+                    }
+                    _ => None, // not a single character
+                }
+            }
+            // `char : Nat ~> Char` — the one-character string for a code (partial: a valid scalar value).
+            StrOp::Char => {
+                let n = self.as_int(kids[0], nat?)?;
+                if n.is_negative() {
+                    return None;
+                }
+                let code = u32::try_from(n.magnitude().to_u64()?).ok()?;
+                let c = char::from_u32(code)?;
+                Some(make_str(self, c.to_string()))
+            }
+            // `find` / `rfind : String String Nat -> FindResult` — C++ `std::string::find`/`rfind`
+            // semantics over the byte sequence (≡ char index for ASCII): first/last occurrence of `pat`
+            // starting at an index `>= start` (find) / `<= start` (rfind), else the `notFound` constant.
+            StrOp::Find | StrOp::Rfind => {
+                let nat = nat?;
+                let (s, pat) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
+                let start = self.as_int(kids[2], nat)?;
+                if start.is_negative() {
+                    return None;
+                }
+                let start = start.magnitude().to_usize()?;
+                let (hay, needle) = (s.as_bytes(), pat.as_bytes());
+                let found = if matches!(op, StrOp::Find) {
+                    byte_find(hay, needle, start)
+                } else {
+                    byte_rfind(hay, needle, start)
+                };
+                match found {
+                    Some(idx) => self.make_int(sig, nat, Int::from_nat(&Nat::from_u64(idx as u64))),
+                    None => Some(self.make_const(sig, not_found?)),
+                }
+            }
+            // `upperCase` / `lowerCase` — ASCII case mapping (C `toupper`/`tolower`, byte-wise).
+            StrOp::UpperCase => {
+                let s = self.as_str(kids[0])?;
+                Some(make_str(self, s.to_ascii_uppercase()))
+            }
+            StrOp::LowerCase => {
+                let s = self.as_str(kids[0])?;
+                Some(make_str(self, s.to_ascii_lowercase()))
+            }
+            // `isX : Char -> Bool` — the C `ctype` class of a single character (else fall through).
+            StrOp::IsClass(class) => {
+                let s = self.as_str(kids[0])?;
+                let mut cs = s.chars();
+                let c = match (cs.next(), cs.next()) {
+                    (Some(c), None) => c,
+                    _ => return None, // not a single character
+                };
+                let h = bool_?;
+                Some(self.make_const(sig, if char_in_class(c, class) { h.true_ } else { h.false_ }))
+            }
+            // `startsWith` / `endsWith : String String -> Bool`.
+            StrOp::StartsWith | StrOp::EndsWith => {
+                let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
+                let res = if matches!(op, StrOp::StartsWith) {
+                    a.starts_with(b.as_ref())
+                } else {
+                    a.ends_with(b.as_ref())
+                };
+                let h = bool_?;
+                Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
+            }
+            // `trim` / `trimStart` / `trimEnd : String -> String` — strip C-whitespace.
+            StrOp::Trim | StrOp::TrimStart | StrOp::TrimEnd => {
+                let s = self.as_str(kids[0])?;
+                let t = match op {
+                    StrOp::TrimStart => s.trim_start_matches(is_c_space),
+                    StrOp::TrimEnd => s.trim_end_matches(is_c_space),
+                    _ => s.trim_matches(is_c_space),
+                };
+                Some(make_str(self, t.to_string()))
             }
             StrOp::Lt | StrOp::Le | StrOp::Gt | StrOp::Ge => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
@@ -337,34 +629,62 @@ impl Runtime {
         let kids: Vec<DagId> = self.node(id).children().collect();
         let a = self.as_float(kids[0])?;
         let make_f = |this: &mut Self, v: f64| this.make_na(sig, float_sym, NaValue::Float(v.to_bits()));
-        match op {
-            FltOp::Neg => Some(make_f(self, -a)),
-            FltOp::Abs => Some(make_f(self, a.abs())),
-            FltOp::Sqrt => Some(make_f(self, a.sqrt())),
-            FltOp::Add | FltOp::Sub | FltOp::Mul | FltOp::Div => {
+        // Comparisons → Bool.
+        if matches!(op, FltOp::Lt | FltOp::Le | FltOp::Gt | FltOp::Ge) {
+            let b = self.as_float(kids[1])?;
+            let res = match op {
+                FltOp::Lt => a < b,
+                FltOp::Le => a <= b,
+                FltOp::Gt => a > b,
+                FltOp::Ge => a >= b,
+                _ => unreachable!(),
+            };
+            let h = bool_?;
+            return Some(self.make_const(sig, if res { h.true_ } else { h.false_ }));
+        }
+        // Arithmetic / functions → Float (IEEE `f64`, Maude's C `libm`).
+        let v = match op {
+            FltOp::Neg => -a,
+            FltOp::Abs => a.abs(),
+            FltOp::Sqrt => a.sqrt(),
+            FltOp::Floor => a.floor(),
+            FltOp::Ceiling => a.ceil(),
+            FltOp::Exp => a.exp(),
+            FltOp::Log => a.ln(),
+            FltOp::Sin => a.sin(),
+            FltOp::Cos => a.cos(),
+            FltOp::Tan => a.tan(),
+            FltOp::Asin => a.asin(),
+            FltOp::Acos => a.acos(),
+            FltOp::Atan => a.atan(),
+            _ => {
                 let b = self.as_float(kids[1])?;
-                let v = match op {
+                // `/`/`rem` by zero is **undefined** in Maude — it does not reduce, even though IEEE
+                // would give ±inf (`1.0 / 0.0` stays `[Float]`, 0 rewrites).
+                if matches!(op, FltOp::Div | FltOp::Rem) && b == 0.0 {
+                    return None;
+                }
+                match op {
                     FltOp::Add => a + b,
                     FltOp::Sub => a - b,
                     FltOp::Mul => a * b,
                     FltOp::Div => a / b,
+                    FltOp::Rem => a % b, // C `fmod` (remainder takes the dividend's sign)
+                    FltOp::Pow => a.powf(b),
+                    FltOp::Min => a.min(b),
+                    FltOp::Max => a.max(b),
+                    FltOp::Atan2 => a.atan2(b),
                     _ => unreachable!(),
-                };
-                Some(make_f(self, v))
+                }
             }
-            FltOp::Lt | FltOp::Le | FltOp::Gt | FltOp::Ge => {
-                let b = self.as_float(kids[1])?;
-                let res = match op {
-                    FltOp::Lt => a < b,
-                    FltOp::Le => a <= b,
-                    FltOp::Gt => a > b,
-                    FltOp::Ge => a >= b,
-                    _ => unreachable!(),
-                };
-                let h = bool_?;
-                Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
-            }
+        };
+        // A partial op (`~>`) off its domain yields NaN, which does **not** reduce — `sqrt(-1.0)` /
+        // `log(-1.0)` / `asin(2.0)` / an indeterminate `^` stay in the kind `[Float]`. (`log(0.0)` =
+        // -inf is *not* NaN, so it reduces — matching the reference.) Total ops keep inf results.
+        if v.is_nan() && matches!(op, FltOp::Sqrt | FltOp::Log | FltOp::Asin | FltOp::Acos | FltOp::Pow) {
+            return None;
         }
+        Some(make_f(self, v))
     }
 
     /// `_/_` (Maude's `DivisionSymbol`): canonicalise `I / N` to lowest terms. Divide both by
@@ -393,6 +713,117 @@ impl Runtime {
     }
 }
 
+/// Whether `c` is C-locale whitespace (`isspace`: space, tab, newline, CR, vertical tab, form feed) —
+/// the trim ops' delimiter. Rust's `is_ascii_whitespace` omits the vertical tab, so spell it out.
+fn is_c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}')
+}
+
+/// Whether the character `c` is in the C `ctype` class `class` (STRING-OPS predicates), tested per byte in
+/// the C locale: a non-ASCII char (byte > 127) is in no class, which the `is_ascii_*` checks give for free.
+fn char_in_class(c: char, class: CharClass) -> bool {
+    match class {
+        CharClass::Control => c.is_ascii_control(),
+        CharClass::Printable => c == ' ' || c.is_ascii_graphic(), // C `isprint`: graphic or space
+        CharClass::Space => is_c_space(c),
+        CharClass::Blank => c == ' ' || c == '\t',
+        CharClass::Graphic => c.is_ascii_graphic(),
+        CharClass::Punct => c.is_ascii_punctuation(),
+        CharClass::Alnum => c.is_ascii_alphanumeric(),
+        CharClass::Alpha => c.is_ascii_alphabetic(),
+        CharClass::Upper => c.is_ascii_uppercase(),
+        CharClass::Lower => c.is_ascii_lowercase(),
+        CharClass::Digit => c.is_ascii_digit(),
+        CharClass::XDigit => c.is_ascii_hexdigit(),
+    }
+}
+
+/// A conversion base as a `u8` in 2..=36, or `None` (out of range / too large) — Maude's base argument.
+fn conv_base(n: Nat) -> Option<u8> {
+    u8::try_from(n.to_u64()?).ok().filter(|&b| (2..=36).contains(&b))
+}
+
+/// Decompose a float for `decFloat(f, prec)` into `(sign, digits, exp)` with value `sign · 0.digits ·
+/// 10^exp` (Maude's `DecFloat`). `sign` is 1 / -1 / 0; `prec > 0` rounds to that many significant digits;
+/// `prec == 0` gives the **exact** full decimal expansion (`|f| = num/2^k` ⇒ digits `num·5^k`, exp
+/// `len − k`). `None` if the exact denominator exponent exceeds machine width (extreme subnormals).
+fn dec_float_parts(f: f64, prec: usize) -> Option<(i32, String, i64)> {
+    if f == 0.0 {
+        return Some((0, "0".repeat(prec.max(1)), 0));
+    }
+    let sign = if f < 0.0 { -1 } else { 1 };
+    let mag = f.abs();
+    if prec == 0 {
+        let (num, den) = num::rational_of_f64(mag)?;
+        let k = i64::from(den.to_u64()?.trailing_zeros()); // den is a power of two, 2^k
+        let five_k = Int::from_nat(&Nat::from_u64(5)).pow_u64(k as u64);
+        let digits = num.mul(&five_k).magnitude().to_decimal();
+        let exp = digits.len() as i64 - k;
+        Some((sign, digits, exp))
+    } else {
+        // `{:.(prec-1)e}` writes `prec` significant digits as `D.DDDe±E` (or `De±E` for prec 1).
+        let sci = format!("{:.*e}", prec - 1, mag);
+        let (mantissa, exp_str) = sci.split_once('e')?;
+        let digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+        Some((sign, digits, exp_str.parse::<i64>().ok()? + 1))
+    }
+}
+
+/// The n-th 32-bit output (0-indexed) of MT19937 seeded with 0 — Maude's `random(n)`. The generator is
+/// re-run from the seed each call (a pure function of `n`); conformance `n` is small. Standard MT19937
+/// constants (Matsumoto–Nishimura); the seed init is the 2002 `init_genrand`.
+fn mt19937_nth(n: u64) -> u32 {
+    const N: usize = 624;
+    const M: usize = 397;
+    let mut mt = [0u32; N]; // mt[0] = seed = 0
+    for i in 1..N {
+        mt[i] = 1_812_433_253u32
+            .wrapping_mul(mt[i - 1] ^ (mt[i - 1] >> 30))
+            .wrapping_add(i as u32);
+    }
+    let mut idx = N; // force a twist before the first extraction
+    let mut out = 0u32;
+    for _ in 0..=n {
+        if idx >= N {
+            for i in 0..N {
+                let y = (mt[i] & 0x8000_0000) | (mt[(i + 1) % N] & 0x7fff_ffff);
+                mt[i] = mt[(i + M) % N] ^ (y >> 1) ^ if y & 1 != 0 { 0x9908_b0df } else { 0 };
+            }
+            idx = 0;
+        }
+        let mut y = mt[idx];
+        idx += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^= y >> 18;
+        out = y;
+    }
+    out
+}
+
+/// First index `>= start` where `needle` occurs in `hay` (C++ `std::string::find`). An empty needle
+/// matches at `start` (when in range); `npos` is `None`.
+fn byte_find(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return (start <= hay.len()).then_some(start);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (start..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// Last index `<= pos` where `needle` occurs in `hay` (C++ `std::string::rfind`). An empty needle matches
+/// at `min(pos, len)`; `npos` is `None`.
+fn byte_rfind(hay: &[u8], needle: &[u8], pos: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(pos.min(hay.len()));
+    }
+    let last = hay.len().checked_sub(needle.len())?;
+    (0..=pos.min(last)).rev().find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
 /// The first numeric operand `n` (multiplicity `m`) folded into a fresh accumulator.
 fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
     match op {
@@ -401,8 +832,9 @@ fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
         // gcd/lcm/min/max are idempotent in multiplicity; their operands are non-negative.
         NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => Int::from_nat(&n.magnitude()),
         // Bitwise: `xor` cancels in pairs (even multiplicity ⇒ 0); `&`/`|` are idempotent (m ⩾ 1 ⇒ n).
+        // The value is kept **signed** (INT folds over two's complement; NAT operands are non-negative).
         NumOp::Xor if m % 2 == 0 => Int::from_nat(&Nat::zero()),
-        NumOp::Xor | NumOp::And | NumOp::Or => Int::from_nat(&n.magnitude()),
+        NumOp::Xor | NumOp::And | NumOp::Or => n.clone(),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
 }
@@ -417,11 +849,11 @@ fn acu_fold(op: NumOp, acc: &Int, n: &Int, m: u32) -> Int {
         NumOp::Lcm => Int::from_nat(&acc.magnitude().lcm(&n.magnitude())),
         NumOp::Min => core::cmp::min(acc.clone(), n.clone()),
         NumOp::Max => core::cmp::max(acc.clone(), n.clone()),
-        // Bitwise folds on magnitudes; an even-multiplicity `xor` operand leaves `acc` unchanged.
+        // Signed two's-complement bit folds; an even-multiplicity `xor` operand leaves `acc` unchanged.
         NumOp::Xor if m % 2 == 0 => acc.clone(),
-        NumOp::Xor => Int::from_nat(&acc.magnitude().bitxor(&n.magnitude())),
-        NumOp::And => Int::from_nat(&acc.magnitude().bitand(&n.magnitude())),
-        NumOp::Or => Int::from_nat(&acc.magnitude().bitor(&n.magnitude())),
+        NumOp::Xor => acc.bitxor(n),
+        NumOp::And => acc.bitand(n),
+        NumOp::Or => acc.bitor(n),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
 }

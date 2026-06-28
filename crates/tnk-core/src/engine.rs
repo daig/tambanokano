@@ -325,8 +325,13 @@ pub enum StmtKind {
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
-    /// Count of equational rewrites applied (Maude's `rewrites` statistic).
-    rewrite_count: u64,
+    /// Count of equational rewrites applied (Maude's `rewrites` statistic). `pub(crate)` so the rewrite-
+    /// path `counter` special ([`Runtime::try_counter`]) can count its step like a rule application.
+    pub(crate) rewrite_count: u64,
+    /// Next value for the `counter` built-in (Maude's `CounterSymbol`): each `rewrite`/`frewrite` step
+    /// that fires a `counter` redex yields this and increments it. Reset to 0 at the start of each
+    /// top-level rewriting command (not on `continue`). Inert under equational `reduce`.
+    pub(crate) counter_value: u64,
     /// When `Some`, [`reduce`](Engine::reduce) records a structured [`TraceEvent`] stream here (opt-in
     /// via [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate node ids, so it
     /// is rooted by [`safe_point_gc`](Self::safe_point_gc) — but it is meant for the REPL, which runs
@@ -682,6 +687,35 @@ impl Signature {
     /// applicable declaration → the error sort of the range's kind.
     pub(crate) fn compute_sort(&self, symbol: SymbolId, arg_sorts: &[SortId]) -> SortId {
         self.compute_sort_uniq(symbol, arg_sorts).0
+    }
+
+    /// The sort of a built-in **NA** constant — *value-dependent* (Maude's per-symbol NA sort
+    /// functions), not just the least declared range: a length-1 string is `Char` else `String`; a
+    /// finite float is `FiniteFloat` else `Float`; a quoted identifier is `Qid`. Concretely: among the
+    /// symbol's declared range sorts, the most specific (min) when the value is "special" (a one-char
+    /// string / a finite float), else the most general (max). A single-decl NA symbol (`Qid`) has
+    /// min == max, so the value does not matter.
+    pub(crate) fn compute_na_sort(&self, symbol: SymbolId, value: &NaValue) -> SortId {
+        let decls = self.symbols.get(symbol).decls();
+        let (mut min, mut max) = (decls[0].range, decls[0].range);
+        for d in &decls[1..] {
+            if self.sorts.leq(d.range, min) {
+                min = d.range;
+            }
+            if self.sorts.leq(max, d.range) {
+                max = d.range;
+            }
+        }
+        let special = match value {
+            NaValue::Str(s) => s.chars().count() == 1,
+            NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
+            NaValue::Qid(_) => true,
+        };
+        if special {
+            min
+        } else {
+            max
+        }
     }
 
     /// [`compute_sort`](Self::compute_sort) plus the **preregularity** bit: `true` iff the least sort
@@ -1426,7 +1460,7 @@ impl Runtime {
     /// Build an atomic **NA** constant node carrying `value` (a string/qid/float). The sort is
     /// `symbol`'s range (`symbol` is an arity-0 NA-constant symbol — Maude's `StringSymbol` etc.).
     pub(crate) fn make_na(&mut self, sig: &Signature, symbol: SymbolId, value: NaValue) -> DagId {
-        let sort = sig.compute_sort(symbol, &[]);
+        let sort = sig.compute_na_sort(symbol, &value);
         self.alloc_node(sort, NodeTerm::Na { symbol, value })
     }
 
@@ -2189,6 +2223,10 @@ impl Runtime {
                 }
             }
             let node = stack[i].node;
+            // A `counter` redex fires like a rule at this (top-down-first) position.
+            if let Some(result) = self.try_counter(sig, node) {
+                return Some(self.rebuild_path(sig, &stack, i, result));
+            }
             if let Some((_rule_id, result)) = self.apply_first_rule_at(sig, node, cursors) {
                 return Some(self.rebuild_path(sig, &stack, i, result));
             }
@@ -3102,9 +3140,14 @@ impl Engine {
             node = self.reduce(node);
         }
         // 3. Apply up to `gas` rules at this node, reducing between each (Maude's `doRewriting` gas loop).
+        //    A `counter` redex fires here too (like a rule), advancing the counter.
         let mut g = gas;
         while g > 0 && *remaining != Some(0) {
-            match self.rewrite_at(node, cursors) {
+            let fired = match self.rt.try_counter(&self.sig, node) {
+                Some(r) => Some(r),
+                None => self.rewrite_at(node, cursors),
+            };
+            match fired {
                 Some(r) => {
                     *progress = true;
                     node = self.reduce(r);
@@ -3125,6 +3168,11 @@ impl Engine {
     }
     pub fn reset_rewrites(&mut self) {
         self.rt.reset_rewrites();
+    }
+    /// Reset the `counter` built-in (Maude's `CounterSymbol`) to 0 — call at the start of each top-level
+    /// `rewrite`/`frewrite` command so successive commands restart the count (`continue` does not reset).
+    pub fn reset_counter(&mut self) {
+        self.rt.reset_counter();
     }
 
     /// Enable or disable reduction tracing. When on, [`reduce`](Self::reduce) records a structured
@@ -5286,13 +5334,13 @@ mod tests {
         let nh = NatHooks { succ: s, zero: z, minus: None };
         let bh = BoolHooks { true_: tt, false_: ff };
         let concat = e.add_op(".", vec![str_s, str_s], str_s);
-        e.set_special(concat, SpecialOp::StringOp { op: StrOp::Concat, str_sym: strsym, nat: None, bool_: None });
+        e.set_special(concat, SpecialOp::StringOp { op: StrOp::Concat, str_sym: strsym, nat: None, bool_: None, not_found: None });
         let len = e.add_op("len", vec![str_s], nat);
-        e.set_special(len, SpecialOp::StringOp { op: StrOp::Length, str_sym: strsym, nat: Some(nh), bool_: None });
+        e.set_special(len, SpecialOp::StringOp { op: StrOp::Length, str_sym: strsym, nat: Some(nh), bool_: None, not_found: None });
         let sub = e.add_op("sub", vec![str_s, nat, nat], str_s);
-        e.set_special(sub, SpecialOp::StringOp { op: StrOp::Substr, str_sym: strsym, nat: Some(nh), bool_: None });
+        e.set_special(sub, SpecialOp::StringOp { op: StrOp::Substr, str_sym: strsym, nat: Some(nh), bool_: None, not_found: None });
         let lt = e.add_op("lt", vec![str_s, str_s], truth);
-        e.set_special(lt, SpecialOp::StringOp { op: StrOp::Lt, str_sym: strsym, nat: None, bool_: Some(bh) });
+        e.set_special(lt, SpecialOp::StringOp { op: StrOp::Lt, str_sym: strsym, nat: None, bool_: Some(bh), not_found: None });
         let se = e.add_op("se", vec![str_s, str_s], truth);
         e.set_special(se, SpecialOp::Equality { eq: tt, neq: ff });
         let qe = e.add_op("qe", vec![qid_s, qid_s], truth);

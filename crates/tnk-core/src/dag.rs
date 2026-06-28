@@ -86,7 +86,7 @@ pub(crate) enum NodeTerm {
 /// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
 /// reference-counted backing (`Rc<str>`, cheap to clone); the float arm lands with `FLOAT` (B3.7).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum NaValue {
+pub enum NaValue {
     /// A string literal / result (the `<Strings>` `StringSymbol`).
     Str(std::rc::Rc<str>),
     /// A quoted identifier (the `<Qids>` `QuotedIdentifierSymbol`).

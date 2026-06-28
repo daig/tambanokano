@@ -39,7 +39,9 @@ impl CuiLhs {
                 let p1 = args.pop().unwrap();
                 (p1, p2)
             }
-            Term::Var(_) => unreachable!("compile is only called on an application lhs"),
+            Term::Var(_) | Term::Na { .. } => {
+                unreachable!("compile is only called on an application lhs")
+            }
         };
         let mut var_indices = Vec::new();
         collect_vars(&p1, &mut var_indices);
@@ -76,6 +78,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 out.push(v.index);
             }
         }
+        Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => {
             for a in args {
                 collect_vars(a, out);

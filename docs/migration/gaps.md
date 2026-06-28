@@ -165,6 +165,22 @@ correctness fix.
   No conformance fixture reaches this corner (a theory-view whose module *also* re-exports the parameter
   through a parameterized import); the single-level and direct cases are exact.
 
+- **Built-in string ops are byte/ASCII-oriented (Tier 2).** Maude's strings are byte sequences; ours wrap a
+  Rust UTF-8 `str`, and the string ops (`length`/`substr`/`find`/`rfind`/`ascii`/the `ctype` predicates/
+  case/trim) index by **char**. For ASCII content — every conformance case, and the prelude's own use —
+  char index ≡ byte index, so they are byte-identical; a string holding a multi-byte UTF-8 scalar would
+  diverge from Maude's per-byte semantics. `char(n)`/`ascii(c)` likewise use the Unicode scalar value,
+  which equals the byte for 0–127.
+- **`decFloat(f, 0)` (exact full expansion) for extreme subnormals.** The exact path needs the float's
+  denominator exponent `k` (`|f| = num/2^k`) to fit a machine word; for `k ≥ 64` (tiny subnormals) it falls
+  through (unreduced) rather than computing a 300+-digit expansion. Finite `prec > 0` and all normal-range
+  floats are exact. Off any real conformance path.
+- **A malformed reduce/match *bubble* can still blow up the Earley parser.** A genuinely unparseable command
+  term against a large module's grammar (e.g. a typo, or the old `red in M : t` before the qualifier existed)
+  can enumerate exponentially. The `in <MODULE> :` qualifier (added in Tier 2) removes the common trigger
+  (the module name is parsed structurally, not as part of the term); a true typo in a big module is still a
+  latent hang. A parse-timeout / ambiguity cap is the fix when it matters.
+
 ## Resolved (here for cross-reference; detail in git history)
 
 The Phase-1.5 sweep closed: eager→lazy membership timing (C1), cross-theory alien-subterm matching (C8/C5),
@@ -179,3 +195,13 @@ including `LIST{List{Nat}}`-style nesting). That work also closed **cross-kind a
 in the kernel (a constructor spanning several connected components, e.g. nested-container `cons`/`nil` — now
 distinct symbols selected by argument kind, with Maude's `(t).Sort` print/parse disambiguation) and
 **memberships over structured sorts** (`mb t : NeList{X}`).
+
+Tier 2 (the remaining built-in data types) landed byte-identically: `INT` (`abs`/`~`/signed two's-complement
+bitwise), `RAT`, `FLOAT` (full op set + Maude's partiality — `/0`/NaN stay at kind `[Float]`), `STRING`/`QID`
+(+ STRING-OPS `ctype`/`trim`), `CONVERSION` (exact float↔rational, base conversion, `decFloat`), and the leaf
+specials `CommutativeDecomposeEqualitySymbol` / `RandomOpSymbol` (MT19937) / `CounterSymbol` (a stateful
+*rule*-special). It also closed five cross-cutting seams: the **`in <MODULE> :` command qualifier**, a
+**`Term::Na` literal** (built-in constants in an equation rhs), **value-dependent NA sorts** (`Char`/`String`,
+`FiniteFloat`/`Float`), **`~>` partiality tracking** (a partial op ranges over its kind), and a
+**punctuation-aware `split_mixfix`** (operators whose names lex with brackets/commas — `_=[_]_`, `<_,_,_>`,
+`[]`, `{}`). Verified by `conformance/prelude-tier2.maude` + `prelude_tier2_through_repl`.

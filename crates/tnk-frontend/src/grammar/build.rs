@@ -12,7 +12,7 @@
 //! colon variables (`X:Sort`), and on-the-fly (undeclared) variables; structured/parameterized sorts.
 
 use super::{Action, GSym, Grammar, Nt, NtType, Production, Terminal, ANY, PREFIX_GATHER};
-use crate::lex::{Frag, Interner, Sym};
+use crate::lex::{Frag, Interner};
 use crate::sig::syntax::BuiltModule;
 use tnk_core::sort::{KindId, SortId, Sorts};
 use tnk_core::symbol::SymbolId;
@@ -206,23 +206,36 @@ fn symbol_productions(
         return;
     }
 
-    // No underscore: a constant (arity 0) or a genuine prefix operator.
-    let name = constant_name(&syn.frags);
+    // No underscore: a constant (arity 0) or a genuine prefix operator. The name is the full fragment
+    // sequence — usually one token (`gcd`, `0`, `tt`), but several when it lexes with punctuation
+    // (`[]`, `{}` → `[ ]` / `{ }`, the empty-collection constants).
+    let name_toks: Vec<GSym> = syn
+        .frags
+        .iter()
+        .map(|f| match f {
+            Frag::Tok(s) => GSym::T(Terminal::Tok(*s)),
+            Frag::Hole => unreachable!("a hole-less operator has no holes"),
+        })
+        .collect();
     if nr_args == 0 {
-        let (term, action) = literal_terminal_for(m, sym)
-            .unwrap_or((Terminal::Tok(name), Action::MakeTerm(sym)));
-        push(g, range_nt, vec![GSym::T(term)], 0, vec![], action);
+        // A single-token constant may be a built-in literal terminal (the string/qid/float pseudo-ctor).
+        if let Some((term, action)) = (name_toks.len() == 1).then(|| literal_terminal_for(m, sym)).flatten() {
+            push(g, range_nt, vec![GSym::T(term)], 0, vec![], action);
+        } else {
+            push(g, range_nt, name_toks, 0, vec![], Action::MakeTerm(sym));
+        }
         return;
     }
 
     // Prefix operator. An associative operator takes its arguments as a flattened assoc list.
-    let name_tok = GSym::T(Terminal::Tok(name));
     if syn.assoc {
         let assoc_nt = Nt::Comp(sorts.kind_of(syn.domain[0]), NtType::AssocList);
-        let rhs = vec![name_tok, GSym::T(lp), GSym::N(assoc_nt), GSym::T(rp)];
+        let mut rhs = name_toks;
+        rhs.extend([GSym::T(lp), GSym::N(assoc_nt), GSym::T(rp)]);
         push(g, range_nt, rhs, 0, vec![PREFIX_GATHER], Action::MakeTerm(sym));
     } else {
-        let mut rhs = vec![name_tok, GSym::T(lp)];
+        let mut rhs = name_toks;
+        rhs.push(GSym::T(lp));
         let mut gather = Vec::with_capacity(nr_args);
         for j in 0..nr_args {
             gather.push(PREFIX_GATHER);
@@ -230,15 +243,6 @@ fn symbol_productions(
             rhs.push(GSym::T(if j + 1 == nr_args { rp } else { comma }));
         }
         push(g, range_nt, rhs, 0, gather, Action::MakeTerm(sym));
-    }
-}
-
-/// The single name token of a hole-less operator (`gcd`, `0`, `tt`). split_mixfix of a name with no `_`
-/// yields exactly one [`Frag::Tok`].
-fn constant_name(frags: &[Frag]) -> Sym {
-    match frags {
-        [Frag::Tok(s)] => *s,
-        _ => panic!("a hole-less operator must have a single name fragment, got {frags:?}"),
     }
 }
 

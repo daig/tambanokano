@@ -93,6 +93,8 @@ impl AcuLhs {
                     Some(av) => av.count += 1,
                     None => vars.push(AcuVar { index: v.index, count: 1, sort: v.sort }),
                 },
+                // A built-in literal is a ground, free-matchable leaf — same fast path as a ground Op.
+                t @ Term::Na { .. } => grounds.push(t),
                 // A ground, free-matchable subterm consumes one structurally-equal subject element
                 // deterministically (the fast path). Everything else — a non-ground subterm (`s M`) or
                 // a theory-rooted one — is an **alien**, matched recursively by its own automaton; merge
@@ -202,6 +204,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 out.push(v.index);
             }
         }
+        Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
     }
 }

@@ -220,12 +220,26 @@ impl Repl {
 
     /// Run a `reduce`/`match` command against the current module.
     fn run_command(&mut self, c: Command, out: &mut String) {
-        let Some(cur) = self.current.clone() else {
+        // An `in <MODULE> :` qualifier overrides the current module for this one command (Maude's
+        // `red in NAT : t .`); without it, the current module is used.
+        let m_override = match &c {
+            Command::Reduce { module, .. }
+            | Command::Match { module, .. }
+            | Command::Rewrite { module, .. }
+            | Command::Frewrite { module, .. }
+            | Command::Search { module, .. } => module.clone(),
+            Command::Continue { .. } => None,
+        };
+        let Some(cur) = m_override.or_else(|| self.current.clone()) else {
             out.push_str("no current module — enter a module first.\n");
             return;
         };
+        if !self.modules.contains_key(&cur) {
+            out.push_str(&format!("error: module `{cur}` does not exist.\n"));
+            return;
+        }
         match c {
-            Command::Reduce { term } => {
+            Command::Reduce { term, .. } => {
                 self.last = None; // a non-continue command invalidates the saved rewrite continuation
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 // Maude echoes the *normalized, pretty-printed* parsed term (special constants collapsed,
@@ -251,7 +265,7 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
-            Command::Match { pattern, subject, xmatch } => {
+            Command::Match { pattern, subject, xmatch, .. } => {
                 self.last = None;
                 let (pe, se) =
                     (join_tokens(&pattern, &self.interner), join_tokens(&subject, &self.interner));
@@ -268,8 +282,9 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
-            Command::Rewrite { bound, term } => {
+            Command::Rewrite { bound, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.reset_counter(); // a fresh `rewrite` restarts the `counter` built-in
                 let echo = command_echo(lm, &self.interner, &term, self.color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
@@ -285,8 +300,9 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
-            Command::Frewrite { bound, term } => {
+            Command::Frewrite { bound, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.reset_counter(); // a fresh `frewrite` restarts the `counter` built-in
                 let echo = command_echo(lm, &self.interner, &term, self.color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
@@ -302,7 +318,7 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
-            Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that } => {
+            Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // search is not traced (yet)
                 lm.built.engine.set_record_whole(false);
