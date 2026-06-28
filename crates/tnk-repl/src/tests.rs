@@ -213,6 +213,11 @@ fn prelude_meta_through_repl() {
             "[2] MatchPair?: (noMatch).MatchPair?",                    // metaXmatch _+_ vs s^5 — no match
             "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- 'f['0.Zero], []}",   // xapply at top
             "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- '0.Zero, 'f[[]]}",   // xapply at inner f
+            // metaSearchPath: the path to the first =>* solution is one TraceStep {a, Elt, ab-rule}, the
+            // rule up-translated. Count + trace structure are the reference's; the up-rule's mixfix spacing
+            // (around `[label(…)]` and the trailing `.`) is the format-attribute gap (finished with
+            // upModule's rule rendering in Stage 4 — the reference prints `'c.Elt [label('ab)] .`).
+            "[3] TraceStep: {'a.Elt, 'Elt, rl 'a.Elt => 'c.Elt[label('ab)].}",
         ],
         "META tower reduces: {out}"
     );

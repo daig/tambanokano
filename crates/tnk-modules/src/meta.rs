@@ -57,7 +57,8 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Apply => self.meta_apply(ctx, hooks, redex),
             MetaOp::Xmatch => self.meta_xmatch(ctx, hooks, redex),
             MetaOp::Xapply => self.meta_xapply(ctx, hooks, redex),
-            _ => None, // metaSearchPath (needs rule up-translation) + Stage 4/Deferred
+            MetaOp::SearchPath => self.meta_search_path(ctx, hooks, redex),
+            _ => None, // Stage 4 (up*/sort queries/parse/print) + Deferred (symbolic/SMT/strategy)
         }
     }
 }
@@ -347,6 +348,54 @@ impl MetaDescent<'_> {
             }
         };
         Some(result)
+    }
+
+    /// `metaSearchPath(M, S, P, C, kind, B, n)` → the `Trace` of the breadth-first path to the `(n+1)`-th
+    /// search solution: one `{up(state), up(type), up(rule)}` `TraceStep` per arc (the state and the rule
+    /// that leaves it), joined by `__`, or `nil` for a zero-length path; `failure` (`Trace?`) when there is
+    /// no such solution. Reuses the same search as [`meta_search`](Self::meta_search); the rules are
+    /// up-translated by [`up_rule`] (unconditional here — see its note).
+    fn meta_search_path(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let mut vars = VarIndex::new();
+        let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
+        let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
+        let cond = down_condition(ctx, hooks, *kids.get(3)?, &loaded.built, &mut vars, &mut bound_set)?;
+        let arrow = down_arrow(ctx, *kids.get(4)?)?;
+        let max_depth = down_bound(ctx, hooks, *kids.get(5)?).map(|d| d as u32);
+        let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
+        let nr = vars.count();
+        loaded.built.engine.reset_rewrites();
+        let mut search = loaded.built.engine.search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut sol = None;
+        for _ in 0..=sol_nr {
+            sol = search.next_solution(&mut loaded.built.engine);
+            if sol.is_none() {
+                break;
+            }
+        }
+        let Some(s) = sol else {
+            ctx.add_rewrites(loaded.built.engine.rewrites());
+            return Some(ctx.app(*hooks.ops.get("failureTraceSymbol")?, vec![]));
+        };
+        ctx.add_rewrites(s.rewrites);
+        let steps = search.path(s.state);
+        // One TraceStep per arc: state `steps[i]` and the rule that produced its successor `steps[i+1]`.
+        let mut trace_steps = Vec::new();
+        for i in 0..steps.len().saturating_sub(1) {
+            let rule_id = steps[i + 1].via? as usize;
+            let ut = up_term(ctx, hooks, &loaded.built, steps[i].term);
+            let us = up_sort(ctx, hooks, &loaded.built, steps[i].term);
+            let rule = up_rule(ctx, hooks, &loaded.built, &loaded.built.rl_traces[rule_id])?;
+            trace_steps.push(ctx.app(*hooks.ops.get("traceStepSymbol")?, vec![ut, us, rule]));
+        }
+        Some(match trace_steps.len() {
+            0 => ctx.app(*hooks.ops.get("nilTraceSymbol")?, vec![]),
+            1 => trace_steps.into_iter().next().unwrap(),
+            _ => ctx.app(*hooks.ops.get("traceSymbol")?, trace_steps),
+        })
     }
 
     /// Down-translate a meta-module term to an object [`LoadedModule`]: reconstruct its `PreModule`
@@ -1083,6 +1132,72 @@ fn up_context(
     let arglist = up_arglist(ctx, hooks, up_args);
     let opqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
     ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
+}
+
+/// Up-translate a kernel [`Term`] (a rule side, with variables) into a meta-term — the inverse of
+/// [`down_term_to_term`], used to show a rule in a `metaSearchPath` trace. A `Var` becomes `'name:Sort`
+/// (its trace name's base + sort), a constant `'c.Sort` (the operator's range sort), an application
+/// `'f[args]`. (Iter-chain collapse to `'s_^n[…]` and built-in literals are refinements the `up*` family /
+/// `upModule` adds — a search trace's rules here are over the free/constant fragment.)
+fn up_pattern(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    term: &Term,
+    names: &[String],
+) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    match term {
+        Term::Var(v) => {
+            let base = names.get(v.index as usize).map_or("V", |s| s.split(':').next().unwrap_or(s));
+            let sort = source.engine.sorts().name(v.sort);
+            ctx.make_na(qid, NaValue::Qid(format!("{base}:{sort}").into()))
+        }
+        Term::Na { symbol, value } => {
+            let rendered = match value {
+                NaValue::Str(s) => format!("{s:?}"),
+                NaValue::Qid(q) => format!("'{q}"),
+                NaValue::Float(b) => format!("{}", f64::from_bits(*b)),
+            };
+            ctx.make_na(qid, NaValue::Qid(format!("{rendered}.{}", sort_name_of(source, *symbol)).into()))
+        }
+        Term::Op { symbol, args } if args.is_empty() => {
+            let name = source.engine.symbol(*symbol).name();
+            ctx.make_na(qid, NaValue::Qid(format!("{name}.{}", sort_name_of(source, *symbol)).into()))
+        }
+        Term::Op { symbol, args } => {
+            let name = source.engine.symbol(*symbol).name().to_string();
+            let up_args: Vec<DagId> =
+                args.iter().map(|a| up_pattern(ctx, hooks, source, a, names)).collect();
+            let arglist = up_arglist(ctx, hooks, up_args);
+            let opqid = ctx.make_na(qid, NaValue::Qid(name.into()));
+            ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
+        }
+    }
+}
+
+/// The declared range-sort name of operator `symbol` (its `SymbolSyntax`), for a constant's `'c.Sort`.
+fn sort_name_of(source: &BuiltModule, symbol: SymbolId) -> String {
+    source.syntax.get(&symbol).map(|s| source.engine.sorts().name(s.range).to_string()).unwrap_or_default()
+}
+
+/// Up-translate a rule (from its trace) to a meta `Rule` — `rl lhs => rhs [label] .` (unconditional). A
+/// conditional rule needs the condition up-map (a `up*`-family follow-on) → `None`; such a rule does not
+/// occur in the ground-rule search traces here.
+fn up_rule(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, trace: &RlTrace) -> Option<DagId> {
+    if !trace.condition.is_empty() {
+        return None;
+    }
+    let up_lhs = up_pattern(ctx, hooks, source, &trace.lhs, &trace.var_names);
+    let up_rhs = up_pattern(ctx, hooks, source, &trace.rhs, &trace.var_names);
+    let attrs = match trace.label.as_deref() {
+        Some(l) => {
+            let lqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(l.into()));
+            ctx.app(hooks.ops["labelSymbol"], vec![lqid])
+        }
+        None => ctx.app(hooks.ops["emptyAttrSetSymbol"], vec![]),
+    };
+    Some(ctx.app(hooks.ops["rlSymbol"], vec![up_lhs, up_rhs, attrs]))
 }
 
 /// Collect the subterm positions of `node` whose depth is in `[min_d, max_d]`, as child-index paths in
