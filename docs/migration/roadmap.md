@@ -79,11 +79,25 @@ prelude load.
      range is its kind); and a **punctuation-aware `split_mixfix`** (so the `_=[_]_` / `<_,_,_>` / `[]` / `{}`
      operators whose names lex with brackets parse and print). Breadth, plus that handful of seams.
    - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
-     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **Stage 1
-     — the whole tower now parses and loads with no errors** (`conformance/prelude-meta.maude`,
-     `prelude_meta_through_repl`): the descent functions are declared via a new `SpecialOp::Meta`
-     (`MetaLevelOpSymbol` → `MetaOp`), currently **inert** (a `metaReduce(…)` stays at kind `[ResultPair]`,
-     like an unreduced partial op — the reflection-core stage fills in the behaviour). Getting there closed
+     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **Stages
+     1–2 done** (`conformance/prelude-meta.maude`, `prelude_meta_through_repl`). **Stage 2 — the reflection
+     core: `metaReduce`/`metaNormalize` compute, byte-identically** (value, sort, and rewrite count). The
+     descent seam is a `DescentOps` trait + a `MetaCtx` view of the engine, defined in `tnk-core` and
+     threaded through `reduce` (kernel-internal callers pass a `NullDescent`); the handler (`tnk-modules`,
+     which owns the build pipeline + module db) **down**-translates the meta-module argument into a real
+     object module (a reconstructed `PreModule` → the ordinary `flatten`+`build`; `flatten_pre` flattens a
+     transient root), down-translates the subject meta-term, reduces in it (folding the object rewrites into
+     the command's count, Maude's accounting), and **up**-translates the result `{term, type}` (constants
+     `'c.S`, applications `'f[…]`, the iter form `'s_^n[…]`). The meta-rep symbols are resolved from each
+     descent op's `op-hook` list by **signature** (name + kinds) into `MetaHooks`. This also needed the
+     **`<Qids>` classification** — a `Qid` constant's least sort is text-dependent (`'0.Zero` → Constant,
+     `'NzNat` → Sort, `'X:S` → Variable, `'[K]` → Kind), which also makes META-TERM's `getName`/`getType`
+     reduce. **Scope of Stage 2:** the module argument is an **import expression** (`[Q]` = `sth Q is
+     including Q . … endsth`, the `['NAT]`/`['BOOL]` form); a meta-module with **inline declarations** (what
+     `upModule` emits) returns `None` (stays at kind level) — `down_module`'s declaration parsing + the
+     other descent functions are Stage 3/4. **Stage 1 — the whole tower parses and loads with no errors**;
+     the descent functions are declared via a new `SpecialOp::Meta` (`MetaLevelOpSymbol` → `MetaOp`).
+     Getting there closed
      five general parse/flatten gaps the meta-modules are the first to hit (none specific to reflection):
      **grammar-aware mixfix op renaming** (`op _,_ to _;_ [prec 43]` over QID-SET — an operator comma vs an
      argument separator can only be told apart by parsing, so the source module's parser marks the operator
@@ -93,13 +107,14 @@ prelude load.
      the **`input_complete` chunker** counting `fmod`/`endfm` only as real delimiters (depth-0, statement-
      leading), not as the meta module-constructor operators' name fragments (`getName(fmod Q is … endfm)`);
      **kind-homogeneous equation parsing** (a bare overloaded `none` rhs parses at the lhs's kind); and the
-     module-constructor operators whose names carry `.`/`is`/`endfm` fragments. **Stage 2+ (the reflection
-     core):** the up/down maps (`upTerm`/`downTerm`, `upModule`/`downModule`, the `up*` family) and the
-     computing descent functions — `metaReduce`/`metaNormalize`, the rewriting/matching/search family, the
+     module-constructor operators whose names carry `.`/`is`/`endfm` fragments. **Stage 3/4 (remaining
+     reflection core):** `down_module`'s inline-declaration parsing (so `upModule`-shaped meta-modules down),
+     `upModule`/`downTerm`/`upTerm` as their own descent ops + the `up*` family, the rewriting/matching/
+     search family (`metaRewrite`/`metaApply`/`metaXapply`/`metaMatch`/`metaXmatch`/`metaSearch`), the
      sort/kind queries, `metaParse`/`metaPrettyPrint`, `metaWellFormed*`. The symbolic (unify/variant/
      narrow), SMT, and strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3, the D6/D7 backends).
-     Reflection-core prerequisites surfaced in Stage 1 (`gaps.md`): the `<Qids>` Qid→Sort/Constant/Variable
-     classification, ad-hoc-overloaded-constant resolution at the command top level, and `format`-attribute
+     Reflection-core gaps still open (`gaps.md`): ad-hoc-overloaded-constant resolution at the command top
+     level (a bare `none`/`nil`), and `format`-attribute
      pretty-printing.
    - Residuals, off the reduce path (`gaps.md`): the parameterized **sortable-list views** parse gap
      (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix

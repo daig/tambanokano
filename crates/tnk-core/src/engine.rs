@@ -13,6 +13,7 @@
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
+use crate::descent::{DescentOps, NullDescent};
 use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
@@ -197,6 +198,20 @@ pub(crate) struct Signature {
     /// Next dense rule id (the count of rules added). Assigned to each [`CompiledRule`]; the frontend
     /// keys its `rl_traces` metadata by it.
     next_rule_id: u32,
+    /// Quoted-identifier classification sorts (META-TERM's `<Qids>` ops). When set, a `Qid` constant's
+    /// least sort is text-dependent (`'X:S` → `Variable`, `'c.S` → `Constant`, `'[K]` → `Kind`, plain `'S`
+    /// → `Sort`); empty elsewhere, where every `Qid` is just a `Qid`.
+    qid_class: QidClass,
+}
+
+/// The classification sorts for quoted-identifier constants (Maude's `QuotedIdentifierSymbol` codes
+/// `sortQid`/`kindQid`/`constantQid`/`variableQid`) — see [`Signature::qid_class`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct QidClass {
+    sort: Option<SortId>,
+    kind: Option<SortId>,
+    constant: Option<SortId>,
+    variable: Option<SortId>,
 }
 
 /// One recorded reduction event (opt-in via [`Engine::set_trace`]) — the structured stream the REPL
@@ -390,6 +405,7 @@ impl Default for Signature {
             next_eq_id: 0,
             next_mb_id: 0,
             next_rule_id: 0,
+            qid_class: QidClass::default(),
         }
     }
 }
@@ -718,6 +734,14 @@ impl Signature {
                 max = d.range;
             }
         }
+        // A quoted-identifier constant's least sort is text-dependent when the module declares META-TERM's
+        // `<Qids>` classification ops (`'X:S` → Variable, `'c.S` → Constant, `'[K]` → Kind, plain → Sort);
+        // without them (a plain `QID`) it falls through to the generic `Qid` (`min`).
+        if let NaValue::Qid(q) = value
+            && let Some(s) = self.classify_qid(q)
+        {
+            return s;
+        }
         let special = match value {
             NaValue::Str(s) => s.chars().count() == 1,
             NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
@@ -727,6 +751,34 @@ impl Signature {
             min
         } else {
             max
+        }
+    }
+
+    /// Classify a quoted-identifier's text into its META-TERM sort, or `None` if this module has no
+    /// classification ops (or the relevant code was not declared). Precedence: a `:` makes it a
+    /// `Variable`, else a `.` a `Constant`, else a leading `[` a `Kind`, else a `Sort`.
+    fn classify_qid(&self, text: &str) -> Option<SortId> {
+        let qc = &self.qid_class;
+        if text.contains(':') {
+            qc.variable
+        } else if text.contains('.') {
+            qc.constant
+        } else if text.starts_with('[') {
+            qc.kind
+        } else {
+            qc.sort
+        }
+    }
+
+    /// Record a quoted-identifier classification sort for one `QuotedIdentifierSymbol` code (META-TERM's
+    /// `<Qids> : -> Sort/Kind/Constant/Variable` declarations).
+    pub(crate) fn set_qid_class(&mut self, code: &str, sort: SortId) {
+        match code {
+            "sortQid" => self.qid_class.sort = Some(sort),
+            "kindQid" => self.qid_class.kind = Some(sort),
+            "constantQid" => self.qid_class.constant = Some(sort),
+            "variableQid" => self.qid_class.variable = Some(sort),
+            _ => {}
         }
     }
 
@@ -1712,6 +1764,11 @@ impl Runtime {
     pub(crate) fn reset_rewrites(&mut self) {
         self.rewrite_count = 0;
     }
+    /// Add `n` to the rewrite counter (a META-LEVEL descent function folding the object-level
+    /// reduction's rewrites into the current command's total).
+    pub(crate) fn add_rewrites(&mut self, n: u64) {
+        self.rewrite_count += n;
+    }
 
     // ---- reduction ----
 
@@ -1719,7 +1776,12 @@ impl Runtime {
     /// rationale. Reads `sig.eq_epoch()`, builds nodes via `self.make_free(sig, ..)`, and rewrites
     /// the top via `self.try_rewrite_top(sig, ..)` — all while holding only a shared borrow of `sig`.
     #[must_use]
-    pub(crate) fn reduce(&mut self, sig: &Signature, root: DagId) -> DagId {
+    pub(crate) fn reduce(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+        descent: &mut dyn DescentOps,
+    ) -> DagId {
         if self.node(root).reduced_epoch == sig.eq_epoch() {
             // Already normal: forward to its recorded nf (C7) — `root`'s own content may be a redex that
             // rewrote out of place, so the nf, not `root`, is its canonical form (`None` ⇒ self).
@@ -1818,7 +1880,7 @@ impl Runtime {
 
             // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
             // this frame's slot for the rewritten term.
-            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack) {
+            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent) {
                 self.rewrite_count += 1;
                 // Faithful `set trace whole`: reconstruct the whole root term before/after this top
                 // rewrite (the redex `rebuilt` / result `next` threaded up through the ancestor frames)
@@ -1968,13 +2030,19 @@ impl Runtime {
         (0..subst.len()).map(|i| subst.get(i)).collect()
     }
 
-    fn try_rewrite_top(&mut self, sig: &Signature, id: DagId, frames: &[ReduceFrame]) -> Option<DagId> {
+    fn try_rewrite_top(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        frames: &[ReduceFrame],
+        descent: &mut dyn DescentOps,
+    ) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
         // they are tried before user equations and fall through (`None`) on no-match. The `&SpecialOp`
         // borrowed from `sig` coexists with `&mut self` (the A4 split).
         if let Some(op) = sig.symbol(symbol).special()
-            && let Some(r) = self.try_special(sig, id, op)
+            && let Some(r) = self.try_special(sig, id, op, descent)
         {
             if self.tracing() {
                 let depth = self.condition_depth;
@@ -2516,10 +2584,10 @@ impl Runtime {
                 // unrooted is live during `l`'s reduction either.
                 self.condition_depth += 1;
                 let l = self.instantiate(sig, lhs, subst);
-                let l = self.reduce(sig, l);
+                let l = self.reduce(sig, l, &mut NullDescent);
                 let _root_l = self.root(l);
                 let r = self.instantiate(sig, rhs, subst);
-                let r = self.reduce(sig, r);
+                let r = self.reduce(sig, r, &mut NullDescent);
                 self.condition_depth -= 1;
                 let holds = self.deep_equal(l, r);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
@@ -2537,7 +2605,7 @@ impl Runtime {
             CompiledFragment::SortTest { term, sort } => {
                 let t = self.instantiate(sig, term, subst);
                 self.condition_depth += 1;
-                let t = self.reduce(sig, t);
+                let t = self.reduce(sig, t, &mut NullDescent);
                 self.condition_depth -= 1;
                 let holds = sig.sorts().leq(self.node(t).sort, *sort);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
@@ -2553,7 +2621,7 @@ impl Runtime {
             CompiledFragment::Matching { pattern, subject, fresh_vars } => {
                 let subj = self.instantiate(sig, subject, subst);
                 self.condition_depth += 1;
-                let subj = self.reduce(sig, subj);
+                let subj = self.reduce(sig, subj, &mut NullDescent);
                 self.condition_depth -= 1;
                 // F-2: `subj` — and the fresh-var bindings, which are its subterms — must survive the
                 // pattern match and the recursive solve of the later fragments, both of which reduce under
@@ -2609,7 +2677,7 @@ impl Runtime {
                 // matching `pattern` that lets the rest of the condition succeed (Pillar A-v).
                 let start = self.instantiate(sig, lhs, subst);
                 self.condition_depth += 1;
-                let start = self.reduce(sig, start);
+                let start = self.reduce(sig, start, &mut NullDescent);
                 self.condition_depth -= 1;
                 self.solve_rewrite_condition(sig, start, pattern, fresh_vars, subst, condition, i, kind, stmt_id, depth)
             }
@@ -2658,7 +2726,7 @@ impl Runtime {
             for (_rule_id, succ) in succs {
                 self.rewrite_count += 1;
                 self.condition_depth += 1;
-                let reduced = self.reduce(sig, succ);
+                let reduced = self.reduce(sig, succ, &mut NullDescent);
                 self.condition_depth -= 1;
                 if !seen.iter().any(|&s| self.deep_equal(s, reduced)) {
                     seen.push(reduced);
@@ -2823,6 +2891,12 @@ impl Engine {
     /// back to unconstrained parsing).
     pub fn symbol_kind(&self, id: SymbolId) -> KindId {
         self.sig.symbol_range_kind(id)
+    }
+
+    /// Record a quoted-identifier classification sort for a `QuotedIdentifierSymbol` code (META-TERM's
+    /// `<Qids> : -> Sort/Kind/Constant/Variable`), so a `Qid` constant's least sort becomes text-dependent.
+    pub fn set_qid_class(&mut self, code: &str, sort: SortId) {
+        self.sig.set_qid_class(code, sort);
     }
 
     // ---- DAG construction ----
@@ -3247,7 +3321,16 @@ impl Engine {
     /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
     #[must_use]
     pub fn reduce(&mut self, root: DagId) -> DagId {
-        self.rt.reduce(&self.sig, root)
+        self.rt.reduce(&self.sig, root, &mut NullDescent)
+    }
+
+    /// Like [`reduce`](Self::reduce) but driving META-LEVEL descent through `descent`: a `metaReduce`/…
+    /// redex encountered during reduction is handed to the handler (which builds the object module and
+    /// runs the operation). The REPL passes a real handler; everything else uses [`reduce`](Self::reduce)
+    /// (i.e. [`NullDescent`] — descent redexes stay at the kind level).
+    #[must_use]
+    pub fn reduce_with(&mut self, root: DagId, descent: &mut dyn DescentOps) -> DagId {
+        self.rt.reduce(&self.sig, root, descent)
     }
 
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be

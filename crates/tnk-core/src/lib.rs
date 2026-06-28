@@ -12,6 +12,7 @@
 
 pub mod arena;
 pub mod dag;
+pub mod descent;
 pub mod engine;
 pub mod id;
 pub mod root;

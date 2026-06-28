@@ -457,8 +457,10 @@ pub fn reduce_command(
 }
 
 /// Parse + build a ground command subject DAG, resetting the rewrite counter and building inside a dedup
-/// window exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders.
-fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<DagId, String> {
+/// window exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders and the
+/// REPL's `reduce` (which then drives [`Engine::reduce_with`](tnk_core::engine::Engine::reduce_with) for
+/// META-LEVEL descent).
+pub fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<DagId, String> {
     let tree = parse_forest(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();

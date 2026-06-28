@@ -17,7 +17,13 @@ use std::rc::Rc;
 
 impl Runtime {
     /// Reduce `id` by its operator's built-in rule, or `None` if the rule does not apply.
-    pub(crate) fn try_special(&mut self, sig: &Signature, id: DagId, op: &SpecialOp) -> Option<DagId> {
+    pub(crate) fn try_special(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        op: &SpecialOp,
+        descent: &mut dyn crate::descent::DescentOps,
+    ) -> Option<DagId> {
         match op {
             SpecialOp::Equality { eq, neq } => self.reduce_equality(sig, id, *eq, *neq),
             SpecialOp::Branch { tests } => self.reduce_branch(id, tests),
@@ -43,11 +49,14 @@ impl Runtime {
                 self.reduce_qid_op(sig, id, *op, *qid_sym, *str_sym)
             }
             SpecialOp::Division { nat } => self.reduce_division(sig, id, nat),
-            // META-LEVEL descent: handled by the reflection layer (`try_descent`), not the local
-            // term-rewriting `try_special`. Inert here until that layer lands — a descent application
-            // stays at the kind level (`metaReduce(…)` is `[ResultPair]`), exactly as an unreduced
-            // partial op.
-            SpecialOp::Meta { .. } => None,
+            // META-LEVEL descent: down-translate the meta-term arguments, run the engine operation in the
+            // object module, up-translate the result. The build pipeline + module database live above this
+            // crate, so we call up through the `DescentOps` seam, handing it a `MetaCtx` view of this
+            // engine (to read the redex and build the up-result). `None` ⇒ stays at the kind level.
+            SpecialOp::Meta { op, hooks } => {
+                let mut ctx = crate::descent::MetaCtx { rt: self, sig };
+                descent.descend(&mut ctx, *op, hooks, id)
+            }
         }
     }
 

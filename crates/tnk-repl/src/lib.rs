@@ -17,14 +17,15 @@ use tnk_core::rewrite::Rewriting;
 use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::load::{
-    build_loaded_module, command_echo, format_matchers, frewrite_command, match_command, reduce_command,
-    rewrite_command, search_command, LoadedModule,
+    build_command_dag, build_loaded_module, command_echo, format_matchers, frewrite_command,
+    match_command, rewrite_command, search_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::flatten::flatten;
+use tnk_modules::meta::MetaDescent;
 use tnk_modules::view::{validate_view, ViewDb};
 use trace::{render_trace, TraceFlags};
 
@@ -249,7 +250,17 @@ impl Repl {
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
-                match reduce_command(lm, &self.interner, &term) {
+                // Build the subject, then reduce driving META-LEVEL descent: a `metaReduce(…)` redex is
+                // handed to `MetaDescent`, which down-translates its meta-module argument into a real
+                // object module (resolving imports from the db) and reduces in it. The descent borrows the
+                // interner mutably, so it is dropped before the (immutable-interner) pretty-print.
+                let reduced = build_command_dag(lm, &self.interner, &term).map(|dag| {
+                    let mut descent =
+                        MetaDescent { interner: &mut self.interner, db: &self.db, views: &self.views };
+                    let result = lm.built.engine.reduce_with(dag, &mut descent);
+                    (result, lm.built.engine.rewrites())
+                });
+                match reduced {
                     Ok((dag, rw)) => {
                         let events = lm.built.engine.take_trace();
                         let trace = render_trace(&lm.built, &self.interner, &events, self.trace, self.color);

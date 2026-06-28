@@ -206,9 +206,29 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         }
         let arity = od.domain.len();
         let special = match &od.attrs.special {
-            Some(spec) => special_op(spec, arity, &name_to_sym, &succ_zero, interner)?,
+            Some(spec) => special_op(
+                spec,
+                arity,
+                &name_to_sym,
+                &succ_zero,
+                &sym_by_profile,
+                &sorts,
+                engine.sorts(),
+                interner,
+            )?,
             None => None,
         };
+        // META-TERM's `<Qids> : -> Sort/Kind/Constant/Variable` declarations record the quoted-identifier
+        // classification sorts, so a `Qid` constant's least sort becomes text-dependent (a `'NzNat` is a
+        // `Sort`, `'0.Zero` a `Constant`, …) — needed for the meta-representation to be well-sorted.
+        if let Some(spec) = &od.attrs.special
+            && let Some((class, data)) = &spec.id_hook
+            && class == "QuotedIdentifierSymbol"
+            && let Some(code) = data.first()
+        {
+            let range = resolve_sort(&engine, &sorts, &od.range)?;
+            engine.set_qid_class(code, range);
+        }
         for &sym in &op_syms[idx] {
             if od.attrs.ctor {
                 engine.set_ctor(sym);
@@ -388,11 +408,15 @@ fn bool_hooks(
 
 /// Map a `special` directive to a kernel [`SpecialOp`] (or `None` for the pure NA-constant / successor
 /// markers, which carry no reduction rule — their behaviour is the theory / the literal productions).
+#[allow(clippy::too_many_arguments)]
 fn special_op(
     spec: &SpecialSpec,
     arity: usize,
     name_to_sym: &HashMap<String, SymbolId>,
     succ_zero: &HashMap<SymbolId, SymbolId>,
+    sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
+    sorts: &HashMap<String, SortId>,
+    sort_table: &tnk_core::sort::Sorts,
     i: &Interner,
 ) -> R<Option<SpecialOp>> {
     let Some((class, data)) = &spec.id_hook else { return Ok(None) };
@@ -472,7 +496,7 @@ fn special_op(
         // reflection-core stage; here they are left empty (descent stays at the kind level).
         "MetaLevelOpSymbol" => SpecialOp::Meta {
             op: meta_op(code.ok_or("MetaLevelOpSymbol code")?),
-            hooks: std::rc::Rc::new(MetaHooks::default()),
+            hooks: std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)),
         },
         other => return Err(format!("unsupported special id-hook `{other}`")),
     };
@@ -527,6 +551,50 @@ fn meta_op(code: &str) -> MetaOp {
         // Symbolic (unification/variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
         _ => MetaOp::Deferred,
     }
+}
+
+/// Resolve a descent function's `op-hook`/`term-hook` list into the meta-representation symbols the
+/// down/up maps need ([`MetaHooks`]), keyed by hook purpose (`qidSymbol`, `metaTermSymbol`, …). Op-hooks
+/// resolve by **signature** (name + domain/range kinds), since names like `_,_` / `__` are ad-hoc
+/// overloaded across kinds (a TermList `_,_` vs a RenamingSet `_,_`); a hook whose signature names a sort
+/// not in this module is skipped (it is simply unavailable to descent).
+fn resolve_meta_hooks(
+    spec: &SpecialSpec,
+    sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
+    sorts: &HashMap<String, SortId>,
+    sort_table: &tnk_core::sort::Sorts,
+    i: &Interner,
+) -> MetaHooks {
+    let mut ops = HashMap::new();
+    for (purpose, sig) in &spec.op_hooks {
+        if let Some(sym) = resolve_op_hook_sig(sig, sym_by_profile, sorts, sort_table, i) {
+            ops.insert(purpose.clone(), sym);
+        }
+    }
+    // The descent functions carry op-hooks only (no term-hooks), so `terms` stays empty.
+    MetaHooks { ops, terms: HashMap::new() }
+}
+
+/// Resolve one `op-hook` signature `name : dom… ~> range` to the symbol with that profile (name + the
+/// kinds of the domain/range sorts), via [`sym_by_profile`]. Returns `None` if the signature is malformed
+/// or names an unknown sort.
+fn resolve_op_hook_sig(
+    sig: &[crate::lex::Token],
+    sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
+    sorts: &HashMap<String, SortId>,
+    sort_table: &tnk_core::sort::Sorts,
+    i: &Interner,
+) -> Option<SymbolId> {
+    let texts: Vec<&str> = sig.iter().map(|t| i.resolve(t.sym)).collect();
+    let colon = texts.iter().position(|&t| t == ":")?;
+    let arrow = texts.iter().position(|&t| t == "~>" || t == "->")?;
+    let name: String = texts[..colon].concat();
+    let kind_of_sort = |s: &str| sorts.get(s).map(|&sid| sort_table.kind_of(sid));
+    let dom_kinds: Vec<KindId> =
+        texts[colon + 1..arrow].iter().map(|s| kind_of_sort(s)).collect::<Option<_>>()?;
+    let range = texts.get(arrow + 1)?;
+    let range_kind = kind_of_sort(range)?;
+    sym_by_profile.get(&(name, dom_kinds, range_kind)).copied()
 }
 
 fn num_op(code: &str) -> R<NumOp> {

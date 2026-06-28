@@ -166,6 +166,48 @@ pub fn flatten(
     })
 }
 
+/// Flatten a **transient** module given directly as a [`PreModule`] (not registered in `db`) — its
+/// imports are still resolved from `db`. Used by META-LEVEL descent to build the object module of a
+/// meta-module term (`metaReduce`'s first argument), e.g. `[Q]` = `sth Q is including Q . … endsth`. The
+/// transient's own name is replaced by a fixed sentinel so that a `including Q .` of a same-named DB
+/// module resolves to that DB module rather than being deduped against the transient itself.
+pub fn flatten_pre(
+    pm: &PreModule,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<PreModule, String> {
+    const SENTINEL: &str = "%META-DOWN%";
+    let mut acc = Acc::default();
+    let mut visited = HashSet::new();
+    visited.insert(SENTINEL.to_string());
+    let params: Vec<(String, String)> =
+        pm.params.iter().map(|p| (p.name.clone(), p.theory.clone())).collect();
+    for (param, theory) in &params {
+        add_parameter_copy(param, theory, db, views, &mut acc, interner)?;
+    }
+    let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+    for imp in &pm.imports {
+        collect_expr(&imp.expr, db, views, &mut acc, &mut visited, interner, &scope)?;
+    }
+    let mut own = own_decls(pm);
+    inline_shadowed_vars(&mut own, &acc, interner);
+    acc.add(own);
+    let d = acc.into_decls();
+    Ok(PreModule {
+        name: SENTINEL.to_string(),
+        kind: pm.kind,
+        is_theory: pm.is_theory,
+        params: Vec::new(),
+        imports: Vec::new(),
+        sorts: d.sorts,
+        subsorts: d.subsorts,
+        ops: d.ops,
+        vars: d.vars,
+        statements: d.statements,
+    })
+}
+
 fn collect_named(
     name: &str,
     db: &ModuleDb,

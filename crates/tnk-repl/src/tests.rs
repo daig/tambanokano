@@ -148,10 +148,14 @@ fn prelude_results(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Stage 1 of META-LEVEL — the whole reflective tower loads. The real prelude through `META-LEVEL`
-/// (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL) parses and builds with **no errors** (the descent
-/// functions are declared via `MetaLevelOpSymbol`, inert for now). Three reduces prove the parse/flatten
-/// fixes this needed, byte-identically (value + 1-rewrite count) to the reference's preloaded modules:
+/// META-LEVEL Stages 1–2. The whole reflective tower (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL,
+/// the real prelude through line 3166) parses and builds with **no errors**; then the reflection core
+/// computes: `metaReduce` down-translates a meta-module + subject, reduces in the object module, and
+/// up-translates the result `{term, type}`, and the `<Qids>` classification makes a `Qid`'s sort
+/// text-dependent. Every reduce is byte-identical (value, sort, **rewrite count**) to the reference's
+/// preloaded modules.
+///
+/// Stage 1 (the parse/flatten fixes the meta-modules first exercise):
 ///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
 ///     (grammar-aware, applied to QID-SET's `_,_` occurrences) gives a working idempotent `_;_` (`N ; N`).
 ///   * `getName(fmod 'FOO is nil sorts none . none none none none endfm)` → `'FOO` — the **module
@@ -168,9 +172,19 @@ fn prelude_meta_through_repl() {
     assert_eq!(
         prelude_results(&out),
         vec![
+            // Stage 1 — the tower loads + the parse/flatten fixes (idempotent renamed `_;_`, the module
+            // constructor inside an equation, kind-homogeneous `none` rhs).
             "[1] NeSortSet: 'a ; 'b",
             "[1] Sort: 'FOO",
             "[1] RuleSet: (none).RuleSet",
+            // Stage 2 — the reflection core: `metaReduce` (down/up + object reduction) over the `[Q]` form,
+            // and `<Qids>`-classified `getName`/`getType`. Values, sorts, and rewrite counts are the
+            // reference binary's.
+            "[2] ResultPair: {'0.Zero, 'Zero}",
+            "[3] ResultPair: {'s_^5['0.Zero], 'NzNat}",
+            "[3] ResultPair: {'false.Bool, 'Bool}",
+            "[6] Sort: 'foo",
+            "[7] Sort: 'Bar",
         ],
         "META tower reduces: {out}"
     );
