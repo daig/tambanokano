@@ -206,6 +206,13 @@ fn prelude_meta_through_repl() {
             "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, 'N:Nat <- 's_^3['0.Zero]}", // apply at top
             "[1] ResultTriple?: (failure).ResultTriple?",              // solution 1 — past the last
             "[1] ResultTriple?: (failure).ResultTriple?",              // no top match (subject is s^3(0))
+            // metaXmatch (extension match → {subst, context}) and metaXapply (rule at a position →
+            // {term, type, subst, context}). The hole `[]` (now printed in full, both bracket fragments)
+            // marks the matched/rewritten position: `[]` at the top, `'f[[]]` at the inner f.
+            "[2] MatchPair: {'N:Nat <- 's_^4['0.Zero], []}",           // metaXmatch s_(N) <-> s^5(0)
+            "[2] MatchPair?: (noMatch).MatchPair?",                    // metaXmatch _+_ vs s^5 — no match
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- 'f['0.Zero], []}",   // xapply at top
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, 'N:Nat <- '0.Zero, 'f[[]]}",   // xapply at inner f
         ],
         "META tower reduces: {out}"
     );

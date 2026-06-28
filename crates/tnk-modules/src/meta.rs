@@ -55,7 +55,9 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Match => self.meta_match(ctx, hooks, redex),
             MetaOp::Search => self.meta_search(ctx, hooks, redex),
             MetaOp::Apply => self.meta_apply(ctx, hooks, redex),
-            _ => None, // metaXapply/metaXmatch/metaSearchPath + Stage 4/Deferred
+            MetaOp::Xmatch => self.meta_xmatch(ctx, hooks, redex),
+            MetaOp::Xapply => self.meta_xapply(ctx, hooks, redex),
+            _ => None, // metaSearchPath (needs rule up-translation) + Stage 4/Deferred
         }
     }
 }
@@ -240,6 +242,108 @@ impl MetaDescent<'_> {
             None => {
                 ctx.add_rewrites(loaded.built.engine.rewrites());
                 ctx.app(*hooks.ops.get("failure3Symbol")?, vec![])
+            }
+        };
+        Some(result)
+    }
+
+    /// `metaXmatch(M, P, S, C, minD, maxD, n)` → the `(n+1)`-th **extension** match of `P` against the
+    /// reduced `S` at the top → `{substitution, context}` (`MatchPair`), or `noMatch`. When the match
+    /// consumes the whole subject (a free/iterated top, or every AC argument bound) the context is the bare
+    /// hole `[]`; a *partial* AC match (a proper sub-multiset, leaving a residue context `op([], …)`) is a
+    /// follow-on — it stays inert rather than report a wrong context. `C` must be `nil`.
+    fn meta_xmatch(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let mut vars = VarIndex::new();
+        let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
+        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
+        if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
+            return None;
+        }
+        let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
+        let nr = vars.count();
+        loaded.built.engine.reset_rewrites();
+        let subj = loaded.built.engine.reduce(subj);
+        ctx.add_rewrites(loaded.built.engine.rewrites());
+        match nth_xmatch(&mut loaded.built.engine, pattern, nr, subj, sol_nr) {
+            Some((bindings, whole)) => {
+                if !whole {
+                    return None; // partial AC match — residue context is a follow-on
+                }
+                let subst = up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &bindings);
+                let context = ctx.app(*hooks.ops.get("holeSymbol")?, vec![]);
+                Some(ctx.app(*hooks.ops.get("matchPairSymbol")?, vec![subst, context]))
+            }
+            None => Some(ctx.app(*hooks.ops.get("noMatchPairSymbol")?, vec![])),
+        }
+    }
+
+    /// `metaXapply(M, T, L, σ, minD, maxD, n)` → the `(n+1)`-th application of a rule labelled `L` at **any
+    /// position** of the reduced `T` whose depth is in `[minD, maxD]` → `{up(whole result), up(type),
+    /// up(match), context}` (`Result4Tuple`), or `failure`. The context is the subject with the rewritten
+    /// position replaced by the hole `[]` (`'f[[]]`, …). Positions are enumerated outermost-first. σ must
+    /// be `none` and the labelled rules unconditional (as for [`meta_apply`](Self::meta_apply)); the
+    /// match at each position is exact (free-theory) — AC sub-multiset application is a follow-on.
+    fn meta_xapply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let subj0 = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let label = match ctx.repr(*kids.get(2)?) {
+            NodeRepr::Qid(s) => s.to_string(),
+            _ => return None,
+        };
+        if !is_empty_subst(ctx, hooks, *kids.get(3)?) {
+            return None;
+        }
+        let min_d = down_nat64(ctx, *kids.get(4)?)? as usize;
+        let max_d = down_bound(ctx, hooks, *kids.get(5)?);
+        let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
+        let rules: Vec<(Term, Term, Vec<String>, u32)> = loaded
+            .built
+            .rl_traces
+            .iter()
+            .filter(|t| t.label.as_deref() == Some(label.as_str()))
+            .map(|t| (t.lhs.clone(), t.rhs.clone(), t.var_names.clone(), t.var_names.len() as u32))
+            .collect();
+        if loaded.built.rl_traces.iter().any(|t| {
+            t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty()
+        }) {
+            return None;
+        }
+        loaded.built.engine.reset_rewrites();
+        let subj = loaded.built.engine.reduce(subj0);
+        // Positions within the depth band, outermost-first; at each, every labelled rule's top matches.
+        let mut positions = Vec::new();
+        collect_positions(&loaded.built.engine, subj, 0, &mut Vec::new(), min_d, max_d, &mut positions);
+        let mut all: Vec<(Vec<usize>, usize, Vec<DagId>)> = Vec::new();
+        for path in &positions {
+            let subterm = subterm_at(&loaded.built.engine, subj, path);
+            for (ri, (lhs, _, _, nr)) in rules.iter().enumerate() {
+                let mut sols = loaded.built.engine.match_solutions(lhs.clone(), *nr, subterm, false);
+                while sols.advance() {
+                    let b: Vec<DagId> =
+                        (0..*nr).map(|k| sols.binding(k).expect("matcher binds every var")).collect();
+                    all.push((path.clone(), ri, b));
+                }
+            }
+        }
+        let result = match all.get(sol_nr) {
+            Some((path, ri, bindings)) => {
+                let (_, rhs, names, _) = &rules[*ri];
+                let new_sub = loaded.built.engine.instantiate_bindings(rhs, bindings);
+                let whole = replace_at(&mut loaded.built.engine, subj, path, new_sub);
+                let whole = loaded.built.engine.reduce(whole);
+                ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
+                let ut = up_term(ctx, hooks, &loaded.built, whole);
+                let us = up_sort(ctx, hooks, &loaded.built, whole);
+                let subst = up_substitution(ctx, hooks, &loaded.built, names, bindings);
+                let context = up_context(ctx, hooks, &loaded.built, subj, path);
+                ctx.app(*hooks.ops.get("result4TupleSymbol")?, vec![ut, us, subst, context])
+            }
+            None => {
+                ctx.add_rewrites(loaded.built.engine.rewrites());
+                ctx.app(*hooks.ops.get("failure4Symbol")?, vec![])
             }
         };
         Some(result)
@@ -949,6 +1053,83 @@ fn var_names(vars: &VarIndex) -> Vec<String> {
     (0..vars.count()).map(|k| vars.name(k).to_string()).collect()
 }
 
+/// Up-translate `node` (in `source`) into a meta `Context` — its [`up_term`], except the subterm at `path`
+/// becomes the hole `[]` (`holeSymbol`). Handles the free-theory application spine (the path component is a
+/// child index); the rewritten/hole position itself is reached when `path` is exhausted.
+fn up_context(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    node: DagId,
+    path: &[usize],
+) -> DagId {
+    let Some((&head, rest)) = path.split_first() else {
+        return ctx.app(hooks.ops["holeSymbol"], vec![]);
+    };
+    let sym = source.engine.node(node).symbol();
+    let name = source.engine.symbol(sym).name().to_string();
+    let children: Vec<DagId> = source.engine.node(node).children().collect();
+    let up_args: Vec<DagId> = children
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if i == head {
+                up_context(ctx, hooks, source, c, rest)
+            } else {
+                up_term(ctx, hooks, source, c)
+            }
+        })
+        .collect();
+    let arglist = up_arglist(ctx, hooks, up_args);
+    let opqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
+    ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
+}
+
+/// Collect the subterm positions of `node` whose depth is in `[min_d, max_d]`, as child-index paths in
+/// outermost-first (pre-order) order — `metaXapply`'s application-position enumeration.
+fn collect_positions(
+    engine: &Engine,
+    node: DagId,
+    depth: usize,
+    path: &mut Vec<usize>,
+    min_d: usize,
+    max_d: Option<u64>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if max_d.is_some_and(|m| depth as u64 > m) {
+        return;
+    }
+    if depth >= min_d {
+        out.push(path.clone());
+    }
+    let children: Vec<DagId> = engine.node(node).children().collect();
+    for (i, &c) in children.iter().enumerate() {
+        path.push(i);
+        collect_positions(engine, c, depth + 1, path, min_d, max_d, out);
+        path.pop();
+    }
+}
+
+/// The subterm of `root` at child-index `path`.
+fn subterm_at(engine: &Engine, root: DagId, path: &[usize]) -> DagId {
+    let mut node = root;
+    for &i in path {
+        node = engine.node(node).children().nth(i).expect("valid position path");
+    }
+    node
+}
+
+/// `root` with the subterm at child-index `path` replaced by `new` (rebuilding the spine, theory-aware).
+fn replace_at(engine: &mut Engine, root: DagId, path: &[usize], new: DagId) -> DagId {
+    let Some((&head, rest)) = path.split_first() else {
+        return new;
+    };
+    let sym = engine.node(root).symbol();
+    let mut children: Vec<DagId> = engine.node(root).children().collect();
+    children[head] = replace_at(engine, children[head], rest, new);
+    engine.make_node(sym, children)
+}
+
 // ---- meta argument decoders (Bound / Nat / search arrow / empty condition) ----
 
 /// A meta `Bound` (`unbounded` | a `Nat`) → the engine driver bound (`None` = unbounded, `Some(n)` = ≤ n).
@@ -1009,4 +1190,31 @@ fn nth_match(
         count += 1;
     }
     None
+}
+
+/// The `(n+1)`-th **extension** match of `pattern` against `subj` — its bindings and whether the matched
+/// portion is the *whole* subject (so the context is the bare hole `[]`). `None` if there are fewer than
+/// `n+1` solutions.
+fn nth_xmatch(
+    engine: &mut Engine,
+    pattern: Term,
+    nr: u32,
+    subj: DagId,
+    n: usize,
+) -> Option<(Vec<DagId>, bool)> {
+    let mut found = None;
+    {
+        let mut sols = engine.match_solutions(pattern, nr, subj, true);
+        let mut count = 0;
+        while sols.advance() {
+            if count == n {
+                let bindings: Vec<DagId> =
+                    (0..nr).map(|k| sols.binding(k).expect("the matcher binds every variable")).collect();
+                found = Some((bindings, sols.matched_portion()));
+                break;
+            }
+            count += 1;
+        }
+    }
+    found.map(|(b, portion)| (b, engine.deep_equal(portion, subj)))
 }

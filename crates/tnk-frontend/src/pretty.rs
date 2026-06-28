@@ -245,9 +245,12 @@ impl<'a> Printer<'a> {
         };
         let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
         if !has_hole {
-            // Constant (a value → `Lit`) or prefix operator (`name(a, b, …)` → `Op` name).
+            // Constant (a value → `Lit`) or prefix operator (`name(a, b, …)` → `Op` name). The name can be
+            // several fragments when it lexes with punctuation (`[]`, `{}`, `<>` — split on `[`/`]`/…), so
+            // emit them all, not just the first (else the hole constant `[]` would render as a bare `[`).
             let cat = if children.is_empty() { Cat::Lit } else { Cat::Op };
-            out.push(Work::Text { cat, text: self.frag_cow(&syn.frags[0]) });
+            let name: String = syn.frags.iter().map(|f| self.frag_cow(f)).collect::<Vec<_>>().concat();
+            out.push(Work::Text { cat, text: Cow::Owned(name) });
             if !children.is_empty() {
                 self.layout_arg_list(children, arg_rk, out);
             }

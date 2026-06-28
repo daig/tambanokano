@@ -3208,3 +3208,12 @@ red in META-LEVEL : metaSearch(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 
 red in META-LEVEL : metaApply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['s_^3['0.Zero]], 'unwrap, none, 0) .
 red in META-LEVEL : metaApply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['s_^3['0.Zero]], 'unwrap, none, 1) .
 red in META-LEVEL : metaApply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 's_^3['0.Zero], 'unwrap, none, 0) .
+
+*** metaXmatch matches with extension at the top, returning a substitution-and-context MatchPair; the
+*** context is the bare hole for a whole-subject free or iterated match. metaXapply applies a labelled
+*** rule at any position outermost-first and returns a term/type/substitution/context Result4Tuple, the
+*** context marking where the rule fired. Values and rewrite counts are the reference binary's.
+red in META-LEVEL : metaXmatch(['NAT], 's_['N:Nat], 's_^5['0.Zero], nil, 0, unbounded, 0) .
+red in META-LEVEL : metaXmatch(['NAT], '_+_['X:Nat, 'Y:Nat], 's_^5['0.Zero], nil, 0, unbounded, 0) .
+red in META-LEVEL : metaXapply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['f['0.Zero]], 'unwrap, none, 0, unbounded, 0) .
+red in META-LEVEL : metaXapply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['f['0.Zero]], 'unwrap, none, 0, unbounded, 1) .
