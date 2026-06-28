@@ -260,6 +260,25 @@ fn instantiation_through_repl() {
     assert!(out.contains("result SA: a"), "multi-parameter instantiation: {out}");
 }
 
+/// Axis-A5: chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (parameter bound to a
+/// richer theory) then a by-parameter / module-view second level, with the chained import's renaming
+/// collapsing the multi-level structured sort. This is the SORTABLE-LIST family's shape; here `USE{X ::
+/// ORD}` chains `LST{ORD}{X}` (renaming `Lst{ORD}{X}` back to `Lst{X}`), instantiated at `USE{OrdColor}`.
+/// Byte-identical to the reference; the prelude's `SORTABLE-LIST{Nat<}` now sorts identically too.
+#[test]
+fn instantiation_chained_through_repl() {
+    let out = repl().eval(conformance_file!("instantiation-chained.maude")).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        vec![
+            "result Lst{OrdColor}: cons(red, cons(green, nil))", // pair(red, green) — chained instance sort
+            "result Lst{OrdColor}: cons(green, nil)",
+        ],
+        "chained instantiation: {out}"
+    );
+}
+
 /// Axis-A1: view operator maps applied at instantiation through the REPL — `op zero to term f0` (op→term)
 /// and `op wrap to box` (op→op), so `ARR{ToFL}`'s `d0`/`d1` reduce to the target's terms.
 #[test]

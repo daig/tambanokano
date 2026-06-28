@@ -657,6 +657,13 @@ impl Signature {
     /// carries no user `strat`, so the seam wires it here (cf. the B2.4 lazy-strat mechanism).
     pub(crate) fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         if let SpecialOp::Branch { .. } = op {
+            // Re-attaching a Branch (the same op reached via two import paths — e.g. `if_then_else_fi`
+            // from a parameter theory's `protecting BOOL` and a regular `BOOL` import) is a no-op: the
+            // seam already installed `strat (1 0)`. The "no user strat" check therefore guards only the
+            // *first* attach — a genuine user `strat` on `if_then_else_fi` still trips it.
+            if matches!(self.symbols.get(sym).special, Some(SpecialOp::Branch { .. })) {
+                return;
+            }
             assert!(
                 self.symbols.get(sym).strategy.is_none(),
                 "`{}` is a Branch operator; its laziness is installed by the seam — it must not also \

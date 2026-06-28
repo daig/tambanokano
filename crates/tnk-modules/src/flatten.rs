@@ -389,6 +389,9 @@ fn instantiate(
             chain.iter().map(|a| canonical_key(a)).collect::<Vec<_>>().join("}{");
         bindings.insert(param.name.clone(), ParamBinding {
             view_name,
+            // The by-parameter `$`-sort rename uses only the last level (the surviving parameter), not the
+            // joined chain — so `LIST{ORD}{X}` renames `X$Elt ↦ X$Elt`, not `↦ ORD}{X$Elt`.
+            final_name: last.binding.view_name.clone(),
             sort_image,
             by_param: last.binding.by_param,
         });
@@ -417,6 +420,12 @@ fn instantiate(
 /// view_name$s` (the parameter survives, renamed — Axis-A5 kind 2).
 struct ParamBinding {
     view_name: String,
+    /// The **final** argument name — the same as `view_name` for a single-level argument, but for a chain
+    /// `M{ToT2}{C2}` it is only the *last* level (`C2`), not the joined chain. Used for the by-parameter
+    /// `$`-sort rename (`X$s ↦ final_name$s`): a chain ending in an enclosing parameter (`LIST{ORD}{X}`)
+    /// must rename `X$Elt ↦ X$Elt`, not `X$Elt ↦ ORD}{X$Elt` — the structured sort keeps the full chain
+    /// (`Lst{X} ↦ Lst{ORD}{X}`), but the surviving parameter's sort uses only the last level.
+    final_name: String,
     sort_image: HashMap<String, String>,
     by_param: bool,
 }
@@ -448,7 +457,12 @@ fn resolve_arg(
         && scope.iter().any(|n| n == p)
     {
         return Ok(ArgResolution {
-            binding: ParamBinding { view_name: p.clone(), sort_image: HashMap::new(), by_param: true },
+            binding: ParamBinding {
+                view_name: p.clone(),
+                final_name: p.clone(),
+                sort_image: HashMap::new(),
+                by_param: true,
+            },
             target: None,
             op_subst: HashMap::new(),
         });
@@ -464,6 +478,7 @@ fn resolve_arg(
             Ok(ArgResolution {
                 binding: ParamBinding {
                     view_name: view_name.clone(),
+                    final_name: view_name.clone(),
                     sort_image: v.sort_maps.iter().cloned().collect(),
                     by_param: false,
                 },
@@ -501,6 +516,7 @@ fn resolve_arg(
             Ok(ArgResolution {
                 binding: ParamBinding {
                     view_name: canonical_key(arg),
+                    final_name: canonical_key(arg),
                     sort_image,
                     by_param: false,
                 },
@@ -545,13 +561,57 @@ fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) ->
             Box::new(subst_params_in_expr(b, map)),
         ),
         ModuleExpr::Rename(inner, items) => {
-            ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map)), items.clone())
+            use tnk_frontend::surface::ast::RenameItem;
+            // Substitute parameters in the renaming's sort/op *names* too (not just `inner`): a chained
+            // import's renaming `sort List{STO}{X} to List{X}` must become `List{STO}{Nat<} to List{Nat<}`
+            // when the enclosing module is instantiated, so its FROM matches the chain-named instance sort
+            // `List{STO}{Nat<}` (which `WSL{STO}{Nat<}` produces) and its TO collapses it to `List{Nat<}`.
+            let names: HashMap<String, String> =
+                map.iter().map(|(p, a)| (p.clone(), canonical_key(a))).collect();
+            let new_items: Vec<RenameItem> = items
+                .iter()
+                .map(|it| match it {
+                    RenameItem::Sort { from, to } => RenameItem::Sort {
+                        from: subst_param_name(from, &names),
+                        to: subst_param_name(to, &names),
+                    },
+                    RenameItem::Op { from, to } => RenameItem::Op {
+                        from: subst_param_name(from, &names),
+                        to: subst_param_name(to, &names),
+                    },
+                })
+                .collect();
+            ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map)), new_items)
         }
         ModuleExpr::Instantiation(base, args) => ModuleExpr::Instantiation(
             Box::new(subst_params_in_expr(base, map)),
             args.iter().map(|a| subst_params_in_expr(a, map)).collect(),
         ),
     }
+}
+
+/// Substitute parameter names in a (possibly structured / chained) sort or op name: each identifier token
+/// — a maximal run between `{`, `}`, `,` — that is a parameter is replaced by its argument name. Brace/
+/// comma delimiting means a *chain* `List{STO}{X}` and a nested `Pair{X, Y}` both substitute correctly
+/// (`X ↦ Nat<` gives `List{STO}{Nat<}`); an unrelated token like `STRICT-TOTAL-ORDER` is left as-is.
+fn subst_param_name(name: &str, names: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    for c in name.chars() {
+        if matches!(c, '{' | '}' | ',') {
+            if !ident.is_empty() {
+                out.push_str(names.get(ident.as_str()).map(String::as_str).unwrap_or(&ident));
+                ident.clear();
+            }
+            out.push(c);
+        } else {
+            ident.push(c);
+        }
+    }
+    if !ident.is_empty() {
+        out.push_str(names.get(ident.as_str()).map(String::as_str).unwrap_or(&ident));
+    }
+    out
 }
 
 /// Apply the instantiation substitution to a module's own declarations: rewrite every sort name through
@@ -699,9 +759,11 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some((param, s)) = name.split_once('$')
         && let Some(b) = bindings.get(param)
     {
-        // By-parameter: prefix-rename `X$s ↦ p$s` (the parameter survives). View: the view's sort image.
+        // By-parameter: prefix-rename `X$s ↦ p$s` (the parameter survives) — using the *final* level only,
+        // so a chain `LIST{ORD}{X}` gives `X$Elt`, not the malformed chain `ORD}{X$Elt`. View: the view's
+        // sort image.
         return if b.by_param {
-            format!("{}${s}", b.view_name)
+            format!("{}${s}", b.final_name)
         } else {
             b.sort_image.get(s).cloned().unwrap_or_else(|| s.to_string())
         };

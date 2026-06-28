@@ -1,0 +1,38 @@
+*** Axis-A5 chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (leaving the parameter
+*** bound to a richer theory) composed with a by-parameter or module-view second level, plus the chained
+*** import's renaming collapsing the multi-level structured sort. This is the SORTABLE-LIST family's shape:
+*** `LIST{STRICT-WEAK-ORDER}{X}` renamed to `List{X}`. Self-contained; oracle is this file through Maude 3.
+
+fth ELT is sort Elt . endfth
+fth ORD is
+  including ELT .
+  op lt : Elt Elt -> Elt .
+endfth
+view ORD from ELT to ORD is endv
+
+fmod LST{X :: ELT} is
+  sort Lst{X} .
+  op nil : -> Lst{X} [ctor] .
+  op cons : X$Elt Lst{X} -> Lst{X} [ctor] .
+endfm
+
+*** USE chains LST{ORD}{X}: theory-view ORD then by-parameter X, renaming the chain sort back to Lst{X}.
+fmod USE{X :: ORD} is
+  protecting LST{ORD}{X} * (sort Lst{ORD}{X} to Lst{X}) .
+  op pair : X$Elt X$Elt -> Lst{X} .
+  vars A B : X$Elt .
+  eq pair(A, B) = cons(A, cons(B, nil)) .
+endfm
+
+fmod COLOR is
+  sort Color .
+  ops red green : -> Color [ctor] .
+  op lt : Color Color -> Color .
+  eq lt(red, green) = red .
+endfm
+view OrdColor from ORD to COLOR is sort Elt to Color . endv
+
+fmod T is protecting USE{OrdColor} . endfm
+
+red in T : pair(red, green) .
+red in T : cons(green, nil) .

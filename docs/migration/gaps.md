@@ -66,20 +66,8 @@ correctness fix.
   multi-element AU subject (residue splits Maude does not report at the top level) — pre-existing, affects only
   the `xmatch` command's solution *set*, not reduce/rewrite. The optimized matcher is also a prerequisite for
   heavy AC `search`.
-- **Chained multi-level instantiation (`LIST{STRICT-WEAK-ORDER}{X}`) — the SORTABLE-LIST family.** The
-  view-frontend is otherwise done: parameterized *view declarations* parse (`view List{X :: TRIV} from TRIV
-  to LIST{X}`), renamings over a **structured** sort parse (`* (sort NeList{Qid} to NeQidList)`, via
-  `renaming()` → `sort_name`, which reads a chain of `{…}` groups), and the eq parser handles a `[_]`-list
-  rhs / a trailing `[owise]` (split at the last top-level `=`, peel `[attrs]` only when it really is
-  attributes). So the metalevel's simple container instantiations build & reduce byte-identically
-  (`NAT-LIST`/`QID-LIST`/`QID-SET`), the standalone `[_]`-list modules `LIST*`/`SET*` build, and the
-  data-type containers are unaffected. **What remains** is the **chained** form `M{A}{B}` (and triple
-  `M{A}{B}{C}`) used by `WEAKLY-SORTABLE-LIST`/`SORTABLE-LIST`/`SORTABLE-LIST-AND-SET` (+ their `'`
-  variants): it *parses* but `flatten` produces a malformed sort name (`unknown sort
-  STRICT-WEAK-ORDER}{X$Elt`) — the **Axis-A5 last-level-substitution residual** (a `tnk-modules` flatten
-  gap; the kernel already nests containers). This is the same residual already tracked under "Chained-
-  instantiation import substitution (Axis-A5 kind 1)" below and on roadmap item 2. Off the data path and
-  off the `META-LEVEL` path. Coverage: `conformance/view-parameterized.maude`, `conformance/eq-bracket-rhs.maude`.
+- *(Resolved — the whole view-frontend, including chained instantiation, now loads the prelude's container
+  views. See the Resolved section.)*
 - **Sort computation.** Least sorts come from direct `findMinSortIndex`-style iteration (down-set GLB), not
   Maude's precompiled **flattened sort-decision diagram**. Same result; the diagram is a per-application
   speedup.
@@ -164,13 +152,6 @@ correctness fix.
   **ill-typed in `M` but well-typed after the substitution** is wrongly accepted at the instance, where Maude
   builds-and-rejects `M` once. Ill-formed-spec only — every well-formed prelude module typechecks in `M` — but
   it is a genuine architectural asymmetry vs. Maude's build-then-instantiate.
-- **Chained-instantiation import substitution (Axis-A5 kind 1).** A theory-view chain `M{ToT2}{C2}` composes
-  the view chain into one binding (correct sort images, target, and the chained structured-sort name
-  `Box{ToT2}{C2}`). When `M`'s *imports* mention the parameter (`M{…}` importing `FOO{X}`), the re-instantiated
-  import uses only the **last** chain level's argument (`FOO{C2}`), dropping the intervening theory-view level.
-  No conformance fixture reaches this corner (a theory-view whose module *also* re-exports the parameter
-  through a parameterized import); the single-level and direct cases are exact.
-
 - **Built-in string ops are byte/ASCII-oriented (Tier 2).** Maude's strings are byte sequences; ours wrap a
   Rust UTF-8 `str`, and the string ops (`length`/`substr`/`find`/`rfind`/`ascii`/the `ctype` predicates/
   case/trim) index by **char**. For ASCII content — every conformance case, and the prelude's own use —
@@ -211,3 +192,17 @@ specials `CommutativeDecomposeEqualitySymbol` / `RandomOpSymbol` (MT19937) / `Co
 `FiniteFloat`/`Float`), **`~>` partiality tracking** (a partial op ranges over its kind), and a
 **punctuation-aware `split_mixfix`** (operators whose names lex with brackets/commas — `_=[_]_`, `<_,_,_>`,
 `[]`, `{}`). Verified by `conformance/prelude-tier2.maude` + `prelude_tier2_through_repl`.
+
+The prelude's **parameterized container views** and **chained instantiation** now load — closing the last
+Axis-A5 residual. The parser side: parameterized view declarations, structured-sort renamings (`renaming()`
+→ `sort_name`, reading a chain of `{…}` groups), and a `[_]`-list rhs / trailing `[owise]` in equations
+(split at the last top-level `=`, attribute-keyword-gated `[attrs]` peel). The flatten side: a chain
+`M{ToTheory}{Arg}` binds the parameter's `$`-sort to only the **final** level (`X$Elt`, not the malformed
+`ToTheory}{X$Elt`) while the structured sort keeps the full chain, and a chained import's **renaming items**
+are parameter-substituted so the chain name collapses level by level. So `NAT-LIST`/`QID-LIST`/`QID-SET`
+build & reduce, the `[_]`-list `LIST*`/`SET*` build, and the `SORTABLE-LIST` family loads — `SORTABLE-LIST
+{Nat<}` sorts byte-identically. A duplicate `if_then_else_fi` (a parameter theory's `protecting BOOL` and a
+regular `BOOL` import) is folded by an idempotent Branch re-attach. Verified by
+`conformance/{instantiation-chained,view-parameterized,eq-bracket-rhs}.maude`. The only prelude modules that
+still don't build are `META-LEVEL` (Tier 3) and the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the
+`[object]` attribute (Phase 2 item 5).

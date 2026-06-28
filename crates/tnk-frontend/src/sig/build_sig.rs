@@ -194,6 +194,12 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // attributes — including the special op, whose hooks resolve to the same constants for every kind
     // (this is the re-attach-per-instance Maude does in `instantiatePolymorph`) — so resolve `special`
     // once and apply to each instance.
+    // A symbol can be reached by more than one declaration. Two kinds occur: (a) a later decl *upgrades*
+    // an earlier one's special — NAT's `_+_` (no `minus`) and INT's `_+_` (with `minus`) share a symbol
+    // (Nat/Int are one kind), and the later (INT) must win; (b) an ad-hoc re-import re-adds an *identical*
+    // op — a parameter theory `protecting BOOL` and a regular `BOOL` import both contribute
+    // `if_then_else_fi`. So `set_special` is last-wins (handling a), and made idempotent for a re-attached
+    // `Branch` (handling b — its "no user strat" assert would otherwise trip on the seam's own strat).
     for (idx, od) in pm.ops.iter().enumerate() {
         if od.attrs.ditto {
             continue; // attributes inherited from the prior declaration (shared symbol)
