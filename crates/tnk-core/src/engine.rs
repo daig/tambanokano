@@ -3352,6 +3352,18 @@ impl Engine {
         self.rt.instantiate(&self.sig, term, subst)
     }
 
+    /// Build a DAG instance of `term` under explicit `bindings` (variable index → value) — a match
+    /// solution's bindings captured from a [`Solutions`] stream. The META-LEVEL `metaApply`/`metaXapply`
+    /// descent uses it to build a named rule's rhs from the bindings of matching its lhs.
+    pub fn instantiate_bindings(&mut self, term: &Term, bindings: &[DagId]) -> DagId {
+        let mut subst = Subst::new();
+        subst.reset(bindings.len() as u32);
+        for (i, &b) in bindings.iter().enumerate() {
+            subst.bind(i as u32, b);
+        }
+        self.instantiate(term, &subst)
+    }
+
     /// Begin enumerating *every* match of `pattern` (with `nr_vars` distinct variables, indexed
     /// `0..nr_vars`) against `subject` — the public face of the A3 matcher seam's multi-solution
     /// [`Subproblem`] stream, which [`match_pattern`](Self::match_pattern) (a single yes/no) cannot

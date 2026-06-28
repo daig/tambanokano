@@ -54,7 +54,8 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Frewrite => self.meta_rewrite(ctx, hooks, redex, true),
             MetaOp::Match => self.meta_match(ctx, hooks, redex),
             MetaOp::Search => self.meta_search(ctx, hooks, redex),
-            _ => None, // metaApply/metaXapply/metaXmatch/metaSearchPath + Stage 4/Deferred
+            MetaOp::Apply => self.meta_apply(ctx, hooks, redex),
+            _ => None, // metaXapply/metaXmatch/metaSearchPath + Stage 4/Deferred
         }
     }
 }
@@ -130,7 +131,7 @@ impl MetaDescent<'_> {
         // Capture the (n+1)-th solution's bindings while the matcher stream borrows the engine.
         let bindings = nth_match(&mut loaded.built.engine, pattern, nr, subj, false, sol_nr);
         let result = match bindings {
-            Some(b) => up_substitution(ctx, hooks, &loaded.built, &vars, &b),
+            Some(b) => up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &b),
             None => ctx.app(*hooks.ops.get("noMatchSubstSymbol")?, vec![]),
         };
         Some(result)
@@ -169,7 +170,71 @@ impl MetaDescent<'_> {
                 let state = search.state_term(s.state)?;
                 let ut = up_term(ctx, hooks, &loaded.built, state);
                 let us = up_sort(ctx, hooks, &loaded.built, state);
-                let subst = up_substitution(ctx, hooks, &loaded.built, &vars, &s.bindings);
+                let subst = up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &s.bindings);
+                ctx.app(*hooks.ops.get("resultTripleSymbol")?, vec![ut, us, subst])
+            }
+            None => {
+                ctx.add_rewrites(loaded.built.engine.rewrites());
+                ctx.app(*hooks.ops.get("failure3Symbol")?, vec![])
+            }
+        };
+        Some(result)
+    }
+
+    /// `metaApply(M, T, L, σ, n)` → the `(n+1)`-th application of a rule labelled `L` at the **top** of the
+    /// reduced `T` (extending the partial substitution σ) → `{up(reduced rhs), up(type), up(σ ∪ match)}`,
+    /// or `failure` (`ResultTriple?`). The rule application itself counts one rewrite (Maude's accounting),
+    /// on top of the subject and result reductions. σ currently must be empty (`none`) and the labelled
+    /// rules unconditional — a partial substitution and conditional-rule application are follow-ons (the
+    /// latter needs the condition solver, shared with conditioned `metaMatch`).
+    fn meta_apply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let label = match ctx.repr(*kids.get(2)?) {
+            NodeRepr::Qid(s) => s.to_string(),
+            _ => return None,
+        };
+        if !is_empty_subst(ctx, hooks, *kids.get(3)?) {
+            return None; // a non-empty partial substitution is a follow-on
+        }
+        let sol_nr = down_nat64(ctx, *kids.get(4)?)? as usize;
+        // The labelled rules (cloned out before mutating the engine). Conditional rules need the condition
+        // solver — bail rather than misapply (a conditional rule whose condition fails must not fire).
+        let rules: Vec<(Term, Term, Vec<String>, u32)> = loaded
+            .built
+            .rl_traces
+            .iter()
+            .filter(|t| t.label.as_deref() == Some(label.as_str()))
+            .map(|t| (t.lhs.clone(), t.rhs.clone(), t.var_names.clone(), t.var_names.len() as u32))
+            .collect();
+        if loaded.built.rl_traces.iter().any(|t| {
+            t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty()
+        }) {
+            return None;
+        }
+        loaded.built.engine.reset_rewrites();
+        let subj = loaded.built.engine.reduce(subj);
+        // Enumerate top matches across the labelled rules (in declaration order), pick the (n+1)-th.
+        let mut all: Vec<(usize, Vec<DagId>)> = Vec::new();
+        for (ri, (lhs, _, _, nr)) in rules.iter().enumerate() {
+            let mut sols = loaded.built.engine.match_solutions(lhs.clone(), *nr, subj, false);
+            while sols.advance() {
+                let b: Vec<DagId> =
+                    (0..*nr).map(|k| sols.binding(k).expect("matcher binds every var")).collect();
+                all.push((ri, b));
+            }
+        }
+        let result = match all.get(sol_nr) {
+            Some((ri, bindings)) => {
+                let (_, rhs, names, _) = &rules[*ri];
+                let res = loaded.built.engine.instantiate_bindings(rhs, bindings);
+                let res = loaded.built.engine.reduce(res);
+                // subject reduce + result reduce + the rule application (1).
+                ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
+                let ut = up_term(ctx, hooks, &loaded.built, res);
+                let us = up_sort(ctx, hooks, &loaded.built, res);
+                let subst = up_substitution(ctx, hooks, &loaded.built, names, bindings);
                 ctx.app(*hooks.ops.get("resultTripleSymbol")?, vec![ut, us, subst])
             }
             None => {
@@ -852,22 +917,23 @@ fn up_sort(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
     ctx.make_na(qid, NaValue::Qid(sort.into()))
 }
 
-/// Up-translate a solution substitution: each bound pattern variable `'X:Sort` to an assignment
+/// Up-translate a solution substitution: each bound variable `'X:Sort` to an assignment
 /// `'X:Sort <- up(value)`, joined by `_;_`; an all-ground (no-variable) match is the empty `none`. The
-/// variable's meta name is its `VarIndex` key (the full `X:Sort` text), so the round-trip is exact.
+/// variable's meta name is the full `X:Sort` text (a `VarIndex` key or a rule trace's `var_names`), so the
+/// round-trip is exact. A binding with no value (`None`) is skipped (an unconstrained variable).
 fn up_substitution(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     source: &BuiltModule,
-    vars: &VarIndex,
+    names: &[String],
     bindings: &[DagId],
 ) -> DagId {
     let qid = hooks.ops["qidSymbol"];
     let assign = hooks.ops["assignmentSymbol"];
     let mut assigns = Vec::new();
-    for k in 0..vars.count() {
-        let Some(&val) = bindings.get(k as usize) else { continue };
-        let var_qid = ctx.make_na(qid, NaValue::Qid(vars.name(k).into()));
+    for (k, name) in names.iter().enumerate() {
+        let Some(&val) = bindings.get(k) else { continue };
+        let var_qid = ctx.make_na(qid, NaValue::Qid(name.as_str().into()));
         let up_val = up_term(ctx, hooks, source, val);
         assigns.push(ctx.app(assign, vec![var_qid, up_val]));
     }
@@ -876,6 +942,11 @@ fn up_substitution(
         1 => assigns.into_iter().next().unwrap(),
         _ => ctx.app(hooks.ops["substitutionSymbol"], assigns),
     }
+}
+
+/// The `VarIndex`'s variable names as the `&[String]` [`up_substitution`] expects.
+fn var_names(vars: &VarIndex) -> Vec<String> {
+    (0..vars.count()).map(|k| vars.name(k).to_string()).collect()
 }
 
 // ---- meta argument decoders (Bound / Nat / search arrow / empty condition) ----
@@ -910,6 +981,11 @@ fn down_arrow(ctx: &MetaCtx, d: DagId) -> Option<Arrow> {
 /// Whether a meta `Condition` is the empty `nil` (the only condition the matching descent handles so far).
 fn is_nil_condition(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> bool {
     Some(ctx.top(d)) == hooks.ops.get("noConditionSymbol").copied()
+}
+
+/// Whether a meta `Substitution` is the empty `none` (the only partial substitution `metaApply` handles).
+fn is_empty_subst(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> bool {
+    Some(ctx.top(d)) == hooks.ops.get("emptySubstitutionSymbol").copied()
 }
 
 /// The `(n+1)`-th match solution's bindings (`0..nr`) of `pattern` against `subj`, or `None` if there are

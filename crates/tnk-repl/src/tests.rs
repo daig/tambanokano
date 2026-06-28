@@ -202,6 +202,10 @@ fn prelude_meta_through_repl() {
             "[2] ResultTriple: {'b.Elt, 'Elt, 'X:Elt <- 'b.Elt}",      // metaSearch =>+ sol 0: a=>b
             "[3] ResultTriple: {'c.Elt, 'Elt, 'X:Elt <- 'c.Elt}",      // metaSearch =>+ sol 1: a=>c (ab)
             "[3] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! to normal form c
+            // metaApply: the labelled rule `unwrap` (f(N) => N) at the top, its binding, or failure.
+            "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, 'N:Nat <- 's_^3['0.Zero]}", // apply at top
+            "[1] ResultTriple?: (failure).ResultTriple?",              // solution 1 — past the last
+            "[1] ResultTriple?: (failure).ResultTriple?",              // no top match (subject is s^3(0))
         ],
         "META tower reduces: {out}"
     );
