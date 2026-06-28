@@ -3180,3 +3180,11 @@ red in META-LEVEL : metaReduce(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]) .
 red in META-LEVEL : metaReduce(['BOOL], '_and_['true.Bool, 'false.Bool]) .
 red in META-TERM : getName('foo.Bar) .
 red in META-TERM : getType('foo.Bar) .
+
+*** Stage 3: inline down_module. The module argument now carries inline declarations (sorts, subsorts,
+*** ops with attributes, and equations), not only imports — so metaReduce builds the object module from a
+*** reconstructed PreModule + the ordinary flatten/build, then installs the inline equations by down-
+*** translating their meta-terms straight into the engine. BAR exercises an own equation over an imported
+*** type; LEN exercises subsorts, an AU `id(...)` operator, and a recursive AU-matching equation.
+red in META-LEVEL : metaReduce(fmod 'BAR is including 'NAT . sorts none . none op 'double : 'Nat -> 'Nat [none] . none eq 'double['N:Nat] = '_+_['N:Nat, 'N:Nat] [none] . endfm, 'double['s_^3['0.Zero]]) .
+red in META-LEVEL : metaReduce(fmod 'LEN is including 'NAT . sorts 'Elt ; 'Lst . subsort 'Elt < 'Lst . op 'nil : nil -> 'Lst [ctor] . op '__ : 'Lst 'Lst -> 'Lst [ctor assoc id('nil.Lst)] . op 'e : nil -> 'Elt [ctor] . op 'len : 'Lst -> 'Nat [none] . none eq 'len['nil.Lst] = '0.Zero [none] . eq 'len['__['X:Elt, 'L:Lst]] = '_+_['s_^1['0.Zero], 'len['L:Lst]] [none] . endfm, 'len['__['e.Elt, '__['e.Elt, 'e.Elt]]]) .

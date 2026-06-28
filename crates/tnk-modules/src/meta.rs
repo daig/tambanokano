@@ -11,13 +11,17 @@
 //! from the imported, db-resolved modules. A meta-module with *inline* declarations (what `upModule`
 //! emits) is a follow-on (`down_module` returns `None` for it → the redex stays at the kind level).
 
+use std::collections::BTreeSet;
+
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::descent::{DescentOps, MetaCtx};
-use tnk_core::symbol::{MetaHooks, MetaOp};
-use tnk_frontend::lex::Interner;
+use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
+use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
+use tnk_frontend::build_term::VarIndex;
+use tnk_frontend::lex::{tokenize, Interner};
 use tnk_frontend::load::{build_loaded_module, LoadedModule};
-use tnk_frontend::sig::syntax::BuiltModule;
-use tnk_frontend::surface::ast::{Import, ImportMode, ModuleExpr, ModuleKind, PreModule};
+use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
+use tnk_frontend::surface::ast::{Attrs, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, PreModule};
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten_pre;
@@ -67,9 +71,11 @@ impl MetaDescent<'_> {
         Some(ctx.app(rp, vec![ut, us]))
     }
 
-    /// Down-translate a meta-module term to an object [`LoadedModule`]: reconstruct its `PreModule`, then
-    /// run the ordinary flatten (against the db) + build. Handles the **import-expression** form (sorts/
-    /// ops/equations all `none`, e.g. `[Q]`); a meta-module with inline declarations returns `None`.
+    /// Down-translate a meta-module term to an object [`LoadedModule`]: reconstruct its `PreModule`
+    /// (imports + sorts + subsorts + ops), run the ordinary flatten (against the db) + build, then
+    /// install its inline memberships/equations/rules by down-translating their meta-terms directly into
+    /// the built engine. Handles both the **import-expression** form (`[Q]` — sorts/ops/equations all
+    /// `none`) and a module with **inline declarations** (what `upModule` emits, or a hand-written one).
     fn down_module(
         &mut self,
         ctx: &MetaCtx,
@@ -79,30 +85,40 @@ impl MetaDescent<'_> {
         let ctor = ctx.name(ctx.top(m)).to_string();
         let (kind, is_theory) = module_kind(&ctor)?;
         let kids = ctx.children(m);
-        // Layout (every constructor): [Header, ImportList, SortSet, SubsortDeclSet, OpDeclSet, MembAxSet,
-        // EquationSet, (RuleSet), (StratDeclSet, StratDefSet)]. We need the import list (index 1); the
-        // declaration children (2..) must all be the empty constant for this import-only path.
-        let imports_dag = *kids.get(1)?;
-        for &decl in kids.get(2..)? {
-            if !is_empty_decl(ctx, hooks, decl) {
-                return None; // inline declarations — full down_module is a follow-on
-            }
-        }
-        let imports = down_imports(ctx, hooks, imports_dag)?;
+        // Constructor layout: [0]=Header(Qid), [1]=ImportList, [2]=SortSet, [3]=SubsortDeclSet,
+        // [4]=OpDeclSet, [5]=MembAxSet, [6]=EquationSet, [7]=RuleSet (system only), [8,9]=Strat* (smod).
+        let imports = down_imports(ctx, hooks, *kids.get(1)?)?;
+        let sorts = down_sorts(ctx, hooks, *kids.get(2)?);
+        let subsorts = down_subsorts(ctx, hooks, *kids.get(3)?);
+        let mut ops = down_ops(ctx, hooks, *kids.get(4)?, self.interner)?;
+        // Declare constants (arity 0) first: `build_module` resolves an `id(c)`/`left-id`/`right-id`
+        // identity against the *already-declared* ops, but the meta `OpDeclSet` is an AU multiset whose
+        // canonical order need not place the identity constant before the operator that names it (e.g.
+        // `__`'s `id(nil)` with `__` ordered before `nil`). A stable constants-first sort guarantees every
+        // identity constant exists when its operator is declared, without disturbing same-arity order.
+        ops.sort_by_key(|o| !o.domain.is_empty());
         let pm = PreModule {
             name: "%META%".to_string(),
             kind,
             is_theory,
             params: Vec::new(),
             imports,
-            sorts: Vec::new(),
-            subsorts: Vec::new(),
-            ops: Vec::new(),
+            sorts,
+            subsorts,
+            ops,
             vars: Vec::new(),
-            statements: Vec::new(),
+            statements: Vec::new(), // inline statements are down-translated post-build (below)
         };
         let flat = flatten_pre(&pm, self.db, self.views, self.interner).ok()?;
-        build_loaded_module(&flat, self.interner).ok()
+        let mut loaded = build_loaded_module(&flat, self.interner).ok()?;
+        // Install this module's own inline declarations (the imports' statements came through `flatten`,
+        // parsed by `build_loaded_module`; these are reconstructed straight from their meta-terms).
+        install_membs(ctx, hooks, *kids.get(5)?, &mut loaded.built)?;
+        install_eqs(ctx, hooks, *kids.get(6)?, &mut loaded.built)?;
+        if kind == ModuleKind::System {
+            install_rules(ctx, hooks, *kids.get(7)?, &mut loaded.built)?;
+        }
+        Some(loaded)
     }
 }
 
@@ -121,21 +137,451 @@ fn module_kind(ctor: &str) -> Option<(ModuleKind, bool)> {
     }
 }
 
-/// Whether `decl` is an empty declaration set (`none`/`nil` — one of the `emptyXSymbol` hooks).
-fn is_empty_decl(ctx: &MetaCtx, hooks: &MetaHooks, decl: DagId) -> bool {
-    let sym = ctx.top(decl);
-    [
-        "emptySortSetSymbol",
-        "emptySubsortDeclSetSymbol",
-        "emptyOpDeclSetSymbol",
-        "emptyMembAxSetSymbol",
-        "emptyEquationSetSymbol",
-        "emptyRuleSetSymbol",
-        "emptyStratDeclSetSymbol",
-        "emptyStratDefSetSymbol",
-    ]
-    .iter()
-    .any(|h| hooks.ops.get(*h) == Some(&sym))
+// ---- inline declaration down-translation (sorts / subsorts / ops / membs / eqs / rules) ----
+
+/// The text of a `Qid` leaf (a meta sort/op/variable name), or `None` if `d` is not a `Qid`.
+fn qid_text(ctx: &MetaCtx, d: DagId) -> Option<String> {
+    match ctx.repr(d) {
+        NodeRepr::Qid(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Flatten a meta declaration set joined by a binary constructor `join` (`__`/`_;_`) into its element
+/// DAGs in left-to-right order, dropping the `empty` constant (`none`/`nil`). A single element, the empty
+/// constant, or a (AU/ACU-canonicalized) tree of `join` all collapse to a flat element list.
+fn flatten_set(ctx: &MetaCtx, d: DagId, empty: Option<SymbolId>, join: Option<SymbolId>) -> Vec<DagId> {
+    fn go(ctx: &MetaCtx, d: DagId, empty: Option<SymbolId>, join: Option<SymbolId>, out: &mut Vec<DagId>) {
+        let sym = Some(ctx.top(d));
+        if sym == empty {
+            return;
+        }
+        if sym == join {
+            for c in ctx.children(d) {
+                go(ctx, c, empty, join, out);
+            }
+            return;
+        }
+        out.push(d);
+    }
+    let mut out = Vec::new();
+    go(ctx, d, empty, join, &mut out);
+    out
+}
+
+/// A meta `SortSet` (`none` | `_;_`-joined sort `Qid`s) → the sort name strings.
+fn down_sorts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<String> {
+    let empty = hooks.ops.get("emptySortSetSymbol").copied();
+    let join = hooks.ops.get("sortSetSymbol").copied();
+    flatten_set(ctx, d, empty, join).iter().filter_map(|&x| qid_text(ctx, x)).collect()
+}
+
+/// A meta `SubsortDeclSet` (`none` | `__`-joined `subsort A < B .`) → the surface chain form (each decl a
+/// two-level chain `[[A], [B]]`).
+fn down_subsorts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<Vec<Vec<String>>> {
+    let empty = hooks.ops.get("emptySubsortDeclSetSymbol").copied();
+    let join = hooks.ops.get("subsortDeclSetSymbol").copied();
+    let subsort = hooks.ops.get("subsortSymbol").copied();
+    let mut out = Vec::new();
+    for decl in flatten_set(ctx, d, empty, join) {
+        if Some(ctx.top(decl)) != subsort {
+            continue;
+        }
+        let kids = ctx.children(decl);
+        if let (Some(a), Some(b)) =
+            (kids.first().and_then(|&x| qid_text(ctx, x)), kids.get(1).and_then(|&x| qid_text(ctx, x)))
+        {
+            out.push(vec![vec![a], vec![b]]);
+        }
+    }
+    out
+}
+
+/// A meta `OpDeclSet` (`none` | `__`-joined `op N : D -> R [A] .`) → surface [`OpDecl`]s. `None` on an
+/// unexpected element or an op-attribute we do not reconstruct for an own-op (see [`down_attrs`]).
+fn down_ops(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> Option<Vec<OpDecl>> {
+    let empty = hooks.ops.get("emptyOpDeclSetSymbol").copied();
+    let join = hooks.ops.get("opDeclSetSymbol").copied();
+    let opdecl = hooks.ops.get("opDeclSymbol").copied();
+    let mut out = Vec::new();
+    for decl in flatten_set(ctx, d, empty, join) {
+        if Some(ctx.top(decl)) != opdecl {
+            return None;
+        }
+        let kids = ctx.children(decl); // [name, typelist, range, attrset]
+        let name_str = qid_text(ctx, *kids.first()?)?;
+        let domain = down_typelist(ctx, hooks, *kids.get(1)?);
+        let range = qid_text(ctx, *kids.get(2)?)?;
+        let attrs = down_attrs(ctx, hooks, *kids.get(3)?, i)?;
+        out.push(OpDecl { name: tokenize(&name_str, i), domain, range, partial: false, attrs });
+    }
+    Some(out)
+}
+
+/// A meta `TypeList` (`nil` | `__`-joined type `Qid`s) → the sort/kind name strings.
+fn down_typelist(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<String> {
+    let empty = hooks.ops.get("nilQidListSymbol").copied();
+    let join = hooks.ops.get("qidListSymbol").copied();
+    flatten_set(ctx, d, empty, join).iter().filter_map(|&x| qid_text(ctx, x)).collect()
+}
+
+/// A meta `AttrSet` → surface [`Attrs`]. Reconstructs the structural attributes (`ctor`/`assoc`/`comm`/
+/// `idem`/`iter`/`id:`/`prec`); drops the print/metadata-only ones; and returns `None` on a semantic
+/// attribute we do not yet rebuild for a module's *own* op (`special`/`frozen`/`strat`/`poly`/… — which in
+/// practice arrive through imports, already built). The statement attributes `owise`/`nonexec`/`label`
+/// are read separately where the statement is installed.
+fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> Option<Attrs> {
+    let empty = hooks.ops.get("emptyAttrSetSymbol").copied();
+    let join = hooks.ops.get("attrSetSymbol").copied();
+    let mut a = Attrs::default();
+    for attr in flatten_set(ctx, d, empty, join) {
+        let sym = ctx.top(attr);
+        let is = |name: &str| hooks.ops.get(name).copied() == Some(sym);
+        if is("ctorSymbol") {
+            a.ctor = true;
+        } else if is("assocSymbol") {
+            a.assoc = true;
+        } else if is("commSymbol") {
+            a.comm = true;
+        } else if is("idemSymbol") {
+            a.idem = true;
+        } else if is("iterSymbol") {
+            a.iter = true;
+        } else if is("idSymbol") || is("leftIdSymbol") || is("rightIdSymbol") {
+            // `id:`/`left-id:`/`right-id:` <term> — a single identity constant in practice; carry its name.
+            a.id = Some(id_bubble(ctx, *ctx.children(attr).first()?, i)?);
+        } else if is("precSymbol") {
+            a.prec = down_nat(ctx, *ctx.children(attr).first()?);
+        } else if is("gatherSymbol")
+            || is("formatSymbol")
+            || is("metadataSymbol")
+            || is("latexSymbol")
+            || is("memoSymbol")
+            || is("printSymbol")
+            || is("dittoSymbol")
+        {
+            // printing / metadata / memo — no effect on reduction; safe to drop.
+        } else {
+            return None; // a semantic attribute we do not yet reconstruct for an own-op
+        }
+    }
+    Some(a)
+}
+
+/// The `id:`-attribute bubble for an identity constant `'name.Sort`: its name as a single token (what
+/// `declare_op` resolves against `name_to_sym`).
+fn id_bubble(ctx: &MetaCtx, t: DagId, i: &mut Interner) -> Option<Vec<tnk_frontend::lex::Token>> {
+    let text = qid_text(ctx, t)?;
+    let name = text.rsplit_once('.').map(|(n, _)| n).unwrap_or(&text);
+    Some(tokenize(name, i))
+}
+
+/// A meta `Nat` (`'0.Zero`, `'s_^n['0.Zero]`, or a NAT numeral) → its `u32` value (for `prec`).
+fn down_nat(ctx: &MetaCtx, d: DagId) -> Option<u32> {
+    match ctx.repr(d) {
+        NodeRepr::Iter { count, .. } => count.parse().ok(),
+        _ => Some(0), // the zero constant
+    }
+}
+
+/// Whether a meta `AttrSet` contains the attribute with hook purpose `hook` (`owiseSymbol`/`nonexecSymbol`).
+fn attrset_has(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, hook: &str) -> bool {
+    let empty = hooks.ops.get("emptyAttrSetSymbol").copied();
+    let join = hooks.ops.get("attrSetSymbol").copied();
+    let target = hooks.ops.get(hook).copied();
+    target.is_some() && flatten_set(ctx, d, empty, join).iter().any(|&x| Some(ctx.top(x)) == target)
+}
+
+/// The `label(Q)` of a rule's meta `AttrSet`, if present.
+fn attrset_label(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<String> {
+    let empty = hooks.ops.get("emptyAttrSetSymbol").copied();
+    let join = hooks.ops.get("attrSetSymbol").copied();
+    let label = hooks.ops.get("labelSymbol").copied();
+    for attr in flatten_set(ctx, d, empty, join) {
+        if Some(ctx.top(attr)) == label {
+            return qid_text(ctx, *ctx.children(attr).first()?);
+        }
+    }
+    None
+}
+
+/// Install a meta `MembAxSet`'s memberships into the built engine (down-translating each `mb`/`cmb`).
+fn install_membs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) -> Option<()> {
+    let empty = hooks.ops.get("emptyMembAxSetSymbol").copied();
+    let join = hooks.ops.get("membAxSetSymbol").copied();
+    let mb = hooks.ops.get("mbSymbol").copied();
+    let cmb = hooks.ops.get("cmbSymbol").copied();
+    for stmt in flatten_set(ctx, d, empty, join) {
+        let sym = Some(ctx.top(stmt));
+        let kids = ctx.children(stmt);
+        let mut vars = VarIndex::new();
+        let (lhs, sort_id, condition, attrs) = if sym == mb {
+            // mb lhs : Sort [attrs]
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let sort = *m.sorts.get(&qid_text(ctx, *kids.get(1)?)?)?;
+            (lhs, sort, Vec::new(), *kids.get(2)?)
+        } else if sym == cmb {
+            // cmb lhs : Sort if cond [attrs]
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let sort = *m.sorts.get(&qid_text(ctx, *kids.get(1)?)?)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let cond = down_condition(ctx, hooks, *kids.get(2)?, m, &mut vars, &mut bound)?;
+            (lhs, sort, cond, *kids.get(3)?)
+        } else {
+            return None;
+        };
+        if attrset_has(ctx, hooks, attrs, "nonexecSymbol") {
+            continue;
+        }
+        let nr = vars.count();
+        let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
+        let trace = MbTrace { lhs: lhs.clone(), sort: sort_id, condition: condition.clone(), var_names };
+        let id = if condition.is_empty() {
+            m.engine.add_membership(Membership { lhs, sort: sort_id, nr_vars: nr })
+        } else {
+            m.engine.add_conditional_membership(lhs, sort_id, nr, condition)
+        };
+        assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
+        m.mb_traces.push(trace);
+    }
+    Some(())
+}
+
+/// Install a meta `EquationSet`'s equations into the built engine (down-translating each `eq`/`ceq`).
+fn install_eqs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) -> Option<()> {
+    let empty = hooks.ops.get("emptyEquationSetSymbol").copied();
+    let join = hooks.ops.get("equationSetSymbol").copied();
+    let eq = hooks.ops.get("eqSymbol").copied();
+    let ceq = hooks.ops.get("ceqSymbol").copied();
+    for stmt in flatten_set(ctx, d, empty, join) {
+        let sym = Some(ctx.top(stmt));
+        let kids = ctx.children(stmt);
+        let mut vars = VarIndex::new();
+        // Build order lhs → condition → rhs, sharing one variable index (matches Maude's numbering).
+        let (lhs, rhs, condition, attrs) = if sym == eq {
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+            (lhs, rhs, Vec::new(), *kids.get(2)?)
+        } else if sym == ceq {
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let cond = down_condition(ctx, hooks, *kids.get(2)?, m, &mut vars, &mut bound)?;
+            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+            (lhs, rhs, cond, *kids.get(3)?)
+        } else {
+            return None;
+        };
+        if attrset_has(ctx, hooks, attrs, "nonexecSymbol") {
+            continue;
+        }
+        let owise = attrset_has(ctx, hooks, attrs, "owiseSymbol");
+        let nr = vars.count();
+        let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
+        let trace =
+            EqTrace { lhs: lhs.clone(), rhs: rhs.clone(), condition: condition.clone(), var_names, owise };
+        let id = if owise {
+            m.engine.add_owise_equation(lhs, rhs, nr, condition)
+        } else if condition.is_empty() {
+            m.engine.add_equation(Equation { lhs, rhs, nr_vars: nr })
+        } else {
+            m.engine.add_conditional_equation(lhs, rhs, nr, condition)
+        };
+        assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
+        m.eq_traces.push(trace);
+    }
+    Some(())
+}
+
+/// Install a meta `RuleSet`'s rules into the built engine (down-translating each `rl`/`crl`).
+fn install_rules(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) -> Option<()> {
+    let empty = hooks.ops.get("emptyRuleSetSymbol").copied();
+    let join = hooks.ops.get("ruleSetSymbol").copied();
+    let rl = hooks.ops.get("rlSymbol").copied();
+    let crl = hooks.ops.get("crlSymbol").copied();
+    for stmt in flatten_set(ctx, d, empty, join) {
+        let sym = Some(ctx.top(stmt));
+        let kids = ctx.children(stmt);
+        let mut vars = VarIndex::new();
+        let (lhs, rhs, condition, attrs) = if sym == rl {
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+            (lhs, rhs, Vec::new(), *kids.get(2)?)
+        } else if sym == crl {
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let cond = down_condition(ctx, hooks, *kids.get(2)?, m, &mut vars, &mut bound)?;
+            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+            (lhs, rhs, cond, *kids.get(3)?)
+        } else {
+            return None;
+        };
+        if attrset_has(ctx, hooks, attrs, "nonexecSymbol") {
+            continue;
+        }
+        let label = attrset_label(ctx, hooks, attrs);
+        let nr = vars.count();
+        let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
+        let trace =
+            RlTrace { lhs: lhs.clone(), rhs: rhs.clone(), condition: condition.clone(), var_names, label };
+        let id = if condition.is_empty() {
+            m.engine.add_rule(lhs, rhs, nr)
+        } else {
+            m.engine.add_conditional_rule(lhs, rhs, nr, condition)
+        };
+        assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
+        m.rl_traces.push(trace);
+    }
+    Some(())
+}
+
+/// Down-translate a meta `Condition`/`EqCondition` into kernel [`ConditionFragment`]s. `nil` is the empty
+/// condition; `_/\_` conjoins; each fragment is `_=_`/`_:_`/`_:=_`/`_=>_`. Shares the statement's `vars`;
+/// a `:=`/`=>` fragment's fresh variables are those its pattern introduces (not already in `bound`).
+fn down_condition(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    d: DagId,
+    m: &BuiltModule,
+    vars: &mut VarIndex,
+    bound: &mut BTreeSet<u32>,
+) -> Option<Vec<ConditionFragment>> {
+    let nil = hooks.ops.get("noConditionSymbol").copied();
+    let conj = hooks.ops.get("conjunctionSymbol").copied();
+    let eq_c = hooks.ops.get("equalityConditionSymbol").copied();
+    let sort_c = hooks.ops.get("sortTestConditionSymbol").copied();
+    let match_c = hooks.ops.get("matchConditionSymbol").copied();
+    let rw_c = hooks.ops.get("rewriteConditionSymbol").copied();
+    let fragments = flatten_set(ctx, d, nil, conj);
+    let mut out = Vec::with_capacity(fragments.len());
+    for f in fragments {
+        let sym = Some(ctx.top(f));
+        let kids = ctx.children(f);
+        let frag = if sym == eq_c {
+            ConditionFragment::Equality {
+                lhs: down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?,
+                rhs: down_term_to_term(ctx, hooks, *kids.get(1)?, m, vars)?,
+            }
+        } else if sym == sort_c {
+            let term = down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?;
+            let sort = *m.sorts.get(&qid_text(ctx, *kids.get(1)?)?)?;
+            ConditionFragment::SortTest { term, sort }
+        } else if sym == match_c {
+            let pattern = down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?;
+            let subject = down_term_to_term(ctx, hooks, *kids.get(1)?, m, vars)?;
+            let fresh = fresh_vars(&pattern, bound);
+            ConditionFragment::Matching { pattern, subject, fresh_vars: fresh }
+        } else if sym == rw_c {
+            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?;
+            let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, m, vars)?;
+            let fresh = fresh_vars(&pattern, bound);
+            ConditionFragment::Rewrite { lhs, pattern, fresh_vars: fresh }
+        } else {
+            return None;
+        };
+        out.push(frag);
+    }
+    Some(out)
+}
+
+/// The pattern's variable indices not already in `bound` (the fresh ones a `:=`/`=>` fragment binds);
+/// extends `bound` with all of them.
+fn fresh_vars(pat: &Term, bound: &mut BTreeSet<u32>) -> Vec<u32> {
+    let mut idx = Vec::new();
+    term_var_indices(pat, &mut idx);
+    let fresh: Vec<u32> = idx.iter().copied().filter(|v| !bound.contains(v)).collect();
+    bound.extend(idx);
+    fresh
+}
+
+/// Collect a term's distinct variable indices, in first-seen order.
+fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
+    match t {
+        Term::Var(v) => {
+            if !out.contains(&v.index) {
+                out.push(v.index);
+            }
+        }
+        Term::Na { .. } => {}
+        Term::Op { args, .. } => {
+            for a in args {
+                term_var_indices(a, out);
+            }
+        }
+    }
+}
+
+/// Down-translate a meta-term into a kernel [`Term`] (a pattern / statement side) over `target`. Like
+/// [`down_term`] but yields a static `Term`: a meta variable `'X:Sort` becomes an indexed `Term::Var`
+/// (tracked in `vars`, keyed by the full meta name so `'X:Nat` and `'X:Int` stay distinct), a constant
+/// `'c.S` an arity-0 `Term::Op`, an application `'f[args]` a `Term::Op`, and the iterated `'s_^n[t]` an
+/// `n`-deep successor chain (the kernel folds it to a compact `s^n` node downstream).
+fn down_term_to_term(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    t: DagId,
+    target: &BuiltModule,
+    vars: &mut VarIndex,
+) -> Option<Term> {
+    let meta_term = hooks.ops.get("metaTermSymbol").copied();
+    match ctx.repr(t) {
+        NodeRepr::Qid(text) => down_leaf_to_term(text, target, vars),
+        NodeRepr::App if Some(ctx.top(t)) == meta_term => {
+            let kids = ctx.children(t);
+            let head = qid_text(ctx, *kids.first()?)?;
+            let args = down_arglist_to_term(ctx, hooks, *kids.get(1)?, target, vars)?;
+            build_app_term(&head, args, target)
+        }
+        _ => None,
+    }
+}
+
+/// A meta-term leaf `'X:Sort` (variable) or `'c.Sort` (constant) → a kernel [`Term`].
+fn down_leaf_to_term(text: &str, target: &BuiltModule, vars: &mut VarIndex) -> Option<Term> {
+    if let Some(colon) = text.find(':') {
+        // Variable: a name can hold no `:` and a sort no `:`, so the first `:` splits name from sort.
+        let sort = *target.sorts.get(&text[colon + 1..])?;
+        Some(Term::var(vars.index_of(text, sort), sort))
+    } else if let Some(dot) = text.rfind('.') {
+        // Constant `name.Sort`: look up the arity-0 operator (literal NA constants are a follow-up).
+        let sym = *target.ops.get(&(text[..dot].to_string(), 0))?;
+        Some(Term::constant(sym))
+    } else {
+        None
+    }
+}
+
+/// Down-translate a `metaTermSymbol` argument list (a `metaArgSymbol` `_,_` flattens to its elements;
+/// anything else is a single argument) to kernel [`Term`]s.
+fn down_arglist_to_term(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    list: DagId,
+    target: &BuiltModule,
+    vars: &mut VarIndex,
+) -> Option<Vec<Term>> {
+    let arg_sym = hooks.ops.get("metaArgSymbol").copied();
+    if Some(ctx.top(list)) == arg_sym {
+        ctx.children(list).into_iter().map(|c| down_term_to_term(ctx, hooks, c, target, vars)).collect()
+    } else {
+        Some(vec![down_term_to_term(ctx, hooks, list, target, vars)?])
+    }
+}
+
+/// Build a kernel [`Term`] application from a meta op-name + down-translated args: an iterated name
+/// `base^n` wraps the argument in `n` nested successor `Term::Op`s; otherwise the operator is `(name, arity)`.
+fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<Term> {
+    if let Some((base, count)) = head.rsplit_once('^')
+        && let Ok(n) = count.parse::<u64>()
+    {
+        let sym = *target.ops.get(&(base.to_string(), 1))?;
+        let mut t = args.into_iter().next()?;
+        for _ in 0..n {
+            t = Term::op(sym, vec![t]);
+        }
+        return Some(t);
+    }
+    let sym = *target.ops.get(&(head.to_string(), args.len()))?;
+    Some(Term::op(sym, args))
 }
 
 /// Down-translate an `ImportList` (`__`-flattened `including_.`/`protecting_.`/`extending_.` of a module

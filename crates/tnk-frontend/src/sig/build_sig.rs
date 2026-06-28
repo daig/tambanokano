@@ -18,8 +18,37 @@ use tnk_core::symbol::{
 type R<T> = Result<T, String>;
 
 /// The canonical mixfix name of an op (its name tokens concatenated): `[s_]`→`"s_"`, `[<_, ,, _>]`→`"<_,_>"`.
+/// An operator name may be **parenthesized to quote** a name that would otherwise clash with a keyword or
+/// the terminator `.` — Maude's `op (op_:_->_[_].) : …` (the META-MODULE constructor whose name starts with
+/// the `op` keyword and ends in `.`). The outer parens are a quoting wrapper, not part of the name, so they
+/// are stripped: the canonical name (and thus its grammar production and `sym_by_profile` key) is
+/// `op_:_->_[_].`, matching the unparenthesized `op-hook` references.
 fn canonical_name(name: &[Token], i: &Interner) -> String {
-    name.iter().map(|t| i.resolve(t.sym)).collect()
+    strip_outer_parens(name, i).iter().map(|t| i.resolve(t.sym)).collect()
+}
+
+/// The inner tokens if `toks` is wrapped in a single balanced `( … )` pair, else `toks` unchanged. The
+/// opening paren must match the *final* token (depth returns to 0 only at the end), so a name that merely
+/// starts and ends with parens — `(a) b (c)` — is left intact.
+fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
+    if toks.len() < 2
+        || i.resolve(toks[0].sym) != "("
+        || i.resolve(toks[toks.len() - 1].sym) != ")"
+    {
+        return toks;
+    }
+    let mut depth = 0i32;
+    for (k, t) in toks.iter().enumerate() {
+        match i.resolve(t.sym) {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && k + 1 != toks.len() {
+            return toks; // closed before the end → not a single enclosing wrapper
+        }
+    }
+    &toks[1..toks.len() - 1]
 }
 
 /// Resolve a sort name, handling the **kind** form `[S]` — the top (error) sort of S's connected
@@ -200,6 +229,10 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // op — a parameter theory `protecting BOOL` and a regular `BOOL` import both contribute
     // `if_then_else_fi`. So `set_special` is last-wins (handling a), and made idempotent for a re-attached
     // `Branch` (handling b — its "no user strat" assert would otherwise trip on the seam's own strat).
+    // The canonical META-LEVEL hook set: `metaReduce` carries the full `op-hook` list; every other descent
+    // op declares only `op-hook shareWith (metaReduce …)`. Resolve `metaReduce`'s once (order-independent —
+    // by spec shape, not declaration position) so all sharers can clone it (see the `MetaLevelOpSymbol` arm).
+    let canonical_meta = find_canonical_meta_hooks(pm, &sym_by_profile, &sorts, engine.sorts(), interner);
     for (idx, od) in pm.ops.iter().enumerate() {
         if od.attrs.ditto {
             continue; // attributes inherited from the prior declaration (shared symbol)
@@ -214,6 +247,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 &sym_by_profile,
                 &sorts,
                 engine.sorts(),
+                &canonical_meta,
                 interner,
             )?,
             None => None,
@@ -417,6 +451,7 @@ fn special_op(
     sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
     sorts: &HashMap<String, SortId>,
     sort_table: &tnk_core::sort::Sorts,
+    canonical_meta: &Option<std::rc::Rc<MetaHooks>>,
     i: &Interner,
 ) -> R<Option<SpecialOp>> {
     let Some((class, data)) = &spec.id_hook else { return Ok(None) };
@@ -491,12 +526,18 @@ fn special_op(
                 bool_: bool_hooks(spec, name_to_sym, i),
             },
         },
-        // META-LEVEL descent functions (`metaReduce`/`metaApply`/…). The reflection core computes; the
-        // symbolic/SMT/strategy descent is declared but inert (Phase 3.2/3.3). Hooks are resolved in the
-        // reflection-core stage; here they are left empty (descent stays at the kind level).
+        // META-LEVEL descent functions (`metaReduce`/`metaApply`/…). Every descent op shares one
+        // meta-representation hook set: `metaReduce` carries the full `op-hook` list and the rest declare
+        // only `op-hook shareWith (metaReduce …)`. So the canonical set is resolved once (pre-scan, below)
+        // and shared here — resolving each op's own `shareWith`-only spec would leave the constructors
+        // (`qidSymbol`/`resultPairSymbol`/…) the down/up maps need unresolved.
         "MetaLevelOpSymbol" => SpecialOp::Meta {
             op: meta_op(code.ok_or("MetaLevelOpSymbol code")?),
-            hooks: std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)),
+            hooks: match canonical_meta {
+                Some(h) => h.clone(),
+                // No `shareWith` source in this module (a descent op standing alone) — resolve its own.
+                None => std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)),
+            },
         },
         other => return Err(format!("unsupported special id-hook `{other}`")),
     };
@@ -551,6 +592,29 @@ fn meta_op(code: &str) -> MetaOp {
         // Symbolic (unification/variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
         _ => MetaOp::Deferred,
     }
+}
+
+/// Find and resolve the **canonical** META-LEVEL hook set: the one descent op that carries the full
+/// `op-hook` list rather than a `shareWith` reference (it is `metaReduce`). All other descent ops
+/// (`metaRewrite`/`metaApply`/…) declare `op-hook shareWith (metaReduce …)` and reuse this set, so the
+/// down/up maps see the constructors (`qidSymbol`/`resultPairSymbol`/`assignmentSymbol`/…) regardless of
+/// declaration order. `None` if the module declares no such op (a module without `metaReduce`).
+fn find_canonical_meta_hooks(
+    pm: &PreModule,
+    sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
+    sorts: &HashMap<String, SortId>,
+    sort_table: &tnk_core::sort::Sorts,
+    i: &Interner,
+) -> Option<std::rc::Rc<MetaHooks>> {
+    pm.ops.iter().find_map(|od| {
+        let spec = od.attrs.special.as_ref()?;
+        let (class, _) = spec.id_hook.as_ref()?;
+        if class == "MetaLevelOpSymbol" && !spec.op_hooks.iter().any(|(p, _)| p == "shareWith") {
+            Some(std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)))
+        } else {
+            None
+        }
+    })
 }
 
 /// Resolve a descent function's `op-hook`/`term-hook` list into the meta-representation symbols the

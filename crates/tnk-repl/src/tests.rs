@@ -185,6 +185,11 @@ fn prelude_meta_through_repl() {
             "[3] ResultPair: {'false.Bool, 'Bool}",
             "[6] Sort: 'foo",
             "[7] Sort: 'Bar",
+            // Stage 3 — inline down_module: the module argument carries inline declarations (sorts,
+            // subsorts, attributed ops, equations), down-translated straight into the built engine. BAR
+            // (own eq over imported NAT) and LEN (subsorts + AU `id(...)` op + recursive AU-matching eq).
+            "[3] ResultPair: {'s_^6['0.Zero], 'NzNat}",
+            "[8] ResultPair: {'s_^3['0.Zero], 'NzNat}",
         ],
         "META tower reduces: {out}"
     );
@@ -1159,3 +1164,4 @@ fn input_complete_boundaries() {
     assert!(!r.input_complete(""), "empty");
     assert!(!r.input_complete("   \n  "), "whitespace");
 }
+
