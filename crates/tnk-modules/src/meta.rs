@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::descent::{DescentOps, MetaCtx};
+use tnk_core::engine::Engine;
+use tnk_core::search::Arrow;
 use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 use tnk_frontend::build_term::VarIndex;
@@ -47,7 +49,12 @@ impl DescentOps for MetaDescent<'_> {
             // `metaReduce` and `metaNormalize` differ only in whether membership/sort computation runs;
             // our `reduce` already computes sorts, so both map to the same object reduction here.
             MetaOp::Reduce | MetaOp::Normalize => self.meta_reduce(ctx, hooks, redex),
-            _ => None, // other descent functions: Stage 3/4 (or Deferred)
+            // The rewriting/matching/search family (Stage 3): down/up + the engine's rewrite/match/search.
+            MetaOp::Rewrite => self.meta_rewrite(ctx, hooks, redex, false),
+            MetaOp::Frewrite => self.meta_rewrite(ctx, hooks, redex, true),
+            MetaOp::Match => self.meta_match(ctx, hooks, redex),
+            MetaOp::Search => self.meta_search(ctx, hooks, redex),
+            _ => None, // metaApply/metaXapply/metaXmatch/metaSearchPath + Stage 4/Deferred
         }
     }
 }
@@ -69,6 +76,108 @@ impl MetaDescent<'_> {
         let us = up_sort(ctx, hooks, &loaded.built, result);
         let rp = *hooks.ops.get("resultPairSymbol")?;
         Some(ctx.app(rp, vec![ut, us]))
+    }
+
+    /// `metaRewrite(M, T, B)` / `metaFrewrite(M, T, B, gas)` → `{up(t'), up(leastSort(t'))}` where `t'` is
+    /// `down(T)` rule-rewritten (rule-fair / position-fair) in `down(M)` for up to bound `B` rule steps.
+    /// The object run's rewrites (equation reductions + rule applications) fold into the command count.
+    fn meta_rewrite(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        position_fair: bool,
+    ) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let bound = down_bound(ctx, hooks, *kids.get(2)?);
+        loaded.built.engine.reset_rewrites();
+        let result = if position_fair {
+            // `metaFrewrite`'s 4th argument is the per-position gas (Maude's `frewrite`).
+            let gas = down_nat64(ctx, *kids.get(3)?)?;
+            let mut rw = loaded.built.engine.frewrite(subj, gas);
+            rw.run(&mut loaded.built.engine, bound).term
+        } else {
+            let mut rw = loaded.built.engine.rewrite(subj);
+            rw.run(&mut loaded.built.engine, bound).term
+        };
+        ctx.add_rewrites(loaded.built.engine.rewrites());
+        let ut = up_term(ctx, hooks, &loaded.built, result);
+        let us = up_sort(ctx, hooks, &loaded.built, result);
+        let rp = *hooks.ops.get("resultPairSymbol")?;
+        Some(ctx.app(rp, vec![ut, us]))
+    }
+
+    /// `metaMatch(M, P, S, C, n)` → the `(n+1)`-th solution's `Substitution` of matching pattern `P`
+    /// against the reduced subject `S` at the top, or `noMatch` (`Substitution?`). The condition `C`
+    /// currently must be `nil` (an empty condition); a non-empty such-that is a follow-on.
+    fn meta_match(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let mut vars = VarIndex::new();
+        let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
+        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
+        // The condition (such-that) is handled only when empty for now.
+        if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
+            return None;
+        }
+        let sol_nr = down_nat64(ctx, *kids.get(4)?)? as usize;
+        let nr = vars.count();
+        loaded.built.engine.reset_rewrites();
+        let subj = loaded.built.engine.reduce(subj); // Maude matches against the reduced subject
+        ctx.add_rewrites(loaded.built.engine.rewrites());
+        // Capture the (n+1)-th solution's bindings while the matcher stream borrows the engine.
+        let bindings = nth_match(&mut loaded.built.engine, pattern, nr, subj, false, sol_nr);
+        let result = match bindings {
+            Some(b) => up_substitution(ctx, hooks, &loaded.built, &vars, &b),
+            None => ctx.app(*hooks.ops.get("noMatchSubstSymbol")?, vec![]),
+        };
+        Some(result)
+    }
+
+    /// `metaSearch(M, S, P, C, kind, B, n)` → the `(n+1)`-th solution `{up(state), up(type), subst}` of
+    /// searching from `S` for a state matching `P` (such that `C`) under reachability `kind` (`'*`/`'+`/
+    /// `'!`/`'1`) within depth bound `B`, or `failure` (`ResultTriple?`). The object search's rewrite count
+    /// at that solution folds into the command count.
+    fn meta_search(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let mut vars = VarIndex::new();
+        let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
+        let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
+        let cond = down_condition(ctx, hooks, *kids.get(3)?, &loaded.built, &mut vars, &mut bound_set)?;
+        let arrow = down_arrow(ctx, *kids.get(4)?)?;
+        let max_depth = down_bound(ctx, hooks, *kids.get(5)?).map(|d| d as u32);
+        let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
+        let nr = vars.count();
+        loaded.built.engine.reset_rewrites();
+        let mut search = loaded.built.engine.search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut sol = None;
+        for _ in 0..=sol_nr {
+            sol = search.next_solution(&mut loaded.built.engine);
+            if sol.is_none() {
+                break;
+            }
+        }
+        let result = match sol {
+            Some(s) => {
+                // Maude reports the rewrite count *at* the solution state (the snapshot), not the total
+                // exploration (BFS may have visited siblings first).
+                ctx.add_rewrites(s.rewrites);
+                let state = search.state_term(s.state)?;
+                let ut = up_term(ctx, hooks, &loaded.built, state);
+                let us = up_sort(ctx, hooks, &loaded.built, state);
+                let subst = up_substitution(ctx, hooks, &loaded.built, &vars, &s.bindings);
+                ctx.app(*hooks.ops.get("resultTripleSymbol")?, vec![ut, us, subst])
+            }
+            None => {
+                ctx.add_rewrites(loaded.built.engine.rewrites());
+                ctx.app(*hooks.ops.get("failure3Symbol")?, vec![])
+            }
+        };
+        Some(result)
     }
 
     /// Down-translate a meta-module term to an object [`LoadedModule`]: reconstruct its `PreModule`
@@ -741,4 +850,87 @@ fn up_sort(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
     let qid = hooks.ops["qidSymbol"];
     let sort = source.engine.sorts().name(source.engine.sort_of(t)).to_string();
     ctx.make_na(qid, NaValue::Qid(sort.into()))
+}
+
+/// Up-translate a solution substitution: each bound pattern variable `'X:Sort` to an assignment
+/// `'X:Sort <- up(value)`, joined by `_;_`; an all-ground (no-variable) match is the empty `none`. The
+/// variable's meta name is its `VarIndex` key (the full `X:Sort` text), so the round-trip is exact.
+fn up_substitution(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    vars: &VarIndex,
+    bindings: &[DagId],
+) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    let assign = hooks.ops["assignmentSymbol"];
+    let mut assigns = Vec::new();
+    for k in 0..vars.count() {
+        let Some(&val) = bindings.get(k as usize) else { continue };
+        let var_qid = ctx.make_na(qid, NaValue::Qid(vars.name(k).into()));
+        let up_val = up_term(ctx, hooks, source, val);
+        assigns.push(ctx.app(assign, vec![var_qid, up_val]));
+    }
+    match assigns.len() {
+        0 => ctx.app(hooks.ops["emptySubstitutionSymbol"], vec![]),
+        1 => assigns.into_iter().next().unwrap(),
+        _ => ctx.app(hooks.ops["substitutionSymbol"], assigns),
+    }
+}
+
+// ---- meta argument decoders (Bound / Nat / search arrow / empty condition) ----
+
+/// A meta `Bound` (`unbounded` | a `Nat`) → the engine driver bound (`None` = unbounded, `Some(n)` = ≤ n).
+fn down_bound(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<u64> {
+    if Some(ctx.top(d)) == hooks.ops.get("unboundedSymbol").copied() {
+        return None;
+    }
+    down_nat64(ctx, d)
+}
+
+/// A meta `Nat` (`'0.Zero`, `'s_^n['0.Zero]`, or a NAT numeral) → its `u64` value.
+fn down_nat64(ctx: &MetaCtx, d: DagId) -> Option<u64> {
+    match ctx.repr(d) {
+        NodeRepr::Iter { count, .. } => count.parse().ok(),
+        _ => Some(0), // the zero constant
+    }
+}
+
+/// A meta search-type `Qid` (`'*`/`'+`/`'!`/`'1`) → the reachability [`Arrow`].
+fn down_arrow(ctx: &MetaCtx, d: DagId) -> Option<Arrow> {
+    match ctx.repr(d) {
+        NodeRepr::Qid("*") => Some(Arrow::Star),
+        NodeRepr::Qid("+") => Some(Arrow::Plus),
+        NodeRepr::Qid("!") => Some(Arrow::Bang),
+        NodeRepr::Qid("1") => Some(Arrow::One),
+        _ => None,
+    }
+}
+
+/// Whether a meta `Condition` is the empty `nil` (the only condition the matching descent handles so far).
+fn is_nil_condition(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> bool {
+    Some(ctx.top(d)) == hooks.ops.get("noConditionSymbol").copied()
+}
+
+/// The `(n+1)`-th match solution's bindings (`0..nr`) of `pattern` against `subj`, or `None` if there are
+/// fewer than `n+1`. `extension` allows the pattern to match a sub-part (`xmatch`).
+fn nth_match(
+    engine: &mut Engine,
+    pattern: Term,
+    nr: u32,
+    subj: DagId,
+    extension: bool,
+    n: usize,
+) -> Option<Vec<DagId>> {
+    let mut sols = engine.match_solutions(pattern, nr, subj, extension);
+    let mut count = 0;
+    while sols.advance() {
+        if count == n {
+            return Some(
+                (0..nr).map(|k| sols.binding(k).expect("the matcher binds every pattern variable")).collect(),
+            );
+        }
+        count += 1;
+    }
+    None
 }

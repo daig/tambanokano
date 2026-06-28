@@ -3188,3 +3188,16 @@ red in META-TERM : getType('foo.Bar) .
 *** type; LEN exercises subsorts, an AU `id(...)` operator, and a recursive AU-matching equation.
 red in META-LEVEL : metaReduce(fmod 'BAR is including 'NAT . sorts none . none op 'double : 'Nat -> 'Nat [none] . none eq 'double['N:Nat] = '_+_['N:Nat, 'N:Nat] [none] . endfm, 'double['s_^3['0.Zero]]) .
 red in META-LEVEL : metaReduce(fmod 'LEN is including 'NAT . sorts 'Elt ; 'Lst . subsort 'Elt < 'Lst . op 'nil : nil -> 'Lst [ctor] . op '__ : 'Lst 'Lst -> 'Lst [ctor assoc id('nil.Lst)] . op 'e : nil -> 'Elt [ctor] . op 'len : 'Lst -> 'Nat [none] . none eq 'len['nil.Lst] = '0.Zero [none] . eq 'len['__['X:Elt, 'L:Lst]] = '_+_['s_^1['0.Zero], 'len['L:Lst]] [none] . endfm, 'len['__['e.Elt, '__['e.Elt, 'e.Elt]]]) .
+
+*** Stage 3 (the rewriting/matching/search descent family). FOO is a system module with three labelled
+*** rules (a=>b, b=>c, a=>c). metaRewrite/metaFrewrite apply rules (rule-fair / position-fair) to a
+*** ResultPair; metaMatch returns the matching Substitution (or noMatch); metaSearch does breadth-first
+*** reachability to a ResultPair-with-substitution. Values + rewrite counts are the reference binary's.
+red in META-LEVEL : metaRewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, unbounded) .
+red in META-LEVEL : metaRewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 1) .
+red in META-LEVEL : metaFrewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, unbounded, 1) .
+red in META-LEVEL : metaMatch(['NAT], 's_['N:Nat], 's_^5['0.Zero], nil, 0) .
+red in META-LEVEL : metaMatch(['NAT], '_+_['X:Nat, 'Y:Nat], 's_^5['0.Zero], nil, 0) .
+red in META-LEVEL : metaSearch(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 'X:Elt, nil, '+, unbounded, 0) .
+red in META-LEVEL : metaSearch(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 'X:Elt, nil, '+, unbounded, 1) .
+red in META-LEVEL : metaSearch(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 'c.Elt, nil, '!, unbounded, 0) .

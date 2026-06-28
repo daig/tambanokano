@@ -190,6 +190,18 @@ fn prelude_meta_through_repl() {
             // (own eq over imported NAT) and LEN (subsorts + AU `id(...)` op + recursive AU-matching eq).
             "[3] ResultPair: {'s_^6['0.Zero], 'NzNat}",
             "[8] ResultPair: {'s_^3['0.Zero], 'NzNat}",
+            // Stage 3 — the rewriting/matching/search family over the rule-bearing FOO (and `[NAT]`).
+            // Values + rewrite counts are byte-identical to the reference; the substitution/result-triple
+            // *layout* differs only by the `format`-attribute newline (a documented printing gap — the
+            // reference indents the `_<-_`/`{_,_,_}` onto continuation lines, we render one line).
+            "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaRewrite unbounded: a=>b=>c
+            "[2] ResultPair: {'b.Elt, 'Elt}",                          // metaRewrite [1]: one step a=>b
+            "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaFrewrite gas 1: a=>b=>c
+            "[2] Assignment: 'N:Nat <- 's_^4['0.Zero]",                // metaMatch: s_(N) <-> s^5(0)
+            "[2] Substitution?: (noMatch).Substitution?",              // metaMatch: _+_ vs s^5 — no match
+            "[2] ResultTriple: {'b.Elt, 'Elt, 'X:Elt <- 'b.Elt}",      // metaSearch =>+ sol 0: a=>b
+            "[3] ResultTriple: {'c.Elt, 'Elt, 'X:Elt <- 'c.Elt}",      // metaSearch =>+ sol 1: a=>c (ab)
+            "[3] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! to normal form c
         ],
         "META tower reduces: {out}"
     );
