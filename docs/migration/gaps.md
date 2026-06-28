@@ -167,6 +167,22 @@ correctness fix.
   can enumerate exponentially. The `in <MODULE> :` qualifier (added in Tier 2) removes the common trigger
   (the module name is parsed structurally, not as part of the term); a true typo in a big module is still a
   latent hang. A parse-timeout / ambiguity cap is the fix when it matters.
+- **META-LEVEL descent — corner inputs (the reflection core, item 3(c) Stage 3).** The rewriting/matching/
+  search family computes byte-identically (value + rewrite count) on the common inputs; four corners are
+  deferred, each tied to a **different** subsystem — so they are *not* one META subphase (the roadmap's
+  Stage-3.5 is the separate, coherent `format`-display prerequisite, not these). (a) A **conditional rule** in
+  `metaApply`/`metaXapply` and a **conditioned** `metaMatch` need the descent **condition evaluator** — the
+  engine already evaluates `ceq`/`crl` conditions internally; exposing a reusable "eval-under-substitution,
+  enumerate" seam is the work. Until then a labelled conditional rule keeps `metaApply` inert (never
+  misfires), and a non-`nil` `metaMatch` such-that returns `None`; `metaSearch`'s such-that already rides the
+  engine's native search. (b) A **non-empty partial substitution** σ to `metaApply`/`metaXapply` (down σ +
+  seed/filter the matcher) — only the empty `none` is handled. (c) The **AC-residue `metaXmatch` context** —
+  a proper sub-multiset match (`op([], residue)`) rides the AC matcher's residue extraction (same area as the
+  `xmatch`-over-enumerates note in §2); a whole-subject match (context `[]`) is handled, a partial AC match
+  stays inert rather than report a wrong context. (d) The **exhausted-search count** — asking `metaSearch`/
+  `metaSearchPath` for a solution past the last over-counts the sibling expansion (a `search.rs`
+  solution-enumeration snapshot detail, off every success path). The `format`-attribute *display* of a
+  descent result is the Stage-3.5 pretty-printer item, not a corner here.
 
 ## Resolved (here for cross-reference; detail in git history)
 

@@ -125,16 +125,27 @@ prelude load.
      outer quoting parens are stripped, fixing both the grammar production and the by-profile hook resolve),
      and **constants-first op ordering** (an `id(c)` identity resolves against an already-declared `c`). The
      **`[]`/`{}` constant pretty-printer** (all name fragments, not just the first) came with the hole.
-     **Stage 4 (remaining reflection core):** the `up*` family — `upModule`/`upTerm`/`downTerm`,
-     `upSorts`/`upOpDecls`/`upEqs`/`upRls`/… (with `up_pattern`'s iter-collapse + literals, and the rule
-     mixfix **`format` spacing** that also finishes `metaSearchPath`'s trace rendering); the sort/kind
-     queries (`metaSortLeq`/`metaLeastSort`/`metaGlbSorts`/`metaGetKind(s)`/…); `metaParse`/`metaPrettyPrint`;
-     `metaWellFormed*`. The symbolic (unify/variant/narrow), SMT, and strategy descent stay
-     `MetaOp::Deferred` (Phase 3.2/3.3, the D6/D7 backends). Reflection-core residuals (`gaps.md`):
-     conditional-rule `metaApply` + conditioned `metaMatch` (need the condition solver), a non-empty partial
-     substitution to `metaApply`/`metaXapply`, the AC-residue `metaXmatch` context, the exhausted-search
-     failure count, and the `format`-attribute pretty-printing (rule/substitution mixfix layout) — values and
-     rewrite counts conform throughout; only the `format` *layout* differs.
+     **Stage 3.5 — the `format` display layer (the one prerequisite between Stages 3 and 4).** A single,
+     cross-cutting concern: `print_pretty` honoring the **`format`-attribute mixfix layout** (and the
+     bracket/dot spacing of names like `rl_=>_[_].`). It is the genuine prerequisite for Stage 4's
+     `upModule`/`metaPrettyPrint` **display** conformance — a whole `Module` term (`mod 'FOO is … rl … endm`)
+     only renders byte-identically with it — and it closes Stage 3's two display residuals (the
+     `_<-_`/`{_,_,_}` substitution layout, `metaSearchPath`'s rule spacing). Doing it *here* keeps Stage 4 a
+     clean compute surface — its up-results conform on display from the start — rather than landing value-only
+     and retrofitting layout. It is the **only** deferred item with a hard ordering constraint relative to
+     Stage 4; every descent function's value and rewrite count already conform, so this is layout-only.
+     **Stage 4 (the `up*` family — originally planned, now un-conflated):** `upModule`/`upTerm`/`downTerm`,
+     `upSorts`/`upOpDecls`/`upEqs`/`upRls`/… (extending Stage 3's `up_pattern`/`up_rule` seam with iter-chain
+     collapse + literals + conditional rules); the sort/kind queries (`metaSortLeq`/`metaLeastSort`/
+     `metaGlbSorts`/`metaGetKind(s)`/…); `metaParse`/`metaPrettyPrint`; `metaWellFormed*`. The symbolic
+     (unify/variant/narrow), SMT, and strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3, the D6/D7
+     backends). **Orthogonal residuals — *not* a subphase; each rides its own subsystem (`gaps.md`).** None
+     gates Stage 4 and Stage 4 produces none of them, so forcing them into a stage would misrepresent their
+     independence: the descent **condition evaluator** (→ conditional-rule `metaApply` + conditioned
+     `metaMatch`) and a non-empty **partial substitution** (→ `metaApply`/`metaXapply`) are reflection compute
+     corners; the **AC-residue `metaXmatch` context** rides the AC/Diophantine matcher and the
+     **exhausted-search failure count** the search engine. All conform on value + rewrite count today; only
+     the corner inputs are unhandled.
    - Residuals, off the reduce path (`gaps.md`): the parameterized **sortable-list views** parse gap
      (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
      number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput
