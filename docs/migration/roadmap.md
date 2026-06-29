@@ -196,7 +196,20 @@ prelude load.
      (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
      number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput
      optimization; the naive matcher already gives correct counts), needed for heavy AC `search`, not to load.
-4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). Reference:
+4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). **← IN PROGRESS:
+   the parser + core interpreter are done (Phase 2.4 A+B).** `smod`/`sth` modules parse (`strat`/`strats`,
+   `sd`/`csd`), the `srewrite`/`dsrewrite … using …` commands run, and the core combinators —
+   `idle`/`fail`/`all`/rule-application-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+ `try`/`not`/`test`/
+   `or-else`)/`match`/`amatch` — enumerate solutions **byte-identically to the reference** (values + order;
+   `conformance/strategy.maude`, `strategy_core_through_repl`). A surface `StratExpr` combinator tree (term
+   parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a recursive solution enumerator over
+   the engine (iteration cycle-detected by `deep_equal`; rule application reuses match/instantiate/reduce on
+   an explicit position walk). **Remaining (C/D/E):** strategy **calls** + `sd`/`csd` resolution (needs the
+   def table on the built module + recursion cycle detection — the eager enumerator handles only
+   terminating/non-recursive defs); **`matchrew`** + rule **conditions**/application substitutions + `xmatch`
+   (the condition machinery); the **fair BFS `srewrite`** order/count (today's depth-first accounting matches
+   `dsrewrite`; the `srewrite` per-solution count is the BFS snapshot — `gaps.md`); and the strategy
+   **meta** ops (`upStratDecls`/`metaParseStrategy`/…). Plan: `strategy-plan.md`. Reference:
    `reports/A6-operational.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
    streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`

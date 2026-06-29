@@ -213,6 +213,15 @@ correctness fix.
   reference *computes* these; ours stays inert until the respective backend/feature lands. This is a
   not-yet-built *feature* (roadmap Phase 3.2/3.3, item 4), surfaced here only because the ops exist in the
   loaded prelude.
+- **Strategy language — core in, advanced deferred (Phase 2.4 A+B).** The parser + the core interpreter
+  (`srewrite`/`dsrewrite` over `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`/`match`/
+  `amatch`) enumerate solutions byte-identically to the reference (values + order; `conformance/strategy.maude`).
+  The interpreter is an **eager** recursive enumerator, leaving three scoped follow-ons (`strategy-plan.md`
+  C/D/E): (a) the per-solution **`srewrite` count** is our depth-first accounting (it matches `dsrewrite`; the
+  fair-BFS snapshot count is the same class as the `metaSearch` count divergence — value/order are faithful);
+  (b) **strategy calls** (`sd`/`csd`) + recursion need the def table on the built module + runtime cycle
+  detection (the eager enumerator would diverge on a genuinely recursive definition); (c) **`matchrew`**, rule
+  **conditions**/application substitutions, and **`xmatch`** need the condition machinery.
 
 ## Resolved (here for cross-reference; detail in git history)
 
