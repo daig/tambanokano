@@ -32,21 +32,25 @@ prelude load.
    `SORTABLE-LIST{Nat<}` sorts byte-identically). The one residual (orthogonal, in `gaps.md`):
    identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized). Reference:
    `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude — `poly`/`Universal` + loading the actual library. ← IN PROGRESS: the data library and
-   the **whole reflection surface** are done (item (c), Stages 1–4 — only the Stage-5 inert declarations +
-   the symbolic/SMT/strategy descent remain).** The real
+3. **The real prelude — `poly`/`Universal` + loading the actual library. ← DONE on the data path; the only
+   non-loading modules are objects-gated.** The data library + the **whole META-LEVEL surface** (item (c),
+   Stages 1–5) are complete; the remaining prelude modules (`LEXICAL`/`LOOP-MODE`, the `[object]` attribute)
+   need objects/IO (Phase 2 item 5), and the symbolic/SMT/strategy *implementations* are Phase 3.2/3.3 /
+   item 4. The real
    `BOOL`, `NAT`, `LIST{Nat}`, the container library, **and all the built-in data types** (`INT`/`RAT`/
    `FLOAT`/`STRING`/`QID`/`CONVERSION` + the leaf specials) load and reduce **byte-identically** to the
    reference. **`META-LEVEL` now builds and computes byte-identically across the descent family AND the
-   level-shift / query / syntax layer** (item (c), Stages 1–4 — the down/up maps, the whole
+   level-shift / query / syntax layer** (item (c), Stages 1–5 — the down/up maps, the whole
    `metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/… family, **the `up*` family**
    (`upModule`/`upImports`/`up{Sorts,SubsortDecls,OpDecls,Mbs,Eqs,Rls}`/`upView`/`upTerm`/`downTerm`), **the
    sort/kind queries** (`sortLeq`/`sameKind`/`leastSort`/`lesserSorts`/`glbSorts`/`completeName`/
    `getKind(s)`/`maximal`/`minimalSorts`/`maximalAritySet`), **`metaParse`/`metaPrettyPrint`/
-   `metaPrintToString`**, and **`metaWellFormed*`** — including `format`-attribute display). The only prelude
-   modules that still **don't** build are the few that import `QID-LIST`/objects (the parameterized-view gap +
-   the `[object]` attribute — both off the data path, Phase 2 item 5). `poly-universal-prelude.md` is a record
-   of the gateway. What landed:
+   `metaPrintToString`**, and **`metaWellFormed*`** — including `format`-attribute display). The
+   symbolic/SMT/strategy descent is declared and **reduces inert** (Stage 5 — `descend`'s exhaustive
+   `=> None` arm; never misfires) until its backends land. The only prelude modules that still **don't**
+   build are the few that import `QID-LIST`/objects (the parameterized-view gap + the `[object]` attribute —
+   both off the data path, Phase 2 item 5). `poly-universal-prelude.md` is a record of the gateway. What
+   landed:
    - **`poly` / the `Universal` sort** — a `Universal`-typed op (`_==_`/`_=/=_`/`if_then_else_fi`) is expanded
      into one concrete instance **per connected component** (eager per-kind, in `build_sig` after
      `close_sorts`); no new kernel reduction code (the existing `Equality`/`Branch` special ops reduce each
@@ -57,7 +61,7 @@ prelude load.
      mistyping `LIST`'s `append`) and **AU identity-collapse matching** (a pattern `E L` matches a singleton
      `c` as `c nil`) — the two things `LIST{Nat}` needed beyond the existing Pillar-B module algebra. **(M2)**
 
-   **Remaining prelude work, in dependency order:**
+   **Prelude work, in dependency order (all ✅ DONE — the data path loads & runs end-to-end):**
    - **(a) Container library — ✅ DONE (the data structures).** `EXT-BOOL`, `SET{Nat}`, `MAP{Nat,Nat}`,
      `ARRAY{Nat,Nat0}` all load and reduce byte-identically (`conformance/prelude-{set,map,array}.maude`). It
      took the **`[Sort]` kind notation** (`var B : [Bool]`, `op undefined : -> [Y$Elt]` → `error_sort(kind_of
@@ -87,9 +91,11 @@ prelude load.
      range is its kind); and a **punctuation-aware `split_mixfix`** (so the `_=[_]_` / `<_,_,_>` / `[]` / `{}`
      operators whose names lex with brackets parse and print). Breadth, plus that handful of seams.
    - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
-     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **Stages
-     1–3.5 done** (`conformance/prelude-meta.maude`, `prelude_meta_through_repl`) — the reflection **core**
-     (the descent family) computes byte-identically; the `up*`/query/parse layer is Stage 4 (below). **Stage
+     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **✅ DONE —
+     Stages 1–5** (`conformance/prelude-meta.maude`, `prelude_meta_through_repl`): the reflection core (the
+     descent family), the `up*`/query/parse/wellformed layer (Stage 4), and the inert symbolic/SMT/strategy
+     declarations (Stage 5) — the whole implementable surface computes byte-identically; only the
+     backend-gated *implementations* (Phase 3.2/3.3, item 4) remain. **Stage
      2 — the reflection core: `metaReduce`/`metaNormalize` compute, byte-identically** (value, sort, and
      rewrite count). The
      descent seam is a `DescentOps` trait + a `MetaCtx` view of the engine, defined in `tnk-core` and
@@ -172,8 +178,14 @@ prelude load.
      attributes (the inverse of `down_attrs`' boundary — so flat `upModule` over a builtin module stays inert);
      the multi-attribute `ctor`-order ACU divergence; non-`mixfix` print options; own `nonexec`-statement up;
      structured (non-`Named`) module expressions + op→term view maps.
-     The symbolic (unify/variant/narrow), SMT, and strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3,
-     the D6/D7 backends). **Orthogonal residuals — *not* a subphase; each rides its own subsystem (`gaps.md`).** None
+     **Stage 5 — the inert declarations, finalized — DONE.** The symbolic (unify/variant/narrow, Phase 3.2,
+     D6 BDD), SMT (Phase 3.3, D7 Z3), and strategy (Phase 2.4) descent — `MetaOp::Deferred` plus the
+     strategy-up maps `upStratDecls`/`upSds` — are declared, parse (the tower loads), and **reduce inert** to
+     the kind level via a single exhaustive `descend` arm (`Deferred | UpStratDecls | UpSds => None`), so a
+     newly-added descent op now forces a dispatch choice at compile time and a deferred op can never misfire.
+     `conformance/prelude-meta.maude`'s Stage-5 reduces pin the inert kind-level result (ours, not the
+     reference's — that's the point of the boundary). The implementations themselves are the respective later
+     phases. **Orthogonal residuals — *not* a subphase; each rides its own subsystem (`gaps.md`).** None
      gates Stage 4 and Stage 4 produces none of them, so forcing them into a stage would misrepresent their
      independence: the descent **condition evaluator** (→ conditional-rule `metaApply` + conditioned
      `metaMatch`) and a non-empty **partial substitution** (→ `metaApply`/`metaXapply`) are reflection compute

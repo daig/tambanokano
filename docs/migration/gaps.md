@@ -204,6 +204,15 @@ correctness fix.
   installs no engine trace, so `upEqs`/`upMbs`/`upRls` omit it (a theory's `[nonexec]` axioms need parsing the
   unbuilt bubble); and **structured (non-`Named`) module expressions** in a view's `from`/`to` or an import,
   an **op→term view map**, and **strategy maps** leave the enclosing `upView`/`upImports` inert.
+- **META-LEVEL symbolic/SMT/strategy descent — declared but inert (Stage 5).** The unification/variant/
+  narrowing (`metaUnify`/`metaVariant*`/`metaNarrow*` + the `legacy*` forms, Phase 3.2, D6 BDD), SMT
+  (`metaSmtSearch`/`metaCheck`, Phase 3.3, D7 Z3), and strategy (`metaSrewrite`/`metaParseStrategy`/
+  `metaPrettyPrintStrategy`/`upStratDecls`/`upSds`, Phase 2.4) descent functions are **declared and parse**
+  (the whole tower loads) but **reduce to the kind level** — they go through `descend`'s single exhaustive
+  inert arm, so they never misfire and a new descent op forces a dispatch choice at compile time. The
+  reference *computes* these; ours stays inert until the respective backend/feature lands. This is a
+  not-yet-built *feature* (roadmap Phase 3.2/3.3, item 4), surfaced here only because the ops exist in the
+  loaded prelude.
 
 ## Resolved (here for cross-reference; detail in git history)
 
@@ -241,8 +250,8 @@ build & reduce, the `[_]`-list `LIST*`/`SET*` build, and the `SORTABLE-LIST` fam
 {Nat<}` sorts byte-identically. A duplicate `if_then_else_fi` (a parameter theory's `protecting BOOL` and a
 regular `BOOL` import) is folded by an idempotent Branch re-attach. Verified by
 `conformance/{instantiation-chained,view-parameterized,eq-bracket-rhs}.maude`. `META-LEVEL` (Tier 3) now
-builds too, and its **whole descent surface** computes byte-identically (roadmap item 3(c), Stages 1–4 — the
-rewriting/matching/search family, the `up*` family + `upTerm`/`downTerm`/`upView`, the sort/kind queries,
-`metaParse`/`metaPrettyPrint`/`metaPrintToString`, and `metaWellFormed*`); the only prelude modules that
-still don't build are the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]` attribute (Phase 2
-item 5).
+builds too, and its **whole implementable descent surface** computes byte-identically (roadmap item 3(c),
+Stages 1–5 — the rewriting/matching/search family, the `up*` family + `upTerm`/`downTerm`/`upView`, the
+sort/kind queries, `metaParse`/`metaPrettyPrint`/`metaPrintToString`, and `metaWellFormed*`, plus the inert
+symbolic/SMT/strategy declarations); the only prelude modules that still don't build are the
+`QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]` attribute (Phase 2 item 5).
