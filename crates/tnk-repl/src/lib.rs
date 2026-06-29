@@ -228,7 +228,8 @@ impl Repl {
             | Command::Match { module, .. }
             | Command::Rewrite { module, .. }
             | Command::Frewrite { module, .. }
-            | Command::Search { module, .. } => module.clone(),
+            | Command::Search { module, .. }
+            | Command::Srewrite { module, .. } => module.clone(),
             Command::Continue { .. } => None,
         };
         let Some(cur) = m_override.or_else(|| self.current.clone()) else {
@@ -346,6 +347,39 @@ impl Repl {
                         let body = render_search(&mut session, lm, &self.interner, self.color, max_solutions);
                         out.push_str(&format!("search{bound_str} in {cur} : {header} .\n{body}"));
                         self.last = Some((cur.clone(), Continuation::Search(Box::new(session))));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::Srewrite { depth_first, term, strategy, .. } => {
+                self.last = None;
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                let kw = if depth_first { "dsrewrite" } else { "srewrite" };
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
+                let strat_str = tnk_frontend::strategy::print_strategy(&strategy, &self.interner);
+                match tnk_frontend::strategy::srewrite_command(
+                    lm, &self.interner, &term, &strategy, depth_first,
+                ) {
+                    Ok((sols, total)) => {
+                        let rate = "0ms cpu (0ms real) (~ rewrites/second)";
+                        let mut body = String::new();
+                        if sols.is_empty() {
+                            body.push_str(&format!("\nNo solution.\nrewrites: {total} in {rate}\n"));
+                        } else {
+                            let eng = &lm.built.engine;
+                            for (k, s) in sols.iter().enumerate() {
+                                let sort = eng.sorts().name(eng.sort_of(s.term)).to_string();
+                                let value = print_pretty(&lm.built, &self.interner, s.term, self.color);
+                                body.push_str(&format!(
+                                    "\nSolution {}\nrewrites: {} in {rate}\nresult {sort}: {value}\n",
+                                    k + 1,
+                                    s.rewrites
+                                ));
+                            }
+                            body.push_str(&format!("\nNo more solutions.\nrewrites: {total} in {rate}\n"));
+                        }
+                        out.push_str(&format!("{kw} in {cur} : {echo} using {strat_str} .\n{body}"));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }

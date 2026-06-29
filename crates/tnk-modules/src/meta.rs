@@ -959,6 +959,7 @@ impl MetaDescent<'_> {
             name: "%META%".to_string(),
             kind,
             is_theory,
+            is_strategy: false,
             params: Vec::new(),
             imports,
             sorts,
@@ -966,6 +967,8 @@ impl MetaDescent<'_> {
             ops,
             vars: Vec::new(),
             statements: Vec::new(), // inline statements are down-translated post-build (below)
+            strat_decls: Vec::new(),
+            strat_defs: Vec::new(),
         };
         let flat = flatten_pre(&pm, self.db, self.views, self.interner).ok()?;
         let mut loaded = build_loaded_module(&flat, self.interner).ok()?;

@@ -147,13 +147,20 @@ pub fn flatten(
     collect_named(name, db, views, &mut acc, &mut visited, interner)?;
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
-    let (kind, is_theory) =
-        db.get(name).map(|pm| (pm.kind, pm.is_theory)).unwrap_or((ModuleKind::Functional, false));
+    let root = db.get(name);
+    let (kind, is_theory, is_strategy) = root
+        .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy))
+        .unwrap_or((ModuleKind::Functional, false, false));
+    // Carry the root module's own strategy declarations/definitions through (a strategy module flattened by
+    // name keeps its own `strat`/`sd`; merging an *import's* strategies is the Pillar-2.4 follow-on).
+    let (strat_decls, strat_defs) =
+        root.map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone())).unwrap_or_default();
     let d = acc.into_decls();
     Ok(PreModule {
         name: name.to_string(),
         kind,
         is_theory,
+        is_strategy,
         // The flattened module is fully resolved: each parameter's copy (its `X$s` sorts) is inlined, so
         // no formal parameters remain.
         params: Vec::new(),
@@ -163,6 +170,8 @@ pub fn flatten(
         ops: d.ops,
         vars: d.vars,
         statements: d.statements,
+        strat_decls,
+        strat_defs,
     })
 }
 
@@ -198,6 +207,7 @@ pub fn flatten_pre(
         name: SENTINEL.to_string(),
         kind: pm.kind,
         is_theory: pm.is_theory,
+        is_strategy: pm.is_strategy,
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts,
@@ -205,6 +215,8 @@ pub fn flatten_pre(
         ops: d.ops,
         vars: d.vars,
         statements: d.statements,
+        strat_decls: pm.strat_decls.clone(),
+        strat_defs: pm.strat_defs.clone(),
     })
 }
 

@@ -220,6 +220,7 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
         name: "$RENAME-SRC".to_string(),
         kind: ModuleKind::System,
         is_theory: false,
+        is_strategy: false,
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts.clone(),
@@ -227,6 +228,8 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
         ops: d.ops.clone(),
         vars: d.vars.clone(),
         statements: d.statements.clone(),
+        strat_decls: Vec::new(),
+        strat_defs: Vec::new(),
     }
 }
 

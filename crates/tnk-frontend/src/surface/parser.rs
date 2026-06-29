@@ -224,8 +224,18 @@ impl<'a> Parser<'a> {
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
         let Some(txt) = self.peek_text() else { return Ok(None) };
         let item = match txt {
-            "fmod" | "mod" | "fth" | "th" => TopItem::Module(self.module()?),
+            "fmod" | "mod" | "fth" | "th" | "smod" | "sth" => TopItem::Module(self.module()?),
             "view" => TopItem::View(self.view()?),
+            "srewrite" | "srew" | "dsrewrite" | "dsrew" => {
+                let depth_first = txt.starts_with('d');
+                self.advance();
+                let module = self.opt_in_module()?;
+                let term = self.collect_until(&["using"]);
+                self.eat("using")?;
+                let strategy = self.strategy()?;
+                self.eat_dot()?;
+                TopItem::Command(Command::Srewrite { module, depth_first, term, strategy })
+            }
             "reduce" | "red" => {
                 self.advance();
                 let module = self.opt_in_module()?;
@@ -337,9 +347,13 @@ impl<'a> Parser<'a> {
         // System (`mod`/`th`) allows rules; functional (`fmod`/`fth`) rejects them (in `decl`). `fth`/`th`
         // are theories (the `is_theory` axis — a view source / parameter bound, statements not executed).
         let kw = self.peek_text().unwrap_or("");
-        let kind = if matches!(kw, "mod" | "th") { ModuleKind::System } else { ModuleKind::Functional };
-        let is_theory = matches!(kw, "fth" | "th");
-        self.advance(); // fmod / mod / fth / th
+        // A strategy module/theory (`smod`/`sth`) is a system module (rules allowed) that additionally
+        // permits `strat`/`sd`; a `th`/`sth` is a theory.
+        let kind =
+            if matches!(kw, "mod" | "th" | "smod" | "sth") { ModuleKind::System } else { ModuleKind::Functional };
+        let is_theory = matches!(kw, "fth" | "th" | "sth");
+        let is_strategy = matches!(kw, "smod" | "sth");
+        self.advance(); // fmod / mod / fth / th / smod / sth
         let name = self.name()?;
         // Optional formal parameters `{X :: T, …}` (B-iii). The stored name stays the bare base.
         let params = if self.at("{") { self.param_list()? } else { Vec::new() };
@@ -348,6 +362,7 @@ impl<'a> Parser<'a> {
             name,
             kind,
             is_theory,
+            is_strategy,
             params,
             imports: Vec::new(),
             sorts: Vec::new(),
@@ -355,6 +370,8 @@ impl<'a> Parser<'a> {
             ops: Vec::new(),
             vars: Vec::new(),
             statements: Vec::new(),
+            strat_decls: Vec::new(),
+            strat_defs: Vec::new(),
         };
         while !self.at_module_end() {
             self.decl(&mut m)?;
@@ -365,7 +382,7 @@ impl<'a> Parser<'a> {
 
     /// At a module/theory closing keyword (`endfm`/`endm`/`endfth`/`endth`).
     fn at_module_end(&self) -> bool {
-        matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth"))
+        matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth"))
     }
 
     /// A formal parameter list `{X :: T, Y :: T', …}` (B-iii). `::` lexes as one token (`:` is not
@@ -649,9 +666,293 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 m.statements.push(Statement::Rule { label, lhs, rhs, cond, nonexec: sa.nonexec });
             }
+            "strat" | "strats" => {
+                if !m.is_strategy {
+                    return Err(format!(
+                        "strategy declaration `{kw}` is only allowed in a strategy module (`smod {}`)",
+                        m.name
+                    ));
+                }
+                self.advance();
+                // `strat[s] n1 … : <domain sorts> @ Sort .`
+                let mut names = Vec::new();
+                while !self.at(":") {
+                    names.push(self.name()?);
+                }
+                self.eat(":")?;
+                let mut domain = Vec::new();
+                while !self.at("@") {
+                    domain.push(self.sort_name()?);
+                }
+                self.eat("@")?;
+                let subject = self.sort_name()?;
+                self.eat_dot()?;
+                for name in names {
+                    m.strat_decls.push(StratDecl { name, domain: domain.clone(), subject: subject.clone() });
+                }
+            }
+            "sd" | "csd" => {
+                if !m.is_strategy {
+                    return Err(format!(
+                        "strategy definition `{kw}` is only allowed in a strategy module (`smod {}`)",
+                        m.name
+                    ));
+                }
+                let conditional = kw == "csd";
+                self.advance();
+                let name = self.name()?;
+                // Optional call parameters `name(p1, …)` — raw bubbles, split at top-level commas.
+                let params = if self.at("(") { self.paren_arg_bubbles()? } else { Vec::new() };
+                self.eat(":=")?;
+                let body = self.strategy()?;
+                let cond = if conditional {
+                    self.eat("if")?;
+                    Some(self.collect_until(&[]))
+                } else {
+                    None
+                };
+                self.eat_dot()?;
+                m.strat_defs.push(StratDef { name, params, body, cond });
+            }
             other => return Err(format!("unsupported declaration `{other}`")),
         }
         Ok(())
+    }
+
+    // ---- strategy expressions (Pillar 2.4) ----
+
+    /// Parse a strategy expression (precedence low→high: `|` < `;` < `? :` < postfix `* + !` < atom). Term-
+    /// carrying parts (test/matchrew patterns + conditions, application substitutions, call arguments) are
+    /// left as raw token bubbles, parsed against the module grammar at execution time.
+    fn strategy(&mut self) -> PResult<StratExpr> {
+        let mut e = self.strat_branch()?;
+        while self.at("|") {
+            self.advance();
+            let rhs = self.strat_branch()?;
+            e = StratExpr::Union(Box::new(e), Box::new(rhs));
+        }
+        Ok(e)
+    }
+
+    fn strat_branch(&mut self) -> PResult<StratExpr> {
+        let e = self.strat_seq()?;
+        if self.at("?") {
+            self.advance();
+            let success = self.strategy()?;
+            self.eat(":")?;
+            let failure = self.strat_branch()?;
+            return Ok(StratExpr::Branch {
+                test: Box::new(e),
+                success: Box::new(success),
+                failure: Box::new(failure),
+            });
+        }
+        Ok(e)
+    }
+
+    fn strat_seq(&mut self) -> PResult<StratExpr> {
+        let mut e = self.strat_postfix()?;
+        while self.at(";") {
+            self.advance();
+            let rhs = self.strat_postfix()?;
+            e = StratExpr::Seq(Box::new(e), Box::new(rhs));
+        }
+        Ok(e)
+    }
+
+    fn strat_postfix(&mut self) -> PResult<StratExpr> {
+        let mut e = self.strat_atom()?;
+        loop {
+            e = match self.peek_text() {
+                Some("*") => StratExpr::Star(Box::new(e)),
+                Some("+") => StratExpr::Plus(Box::new(e)),
+                Some("!") => StratExpr::Normalize(Box::new(e)),
+                _ => break,
+            };
+            self.advance();
+        }
+        Ok(e)
+    }
+
+    fn strat_atom(&mut self) -> PResult<StratExpr> {
+        let txt = self.peek_text().ok_or("expected a strategy")?;
+        Ok(match txt {
+            "idle" => {
+                self.advance();
+                StratExpr::Idle
+            }
+            "fail" => {
+                self.advance();
+                StratExpr::Fail
+            }
+            "all" => {
+                self.advance();
+                StratExpr::All
+            }
+            "(" => {
+                self.advance();
+                let e = self.strategy()?;
+                self.eat(")")?;
+                e
+            }
+            "top" | "one" => {
+                self.advance();
+                self.eat("(")?;
+                let e = Box::new(self.strategy()?);
+                self.eat(")")?;
+                if txt == "top" { StratExpr::Top(e) } else { StratExpr::One(e) }
+            }
+            // Derived branch forms (sugar over `? :`).
+            "try" | "not" | "test" => {
+                self.advance();
+                self.eat("(")?;
+                let e = Box::new(self.strategy()?);
+                self.eat(")")?;
+                let (success, failure) = match txt {
+                    "not" => (StratExpr::Fail, StratExpr::Idle),
+                    _ => (StratExpr::Idle, StratExpr::Fail), // try / test
+                };
+                StratExpr::Branch { test: e, success: Box::new(success), failure: Box::new(failure) }
+            }
+            "or-else" => {
+                self.advance();
+                self.eat("(")?;
+                let a = Box::new(self.strategy()?);
+                self.eat(",")?;
+                let b = self.strategy()?;
+                self.eat(")")?;
+                StratExpr::Branch { test: a, success: Box::new(StratExpr::Idle), failure: Box::new(b) }
+            }
+            "match" | "xmatch" | "amatch" => {
+                self.advance();
+                let kind = Self::test_kind(txt);
+                let (pattern, cond) = self.strat_pattern_cond()?;
+                StratExpr::Test { kind, pattern, cond }
+            }
+            "matchrew" | "xmatchrew" | "amatchrew" => {
+                self.advance();
+                let kind = match txt {
+                    "xmatchrew" => TestKind::XMatch,
+                    "amatchrew" => TestKind::AMatch,
+                    _ => TestKind::Match,
+                };
+                let (pattern, cond) = self.strat_pattern_cond_until(&["by"])?;
+                self.eat("by")?;
+                let mut subs = Vec::new();
+                loop {
+                    let var = self.collect_until(&["using"]);
+                    self.eat("using")?;
+                    let e = self.strategy()?;
+                    subs.push((var, e));
+                    if self.at(",") {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                StratExpr::MatchRew { kind, pattern, cond, subs }
+            }
+            // A rule application `label[σ]{strats}` or a strategy call `name(args)` / bare `name`.
+            _ => {
+                let name = self.name()?;
+                if self.at("(") {
+                    StratExpr::Call { name, args: self.paren_arg_bubbles()? }
+                } else {
+                    let subst = if self.at("[") { self.strat_subst()? } else { Vec::new() };
+                    let substrats = if self.at("{") { self.strat_brace_strats()? } else { Vec::new() };
+                    StratExpr::Apply { label: name, subst, substrats }
+                }
+            }
+        })
+    }
+
+    fn test_kind(txt: &str) -> TestKind {
+        match txt {
+            "xmatch" => TestKind::XMatch,
+            "amatch" => TestKind::AMatch,
+            _ => TestKind::Match,
+        }
+    }
+
+    /// A test pattern up to a strategy delimiter, plus an optional `such that <cond>`.
+    fn strat_pattern_cond(&mut self) -> PResult<(Vec<Token>, Option<Vec<Token>>)> {
+        self.strat_pattern_cond_until(&[])
+    }
+
+    /// As [`strat_pattern_cond`](Self::strat_pattern_cond) but `extra` adds pattern/condition stop tokens
+    /// (matchrew stops the pattern/condition at `by`).
+    fn strat_pattern_cond_until(&mut self, extra: &[&str]) -> PResult<(Vec<Token>, Option<Vec<Token>>)> {
+        let mut stops = vec!["such", ";", "|", "?", ":", ")", ",", "*", "+", "!"];
+        stops.extend_from_slice(extra);
+        let pattern = self.collect_until(&stops);
+        let cond = if self.at("such") {
+            self.advance();
+            self.eat("that")?;
+            let mut cstops = vec![";", "|", "?", ":", ")", ",", "*", "+", "!"];
+            cstops.extend_from_slice(extra);
+            Some(self.collect_until(&cstops))
+        } else {
+            None
+        };
+        Ok((pattern, cond))
+    }
+
+    /// An application's initial substitution `[x1 <- t1, …]` — raw `(var, term)` bubbles.
+    fn strat_subst(&mut self) -> PResult<Vec<(Vec<Token>, Vec<Token>)>> {
+        self.eat("[")?;
+        let mut subst = Vec::new();
+        if !self.at("]") {
+            loop {
+                let var = self.collect_until(&["<-"]);
+                self.eat("<-")?;
+                let term = self.collect_until(&[",", "]"]);
+                subst.push((var, term));
+                if self.at(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat("]")?;
+        Ok(subst)
+    }
+
+    /// An application's rewrite-condition substrategies `{E1, …}`.
+    fn strat_brace_strats(&mut self) -> PResult<Vec<StratExpr>> {
+        self.eat("{")?;
+        let mut strats = Vec::new();
+        if !self.at("}") {
+            loop {
+                strats.push(self.strategy()?);
+                if self.at(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat("}")?;
+        Ok(strats)
+    }
+
+    /// A parenthesized comma-separated list of raw argument bubbles `( a1, …, an )` (call args / `sd`
+    /// parameters). The `(`-depth in [`collect_until`](Self::collect_until) keeps nested calls intact.
+    fn paren_arg_bubbles(&mut self) -> PResult<Vec<Vec<Token>>> {
+        self.eat("(")?;
+        let mut args = Vec::new();
+        if !self.at(")") {
+            loop {
+                args.push(self.collect_until(&[",", ")"]));
+                if self.at(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(")")?;
+        Ok(args)
     }
 
     // ---- module expressions (B5) ----

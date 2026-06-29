@@ -31,6 +31,14 @@ pub struct PreModule {
     pub ops: Vec<OpDecl>,
     pub vars: Vec<VarDecl>,
     pub statements: Vec<Statement>,
+    /// `true` for a **strategy module/theory** (`smod`/`ssth`) — a system module that additionally permits
+    /// strategy declarations/definitions ([`strat_decls`](Self::strat_decls)/[`strat_defs`](Self::strat_defs)).
+    /// Orthogonal to [`kind`](Self::kind) (a strategy module is a system module). Plain `mod`/`fmod` = `false`.
+    pub is_strategy: bool,
+    /// `strat`/`strats` declarations (Pillar 2.4) — empty for a non-strategy module.
+    pub strat_decls: Vec<StratDecl>,
+    /// `sd`/`csd` strategy definitions (Pillar 2.4) — empty for a non-strategy module.
+    pub strat_defs: Vec<StratDef>,
 }
 
 /// One formal parameter `X :: T` of a parameterized module/view: the parameter name and the theory it is
@@ -207,8 +215,77 @@ pub enum Statement {
     Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },
 }
 
-/// A top-level command (functional fragment): `reduce`/`red`, `match`/`xmatch`, and the rewriting
-/// commands `rewrite`/`rew` + `continue` (Pillar A).
+/// A **strategy declaration** `strat name : <domain> @ Sort .` (Pillar 2.4) — names a strategy with its
+/// argument sorts (`domain`, empty for a 0-ary strategy) and the **subject sort** it applies to (`@ Sort`).
+/// `strats a b : … @ … .` expands to one [`StratDecl`] per name.
+#[derive(Debug, Clone)]
+pub struct StratDecl {
+    pub name: String,
+    pub domain: Vec<String>,
+    pub subject: String,
+}
+
+/// A **strategy definition** `sd name(params) := body .` / `csd … := body if cond .`. The call-pattern
+/// arguments (`params`) and any condition are raw token bubbles (parsed against the module grammar at build
+/// time, like equation bubbles); the `body` strategy structure is parsed now.
+#[derive(Debug, Clone)]
+pub struct StratDef {
+    pub name: String,
+    pub params: Vec<Vec<Token>>,
+    pub body: StratExpr,
+    pub cond: Option<Vec<Token>>,
+}
+
+/// A test/matchrew matching mode: `match` (top), `xmatch` (with extension), `amatch` (anywhere).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestKind {
+    Match,
+    XMatch,
+    AMatch,
+}
+
+/// A **strategy expression** (the combinator tree, Table 10.1). Term-carrying parts (a rule label's initial
+/// substitution / its rewrite-condition substrategies, a test/matchrew pattern + condition, a call's
+/// arguments) are raw token bubbles, parsed against the module grammar at execution time. The derived forms
+/// `try`/`not`/`test`/`or-else` desugar to [`StratExpr::Branch`] in the parser.
+#[derive(Debug, Clone)]
+pub enum StratExpr {
+    /// `idle` — pass the subject through unchanged (one solution).
+    Idle,
+    /// `fail` — no solution.
+    Fail,
+    /// `all` — apply any rule once, anywhere (every one-step rewrite).
+    All,
+    /// `label[σ]{E,…}` — apply the rule(s) labelled `label`; `subst` is the optional initial substitution
+    /// (`x <- t` bubbles), `substrats` the substrategies for the rule's rewrite conditions.
+    Apply { label: String, subst: Vec<(Vec<Token>, Vec<Token>)>, substrats: Vec<StratExpr> },
+    /// `top(E)` — apply `E` only at the top of the subject.
+    Top(Box<StratExpr>),
+    /// `one(E)` — at most the first solution of `E`.
+    One(Box<StratExpr>),
+    /// `E ; F` — run `F` on each solution of `E`.
+    Seq(Box<StratExpr>, Box<StratExpr>),
+    /// `E | F` — the union of the solutions of `E` and `F`.
+    Union(Box<StratExpr>, Box<StratExpr>),
+    /// `E *` — zero-or-more iterations (`idle | (E ; E*)`).
+    Star(Box<StratExpr>),
+    /// `E +` — one-or-more iterations (`E ; E*`).
+    Plus(Box<StratExpr>),
+    /// `E !` — normalization: iterate `E` to a fixpoint (`E ? (E !) : idle`).
+    Normalize(Box<StratExpr>),
+    /// `test ? success : failure` — if `test` has ≥1 solution, run `success` on each; else `failure` on the
+    /// original subject. The primitive behind `try`/`not`/`test`/`or-else`.
+    Branch { test: Box<StratExpr>, success: Box<StratExpr>, failure: Box<StratExpr> },
+    /// `match P [s.t. C]` / `xmatch` / `amatch` — a test (no rewrite): succeed iff `P` matches.
+    Test { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>> },
+    /// `matchrew P [s.t. C] by x1 using E1, …` — match `P`, run `Eᵢ` on the subterm bound to `xᵢ`, rebuild.
+    MatchRew { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>>, subs: Vec<(Vec<Token>, StratExpr)> },
+    /// A named strategy `s` / `s(args)`, resolved against the module's `sd`/`csd` definitions.
+    Call { name: String, args: Vec<Vec<Token>> },
+}
+
+/// A top-level command (functional fragment): `reduce`/`red`, `match`/`xmatch`, the rewriting commands
+/// `rewrite`/`rew` + `continue` (Pillar A), and the strategy commands `srewrite`/`dsrewrite` (Pillar 2.4).
 #[derive(Debug)]
 pub enum Command {
     /// `reduce [in M :] term .`. The optional `module` is Maude's `in <MODULE> :` qualifier — reduce in
@@ -232,6 +309,9 @@ pub enum Command {
     },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
+    /// `srewrite [in M :] T using E .` (fair) / `dsrewrite …` (depth-first) — strategy-controlled rewriting
+    /// (Pillar 2.4). Enumerates the solutions of applying strategy `E` to `T`.
+    Srewrite { module: Option<String>, depth_first: bool, term: Vec<Token>, strategy: StratExpr },
 }
 
 /// The reachability arrow of a `search` command (`=>1` / `=>+` / `=>*` / `=>!`).

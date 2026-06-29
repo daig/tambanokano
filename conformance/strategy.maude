@@ -1,0 +1,32 @@
+*** Phase 2.4 — strategy language (core combinators). Oracle: the reference binary's srewrite/dsrewrite.
+*** Solution values + order are byte-identical; the per-solution srewrite rewrite count follows the BFS
+*** snapshot (see gaps.md), so the test pins the solution values/structure.
+mod STRAT-CORE is
+  sort S .
+  ops a b c d : -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [r3] : b => d .
+  rl [r4] : c => d .
+endm
+srewrite a using r1 .
+srewrite a using r1 | r2 .
+srewrite a using r1 ; r3 .
+srewrite a using r1 * .
+srewrite a using all .
+srewrite a using idle .
+srewrite a using fail .
+srewrite a using top(r1) .
+srewrite a using match b .
+srewrite a using match a .
+srewrite a using amatch d .
+srewrite a using r1 ? r3 : r2 .
+srewrite a using r2 ? r3 : r4 .
+srewrite a using (r1 | r2) ! .
+srewrite a using r1 + .
+srewrite a using try(r1) .
+srewrite a using not(fail) .
+srewrite a using (r1 ; r3) | (r2 ; r4) .
+srewrite a using one(r1 | r2) .
+dsrewrite a using r1 | r2 .
+dsrewrite a using (r1 | r2) ; r3 .

@@ -139,6 +139,70 @@ fn prelude_set_through_repl() {
 /// Each `[rewrite-count] sort: value` result, with the **full** value — a `format`-attribute result spans
 /// continuation lines (a substitution's `_<-_` newline-indents each binding), captured up to the next
 /// command echo / `rewrites:` line, so the multi-line layout is compared verbatim against the reference.
+/// Per `srewrite`/`dsrewrite` command, the ordered solution values joined by ` ; ` (or `(no solution)`).
+fn strategy_solutions(out: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let (mut active, mut none) = (false, false);
+    for line in out.lines() {
+        if line.starts_with("srewrite ") || line.starts_with("dsrewrite ") {
+            if active {
+                res.push(if none { "(no solution)".to_string() } else { cur.join(" ; ") });
+            }
+            cur = Vec::new();
+            active = true;
+            none = false;
+        } else if let Some(v) = line.strip_prefix("result ") {
+            if let Some(idx) = v.find(": ") {
+                cur.push(v[idx + 2..].to_string());
+            }
+        } else if line.starts_with("No solution.") {
+            none = true;
+        }
+    }
+    if active {
+        res.push(if none { "(no solution)".to_string() } else { cur.join(" ; ") });
+    }
+    res
+}
+
+/// Phase 2.4 — the core strategy language. `srewrite`/`dsrewrite` over `STRAT-CORE` exercising
+/// `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+`try`/`not`)/`match`/`amatch`:
+/// the solution values + order are byte-identical to the reference. (The per-solution `srewrite` rewrite
+/// count follows the BFS snapshot — see `gaps.md` — so this pins the solution values/structure.)
+#[test]
+fn strategy_core_through_repl() {
+    let out = repl().eval(conformance_file!("strategy.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error:"), "strategy core builds/runs: {out}");
+    assert_eq!(
+        strategy_solutions(&out),
+        vec![
+            "b",                 // r1
+            "b ; c",             // r1 | r2
+            "d",                 // r1 ; r3
+            "a ; b",             // r1 * (zero-or-more)
+            "b ; c",             // all
+            "a",                 // idle
+            "(no solution)",     // fail
+            "b",                 // top(r1)
+            "(no solution)",     // match b — a doesn't match b
+            "a",                 // match a — succeeds, returns the subject
+            "(no solution)",     // amatch d — d occurs nowhere in a
+            "d",                 // r1 ? r3 : r2 — r1 succeeds → r3 on b
+            "(no solution)",     // r2 ? r3 : r4 — r2 succeeds → r3 on c fails (no γ)
+            "b ; c",             // (r1 | r2) ! — normalization to the strategy's normal forms
+            "b",                 // r1 +
+            "b",                 // try(r1)
+            "a",                 // not(fail)
+            "d",                 // (r1 ; r3) | (r2 ; r4)
+            "b",                 // one(r1 | r2) — only the first solution
+            "b ; c",             // dsrewrite r1 | r2
+            "d",                 // dsrewrite (r1 | r2) ; r3
+        ],
+        "strategy solutions: {out}"
+    );
+}
+
 fn prelude_results(out: &str) -> Vec<String> {
     let lines: Vec<&str> = out.lines().collect();
     let mut results = Vec::new();

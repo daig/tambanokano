@@ -355,7 +355,7 @@ fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<P
 }
 
 /// Parse a term token bubble and build its kernel [`Term`] (the statement/pattern path).
-fn parse_build(
+pub(crate) fn parse_build(
     tokens: &[Token],
     g: &CompiledGrammar,
     m: &BuiltModule,
