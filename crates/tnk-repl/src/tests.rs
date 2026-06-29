@@ -163,12 +163,13 @@ fn prelude_results(out: &str) -> Vec<String> {
     results
 }
 
-/// META-LEVEL Stages 1–2. The whole reflective tower (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL,
-/// the real prelude through line 3166) parses and builds with **no errors**; then the reflection core
-/// computes: `metaReduce` down-translates a meta-module + subject, reduces in the object module, and
-/// up-translates the result `{term, type}`, and the `<Qids>` classification makes a `Qid`'s sort
-/// text-dependent. Every reduce is byte-identical (value, sort, **rewrite count**) to the reference's
-/// preloaded modules.
+/// META-LEVEL Stages 1–4. The whole reflective tower (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL,
+/// the real prelude) parses and builds with **no errors**; then the **entire descent surface** computes
+/// byte-identically (value, sort, **rewrite count**, and layout) to the reference: the reflection core
+/// (`metaReduce`/…/`metaSearchPath`, Stages 1–3.5) and the Stage-4 up*/query/syntax layer — the `up*`
+/// family (`upModule`/`up{Sorts,…,Rls}`/`upView`/`upTerm`/`downTerm`), the sort/kind queries
+/// (`sortLeq`/…/`maximalAritySet`), `metaParse`/`metaPrettyPrint`, and `metaWellFormed*`. (The two
+/// `metaSearch` rewrite counts pin our BFS-snapshot value — see `gaps.md`; value/sort/reachability match.)
 ///
 /// Stage 1 (the parse/flatten fixes the meta-modules first exercise):
 ///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
@@ -237,6 +238,60 @@ fn prelude_meta_through_repl() {
             // declaration lists need). Byte-identical to the reference.
             "[3] Trace: {'a.Elt, 'Elt, rl 'a.Elt => 'b.Elt [label('r1)] .}\n\
              {'b.Elt, 'Elt, rl 'b.Elt => 'c.Elt [label('r2)] .}",
+            // Stage 4 — the up*/query/parse layer. The sort/kind queries read the down-translated
+            // module's lattice; value + count are the reference binary's.
+            "[2] Bool: true",                                          // sortLeq(Zero, Nat)
+            "[2] Bool: false",                                         // sameKind(Nat, Bool)
+            "[2] Sort: 'NzNat",                                        // leastSort(2 + 3)
+            "[2] NeSortSet: 'NzNat ; 'Zero",                           // lesserSorts(Nat)
+            "[2] Sort: 'NzNat",                                        // glbSorts(Nat, NzNat)
+            "[2] Sort: 'Nat",                                          // completeName(Nat)
+            "[2] Kind: '`[Nat`]",                                      // getKind(Nat)
+            "[2] NeKindSet: '`[Bool`] ; '`[Nat`]",                     // getKinds
+            "[2] Sort: 'Nat",                                          // maximalSorts([Nat])
+            "[2] NeSortSet: 'NzNat ; 'Zero",                           // minimalSorts([Nat])
+            "[2] NeTypeList: 'Nat 'Nat",                               // maximalAritySet(_+_)
+            // wellFormed: module/term/substitution. The ill-typed term/binding return false.
+            "[2] Bool: true",                                          // wellFormed(2 + 3)
+            "[2] Bool: false",                                         // wellFormed(true + 0) — ill-typed
+            "[2] Bool: true",                                          // wellFormed(X:Nat <- 0)
+            "[2] Bool: false",                                         // wellFormed(X:Nat <- true) — kind clash
+            // upModule + the up* projections. Non-flat lists imports + own decls; flat (S4-LIST, no
+            // imports) inlines everything with a `nil` import list. Empty sets render `none`. Exercises
+            // the iter-chain collapse (`s s 0` → `'s_^2['0.Zero]`), the `id:` attribute, conditional eqs,
+            // and a system module's labelled (`crl`) rules.
+            "[1] FModule: fmod 'S4-FOO is\n  protecting 'NAT .\n  sorts 'Bar ; 'Foo .\n  \
+             subsort 'Foo < 'Bar .\n  op 'c : nil -> 'Foo [ctor] .\n  \
+             op 'f : 'Foo 'Nat -> 'Bar [ctor] .\n  op 'g : 'Bar -> 'Bar [none] .\n  none\n  \
+             eq 'g['X:Bar] = 'X:Bar [none] .\nendfm",
+            "[1] FModule: fmod 'S4-LIST is\n  nil\n  sorts 'Elt ; 'Lst .\n  subsort 'Elt < 'Lst .\n  \
+             op '__ : 'Lst 'Lst -> 'Lst [assoc id('nil.Lst)] .\n  op 'a : nil -> 'Elt [ctor] .\n  \
+             op 'b : nil -> 'Elt [ctor] .\n  op 'nil : nil -> 'Lst [ctor] .\n  none\n  \
+             ceq 'a.Elt = 'b.Elt if 'a.Elt = 'b.Elt [none] .\nendfm",
+            "[1] FModule: fmod 'S4-NUM is\n  protecting 'NAT .\n  sorts none .\n  none\n  \
+             op 'two : nil -> 'Nat [none] .\n  none\n  eq 'two.Nat = 's_^2['0.Zero] [none] .\nendfm",
+            "[1] SModule: mod 'S4-SYS is\n  nil\n  sorts 'St .\n  none\n  op 'a : nil -> 'St [ctor] .\n  \
+             op 'b : nil -> 'St [ctor] .\n  op 'c : nil -> 'St [ctor] .\n  none\n  none\n  \
+             rl 'a.St => 'b.St [label('r1)] .\n  crl 'b.St => 'c.St if 'b.St = 'b.St [label('r2)] .\nendm",
+            "[1] Import: protecting 'NAT .",                           // upImports
+            "[1] NeSortSet: 'Bar ; 'Foo",                             // upSorts (own)
+            "[1] OpDeclSet: op 'c : nil -> 'Foo [ctor] .\n\
+             op 'f : 'Foo 'Nat -> 'Bar [ctor] .\nop 'g : 'Bar -> 'Bar [none] .", // upOpDecls
+            "[1] Equation: ceq 'a.Elt = 'b.Elt if 'a.Elt = 'b.Elt [none] .", // upEqs (conditional)
+            "[1] RuleSet: rl 'a.St => 'b.St [label('r1)] .\n\
+             crl 'b.St => 'c.St if 'b.St = 'b.St [label('r2)] .",      // upRls
+            // upTerm reduces its argument then ups it; downTerm builds (the ambient reduces), returning
+            // the default `99` when the meta-term is unresolvable.
+            "[2] GroundTerm: 's_^3['0.Zero]",                          // upTerm(1 + 2)
+            "[1] NzNat: 4",                                            // downTerm(s^4(0), 0)
+            "[1] NzNat: 99",                                           // downTerm(bogus, 99) → default
+            // metaParse parses (no reduce) → {term, sort}; noParse(n) on failure. metaPrettyPrint renders
+            // a term to a QidList via the format-aware printer.
+            "[2] ResultPair: {'_+_['s_['0.Zero], 's_^2['0.Zero]], 'NzNat}", // metaParse(1 + 2)
+            "[2] ResultPair?: noParse(0)",                             // metaParse(foo bar)
+            "[3] NeTypeList: '2 '+ '3",                                // metaPrettyPrint(2 + 3)
+            // upView decomposes a view: header, from/to module exprs, and its sort/op maps.
+            "[1] View: view 'S4-V from 'TRIV to 'NAT is\n  sort 'Elt to 'Nat .\n  none\n  none\nendv",
         ],
         "META tower reduces: {out}"
     );

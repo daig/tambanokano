@@ -23,7 +23,7 @@ type R<T> = Result<T, String>;
 /// the `op` keyword and ends in `.`). The outer parens are a quoting wrapper, not part of the name, so they
 /// are stripped: the canonical name (and thus its grammar production and `sym_by_profile` key) is
 /// `op_:_->_[_].`, matching the unparenthesized `op-hook` references.
-fn canonical_name(name: &[Token], i: &Interner) -> String {
+pub fn canonical_name(name: &[Token], i: &Interner) -> String {
     strip_outer_parens(name, i).iter().map(|t| i.resolve(t.sym)).collect()
 }
 

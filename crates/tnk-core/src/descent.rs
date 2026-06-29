@@ -64,6 +64,20 @@ impl MetaCtx<'_> {
     pub fn app(&mut self, sym: SymbolId, args: Vec<DagId>) -> DagId {
         self.rt.rebuild(self.sig, sym, args)
     }
+    /// Build an `iter` successor `sym^count(arg)` in the current engine (`downTerm`'s `'s_^n[t]`).
+    pub fn make_iter(&mut self, sym: SymbolId, count: u64, arg: DagId) -> DagId {
+        self.rt.make_s(self.sig, sym, crate::num::Nat::from_u64(count), arg)
+    }
+    /// Resolve an operator by canonical name + arity in the **current** module (the engine the redex is
+    /// reducing in) — for building result constants (`true`/`false`/`leastSort`'s qids resolve from
+    /// [`MetaHooks`]) and down-translating `downTerm`'s argument into this module. `None` if undeclared.
+    pub fn resolve_op(&self, name: &str, arity: usize) -> Option<SymbolId> {
+        self.sig.resolve_symbol(name, arity)
+    }
+    /// The arity (declared domain length) of symbol `sym`.
+    pub fn arity(&self, sym: SymbolId) -> usize {
+        self.sig.symbol(sym).arity()
+    }
     /// Add `n` to this engine's rewrite counter — a descent function reports the object-level reduction's
     /// rewrites as part of its own (Maude's `metaReduce` count = the object rewrites + 1 for the descent
     /// itself, the `+1` coming from the normal `try_special` increment).

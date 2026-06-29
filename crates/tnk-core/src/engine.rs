@@ -561,6 +561,17 @@ impl Signature {
         self.symbols.get(id)
     }
 
+    /// Resolve an operator by canonical name + arity to its symbol id (the META-LEVEL descent seam's
+    /// reverse lookup, for building result terms like `true`/`false` or down-translating `downTerm`'s
+    /// argument into the current module). Our kernel folds overloads into one symbol per `(name, arity)`,
+    /// so this is unambiguous; `None` if no such operator is declared in this module.
+    pub(crate) fn resolve_symbol(&self, name: &str, arity: usize) -> Option<SymbolId> {
+        self.symbols
+            .iter()
+            .find(|(_, s)| s.arity() == arity && s.name() == name)
+            .map(|(id, _)| id)
+    }
+
     /// The kind of `id`'s first declaration's range.
     pub(crate) fn symbol_range_kind(&self, id: SymbolId) -> KindId {
         self.sorts.kind_of(self.symbols.get(id).decls[0].range)
@@ -2884,6 +2895,12 @@ impl Engine {
     }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
         self.sig.symbol(id)
+    }
+
+    /// The `(domain, range)` of each of `sym`'s operator declarations (one per ad-hoc/subsort overload).
+    /// The META-LEVEL `maximalAritySet` descent reads these to find an operator's maximal argument sorts.
+    pub fn symbol_declarations(&self, id: SymbolId) -> Vec<(Vec<SortId>, SortId)> {
+        self.sig.symbol(id).decls().iter().map(|d| (d.domain.clone(), d.range)).collect()
     }
 
     /// The kind (connected component) of `sym`'s result — its first declaration's range kind. Used by the

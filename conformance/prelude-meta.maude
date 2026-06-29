@@ -3227,3 +3227,88 @@ red in META-LEVEL : metaSearchPath(mod 'FOO is nil sorts 'Elt . none op 'a : nil
 *** H reaches c only via a => b => c (no direct a => c), so the first =>* path is two arcs — a folded
 *** two-step Trace. The `__` trace constructor's `format (d n d)` puts each TraceStep on its own line.
 red in META-LEVEL : metaSearchPath(mod 'H is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . endm, 'a.Elt, 'c.Elt, nil, '*, unbounded, 0) .
+
+*** ============================================================================
+*** Stage 4: the up*/query/parse layer. Named modules + a view, decomposed back
+*** to their meta-rep; the sort/kind lattice queries; metaParse/metaPrettyPrint;
+*** wellFormed. Oracle: the reference binary. (BOOL auto-import stays off.)
+*** ============================================================================
+
+fmod S4-FOO is
+  protecting NAT .
+  sorts Foo Bar .
+  subsort Foo < Bar .
+  op c : -> Foo [ctor] .
+  op f : Foo Nat -> Bar [ctor] .
+  op g : Bar -> Bar .
+  vars X : Bar .
+  eq g(X) = X .
+endfm
+
+fmod S4-LIST is
+  sorts Elt Lst .
+  subsort Elt < Lst .
+  op nil : -> Lst [ctor] .
+  op __ : Lst Lst -> Lst [assoc id: nil] .
+  ops a b : -> Elt [ctor] .
+  vars L : Lst .
+  ceq a = b if a = b .
+endfm
+
+fmod S4-NUM is
+  protecting NAT .
+  op two : -> Nat .
+  eq two = s s 0 .
+endfm
+
+mod S4-SYS is
+  sort St .
+  ops a b c : -> St [ctor] .
+  rl [r1] : a => b .
+  crl [r2] : b => c if b = b .
+endm
+
+view S4-V from TRIV to NAT is sort Elt to Nat . endv
+
+*** -- sort/kind queries: read the down-translated module's sort lattice --
+red in META-LEVEL : sortLeq(['NAT], 'Zero, 'Nat) .
+red in META-LEVEL : sameKind(['NAT], 'Nat, 'Bool) .
+red in META-LEVEL : leastSort(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]) .
+red in META-LEVEL : lesserSorts(['NAT], 'Nat) .
+red in META-LEVEL : glbSorts(['NAT], 'Nat, 'NzNat) .
+red in META-LEVEL : completeName(['NAT], 'Nat) .
+red in META-LEVEL : getKind(['NAT], 'Nat) .
+red in META-LEVEL : getKinds(['NAT]) .
+red in META-LEVEL : maximalSorts(['NAT], '`[Nat`]) .
+red in META-LEVEL : minimalSorts(['NAT], '`[Nat`]) .
+red in META-LEVEL : maximalAritySet(['NAT], '_+_, '`[Nat`] '`[Nat`], 'Nat) .
+
+*** -- wellFormed: module / term / substitution --
+red in META-LEVEL : wellFormed(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]) .
+red in META-LEVEL : wellFormed(['NAT], '_+_['true.Bool, '0.Zero]) .
+red in META-LEVEL : wellFormed(['NAT], 'X:Nat <- '0.Zero) .
+red in META-LEVEL : wellFormed(['NAT], 'X:Nat <- 'true.Bool) .
+
+*** -- upModule + the individual up* projections (own decls / flat closure) --
+red in META-LEVEL : upModule('S4-FOO, false) .
+red in META-LEVEL : upModule('S4-LIST, true) .
+red in META-LEVEL : upModule('S4-NUM, false) .
+red in META-LEVEL : upModule('S4-SYS, false) .
+red in META-LEVEL : upImports('S4-FOO) .
+red in META-LEVEL : upSorts('S4-FOO, false) .
+red in META-LEVEL : upOpDecls('S4-FOO, false) .
+red in META-LEVEL : upEqs('S4-LIST, false) .
+red in META-LEVEL : upRls('S4-SYS, false) .
+
+*** -- upTerm / downTerm (over the current module) --
+red in META-LEVEL : upTerm(1 + 2) .
+red in META-LEVEL : downTerm('s_^4['0.Zero], 0) .
+red in META-LEVEL : downTerm('bogus.Nat, 99) .
+
+*** -- metaParse / metaPrettyPrint --
+red in META-LEVEL : metaParse(['NAT], none, '1 '+ '2, anyType) .
+red in META-LEVEL : metaParse(['NAT], none, 'foo 'bar, anyType) .
+red in META-LEVEL : metaPrettyPrint(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]) .
+
+*** -- upView --
+red in META-LEVEL : upView('S4-V) .

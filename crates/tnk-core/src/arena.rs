@@ -115,6 +115,21 @@ impl<T> Arena<T> {
         }
     }
 
+    /// Iterate every live `(id, &value)` in slot order, with each handle properly stamped for this arena
+    /// (so it round-trips through [`get`](Self::get)). Used for reverse lookups (name → symbol) that the
+    /// kernel does not index.
+    pub fn iter(&self) -> impl Iterator<Item = (Id<T>, &T)> + '_ {
+        self.slots.iter().enumerate().filter_map(move |(raw, slot)| match slot {
+            Slot::Occupied(v) => {
+                let id = Id::from_raw(raw as u32);
+                #[cfg(debug_assertions)]
+                let id = id.stamp(self.generations[raw], self.id);
+                Some((id, v))
+            }
+            Slot::Free => None,
+        })
+    }
+
     pub(crate) fn get_mut(&mut self, id: Id<T>) -> &mut T {
         self.check(id);
         match &mut self.slots[id.index()] {
