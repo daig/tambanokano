@@ -179,11 +179,31 @@ correctness fix.
   seed/filter the matcher) — only the empty `none` is handled. (c) The **AC-residue `metaXmatch` context** —
   a proper sub-multiset match (`op([], residue)`) rides the AC matcher's residue extraction (same area as the
   `xmatch`-over-enumerates note in §2); a whole-subject match (context `[]`) is handled, a partial AC match
-  stays inert rather than report a wrong context. (d) The **exhausted-search count** — asking `metaSearch`/
-  `metaSearchPath` for a solution past the last over-counts the sibling expansion (a `search.rs`
-  solution-enumeration snapshot detail, off every success path). (The `format`-attribute *display* of a
-  descent result — the substitution/trace/rule layout — is **done**, Stage 3.5: `print_pretty` honors the
-  `format` attribute, so these results render byte-identically including newlines/indent.)
+  stays inert rather than report a wrong context. (d) The **`metaSearch`/`metaSearchPath` rewrite count** can
+  differ from the reference by the BFS sibling-expansion accounting — not only past the last solution but on
+  some success solutions too (e.g. the FOO `=>+` 2nd solution counts 3 vs Maude's 2; `=>!` to `c` counts 3 vs
+  Maude's 4). Maude reports the rewrites *at the solution snapshot*; our `search.rs` enumeration snapshots a
+  slightly different frontier. **Value, sort, and reachability are always faithful**; only this count differs,
+  and the meta conformance pins our count for these two cases (the search-engine accounting is a Pillar-A
+  follow-up, orthogonal to reflection). (The `format`-attribute *display* of a descent result is **done**,
+  Stage 3.5: `print_pretty` honors the `format` attribute, so substitutions/traces/rules render byte-identically.)
+- **META-LEVEL `up*`/query/syntax — Stage-4 boundaries.** The `up*` family, the sort/kind queries, and
+  `metaParse`/`metaPrettyPrint`/`metaWellFormed*` conform byte-identically (value + sort + count + layout) on
+  the common surface (`conformance/prelude-meta.maude` Stage-4 block). Five narrow boundaries, each its own
+  surface: (a) **flat-mode `special`/`poly` builtin-hook attributes** — `upOpDecls`/`upModule` with `flat =
+  true` over a module whose closure has builtin ops would need to up-translate `special (id-hook … op-hook …)`
+  + `poly`, the inverse of `build_sig`'s hook resolution (and of `down_attrs`' existing `special → None`
+  boundary); so flat `upModule('NAT, true)` stays inert (non-flat over a builtin-importing module, and flat
+  over a builtin-free closure, both work — own/user ops carry no `special`). (b) The **multi-attribute `ctor`
+  order**: `[ctor]` combined with a META-MODULE-later attribute (`id`/`prec`/`gather`/`format`/`strat`/`memo`)
+  prints in our `SymbolId` ACU order (`[assoc id(c) ctor]`) vs Maude's `orderInt` (`[assoc ctor id(c)]`) — the
+  same accepted ACU-print-order divergence as §1's `5 + x` (same multiset; every other attribute combination
+  matches). (c) **Non-`mixfix` print options** to `metaPrettyPrint`/`metaPrintToString` (the prefix `f(_,_)`
+  rendering) stay inert — a separate renderer, not `print_pretty`. (d) **`metaParse`'s `noParse(n)`** reports
+  `n = 0` (a full-failure position), not the exact mid-parse token index. (e) An own **`nonexec` statement**
+  installs no engine trace, so `upEqs`/`upMbs`/`upRls` omit it (a theory's `[nonexec]` axioms need parsing the
+  unbuilt bubble); and **structured (non-`Named`) module expressions** in a view's `from`/`to` or an import,
+  an **op→term view map**, and **strategy maps** leave the enclosing `upView`/`upImports` inert.
 
 ## Resolved (here for cross-reference; detail in git history)
 
@@ -221,6 +241,8 @@ build & reduce, the `[_]`-list `LIST*`/`SET*` build, and the `SORTABLE-LIST` fam
 {Nat<}` sorts byte-identically. A duplicate `if_then_else_fi` (a parameter theory's `protecting BOOL` and a
 regular `BOOL` import) is folded by an idempotent Branch re-attach. Verified by
 `conformance/{instantiation-chained,view-parameterized,eq-bracket-rhs}.maude`. `META-LEVEL` (Tier 3) now
-builds too, and its reflection core computes byte-identically (roadmap item 3(c), Stages 1–3.5); the only
-prelude modules that still don't build are the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]`
-attribute (Phase 2 item 5).
+builds too, and its **whole descent surface** computes byte-identically (roadmap item 3(c), Stages 1–4 — the
+rewriting/matching/search family, the `up*` family + `upTerm`/`downTerm`/`upView`, the sort/kind queries,
+`metaParse`/`metaPrettyPrint`/`metaPrintToString`, and `metaWellFormed*`); the only prelude modules that
+still don't build are the `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]` attribute (Phase 2
+item 5).

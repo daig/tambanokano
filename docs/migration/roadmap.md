@@ -33,15 +33,20 @@ prelude load.
    identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized). Reference:
    `reports/A5-modules-parameterization-repl.md`.
 3. **The real prelude — `poly`/`Universal` + loading the actual library. ← IN PROGRESS: the data library and
-   the reflection core are done; the META `up*`/query layer remains (item (c), Stages 4–5).** The real
+   the **whole reflection surface** are done (item (c), Stages 1–4 — only the Stage-5 inert declarations +
+   the symbolic/SMT/strategy descent remain).** The real
    `BOOL`, `NAT`, `LIST{Nat}`, the container library, **and all the built-in data types** (`INT`/`RAT`/
    `FLOAT`/`STRING`/`QID`/`CONVERSION` + the leaf specials) load and reduce **byte-identically** to the
-   reference. **`META-LEVEL` now builds too**, and its **reflection core computes byte-identically** (item
-   (c), Stages 1–3.5 — the down/up maps + the whole `metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/
-   `metaSearch`/… descent family, including `format`-attribute display). The only prelude modules that still
-   **don't** build are the few that import `QID-LIST`/objects (the parameterized-view gap + the `[object]`
-   attribute — both off the data path, Phase 2 item 5). `poly-universal-prelude.md` is a record of the
-   gateway. What landed:
+   reference. **`META-LEVEL` now builds and computes byte-identically across the descent family AND the
+   level-shift / query / syntax layer** (item (c), Stages 1–4 — the down/up maps, the whole
+   `metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/… family, **the `up*` family**
+   (`upModule`/`upImports`/`up{Sorts,SubsortDecls,OpDecls,Mbs,Eqs,Rls}`/`upView`/`upTerm`/`downTerm`), **the
+   sort/kind queries** (`sortLeq`/`sameKind`/`leastSort`/`lesserSorts`/`glbSorts`/`completeName`/
+   `getKind(s)`/`maximal`/`minimalSorts`/`maximalAritySet`), **`metaParse`/`metaPrettyPrint`/
+   `metaPrintToString`**, and **`metaWellFormed*`** — including `format`-attribute display). The only prelude
+   modules that still **don't** build are the few that import `QID-LIST`/objects (the parameterized-view gap +
+   the `[object]` attribute — both off the data path, Phase 2 item 5). `poly-universal-prelude.md` is a record
+   of the gateway. What landed:
    - **`poly` / the `Universal` sort** — a `Universal`-typed op (`_==_`/`_=/=_`/`if_then_else_fi`) is expanded
      into one concrete instance **per connected component** (eager per-kind, in `build_sig` after
      `close_sorts`); no new kernel reduction code (the existing `Equality`/`Branch` special ops reduce each
@@ -144,17 +149,29 @@ prelude load.
      the same fold path `upModule`'s declaration lists will reuse in Stage 4). The conformance test now
      captures each result's full multi-line value, pinned to the reference's exact bytes. So Stage 4 starts
      on a clean compute surface — its `up*` results conform on display from the first reduce.
-     **Stage 4 (the `up*` family — originally planned, now un-conflated) — the inverse of Stage 3's down
-     maps.** `upModule`/`upImports`/`upSorts`/`upSubsortDecls`/`upOpDecls`/`upMbs`/`upEqs`/`upRls` decompose a
-     built `LoadedModule` back to its meta-rep — mirroring `meta.rs`'s `down_sorts`/`down_subsorts`/`down_ops`/
-     `install_{membs,eqs,rules}` and extending the existing `up_pattern`/`up_rule` seam (the refinements
-     Stage 3 noted: iter-chain collapse `s s X` → `'s_^2['X:S]`, NA literals, and conditional rules + the
-     condition up-map). `upTerm`/`downTerm` are the term-level wrappers (`up_term`/`down_term` already exist);
-     `upView` ups a view. `metaParse`/`metaPrettyPrint` reuse the per-module grammar (`build_grammar` + the
-     Earley parser) and the now-`format`-aware `print_pretty`, emitting a `QidList`. The sort/kind queries
-     (`metaSortLeq`/`metaSameKind`/`metaLeastSort`/`metaGlbSorts`/`metaCompleteName`/`metaGetKind(s)`/
-     `metaMaximal`/`metaMinimalSorts`/`metaMaximalAritySet`) read the engine's sort lattice; `metaWellFormed*`
-     are structural checks. (Probe each op's exact result shape against the reference first, as throughout.)
+     **Stage 4 — the `up*`/query/parse layer — DONE.** The inverse of Stage 3's down maps, plus the lattice
+     queries and the syntax ops, all byte-conformant (`conformance/prelude-meta.maude`'s Stage-4 block,
+     `prelude_meta_through_repl` — value + sort + count + layout). What landed:
+     `upModule`/`upImports`/`up{Sorts,SubsortDecls,OpDecls,Mbs,Eqs,Rls}` decompose a *named* module (resolved
+     in the db, flattened + built) back to its meta-rep — mirroring `down_sorts`/`down_subsorts`/`down_ops`/
+     `install_{membs,eqs,rules}`. The `Bool` (flat) flag selects the whole import closure vs. the module's own
+     declarations (the suffix of the flat build's trace vectors — flatten appends own statements last); empty
+     sets render `none`. `up_pattern` gained iter-chain collapse (`s s X` → `'s_^2['X:S]`) + NA literals;
+     `up_rule`/the new `up_condition` reconstruct conditional rules/equations. `upTerm`/`downTerm` are the
+     term-level wrappers over the **current** module — a new `MetaCtx` name resolver (`resolve_op`/`make_iter`,
+     backed by `Signature::resolve_symbol` + a stamped-id `Arena::iter`) is the seam, since they read/build in
+     the engine the redex is reducing in (not a down-translated object module). `upView` decomposes a view
+     (header + from/to module exprs + sort/op maps) from the view db. `metaParse` reuses the per-module grammar
+     (`build_command_dag`'s Earley parse, no reduce) → `ResultPair?`/`noParse`; `metaPrettyPrint`/
+     `metaPrintToString` reuse the format-aware `print_pretty` → `QidList`/`String`. The sort/kind queries
+     (`sortLeq`/`sameKind`/`leastSort`/`lesserSorts`/`glbSorts`/`completeName`/`getKind(s)`/`maximal`/
+     `minimalSorts`/`maximalAritySet`, the last reading per-overload op declarations via a new
+     `Engine::symbol_declarations`) read the engine's sort lattice; `metaWellFormed{Module,Term,Substitution}`
+     are structural checks (a kind-match walk catches the ill-typed term/binding the kernel builds permissively).
+     The Stage-4 boundaries (each its own surface, `gaps.md`): flat-mode `special`/`poly` builtin-hook
+     attributes (the inverse of `down_attrs`' boundary — so flat `upModule` over a builtin module stays inert);
+     the multi-attribute `ctor`-order ACU divergence; non-`mixfix` print options; own `nonexec`-statement up;
+     structured (non-`Named`) module expressions + op→term view maps.
      The symbolic (unify/variant/narrow), SMT, and strategy descent stay `MetaOp::Deferred` (Phase 3.2/3.3,
      the D6/D7 backends). **Orthogonal residuals — *not* a subphase; each rides its own subsystem (`gaps.md`).** None
      gates Stage 4 and Stage 4 produces none of them, so forcing them into a stage would misrepresent their
