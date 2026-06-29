@@ -3312,3 +3312,8 @@ red in META-LEVEL : metaPrettyPrint(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]
 
 *** -- upView --
 red in META-LEVEL : upView('S4-V) .
+
+*** -- Stage 5: the symbolic/SMT/strategy descent is declared but INERT (kind-level) --
+*** These reduce to OUR kind-level term (the reference computes them — Phase 3.2/3.3/strategy backends).
+red in META-LEVEL : upStratDecls('S4-FOO, false) .
+red in META-LEVEL : upSds('S4-FOO, false) .

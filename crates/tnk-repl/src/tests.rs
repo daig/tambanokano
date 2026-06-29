@@ -292,6 +292,13 @@ fn prelude_meta_through_repl() {
             "[3] NeTypeList: '2 '+ '3",                                // metaPrettyPrint(2 + 3)
             // upView decomposes a view: header, from/to module exprs, and its sort/op maps.
             "[1] View: view 'S4-V from 'TRIV to 'NAT is\n  sort 'Elt to 'Nat .\n  none\n  none\nendv",
+            // Stage 5 — the symbolic/SMT/strategy descent is declared (the tower loads) but stays INERT:
+            // it reduces to OUR kind-level term, never misfiring, until the Phase-3.2/3.3 (D6/D7) and
+            // strategy (Phase 2.4) backends land. (These two pin our inert result, *not* the reference's —
+            // the reference computes `none` for a strat-free module; see gaps.md. The symbolic/SMT ops go
+            // through the same exhaustive `=> None` arm.)
+            "[0] [StratDeclSet]: upStratDecls('S4-FOO, false)",
+            "[0] [StratDefSet]: upSds('S4-FOO, false)",
         ],
         "META tower reduces: {out}"
     );
