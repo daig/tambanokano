@@ -196,22 +196,27 @@ prelude load.
      (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
      number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput
      optimization; the naive matcher already gives correct counts), needed for heavy AC `search`, not to load.
-4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). **← IN PROGRESS:
-   the parser + core interpreter are done (Phase 2.4 A+B).** `smod`/`sth` modules parse (`strat`/`strats`,
-   `sd`/`csd`), the `srewrite`/`dsrewrite … using …` commands run, and the core combinators —
-   `idle`/`fail`/`all`/rule-application-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+ `try`/`not`/`test`/
-   `or-else`)/`match`/`amatch` — enumerate solutions **byte-identically to the reference** (values + order;
-   `conformance/strategy.maude`, `strategy_core_through_repl`). A surface `StratExpr` combinator tree (term
-   parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a recursive solution enumerator over
-   the engine (iteration cycle-detected by `deep_equal`; rule application reuses match/instantiate/reduce on
-   an explicit position walk). **Strategy definitions + calls (Phase C) done too:** `sd` definitions build a
-   call table on the module, a `Call` resolves to its (parameterless, unconditional) body, and recursion is
-   cycle-detected on `(dag, name)` — so `go := r1 ; r3`, `go2 := go | r2`, and the recursive
-   `reach := idle | (… ; reach)` all enumerate byte-identically (`dsrewrite`). **Remaining (D/E):**
-   **`matchrew`** + rule **conditions**/application substitutions + `xmatch` + parameterized/`csd` calls (the
-   condition machinery); the **fair BFS `srewrite`** order *and* per-solution count (today's eager depth-first
-   accounting matches `dsrewrite` exactly — value/sort/reachability always faithful; the BFS snapshot is the
-   follow-on, `gaps.md`); and the strategy **meta** ops (`upStratDecls`/`metaParseStrategy`/…). Plan:
+4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). **← LANGUAGE
+   COMPLETE: Phase 2.4 A–D done and conformant; E (meta) documented as a follow-on.** `smod`/`sth` modules
+   parse (`strat`/`strats`, `sd`/`csd`), the `srewrite`/`dsrewrite … using …` commands run, and the **whole
+   surface** enumerates solutions **byte-identically to the reference** (values + order;
+   `conformance/strategy.maude`, `strategy_core_through_repl`, 45 srew/dsrew cases): the core combinators
+   (`idle`/`fail`/`all`/rule-application-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+ `try`/`not`/`test`/
+   `or-else`)), the `match`/`xmatch`/`amatch` tests (with `such that`), **`matchrew`/`amatchrew`** (with
+   `such that` + a by-list cartesian product), **conditional rules** in application (equality/sort/matching
+   fragments solved natively; rewrite `=>` fragments driven by the application's substrategies `L{E,…}`), the
+   **application substitution** `L[x<-t]`, and strategy **definitions + calls** (`sd` — parameterless-recursive
+   cycle-detected on `(dag, name)`, parameterized via inline parameter substitution). A surface `StratExpr`
+   combinator tree (term parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a recursive
+   solution enumerator over the engine, with a frontend-level condition solver (`solve_frags` over the kernel's
+   `ConditionFragment`s) and a linearize-then-post-check matcher (`match_extend`) for non-linear condition
+   patterns. **Remaining (all scoped in `gaps.md`):** the **fair BFS `srewrite`** order *and* per-solution
+   count (today's eager depth-first accounting matches `dsrewrite` exactly — value/sort/reachability always
+   faithful; the BFS snapshot is the follow-on); **`xmatchrew`** (extension-rewrite residue reassembly) and
+   **`csd`** (runtime condition bindings into the body), both erroring clearly at resolve; and the strategy
+   **meta** ops (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`, Phase 2.4 E) — the
+   META-LEVEL Stage-5 strategy tail, kept inert (needs sort-aware constructor resolution + a non-desugaring
+   parse + the StratExpr→Strategy up-translation/inverse). Plan:
    `strategy-plan.md`. Reference: `reports/A6-operational.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
    streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`

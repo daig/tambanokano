@@ -207,23 +207,45 @@ correctness fix.
 - **META-LEVEL symbolic/SMT/strategy descent — declared but inert (Stage 5).** The unification/variant/
   narrowing (`metaUnify`/`metaVariant*`/`metaNarrow*` + the `legacy*` forms, Phase 3.2, D6 BDD), SMT
   (`metaSmtSearch`/`metaCheck`, Phase 3.3, D7 Z3), and strategy (`metaSrewrite`/`metaParseStrategy`/
-  `metaPrettyPrintStrategy`/`upStratDecls`/`upSds`, Phase 2.4) descent functions are **declared and parse**
+  `metaPrettyPrintStrategy`/`upStratDecls`/`upSds`, Phase 2.4 E) descent functions are **declared and parse**
   (the whole tower loads) but **reduce to the kind level** — they go through `descend`'s single exhaustive
   inert arm, so they never misfire and a new descent op forces a dispatch choice at compile time. The
   reference *computes* these; ours stays inert until the respective backend/feature lands. This is a
   not-yet-built *feature* (roadmap Phase 3.2/3.3, item 4), surfaced here only because the ops exist in the
-  loaded prelude.
-- **Strategy language — core in, advanced deferred (Phase 2.4 A+B).** The parser + the core interpreter
-  (`srewrite`/`dsrewrite` over `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`/`match`/
-  `amatch`) enumerate solutions byte-identically to the reference (values + order; `conformance/strategy.maude`).
-  Strategy **definitions + calls** (`sd`, incl. recursion, cycle-detected) also enumerate byte-identically
-  via `dsrewrite`. The interpreter is an **eager depth-first** recursive enumerator, leaving two scoped
-  follow-ons (`strategy-plan.md` D/E): (a) the **`srewrite` solution order *and* per-solution count** are our
-  depth-first accounting — they match `dsrewrite` exactly, but Maude's *fair* `srewrite` enumerates by a
-  breadth-first frontier, so for unequal-depth branches (e.g. `go | r2` where `go` is 2 steps and `r2` is 1)
-  the `srewrite` order/count differ (the solution *set*, value, sort, and reachability are always faithful —
-  same class as the `metaSearch` snapshot divergence); (b) **`matchrew`**, rule **conditions** + application
-  substitutions, **`xmatch`**, and **parameterized/`csd`** calls need the condition machinery.
+  loaded prelude. The **strategy-meta up/down** layer specifically is the natural completion of the up*
+  family now that strategy modules build (Phase 2.4 A–D), but it is a META-LEVEL stage of its own, not a
+  wire-up, with three concrete prerequisites: (i) **sort-aware constructor resolution** — `resolve_op(name,
+  arity)` returns the first match, but the ~25 strategy meta-constructors overload names (`none`/`_;_`/`_,_`/
+  `_|_`) across many sorts, so building `none.StratDeclSet` / `_;_ : Strategy Strategy` needs resolution by
+  *result sort*; (ii) **non-desugaring parse** — the surface parser desugars `try`/`not`/`test`/`or-else`
+  into `Branch` (`_?_:_`), but the meta-rep keeps them as distinct constructors, so a faithful `upSds`
+  round-trip needs the surface form preserved; (iii) the **StratExpr→Strategy up-translation** (each variant
+  → its constructor, term bubbles parsed + `upTerm`'d, conditions up-translated) plus the *inverse*
+  `metaParseStrategy`/`metaPrettyPrintStrategy` (a meta-tokenization mechanism). Scoped for the Stage-5
+  strategy tail; the strategy *language* (execution) is unaffected and complete.
+- **Strategy language — complete; two scoped follow-ons (Phase 2.4 A–D done; E = meta).** The parser + the
+  interpreter enumerate solutions byte-identically to the reference (values + order; `conformance/strategy.maude`,
+  `strategy_core_through_repl`, 45 srew/dsrew cases) across the whole surface: the core combinators
+  (`idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:` + `try`/`not`/`test`/`or-else`),
+  the `match`/`xmatch`/`amatch` tests (with `such that`), **`matchrew`/`amatchrew`** (with `such that` + a
+  by-list cartesian product), **conditional rules** in application (equality/sort/matching fragments solved
+  natively; rewrite `=>` fragments driven by the application's substrategies `L{E,…}`), the **application
+  substitution** `L[x<-t]`, strategy **definitions + calls** (`sd`, parameterless-recursive cycle-detected,
+  and parameterized via inline parameter substitution). The interpreter is an **eager depth-first** recursive
+  enumerator; the remaining items are:
+  - **Fair `srewrite` order + per-solution count.** Our `srewrite` uses the depth-first accounting, which
+    matches `dsrewrite` exactly; Maude's *fair* `srewrite` enumerates by a breadth-first frontier, so for
+    unequal-depth branches (e.g. `go | r2` where `go` is 2 steps and `r2` is 1) the `srewrite` order/count
+    differ (the solution *set*, value, sort, and reachability are always faithful — same class as the
+    `metaSearch` snapshot divergence). Multi-solution conformance cases are therefore pinned via `dsrewrite`.
+  - **`xmatchrew`** (extension-match *rewriting*) needs the engine to expose an extension match's residue so
+    the rewritten matched portion can be reassembled — narrow, assoc/AC-only, same family as the AC-order
+    follow-ons. The `xmatch` *test* (extension match, yes/no) is done. Errors clearly at resolve.
+  - **Conditional (`csd`) strategy definitions** need the condition's runtime bindings (a `:=`/`=>` fragment
+    binds fresh variables) to flow into the definition body — i.e. a value→body substitution that the
+    parameter-token mechanism (a syntactic substitution) cannot express. Errors clearly at resolve.
+  - **Strategy meta** (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`, Phase 2.4 E) —
+    see the next item; this is the META-LEVEL tower's Stage-5 strategy tail, kept **inert**.
 
 ## Resolved (here for cross-reference; detail in git history)
 

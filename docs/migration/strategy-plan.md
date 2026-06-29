@@ -45,21 +45,39 @@ highest risk"):
 
 ## Phases (each ends at a conformance-verified milestone; commit per phase)
 
-- **A — Parsing + AST.** Surface `StratExpr` enum + `StratDecl`/`StratDef`; `smod`/`sth` modules; the
-  `srewrite`/`dsrewrite … using …` commands. Strategy-expr grammar with the precedence above. (Echo-testable.)
-- **B — Core interpreter.** The work-queue search; `idle`/`fail`/application(`L`)/`all`/`top`/`;`/`|`/`*`/`+`/
-  `?:`(+ derived)/`match` tests; the `srewrite`/`dsrewrite` REPL commands + output format. Conformance: the
-  probed cases.
-- **C — Definitions + calls.** `strat` decls + `sd`/`csd`; resolve a call to its definition (match the call
-  term + `@ Sort`), recursion, cycle detection.
-- **D — matchrew + rewrite-condition strategies.** `matchrew … by … using …`; application with substrategies
-  for a rule's rewrite conditions; `one`.
-- **E — meta + docs.** Wire `upStratDecls`/`upSds`/`metaParseStrategy`/`…` now that strats exist (or document
-  as a follow-on); final roadmap/gaps.
+- **A — Parsing + AST. DONE.** Surface `StratExpr` enum + `StratDecl`/`StratDef`; `smod`/`sth` modules; the
+  `srewrite`/`dsrewrite … using …` commands. Strategy-expr grammar with the precedence above.
+- **B — Core interpreter. DONE.** A recursive solution enumerator (not the work-queue — see Status);
+  `idle`/`fail`/application(`L`)/`all`/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+ derived)/`match`/`amatch` tests;
+  the `srewrite`/`dsrewrite` REPL commands + output format. Conformance: the probed cases.
+- **C — Definitions + calls. DONE.** `strat` decls + `sd`; resolve a parameterless call to its definition,
+  recursion, `(dag, name)` cycle detection.
+- **D — matchrew + conditions + substitutions + params. DONE.** `matchrew`/`amatchrew … [such that …] by … using
+  …` (by-list cartesian product); **conditional rules** in application (equality/sort/matching fragments solved
+  natively by a frontend `solve_frags` over the kernel's `ConditionFragment`s; rewrite `=>` fragments driven by
+  the application's substrategies `L{E,…}`); the **application substitution** `L[x<-t]`; the `xmatch` test;
+  **parameterized calls** `s(args)` via inline parameter→argument token substitution. A linearize-then-post-check
+  matcher (`match_extend`) gives non-linear condition matching without seeding the kernel matcher. Conformance:
+  21 added srew/dsrew cases, all values/order byte-identical (Maude 3.5.1).
+- **E — meta + docs. DECISION: documented as a follow-on** (this plan's sanctioned outcome). The strategy *language*
+  is complete (A–D); the strategy *meta* layer (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`)
+  is the META-LEVEL tower's **Stage-5 strategy tail**, kept inert. It is a META stage, not a wire-up — see
+  `gaps.md` for the three concrete prerequisites (sort-aware constructor resolution; a non-desugaring parse so
+  `try`/`not`/`test`/`or-else` survive round-trip; the StratExpr→Strategy up-translation + its inverse). Final
+  roadmap/gaps updated.
 
-## Known hazards / deferrals
-- Exact `srew`/`dsrew` rewrite-count parity rides the queue order (gaps.md already accepts search-count
-  divergences) — match where tractable, document deltas.
-- Infinite test strategy inside `?:`/`!` (eager test eval) — terminating tests are the norm; the lazy
-  task-watch model is the refinement.
-- `matchrew`/conditional-`csd` need the condition machinery (shared with `ceq`/`crl`).
+## Status (final)
+The interpreter is an **eager recursive solution enumerator** (`eval` over an explicit `Cx`), not the work-queue
+sketched in Architecture above. It matches `dsrewrite` exactly (value + order + count). The fair-BFS `srewrite`
+order/count for unequal-depth branches is the documented follow-on (it shares the `metaSearch`-snapshot class:
+solution set/value/sort/reachability are always faithful). This was the right call — the eager enumerator is far
+simpler, and every combinator + matchrew + conditional-rule case is byte-conformant on values/order.
+
+## Known hazards / deferrals (final state)
+- **Fair `srew` order + per-solution count** — the BFS-frontier follow-on (above); multi-solution conformance
+  cases are pinned via `dsrewrite`, whose depth-first order/count we reproduce exactly.
+- **`xmatchrew`** — extension-match *rewriting* needs the engine to expose an extension match's residue for
+  reassembly (narrow, assoc/AC-only). The `xmatch` *test* is done. Errors clearly at resolve.
+- **`csd`** — a conditional strategy definition's runtime condition bindings must flow into the body, which the
+  syntactic parameter-substitution mechanism cannot express. Errors clearly at resolve.
+- **Strategy meta** — Phase E, above.
