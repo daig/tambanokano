@@ -196,7 +196,7 @@ enum Connective {
 /// paren-depth 0, then each fragment on its connective. Shares the statement's variable index; a `:=`
 /// fragment's *fresh* variables are the pattern variables not already bound (by the lhs or an earlier
 /// fragment), which the matcher binds.
-fn parse_condition(
+pub(crate) fn parse_condition(
     bubble: &[Token],
     g: &CompiledGrammar,
     m: &BuiltModule,
@@ -323,7 +323,7 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
 }
 
 /// Collect a term's distinct variable indices, in first-seen order.
-fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
+pub(crate) fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
     match t {
         Term::Var(v) => {
             if !out.contains(&v.index) {

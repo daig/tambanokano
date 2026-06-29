@@ -204,6 +204,29 @@ fn strategy_core_through_repl() {
             "d",                 // srewrite go
             "d ; c",             // dsrewrite go2
             "a ; b ; d ; c",     // dsrewrite reach — all states reachable from a (recursion terminates)
+            // Phase D — matchrew/amatchrew, conditional rules (equality + rewrite-condition substrategies),
+            // application substitution `L[x <- t]`, the `xmatch` test, and parameterized strategy calls.
+            "f(b, c)",                              // matchrew by X using r1, Y using r2
+            "f(b, b) ; f(c, b)",                    // matchrew by X using (r1|r2), Y using r1
+            "f(b, b) ; f(c, b) ; f(b, c) ; f(c, c)", // dsrewrite matchrew — full cartesian product
+            "f(b, a)",                              // matchrew by X using r1 — partial by-list (Y kept)
+            "(no solution)",                        // matchrew f(b,a) … X using r1 — r1 fails on b
+            "f(b, a) ; f(a, b)",                    // amatchrew X by X using r1 — anywhere
+            "g(b)",                                 // wrap{r1} — rewrite condition solved by r1
+            "g(c)",                                 // wrap{r2}
+            "g(b) ; g(c)",                          // dsrewrite wrap{r1 | r2}
+            "(no solution)",                        // wrap — bare rewrite-conditional rule cannot apply
+            "d",                                    // eqc — equality condition holds
+            "(no solution)",                        // eqf — equality condition fails
+            "f(b, a)",                              // swap — plain
+            "f(b, a)",                              // swap[X <- a] — consistent constraint
+            "(no solution)",                        // swap[X <- b] — inconsistent with the match
+            "a . a . a",                            // xmatch X . Y — extension test returns the subject
+            "a . a . a",                            // match X . Y — whole-match test returns the subject
+            "b",                                    // s2(a) — parameterized call
+            "b",                                    // go3 := s2(a)
+            "b",                                    // mtest(b) := match b — parameter used in a pattern
+            "(no solution)",                        // mtest(a) := match a — fails on subject b
         ],
         "strategy solutions: {out}"
     );

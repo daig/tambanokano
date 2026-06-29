@@ -43,3 +43,59 @@ endsm
 srewrite a using go .
 dsrewrite a using go2 .
 dsrewrite a using reach .
+
+*** Phase D — matchrew/amatchrew, conditional rules (equality + rewrite-condition substrategies), the
+*** application substitution `L[x <- t]`, the `xmatch` test, and parameterized strategy calls. `dsrewrite`
+*** pins the unequal-depth multi-solution case (its depth-first order/count is faithful; the fair `srewrite`
+*** BFS order for unequal-depth branches is the documented follow-on, gaps.md). Solution values + order are
+*** byte-identical to the reference.
+mod STRAT-D is
+  sort S .
+  ops a b c d : -> S [ctor] .
+  op f : S S -> S [ctor] .
+  op g : S -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [swap] : f(X:S, Y:S) => f(Y:S, X:S) .
+  crl [wrap] : a => g(Z:S) if a => Z:S .    *** a rewrite (`=>`) condition — needs a substrategy
+  crl [eqc] : a => d if b = b .             *** an equality condition that holds
+  crl [eqf] : a => d if b = c .             *** an equality condition that fails
+endm
+srewrite f(a, a) using matchrew f(X:S, Y:S) by X:S using r1, Y:S using r2 .
+srewrite f(a, a) using matchrew f(X:S, Y:S) by X:S using (r1 | r2), Y:S using r1 .
+dsrewrite f(a, a) using matchrew f(X:S, Y:S) by X:S using (r1 | r2), Y:S using (r1 | r2) .
+srewrite f(a, a) using matchrew f(X:S, Y:S) by X:S using r1 .
+srewrite f(b, a) using matchrew f(X:S, Y:S) by X:S using r1, Y:S using r2 .
+srewrite f(a, a) using amatchrew X:S by X:S using r1 .
+srewrite a using wrap{r1} .
+srewrite a using wrap{r2} .
+dsrewrite a using wrap{r1 | r2} .
+srewrite a using wrap .
+srewrite a using eqc .
+srewrite a using eqf .
+srewrite f(a, b) using swap .
+srewrite f(a, b) using swap[X:S <- a] .
+srewrite f(a, b) using swap[X:S <- b] .
+
+*** xmatch (extension) test over an associative operator — a test returns the (unchanged) subject.
+mod STRAT-XM is
+  sort S .
+  op _._ : S S -> S [ctor assoc] .
+  ops a b : -> S [ctor] .
+endm
+srewrite a . a . a using xmatch X:S . Y:S .
+srewrite a . a . a using match X:S . Y:S .
+
+*** Parameterized strategy calls (`sd s(p) := …`), incl. a parameter used inside a pattern bubble.
+smod STRAT-DP is
+  protecting STRAT-D .
+  strat s2 mtest : S @ S .
+  strat go3 : @ S .
+  sd s2(W:S) := r1 .
+  sd go3 := s2(a) .
+  sd mtest(T:S) := match T:S .
+endsm
+srewrite a using s2(a) .
+srewrite a using go3 .
+srewrite b using mtest(b) .
+srewrite b using mtest(a) .
