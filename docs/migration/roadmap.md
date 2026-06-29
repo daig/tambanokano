@@ -204,13 +204,15 @@ prelude load.
    `conformance/strategy.maude`, `strategy_core_through_repl`). A surface `StratExpr` combinator tree (term
    parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a recursive solution enumerator over
    the engine (iteration cycle-detected by `deep_equal`; rule application reuses match/instantiate/reduce on
-   an explicit position walk). **Remaining (C/D/E):** strategy **calls** + `sd`/`csd` resolution (needs the
-   def table on the built module + recursion cycle detection — the eager enumerator handles only
-   terminating/non-recursive defs); **`matchrew`** + rule **conditions**/application substitutions + `xmatch`
-   (the condition machinery); the **fair BFS `srewrite`** order/count (today's depth-first accounting matches
-   `dsrewrite`; the `srewrite` per-solution count is the BFS snapshot — `gaps.md`); and the strategy
-   **meta** ops (`upStratDecls`/`metaParseStrategy`/…). Plan: `strategy-plan.md`. Reference:
-   `reports/A6-operational.md`.
+   an explicit position walk). **Strategy definitions + calls (Phase C) done too:** `sd` definitions build a
+   call table on the module, a `Call` resolves to its (parameterless, unconditional) body, and recursion is
+   cycle-detected on `(dag, name)` — so `go := r1 ; r3`, `go2 := go | r2`, and the recursive
+   `reach := idle | (… ; reach)` all enumerate byte-identically (`dsrewrite`). **Remaining (D/E):**
+   **`matchrew`** + rule **conditions**/application substitutions + `xmatch` + parameterized/`csd` calls (the
+   condition machinery); the **fair BFS `srewrite`** order *and* per-solution count (today's eager depth-first
+   accounting matches `dsrewrite` exactly — value/sort/reachability always faithful; the BFS snapshot is the
+   follow-on, `gaps.md`); and the strategy **meta** ops (`upStratDecls`/`metaParseStrategy`/…). Plan:
+   `strategy-plan.md`. Reference: `reports/A6-operational.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
    streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`
    decision. Reference: `reports/A6-operational.md`.

@@ -513,7 +513,8 @@ impl Repl {
         // module-constructor operators put `fmod`/`is`/`sorts`/`endfm` *inside* a term
         // (`getName(fmod Q is … endfm) = Q`), where they are operator-name fragments, not delimiters —
         // counting those would close the module early and submit it without its `endfm`.
-        let is_close = |s: &str| matches!(s, "endfm" | "endm" | "endfth" | "endth" | "endv");
+        let is_close =
+            |s: &str| matches!(s, "endfm" | "endm" | "endfth" | "endth" | "endv" | "endsm" | "endsth");
         let mut open = false;
         let mut saw_open = false;
         let mut depth = 0i32;
@@ -525,7 +526,7 @@ impl Repl {
             // from looking like a module. A *close* keyword only counts at depth 0, so the meta-level's
             // module-constructor operators (`getName(fmod Q is … endfm)`) — whose `endfm` is an
             // operator-name fragment inside brackets — never close the surrounding module early.
-            if depth == 0 && leading && matches!(txt, "fmod" | "mod" | "fth" | "th" | "view") {
+            if depth == 0 && leading && matches!(txt, "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "view") {
                 open = true;
                 saw_open = true;
             }

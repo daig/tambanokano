@@ -216,12 +216,14 @@ correctness fix.
 - **Strategy language — core in, advanced deferred (Phase 2.4 A+B).** The parser + the core interpreter
   (`srewrite`/`dsrewrite` over `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`/`match`/
   `amatch`) enumerate solutions byte-identically to the reference (values + order; `conformance/strategy.maude`).
-  The interpreter is an **eager** recursive enumerator, leaving three scoped follow-ons (`strategy-plan.md`
-  C/D/E): (a) the per-solution **`srewrite` count** is our depth-first accounting (it matches `dsrewrite`; the
-  fair-BFS snapshot count is the same class as the `metaSearch` count divergence — value/order are faithful);
-  (b) **strategy calls** (`sd`/`csd`) + recursion need the def table on the built module + runtime cycle
-  detection (the eager enumerator would diverge on a genuinely recursive definition); (c) **`matchrew`**, rule
-  **conditions**/application substitutions, and **`xmatch`** need the condition machinery.
+  Strategy **definitions + calls** (`sd`, incl. recursion, cycle-detected) also enumerate byte-identically
+  via `dsrewrite`. The interpreter is an **eager depth-first** recursive enumerator, leaving two scoped
+  follow-ons (`strategy-plan.md` D/E): (a) the **`srewrite` solution order *and* per-solution count** are our
+  depth-first accounting — they match `dsrewrite` exactly, but Maude's *fair* `srewrite` enumerates by a
+  breadth-first frontier, so for unequal-depth branches (e.g. `go | r2` where `go` is 2 steps and `r2` is 1)
+  the `srewrite` order/count differ (the solution *set*, value, sort, and reachability are always faithful —
+  same class as the `metaSearch` snapshot divergence); (b) **`matchrew`**, rule **conditions** + application
+  substitutions, **`xmatch`**, and **parameterized/`csd`** calls need the condition machinery.
 
 ## Resolved (here for cross-reference; detail in git history)
 

@@ -126,6 +126,9 @@ pub struct BuiltModule {
     /// is unknown); [`OVL_RANGE`] = another shares its name *and* range kind. Absent = unique (no
     /// disambiguation).
     pub overload: HashMap<SymbolId, u8>,
+    /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
+    /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
+    pub strat_defs: Vec<crate::surface::ast::StratDef>,
 }
 
 /// Another symbol shares this one's name ([`BuiltModule::overload`]).

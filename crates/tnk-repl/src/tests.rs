@@ -198,6 +198,12 @@ fn strategy_core_through_repl() {
             "b",                 // one(r1 | r2) — only the first solution
             "b ; c",             // dsrewrite r1 | r2
             "d",                 // dsrewrite (r1 | r2) ; r3
+            // Phase C — strategy definitions (`sd`) + calls. `go := r1 ; r3`, `go2 := go | r2`, and the
+            // recursive `reach := idle | ((r1|r2|r3|r4) ; reach)` (cycle-detected). `dsrewrite` for the
+            // multi-solution calls (the fair `srewrite` order is the BFS follow-on, gaps.md).
+            "d",                 // srewrite go
+            "d ; c",             // dsrewrite go2
+            "a ; b ; d ; c",     // dsrewrite reach — all states reachable from a (recursion terminates)
         ],
         "strategy solutions: {out}"
     );

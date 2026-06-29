@@ -316,6 +316,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         true_sym,
         false_sym,
         overload,
+        strat_defs: pm.strat_defs.clone(),
     })
 }
 

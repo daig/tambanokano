@@ -30,3 +30,16 @@ srewrite a using (r1 ; r3) | (r2 ; r4) .
 srewrite a using one(r1 | r2) .
 dsrewrite a using r1 | r2 .
 dsrewrite a using (r1 | r2) ; r3 .
+
+*** Strategy definitions (sd) + calls (Phase C). `dsrewrite` for multi-solution calls — its depth-first
+*** order/count is faithful; the fair `srewrite` BFS order for unequal-depth branches is a follow-on (gaps.md).
+smod STRAT-DEFS is
+  protecting STRAT-CORE .
+  strats go go2 reach : @ S .
+  sd go := r1 ; r3 .
+  sd go2 := go | r2 .
+  sd reach := idle | ((r1 | r2 | r3 | r4) ; reach) .
+endsm
+srewrite a using go .
+dsrewrite a using go2 .
+dsrewrite a using reach .

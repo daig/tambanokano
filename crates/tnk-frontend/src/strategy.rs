@@ -50,6 +50,18 @@ enum RStrat {
     Branch { test: Box<RStrat>, success: Box<RStrat>, failure: Box<RStrat> },
     /// `match`/`amatch P` — a test (no rewrite): succeed iff `pattern` matches at the top / anywhere.
     Test { anywhere: bool, pattern: Term, nr_vars: u32 },
+    /// A parameterless strategy call `s` — resolved against the module's `sd` definition table at eval time
+    /// (so a recursive definition is a finite reference, not an infinite inlining).
+    Call(String),
+}
+
+/// The evaluation context: the engine, the resolved `sd` definition table (call name → body), the running
+/// cumulative rewrite count, and the current call path (for recursion cycle detection).
+struct Cx<'a> {
+    eng: &'a mut Engine,
+    defs: &'a std::collections::HashMap<String, RStrat>,
+    count: u64,
+    seen: Vec<(DagId, String)>,
 }
 
 /// Run `srewrite`/`dsrewrite [in M :] term using strat` — resolve the strategy against `lm`, build + reduce
@@ -69,14 +81,25 @@ pub fn srewrite_command(
     if vars.count() != 0 {
         return Err("srewrite subject must be a ground term".to_string());
     }
+    // Resolve the module's (unconditional, parameterless) strategy definitions into a call table; a
+    // conditional/parameterized `sd`/`csd` is a follow-on (skipped — a call to it errors at resolve).
+    let mut defs = std::collections::HashMap::new();
+    for d in &lm.built.strat_defs {
+        if d.cond.is_none() && d.params.is_empty() {
+            if let Ok(body) = resolve(&d.body, lm, i) {
+                defs.insert(d.name.clone(), body);
+            }
+        }
+    }
     let subj = lm.built.engine.instantiate_bindings(&subj_term, &[]);
-    let eng = &mut lm.built.engine;
-    eng.reset_rewrites();
-    let subj = eng.reduce(subj);
-    let mut count = eng.rewrites();
+    let mut cx = Cx { eng: &mut lm.built.engine, defs: &defs, count: 0, seen: Vec::new() };
+    cx.eng.reset_rewrites();
+    let subj = cx.eng.reduce(subj);
+    cx.count = cx.eng.rewrites();
     let mut out = Vec::new();
-    eval(&rstrat, subj, eng, &mut count, &mut out);
-    Ok((dedup(eng, out), count))
+    eval(&rstrat, subj, &mut cx, &mut out);
+    let total = cx.count;
+    Ok((dedup(cx.eng, out), total))
 }
 
 /// Render a strategy expression back to source text (the `srewrite … using <here> .` echo). Best-effort —
@@ -144,12 +167,13 @@ fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<RStrat, Str
                 return Err("strategy application with substitution/condition substrategies: a follow-on (Phase D)".to_string());
             }
             let rules = rules_labelled(lm, label);
-            if rules.is_empty() {
-                return Err(format!(
-                    "no (unconditional) rule labelled `{label}` (strategy calls `sd`/`csd` are a follow-on, Phase C)"
-                ));
+            if !rules.is_empty() {
+                RStrat::Apply { rules, top: false }
+            } else if is_strat_def(lm, label) {
+                RStrat::Call(label.clone()) // a bare name that is a strategy, not a rule label
+            } else {
+                return Err(format!("`{label}` is neither a rule label nor a strategy of this module"));
             }
-            RStrat::Apply { rules, top: false }
         }
         StratExpr::Top(inner) => match resolve(inner, lm, i)? {
             RStrat::Apply { rules, .. } => RStrat::Apply { rules, top: true },
@@ -180,8 +204,21 @@ fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<RStrat, Str
             RStrat::Test { anywhere, pattern, nr_vars: vars.count() }
         }
         StratExpr::MatchRew { .. } => return Err("matchrew is a follow-on (Phase D)".to_string()),
-        StratExpr::Call { .. } => return Err("strategy calls are a follow-on (Phase C)".to_string()),
+        StratExpr::Call { name, args } => {
+            if !args.is_empty() {
+                return Err("a parameterized strategy call `s(args)` is a follow-on".to_string());
+            }
+            if !is_strat_def(lm, name) {
+                return Err(format!("no (unconditional, parameterless) strategy `{name}` in this module"));
+            }
+            RStrat::Call(name.clone())
+        }
     })
+}
+
+/// Whether `name` is an unconditional, parameterless strategy definition of `lm`.
+fn is_strat_def(lm: &LoadedModule, name: &str) -> bool {
+    lm.built.strat_defs.iter().any(|d| d.name == name && d.cond.is_none() && d.params.is_empty())
 }
 
 /// All (unconditional) rules of the module, as [`RRule`]s.
@@ -206,36 +243,36 @@ fn rules_labelled(lm: &LoadedModule, label: &str) -> Vec<RRule> {
 
 /// Enumerate the solutions of `strat` applied to `dag`, pushing each `(result, count-snapshot)` to `out`.
 /// `count` is the running cumulative rewrite total (rule applications + equational reductions).
-fn eval(strat: &RStrat, dag: DagId, eng: &mut Engine, count: &mut u64, out: &mut Vec<StratSolution>) {
+fn eval(strat: &RStrat, dag: DagId, cx: &mut Cx, out: &mut Vec<StratSolution>) {
     match strat {
-        RStrat::Idle => out.push(StratSolution { term: dag, rewrites: *count }),
+        RStrat::Idle => out.push(StratSolution { term: dag, rewrites: cx.count }),
         RStrat::Fail => {}
         RStrat::Apply { rules, top } => {
-            for r in one_step(eng, dag, rules, *top, count) {
-                out.push(StratSolution { term: r, rewrites: *count });
+            for r in one_step(cx.eng, dag, rules, *top, &mut cx.count) {
+                out.push(StratSolution { term: r, rewrites: cx.count });
             }
         }
         RStrat::Seq(a, b) => {
             let mut mid = Vec::new();
-            eval(a, dag, eng, count, &mut mid);
+            eval(a, dag, cx, &mut mid);
             for s in mid {
-                eval(b, s.term, eng, count, out);
+                eval(b, s.term, cx, out);
             }
         }
         RStrat::Union(a, b) => {
-            eval(a, dag, eng, count, out);
-            eval(b, dag, eng, count, out);
+            eval(a, dag, cx, out);
+            eval(b, dag, cx, out);
         }
         RStrat::Star(a) => {
             // Zero-or-more: the reachable set under `a`, BFS from `dag` (idle path included), cycle-detected.
             let mut seen = vec![dag];
-            out.push(StratSolution { term: dag, rewrites: *count });
+            out.push(StratSolution { term: dag, rewrites: cx.count });
             let mut frontier = vec![dag];
             while let Some(w) = frontier.pop() {
                 let mut next = Vec::new();
-                eval(a, w, eng, count, &mut next);
+                eval(a, w, cx, &mut next);
                 for s in next {
-                    if !seen.iter().any(|&x| eng.deep_equal(x, s.term)) {
+                    if !seen.iter().any(|&x| cx.eng.deep_equal(x, s.term)) {
                         seen.push(s.term);
                         frontier.push(s.term);
                         out.push(s);
@@ -246,46 +283,60 @@ fn eval(strat: &RStrat, dag: DagId, eng: &mut Engine, count: &mut u64, out: &mut
         RStrat::Plus(a) => {
             // One-or-more = a ; a*.
             let mut first = Vec::new();
-            eval(a, dag, eng, count, &mut first);
+            eval(a, dag, cx, &mut first);
             let star = RStrat::Star(Box::new(clone_rstrat(a)));
             for s in first {
-                // a* includes the idle (s itself); emit s + its closure.
-                eval(&star, s.term, eng, count, out);
+                eval(&star, s.term, cx, out);
             }
         }
         RStrat::Normalize(a) => {
             // Apply `a` to a fixpoint: a result with no `a`-successor is a normal form.
             let mut next = Vec::new();
-            eval(a, dag, eng, count, &mut next);
+            eval(a, dag, cx, &mut next);
             if next.is_empty() {
-                out.push(StratSolution { term: dag, rewrites: *count });
+                out.push(StratSolution { term: dag, rewrites: cx.count });
             } else {
                 for s in next {
-                    eval(strat, s.term, eng, count, out);
+                    eval(strat, s.term, cx, out);
                 }
             }
         }
         RStrat::Branch { test, success, failure } => {
             let mut rs = Vec::new();
-            eval(test, dag, eng, count, &mut rs);
+            eval(test, dag, cx, &mut rs);
             if rs.is_empty() {
-                eval(failure, dag, eng, count, out);
+                eval(failure, dag, cx, out);
             } else {
                 for s in rs {
-                    eval(success, s.term, eng, count, out);
+                    eval(success, s.term, cx, out);
                 }
             }
         }
         RStrat::One(a) => {
             let mut all = Vec::new();
-            eval(a, dag, eng, count, &mut all);
+            eval(a, dag, cx, &mut all);
             if let Some(s) = all.into_iter().next() {
                 out.push(s);
             }
         }
         RStrat::Test { anywhere, pattern, nr_vars } => {
-            if test_matches(eng, pattern, *nr_vars, dag, *anywhere) {
-                out.push(StratSolution { term: dag, rewrites: *count }); // a test: no rewrite, original subject
+            if test_matches(cx.eng, pattern, *nr_vars, dag, *anywhere) {
+                out.push(StratSolution { term: dag, rewrites: cx.count }); // a test: no rewrite, original subject
+            }
+        }
+        RStrat::Call(name) => {
+            // Look up the definition body; cut on a (dag, name) cycle to terminate recursion.
+            let key = (dag, name.clone());
+            if cx.seen.contains(&key) {
+                return;
+            }
+            if let Some(body) = cx.defs.get(name) {
+                // `body` borrows `cx.defs` immutably; eval needs `cx` mutably. Take the body out via a raw
+                // re-borrow is unsound, so clone the (small) resolved body for the recursive call.
+                let body = clone_rstrat(body);
+                cx.seen.push(key);
+                eval(&body, dag, cx, out);
+                cx.seen.pop();
             }
         }
     }
@@ -397,5 +448,6 @@ fn clone_rstrat(s: &RStrat) -> RStrat {
         RStrat::Test { anywhere, pattern, nr_vars } => {
             RStrat::Test { anywhere: *anywhere, pattern: pattern.clone(), nr_vars: *nr_vars }
         }
+        RStrat::Call(name) => RStrat::Call(name.clone()),
     }
 }
