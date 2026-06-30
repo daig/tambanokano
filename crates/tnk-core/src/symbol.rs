@@ -205,6 +205,27 @@ pub enum SpecialOp {
     /// Symbolic / SMT / strategy descent ([`MetaOp::Deferred`]) is declared but stays at the kind level
     /// (Phase 3.2/3.3).
     Meta { op: MetaOp, hooks: std::rc::Rc<MetaHooks> },
+    /// A standard-stream **external-object manager** (Maude's `StreamManagerSymbol`): the 0-ary `Oid`
+    /// constant `stdin`/`stdout`/`stderr` (Pillar 2.5-C). In `erewrite`'s EXTERNAL mode, with a `<>`
+    /// portal in the soup, a message targeting this constant is handled by the manager — `stdout`/`stderr`
+    /// `write(self, me, str)` emits `str` to the stream and replies `wrote(me, self)` **synchronously**;
+    /// `stdin` `getLine` is reactor-async (a later sub-step). The hooks are the message symbols the manager
+    /// consumes/produces, resolved from the op's `op-hook` list.
+    StreamManager {
+        stream: StdStream,
+        write_msg: Option<SymbolId>,
+        wrote_msg: Option<SymbolId>,
+        get_line_msg: Option<SymbolId>,
+        got_line_msg: Option<SymbolId>,
+    },
+}
+
+/// Which standard stream a [`SpecialOp::StreamManager`] drives (Maude's `StreamManagerSymbol` data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdStream {
+    Stdin,
+    Stdout,
+    Stderr,
 }
 
 /// Which META-LEVEL descent function a [`SpecialOp::Meta`] performs (Maude's `MetaLevelOpSymbol` code).

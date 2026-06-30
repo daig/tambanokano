@@ -57,6 +57,9 @@ impl Runtime {
                 let mut ctx = crate::descent::MetaCtx { rt: self, sig };
                 descent.descend(&mut ctx, *op, hooks, id)
             }
+            // A standard-stream manager constant (`stdin`/`stdout`/`stderr`) has no equational reduction —
+            // it stands for itself. Its messages are handled by the `erewrite` EXTERNAL driver, not here.
+            SpecialOp::StreamManager { .. } => None,
         }
     }
 
@@ -479,7 +482,7 @@ impl Runtime {
     }
 
     /// Read a string value from a `NodeTerm::Na::Str`, or `None` (not a string literal/result).
-    fn as_str(&self, id: DagId) -> Option<Rc<str>> {
+    pub(crate) fn as_str(&self, id: DagId) -> Option<Rc<str>> {
         match &self.node(id).term {
             NodeTerm::Na { value: NaValue::Str(s), .. } => Some(s.clone()),
             _ => None,

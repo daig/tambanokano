@@ -1510,3 +1510,32 @@ fn objects_through_repl() {
     );
 }
 
+/// Pillar 2.5-C (synchronous STD-STREAM) — `erewrite` EXTERNAL-mode standard-stream output. With a `<>`
+/// portal in the soup, a `write(stdout, me, str)` message to the `stdout` manager (`StreamManagerSymbol`)
+/// emits `str` and replies `wrote(me, stdout)` **synchronously** (no reactor). The side-channel writes
+/// surface after the echo, before `rewrites:` — exactly as Maude interleaves them. GREET writes one line;
+/// TICKER writes three sequentially (each waits for the `wrote` reply). Byte-identical to the reference.
+#[test]
+fn objects_io_through_repl() {
+    let out = repl().eval(conformance_file!("objects-io.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "io build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // GREET: start -> write "hello\n" -> wrote -> stop. The write happens externally (not a
+            // rewrite); the count is the `go`+`done` rules = 2.
+            "hello",
+            "rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: <> < g : Greeter | none >",
+            // TICKER: three sequential "tick\n" writes (go + next + next), then stop = 4 rule rewrites.
+            "tick",
+            "tick",
+            "tick",
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: <> < t : Ticker | n : 0 >",
+        ],
+        "synchronous stdout writes + erewrite outcomes must match the reference: {out}"
+    );
+}
+

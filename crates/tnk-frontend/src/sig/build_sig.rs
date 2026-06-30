@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
-    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp, StdStream, StrOp,
+    SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -552,6 +553,21 @@ fn special_op(
                 // No `shareWith` source in this module (a descent op standing alone) — resolve its own.
                 None => std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)),
             },
+        },
+        // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
+        // standard-stream external-object manager. The id-hook data selects the stream; the op-hooks name
+        // the `write`/`wrote` (and `getLine`/`gotLine`) message symbols the manager consumes/produces.
+        "StreamManagerSymbol" => SpecialOp::StreamManager {
+            stream: match code {
+                Some("stdin") => StdStream::Stdin,
+                Some("stdout") => StdStream::Stdout,
+                Some("stderr") => StdStream::Stderr,
+                _ => return Err("StreamManagerSymbol needs a stdin/stdout/stderr id-hook".into()),
+            },
+            write_msg: op_hook_sym(spec, "writeMsg", name_to_sym, i),
+            wrote_msg: op_hook_sym(spec, "wroteMsg", name_to_sym, i),
+            get_line_msg: op_hook_sym(spec, "getLineMsg", name_to_sym, i),
+            got_line_msg: op_hook_sym(spec, "gotLineMsg", name_to_sym, i),
         },
         other => return Err(format!("unsupported special id-hook `{other}`")),
     };

@@ -1,0 +1,77 @@
+*** Pillar 2.5-C (synchronous STD-STREAM): erewrite EXTERNAL-mode standard-stream output. The `<>` portal
+*** enables external IO; a `write(stdout, me, str)` message targeting the `stdout` manager (StreamManagerSymbol)
+*** emits `str` to stdout and replies `wrote(me, stdout)` synchronously -- no reactor. The side-channel writes
+*** print after the command echo, before `rewrites:`. CONFIGURATION + a minimal NAT/STRING + a minimal
+*** STD-STREAM (the real op-hook shape, incl. stringSymbol -- the reference crashes without it) are inlined.
+***
+*** Oracle: ~/Downloads/Maude-3/maude -no-banner conformance/objects-io.maude < /dev/null
+
+set show advisories off .
+
+mod CONFIGURATION is
+  sorts Attribute AttributeSet .
+  subsort Attribute < AttributeSet .
+  op none : -> AttributeSet  [ctor] .
+  op _,_ : AttributeSet AttributeSet -> AttributeSet [ctor assoc comm id: none] .
+  sorts Oid Cid Object Msg Portal Configuration .
+  subsort Object Msg Portal < Configuration .
+  op <_:_|_> : Oid Cid AttributeSet -> Object [ctor object
+                                               special (id-hook ObjectConstructorSymbol
+                                                 op-hook attributeSetSymbol (_,_ : AttributeSet AttributeSet ~> AttributeSet))] .
+  op none : -> Configuration [ctor] .
+  op __ : Configuration Configuration -> Configuration [ctor config assoc comm id: none] .
+  op <> : -> Portal [ctor portal] .
+endm
+
+fmod NAT is
+  sorts Zero NzNat Nat .  subsort Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+endfm
+
+fmod STRING is
+  sort String .
+  op <Strings> : -> String [special (id-hook StringSymbol)] .
+endfm
+
+*** A minimal STD-STREAM: the `stdout` manager (StreamManagerSymbol) with the real op-hook shape, plus the
+*** write/wrote messages. (The stringSymbol op-hook is required -- the reference crashes without it.)
+mod STD-OUT is
+  protecting STRING .  protecting CONFIGURATION .
+  op write : Oid Oid String -> Msg [ctor msg] .
+  op wrote : Oid Oid -> Msg [ctor msg] .
+  op stdout : -> Oid
+       [special (id-hook StreamManagerSymbol (stdout)
+                 op-hook stringSymbol (<Strings> : ~> String)
+                 op-hook writeMsg (write : Oid Oid String ~> Msg)
+                 op-hook wroteMsg (wrote : Oid Oid ~> Msg))] .
+endm
+
+*** Single write: start -> write "hello\n" -> wrote -> stop.
+mod GREET is
+  protecting STD-OUT .
+  sort GId .  subsort GId < Oid .
+  op Greeter : -> Cid [ctor] .
+  op g : -> GId [ctor] .
+  op start : Oid -> Msg [ctor msg] .
+  var O : Oid .
+  rl [go]   : start(O) < O : Greeter | none > => < O : Greeter | none > write(stdout, O, "hello\n") .
+  rl [done] : wrote(O, stdout) < O : Greeter | none > => < O : Greeter | none > .
+endm
+
+*** Sequential multi-line: a counter writes "tick\n" once per turn, each waiting for the wrote reply.
+mod TICKER is
+  protecting STD-OUT .  protecting NAT .
+  sort TId .  subsort TId < Oid .
+  op Ticker : -> Cid [ctor] .
+  op n :_ : Nat -> Attribute [ctor] .
+  op t : -> TId [ctor] .
+  op start : Oid -> Msg [ctor msg] .
+  var O : Oid .  var K : Nat .
+  rl [go]   : start(O) < O : Ticker | n : (s K) > => < O : Ticker | n : K > write(stdout, O, "tick\n") .
+  rl [next] : wrote(O, stdout) < O : Ticker | n : (s K) > => < O : Ticker | n : K > write(stdout, O, "tick\n") .
+  rl [stop] : wrote(O, stdout) < O : Ticker | n : 0 > => < O : Ticker | n : 0 > .
+endm
+
+erewrite in GREET : <> start(g) < g : Greeter | none > .
+erewrite in TICKER : <> start(t) < t : Ticker | n : (s s s 0) > .

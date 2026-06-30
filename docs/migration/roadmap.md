@@ -234,8 +234,11 @@ prelude load.
    **Phase B done** — `erewrite` (the object-message-fair `ConfigSymbol` scheduler): a `config` soup's
    `msg`-flagged messages deliver object-by-object (oid order), the `[n]` bound counts delivering passes, with
    bank/ping-pong `erewrite` byte-identical to the reference (`objects_through_repl`). Residuals: the generic
-   `leftOver` path (multi-object rules / un-`msg` messages) and per-message-symbol round-robin. Next: Phase C
-   (the `mio` reactor + `STD-STREAM`, first external IO).
+   `leftOver` path (multi-object rules / un-`msg` messages) and per-message-symbol round-robin.
+   **Phase C-sync done** — synchronous `STD-STREAM`: `erewrite` EXTERNAL mode with a `<>` portal routes a
+   `write(stdout, me, str)` to the `stdout` manager (`StreamManagerSymbol`), emitting `str` and replying `wrote`
+   synchronously (no reactor); `conformance/objects-io.maude` (`objects_io_through_repl`) is byte-identical.
+   Next: Phase C-reactor (the `mio` reactor + async `stdin` `getLine`).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 

@@ -334,6 +334,7 @@ impl Repl {
             Command::ERewrite { bound, gas, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `erewrite` restarts the `counter` built-in
+                lm.built.engine.reset_external(); // and the EXTERNAL-mode stream output + reply mailbox
                 let echo = command_echo(lm, &self.interner, &term, self.color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
@@ -348,7 +349,10 @@ impl Repl {
                 match erewrite_command(lm, &self.interner, &term, gas.unwrap_or(1)) {
                     Ok(mut rw) => {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
-                        out.push_str(&format!("erewrite{bound_str} in {cur} : {echo} .\n{body}"));
+                        // Side-channel `stdout` writes (Pillar 2.5-C) are interleaved by Maude after the
+                        // command echo, before the `rewrites:`/`result` lines — surface them there.
+                        let ext = lm.built.engine.take_external_out();
+                        out.push_str(&format!("erewrite{bound_str} in {cur} : {echo} .\n{ext}{body}"));
                         self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),

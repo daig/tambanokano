@@ -19,7 +19,7 @@ use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
 use crate::sort::{KindId, SortId, Sorts};
-use crate::symbol::{Axioms, OoFlags, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
+use crate::symbol::{Axioms, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
@@ -385,6 +385,15 @@ pub(crate) struct Runtime {
     /// allocation funnel, leaving the reduce hot path untouched. Bottom-up construction keeps the
     /// [`NodeTerm`] key shallow (children are deduped first, so identical subtrees already share ids).
     dedup: Option<HashMap<NodeTerm, DagId>>,
+    /// Captured `stdout` / `stderr` writes from `erewrite` EXTERNAL-mode stream managers (Pillar 2.5-C),
+    /// surfaced by the REPL. Reset per `erewrite` command via [`reset_external`](Engine::reset_external).
+    external_out: String,
+    external_err: String,
+    /// Buffered reply messages from external managers (Maude's `incomingMessages` mailbox) — delivered
+    /// into the soup on the next `erewrite` pass (`getExternalMessages`). Reset per command. (REPL GC is
+    /// off during a command, so these survive between passes without an explicit root; the reactor phase
+    /// will GC-root the in-flight message when blocking spans a collection.)
+    incoming: Vec<DagId>,
 }
 
 #[derive(Default)]
@@ -3358,9 +3367,15 @@ impl Engine {
         // has no local object keep a map entry with object `None` (→ undelivered → remainder), as in C++.
         let mut map: Vec<(DagId, Option<DagId>, Vec<DagId>)> = Vec::new();
         let mut remainder: Vec<(DagId, u32)> = Vec::new();
+        // External IO is enabled only when a `<>` portal is in the soup (Maude's `portalSeen`); `erewrite`
+        // is always EXTERNAL mode, so `external == portal_seen`.
+        let mut portal_seen = false;
         for (elem, mult) in args {
             let sym = self.node(elem).symbol();
             let oo = self.symbol(sym).oo;
+            if oo.portal {
+                portal_seen = true;
+            }
             if oo.object {
                 let name = self.node(elem).children().next().expect("object constructor has a name arg");
                 match map.iter_mut().find(|(n, _, _)| self.rt.dag_compare(*n, name) == Ordering::Equal) {
@@ -3391,25 +3406,43 @@ impl Engine {
         // One pass delivers *every* currently-queued message (the bound counts passes, not deliveries —
         // enforced by the driver). Within the pass the message queues are fixed; a delivery's newly-produced
         // messages land in `remainder` for the next pass.
-        for (name, mut obj, messages) in map {
+        for (name, mut obj, mut messages) in map {
+            // getExternalMessages: drain buffered replies addressed to this object into its queue (Maude's
+            // per-object external-reply pickup). Replies buffered during *this* pass wait for the next one.
+            if portal_seen {
+                let pending = std::mem::take(&mut self.rt.incoming);
+                let (mine, rest): (Vec<DagId>, Vec<DagId>) = pending.into_iter().partition(|&r| {
+                    self.node(r).children().next().is_some_and(|a| self.rt.dag_compare(a, name) == Ordering::Equal)
+                });
+                messages.extend(mine);
+                self.rt.incoming = rest;
+            }
             for msg in messages {
-                let delivered = match obj {
+                match obj {
                     Some(o) => {
                         let pair = self.make_acu(config_sym, vec![(o, 1), (msg, 1)]);
-                        self.rewrite_at(pair, cursors).map(|r| self.reduce(r))
-                    }
-                    None => None, // no object for this target
-                };
-                match delivered {
-                    Some(r) => {
-                        let (new_obj, others) = self.retrieve_object(r, name);
-                        obj = new_obj;
-                        for e in others {
-                            remainder.push((e, 1));
+                        match self.rewrite_at(pair, cursors).map(|r| self.reduce(r)) {
+                            Some(r) => {
+                                let (new_obj, others) = self.retrieve_object(r, name);
+                                obj = new_obj;
+                                for e in others {
+                                    remainder.push((e, 1));
+                                }
+                                *progress = true;
+                            }
+                            None => remainder.push((msg, 1)), // undelivered
                         }
-                        *progress = true;
                     }
-                    None => remainder.push((msg, 1)), // undelivered
+                    // No local object for this target. If external IO is on and the target is a stream
+                    // manager (`stdout`/`stderr`), handle the message there (offerMessageExternally) — the
+                    // write happens and a reply is buffered; this counts as progress but not a rewrite.
+                    None => {
+                        if portal_seen && self.handle_stream_message(name, msg) {
+                            *progress = true;
+                        } else {
+                            remainder.push((msg, 1)); // undelivered (no object, not a manager)
+                        }
+                    }
                 }
             }
             if let Some(o) = obj {
@@ -3463,6 +3496,58 @@ impl Engine {
     /// `rewrite`/`frewrite` command so successive commands restart the count (`continue` does not reset).
     pub fn reset_counter(&mut self) {
         self.rt.reset_counter();
+    }
+
+    /// Reset the `erewrite` EXTERNAL-mode state (captured stream output + the reply mailbox) — call at the
+    /// start of each `erewrite` command (Pillar 2.5-C).
+    pub fn reset_external(&mut self) {
+        self.rt.external_out.clear();
+        self.rt.external_err.clear();
+        self.rt.incoming.clear();
+    }
+
+    /// Take the captured `stdout` writes from the last `erewrite` run (the REPL surfaces them before the
+    /// `rewrites:`/`result` lines, as Maude interleaves the side-channel writes).
+    pub fn take_external_out(&mut self) -> String {
+        std::mem::take(&mut self.rt.external_out)
+    }
+    /// Take the captured `stderr` writes from the last `erewrite` run.
+    pub fn take_external_err(&mut self) -> String {
+        std::mem::take(&mut self.rt.external_err)
+    }
+
+    /// Handle a message addressed to a standard-stream **manager** constant (`stdout`/`stderr`/`stdin`),
+    /// Maude's `StreamManagerSymbol::handleMessage`. `name` is the message's target (arg0); `msg` the
+    /// message. A synchronous `write(self, me, str)` to `stdout`/`stderr` emits `str` and buffers a
+    /// `wrote(me, self)` reply; returns `true` if the message was a recognized manager request (consumed).
+    /// `getLine` (stdin) is reactor-async and not yet handled here (returns `false`, leaving it in the soup).
+    fn handle_stream_message(&mut self, name: DagId, msg: DagId) -> bool {
+        let Some(SpecialOp::StreamManager { stream, write_msg, wrote_msg, .. }) =
+            self.symbol(self.node(name).symbol()).special.clone()
+        else {
+            return false;
+        };
+        let msg_sym = self.node(msg).symbol();
+        // `write(self, me, str)` → emit `str`, reply `wrote(me, self)`. Stdin's `getLine` is async (later).
+        if Some(msg_sym) == write_msg && matches!(stream, StdStream::Stdout | StdStream::Stderr) {
+            let args: Vec<DagId> = self.node(msg).children().collect();
+            if args.len() != 3 {
+                return false;
+            }
+            let (me, target, payload) = (args[1], args[0], args[2]);
+            let Some(text) = self.rt.as_str(payload) else { return false };
+            match stream {
+                StdStream::Stdout => self.rt.external_out.push_str(&text),
+                StdStream::Stderr => self.rt.external_err.push_str(&text),
+                StdStream::Stdin => unreachable!(),
+            }
+            if let Some(wrote) = wrote_msg {
+                let reply = self.make_free(wrote, vec![me, target]); // wrote(me, self) — swap arg0/arg1
+                self.rt.incoming.push(reply);
+            }
+            return true;
+        }
+        false
     }
 
     /// Enable or disable reduction tracing. When on, [`reduce`](Self::reduce) records a structured

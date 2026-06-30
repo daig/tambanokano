@@ -303,16 +303,34 @@ print. Under the `EREWRITE_LOOP_MODE` flag the loop runs in EXTERNAL mode (can t
   Probe scaffolding in scratchpad (`sched.maude`/`fast.maude`); fold a bank/ping-pong `erewrite` fixture into
   `conformance/objects.maude` (or a sibling) + a REPL test, mirroring `objects_through_repl`.
 
-### C — the `mio` reactor + `STD-STREAM`. *(first external IO)*
+### C — `STD-STREAM` + the `mio` reactor. *(first external IO)*
+
+**C-sync — synchronous `stdout`/`stderr` `write`→`wrote`. DONE.** No reactor. The framework that the async
+part also rides on:
+- `SpecialOp::StreamManager { stream, write_msg, wrote_msg, … }` + `StdStream` (`symbol.rs`), resolved from the
+  `StreamManagerSymbol` id-hook in `build_sig` (the `stdin`/`stdout`/`stderr` manager constants; the
+  `stringSymbol`/`writeMsg`/`wroteMsg` op-hooks). **Note:** the reference *crashes* on a `stdout` op missing the
+  `stringSymbol` op-hook — the conformance fixture carries the real op-hook shape.
+- The `incomingMessages` reply **mailbox** (`Runtime::incoming`) + captured `external_out`/`external_err`, reset
+  per `erewrite` command (`Engine::reset_external`). `erewrite_pass`, when a `<>` portal is in the soup
+  (`portal_seen`, the `external` gate): drains buffered replies into each object's queue (`getExternalMessages`),
+  and routes a message with no local object whose target is a stream manager to `handle_stream_message`
+  (`offerMessageExternally`) — `write(stdout, me, str)` pushes `str` to `external_out` and buffers `wrote(me,
+  stdout)`. External handling is **progress but not a rewrite** (so the count is just the user rules). The REPL
+  surfaces `external_out` between the echo and `rewrites:`, as Maude interleaves the side-channel writes.
+- **Conformance:** `conformance/objects-io.maude` + `objects_io_through_repl` — a one-line `write` (GREET) and
+  three sequential writes (TICKER, each awaiting `wrote`), byte-identical to the reference (`hello`, count 2;
+  `tick`×3, count 4). `set show advisories off` keeps it comparable.
+- *Deferred to C-reactor:* `stderr` is captured (`external_err`) but not yet surfaced by the REPL; GC-rooting the
+  in-flight message (REPL GC is off within a command, so the mailbox survives between passes meanwhile).
+
+**C-reactor — async `stdin` `getLine`→`gotLine`. TODO.**
 - New `engine::io` module: the owned `Reactor` (`mio::Poll` + fd→owner map + timer `BinaryHeap`), the
   `ExternalObject` trait (`do_read`/`do_write`/`do_error`/`do_hung_up`/`do_callback`/`do_child_exit`), and the
   `eventLoop(block)` analog returning the `NOTHING_PENDING|INTERRUPTED|EVENT_HANDLED` discriminant.
-- Wire the `externalObjects` registry + `incomingMessages` reply mailbox onto the erewrite context, with
-  `buffer_message`/`get_external_messages` and the `<>`-portal gating.
 - Implement the `interleave`/`externalRewrite` driver (local rewrites priority; block on `reactor.poll()` when dry;
   inject replies on the next config traversal).
-- `STD-STREAM`: `stdout` `write`→`wrote` (synchronous), `stdin` `getLine`→`gotLine` (reactor-async). **GC-root the
-  in-flight message while an object is blocked.**
+- `stdin` `getLine`→`gotLine` (reactor-async). **GC-root the in-flight message while an object is blocked.**
 - **Conformance:** scripted-stdin / expected-stdout fixtures — this is sequencing, not pure values (see Hazards).
 
 ### D — `FILE`, then `SOCKET` / `PROCESS`.
