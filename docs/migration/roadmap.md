@@ -207,17 +207,19 @@ prelude load.
    fragments solved natively; rewrite `=>` fragments driven by the application's substrategies `L{E,…}`), the
    **application substitution** `L[x<-t]`, and strategy **definitions + calls** (`sd` — parameterless-recursive
    cycle-detected on `(dag, name)`, parameterized via inline parameter substitution). A surface `StratExpr`
-   combinator tree (term parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a recursive
-   solution enumerator over the engine, with a frontend-level condition solver (`solve_frags` over the kernel's
-   `ConditionFragment`s) and a linearize-then-post-check matcher (`match_extend`) for non-linear condition
-   patterns. **Remaining (all scoped in `gaps.md`):** the **fair BFS `srewrite`** order *and* per-solution
-   count (today's eager depth-first accounting matches `dsrewrite` exactly — value/sort/reachability always
-   faithful; the BFS snapshot is the follow-on); **`xmatchrew`** (extension-rewrite residue reassembly) and
-   **`csd`** (runtime condition bindings into the body), both erroring clearly at resolve; and the strategy
-   **meta** ops (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`, Phase 2.4 E) — the
-   META-LEVEL Stage-5 strategy tail, kept inert (needs sort-aware constructor resolution + a non-desugaring
-   parse + the StratExpr→Strategy up-translation/inverse). Plan:
-   `strategy-plan.md`. Reference: `reports/A6-operational.md`.
+   combinator tree (term parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a faithful port
+   of Maude's strategic-search **process + task model**: a `VecDeque` of `(term, pending-strategy-stack, task)`
+   processes (decompose = schedule-only; rule application = a resumable per-step `AppState`; empty pending = a
+   solution); `srewrite` appends successors (FIFO round-robin), `dsrewrite` prepends (LIFO); branch/`one`/`!`
+   spawn child tasks whose sub-searches interleave with a slave-count exhaustion check. **Fair `srewrite` is
+   byte-exact** — value, order, AND per-solution cumulative rewrite count, in both modes
+   (`strategy_fair_counts_through_repl` pins the unequal-depth interleavings, e.g. `r2|(r1;p)|(r1;p;pp)` →
+   c[1] d[5] g[6]). **Remaining (narrow, scoped in `gaps.md`):** the eager-sub-search per-solution *count* for
+   `matchrew`/`amatchrew` + conditional rewrite-condition substrategies (Maude's parallel `SubtermTask`/
+   `rewriteTask` odometer; values/order/reachability faithful); a narrow `one`/`!`-after-union order swap;
+   **`xmatchrew`** (extension-rewrite residue reassembly) and **`csd`** (runtime condition bindings into the
+   body), both erroring clearly at resolve; and the strategy **meta** ops (Phase 2.4 E) — the META-LEVEL
+   Stage-5 strategy tail, kept inert. Plan: `strategy-plan.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
    streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`
    decision. Reference: `reports/A6-operational.md`.

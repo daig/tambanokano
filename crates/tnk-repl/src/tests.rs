@@ -232,6 +232,64 @@ fn strategy_core_through_repl() {
     );
 }
 
+/// Per `srewrite`/`dsrewrite` command, each solution as `value[cumulative-rewrite-count]` joined by ` ; `
+/// (or `(no solution)`). The `rewrites:` line precedes each `result`, so each result pairs with the most
+/// recent count. Pins the fair-`srewrite` solution ORDER **and** per-solution count (unlike
+/// [`strategy_solutions`], which pins only values).
+fn strategy_value_counts(out: &str) -> Vec<String> {
+    let mut res = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let (mut active, mut rw) = (false, String::new());
+    for line in out.lines() {
+        if line.starts_with("srewrite ") || line.starts_with("dsrewrite ") {
+            if active {
+                res.push(cur.join(" ; "));
+            }
+            cur = Vec::new();
+            active = true;
+        } else if let Some(n) = line.strip_prefix("rewrites: ") {
+            rw = n.split(' ').next().unwrap_or("?").to_string();
+        } else if let Some(v) = line.strip_prefix("result ") {
+            if let Some((_, val)) = v.split_once(": ") {
+                cur.push(format!("{val}[{rw}]"));
+            }
+        } else if line.starts_with("No solution.") {
+            cur.push("(no solution)".to_string());
+        }
+    }
+    if active {
+        res.push(cur.join(" ; "));
+    }
+    res
+}
+
+/// Phase 2.4 — fair `srewrite` (and `dsrewrite`) solution ORDER **and** per-solution cumulative rewrite
+/// COUNT, byte-identical to Maude 3.5.1. These are the unequal-depth interleavings the old eager depth-first
+/// enumerator got wrong: the fair FIFO round-robin emits the shorter derivation first while DFS explores
+/// left-fully, and the per-solution count tracks the exact process schedule (a decompose step costs a turn
+/// but no rewrite; unions are n-ary). The process-queue + task-tree executor reproduces both.
+#[test]
+fn strategy_fair_counts_through_repl() {
+    let out = repl().eval(conformance_file!("strategy-fair.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error:"), "fair strategy builds/runs: {out}");
+    assert_eq!(
+        strategy_value_counts(&out),
+        vec![
+            "c[2] ; g[4]",        // srew (r1;p;pp) | r2 — fair emits the shorter derivation (c) first
+            "g[3] ; c[4]",        // dsrew — left branch explored fully first
+            "c[1] ; d[5] ; g[6]", // srew r2 | (r1;p) | (r1;p;pp) — n-ary union decompose timing
+            "c[1] ; d[3] ; g[6]", // dsrew
+            "d[4] ; e[4]",        // srew (r1;p) | (r2;q) — equal depth, both at the level's final count
+            "a[0] ; b[2] ; c[2]", // srew (r1|r2)* — reachable set, fair count snapshot
+            "a[0] ; b[1] ; c[2]", // dsrew (r1|r2)* — depth-first count snapshot
+            "c[2] ; b[2]",        // srew r2 | r1 — the 2nd branch rewrites before the 1st emits
+            "e[5] ; g[5]",        // srew (r1|r2) ; (p ? pp : q) — interleaved branch sub-tasks
+            "b[1] ; c[2]",        // dsrew (r1|r2)! — normalize, depth-first
+        ],
+        "fair srewrite order+count: {out}"
+    );
+}
+
 fn prelude_results(out: &str) -> Vec<String> {
     let lines: Vec<&str> = out.lines().collect();
     let mut results = Vec::new();

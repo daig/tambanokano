@@ -1,0 +1,32 @@
+*** Phase 2.4 — fair `srewrite` (and `dsrewrite`) ORDER + per-solution cumulative rewrite COUNT, byte-
+*** identical to Maude 3.5.1. These pin the process-queue scheduler: the unequal-depth interleavings the
+*** old eager depth-first enumerator got wrong, where the fair FIFO round-robin and the DFS LIFO stack give
+*** different solution orders AND different per-solution counts. The `result`/`rewrites:` pair per solution
+*** is the oracle (see strategy_fair_counts_through_repl).
+mod FAIR is
+  sort S .
+  ops a b c d e g : -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [p]  : b => d .
+  rl [q]  : c => e .
+  rl [pp] : d => g .
+  rl [r3] : b => e .
+endm
+*** unequal-depth union: fair emits the shorter derivation first (c before g); dfs explores left fully.
+srewrite a using (r1 ; p ; pp) | r2 .
+dsrewrite a using (r1 ; p ; pp) | r2 .
+*** three branches of depth 1 / 2 / 3 — the headline case (n-ary union timing): c[1] d[5] g[6].
+srewrite a using r2 | (r1 ; p) | (r1 ; p ; pp) .
+dsrewrite a using r2 | (r1 ; p) | (r1 ; p ; pp) .
+*** two equal-depth branches: both at the final count (the interleave completes the level first).
+srewrite a using (r1 ; p) | (r2 ; q) .
+*** iteration: the reachable set with the fair vs depth-first count snapshot.
+srewrite a using (r1 | r2) * .
+dsrewrite a using (r1 | r2) * .
+*** two depth-1 branches: both deferred to count 2 (the second branch rewrites before the first emits).
+srewrite a using r2 | r1 .
+*** a branch nested after a union — interleaved sub-tasks (the c-branch's e emerges with the b-branch's g).
+srewrite a using (r1 | r2) ; (p ? pp : q) .
+*** normalize nested after a union, depth-first (the eager enumerator collapsed this count).
+dsrewrite a using (r1 | r2) ! .

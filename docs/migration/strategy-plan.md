@@ -67,15 +67,20 @@ highest risk"):
   roadmap/gaps updated.
 
 ## Status (final)
-The interpreter is an **eager recursive solution enumerator** (`eval` over an explicit `Cx`), not the work-queue
-sketched in Architecture above. It matches `dsrewrite` exactly (value + order + count). The fair-BFS `srewrite`
-order/count for unequal-depth branches is the documented follow-on (it shares the `metaSearch`-snapshot class:
-solution set/value/sort/reachability are always faithful). This was the right call — the eager enumerator is far
-simpler, and every combinator + matchrew + conditional-rule case is byte-conformant on values/order.
+The interpreter is the **process + task model** of the Architecture section above (a `VecDeque` of
+`(term, pending, task)` processes; FIFO for the fair `srewrite`, LIFO for `dsrewrite`; branch/`one`/`!` as
+interleaved child tasks). It was first built as an eager recursive enumerator (matching `dsrewrite` only), then
+rebuilt as the process queue once the C++ `StrategyLanguage/` scheduling was reverse-engineered — the FIFO ring
+vs LIFO stack, the n-ary union/seq decompose timing, the per-step rule application, the slave-count task
+exhaustion. **Fair `srewrite` is now byte-exact** — value, order, AND per-solution cumulative rewrite count, in
+both modes (`strategy_fair_counts_through_repl`).
 
 ## Known hazards / deferrals (final state)
-- **Fair `srew` order + per-solution count** — the BFS-frontier follow-on (above); multi-solution conformance
-  cases are pinned via `dsrewrite`, whose depth-first order/count we reproduce exactly.
+- **Eager sub-search count** — `matchrew`/`amatchrew` + conditional rewrite-condition substrategies run their
+  sub-searches eagerly within a step, so their per-solution *count* can collapse when interleaved with parallel
+  unequal-depth work (values/order/reachability faithful). Maude's parallel `SubtermTask`/`rewriteTask` odometer
+  is the faithful mechanism; pinned via `dsrewrite` where the eager count coincides.
+- **`one`/`!` order after a union** — a narrow forwarding-order swap of two solutions at the same count.
 - **`xmatchrew`** — extension-match *rewriting* needs the engine to expose an extension match's residue for
   reassembly (narrow, assoc/AC-only). The `xmatch` *test* is done. Errors clearly at resolve.
 - **`csd`** — a conditional strategy definition's runtime condition bindings must flow into the body, which the

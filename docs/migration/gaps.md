@@ -223,29 +223,34 @@ correctness fix.
   → its constructor, term bubbles parsed + `upTerm`'d, conditions up-translated) plus the *inverse*
   `metaParseStrategy`/`metaPrettyPrintStrategy` (a meta-tokenization mechanism). Scoped for the Stage-5
   strategy tail; the strategy *language* (execution) is unaffected and complete.
-- **Strategy language — complete; two scoped follow-ons (Phase 2.4 A–D done; E = meta).** The parser + the
-  interpreter enumerate solutions byte-identically to the reference (values + order; `conformance/strategy.maude`,
-  `strategy_core_through_repl`, 45 srew/dsrew cases) across the whole surface: the core combinators
-  (`idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:` + `try`/`not`/`test`/`or-else`),
-  the `match`/`xmatch`/`amatch` tests (with `such that`), **`matchrew`/`amatchrew`** (with `such that` + a
-  by-list cartesian product), **conditional rules** in application (equality/sort/matching fragments solved
-  natively; rewrite `=>` fragments driven by the application's substrategies `L{E,…}`), the **application
-  substitution** `L[x<-t]`, strategy **definitions + calls** (`sd`, parameterless-recursive cycle-detected,
-  and parameterized via inline parameter substitution). The interpreter is an **eager depth-first** recursive
-  enumerator; the remaining items are:
-  - **Fair `srewrite` order + per-solution count.** Our `srewrite` uses the depth-first accounting, which
-    matches `dsrewrite` exactly; Maude's *fair* `srewrite` enumerates by a breadth-first frontier, so for
-    unequal-depth branches (e.g. `go | r2` where `go` is 2 steps and `r2` is 1) the `srewrite` order/count
-    differ (the solution *set*, value, sort, and reachability are always faithful — same class as the
-    `metaSearch` snapshot divergence). Multi-solution conformance cases are therefore pinned via `dsrewrite`.
+- **Strategy language — complete incl. fair `srewrite`; narrow scoped follow-ons (Phase 2.4 A–D done; E =
+  meta).** The interpreter is a faithful port of Maude's strategic-search **process + task model**
+  (`tnk-frontend::strategy`): a `VecDeque` of `(term, pending-strategy-stack, task)` processes; a decompose
+  step schedules without rewriting; a rule application is a resumable per-step `AppState`; an empty pending is
+  a solution routed to its task. `srewrite` appends successors (FIFO round-robin), `dsrewrite` prepends (LIFO);
+  unions/sequences flatten to n-ary so the decompose timing — hence the cumulative count — matches; branch
+  (`?:`/`try`/`not`/`test`/`or-else`), `one`, and `!` spawn child tasks whose sub-searches interleave in the
+  same queue with a slave-count exhaustion check. It enumerates solutions **byte-identically to the reference
+  — values, order, AND per-solution cumulative rewrite count** (`conformance/{strategy,strategy-fair}.maude`,
+  `strategy_core_through_repl` + `strategy_fair_counts_through_repl`) across the whole surface (the combinators,
+  `match`/`xmatch`/`amatch` tests with `such that`, `matchrew`/`amatchrew`, conditional rules in application
+  with `L{E,…}` substrategies, the substitution `L[x<-t]`, `sd` definitions/recursion/parameterized calls), in
+  **both** `srewrite` and `dsrewrite`. The remaining items are narrow:
+  - **Eager sub-search count for `matchrew`/`amatchrew` + conditional rewrite-condition substrategies.** These
+    run their sub-searches *eagerly within a step* (computing all solutions, then emitting), so their
+    per-solution count can collapse to the final total when interleaved with parallel unequal-depth work —
+    faithful values/order/reachability, count-only divergence (Maude's parallel `SubtermTask`/`rewriteTask`
+    odometer is the faithful mechanism). Pinned via `dsrewrite` where the eager count coincides.
+  - **`one`/`!` solution *order* nested after a union with a multi-solution sub-search** — a narrow
+    forwarding-order swap of two solutions at the same count (values + counts faithful).
   - **`xmatchrew`** (extension-match *rewriting*) needs the engine to expose an extension match's residue so
-    the rewritten matched portion can be reassembled — narrow, assoc/AC-only, same family as the AC-order
-    follow-ons. The `xmatch` *test* (extension match, yes/no) is done. Errors clearly at resolve.
-  - **Conditional (`csd`) strategy definitions** need the condition's runtime bindings (a `:=`/`=>` fragment
-    binds fresh variables) to flow into the definition body — i.e. a value→body substitution that the
-    parameter-token mechanism (a syntactic substitution) cannot express. Errors clearly at resolve.
+    the rewritten matched portion can be reassembled — narrow, assoc/AC-only. The `xmatch` *test* is done.
+    Errors clearly at resolve.
+  - **Conditional (`csd`) strategy definitions** need the condition's runtime bindings to flow into the
+    definition body — a value→body substitution the syntactic parameter-token mechanism cannot express. Errors
+    clearly at resolve.
   - **Strategy meta** (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`, Phase 2.4 E) —
-    see the next item; this is the META-LEVEL tower's Stage-5 strategy tail, kept **inert**.
+    see the next item; the META-LEVEL tower's Stage-5 strategy tail, kept **inert**.
 
 ## Resolved (here for cross-reference; detail in git history)
 
