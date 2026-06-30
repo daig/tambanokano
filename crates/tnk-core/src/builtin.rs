@@ -489,6 +489,16 @@ impl Runtime {
         }
     }
 
+    /// Read one line from the pending `stdin` buffer for `getLine` (Pillar 2.5-C): up to and **including**
+    /// the next `\n` (the reference returns the newline), or the rest if there is no trailing `\n`, or `""`
+    /// when the buffer is empty (EOF). Consumes what it returns from [`external_in`](crate::engine).
+    pub(crate) fn read_line(&mut self) -> String {
+        match self.external_in.find('\n') {
+            Some(i) => self.external_in.drain(..=i).collect(),
+            None => std::mem::take(&mut self.external_in),
+        }
+    }
+
     /// `StringOpSymbol` (concat / length / substr / comparisons): operate on string `NodeTerm::Na`
     /// values, building a string (`str_sym`), a Nat (`nat`), or a Bool (`bool_`) result.
     #[allow(clippy::too_many_arguments)]

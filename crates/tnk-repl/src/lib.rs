@@ -61,6 +61,9 @@ pub struct Repl {
     /// `select`) clears it — Maude's continuation invalidation. Stays valid between commands because the
     /// REPL runs with in-reduction GC off, so the session's terms are never collected.
     last: Option<(String, Continuation)>,
+    /// Pending `stdin` for `erewrite`'s `getLine` (Pillar 2.5-C). Set via [`set_stdin`](Self::set_stdin)
+    /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
+    stdin: String,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -92,7 +95,13 @@ impl Repl {
             color,
             trace: TraceFlags::default(),
             last: None,
+            stdin: String::new(),
         }
+    }
+
+    /// Provide `stdin` input for `erewrite`'s `getLine` (Pillar 2.5-C) — the scripted/piped input stream.
+    pub fn set_stdin(&mut self, input: impl Into<String>) {
+        self.stdin = input.into();
     }
 
     /// The current module's name, if any (for the prompt / introspection).
@@ -332,9 +341,11 @@ impl Repl {
                 }
             }
             Command::ERewrite { bound, gas, term, .. } => {
+                let stdin = std::mem::take(&mut self.stdin); // move the scripted input in before borrowing lm
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `erewrite` restarts the `counter` built-in
                 lm.built.engine.reset_external(); // and the EXTERNAL-mode stream output + reply mailbox
+                lm.built.engine.set_external_input(stdin); // `getLine` reads from here
                 let echo = command_echo(lm, &self.interner, &term, self.color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
@@ -356,6 +367,11 @@ impl Repl {
                         self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+                // Thread the unread `stdin` back (a command that didn't `getLine` leaves it intact, so a
+                // later command in another module can still read it). Re-borrow after `lm`'s use ends.
+                if let Some(lm) = self.modules.get_mut(&cur) {
+                    self.stdin = lm.built.engine.take_external_input();
                 }
             }
             Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that, .. } => {

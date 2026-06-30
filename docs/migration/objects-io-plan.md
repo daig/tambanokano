@@ -324,13 +324,25 @@ part also rides on:
 - *Deferred to C-reactor:* `stderr` is captured (`external_err`) but not yet surfaced by the REPL; GC-rooting the
   in-flight message (REPL GC is off within a command, so the mailbox survives between passes meanwhile).
 
-**C-reactor — async `stdin` `getLine`→`gotLine`. TODO.**
+**C-stdin — `stdin` `getLine`→`gotLine` over a scripted/piped input buffer. DONE.**
+- `SpecialOp::StreamManager` gains `string_sym` (the `stringSymbol` op-hook) to build the `gotLine` payload;
+  `Runtime::external_in` holds the pending input, `read_line` consumes up to and **including** the next `\n` (the
+  reference returns the newline), empty buffer = EOF → `""` (both pinned against the reference). `getLine(stdin,
+  me, prompt)` writes `prompt` to stdout, reads a line, and buffers `gotLine(me, stdin, line)` — synchronous over
+  the buffer (handled in `handle_stream_message` alongside `write`). The REPL threads the input via
+  `Repl::set_stdin` → the running module's engine, returning the unread tail after each `erewrite`.
+- **Conformance:** `objects-io.maude`'s ECHO module reads two piped lines and echoes each;
+  `objects_io_through_repl` (with `set_stdin("one\ntwo\n")`) is byte-identical to the reference (`one`/`two`,
+  count 5). For piped/scripted stdin this is exact — it *is* what Maude does once the bytes are available.
+
+**C-reactor — the `mio` event loop. TODO (folded forward to Phase D, which needs it for sockets/processes).**
 - New `engine::io` module: the owned `Reactor` (`mio::Poll` + fd→owner map + timer `BinaryHeap`), the
   `ExternalObject` trait (`do_read`/`do_write`/`do_error`/`do_hung_up`/`do_callback`/`do_child_exit`), and the
   `eventLoop(block)` analog returning the `NOTHING_PENDING|INTERRUPTED|EVENT_HANDLED` discriminant.
 - Implement the `interleave`/`externalRewrite` driver (local rewrites priority; block on `reactor.poll()` when dry;
-  inject replies on the next config traversal).
-- `stdin` `getLine`→`gotLine` (reactor-async). **GC-root the in-flight message while an object is blocked.**
+  inject replies on the next config traversal). Needed for *interactive* stdin (a forked reader) and the async
+  managers below; the scripted-stdin path above does not require it. **GC-root the in-flight message while an
+  object is blocked** (the reactor can span a GC; the synchronous buffer path cannot).
 - **Conformance:** scripted-stdin / expected-stdout fixtures — this is sequencing, not pure values (see Hazards).
 
 ### D — `FILE`, then `SOCKET` / `PROCESS`.

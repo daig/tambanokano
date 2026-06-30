@@ -213,6 +213,8 @@ pub enum SpecialOp {
     /// consumes/produces, resolved from the op's `op-hook` list.
     StreamManager {
         stream: StdStream,
+        /// `<Strings>` (the `stringSymbol` op-hook) — builds the `gotLine` payload from a read line.
+        string_sym: Option<SymbolId>,
         write_msg: Option<SymbolId>,
         wrote_msg: Option<SymbolId>,
         get_line_msg: Option<SymbolId>,

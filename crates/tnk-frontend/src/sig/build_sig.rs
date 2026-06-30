@@ -564,6 +564,7 @@ fn special_op(
                 Some("stderr") => StdStream::Stderr,
                 _ => return Err("StreamManagerSymbol needs a stdin/stdout/stderr id-hook".into()),
             },
+            string_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i),
             write_msg: op_hook_sym(spec, "writeMsg", name_to_sym, i),
             wrote_msg: op_hook_sym(spec, "wroteMsg", name_to_sym, i),
             get_line_msg: op_hook_sym(spec, "getLineMsg", name_to_sym, i),

@@ -34,22 +34,30 @@ fmod STRING is
   op <Strings> : -> String [special (id-hook StringSymbol)] .
 endfm
 
-*** A minimal STD-STREAM: the `stdout` manager (StreamManagerSymbol) with the real op-hook shape, plus the
-*** write/wrote messages. (The stringSymbol op-hook is required -- the reference crashes without it.)
-mod STD-OUT is
+*** A minimal STD-STREAM: the `stdout`/`stdin` managers (StreamManagerSymbol) with the real op-hook shape,
+*** plus the write/wrote and getLine/gotLine messages. (The stringSymbol op-hook is required -- the
+*** reference crashes without it.)
+mod STD-IO is
   protecting STRING .  protecting CONFIGURATION .
   op write : Oid Oid String -> Msg [ctor msg] .
   op wrote : Oid Oid -> Msg [ctor msg] .
+  op getLine : Oid Oid String -> Msg [ctor msg] .
+  op gotLine : Oid Oid String -> Msg [ctor msg] .
   op stdout : -> Oid
        [special (id-hook StreamManagerSymbol (stdout)
                  op-hook stringSymbol (<Strings> : ~> String)
                  op-hook writeMsg (write : Oid Oid String ~> Msg)
                  op-hook wroteMsg (wrote : Oid Oid ~> Msg))] .
+  op stdin : -> Oid
+       [special (id-hook StreamManagerSymbol (stdin)
+                 op-hook stringSymbol (<Strings> : ~> String)
+                 op-hook getLineMsg (getLine : Oid Oid String ~> Msg)
+                 op-hook gotLineMsg (gotLine : Oid Oid String ~> Msg))] .
 endm
 
 *** Single write: start -> write "hello\n" -> wrote -> stop.
 mod GREET is
-  protecting STD-OUT .
+  protecting STD-IO .
   sort GId .  subsort GId < Oid .
   op Greeter : -> Cid [ctor] .
   op g : -> GId [ctor] .
@@ -61,7 +69,7 @@ endm
 
 *** Sequential multi-line: a counter writes "tick\n" once per turn, each waiting for the wrote reply.
 mod TICKER is
-  protecting STD-OUT .  protecting NAT .
+  protecting STD-IO .  protecting NAT .
   sort TId .  subsort TId < Oid .
   op Ticker : -> Cid [ctor] .
   op n :_ : Nat -> Attribute [ctor] .
@@ -73,5 +81,22 @@ mod TICKER is
   rl [stop] : wrote(O, stdout) < O : Ticker | n : 0 > => < O : Ticker | n : 0 > .
 endm
 
+*** stdin getLine -> gotLine (reads the line incl. its newline), echoed straight to stdout. Reads two
+*** lines (a counter), each getLine awaiting the previous wrote. Run with piped stdin (two lines).
+mod ECHO is
+  protecting STD-IO .  protecting NAT .
+  sort EId .  subsort EId < Oid .
+  op Echoer : -> Cid [ctor] .
+  op n :_ : Nat -> Attribute [ctor] .
+  op e : -> EId [ctor] .
+  op start : Oid -> Msg [ctor msg] .
+  var O : Oid .  var S : String .  var K : Nat .
+  rl [go]   : start(O) < O : Echoer | n : (s K) > => < O : Echoer | n : (s K) > getLine(stdin, O, "") .
+  rl [got]  : gotLine(O, stdin, S) < O : Echoer | n : (s K) > => < O : Echoer | n : K > write(stdout, O, S) .
+  rl [next] : wrote(O, stdout) < O : Echoer | n : (s K) > => < O : Echoer | n : (s K) > getLine(stdin, O, "") .
+  rl [stop] : wrote(O, stdout) < O : Echoer | n : 0 > => < O : Echoer | n : 0 > .
+endm
+
 erewrite in GREET : <> start(g) < g : Greeter | none > .
 erewrite in TICKER : <> start(t) < t : Ticker | n : (s s s 0) > .
+erewrite in ECHO : <> start(e) < e : Echoer | n : (s s 0) > .

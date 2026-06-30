@@ -235,10 +235,11 @@ prelude load.
    `msg`-flagged messages deliver object-by-object (oid order), the `[n]` bound counts delivering passes, with
    bank/ping-pong `erewrite` byte-identical to the reference (`objects_through_repl`). Residuals: the generic
    `leftOver` path (multi-object rules / un-`msg` messages) and per-message-symbol round-robin.
-   **Phase C-sync done** — synchronous `STD-STREAM`: `erewrite` EXTERNAL mode with a `<>` portal routes a
-   `write(stdout, me, str)` to the `stdout` manager (`StreamManagerSymbol`), emitting `str` and replying `wrote`
-   synchronously (no reactor); `conformance/objects-io.maude` (`objects_io_through_repl`) is byte-identical.
-   Next: Phase C-reactor (the `mio` reactor + async `stdin` `getLine`).
+   **Phase C STD-STREAM done** — `erewrite` EXTERNAL mode with a `<>` portal: `write(stdout, me, str)` →
+   `stdout` manager (`StreamManagerSymbol`) emits `str` + replies `wrote` (synchronous); `getLine(stdin, me,
+   prompt)` writes the prompt + reads a line (incl. its `\n`, EOF → `""`) over a scripted/piped input buffer +
+   replies `gotLine`. `conformance/objects-io.maude` (`objects_io_through_repl`, GREET/TICKER/ECHO) is
+   byte-identical to the reference. Next: the `mio` reactor (interactive stdin + the Phase-D async managers).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 

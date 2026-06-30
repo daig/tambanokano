@@ -1517,7 +1517,9 @@ fn objects_through_repl() {
 /// TICKER writes three sequentially (each waits for the `wrote` reply). Byte-identical to the reference.
 #[test]
 fn objects_io_through_repl() {
-    let out = repl().eval(conformance_file!("objects-io.maude")).output;
+    let mut r = repl();
+    r.set_stdin("one\ntwo\n"); // piped stdin for ECHO's getLine
+    let out = r.eval(conformance_file!("objects-io.maude")).output;
     assert!(!out.contains("no parse") && !out.contains("error in module"), "io build: {out}");
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
@@ -1534,8 +1536,14 @@ fn objects_io_through_repl() {
             "tick",
             "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
             "result Configuration: <> < t : Ticker | n : 0 >",
+            // ECHO: getLine reads "one\n"/"two\n" (incl. newline), each echoed straight to stdout; count is
+            // go + got + next + got + stop = 5 rule rewrites (the getLine/write handling is not a rewrite).
+            "one",
+            "two",
+            "rewrites: 5 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: <> < e : Echoer | n : 0 >",
         ],
-        "synchronous stdout writes + erewrite outcomes must match the reference: {out}"
+        "STD-STREAM stdout writes + stdin getLine + erewrite outcomes must match the reference: {out}"
     );
 }
 

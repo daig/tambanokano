@@ -394,6 +394,10 @@ pub(crate) struct Runtime {
     /// off during a command, so these survive between passes without an explicit root; the reactor phase
     /// will GC-root the in-flight message when blocking spans a collection.)
     incoming: Vec<DagId>,
+    /// Pending `stdin` input for `getLine` (Pillar 2.5-C): the raw not-yet-read bytes. A `getLine` reads up
+    /// to and **including** the next `\n` (or the rest with no trailing `\n`); empty buffer = EOF → `""`.
+    /// Threaded by the REPL across commands (NOT reset per command, unlike the output buffers).
+    pub(crate) external_in: String,
 }
 
 #[derive(Default)]
@@ -3516,21 +3520,36 @@ impl Engine {
         std::mem::take(&mut self.rt.external_err)
     }
 
+    /// Set the pending `stdin` input for `getLine` (the scripted input stream; Pillar 2.5-C).
+    pub fn set_external_input(&mut self, input: String) {
+        self.rt.external_in = input;
+    }
+    /// Take back the unread `stdin` input (the REPL threads it across `erewrite` commands).
+    pub fn take_external_input(&mut self) -> String {
+        std::mem::take(&mut self.rt.external_in)
+    }
+
     /// Handle a message addressed to a standard-stream **manager** constant (`stdout`/`stderr`/`stdin`),
     /// Maude's `StreamManagerSymbol::handleMessage`. `name` is the message's target (arg0); `msg` the
     /// message. A synchronous `write(self, me, str)` to `stdout`/`stderr` emits `str` and buffers a
     /// `wrote(me, self)` reply; returns `true` if the message was a recognized manager request (consumed).
     /// `getLine` (stdin) is reactor-async and not yet handled here (returns `false`, leaving it in the soup).
     fn handle_stream_message(&mut self, name: DagId, msg: DagId) -> bool {
-        let Some(SpecialOp::StreamManager { stream, write_msg, wrote_msg, .. }) =
-            self.symbol(self.node(name).symbol()).special.clone()
+        let Some(SpecialOp::StreamManager {
+            stream,
+            string_sym,
+            write_msg,
+            wrote_msg,
+            get_line_msg,
+            got_line_msg,
+        }) = self.symbol(self.node(name).symbol()).special.clone()
         else {
             return false;
         };
         let msg_sym = self.node(msg).symbol();
-        // `write(self, me, str)` → emit `str`, reply `wrote(me, self)`. Stdin's `getLine` is async (later).
+        let args: Vec<DagId> = self.node(msg).children().collect();
+        // `write(self, me, str)` → emit `str`, reply `wrote(me, self)` (stdout/stderr).
         if Some(msg_sym) == write_msg && matches!(stream, StdStream::Stdout | StdStream::Stderr) {
-            let args: Vec<DagId> = self.node(msg).children().collect();
             if args.len() != 3 {
                 return false;
             }
@@ -3543,6 +3562,25 @@ impl Engine {
             }
             if let Some(wrote) = wrote_msg {
                 let reply = self.make_free(wrote, vec![me, target]); // wrote(me, self) — swap arg0/arg1
+                self.rt.incoming.push(reply);
+            }
+            return true;
+        }
+        // `getLine(self, me, prompt)` (stdin) → write `prompt` to stdout, read a line (incl. its `\n`; empty
+        // at EOF), reply `gotLine(me, self, line)`. Synchronous over the scripted input buffer — the true
+        // reactor (a forked reader for interactive stdin) is the `mio` phase; for piped input this is exact.
+        if Some(msg_sym) == get_line_msg && stream == StdStream::Stdin {
+            if args.len() != 3 {
+                return false;
+            }
+            let (me, target, prompt) = (args[1], args[0], args[2]);
+            if let Some(p) = self.rt.as_str(prompt) {
+                self.rt.external_out.push_str(&p); // the prompt goes to stdout
+            }
+            let line = self.rt.read_line();
+            if let (Some(got), Some(str_sym)) = (got_line_msg, string_sym) {
+                let line_dag = self.rt.make_na(&self.sig, str_sym, crate::dag::NaValue::Str(line.into()));
+                let reply = self.make_free(got, vec![me, target, line_dag]); // gotLine(me, self, line)
                 self.rt.incoming.push(reply);
             }
             return true;
