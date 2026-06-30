@@ -231,7 +231,11 @@ prelude load.
    `conformance/objects.maude` (bank + ping-pong) byte-identical under plain `rewrite`/`search`. Incidental
    fixes it forced: `split_mixfix` splits on `:` (attribute ops `bal :_` now parse) and `dag_compare` orders
    ACU elements arity-first (Maude's `orderInt`), which also resolved the old `x + 5`/`5 + x` print delta.
-   Next: Phase B (`erewrite` object-message scheduler).
+   **Phase B done** — `erewrite` (the object-message-fair `ConfigSymbol` scheduler): a `config` soup's
+   `msg`-flagged messages deliver object-by-object (oid order), the `[n]` bound counts delivering passes, with
+   bank/ping-pong `erewrite` byte-identical to the reference (`objects_through_repl`). Residuals: the generic
+   `leftOver` path (multi-object rules / un-`msg` messages) and per-message-symbol round-robin. Next: Phase C
+   (the `mio` reactor + `STD-STREAM`, first external IO).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 

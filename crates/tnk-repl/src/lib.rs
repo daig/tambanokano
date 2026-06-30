@@ -17,8 +17,8 @@ use tnk_core::rewrite::Rewriting;
 use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::load::{
-    build_command_dag, build_loaded_module, command_echo, format_matchers, frewrite_command,
-    match_command, rewrite_command, search_command, LoadedModule,
+    build_command_dag, build_loaded_module, command_echo, erewrite_command, format_matchers,
+    frewrite_command, match_command, rewrite_command, search_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
@@ -228,6 +228,7 @@ impl Repl {
             | Command::Match { module, .. }
             | Command::Rewrite { module, .. }
             | Command::Frewrite { module, .. }
+            | Command::ERewrite { module, .. }
             | Command::Search { module, .. }
             | Command::Srewrite { module, .. } => module.clone(),
             Command::Continue { .. } => None,
@@ -325,6 +326,29 @@ impl Repl {
                     Ok(mut rw) => {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                         out.push_str(&format!("frewrite{bound_str} in {cur} : {echo} .\n{body}"));
+                        self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::ERewrite { bound, gas, term, .. } => {
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.reset_counter(); // a fresh `erewrite` restarts the `counter` built-in
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
+                lm.built.engine.set_trace(self.trace.master);
+                lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
+                // Maude's `erewrite [n]` / `[n, g]`: `n` bounds deliveries, `g` (default 1) is the gas.
+                // The echo shows the bound exactly as written (`[n]` or `[n, g]`).
+                let bound_str = match (bound, gas) {
+                    (Some(n), Some(g)) => format!(" [{n}, {g}]"),
+                    (Some(n), None) => format!(" [{n}]"),
+                    _ => String::new(),
+                };
+                match erewrite_command(lm, &self.interner, &term, gas.unwrap_or(1)) {
+                    Ok(mut rw) => {
+                        let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
+                        out.push_str(&format!("erewrite{bound_str} in {cur} : {echo} .\n{body}"));
                         self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),

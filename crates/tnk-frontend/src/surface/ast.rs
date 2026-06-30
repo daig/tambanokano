@@ -305,6 +305,10 @@ pub enum Command {
     Rewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
     /// `frewrite [bound] term .` — position-fair rewriting (Pillar A-ii).
     Frewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
+    /// `erewrite [bound [, gas]] term .` — object-message-fair rewriting of a configuration (Pillar 2.5).
+    /// `bound` caps **deliveries** (config-level rule rewrites); `gas` (default 1) is the per-position gas
+    /// for the non-config fallback.
+    ERewrite { module: Option<String>, bound: Option<u64>, gas: Option<u64>, term: Vec<Token> },
     /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
     /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
     Search {

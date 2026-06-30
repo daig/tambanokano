@@ -483,6 +483,13 @@ pub fn frewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas
     Ok(lm.built.engine.frewrite(dag, gas))
 }
 
+/// Begin an `erewrite` (object-message-fair) session over `term` (Pillar 2.5-B); `gas` is the
+/// per-position gas for the non-config fallback (default 1).
+pub fn erewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas: u64) -> Result<Rewriting, String> {
+    let dag = build_command_dag(lm, i, term)?;
+    Ok(lm.built.engine.erewrite(dag, gas))
+}
+
 /// Begin a `search` (Pillar A-iv): build the subject DAG + the goal pattern (a [`Term`], its variable
 /// names tracked for rendering) + the optional `such that` condition over the goal's variables, then
 /// open the [`Search`] for `arrow` up to `max_depth`. Returns the session and the goal's [`VarIndex`]

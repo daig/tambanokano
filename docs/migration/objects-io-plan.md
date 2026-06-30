@@ -240,16 +240,68 @@ print. Under the `EREWRITE_LOOP_MODE` flag the loop runs in EXTERNAL mode (can t
   (`bal : N:Nat` → `N --> …`) but keeps it for a top-level pattern (`=>1 Y:T` → `Y:T --> …`); we always keep it.
   Orthogonal to objects (a search/printing detail). The fixture sidesteps it with a declared variable.
 
-### B — `erewrite` (the object-message-fair driver). *(still no external IO)*
-- New `Command::ERewrite` (`surface/ast.rs`) + `run_command` arm (`tnk-repl/src/lib.rs:223`); new engine driver
-  `engine.erewrite(...)` next to `rewrite`/`frewrite` (`engine.rs:3116/3203`).
-- Port the position-fair `fairRewrite` gas-per-node traversal (reuse/extend `frewrite`).
-- Port the **`ConfigSymbol` object-message scheduler**: recognize the `config`-tagged top symbol, partition the
-  soup (objects/messages/portals/remainder via the symbol attr flags), build the object→message-queue map keyed on
-  message arg0, deliver round-robin from rules hash-indexed by the consumed message symbol. This is the substantive
-  new engine code.
+### B — `erewrite` (the object-message-fair driver). *(still no external IO)* **DONE.**
+- `Command::ERewrite { bound, gas }` (`surface/ast.rs`) + parser (`erewrite`/`erew`, `[n]` or `[n, g]`) +
+  `run_command` arm (`tnk-repl/src/lib.rs`); `Engine::erewrite` + a `Mode::ObjectMessageFair` `Rewriting` session
+  (`rewrite.rs`) next to `rewrite`/`frewrite`; the scheduler `Engine::erewrite_pass` + `retrieve_object` +
+  `is_config_node` (`engine.rs`). Rules live keyed by their LHS top symbol (`__` for a config rule), so a delivery
+  is just `rewrite_at` on the **isolated** two-element `__(object, message)` — the matching rule fires; no separate
+  per-message rule index needed.
+- **Conformance:** `objects.maude` extended with `msg`-flagged credit/ping/pong + `erewrite` commands;
+  `objects_through_repl` pins bank (both credits in one pass → `< a | 50 > < b | 125 >`, count 4), a same-account
+  bank (`a` evolves 0→5→12, lone-object `result Object:` collapse), and ping-pong `erewrite [3]` (one delivery per
+  pass) — all byte-identical to the reference.
+
+**Two corrections the implementation forced (the earlier un-`msg` probes were misleading):**
+- A message symbol is one with the **`msg` attribute** (`OoFlags::message`), not merely one ranged in `Msg`. An
+  un-flagged `Msg`-sorted op is **not** scheduled — Maude routes it through the generic `leftOver` path, which
+  *looks* like object-message delivery on a simple system but is plain ACU rewriting. All the first probes (no
+  `msg`) were exercising `leftOver`, not the scheduler; the real fixtures carry `[ctor msg]`.
+- The `[n]` bound counts **delivering passes** (one `ConfigSymbol::ruleRewrite` call), **not** individual
+  deliveries. One pass delivers *every* currently-queued message; bank `erewrite [1]` therefore delivers **both**
+  credits (count 4). (The per-delivery bound only appears on the `leftOver` path — hence the misleading early
+  probe. Ping-pong shows one delivery per pass because each delivery produces the *next* pass's lone message.)
+
+**Residuals (errored-or-inert, documented — mirroring the strategy phase's `xmatchrew`/`csd`):**
+- **`leftOver` / multi-object rules** — a rule consuming **two+ objects** (a shared counter, a broker) or an
+  un-`msg` message does not fit the `message + single object` fast path; tnk leaves such messages undelivered
+  (the soup terminates) rather than porting Maude's generic `leftOverRewrite`. Idiomatic `msg`-flagged,
+  single-object-rule systems (the corpus) are byte-exact.
+- **Round-robin among multiple rules consuming one message symbol** — our cursor is per-config-symbol, Maude's is
+  per-message-symbol; identical while ≤1 rule matches a given message (the corpus).
+- **Nested / non-top config** — the scheduler triggers on a `config` *top* node; a config nested inside another
+  term falls to the position-fair fallback.
+
+**Pinned model (empirical against the reference + `configSymbol.cc:221`/`run.cc:313`).** Confirmed with bounded
+`erewrite [k]` probes on multi-object/multi-message configs:
+- **Partition** the config ACU soup by the op's `OoFlags`: `object` ctors, `message` ops, `portal`, else
+  `remainder` (`configSymbol.cc:234`). **Key on the flags, not the `Object`/`Msg` sorts.**
+- **Object map** = `object-name → (object, message-queue)`. A message's target is its **arg0**; messages whose
+  target has no local object stay in `remainder`. The map is iterated in **object-name order** — i.e. our
+  `dag_compare` on the names (oid order `a < b`, **independent of soup position** — verified by reversing the
+  soup). Each object's queue holds its messages in **`dag_compare` (canonical) order**.
+- **Delivery** order: for each object (name order), for each queued message (canonical order), apply the rule
+  that consumes that message symbol — **all of object a, then all of object b** (`m(a,1) m(a,2) m(b,3) m(b,4)` →
+  that order). One `ConfigSymbol::ruleRewrite` **pass delivers every currently-queued message**; the `[n]` bound
+  (default `gas` = 1, `erewrite.cc:56`) counts **delivering passes**, not individual deliveries — see the
+  correction below. Within a pass the queues are fixed; a delivery's **newly-produced** messages (e.g. a reply)
+  land in `remainder` and are delivered on the **next** pass (`fairTraversal` repeats while progress). The
+  object's state updates between its own deliveries (`i->second.object = retrieveObject(...)`).
+- **Two rule shapes.** The fast path (`objMsgRewrite:434`) matches `message + single object` and is what
+  bank/ping-pong (and most systems) use — `ruleMap[messageSymbol]` is a per-message-symbol `RuleSet` cycled
+  **round-robin** (`rs.next`) when >1 rule consumes the same message. A rule that needs **more than one object**
+  (a shared counter, a broker) does **not** fit and falls to `leftOver.rules` → generic ACU `leftOverRewrite`.
+  *Implementation note:* land the fast path first (covers the conformance corpus); a multi-object rule with no
+  fast-path match should error clearly at `erewrite` (the established residual pattern, cf. `xmatchrew`/`csd`),
+  **not** silently mis-deliver.
+- **Count** is the cumulative `rewrites:` (rule + the equational reductions each delivery triggers — bank credit =
+  rule + one `_+_` = 2 rewrites/credit, 4 total). Drive deliveries through the existing rule-application +
+  `reduce` machinery so the count co-varies, as with `frewrite`.
+- **No portal needed** for internal object-message delivery (`<>` only gates *external* IO in EXTERNAL mode);
+  `erewrite` over a portal-less soup still does object-message fair delivery (verified).
 - **Conformance:** the same object systems under `erewrite [n]` — solution + per-step order/count vs reference.
-  *(Probe the reference first: `erewrite` order on a multi-object/multi-message config, bounded with `[n]`.)*
+  Probe scaffolding in scratchpad (`sched.maude`/`fast.maude`); fold a bank/ping-pong `erewrite` fixture into
+  `conformance/objects.maude` (or a sibling) + a REPL test, mirroring `objects_through_repl`.
 
 ### C — the `mio` reactor + `STD-STREAM`. *(first external IO)*
 - New `engine::io` module: the owned `Reactor` (`mio::Poll` + fd→owner map + timer `BinaryHeap`), the

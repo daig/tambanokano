@@ -1435,7 +1435,7 @@ fn objects_outcomes(out: &str) -> Vec<String> {
     let mut lines = out.lines().peekable();
     let mut keep = Vec::new();
     while let Some(line) = lines.next() {
-        if matches!(line.split(' ').next(), Some("rewrite" | "reduce" | "search")) {
+        if matches!(line.split(' ').next(), Some("rewrite" | "reduce" | "search" | "erewrite")) {
             // Skip the echo block: this line plus continuations, through the trailing ` .`.
             let mut l = line;
             while !l.trim_end().ends_with('.') {
@@ -1491,6 +1491,20 @@ fn objects_through_repl() {
             "Solution 1 (state 1)",
             "states: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
             "C:Configuration --> < p1 : Player | turns : 1 > < p2 : Player | turns : 0 >",
+            // erewrite (object-message-fair, Pillar 2.5-B). The `msg`-flagged credit/ping/pong engage the
+            // ConfigSymbol scheduler. BANK: one pass delivers BOTH credits (the bound counts passes), 4
+            // rewrites (2 credits x rule+`+`).
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Account | bal : 50 > < b : Account | bal : 125 >",
+            // BANK, two credits to ONE account: `a` evolves 0->5->12 within the pass; the lone object
+            // collapses to `result Object:`.
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Object: < a : Account | bal : 12 >",
+            // PINGPONG `erewrite [3]`: one delivery per pass (each produces the next message), so [3] = 3
+            // hand-offs — pong leftover, p1 at 2 turns, p2 at 1. (Result wraps at 80 cols.)
+            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
+            "    turns : 1 >",
         ],
         "objects outcomes (echoes/rate aside) must match the reference: {out}"
     );

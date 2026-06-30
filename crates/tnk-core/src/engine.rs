@@ -3309,6 +3309,149 @@ impl Engine {
         node
     }
 
+    /// `erewrite` entry (Pillar 2.5-B): object-message-fair rewriting of a configuration. Default `gas`
+    /// is 1 (`erewrite.cc:56`). Returns a resumable [`Rewriting`] session, like [`frewrite`](Self::frewrite).
+    pub fn erewrite(&mut self, initial: DagId, gas: u64) -> crate::rewrite::Rewriting {
+        let root = self.root(initial);
+        crate::rewrite::Rewriting::new_object_message_fair(root, initial, gas)
+    }
+
+    /// Whether `id` is a `config`-tagged ACU node (the object-message configuration soup) — the trigger
+    /// for the [`erewrite_pass`](Self::erewrite_pass) scheduler. Mirrors Maude dispatching the
+    /// object-message machinery on `ConfigSymbol` (an ACU op carrying the `config` attribute).
+    pub(crate) fn is_config_node(&self, id: DagId) -> bool {
+        matches!(self.node(id).term, NodeTerm::Acu { .. }) && self.symbol(self.node(id).symbol()).oo.config
+    }
+
+    /// One object-message-fair delivery pass over a `config` ACU soup — Maude's `ConfigSymbol::ruleRewrite`
+    /// in FAIR/EXTERNAL mode (`configSymbol.cc:221`). **Partition** the soup by the operator `OoFlags`:
+    /// object constructors (keyed by their name = arg0), messages (queued under their target = arg0), and
+    /// a remainder (portals + anything else). Then, **objects in name order** (`dag_compare`), deliver each
+    /// queued message — **in canonical queue order** — by applying the consuming rule to the *isolated*
+    /// two-element config `object message` (so the AC search can't pair the wrong elements). The object
+    /// **evolves** between its own deliveries (`retrieve_object` pulls the same-named object out of each
+    /// result); newly-produced messages/objects land in the remainder and are delivered on the **next**
+    /// pass (the message queues are fixed for this pass). **Each delivery is one rule rewrite**, so
+    /// `remaining` (the `[n]` bound) caps deliveries and may stop the pass mid-stream; `progress` records
+    /// whether anything was delivered (the driver repeats passes while it does, decrementing the `[n]`
+    /// bound **once per delivering pass** — one `ruleRewrite` call delivers *all* currently-queued
+    /// messages, so the bound counts passes, not individual deliveries: bank `erewrite [1]` delivers both
+    /// pending credits). The fast path covers a rule of shape `message + single object` (bank/ping-pong and
+    /// most systems). A message symbol is one carrying the **`msg` attribute** (`OoFlags::message`), not
+    /// merely one ranged in `Msg` — matching Maude's `messageSymbols`; an un-flagged `Msg`-sorted op is not
+    /// scheduled (it would take Maude's generic `leftOver` path). *Residuals* (errored or not yet exercised,
+    /// mirroring the strategy phase): a rule needing **two+ objects** (Maude's `leftOver`/generic path) and
+    /// **round-robin among multiple rules consuming one message symbol** (our cursor is per-config-symbol,
+    /// Maude's per-message-symbol) — fine while ≤1 rule matches a message.
+    pub(crate) fn erewrite_pass(
+        &mut self,
+        config: DagId,
+        progress: &mut bool,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> DagId {
+        let config_sym = self.node(config).symbol();
+        let args: Vec<(DagId, u32)> = match &self.node(config).term {
+            NodeTerm::Acu { args, .. } => args.clone(),
+            _ => return config,
+        };
+        // Partition into an object map (name → object?, message queue) + remainder. Messages whose target
+        // has no local object keep a map entry with object `None` (→ undelivered → remainder), as in C++.
+        let mut map: Vec<(DagId, Option<DagId>, Vec<DagId>)> = Vec::new();
+        let mut remainder: Vec<(DagId, u32)> = Vec::new();
+        for (elem, mult) in args {
+            let sym = self.node(elem).symbol();
+            let oo = self.symbol(sym).oo;
+            if oo.object {
+                let name = self.node(elem).children().next().expect("object constructor has a name arg");
+                match map.iter_mut().find(|(n, _, _)| self.rt.dag_compare(*n, name) == Ordering::Equal) {
+                    Some(entry) if entry.1.is_none() => entry.1 = Some(elem),
+                    Some(_) => remainder.push((elem, mult)), // duplicate-named object — leave it in the soup
+                    None => map.push((name, Some(elem), Vec::new())),
+                }
+                // A multiplicity > 1 means duplicate objects; the extras stay in the soup.
+                for _ in 1..mult {
+                    remainder.push((elem, 1));
+                }
+            } else if oo.message {
+                let target = self.node(elem).children().next().expect("message has a target arg");
+                match map.iter_mut().find(|(n, _, _)| self.rt.dag_compare(*n, target) == Ordering::Equal) {
+                    Some(entry) => {
+                        for _ in 0..mult {
+                            entry.2.push(elem);
+                        }
+                    }
+                    None => map.push((target, None, vec![elem; mult as usize])),
+                }
+            } else {
+                remainder.push((elem, mult)); // portal or non-object/message
+            }
+        }
+        // Objects are processed in name order (Maude's `ObjectMap` is keyed/iterated by the name's order).
+        map.sort_by(|x, y| self.rt.dag_compare(x.0, y.0));
+        // One pass delivers *every* currently-queued message (the bound counts passes, not deliveries —
+        // enforced by the driver). Within the pass the message queues are fixed; a delivery's newly-produced
+        // messages land in `remainder` for the next pass.
+        for (name, mut obj, messages) in map {
+            for msg in messages {
+                let delivered = match obj {
+                    Some(o) => {
+                        let pair = self.make_acu(config_sym, vec![(o, 1), (msg, 1)]);
+                        self.rewrite_at(pair, cursors).map(|r| self.reduce(r))
+                    }
+                    None => None, // no object for this target
+                };
+                match delivered {
+                    Some(r) => {
+                        let (new_obj, others) = self.retrieve_object(r, name);
+                        obj = new_obj;
+                        for e in others {
+                            remainder.push((e, 1));
+                        }
+                        *progress = true;
+                    }
+                    None => remainder.push((msg, 1)), // undelivered
+                }
+            }
+            if let Some(o) = obj {
+                remainder.push((o, 1)); // object survives the pass
+            }
+        }
+        self.make_acu(config_sym, remainder)
+    }
+
+    /// Pull the object named `name` out of a delivery result `r` (Maude's `retrieveObject`): the result is
+    /// a config soup (or a single element); return that object (the one whose name = arg0 matches) and the
+    /// remaining elements (newly-produced messages/objects) to fold back into the soup. If the rule
+    /// consumed the object (none with `name` survives), the object is `None` and everything is "others".
+    fn retrieve_object(&self, r: DagId, name: DagId) -> (Option<DagId>, Vec<DagId>) {
+        let elems: Vec<(DagId, u32)> = match &self.node(r).term {
+            NodeTerm::Acu { args, .. } if self.symbol(self.node(r).symbol()).oo.config => args.clone(),
+            _ => vec![(r, 1)],
+        };
+        let mut obj = None;
+        let mut others = Vec::new();
+        for (e, m) in elems {
+            let is_named_object = obj.is_none()
+                && self.symbol(self.node(e).symbol()).oo.object
+                && self
+                    .node(e)
+                    .children()
+                    .next()
+                    .is_some_and(|a| self.rt.dag_compare(a, name) == Ordering::Equal);
+            if is_named_object {
+                obj = Some(e);
+                for _ in 1..m {
+                    others.push(e); // duplicate of the named object (defensive; mult is normally 1)
+                }
+            } else {
+                for _ in 0..m {
+                    others.push(e);
+                }
+            }
+        }
+        (obj, others)
+    }
+
     /// Total equational rewrites applied so far.
     pub fn rewrites(&self) -> u64 {
         self.rt.rewrites()

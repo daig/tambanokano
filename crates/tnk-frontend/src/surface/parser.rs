@@ -269,6 +269,16 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Frewrite { module, bound, term })
             }
+            "erewrite" | "erew" => {
+                // `erewrite [n]` (delivery bound) or `erewrite [n, g]` (bound + gas). The two-number form
+                // reuses the search-style `[n, m]` parse: `(bound, gas)`.
+                self.advance();
+                let (bound, gas) = self.opt_search_bound()?;
+                let module = self.opt_in_module()?;
+                let term = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::ERewrite { module, bound, gas, term })
+            }
             "search" => {
                 self.advance();
                 let (max_solutions, max_depth) = self.opt_search_bound()?;

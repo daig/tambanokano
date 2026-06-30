@@ -121,13 +121,6 @@ impl Symbol {
             Some(v) => v.contains(&(arg as u32)),
         }
     }
-
-    /// The object-system role flags (`config`/`obj`/`msg`/`portal`) — see [`OoFlags`]. Read by the
-    /// `erewrite` object-message scheduler (Phase 2.5-B); inert for the existing rewriting modes.
-    #[allow(dead_code)] // consumed by the Phase 2.5-B `erewrite` scheduler
-    pub(crate) fn oo_flags(&self) -> OoFlags {
-        self.oo
-    }
 }
 
 /// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam

@@ -18,6 +18,10 @@ enum Mode {
     RuleFair,
     /// `frewrite`: position-fair — `gas` rule applications per non-frozen position per traversal pass.
     PositionFair { gas: u64 },
+    /// `erewrite`: object-message-fair — at a `config` soup, deliver queued messages object-by-object
+    /// (Pillar 2.5-B); at any other node, fall back to position-fair. `gas` is the per-position gas for
+    /// the non-config fallback (default 1).
+    ObjectMessageFair { gas: u64 },
 }
 
 /// A resumable rewriting session (`rewrite` or `frewrite`). Owns the current term — pinned by a
@@ -55,6 +59,12 @@ impl Rewriting {
         Rewriting { current, root, cursors: HashMap::new(), done: false, mode: Mode::PositionFair { gas } }
     }
 
+    /// Construct an object-message-fair (`erewrite`) session rooted at `current` (Pillar 2.5-B), with
+    /// `gas` for the non-config fallback.
+    pub(crate) fn new_object_message_fair(root: RootGuard, current: DagId, gas: u64) -> Self {
+        Rewriting { current, root, cursors: HashMap::new(), done: false, mode: Mode::ObjectMessageFair { gas } }
+    }
+
     /// The current term.
     pub fn current(&self) -> DagId {
         self.current
@@ -75,6 +85,7 @@ impl Rewriting {
         match self.mode {
             Mode::RuleFair => self.run_rule_fair(engine, bound),
             Mode::PositionFair { gas } => self.run_position_fair(engine, bound, gas),
+            Mode::ObjectMessageFair { gas } => self.run_object_message_fair(engine, bound, gas),
         }
     }
 
@@ -122,6 +133,50 @@ impl Rewriting {
             if !progress {
                 self.done = true;
                 return RewriteStep { term: self.current, done: true, sort_known: true };
+            }
+        }
+    }
+
+    /// `erewrite`: object-message-fair. Reduce once, then repeat passes. At a `config` soup each pass is
+    /// the object-message scheduler ([`Engine::erewrite_pass`], Maude's `ConfigSymbol::ruleRewrite`); at
+    /// any other top node it falls back to a position-fair pass. The `[n]` bound counts **deliveries**
+    /// (config-level rule rewrites) — a delivery's equational reductions add to `rewrites:` but not to the
+    /// bound — so a bounded stop still leaves a reduced, sort-known configuration (Maude prints
+    /// `result Configuration:`, not `(sort not calculated)`). Passes repeat while a delivery is made.
+    fn run_object_message_fair(&mut self, engine: &mut Engine, bound: Option<u64>, gas: u64) -> RewriteStep {
+        let mut remaining = bound;
+        self.current = engine.reduce(self.current);
+        self.root.set(self.current);
+        loop {
+            if remaining == Some(0) {
+                return RewriteStep { term: self.current, done: false, sort_known: true };
+            }
+            let mut progress = false;
+            if engine.is_config_node(self.current) {
+                // One object-message delivery pass delivers every queued message; the bound counts
+                // delivering passes (one `ConfigSymbol::ruleRewrite` call), so decrement it by one here.
+                let next = engine.erewrite_pass(self.current, &mut progress, &mut self.cursors);
+                self.current = engine.reduce(next);
+                self.root.set(self.current);
+                if !progress {
+                    self.done = true;
+                    return RewriteStep { term: self.current, done: true, sort_known: true };
+                }
+                if let Some(rem) = &mut remaining {
+                    *rem -= 1;
+                }
+            } else {
+                // Non-config fallback: position-fair, per-rewrite bound (as `frewrite`).
+                let next = engine.frewrite_pass(self.current, gas, &mut remaining, &mut progress, &mut self.cursors);
+                self.current = engine.reduce(next);
+                self.root.set(self.current);
+                if remaining == Some(0) {
+                    return RewriteStep { term: self.current, done: false, sort_known: true };
+                }
+                if !progress {
+                    self.done = true;
+                    return RewriteStep { term: self.current, done: true, sort_known: true };
+                }
             }
         }
     }

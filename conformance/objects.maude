@@ -50,7 +50,7 @@ mod BANK is
   op Account : -> Cid [ctor] .
   op bal :_ : Nat -> Attribute [ctor] .
   ops a b : -> AccId [ctor] .
-  op credit : Oid Nat -> Msg [ctor] .
+  op credit : Oid Nat -> Msg [ctor msg] .
   var A : AccId .  vars N M : Nat .
   rl [credit] : credit(A, M) < A : Account | bal : N > => < A : Account | bal : (N + M) > .
 endm
@@ -63,7 +63,7 @@ mod PINGPONG is
   op Player : -> Cid [ctor] .
   op turns :_ : Nat -> Attribute [ctor] .
   ops p1 p2 : -> PlayerId [ctor] .
-  ops ping pong : Oid Oid -> Msg [ctor] .
+  ops ping pong : Oid Oid -> Msg [ctor msg] .
   vars X Y : Oid .  var N : Nat .
   rl [ping] : ping(X, Y) < X : Player | turns : N > => pong(Y, X) < X : Player | turns : (s N) > .
   rl [pong] : pong(X, Y) < X : Player | turns : N > => ping(Y, X) < X : Player | turns : (s N) > .
@@ -74,3 +74,10 @@ red in BANK : getClass(< a : Account | bal : 0 >) .
 search in BANK : < a : Account | bal : 0 > credit(a, 5) credit(a, 7) =>* < a : Account | bal : N > .
 rewrite [4] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > .
 search [1] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > =>+ pong(p2, p1) C:Configuration .
+
+*** Pillar 2.5-B: erewrite (object-message-fair). The `msg`-flagged credit/ping/pong engage the
+*** ConfigSymbol scheduler. One pass delivers every queued message object-by-object (oid order); the
+*** [n] bound counts delivering passes -- bank delivers both credits in one pass, ping-pong one per pass.
+erewrite in BANK : < a : Account | bal : 0 > < b : Account | bal : 100 > credit(a, 50) credit(b, 25) .
+erewrite in BANK : < a : Account | bal : 0 > credit(a, 5) credit(a, 7) .
+erewrite [3] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > .
