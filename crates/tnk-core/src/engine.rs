@@ -19,7 +19,7 @@ use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
 use crate::sort::{KindId, SortId, Sorts};
-use crate::symbol::{Axioms, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
+use crate::symbol::{Axioms, OoFlags, OpDeclaration, SpecialOp, Symbol, SymbolId, Theory};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
@@ -462,6 +462,7 @@ impl Signature {
             strategy: None,
             frozen: None,
             special: None,
+            oo: OoFlags::default(),
         })
     }
 
@@ -485,6 +486,7 @@ impl Signature {
             strategy: None,
             frozen: None,
             special: None,
+            oo: OoFlags::default(),
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -509,6 +511,7 @@ impl Signature {
             strategy: None,
             frozen: None,
             special: None,
+            oo: OoFlags::default(),
         })
     }
 
@@ -532,6 +535,7 @@ impl Signature {
             strategy: None,
             frozen: None,
             special: None,
+            oo: OoFlags::default(),
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -555,6 +559,7 @@ impl Signature {
             strategy: None,
             frozen: None,
             special: None,
+            oo: OoFlags::default(),
         })
     }
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
@@ -680,6 +685,12 @@ impl Signature {
             self.symbols.get(sym).name()
         );
         self.symbols.get_mut(sym).frozen = Some(raw.iter().map(|&p| p - 1).collect());
+    }
+
+    /// Set the object-system role flags (`config`/`obj`/`msg`/`portal`) on `sym` (Pillar 2.5). Inert
+    /// for the existing rewriting modes; consumed by the `erewrite` object-message scheduler (Phase B).
+    pub(crate) fn set_oo_flags(&mut self, sym: SymbolId, oo: OoFlags) {
+        self.symbols.get_mut(sym).oo = oo;
     }
 
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym`. The op-hook/term-hook
@@ -1578,12 +1589,31 @@ impl Runtime {
     /// canonicalizer sorts and uniquizes by. Recurses on *element* depth (like `match_pattern`,
     /// author-/data-shallow for the canonical subterms it compares); an iterative form is a follow-up
     /// if deep ACU elements ever appear.
+    /// A node's top-symbol arity — Maude's `Symbol::arity`, the high bits of its `orderInt` order key.
+    /// A theory symbol is binary (ACU / AU / CUI) or unary (S, the `iter` successor); an NA constant is
+    /// nullary; a free symbol carries its declared argument count. The primary key of [`dag_compare`].
+    fn node_arity(n: &DagNode) -> usize {
+        match &n.term {
+            NodeTerm::Free { args, .. } => args.len(),
+            NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } => 2,
+            NodeTerm::S { .. } => 1,
+            NodeTerm::Na { .. } => 0,
+        }
+    }
+
     pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
         if a == b {
             return Ordering::Equal; // same node id — identical, prune
         }
         let (na, nb) = (self.dags.get(a), self.dags.get(b));
-        match na.symbol().cmp(&nb.symbol()) {
+        // Maude builds each symbol's order key as `orderInt = symbolCount++ | (arity << 24)`
+        // (`Interface/symbol.cc`), so the canonical symbol order is **arity-first** (the high bits),
+        // then global creation index. A mixed-arity ACU soup therefore groups by arity before
+        // creation order — e.g. a configuration's arity-2 messages all sort before its arity-3
+        // objects, regardless of which was declared first. Mirror that: compare arity, then `SymbolId`
+        // (our per-build creation index, the `symbolCount` analog). Same-arity elements keep the
+        // existing index order, so NAT/SET/MAP conformance (uniform arity) is unchanged.
+        match Self::node_arity(na).cmp(&Self::node_arity(nb)).then_with(|| na.symbol().cmp(&nb.symbol())) {
             Ordering::Equal => {}
             ord => return ord,
         }
@@ -2839,6 +2869,13 @@ impl Engine {
     /// is never rewritten by `rewrite`/`frewrite`/`search`; equational `reduce` is unaffected.
     pub fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) {
         self.sig.set_frozen(sym, raw);
+    }
+
+    /// Record the object-system role of `sym` (`config`/`obj`/`msg`/`portal` attributes, Pillar 2.5).
+    /// Inert for `reduce`/`rewrite`/`frewrite`/`search` (the `config` `__` stays an ordinary ACU soup);
+    /// the flags drive the `erewrite` object-message scheduler's soup partition (Phase 2.5-B).
+    pub fn set_oo_flags(&mut self, sym: SymbolId, config: bool, object: bool, message: bool, portal: bool) {
+        self.sig.set_oo_flags(sym, OoFlags { config, object, message, portal });
     }
 
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user

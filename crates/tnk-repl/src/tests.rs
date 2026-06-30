@@ -1425,3 +1425,74 @@ fn input_complete_boundaries() {
     assert!(!r.input_complete("   \n  "), "whitespace");
 }
 
+/// Extract the conformance-relevant outcome lines from an objects-system run: every line that is **not**
+/// a command echo (the `rewrite`/`reduce`/`search` line and any wrapped continuation, ending at the
+/// trailing ` .`). What remains — `result …`, `rewrites:`, `states:`, `Solution …`, the `Var --> v`
+/// bindings — is exactly what we compare byte-for-byte to the reference (the echo's `__`-parenthesization
+/// and ordering is a known rendering divergence that every conformance fixture abstracts over; the
+/// `rewrites/second` *rate* is timing noise — ours is always `~`).
+fn objects_outcomes(out: &str) -> Vec<String> {
+    let mut lines = out.lines().peekable();
+    let mut keep = Vec::new();
+    while let Some(line) = lines.next() {
+        if matches!(line.split(' ').next(), Some("rewrite" | "reduce" | "search")) {
+            // Skip the echo block: this line plus continuations, through the trailing ` .`.
+            let mut l = line;
+            while !l.trim_end().ends_with('.') {
+                match lines.next() {
+                    Some(next) => l = next,
+                    None => break,
+                }
+            }
+            continue;
+        }
+        keep.push(line.to_string());
+    }
+    keep
+}
+
+/// Pillar 2.5-A — object-message **configurations** under plain `rewrite`/`search` (no `erewrite`, no
+/// external IO). Loads the real prelude `CONFIGURATION` (`<_:_|_>` resolving its `ObjectConstructorSymbol`
+/// id-hook; the `config`/`obj`/`portal` op attributes recorded onto the kernel symbol) plus a bank and a
+/// ping-pong system, and pins the outcome of each command **byte-identically to the reference**
+/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects.maude`). The message-vs-object multiset
+/// order is the load-bearing case: Maude orders ACU elements arity-first (`orderInt`), so the arity-2
+/// `ping(p1, p2)` prints *before* the arity-3 objects — `dag_compare` now matches (it ordered by raw
+/// `SymbolId` before, which is why this is the test that locks the fix in).
+#[test]
+fn objects_through_repl() {
+    let out = repl().eval(conformance_file!("objects.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "objects build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // BANK: two credits apply (4 rewrites), balances updated, objects in `a < b` order.
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Account | bal : 50 > < b : Account | bal : 125 >",
+            // getClass: an ordinary equation over the object constructor.
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Cid: Account",
+            // BANK search: credit 5 then 7 reaches balance 12 (state 3 of 4); declared var `N` prints bare.
+            "",
+            "Solution 1 (state 3)",
+            "states: 4  rewrites: 6 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "N --> 12",
+            "",
+            "No more solutions.",
+            "states: 4  rewrites: 8 in 0ms cpu (0ms real) (~ rewrites/second)",
+            // PINGPONG `rewrite [4]`: four message hand-offs; the leftover `ping(p1, p2)` (arity 2) prints
+            // BEFORE the two arity-3 objects — the arity-first ACU order. (Result wraps at 80 cols.)
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: ping(p1, p2) < p1 : Player | turns : 2 > < p2 : Player |",
+            "    turns : 2 >",
+            // PINGPONG search `=>+`: the first `pong(p2, p1)` state (depth 1), the soup remainder bound to C.
+            "",
+            "Solution 1 (state 1)",
+            "states: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "C:Configuration --> < p1 : Player | turns : 1 > < p2 : Player | turns : 0 >",
+        ],
+        "objects outcomes (echoes/rate aside) must match the reference: {out}"
+    );
+}
+

@@ -226,7 +226,12 @@ prelude load.
    so the new runtime is `erewrite`'s object-message-fair scheduler (the C++ `ConfigSymbol`) + the reactor
    (the C++ `PseudoThread`); the OO syntax (`omod`/`class`/`msg`) is Core-Maude C++, a frontend desugaring
    here. Full C++-grounded plan (context stack / fairness / manager protocols / reactor contract / signals /
-   LOOP-MODE / phasing): `objects-io-plan.md`.
+   LOOP-MODE / phasing): `objects-io-plan.md`. **Phase A done** — the build-layer plumbing (OO op attributes
+   recorded onto the kernel symbol; `ObjectConstructorSymbol` resolved; real `CONFIGURATION` loads) with
+   `conformance/objects.maude` (bank + ping-pong) byte-identical under plain `rewrite`/`search`. Incidental
+   fixes it forced: `split_mixfix` splits on `:` (attribute ops `bal :_` now parse) and `dag_compare` orders
+   ACU elements arity-first (Maude's `orderInt`), which also resolved the old `x + 5`/`5 + x` print delta.
+   Next: Phase B (`erewrite` object-message scheduler).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 

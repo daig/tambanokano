@@ -490,7 +490,11 @@ impl Repl {
             line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
         let out = match words.get(1).copied() {
             Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
-            _ => "set: only `set trace [<option>] on|off` is supported in this build.".into(),
+            // Every other interpreter directive (`set show advisories off`, `set include … on/off`,
+            // `set oo include … on`, …) is a silent no-op, as the file-loading parser already treats
+            // `set` (we never auto-import, and these toggles do not affect our output). Silence matches
+            // Maude — it applies these without echoing — so loaded `.maude` files stay byte-comparable.
+            _ => String::new(),
         };
         Eval { output: out, exit: false }
     }

@@ -274,6 +274,12 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             if let Some(frozen) = &od.attrs.frozen {
                 engine.set_frozen(sym, frozen);
             }
+            // Object-system role flags (`config`/`obj`/`msg`/`portal`, Pillar 2.5). Mirror Maude's
+            // `SymbolType` CONFIG/OBJECT/MESSAGE/PORTAL bits onto the kernel symbol. Inert for the
+            // existing rewriting modes; the `erewrite` scheduler (Phase 2.5-B) keys on them.
+            if od.attrs.config || od.attrs.object || od.attrs.message || od.attrs.portal {
+                engine.set_oo_flags(sym, od.attrs.config, od.attrs.object, od.attrs.message, od.attrs.portal);
+            }
             if let Some(op) = &special {
                 engine.set_special(sym, op.clone());
             }
@@ -466,6 +472,12 @@ fn special_op(
         // can reference the canonical truth constants.
         "SuccSymbol" | "StringSymbol" | "FloatSymbol" | "QuotedIdentifierSymbol" | "SystemTrue"
         | "SystemFalse" => return Ok(None),
+        // `<_:_|_>` (CONFIGURATION's `ObjectConstructorSymbol`, Pillar 2.5). A marker: the object
+        // constructor is an ordinary free symbol for reduction/rewriting (its third argument is the
+        // ACU `AttributeSet`, matched by the existing engine). The C++ symbol adds object-pattern
+        // matching optimizations (via the `attributeSetSymbol` op-hook) that the `erewrite` scheduler
+        // will exploit (Phase 2.5-B); for plain rewrite/search nothing special is needed.
+        "ObjectConstructorSymbol" => return Ok(None),
         "MinusSymbol" => SpecialOp::Minus { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "DivisionSymbol" => SpecialOp::Division { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         // `_==_`/`_=/=_` and the initial-equality predicate `_.=._` (the latter is `comm`/`poly` and, for

@@ -762,16 +762,16 @@ mod tests {
     }
     #[test]
     fn nat_renders_like_binary() {
-        // Every command matches the binary EXCEPT the last: the residue prints `5 + x` here vs the
-        // binary's `x + 5`. This is a COSMETIC representation difference, not a correctness gap: the
-        // kernel's `dag_compare` orders ACU elements by `SymbolId` while Maude orders by `Symbol::orderInt`
-        // (`Interface/symbol.hh:239`). Same multiset → identical equality / normal forms / sorts /
-        // arithmetic; only the print order differs, and we don't require visual parity. The printer
-        // faithfully renders whatever canonical order the kernel produced. (Aligning the order is an
-        // optional kernel tweak — task #7 — that would cost a full AC rewrite-count re-verification.)
+        // Every command matches the binary, including the last: the residue prints `x + 5`, exactly as
+        // the reference does. The kernel's `dag_compare` now orders ACU elements by Maude's
+        // `Symbol::orderInt` key — **arity first** (`orderInt = symbolCount | (arity << 24)`,
+        // `Interface/symbol.{hh,cc}`), then creation index — so the nullary `x` sorts before the unary
+        // `s^5(0)` (`5`), giving `x + 5`. (Before that fix it printed `5 + x`, a documented cosmetic
+        // discrepancy; aligning the order made the object-configuration soups byte-identical too,
+        // Pillar 2.5-A.)
         renders_as(
             file!("nat.maude"),
-            &["5", "4", "5", "12", "4", "3", "1", "1024", "6", "tt", "ff", "tt", "5 + x"],
+            &["5", "4", "5", "12", "4", "3", "1", "1024", "6", "tt", "ff", "tt", "x + 5"],
         );
     }
     #[test]

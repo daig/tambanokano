@@ -88,6 +88,27 @@ pub struct Symbol {
     pub(crate) frozen: Option<Vec<u32>>,
     /// Built-in reduction rule (`special (id-hook …)`, B3), if any — tried before user equations.
     pub(crate) special: Option<SpecialOp>,
+    /// Object-system role flags (`config`/`obj`/`msg`/`portal` operator attributes), Pillar 2.5. Inert
+    /// for `reduce`/`rewrite`/`frewrite`/`search` — the `config` ACU `__` rewrites as an ordinary ACU
+    /// soup. Consumed by the `erewrite` object-message scheduler (Phase 2.5-B) to partition the soup.
+    pub(crate) oo: OoFlags,
+}
+
+/// The object-system role of an operator — Maude's `SymbolType` `CONFIG`/`OBJECT`/`MESSAGE`/`PORTAL`
+/// bits (`symbolType.hh`), set from the `config`/`obj`/`msg`/`portal` operator attributes
+/// (`obj`≡`object`, `msg`≡`message`, `config`≡`configuration`). The roles are independent bits (an op
+/// could in principle carry more than one), matching the C++ flag word. The `erewrite` scheduler keys
+/// its soup partition on these — **not** on the `Object`/`Msg` sorts (see the plan §2.8 / hazards).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OoFlags {
+    /// `config` — the configuration multiset constructor (`__`), built as a `ConfigSymbol` in C++.
+    pub(crate) config: bool,
+    /// `obj`/`object` — the object constructor (`<_:_|_>`).
+    pub(crate) object: bool,
+    /// `msg`/`message` — a message operator.
+    pub(crate) message: bool,
+    /// `portal` — the external-IO portal (`<>`).
+    pub(crate) portal: bool,
 }
 
 impl Symbol {
@@ -99,6 +120,13 @@ impl Symbol {
             Some(v) if v.is_empty() => true, // `[frozen]` = every argument
             Some(v) => v.contains(&(arg as u32)),
         }
+    }
+
+    /// The object-system role flags (`config`/`obj`/`msg`/`portal`) — see [`OoFlags`]. Read by the
+    /// `erewrite` object-message scheduler (Phase 2.5-B); inert for the existing rewriting modes.
+    #[allow(dead_code)] // consumed by the Phase 2.5-B `erewrite` scheduler
+    pub(crate) fn oo_flags(&self) -> OoFlags {
+        self.oo
     }
 }
 

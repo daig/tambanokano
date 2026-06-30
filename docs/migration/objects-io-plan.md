@@ -204,15 +204,41 @@ print. Under the `EREWRITE_LOOP_MODE` flag the loop runs in EXTERNAL mode (can t
 > at safe points (the `ctrlC_Flag`+`traceFlag` analog). `tokio` is **not** adopted (Maude IO is cooperative
 > single-threaded; determinism is required for conformance).
 
-### A — build-layer foundation + `CONFIGURATION` + in-memory object data. *(no reactor, no erewrite)*
-- Record the `object`/`config`/`message`/`portal` operator attributes on the symbol (today the parser discards
-  them: `surface/parser.rs:1145,1168`). Mirror `SymbolType`'s `CONFIG/OBJECT/MESSAGE/PORTAL` flags as symbol attrs.
-- Resolve `ObjectConstructorSymbol` (and later the manager `id-hook`s) in `build_sig` alongside the existing
-  `MetaLevelOpSymbol` resolution.
-- Load `CONFIGURATION` (≈15 lines). The `__` config op stays an ordinary ACU symbol for now; `<_:_|_>` is a free
-  symbol; `getClass` is an ordinary equation. **Plain `rewrite`/`search` over configs already work** (verified).
-- **Conformance:** bank-account / ping-pong object systems under plain `rewrite`/`search` — value/order/count vs
-  the reference (no IO).
+### A — build-layer foundation + `CONFIGURATION` + in-memory object data. *(no reactor, no erewrite)* **DONE.**
+- Record the `object`/`config`/`message`/`portal` operator attributes on the symbol (the parser used to discard
+  them). **Done:** `Attrs.{config,object,message,portal}` (`surface/ast.rs`); the parser records them with the
+  lexer's aliases (`obj`≡`object`, `msg`≡`message`, `config`≡`configuration`); they mirror onto the kernel symbol
+  as `Symbol.oo: OoFlags` (`symbol.rs`) via `Engine::set_oo_flags`, wired from `build_sig` Pass B. The flags are
+  inert for the current rewriting modes; `OoFlags`'s reader (`#[allow(dead_code)]`) is consumed by Phase B.
+- Resolve `ObjectConstructorSymbol` in `build_sig` (`special_op` → `Ok(None)` — `<_:_|_>` is an ordinary free
+  symbol; the `attributeSetSymbol` op-hook is ignored until Phase B). **Done.**
+- Load `CONFIGURATION` verbatim; `__` stays an ordinary ACU symbol; `getClass` an ordinary equation. **Done.**
+- **Conformance:** `conformance/objects.maude` (CONFIGURATION + minimal NAT + bank + ping-pong) under plain
+  `rewrite`/`search`, pinned byte-identically (value/order/count/states/bindings, modulo the command echo and the
+  `rewrites/second` rate) by `objects_through_repl`. **Done.**
+
+**Three incidental fixes surfaced (all real gaps, fixed in place — not deferred):**
+1. **`split_mixfix` now splits on `:`** (`lex.rs`). An attribute op `bal :_` lexes as tokens `[bal][:_]` and
+   canonicalizes to `bal:_`; `:` was not a fragment boundary, so the grammar terminal glued to `bal:` and never
+   matched a term's standalone `:`. `<_:_|_>` worked only because its `:` sits between holes. Now every
+   `:`-bearing mixfix op (attribute ops, `<_:_|_>`) parses. (The main lexer is unchanged — `X:Nat` stays one
+   colon-variable token.)
+2. **`dag_compare` orders ACU elements arity-first** (`engine.rs`), matching Maude's
+   `orderInt = symbolCount | (arity << 24)` (`Interface/symbol.cc`). A configuration soup's arity-2 messages thus
+   sort before its arity-3 objects (`ping(p1,p2) < … > < … >`), as the reference does. Side benefit: resolved a
+   pre-existing documented cosmetic discrepancy (`x + 5` vs `5 + x`, `nat_renders_like_binary`). Same-arity
+   elements keep the prior `SymbolId` order, so NAT/SET/MAP conformance is unchanged.
+3. **`set <non-trace>` is a silent no-op** in the REPL (`lib.rs` `meta_set`), so `set show advisories off` (used
+   to suppress the reference's "redefining CONFIGURATION" advisory) and `set include …` apply silently — matching
+   Maude — instead of printing an "unsupported" notice.
+
+**Two known rendering divergences (cosmetic, abstracted over by the conformance harness — not objects bugs):**
+- The **command echo** of an ACU soup: Maude re-renders with the `__` operator's binary nesting parens and its
+  echo order; we render the canonical flat form. Results print identically; only the echoed *input* differs (the
+  same class as the `join_tokens` echo caveat).
+- An **on-the-fly search variable**'s sort qualifier: Maude elides `:Sort` when the goal position determines it
+  (`bal : N:Nat` → `N --> …`) but keeps it for a top-level pattern (`=>1 Y:T` → `Y:T --> …`); we always keep it.
+  Orthogonal to objects (a search/printing detail). The fixture sidesteps it with a declared variable.
 
 ### B — `erewrite` (the object-message-fair driver). *(still no external IO)*
 - New `Command::ERewrite` (`surface/ast.rs`) + `run_command` arm (`tnk-repl/src/lib.rs:223`); new engine driver

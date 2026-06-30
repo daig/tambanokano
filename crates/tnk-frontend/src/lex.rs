@@ -398,7 +398,15 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
         // own fragment. Splitting on punctuation — like the main lexer — is what makes an op name whose
         // tokens glue punctuation to text (`_=[_]_` → `= [ ]`) align with how a *term* tokenizes (`=[Z]`
         // lexes as `= [ Z ]`); without it the grammar terminal `=[` could never match.
-        if ch == '_' || is_punct(ch) {
+        //
+        // `:` splits too — but unlike punctuation it is *not* split by the main lexer (so `X:Nat` stays
+        // one colon-variable token). The asymmetry is deliberate: an op name's `:` is a syntactic
+        // separator that is always written space-delimited (`bal :_`, `<_:_|_>`), so in a *term* it is
+        // its own token (`bal : n0` → `bal`, `:`, `n0` — `bal:n0` with no space would be a variable).
+        // The name's tokens, however, get concatenated into the canonical string (`[bal][:_]` → `bal:_`),
+        // gluing the `:` to `bal`; splitting it back out here makes the grammar terminal `:` match the
+        // term's standalone `:` (object/message attribute ops `bal :_`/`turns :_`, Pillar 2.5).
+        if ch == '_' || ch == ':' || is_punct(ch) {
             if !pending.is_empty() {
                 frags.push(Frag::Tok(interner.intern(&pending)));
                 pending.clear();

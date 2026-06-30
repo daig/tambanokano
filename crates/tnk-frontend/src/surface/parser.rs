@@ -1142,7 +1142,14 @@ impl<'a> Parser<'a> {
                 "iter" => { self.advance(); a.iter = true; }
                 "ctor" => { self.advance(); a.ctor = true; }
                 "ditto" => { self.advance(); a.ditto = true; }
-                "memo" | "config" | "obj" | "msg" | "portal" => { self.advance(); }
+                "memo" => { self.advance(); }
+                // Object-system role attributes (Pillar 2.5). `obj`≡`object`, `msg`≡`message`,
+                // `config`≡`configuration` (Maude's lexer aliases). Recorded onto the symbol; they
+                // drive the `erewrite` object-message scheduler but are inert for plain rewrite/search.
+                "config" | "configuration" => { self.advance(); a.config = true; }
+                "obj" | "object" => { self.advance(); a.object = true; }
+                "msg" | "message" => { self.advance(); a.message = true; }
+                "portal" => { self.advance(); a.portal = true; }
                 "frozen" => {
                     self.advance();
                     // `frozen` = all args; `frozen (1 2)` = those 1-based positions.
@@ -1164,9 +1171,9 @@ impl<'a> Parser<'a> {
                     // `_,_ [assoc comm id: empty prec 121]` defaulted to prec 41 and mis-parsed a
                     // constructor-application argument (`a |-> a, a |-> a`).
                     a.id = Some(self.collect_until(&[
-                        "assoc", "comm", "idem", "iter", "ctor", "ditto", "memo", "config", "obj", "msg",
-                        "portal", "frozen", "id:", "prec", "gather", "strat", "special", "poly", "format",
-                        "metadata", "latex", "]",
+                        "assoc", "comm", "idem", "iter", "ctor", "ditto", "memo", "config", "configuration",
+                        "obj", "object", "msg", "message", "portal", "frozen", "id:", "prec", "gather",
+                        "strat", "special", "poly", "format", "metadata", "latex", "]",
                     ]));
                 }
                 "prec" => {
@@ -1292,6 +1299,10 @@ impl Attrs {
             ditto: self.ditto,
             poly: self.poly.clone(),
             format: self.format.clone(),
+            config: self.config,
+            object: self.object,
+            message: self.message,
+            portal: self.portal,
         }
     }
 }

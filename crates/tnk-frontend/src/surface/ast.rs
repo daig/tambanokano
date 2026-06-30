@@ -178,6 +178,15 @@ pub struct Attrs {
     /// default, `s` space, `t` tab, `n` newline, `i` indent, `+`/`-` indent level — e.g. `n++i`, `ni`).
     /// The pretty-printer uses it for `_<-_`/`{_,_,_}`/`rl_=>_[_].` layout; `None` = Maude's default spacing.
     pub format: Option<Vec<String>>,
+    /// `config` / `configuration` — the configuration-multiset constructor (`__`), Pillar 2.5. Recorded
+    /// onto the kernel symbol; the `erewrite` object-message scheduler keys its soup partition on it.
+    pub config: bool,
+    /// `obj` / `object` — the object constructor (`<_:_|_>`).
+    pub object: bool,
+    /// `msg` / `message` — a message operator.
+    pub message: bool,
+    /// `portal` — the external-IO portal (`<>`).
+    pub portal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
