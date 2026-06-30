@@ -75,16 +75,32 @@ wrapper (`Int`/`Nat`/`Rat` newtypes). `Float` stays IEEE `f64`. `rug` (GMP) is a
 **Impact.** Bignum type appears in the `DagNode` `S`/number variants → wrapper defined in Phase 0.
 **Revisit:** **Phase 1** (confirm with a number-heavy benchmark; verify malachite's license suits us).
 
-## D5 — External IO: own a `mio` reactor
-**Decision.** A single-threaded, deterministic **`mio`** reactor (owned `Reactor` struct: `Poll` + fd→manager
-map + timer heap) drives external objects; `erewrite` interleaves rewriting quanta with `reactor.poll()`.
-Control-C/SIGCHLD via `signal-hook` setting an `AtomicBool` checked at safe points. Managers implement an
-`ExternalObject` trait. `tokio` is **not** adopted now.
+## D5 — External IO: **host-owned IO via embedding** (supersedes the in-engine `mio` reactor)
+**Decision (revised 2026-06-30).** Do **not** build an in-engine reactor or the FILE/SOCKET/PROCESS
+managers. Keep the engine a pure, instance-based rewriting kernel and let a **host program embed it and own
+all IO** — the host runs the event loop and does file/socket/process/terminal IO with native Rust
+(`std::fs`/`std::net`/`std::process`/`tokio`, its choice), calling the engine for computation. The minimal
+embedding-IO API (a Model-B "drain external requests / inject replies" surface) is **deliberately left
+undesigned for now** — to be specified when we take up embedding in earnest.
 
-**Why.** Matches Maude's cooperative single-threaded interleave with no async function-coloring across a
-synchronous CPU-bound engine; lighter and deterministic.
-**Impact.** Shapes `engine::io` and `ObjectSystemRewritingContext`. **Revisit:** **Phase 2**; reconsider
-`tokio` only for a future heavily-networked direction.
+The in-engine **`mio` reactor + `ExternalObject` managers + `signal-hook`** plan below is **shelved**, not
+deleted — recoverable if we ever want to run arbitrary existing Maude IO `.maude` files unmodified (which is
+the only thing that strictly needs the engine to speak the `fileManager`/`socketManager` protocols itself).
+
+**Why.** (1) The engine is *already built for this* — `Engine { sig, rt }` is instance-owned with **no global
+mutable state and no direct IO**; the STD-STREAM work (Phase 2.5-C) already routes `write`→a buffer and
+`getLine`←a buffer the host drives, i.e. it is already host-mediated, not syscall-based. (2) It matches where
+Maude's value actually is (pure rewriting/search/model-checking) and how it is mainly used; raw file/socket/
+process IO is a minority capability. (3) It avoids rebuilding a worse `tokio`/`PseudoThread` and the whole
+signal/suspend-resume surface — the four most expensive, least-conformance-friendly phases collapse to one
+small API. (4) Aligns with **D1** (instance-based, no globals). Trade-off: the IO *conformance target*
+changes — "a faithful pure engine a host drives," not "byte-identical to Maude running an `openFile`
+program" (that would require the host, or a shelved manager layer, to speak the exact protocols).
+
+*Shelved plan (for reference):* a single-threaded deterministic **`mio`** reactor (owned `Reactor`: `Poll` +
+fd→manager map + timer heap); `erewrite` interleaves rewriting quanta with `reactor.poll()`; Ctrl-C/SIGCHLD
+via `signal-hook`→`AtomicBool` at safe points; managers implement an `ExternalObject` trait; no `tokio`.
+**Revisit:** when embedding is taken up (design the Model-B API then) — see `objects-io-plan.md` §4-C…E.
 
 ## D6 — BDD: `biodivine-lib-bdd` behind a facade, feature-gated
 **Decision.** Use pure-Rust **`biodivine-lib-bdd`** behind a `bdd` facade trait (var/and/or/not/restrict/

@@ -1,5 +1,15 @@
 # Phase 2.5 — Objects + external IO: implementation plan
 
+> **⚠️ Direction change (2026-06-30): external IO is deferred in favor of EMBEDDING.** Phases A, B, and the
+> synchronous STD-STREAM (C-sync, C-stdin) are **done** (objects, `erewrite`, host-mediated stdout/stdin). The
+> remaining IO — **C-reactor and all of D (FILE/SOCKET/PROCESS, signals)** — is **not being built in-engine.**
+> Per the revised **D5** (`03-open-decisions.md`), the engine stays a pure, instance-based kernel and a **host
+> program owns IO** (native Rust file/socket/process/event-loop), embedding the engine for computation. The
+> minimal embedding-IO API is **intentionally not designed yet** — to be specified when embedding is taken up.
+> The §4-C…E material below is **retained as the shelved in-engine plan** (recoverable if we ever need to run
+> arbitrary existing Maude IO `.maude` files unmodified). **Next non-IO target: `omod`/`class`/`msg` (§4-E),
+> which is independent of all this.**
+
 The last Phase-2 subsystem: object-message **configurations**, the object-message-fair **`erewrite`**, and
 **external objects** (standard streams / files / sockets / processes), plus Ctrl-C/SIGCHLD. It unblocks the
 **prelude tail** (`LEXICAL`/`LOOP-MODE`/`CONFIGURATION`, the lines just past where the META corpus stops) and is

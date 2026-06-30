@@ -239,7 +239,12 @@ prelude load.
    `stdout` manager (`StreamManagerSymbol`) emits `str` + replies `wrote` (synchronous); `getLine(stdin, me,
    prompt)` writes the prompt + reads a line (incl. its `\n`, EOF → `""`) over a scripted/piped input buffer +
    replies `gotLine`. `conformance/objects-io.maude` (`objects_io_through_repl`, GREET/TICKER/ECHO) is
-   byte-identical to the reference. Next: the `mio` reactor (interactive stdin + the Phase-D async managers).
+   byte-identical to the reference.
+   **External IO deferred (2026-06-30) — embedding direction.** The remaining IO (the `mio` reactor, FILE/
+   SOCKET/PROCESS, signals) is **not** being built in-engine; per the revised **D5** the engine stays a pure,
+   instance-based kernel and a host program owns IO (native Rust), embedding it for computation. The minimal
+   embedding API is left undesigned for now. **Next: `omod`/`class`/`msg` desugaring** (the OO surface
+   language — frontend, independent of IO), then LOOP-MODE → Full Maude (Phase 3.4).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 
