@@ -222,7 +222,11 @@ prelude load.
    Stage-5 strategy tail, kept inert. Plan: `strategy-plan.md`.
 5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
    streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`
-   decision. Reference: `reports/A6-operational.md`.
+   decision. **Greenfield** — plain `rewrite`/`search` over a configuration already work (the ACU engine),
+   so the new runtime is `erewrite`'s object-message-fair scheduler (the C++ `ConfigSymbol`) + the reactor
+   (the C++ `PseudoThread`); the OO syntax (`omod`/`class`/`msg`) is Core-Maude C++, a frontend desugaring
+   here. Full C++-grounded plan (context stack / fairness / manager protocols / reactor contract / signals /
+   LOOP-MODE / phasing): `objects-io-plan.md`.
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 
