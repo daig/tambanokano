@@ -225,8 +225,8 @@ pub struct SpecialSpec {
 /// be too). Such statements parse and carry through flattening, but are skipped when loading the engine.
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool, nonexec: bool },
-    Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },
+    Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool, nonexec: bool, label: Option<String> },
+    Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool, label: Option<String> },
     /// `rl [\[label\] :] lhs => rhs .` (or `crl … if cond .`). A rule condition may carry a rewrite
     /// fragment `t => p` (Pillar A-v) in addition to the `ceq`-style fragments.
     Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },

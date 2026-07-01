@@ -52,6 +52,13 @@ pub struct EqTrace {
     /// Statement-local variable names, indexed as the kernel's substitution is (first occurrence order).
     pub var_names: Vec<String>,
     pub owise: bool,
+    /// The `[label …]` name, if any — retained for META `upEqs`/`upModule` (renders `[label('l)]`), not
+    /// used by execution.
+    pub label: Option<String>,
+    /// A `[nonexec]` axiom (a proof obligation). Engine-registered traces are always `false` (build skips
+    /// nonexec); META up-translation sets it for a module's own `[nonexec]` equations, which it parses on
+    /// demand (they carry no engine trace) — [`parse_statement_trace`](crate::load::parse_statement_trace).
+    pub nonexec: bool,
 }
 
 /// Source-form trace metadata for one membership axiom, keyed by the kernel's dense membership id
@@ -62,6 +69,10 @@ pub struct MbTrace {
     pub sort: SortId,
     pub condition: Vec<ConditionFragment>,
     pub var_names: Vec<String>,
+    /// The `[label …]` name, if any — retained for META `upMbs`/`upModule`. See [`EqTrace::label`].
+    pub label: Option<String>,
+    /// A `[nonexec]` membership axiom — see [`EqTrace::nonexec`].
+    pub nonexec: bool,
 }
 
 /// Source-form trace metadata for one rule, keyed by the kernel's dense rule id
@@ -76,6 +87,8 @@ pub struct RlTrace {
     /// The `[label]` of a labelled rule (`rl [foo] : …`), if any — rendered in the body and on the
     /// `show path` arc.
     pub label: Option<String>,
+    /// A `[nonexec]` rule — see [`EqTrace::nonexec`].
+    pub nonexec: bool,
 }
 
 /// A built module: the `Engine` (sorts + ops + attributes, but **not** statements — those need the grammar,

@@ -43,9 +43,11 @@
 //! subsystem (`gaps.md`): the Stage-3
 //! compute corners (conditional-rule `metaApply`, conditioned `metaMatch`, the partial substitution, the
 //! AC-residue `metaXmatch` context, the exhausted-search count); and the Stage-4 boundaries (flat-mode
-//! `special`/`poly` builtin-hook attributes — the inverse of [`down_attrs`]' boundary, leaving flat
-//! `upModule` over a builtin module inert; the multi-attribute `ctor`-order ACU divergence; non-`mixfix`
-//! print options; own `nonexec`-statement up; and structured module-expression / op→term view maps).
+//! builtin imports — `special`/`poly` op hooks *and* the imported builtin module's statements, both leaving
+//! a flat `up*` over a builtin closure partial/inert, the inverse of [`down_attrs`]' boundary; the
+//! multi-attribute `ctor`-order ACU divergence; non-`mixfix` print options; and structured
+//! module-expression / op→term view maps). Own `[nonexec]` axioms + equation/membership labels *are* now
+//! retained (parsed on demand — build installs no trace; see [`parse_statement_trace`](tnk_frontend::load)).
 
 use std::collections::BTreeSet;
 
@@ -58,7 +60,7 @@ use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{tokenize, Interner};
-use tnk_frontend::load::{build_command_dag, build_loaded_module, LoadedModule};
+use tnk_frontend::load::{build_command_dag, build_loaded_module, parse_statement_trace, LoadedModule, StmtTrace};
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
@@ -738,11 +740,11 @@ impl MetaDescent<'_> {
         let sorts = up_sorts_dag(ctx, hooks, &p.sorts);
         let subsorts = up_subsorts_dag(ctx, hooks, &p.subsorts);
         let ops = up_ops_dag(ctx, hooks, &p.loaded.built, &p.ops)?;
-        let mbs = up_membs_dag(ctx, hooks, &p.loaded.built, p.mb_range.clone())?;
-        let eqs = up_eqs_dag(ctx, hooks, &p.loaded.built, p.eq_range.clone())?;
+        let mbs = up_membs_dag(ctx, hooks, &p.loaded.built, &p.mbs)?;
+        let eqs = up_eqs_dag(ctx, hooks, &p.loaded.built, &p.eqs)?;
         let mut args = vec![header, imports, sorts, subsorts, ops, mbs, eqs];
         let ctor = if p.kind == ModuleKind::System {
-            args.push(up_rls_dag(ctx, hooks, &p.loaded.built, p.rl_range.clone())?);
+            args.push(up_rls_dag(ctx, hooks, &p.loaded.built, &p.rls)?);
             if p.is_theory { "thSymbol" } else { "modSymbol" }
         } else if p.is_theory {
             "fthSymbol"
@@ -819,9 +821,9 @@ impl MetaDescent<'_> {
             UpPart::Sorts => Some(up_sorts_dag(ctx, hooks, &p.sorts)),
             UpPart::Subsorts => Some(up_subsorts_dag(ctx, hooks, &p.subsorts)),
             UpPart::Ops => up_ops_dag(ctx, hooks, &p.loaded.built, &p.ops),
-            UpPart::Mbs => up_membs_dag(ctx, hooks, &p.loaded.built, p.mb_range.clone()),
-            UpPart::Eqs => up_eqs_dag(ctx, hooks, &p.loaded.built, p.eq_range.clone()),
-            UpPart::Rls => up_rls_dag(ctx, hooks, &p.loaded.built, p.rl_range.clone()),
+            UpPart::Mbs => up_membs_dag(ctx, hooks, &p.loaded.built, &p.mbs),
+            UpPart::Eqs => up_eqs_dag(ctx, hooks, &p.loaded.built, &p.eqs),
+            UpPart::Rls => up_rls_dag(ctx, hooks, &p.loaded.built, &p.rls),
         }
     }
 
@@ -902,22 +904,19 @@ impl MetaDescent<'_> {
                 decl: od.clone(),
             })
             .collect();
-        let (mb_range, eq_range, rl_range) = if flat {
-            (
-                0..loaded.built.mb_traces.len(),
-                0..loaded.built.eq_traces.len(),
-                0..loaded.built.rl_traces.len(),
-            )
+        let (mbs, eqs, rls) = if flat {
+            // The whole import closure: walk the flattened statement list, interleaving `[nonexec]` axioms
+            // with the flat build's trace vectors (which cover every executable statement, from index 0).
+            merge_statement_traces(&flat_pm.statements, &loaded, self.interner, (0, 0, 0))
         } else {
-            // Own (non-imported) statements are the suffix: count this module's own executable
-            // declarations of each kind (nonexec statements install no trace, so are excluded here too —
-            // their up-translation would need the unparsed bubble, a theory-axiom follow-on).
+            // The module's own statements: executable ones are the trace suffix (imports are built first, so
+            // the k-th own executable statement of a kind is the k-th entry past the import prefix).
+            let b = &loaded.built;
             let own_mb = pm.statements.iter().filter(|s| matches!(s, Statement::Mb { nonexec, .. } if !nonexec)).count();
             let own_eq = pm.statements.iter().filter(|s| matches!(s, Statement::Eq { nonexec, .. } if !nonexec)).count();
             let own_rl = pm.statements.iter().filter(|s| matches!(s, Statement::Rule { nonexec, .. } if !nonexec)).count();
-            let (mbn, eqn, rln) =
-                (loaded.built.mb_traces.len(), loaded.built.eq_traces.len(), loaded.built.rl_traces.len());
-            ((mbn - own_mb)..mbn, (eqn - own_eq)..eqn, (rln - own_rl)..rln)
+            let starts = (b.mb_traces.len() - own_mb, b.eq_traces.len() - own_eq, b.rl_traces.len() - own_rl);
+            merge_statement_traces(&pm.statements, &loaded, self.interner, starts)
         };
         Some(ModulePieces {
             kind: flat_pm.kind,
@@ -926,9 +925,9 @@ impl MetaDescent<'_> {
             subsorts,
             ops,
             imports,
-            mb_range,
-            eq_range,
-            rl_range,
+            mbs,
+            eqs,
+            rls,
             loaded,
         })
     }
@@ -1219,7 +1218,17 @@ fn install_membs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule
         }
         let nr = vars.count();
         let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
-        let trace = MbTrace { lhs: lhs.clone(), sort: sort_id, condition: condition.clone(), var_names };
+        // Down-installed statements are executable (nonexec skipped above); retain the label from the meta
+        // `AttrSet` (as the rule path does) so a down∘up round-trip preserves it.
+        let label = attrset_label(ctx, hooks, attrs);
+        let trace = MbTrace {
+            lhs: lhs.clone(),
+            sort: sort_id,
+            condition: condition.clone(),
+            var_names,
+            label,
+            nonexec: false,
+        };
         let id = if condition.is_empty() {
             m.engine.add_membership(Membership { lhs, sort: sort_id, nr_vars: nr })
         } else {
@@ -1261,8 +1270,15 @@ fn install_eqs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) 
         let owise = attrset_has(ctx, hooks, attrs, "owiseSymbol");
         let nr = vars.count();
         let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
-        let trace =
-            EqTrace { lhs: lhs.clone(), rhs: rhs.clone(), condition: condition.clone(), var_names, owise };
+        let trace = EqTrace {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            condition: condition.clone(),
+            var_names,
+            owise,
+            label: attrset_label(ctx, hooks, attrs), // executable (nonexec skipped above); retain the label
+            nonexec: false,
+        };
         let id = if owise {
             m.engine.add_owise_equation(lhs, rhs, nr, condition)
         } else if condition.is_empty() {
@@ -1305,8 +1321,14 @@ fn install_rules(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule
         let label = attrset_label(ctx, hooks, attrs);
         let nr = vars.count();
         let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
-        let trace =
-            RlTrace { lhs: lhs.clone(), rhs: rhs.clone(), condition: condition.clone(), var_names, label };
+        let trace = RlTrace {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+            condition: condition.clone(),
+            var_names,
+            label,
+            nonexec: false,
+        };
         let id = if condition.is_empty() {
             m.engine.add_rule(lhs, rhs, nr)
         } else {
@@ -1918,8 +1940,10 @@ enum UpPart {
 }
 
 /// The decomposition of a built module: the surface sorts/subsorts/ops to emit (the whole closure for the
-/// flat form, the module's own for the non-flat form), the import list (non-flat only), and the index
-/// ranges into the flat build's trace vectors for memberships/equations/rules.
+/// flat form, the module's own for the non-flat form), the import list (non-flat only), and the
+/// memberships/equations/rules to up-translate — the flat build's whole trace vectors for the flat form, or
+/// the module's own statements in **declaration order** for the non-flat form (executable statements from
+/// the trace suffix, interleaved with `[nonexec]` axioms parsed on demand — they carry no engine trace).
 struct ModulePieces {
     kind: ModuleKind,
     is_theory: bool,
@@ -1927,10 +1951,65 @@ struct ModulePieces {
     subsorts: Vec<Vec<Vec<String>>>,
     ops: Vec<UpOp>,
     imports: Vec<Import>,
-    mb_range: std::ops::Range<usize>,
-    eq_range: std::ops::Range<usize>,
-    rl_range: std::ops::Range<usize>,
+    mbs: Vec<MbTrace>,
+    eqs: Vec<EqTrace>,
+    rls: Vec<RlTrace>,
     loaded: LoadedModule,
+}
+
+/// Up-translate a statement list to its per-kind traces, in **declaration order**, interleaving executable
+/// statements (which carry an engine trace) with `[nonexec]` axioms (which do not — [`load_statements`]
+/// (tnk_frontend::load) skips them, since a proof obligation is applied by neither reduction nor
+/// completion). Each executable statement of a kind takes the next entry of its trace vector starting at
+/// `starts` (the whole vector — `(0,0,0)` — for the flat closure, or the own-statement suffix for the
+/// non-flat form, since flatten appends a module's own statements after its imports in order); each nonexec
+/// axiom is parsed on demand from its bubble against the built module. A nonexec statement that fails to
+/// parse is skipped (the up result omits it but stays otherwise faithful — the meta layer's inert-on-
+/// failure contract).
+fn merge_statement_traces(
+    stmts: &[Statement],
+    loaded: &LoadedModule,
+    i: &Interner,
+    starts: (usize, usize, usize),
+) -> (Vec<MbTrace>, Vec<EqTrace>, Vec<RlTrace>) {
+    let b = &loaded.built;
+    let (mut mb_i, mut eq_i, mut rl_i) = starts;
+    let (mut mbs, mut eqs, mut rls) = (Vec::new(), Vec::new(), Vec::new());
+    for stmt in stmts {
+        match stmt {
+            Statement::Mb { nonexec, .. } => {
+                if *nonexec {
+                    if let Ok(StmtTrace::Mb(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                        mbs.push(t);
+                    }
+                } else {
+                    mbs.push(b.mb_traces[mb_i].clone());
+                    mb_i += 1;
+                }
+            }
+            Statement::Eq { nonexec, .. } => {
+                if *nonexec {
+                    if let Ok(StmtTrace::Eq(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                        eqs.push(t);
+                    }
+                } else {
+                    eqs.push(b.eq_traces[eq_i].clone());
+                    eq_i += 1;
+                }
+            }
+            Statement::Rule { nonexec, .. } => {
+                if *nonexec {
+                    if let Ok(StmtTrace::Rl(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                        rls.push(t);
+                    }
+                } else {
+                    rls.push(b.rl_traces[rl_i].clone());
+                    rl_i += 1;
+                }
+            }
+        }
+    }
+    (mbs, eqs, rls)
 }
 
 /// One operator to up-translate: its canonical name + the (pre-joined) identity-element name + the surface
@@ -2159,18 +2238,41 @@ fn up_nat_list(ctx: &mut MetaCtx, hooks: &MetaHooks, positions: &[u32]) -> Optio
 }
 
 /// Up-translate the membership traces in `range` to a `MembAxSet` (`mb`/`cmb` joined by `__`).
+/// Build a statement `AttrSet` from its retained attributes — the `owise`/`nonexec` flags and an optional
+/// `label(Q)` — joined ACU (`none` when empty, the `[none]` an unattributed statement prints). The set is
+/// order-independent; Maude renders it in its own ACU order (a fixture pins the common `[nonexec label('l)]`).
+fn stmt_attr_set(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    owise: bool,
+    nonexec: bool,
+    label: Option<&str>,
+) -> DagId {
+    let mut elems = Vec::new();
+    if owise && let Some(&s) = hooks.ops.get("owiseSymbol") {
+        elems.push(ctx.app(s, vec![]));
+    }
+    if nonexec && let Some(&s) = hooks.ops.get("nonexecSymbol") {
+        elems.push(ctx.app(s, vec![]));
+    }
+    if let Some(l) = label {
+        let lqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(l.into()));
+        elems.push(ctx.app(hooks.ops["labelSymbol"], vec![lqid]));
+    }
+    up_set(ctx, elems, hooks.ops["emptyAttrSetSymbol"], hooks.ops["attrSetSymbol"])
+}
+
 fn up_membs_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     m: &BuiltModule,
-    range: std::ops::Range<usize>,
+    traces: &[MbTrace],
 ) -> Option<DagId> {
     let mut elems = Vec::new();
-    for i in range {
-        let t = &m.mb_traces[i];
+    for t in traces {
         let lhs = up_pattern(ctx, hooks, m, &t.lhs, &t.var_names);
         let sort = up_type(ctx, hooks, m, t.sort);
-        let attrs = ctx.app(hooks.ops["emptyAttrSetSymbol"], vec![]);
+        let attrs = stmt_attr_set(ctx, hooks, false, t.nonexec, t.label.as_deref());
         let mb = if t.condition.is_empty() {
             ctx.app(hooks.ops["mbSymbol"], vec![lhs, sort, attrs])
         } else {
@@ -2182,24 +2284,19 @@ fn up_membs_dag(
     Some(up_set(ctx, elems, hooks.ops["emptyMembAxSetSymbol"], hooks.ops["membAxSetSymbol"]))
 }
 
-/// Up-translate the equation traces in `range` to an `EquationSet` (`eq`/`ceq` joined by `__`); a `[owise]`
-/// equation carries the `owise` attribute, all others `[none]`.
+/// Up-translate the equation traces to an `EquationSet` (`eq`/`ceq` joined by `__`), each carrying its
+/// `[owise]`/`[nonexec]`/`[label('l)]` attributes (`[none]` if plain).
 fn up_eqs_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     m: &BuiltModule,
-    range: std::ops::Range<usize>,
+    traces: &[EqTrace],
 ) -> Option<DagId> {
     let mut elems = Vec::new();
-    for i in range {
-        let t = &m.eq_traces[i];
+    for t in traces {
         let lhs = up_pattern(ctx, hooks, m, &t.lhs, &t.var_names);
         let rhs = up_pattern(ctx, hooks, m, &t.rhs, &t.var_names);
-        let attrs = if t.owise {
-            ctx.app(hooks.ops["owiseSymbol"], vec![])
-        } else {
-            ctx.app(hooks.ops["emptyAttrSetSymbol"], vec![])
-        };
+        let attrs = stmt_attr_set(ctx, hooks, t.owise, t.nonexec, t.label.as_deref());
         let eq = if t.condition.is_empty() {
             ctx.app(hooks.ops["eqSymbol"], vec![lhs, rhs, attrs])
         } else {
@@ -2217,11 +2314,11 @@ fn up_rls_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     m: &BuiltModule,
-    range: std::ops::Range<usize>,
+    traces: &[RlTrace],
 ) -> Option<DagId> {
     let mut elems = Vec::new();
-    for i in range {
-        elems.push(up_rule(ctx, hooks, m, &m.rl_traces[i])?);
+    for t in traces {
+        elems.push(up_rule(ctx, hooks, m, t)?);
     }
     Some(up_set(ctx, elems, hooks.ops["emptyRuleSetSymbol"], hooks.ops["ruleSetSymbol"]))
 }
@@ -2437,13 +2534,7 @@ fn sort_name_of(source: &BuiltModule, symbol: SymbolId) -> String {
 fn up_rule(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, trace: &RlTrace) -> Option<DagId> {
     let up_lhs = up_pattern(ctx, hooks, source, &trace.lhs, &trace.var_names);
     let up_rhs = up_pattern(ctx, hooks, source, &trace.rhs, &trace.var_names);
-    let attrs = match trace.label.as_deref() {
-        Some(l) => {
-            let lqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(l.into()));
-            ctx.app(hooks.ops["labelSymbol"], vec![lqid])
-        }
-        None => ctx.app(hooks.ops["emptyAttrSetSymbol"], vec![]),
-    };
+    let attrs = stmt_attr_set(ctx, hooks, false, trace.nonexec, trace.label.as_deref());
     Some(if trace.condition.is_empty() {
         ctx.app(hooks.ops["rlSymbol"], vec![up_lhs, up_rhs, attrs])
     } else {

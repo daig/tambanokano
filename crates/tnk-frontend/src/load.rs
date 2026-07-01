@@ -97,7 +97,7 @@ fn load_statements(
             continue;
         }
         match stmt {
-            Statement::Eq { lhs, rhs, cond, owise, .. } => {
+            Statement::Eq { lhs, rhs, cond, owise, label, .. } => {
                 // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
                 // one variable index. Then add via the matching kernel facade.
                 let mut vars = VarIndex::new();
@@ -123,6 +123,8 @@ fn load_statements(
                     condition: condition.clone(),
                     var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
                     owise: *owise,
+                    label: label.clone(),
+                    nonexec: false, // engine-registered ⇒ executable
                 };
                 let id = if *owise {
                     m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition)
@@ -134,7 +136,7 @@ fn load_statements(
                 assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
                 m.eq_traces.push(trace);
             }
-            Statement::Mb { lhs, sort, cond, .. } => {
+            Statement::Mb { lhs, sort, cond, label, .. } => {
                 let mut vars = VarIndex::new();
                 let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
                 let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -153,6 +155,8 @@ fn load_statements(
                     sort: sort_id,
                     condition: condition.clone(),
                     var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                    label: label.clone(),
+                    nonexec: false, // engine-registered ⇒ executable
                 };
                 let id = if condition.is_empty() {
                     m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr })
@@ -185,6 +189,7 @@ fn load_statements(
                     condition: condition.clone(),
                     var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
                     label: label.clone(),
+                    nonexec: false, // engine-registered ⇒ executable
                 };
                 let id = if condition.is_empty() {
                     m.engine.add_rule(lhs_t, rhs_t, nr)
@@ -197,6 +202,92 @@ fn load_statements(
         }
     }
     Ok(())
+}
+
+/// One statement parsed into its trace form (the sum of the three engine-trace kinds). Produced by
+/// [`parse_statement_trace`] for statements that carry no engine trace.
+pub enum StmtTrace {
+    Eq(EqTrace),
+    Mb(MbTrace),
+    Rl(RlTrace),
+}
+
+/// Parse a statement's raw bubbles into its [`StmtTrace`] against an already-built module's grammar and
+/// signature, **without** registering it in the engine and **without** object-pattern completion. This is
+/// how META up-translation reflects a module's own `[nonexec]` axioms: [`load_statements`] skips them (a
+/// proof obligation is applied by neither reduction nor completion, so it carries no engine trace), yet
+/// `upEqs`/`upMbs`/`upRls`/`upModule` must still emit them. Mirrors the per-statement parse in
+/// [`load_statements`] (lhs → condition → rhs, sharing one variable index); the returned trace carries the
+/// statement's `nonexec`/`owise`/`label` for the up-translated `AttrSet`.
+pub fn parse_statement_trace(
+    stmt: &Statement,
+    m: &BuiltModule,
+    g: &CompiledGrammar,
+    i: &Interner,
+) -> Result<StmtTrace, String> {
+    match stmt {
+        Statement::Eq { lhs, rhs, cond, owise, nonexec, label } => {
+            let mut vars = VarIndex::new();
+            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            reject_rewrite_fragment(&condition, "equation")?;
+            let nr = vars.count();
+            Ok(StmtTrace::Eq(EqTrace {
+                lhs: lhs_t,
+                rhs: rhs_t,
+                condition,
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                owise: *owise,
+                label: label.clone(),
+                nonexec: *nonexec,
+            }))
+        }
+        Statement::Mb { lhs, sort, cond, nonexec, label } => {
+            let mut vars = VarIndex::new();
+            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let sort_id = resolve_sort(sort, m, i)?;
+            let condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            reject_rewrite_fragment(&condition, "membership")?;
+            let nr = vars.count();
+            Ok(StmtTrace::Mb(MbTrace {
+                lhs: lhs_t,
+                sort: sort_id,
+                condition,
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                label: label.clone(),
+                nonexec: *nonexec,
+            }))
+        }
+        Statement::Rule { label, lhs, rhs, cond, nonexec } => {
+            let mut vars = VarIndex::new();
+            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            // (a rule condition may carry a rewrite fragment `t => p`, so no reject here)
+            let nr = vars.count();
+            Ok(StmtTrace::Rl(RlTrace {
+                lhs: lhs_t,
+                rhs: rhs_t,
+                condition,
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                label: label.clone(),
+                nonexec: *nonexec,
+            }))
+        }
+    }
 }
 
 /// The connective of a condition fragment.

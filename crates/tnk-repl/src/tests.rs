@@ -1736,3 +1736,65 @@ fn objects_oth_meta_through_repl() {
     }
 }
 
+/// META-LEVEL up*: a module's own `[nonexec]` axioms are retained by `upEqs`/`upMbs`/`upRls` (build skips
+/// them — a proof obligation carries no engine trace — so up-translation parses their bubbles on demand),
+/// in **declaration order**, and equation/membership `[label …]`s are retained too (the label rode along).
+/// Byte-verified against the reference: nonexec eq/mb/cmb/rule with labels, exec-before-nonexec ordering,
+/// and an executable equation's own label.
+#[test]
+fn meta_nonexec_up_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude")); // load the META-LEVEL tower
+    let out = r
+        .eval(concat!(
+            // an executable eq declared BEFORE a nonexec eq — declaration order must survive up-translation.
+            "fth ORDA is\n",
+            "  sorts Elt .\n",
+            "  op a : -> Elt [ctor] .\n",
+            "  op f : Elt -> Elt .  op g : Elt -> Elt .\n",
+            "  var X : Elt .\n",
+            "  eq f(X) = X .\n",
+            "  eq g(X) = X [nonexec label gx] .\n",
+            "endfth\n",
+            // an EXECUTABLE equation label is retained too (previously dropped).
+            "fmod LBL is\n",
+            "  sorts S .  op a : -> S [ctor] .  op f : S -> S .  var X : S .\n",
+            "  eq f(X) = X [label fx] .\n",
+            "endfm\n",
+            // nonexec memberships: plain + conditional.
+            "fth MBX is\n",
+            "  sorts S T .  subsort T < S .  op a : -> S [ctor] .  op p : S -> S .  var X : S .\n",
+            "  mb a : T [nonexec label mbax] .\n",
+            "  cmb p(X) : T if X : T [nonexec label cmbax] .\n",
+            "endfth\n",
+            // a nonexec rule (label from the leading `[rax] :`), then an executable rule.
+            "mod RLX is\n",
+            "  sorts S .  ops a b : -> S [ctor] .  op f : S -> S .  var X : S .\n",
+            "  rl [rax] : f(X) => X [nonexec] .\n",
+            "  rl f(a) => b .\n",
+            "endm\n",
+            "red in META-LEVEL : upEqs('ORDA, false) .\n",
+            "red in META-LEVEL : upEqs('ORDA, true) .\n", // flat form (no imports ⇒ same result) — exercises the flat merge path
+            "red in META-LEVEL : upEqs('LBL, false) .\n",
+            "red in META-LEVEL : upMbs('MBX, false) .\n",
+            "red in META-LEVEL : upRls('RLX, false) .\n",
+        ))
+        .output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "nonexec up: {out}");
+    // The nonexec eq is retained with `[nonexec label('gx)]`, in declaration order after the exec `[none]`.
+    assert!(
+        out.contains("eq 'f['X:Elt] = 'X:Elt [none] .\neq 'g['X:Elt] = 'X:Elt [nonexec label('gx)] ."),
+        "nonexec eq retained in declaration order: {out}"
+    );
+    // An executable equation's own `[label]` is retained.
+    assert!(out.contains("eq 'f['X:S] = 'X:S [label('fx)] ."), "executable eq label: {out}");
+    // Nonexec memberships (plain + conditional) retained with their labels.
+    assert!(out.contains("mb 'a.S : 'T [nonexec label('mbax)] ."), "nonexec mb: {out}");
+    assert!(out.contains("cmb 'p['X:S] : 'T if 'X:S : 'T [nonexec label('cmbax)] ."), "nonexec cmb: {out}");
+    // Nonexec rule retained (with its label), then the executable rule as `[none]`, in declaration order.
+    assert!(
+        out.contains("rl 'f['X:S] => 'X:S [nonexec label('rax)] .\nrl 'f['a.S] => 'b.S [none] ."),
+        "nonexec rule retained in declaration order: {out}"
+    );
+}
+

@@ -8,12 +8,15 @@ use crate::surface::ast::*;
 
 pub type PResult<T> = Result<T, String>;
 
-/// The execution-relevant trailing attributes of a statement (`[owise]`, `[nonexec]`). Other attributes
-/// (`label`, `metadata`, `print`, …) are parsed but not retained — see [`Parser::stmt_attrs`].
-#[derive(Debug, Default, Clone, Copy)]
+/// The retained trailing attributes of a statement: the execution-relevant `[owise]`/`[nonexec]` flags and
+/// the `[label …]` name (kept for META up-translation — `upEqs`/`upMbs` render it, matching the reference).
+/// Other attributes (`metadata`, `print`, `format`, …) are parsed but not retained — see
+/// [`Parser::stmt_attrs`].
+#[derive(Debug, Default, Clone)]
 struct StmtAttrs {
     owise: bool,
     nonexec: bool,
+    label: Option<String>,
 }
 
 pub struct Parser<'a> {
@@ -76,10 +79,21 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
     if !body.get(open + 1).map(|t| i.resolve(t.sym)).is_some_and(is_attr_kw) {
         return sa; // a `[_]`-list / `{_}`-set term, not attributes
     }
+    // `label`/`metadata` each take one following argument token; capture the label name (for META
+    // up-translation), skip metadata's, and ignore everything else token-by-token.
+    let mut want_arg: Option<&str> = None;
     for t in &body[open + 1..body.len() - 1] {
-        match i.resolve(t.sym) {
+        let s = i.resolve(t.sym);
+        if let Some(kw) = want_arg.take() {
+            if kw == "label" {
+                sa.label = Some(s.to_string());
+            }
+            continue;
+        }
+        match s {
             "owise" => sa.owise = true,
             "nonexec" => sa.nonexec = true,
+            "label" | "metadata" => want_arg = Some(s),
             _ => {}
         }
     }
@@ -779,7 +793,7 @@ impl<'a> Parser<'a> {
                 let eq = top_level_find(&body, self.i, "=", true).ok_or("equation is missing `=`")?;
                 let rhs = body.split_off(eq + 1);
                 body.pop(); // the `=`
-                m.statements.push(Statement::Eq { lhs: body, rhs, cond, owise: sa.owise, nonexec: sa.nonexec });
+                m.statements.push(Statement::Eq { lhs: body, rhs, cond, owise: sa.owise, nonexec: sa.nonexec, label: sa.label });
             }
             "mb" | "cmb" => {
                 let conditional = kw == "cmb";
@@ -800,7 +814,7 @@ impl<'a> Parser<'a> {
                 }
                 let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                m.statements.push(Statement::Mb { lhs, sort, cond, nonexec: sa.nonexec });
+                m.statements.push(Statement::Mb { lhs, sort, cond, nonexec: sa.nonexec, label: sa.label });
             }
             "rl" | "crl" => {
                 if m.kind == ModuleKind::Functional {
@@ -839,7 +853,9 @@ impl<'a> Parser<'a> {
                 // `nonexec` blocks execution; the rest don't affect it.
                 let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                m.statements.push(Statement::Rule { label, lhs, rhs, cond, nonexec: sa.nonexec });
+                // The label may be written either as the leading `[name] :` or as a trailing `[label name]`;
+                // the leading form wins if both appear.
+                m.statements.push(Statement::Rule { label: label.or(sa.label), lhs, rhs, cond, nonexec: sa.nonexec });
             }
             "strat" | "strats" => {
                 if !m.is_strategy {
@@ -1236,9 +1252,9 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
-    /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. Only `owise` and `nonexec`
-    /// affect execution and are returned; `label`/`metadata` (and their argument) plus any other attribute
-    /// (`print`, `format`, …) are parsed and ignored. Absent `[` ⇒ both `false`.
+    /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. `owise`/`nonexec` (execution)
+    /// and the `label` name (for META up-translation) are retained; `metadata` (and its argument) plus any
+    /// other attribute (`print`, `format`, …) are parsed and ignored. Absent `[` ⇒ defaults.
     fn stmt_attrs(&mut self) -> PResult<StmtAttrs> {
         let mut sa = StmtAttrs::default();
         if !self.at("[") {
@@ -1255,10 +1271,17 @@ impl<'a> Parser<'a> {
                     sa.nonexec = true;
                     self.advance();
                 }
-                "label" | "metadata" => {
-                    self.advance(); // the keyword
+                "label" => {
+                    self.advance(); // 'label'
                     if !self.at("]") {
-                        self.advance(); // its single argument (label name / metadata string)
+                        sa.label = self.peek_text().map(str::to_string); // retained for META up-translation
+                        self.advance();
+                    }
+                }
+                "metadata" => {
+                    self.advance(); // 'metadata'
+                    if !self.at("]") {
+                        self.advance(); // its string argument (not retained)
                     }
                 }
                 _ => {

@@ -189,21 +189,23 @@ correctness fix.
   Stage 3.5: `print_pretty` honors the `format` attribute, so substitutions/traces/rules render byte-identically.)
 - **META-LEVEL `up*`/query/syntax — Stage-4 boundaries.** The `up*` family, the sort/kind queries, and
   `metaParse`/`metaPrettyPrint`/`metaWellFormed*` conform byte-identically (value + sort + count + layout) on
-  the common surface (`conformance/prelude-meta.maude` Stage-4 block). Five narrow boundaries, each its own
-  surface: (a) **flat-mode `special`/`poly` builtin-hook attributes** — `upOpDecls`/`upModule` with `flat =
-  true` over a module whose closure has builtin ops would need to up-translate `special (id-hook … op-hook …)`
-  + `poly`, the inverse of `build_sig`'s hook resolution (and of `down_attrs`' existing `special → None`
-  boundary); so flat `upModule('NAT, true)` stays inert (non-flat over a builtin-importing module, and flat
-  over a builtin-free closure, both work — own/user ops carry no `special`). (b) The **multi-attribute `ctor`
+  the common surface (`conformance/prelude-meta.maude` Stage-4 block). Four narrow boundaries, each its own
+  surface: (a) **flat-mode builtin imports** — a builtin/prelude module is imported at the *engine* level (its
+  ops/eqs are not re-inlined into the flattened statement list), so a `flat = true` up-translation over a
+  builtin-importing closure omits it: `upOpDecls`/`upModule` would need to up-translate `special (id-hook …
+  op-hook …)` + `poly` (the inverse of `build_sig`'s hook resolution, and of `down_attrs`' `special → None`
+  boundary) — so flat `upModule('NAT, true)` stays inert — and `upEqs`/`upMbs`/`upRls` with `flat = true`
+  likewise omit the imported builtin module's *equations/memberships/rules* (e.g. `BOOL`'s). Non-flat over a
+  builtin-importing module, and flat over a builtin-free closure, are both complete (own/user statements carry
+  no builtin hook and are inlined normally — incl. their `[nonexec]` axioms, see Resolved). (b) The **multi-attribute `ctor`
   order**: `[ctor]` combined with a META-MODULE-later attribute (`id`/`prec`/`gather`/`format`/`strat`/`memo`)
   prints in our `SymbolId` ACU order (`[assoc id(c) ctor]`) vs Maude's `orderInt` (`[assoc ctor id(c)]`) — the
   same accepted ACU-print-order divergence as §1's `5 + x` (same multiset; every other attribute combination
   matches). (c) **Non-`mixfix` print options** to `metaPrettyPrint`/`metaPrintToString` (the prefix `f(_,_)`
   rendering) stay inert — a separate renderer, not `print_pretty`. (d) **`metaParse`'s `noParse(n)`** reports
-  `n = 0` (a full-failure position), not the exact mid-parse token index. (e) An own **`nonexec` statement**
-  installs no engine trace, so `upEqs`/`upMbs`/`upRls` omit it (a theory's `[nonexec]` axioms need parsing the
-  unbuilt bubble); and **structured (non-`Named`) module expressions** in a view's `from`/`to` or an import,
-  an **op→term view map**, and **strategy maps** leave the enclosing `upView`/`upImports` inert.
+  `n = 0` (a full-failure position), not the exact mid-parse token index. (e) **Structured (non-`Named`) module
+  expressions** in a view's `from`/`to` or an import, an **op→term view map**, and **strategy maps** leave the
+  enclosing `upView`/`upImports` inert.
 - **META-LEVEL symbolic/SMT/strategy descent — declared but inert (Stage 5).** The unification/variant/
   narrowing (`metaUnify`/`metaVariant*`/`metaNarrow*` + the `legacy*` forms, Phase 3.2, D6 BDD), SMT
   (`metaSmtSearch`/`metaCheck`, Phase 3.3, D7 Z3), and strategy (`metaSrewrite`/`metaParseStrategy`/
@@ -295,3 +297,14 @@ symbolic/SMT/strategy declarations); the only prelude modules that still don't b
 `QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` (Phase 2 item 5, `LOOP-MODE` not yet ported). The object-system
 substrate itself is done: `CONFIGURATION` (the `object`/`config`/`msg`/`portal` attributes) builds and runs
 under `erewrite`, and the `omod`/`class`/`subclass`/`msg` surface language desugars onto it (Phase 2.5-E).
+
+META `up*` now retains **`[nonexec]` axioms** and **equation/membership `[label …]`s** (previously omitted).
+Build installs no engine trace for a `nonexec` statement (a proof obligation fires in no reduction), so
+`upEqs`/`upMbs`/`upRls`/`upModule` **decouple** from the engine-id-indexed trace vectors: for a module's own
+statements (and a builtin-free flat closure) they walk the source statement list in **declaration order**,
+taking each executable statement from its trace suffix and **parsing each `[nonexec]` bubble on demand**
+against the built module (`parse_statement_trace`, `tnk-frontend::load`). Equation/membership labels — dropped
+at parse before — are now carried on `EqTrace`/`MbTrace` and rendered (`[label('l)]`), matching the rule path;
+the meta down-path reads them back symmetrically. Byte-verified against the reference (nonexec eq/mb/cmb/rule
+with labels, exec-before-nonexec ordering, executable-eq labels): `meta_nonexec_up_through_repl`. The one
+remaining `up*` statement boundary is the flat-over-builtin-closure omission in §3's Stage-4 bullet (a).

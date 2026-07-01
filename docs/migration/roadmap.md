@@ -174,10 +174,11 @@ prelude load.
      `minimalSorts`/`maximalAritySet`, the last reading per-overload op declarations via a new
      `Engine::symbol_declarations`) read the engine's sort lattice; `metaWellFormed{Module,Term,Substitution}`
      are structural checks (a kind-match walk catches the ill-typed term/binding the kernel builds permissively).
-     The Stage-4 boundaries (each its own surface, `gaps.md`): flat-mode `special`/`poly` builtin-hook
-     attributes (the inverse of `down_attrs`' boundary — so flat `upModule` over a builtin module stays inert);
-     the multi-attribute `ctor`-order ACU divergence; non-`mixfix` print options; own `nonexec`-statement up;
-     structured (non-`Named`) module expressions + op→term view maps.
+     The Stage-4 boundaries (each its own surface, `gaps.md`): flat-mode builtin imports (op `special`/`poly`
+     hooks *and* the imported builtin module's statements — the inverse of `down_attrs`' boundary — so a flat
+     `up*` over a builtin closure stays partial/inert); the multi-attribute `ctor`-order ACU divergence;
+     non-`mixfix` print options; structured (non-`Named`) module expressions + op→term view maps. (Own
+     `[nonexec]` axioms + equation/membership labels are now retained — parsed on demand from their bubbles.)
      **Stage 5 — the inert declarations, finalized — DONE.** The symbolic (unify/variant/narrow, Phase 3.2,
      D6 BDD), SMT (Phase 3.3, D7 Z3), and strategy (Phase 2.4) descent — `MetaOp::Deferred` plus the
      strategy-up maps `upStratDecls`/`upSds` — are declared, parse (the tower loads), and **reduce inert** to
