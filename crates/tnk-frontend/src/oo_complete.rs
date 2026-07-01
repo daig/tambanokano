@@ -451,7 +451,7 @@ fn canonicalize_attr_set(elems: &mut [Term]) {
             Term::Var(_) => (0, true, None),
         }
     }
-    elems.sort_by(|a, b| key(a).cmp(&key(b)));
+    elems.sort_by_key(key);
 }
 
 /// The kind (top/error sort) of an attribute operator's argument, for a fresh kind-variable attribute
