@@ -2917,6 +2917,20 @@ pub struct OoInfo {
 }
 
 impl Engine {
+    /// Whether `sym` is **associative** (an ACU or AU operator). A nested application of such an operator
+    /// (`f(a, f(b, c))`) denotes the same flattened term `f(a, b, c)`; the META up-translation flattens it
+    /// to match Maude's `ACU/AU_Term::makeTerm` normal form.
+    pub fn symbol_is_assoc(&self, sym: SymbolId) -> bool {
+        matches!(self.sig.symbol(sym).theory(), Theory::Acu | Theory::Au)
+    }
+
+    /// Whether `sym` is **associative-commutative** (ACU). Its `makeTerm` normal form flattens *and*
+    /// **sorts** arguments (`Term::compare`), whereas a merely-associative (AU) operator flattens but
+    /// keeps order — so only ACU arguments are reordered in the META up-translation.
+    pub fn symbol_is_acu(&self, sym: SymbolId) -> bool {
+        matches!(self.sig.symbol(sym).theory(), Theory::Acu)
+    }
+
     /// The object-oriented completion context (Pillar 2.5-E) — the CONFIGURATION symbols/sorts the
     /// `omod` object-pattern completion transform reads. `None` when no `object`-flagged constructor is
     /// in scope, or it does not have the `Oid Cid AttributeSet` shape, or no AttributeSet `_,_` is found.
