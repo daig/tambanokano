@@ -1,0 +1,24 @@
+*** Multi-token operator names: an op name may carry a blank between two text tokens
+*** -- op a b, op c d_, op _e f_. The blank is load-bearing: c d_ is the mixfix c, d, _,
+*** distinct from the single literal cd_, and Maude keeps it -- as a backquote -- in the
+*** op's stored/meta name. The space form and the backquote form tokenize to the same name;
+*** an escaped special is unaffected.
+*** Oracle -- byte-for-byte, modulo the ====/Bye. framing:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/multitoken-op.maude < /dev/null
+fmod MULTITOK is
+  sorts S .
+  op a b : -> S [ctor] .
+  op c d_ : S -> S [ctor] .
+  op _e f_ : S S -> S [ctor] .
+  op g_ : S -> S .
+  op done : -> S [ctor] .
+  op _`[_`] : S S -> S [ctor] .
+  eq g(a b) = done .
+endfm
+
+red a b .                    *** a b       (2-token constant)
+red c d a b .                *** c d a b   (mixfix over a 2-token arg)
+red (a b) e f (a b) .        *** a b e f a b
+red g(a b) .                 *** done      (equation over a multi-token subterm fires)
+red g(a`b) .                 *** done      (backquote form is the same term)
+red done [done] .            *** done[done]  (escaped-bracket op still works)

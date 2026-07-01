@@ -1597,13 +1597,13 @@ fn build_app(head: &str, args: Vec<DagId>, target: &mut BuiltModule) -> Option<D
     Some(target.engine.make_node(sym, args))
 }
 
-/// An operator's META name Qid string: its canonical (concatenated) name with a **backtick-blank**
-/// re-inserted between two consecutive *literal* fragments — Maude keeps the blank in a stored op name so
-/// that `bal :_` is `` bal`:_ `` (else `bal:_` would re-tokenize as one token), while `_,_`/`<_:_|_>`
-/// (literals separated by holes) are unchanged. Mirrors [`split_mixfix`](tnk_frontend::lex::split_mixfix)
-/// plus Maude's op-name blanking, without interning. tnk drops blanks between two space-separated *text*
-/// tokens at parse time (e.g. `foo bar_`), so only blanks around a split char (`:` in attribute ops) —
-/// the object-system case — are recoverable here; the general text-text case is a pre-existing limitation.
+/// An operator's META name Qid string: its canonical name with a **backtick-blank** re-inserted before a
+/// *split char* adjacent to a literal — Maude keeps the blank in a stored op name so that `bal :_` is
+/// `` bal`:_ `` (else `bal:_` would re-tokenize as one token), while `_,_`/`<_:_|_>` (literals separated by
+/// holes) are unchanged. A genuine inter-token blank between two *text* tokens (`op c d_`, `op a b`) is now
+/// preserved by [`canonical_name`](tnk_frontend::sig::build_sig::canonical_name) itself (as a backtick), so
+/// it is already present in `name` and passes through here unchanged — this function only adds the
+/// split-char backtick that the canonical form omits. Mirrors [`split_mixfix`](tnk_frontend::lex::split_mixfix).
 fn meta_op_name(name: &str) -> String {
     let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',');
     let mut out = String::new();
@@ -1637,17 +1637,23 @@ fn meta_op_name(name: &str) -> String {
     out
 }
 
-/// The inverse of [`meta_op_name`] for resolving a **down**-translated operator name: strip the
-/// backtick-blanks a meta Qid carries (`` bal`:_ `` → `bal:_`, `` _`,_ `` → `_,_`), mirroring the lexer's
-/// backquote-escape (a backtick is consumed and the next char kept). tnk stores op names blank-free, so a
-/// meta Qid must be normalized before it is looked up in the module's canonical op table.
+/// The inverse of [`meta_op_name`] for resolving a **down**-translated operator name to its canonical op
+/// table key: strip only the backtick-blanks a meta Qid carries *around a split char* (`` bal`:_ `` →
+/// `bal:_`, `` _`,_ `` → `_,_`) — the ones [`meta_op_name`] synthesizes and the canonical name omits. A
+/// backtick before a *normal* char is a genuine inter-token blank that [`canonical_name`] keeps in the key
+/// (`` a`b ``, `` c`d_ ``), so it is preserved here rather than stripped.
 fn strip_op_blanks(name: &str) -> String {
+    let is_split = |c: char| matches!(c, '_' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | ',');
     let mut out = String::new();
-    let mut chars = name.chars();
+    let mut chars = name.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '`' {
-            if let Some(next) = chars.next() {
-                out.push(next); // backquote escapes the next char in; the backtick itself is dropped
+            match chars.peek() {
+                Some(&next) if is_split(next) => {
+                    out.push(next); // a synthesized split-char blank — drop the backtick, keep the char
+                    chars.next();
+                }
+                _ => out.push('`'), // a real text-text blank — part of the canonical key
             }
         } else {
             out.push(ch);

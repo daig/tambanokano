@@ -89,7 +89,7 @@ impl Token {
 }
 
 /// A splitting punctuation char (its own token; not part of a maudeId).
-fn is_punct(c: char) -> bool {
+pub(crate) fn is_punct(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
 }
 
@@ -368,9 +368,32 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                 break;
             }
             if ch == '`' && i + 1 < n {
-                text.push(chars[i + 1]); // backquote escapes the next char into the token
-                i += 2;
-                continue;
+                let next = chars[i + 1];
+                // A backquote before a *split* char (`_`/`:`/punct) escapes it: the char joins this token
+                // as a literal (a `` `[ `` bracket, a `` `, `` comma), so drop the backquote — its only role
+                // was to suppress the split.
+                if next == '_' || next == ':' || is_punct(next) {
+                    text.push(next);
+                    i += 2;
+                    continue;
+                }
+                // A backquote before a *normal* char is an inter-token blank (Maude's op-name spacing).
+                // Inside a quoted identifier (`'`…) it is kept as content — `` 'c`d_ `` is one Qid — so a
+                // spelled-out multi-token Qid round-trips through the meta level. In a *bare* identifier it
+                // *separates* two tokens (`` hello`world `` ≡ the name `hello world`), exactly like a space:
+                // end this token here and resume scanning at the next char, so a term written either way
+                // (`hello world` or `` hello`world ``) tokenizes the same.
+                if text.starts_with('\'') {
+                    text.push('`');
+                    text.push(next);
+                    i += 2;
+                    continue;
+                }
+                i += 1; // consume the separating blank
+                if text.is_empty() {
+                    continue; // a leading blank: nothing to emit yet, keep scanning
+                }
+                break; // emit the token so far; the next token starts at `next`
             }
             text.push(ch);
             i += 1;
@@ -400,11 +423,23 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
     let mut pending = String::new();
     let mut chars = name.chars().peekable();
     while let Some(ch) = chars.next() {
-        // A backquote escapes the next char: it is a *literal* part of the surrounding token (a
-        // non-structural `_`/`[`/`,`), so `` _`[_ `` is one bracket op, not a structural `[`.
+        // A backquote before a *split* char (`_`/`:`/punct) escapes it — a *literal* part of the
+        // surrounding token, so `` _`[_ `` is one bracket op, not a structural `[`. A backquote before a
+        // *normal* char is an inter-token blank (Maude's op-name spacing, `` c`d_ ``): it ends the current
+        // literal fragment, and the next char starts a fresh one — this is what recovers a multi-token name
+        // like `c d_` → `c`, `d`, `_` (rather than merging to the single literal `cd_`).
         if ch == '`' {
-            if let Some(next) = chars.next() {
-                pending.push(next);
+            match chars.peek() {
+                Some(&next) if next == '_' || next == ':' || is_punct(next) => {
+                    chars.next();
+                    pending.push(next);
+                }
+                _ => {
+                    if !pending.is_empty() {
+                        frags.push(Frag::Tok(interner.intern(&pending)));
+                        pending.clear();
+                    }
+                }
             }
             continue;
         }

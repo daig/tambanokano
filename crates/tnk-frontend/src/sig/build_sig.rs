@@ -5,7 +5,7 @@
 //! built-in anchors (succ/zero/string/float/qid) once all names resolve → **pass B** attach
 //! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
 
-use crate::lex::{Interner, Token, split_mixfix};
+use crate::lex::{Interner, Token, is_punct, split_mixfix};
 use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use crate::surface::ast::{Attrs, PreModule, SpecialSpec};
 use std::collections::HashMap;
@@ -25,7 +25,27 @@ type R<T> = Result<T, String>;
 /// are stripped: the canonical name (and thus its grammar production and `sym_by_profile` key) is
 /// `op_:_->_[_].`, matching the unparenthesized `op-hook` references.
 pub fn canonical_name(name: &[Token], i: &Interner) -> String {
-    strip_outer_parens(name, i).iter().map(|t| i.resolve(t.sym)).collect()
+    // Two adjacent name tokens whose boundary chars are both *non-split* (not `_`/`:`/punct) were
+    // space-separated in the source — two maudeIds only ever tokenize apart on whitespace — so the blank
+    // between them is load-bearing: `op c d_` is the mixfix `c`, `d`, `_`, not the single literal `cd_`.
+    // Keep it as a backtick (Maude's op-name spacing convention, `` c`d_ ``), which [`split_mixfix`] reads
+    // back as a fragment boundary. A boundary touching a split char (`bal :_` → `bal:_`, `<_,_>`, `[]`)
+    // needs no marker — split_mixfix already breaks there — so those canonical names are unchanged.
+    let is_split = |c: char| c == '_' || c == ':' || is_punct(c);
+    let mut out = String::new();
+    let mut prev_last: Option<char> = None;
+    for t in strip_outer_parens(name, i) {
+        let s = i.resolve(t.sym);
+        if let (Some(pl), Some(fc)) = (prev_last, s.chars().next())
+            && !is_split(pl)
+            && !is_split(fc)
+        {
+            out.push('`');
+        }
+        out.push_str(s);
+        prev_last = s.chars().last().or(prev_last);
+    }
+    out
 }
 
 /// The inner tokens if `toks` is wrapped in a single balanced `( … )` pair, else `toks` unchanged. The

@@ -1798,3 +1798,54 @@ fn meta_nonexec_up_through_repl() {
     );
 }
 
+/// Multi-token operator names (residual: the inter-token blank in an op name). An op name may carry a blank
+/// between two text tokens — `op a b`, `op c d_`, `op _e f_` — and it is load-bearing: `c d_` is the mixfix
+/// `c`, `d`, `_`, distinct from the single literal `cd_`. tnk now preserves it (canonical name keeps it as a
+/// backquote, `` c`d_ ``), so such ops lex, parse, reduce, and print byte-identically to the reference; the
+/// space form (`a b`) and the backquote form (`` a`b ``) tokenize to the same name, and an escaped special
+/// (`` _`[_`] ``) is unaffected. Verified against `conformance/multitoken-op.maude`.
+#[test]
+fn multitoken_op_through_repl() {
+    let out = repl().eval(conformance_file!("multitoken-op.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error"), "multitoken op: {out}");
+    assert!(out.contains("result S: a b"), "2-token constant: {out}");
+    assert!(out.contains("result S: c d a b"), "mixfix over a 2-token arg: {out}");
+    assert!(out.contains("result S: a b e f a b"), "infix with multiple literals: {out}");
+    assert!(out.contains("result S: done[done]"), "escaped-bracket op still works: {out}");
+    // `g(a b) = done` fires over a multi-token subterm, via BOTH the space and backquote forms.
+    assert_eq!(
+        out.matches("result S: done\n").count(),
+        2,
+        "the equation fires for both `g(a b)` and `g(a`b)`: {out}"
+    );
+}
+
+/// META round-trip of multi-token op names: `upModule` spells the inter-token blank as a backquote
+/// (`` 'a`b ``, `` 'c`d_ ``), matching the reference, and `metaReduce` over a hand-written meta term whose
+/// head is such a Qid (`` 'c`d_['a`b.S] ``) lexes the backquote, resolves the op, and reduces. Byte-verified
+/// against the reference.
+#[test]
+fn multitoken_op_meta_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude")); // the META-LEVEL tower
+    let out = r
+        .eval(concat!(
+            "fmod MT is\n",
+            "  sorts S .\n",
+            "  op a b : -> S [ctor] .\n",
+            "  op c d_ : S -> S .\n",
+            "  op z : -> S [ctor] .\n",
+            "  eq c d (a b) = z .\n",
+            "endfm\n",
+            "red in META-LEVEL : upModule('MT, false) .\n",
+            "red in META-LEVEL : metaReduce(upModule('MT, false), 'c`d_['a`b.S]) .\n",
+        ))
+        .output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "multitoken meta: {out}");
+    // upModule spells the blank as a backquote in each op's name.
+    assert!(out.contains("op 'a`b : nil -> 'S [ctor] ."), "up: 2-token constant name: {out}");
+    assert!(out.contains("op 'c`d_ : 'S -> 'S [none] ."), "up: mixfix name: {out}");
+    // metaReduce down-translates the backquote Qid and reduces `c d (a b)` to `z`.
+    assert!(out.contains("result ResultPair: {'z.S, 'S}"), "down: metaReduce over a backquote Qid: {out}");
+}
+

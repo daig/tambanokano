@@ -263,10 +263,22 @@ impl<'a> Printer<'a> {
         let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
         if !has_hole {
             // Constant (a value → `Lit`) or prefix operator (`name(a, b, …)` → `Op` name). The name can be
-            // several fragments when it lexes with punctuation (`[]`, `{}`, `<>` — split on `[`/`]`/…), so
-            // emit them all, not just the first (else the hole constant `[]` would render as a bare `[`).
+            // several fragments when it lexes with punctuation (`[]`, `{}`, `<>` — split on `[`/`]`/…) or
+            // with an inter-token blank (a multi-token name `a b`), so emit them all with Maude's default
+            // spacing (a space before each fragment except at the start, before a `,`, and around brackets)
+            // — `[]` stays glued, `a b` keeps its blank.
             let cat = if children.is_empty() { Cat::Lit } else { Cat::Op };
-            let name: String = syn.frags.iter().map(|f| self.frag_cow(f)).collect::<Vec<_>>().concat();
+            let mut name = String::new();
+            let mut no_space = true;
+            for f in &syn.frags {
+                let text = self.frag_cow(f);
+                let special = matches!(&*text, "(" | ")" | "[" | "]" | "{" | "}");
+                if !(no_space || special || &*text == ",") {
+                    name.push(' ');
+                }
+                name.push_str(&text);
+                no_space = special;
+            }
             out.push(Work::Text { cat, text: Cow::Owned(name) });
             if !children.is_empty() {
                 self.layout_arg_list(children, arg_rk, out);

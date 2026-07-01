@@ -109,15 +109,16 @@ correctness fix.
   reference; **bracketed comments `***( … )` / `---( … )`** (balanced parens across newlines, backquoted
   parens excluded — Maude warns on a stray-`(` line comment like `*** (foo).`, and so do we) and **strings
   glued into a maudeId** (`foo"bar"`/`"x"y` are one identifier; a lone `"hi"` is a `Str` constant — Maude's
-  `Token::computeSpecialProperty`) are both now handled, byte-identically. Two divergences remain, both rare
-  and unexercised by the prelude/conformance: (a) a backquote before a *normal* char (`a`b`) is a token
-  **separator** in Maude (`a`b` ≡ the two-token name `a b`, printed `a b`); we drop the backquote → `ab`,
-  which mis-prints *and* silently **merges** a distinct `a`b` and `ab` (a wrong *result*, not just a name).
-  This is a special case of multi-token prefix op names, which our term parser does not support at all
-  (`op a b : -> S` likewise fails to parse), so it is not fixable standalone; the sole real occurrence is the
-  prelude's `op_to`term_.` (a view op-to-term map, behind the deferred view op-maps). Escaped *specials*
-  (`` `[_`] ``, `<_`,_>`) are byte-identical either way — both engines map the backquoted special to the
-  bare-char grammar terminal. (b) the terminator-dot heuristic (`is_terminator_dot`) approximates Maude's
+  `Token::computeSpecialProperty`) are both now handled, byte-identically. **Multi-token op names** — a blank
+  between two text tokens (`op a b`, `op c d_`, `op _e f_`) — are now handled too: the blank is load-bearing
+  (`c d_` is the mixfix `c`, `d`, `_`, not the single literal `cd_`), so `canonical_name` keeps it as a
+  backtick (Maude's op-name spacing, `` c`d_ ``), [`split_mixfix`] reads that back as a fragment boundary, and
+  the lexer preserves the backtick *inside* a Qid (`` 'c`d_ ``, for the META down path) while treating it as a
+  *separator* in a bare identifier (`` a`b `` ≡ the name `a b`, exactly like the space form). Such ops now lex,
+  parse, reduce, print, and round-trip through META (`upModule`/`metaReduce`) byte-identically — closing the
+  former `a`b`-merges-to-`ab` divergence (`conformance/multitoken-op.maude`). Escaped *specials* (`` `[_`] ``,
+  `<_`,_>`) are unchanged: a backtick before a *split* char still escapes it into the token. One divergence
+  remains, rare and unexercised: the terminator-dot heuristic (`is_terminator_dot`) approximates Maude's
   mode-based SEEN_DOT rule and could differ on the idiom-rare *two-commands-on-one-line* case. (Leading-zero
   numerals like `00`/`01` are **not** a divergence — verified: both engines lex them as one token then
   reclassify by value, so `00` fails to parse and `01` reduces to `1`; our `classify`→`Number` +
