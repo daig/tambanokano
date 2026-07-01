@@ -2800,6 +2800,56 @@ impl Runtime {
 // Engine: the thin public facade over Signature + Runtime
 // ======================================================================================
 
+/// The CONFIGURATION symbols/sorts an object module's **object-pattern completion** keys on (Pillar
+/// 2.5-E). Resolved structurally from the `object`-flagged constructor `<_:_|_>` in scope — Maude's
+/// `ObjectConstructorSymbol`/`findClassIdSort`/`findAtttributeSort` — so a user configuration with
+/// different sort names still works. Returned by [`Engine::oo_info`]; `None` when no object constructor
+/// is in scope (the module is not object-oriented).
+#[derive(Debug, Clone)]
+pub struct OoInfo {
+    /// The object constructor `<_:_|_> : Oid Cid AttributeSet -> Object` (the `object` attribute).
+    pub object_ctor: SymbolId,
+    /// The AttributeSet multiset constructor `_,_` (the object constructor's `attributeSetSymbol` op-hook):
+    /// the ACU operator ranging on the object constructor's 3rd argument sort.
+    pub attr_set_sym: SymbolId,
+    /// The AttributeSet sort — the object constructor's 3rd argument sort. A fresh completion variable
+    /// `Atts` is created at this sort.
+    pub attr_set_sort: SortId,
+    /// The AttributeSet identity (`none`), if `_,_` was declared with one — the empty attribute set.
+    pub none_sym: Option<SymbolId>,
+    /// The class-identifier sort `Cid` — the object constructor's 2nd argument sort.
+    pub cid_sort: SortId,
+    /// The class sorts: the strict subsorts of [`cid_sort`](Self::cid_sort) (a class `C` is declared
+    /// `subsort C < Cid`). A class *constant* (arity-0 ctor ranging on one of these) or a variable of one
+    /// of these sorts is what makes an object pattern eligible for completion.
+    pub class_sorts: Vec<SortId>,
+}
+
+impl Engine {
+    /// The object-oriented completion context (Pillar 2.5-E) — the CONFIGURATION symbols/sorts the
+    /// `omod` object-pattern completion transform reads. `None` when no `object`-flagged constructor is
+    /// in scope, or it does not have the `Oid Cid AttributeSet` shape, or no AttributeSet `_,_` is found.
+    pub fn oo_info(&self) -> Option<OoInfo> {
+        // The object constructor: the first symbol carrying the `object` OO flag.
+        let (object_ctor, osym) = self.sig.symbols.iter().find(|(_, s)| s.oo.object)?;
+        let odecl = &osym.decls[0];
+        if odecl.domain.len() != 3 {
+            return None; // not the `<_:_|_> : Oid Cid AttributeSet -> Object` shape
+        }
+        let cid_sort = odecl.domain[1];
+        let attr_set_sort = odecl.domain[2];
+        // The AttributeSet constructor `_,_`: the ACU operator whose range is the AttributeSet sort.
+        let (attr_set_sym, assym) = self
+            .sig
+            .symbols
+            .iter()
+            .find(|(_, s)| s.theory() == Theory::Acu && s.decls[0].range == attr_set_sort)?;
+        let none_sym = assym.identity();
+        let class_sorts = self.sig.sorts.strict_subsorts(cid_sort);
+        Some(OoInfo { object_ctor, attr_set_sym, attr_set_sort, none_sym, cid_sort, class_sorts })
+    }
+}
+
 impl Engine {
     pub fn new() -> Self {
         Self::default()

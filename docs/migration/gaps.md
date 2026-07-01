@@ -292,4 +292,6 @@ builds too, and its **whole implementable descent surface** computes byte-identi
 Stages 1–5 — the rewriting/matching/search family, the `up*` family + `upTerm`/`downTerm`/`upView`, the
 sort/kind queries, `metaParse`/`metaPrettyPrint`/`metaPrintToString`, and `metaWellFormed*`, plus the inert
 symbolic/SMT/strategy declarations); the only prelude modules that still don't build are the
-`QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` + the `[object]` attribute (Phase 2 item 5).
+`QID-LIST`-via-objects `LEXICAL`/`LOOP-MODE` (Phase 2 item 5, `LOOP-MODE` not yet ported). The object-system
+substrate itself is done: `CONFIGURATION` (the `object`/`config`/`msg`/`portal` attributes) builds and runs
+under `erewrite`, and the `omod`/`class`/`subclass`/`msg` surface language desugars onto it (Phase 2.5-E).

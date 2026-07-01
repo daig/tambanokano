@@ -221,6 +221,9 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
         kind: ModuleKind::System,
         is_theory: false,
         is_strategy: false,
+        // A scaffold for building the renaming source grammar (no statements are executed here), so
+        // object-pattern completion is irrelevant.
+        is_object: false,
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts.clone(),

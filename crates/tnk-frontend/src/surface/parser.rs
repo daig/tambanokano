@@ -150,6 +150,46 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A synthetic name-fragment token carrying the (already-interned) text `frag` — used only by the
+    /// `omod` class-attribute desugaring to append the `:`/`_` mixfix fragments to an attribute name.
+    /// [`tokenize`](crate::lex::tokenize) guarantees `:`/`_` are interned, so the lookup never fails; only
+    /// the token *text* is load-bearing downstream (`canonical_name` concatenates it, `split_mixfix`
+    /// re-splits), so the kind is a plain `Ident`.
+    fn frag_token(&self, frag: &str, line: u32) -> Token {
+        let sym = self.i.get(frag).expect("`:`/`_` mixfix fragment must be pre-interned by tokenize");
+        Token { sym, line, kind: TokKind::Ident }
+    }
+
+    /// Desugar `class C` into a sort `C`, a subsort `C < Cid`, and the honorary class constant
+    /// `op C : -> C [ctor]` (Maude's `processClassSorts`/`processClassOps`). `ctok` is `C`'s own token
+    /// (reused as the constant's mixfix name).
+    fn desugar_class(&self, m: &mut PreModule, ctok: Token, cname: &str) {
+        m.sorts.push(cname.to_string());
+        // `C < Cid`: a two-group chain (`[[C], [Cid]]`), as the `subsort` parser builds it.
+        m.subsorts.push(vec![vec![cname.to_string()], vec!["Cid".to_string()]]);
+        m.ops.push(OpDecl {
+            name: vec![ctok],
+            domain: Vec::new(),
+            range: cname.to_string(),
+            partial: false,
+            attrs: Attrs { ctor: true, ..Attrs::default() },
+        });
+    }
+
+    /// Desugar a class attribute `a : S` into `op a`:_ : S -> Attribute [ctor gather (&)]` (Maude's
+    /// `processClassOps`: the `attributeSuffix` ``"`:_"``, range `Attribute`, `gather (&)`). `atok` is the
+    /// attribute name's own token; the mixfix name is `[a, :, _]` (canonical `a:_`, re-split to `a :_`).
+    fn desugar_attribute(&self, m: &mut PreModule, atok: Token, asort: String) {
+        let name = vec![atok, self.frag_token(":", atok.line), self.frag_token("_", atok.line)];
+        m.ops.push(OpDecl {
+            name,
+            domain: vec![asort],
+            range: "Attribute".to_string(),
+            partial: false,
+            attrs: Attrs { ctor: true, gather: Some(vec![GatherElem::Any]), ..Attrs::default() },
+        });
+    }
+
     /// Collect a token bubble until a terminator text (or any `.`) at parenthesis depth 0; the terminator
     /// is left unconsumed. `(`/`)` track depth so a terminator inside parens does not end the bubble.
     fn collect_until(&mut self, terms: &[&str]) -> Vec<Token> {
@@ -224,7 +264,9 @@ impl<'a> Parser<'a> {
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
         let Some(txt) = self.peek_text() else { return Ok(None) };
         let item = match txt {
-            "fmod" | "mod" | "fth" | "th" | "smod" | "sth" => TopItem::Module(self.module()?),
+            "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
+                TopItem::Module(self.module()?)
+            }
             "view" => TopItem::View(self.view()?),
             "srewrite" | "srew" | "dsrewrite" | "dsrew" => {
                 let depth_first = txt.starts_with('d');
@@ -357,13 +399,18 @@ impl<'a> Parser<'a> {
         // System (`mod`/`th`) allows rules; functional (`fmod`/`fth`) rejects them (in `decl`). `fth`/`th`
         // are theories (the `is_theory` axis — a view source / parameter bound, statements not executed).
         let kw = self.peek_text().unwrap_or("");
-        // A strategy module/theory (`smod`/`sth`) is a system module (rules allowed) that additionally
-        // permits `strat`/`sd`; a `th`/`sth` is a theory.
-        let kind =
-            if matches!(kw, "mod" | "th" | "smod" | "sth") { ModuleKind::System } else { ModuleKind::Functional };
-        let is_theory = matches!(kw, "fth" | "th" | "sth");
+        // A strategy module/theory (`smod`/`sth`) and an object module/theory (`omod`/`oth`) are both
+        // system modules (rules allowed); `smod`/`sth` additionally permit `strat`/`sd`, `omod`/`oth`
+        // additionally permit `class`/`subclass`/`msg`. A `th`/`sth`/`oth` is a theory.
+        let kind = if matches!(kw, "mod" | "th" | "smod" | "sth" | "omod" | "oth") {
+            ModuleKind::System
+        } else {
+            ModuleKind::Functional
+        };
+        let is_theory = matches!(kw, "fth" | "th" | "sth" | "oth");
         let is_strategy = matches!(kw, "smod" | "sth");
-        self.advance(); // fmod / mod / fth / th / smod / sth
+        let is_object = matches!(kw, "omod" | "oth");
+        self.advance(); // fmod / mod / fth / th / smod / sth / omod / oth
         let name = self.name()?;
         // Optional formal parameters `{X :: T, …}` (B-iii). The stored name stays the bare base.
         let params = if self.at("{") { self.param_list()? } else { Vec::new() };
@@ -373,6 +420,7 @@ impl<'a> Parser<'a> {
             kind,
             is_theory,
             is_strategy,
+            is_object,
             params,
             imports: Vec::new(),
             sorts: Vec::new(),
@@ -383,16 +431,29 @@ impl<'a> Parser<'a> {
             strat_decls: Vec::new(),
             strat_defs: Vec::new(),
         };
+        // An object module auto-imports `CONFIGURATION` (Maude's `set oo include CONFIGURATION on`),
+        // supplying the object constructor `<_:_|_>`, `Cid`/`Attribute`/`AttributeSet`, and the soup `__`.
+        // Applied first (Maude adds oo-includes ahead of the user's imports); the built-in `CONFIGURATION`
+        // is injected into the module DB on demand (`tnk_modules::prelude`). Modes don't affect flattening.
+        if is_object {
+            m.imports.push(Import {
+                mode: ImportMode::Including,
+                expr: ModuleExpr::Named("CONFIGURATION".to_string()),
+            });
+        }
         while !self.at_module_end() {
             self.decl(&mut m)?;
         }
-        self.advance(); // endfm / endm / endfth / endth
+        self.advance(); // endfm / endm / endfth / endth / endom / endoth
         Ok(m)
     }
 
     /// At a module/theory closing keyword (`endfm`/`endm`/`endfth`/`endth`).
     fn at_module_end(&self) -> bool {
-        matches!(self.peek_text(), Some("endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth"))
+        matches!(
+            self.peek_text(),
+            Some("endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth" | "endom" | "endoth")
+        )
     }
 
     /// A formal parameter list `{X :: T, Y :: T', …}` (B-iii). `::` lexes as one token (`:` is not
@@ -590,6 +651,101 @@ impl<'a> Parser<'a> {
                 let sort = self.sort_name()?;
                 self.eat_dot()?;
                 m.vars.push(VarDecl { names, sort });
+            }
+            // Object-module surface (`omod`, Pillar 2.5-E). `class`/`subclass`/`msg` are **desugared here**
+            // into ordinary sorts/subsorts/ops (Maude's `ooProcess.cc`), so the rest of the pipeline needs
+            // no object-module awareness — only the `is_object` flag (for the pattern-completion transform)
+            // and the auto-imported `CONFIGURATION` (for `Cid`/`Attribute`/`AttributeSet`/`<_:_|_>`/`__`).
+            "class" | "classes" => {
+                if !m.is_object {
+                    return Err(format!(
+                        "`{kw}` is only allowed in an object module (`omod {}`)",
+                        m.name
+                    ));
+                }
+                self.advance();
+                // `class C [| a1 : S1, a2 : S2] .` — a class name, then an optional `|`-separated list of
+                // `attr : sort` pairs. `C` becomes a sort `C`, a subsort `C < Cid`, and an honorary class
+                // *constant* `op C : -> C [ctor]`; each attribute `a : S` becomes `op a`:_ : S -> Attribute
+                // [ctor gather (&)]` (the `a :_` mixfix form).
+                let ctok = self.peek().ok_or("expected a class name after `class`")?;
+                let cname = self.name()?;
+                self.desugar_class(m, ctok, &cname);
+                if self.at("|") {
+                    self.advance();
+                    loop {
+                        let atok = self.peek().ok_or("expected an attribute name")?;
+                        let _ = self.name()?; // the attribute name (its token is `atok`)
+                        self.eat(":")?;
+                        let asort = self.sort_name()?;
+                        self.desugar_attribute(m, atok, asort);
+                        if self.at(",") {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat_dot()?;
+            }
+            "subclass" | "subclasses" => {
+                if !m.is_object {
+                    return Err(format!(
+                        "`{kw}` is only allowed in an object module (`omod {}`)",
+                        m.name
+                    ));
+                }
+                self.advance();
+                // `subclass A B < C < D .` is a subsort relation between class sorts — desugar to a subsort
+                // chain, parsed exactly like `subsort`.
+                let mut chain = vec![Vec::new()];
+                while !self.at_dot() {
+                    if self.at("<") {
+                        self.advance();
+                        chain.push(Vec::new());
+                    } else {
+                        chain.last_mut().unwrap().push(self.sort_name()?);
+                    }
+                }
+                self.eat_dot()?;
+                m.subsorts.push(chain);
+            }
+            "msg" | "msgs" => {
+                if !m.is_object {
+                    return Err(format!(
+                        "`{kw}` is only allowed in an object module (`omod {}`)",
+                        m.name
+                    ));
+                }
+                let multi = kw == "msgs";
+                self.advance();
+                // `msg m : S1 S2 -> Msg .` desugars to `op m : S1 S2 -> Msg [ctor msg]` (Maude's `endMsg`
+                // sets `MESSAGE | CTOR`); the range is whatever the user writes (`Msg` by convention).
+                let names = self.collect_until(&[":"]);
+                self.eat(":")?;
+                let mut domain = Vec::new();
+                while !self.at("->") && !self.at("~>") {
+                    domain.push(self.sort_name()?);
+                }
+                self.eat("->")?;
+                let range = self.sort_name()?;
+                let mut attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
+                attrs.ctor = true;
+                attrs.message = true;
+                self.eat_dot()?;
+                if multi {
+                    for t in names {
+                        m.ops.push(OpDecl {
+                            name: vec![t],
+                            domain: domain.clone(),
+                            range: range.clone(),
+                            partial: false,
+                            attrs: attrs.clone_shallow(),
+                        });
+                    }
+                } else {
+                    m.ops.push(OpDecl { name: names, domain, range, partial: false, attrs });
+                }
             }
             "eq" | "ceq" => {
                 let conditional = kw == "ceq";

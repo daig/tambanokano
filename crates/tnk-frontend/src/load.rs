@@ -15,6 +15,7 @@ use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Nt, NtType};
 use crate::lex::{tokenize, Interner, Token};
+use crate::oo_complete;
 use crate::pretty::print_pretty;
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
@@ -83,6 +84,11 @@ fn load_statements(
     g: &CompiledGrammar,
     i: &Interner,
 ) -> Result<(), String> {
+    // Object-pattern completion context (Pillar 2.5-E): resolved once for an `omod`'s flattened module
+    // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
+    // module, or one with no object constructor in scope — completion then never runs.
+    let oo = pm.is_object.then(|| m.engine.oo_info()).flatten();
+
     for stmt in &pm.statements {
         // Skip `nonexec` axioms — proof obligations never applied during reduction/rewriting (every
         // theory axiom is `[nonexec]`; a module statement may be too). They still carry through parsing
@@ -95,13 +101,18 @@ fn load_statements(
                 // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
                 // one variable index. Then add via the matching kernel facade.
                 let mut vars = VarIndex::new();
-                let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
                 let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-                let condition = match cond {
+                let mut condition = match cond {
                     Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                     None => Vec::new(),
                 };
-                let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+                let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+                if let Some(info) = &oo {
+                    oo_complete::complete_statement(
+                        info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                    );
+                }
                 let nr = vars.count();
                 // Capture the source-form trace metadata before the Terms are moved into the kernel; the
                 // kernel returns the dense equation id, which must index `eq_traces` (asserted).
@@ -125,13 +136,16 @@ fn load_statements(
             }
             Statement::Mb { lhs, sort, cond, .. } => {
                 let mut vars = VarIndex::new();
-                let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
                 let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
                 let sort_id = resolve_sort(sort, m, i)?;
-                let condition = match cond {
+                let mut condition = match cond {
                     Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                     None => Vec::new(),
                 };
+                if let Some(info) = &oo {
+                    oo_complete::complete_statement(info, m, &mut vars, &mut lhs_t, None, &mut condition);
+                }
                 let nr = vars.count();
                 reject_rewrite_fragment(&condition, "membership")?;
                 let trace = MbTrace {
@@ -152,13 +166,18 @@ fn load_statements(
                 // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
                 // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
                 let mut vars = VarIndex::new();
-                let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
                 let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-                let condition = match cond {
+                let mut condition = match cond {
                     Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                     None => Vec::new(),
                 };
-                let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+                let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+                if let Some(info) = &oo {
+                    oo_complete::complete_statement(
+                        info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                    );
+                }
                 let nr = vars.count();
                 let trace = RlTrace {
                     lhs: lhs_t.clone(),

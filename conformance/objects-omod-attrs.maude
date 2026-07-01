@@ -1,0 +1,39 @@
+*** Pillar 2.5-E: object-pattern completion attribute edge cases (ooTransform.cc), beyond the
+*** class-constant->variable + fresh-AttributeSet-variable cases in objects-omod.maude:
+***   - MISSING-ATTRIBUTE COPY: a rule whose RHS omits an attribute its LHS matched. Completion copies the
+***     pattern attribute back onto the RHS, so applyRate updates bal but PRESERVES rate.
+***   - SUBJECT-ONLY ATTRIBUTE: a rule whose RHS sets an attribute its LHS did not match. Completion adds a
+***     fresh kind-variable attribute to the LHS pattern (last : L:[Nat]), so the rule matches only objects
+***     that already carry that attribute, and the RHS overwrites it.
+***
+*** Oracle -- byte-for-byte, modulo the ====/Bye. framing:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-attrs.maude < /dev/null
+
+set show advisories off .
+
+fmod NAT is
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op _+_ : NzNat Nat -> NzNat [assoc comm prec 33 special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+endfm
+
+omod ACCT is
+  protecting NAT .
+  class Savings | bal : Nat, rate : Nat .
+  class Logger | count : Nat, last : Nat .
+  op s1 : -> Oid [ctor] .
+  op lg : -> Oid [ctor] .
+  msg applyRate : Oid -> Msg .
+  msg log : Oid Nat -> Msg .
+  vars A : Oid .  vars N R V : Nat .
+  rl [applyRate] : applyRate(A) < A : Savings | bal : N, rate : R > => < A : Savings | bal : (N + R) > .
+  rl [log] : log(A, V) < A : Logger | count : N > => < A : Logger | count : (s N), last : V > .
+endom
+
+*** applyRate: bal := bal + rate; rate is not on the RHS but is preserved (missing-attribute copy).
+erewrite in ACCT : applyRate(s1) < s1 : Savings | bal : 100, rate : 5 > .
+*** log: count := s count and last := V; `last` is set on the RHS but matched by a fresh kind-variable.
+erewrite in ACCT : log(lg, 7) < lg : Logger | count : 0, last : 0 > .

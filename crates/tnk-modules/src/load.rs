@@ -36,7 +36,7 @@ pub fn load_program(src: &str) -> Result<Program, String> {
 
     // Names in file order (the command-index basis), and the database for import resolution.
     let names: Vec<String> = pre.iter().map(|m| m.name.clone()).collect();
-    let db = ModuleDb::from_modules(pre);
+    let mut db = ModuleDb::from_modules(pre);
 
     // Views first (B-ii): validate each against the module DB, then store — so a parameterized
     // instantiation `M{V}` reached while flattening a module can resolve its view (B-iv). A bad view aborts
@@ -47,10 +47,15 @@ pub fn load_program(src: &str) -> Result<Program, String> {
         views.insert(v);
     }
 
-    // Then flatten + build each module (instantiations resolve against `views`).
+    // Then flatten + build each module (instantiations resolve against `views`). Before each flatten,
+    // inject any built-in prelude module the module imports (e.g. an `omod`'s auto-imported
+    // `CONFIGURATION`) that the user has not defined — in file order, so an imported module's own
+    // built-in needs are satisfied by the time a later importer is flattened.
     let mut modules = Vec::with_capacity(names.len());
     let mut module_index = HashMap::new();
     for (idx, name) in names.iter().enumerate() {
+        let imports = db.get(name).map(|pm| pm.imports.clone()).unwrap_or_default();
+        crate::prelude::ensure_builtins(&imports, &mut db, &mut interner);
         let flat = flatten(name, &db, &views, &mut interner)?;
         modules.push(build_loaded_module(&flat, &mut interner)?);
         module_index.insert(name.clone(), idx);

@@ -14,6 +14,7 @@ pub mod cfparser;
 pub mod grammar;
 pub mod lex;
 pub mod load;
+pub mod oo_complete;
 pub mod pretty;
 pub mod rename_terms;
 pub mod sig;

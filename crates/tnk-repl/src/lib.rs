@@ -198,7 +198,11 @@ impl Repl {
     fn enter_module(&mut self, pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
         self.last = None; // a (re)built module invalidates any saved rewrite continuation
+        // Inject any built-in prelude module this module imports (e.g. an `omod`'s auto-imported
+        // `CONFIGURATION`) that the user has not defined, so flattening can resolve it.
+        let imports = pm.imports.clone();
         self.db.insert(pm);
+        tnk_modules::prelude::ensure_builtins(&imports, &mut self.db, &mut self.interner);
         let built = flatten(&name, &self.db, &self.views, &mut self.interner)
             .and_then(|flat| build_loaded_module(&flat, &mut self.interner));
         match built {
@@ -561,8 +565,12 @@ impl Repl {
         // module-constructor operators put `fmod`/`is`/`sorts`/`endfm` *inside* a term
         // (`getName(fmod Q is … endfm) = Q`), where they are operator-name fragments, not delimiters —
         // counting those would close the module early and submit it without its `endfm`.
-        let is_close =
-            |s: &str| matches!(s, "endfm" | "endm" | "endfth" | "endth" | "endv" | "endsm" | "endsth");
+        let is_close = |s: &str| {
+            matches!(
+                s,
+                "endfm" | "endm" | "endfth" | "endth" | "endv" | "endsm" | "endsth" | "endom" | "endoth"
+            )
+        };
         let mut open = false;
         let mut saw_open = false;
         let mut depth = 0i32;
@@ -574,7 +582,13 @@ impl Repl {
             // from looking like a module. A *close* keyword only counts at depth 0, so the meta-level's
             // module-constructor operators (`getName(fmod Q is … endfm)`) — whose `endfm` is an
             // operator-name fragment inside brackets — never close the surrounding module early.
-            if depth == 0 && leading && matches!(txt, "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "view") {
+            if depth == 0
+                && leading
+                && matches!(
+                    txt,
+                    "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" | "view"
+                )
+            {
                 open = true;
                 saw_open = true;
             }

@@ -7,8 +7,17 @@
 > program owns IO** (native Rust file/socket/process/event-loop), embedding the engine for computation. The
 > minimal embedding-IO API is **intentionally not designed yet** — to be specified when embedding is taken up.
 > The §4-C…E material below is **retained as the shelved in-engine plan** (recoverable if we ever need to run
-> arbitrary existing Maude IO `.maude` files unmodified). **Next non-IO target: `omod`/`class`/`msg` (§4-E),
-> which is independent of all this.**
+> arbitrary existing Maude IO `.maude` files unmodified).
+>
+> **Update (2026-06-30): `omod`/`class`/`subclass`/`msg` (the OO surface language, §4-E) is DONE** — a pure
+> frontend desugaring, independent of IO. `omod … endom` (+ `oth`) parses and lowers to CONFIGURATION-based
+> Core-Maude (`class` → sort + `subsort < Cid` + constant op + `a :_` attribute ops; `subclass` → subsort;
+> `msg` → `[ctor msg]` op); an object module auto-imports the new **built-in `CONFIGURATION`** (injected on
+> demand — `tnk-modules/prelude.rs`); and **object-pattern completion** (`ooTransform.cc`, in
+> `tnk-frontend/oo_complete.rs`) runs at `load_statements` time — fresh `Atts:AttributeSet` variable per
+> object pattern, class-constant → fresh class-sorted variable (subclass polymorphism), plus the
+> missing-attribute / subject-only-attribute cases. Byte-conformant: `conformance/objects-omod.maude` +
+> `objects-omod-attrs.maude`. (LOOP-MODE, §4-E's other half, remains the next target.)
 
 The last Phase-2 subsystem: object-message **configurations**, the object-message-fair **`erewrite`**, and
 **external objects** (standard streams / files / sockets / processes), plus Ctrl-C/SIGCHLD. It unblocks the

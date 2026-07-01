@@ -109,6 +109,14 @@ impl Sorts {
         &self.leqs[s.index()]
     }
 
+    /// The **strict** subsorts of `s`: every sort `y != s` with `y <= s`. The `omod` object-pattern
+    /// completion recovers the class sorts as the strict subsorts of `Cid` (a class `C` is declared with
+    /// `subsort C < Cid`), so a class *constant* / class-sorted variable is recognized structurally.
+    /// Requires [`close`](Self::close).
+    pub(crate) fn strict_subsorts(&self, s: SortId) -> Vec<SortId> {
+        self.down_set(s).iter().copied().filter(|&y| y != s).collect()
+    }
+
     /// `true` if `a` and `b` are in the same kind (connected component).
     pub fn same_kind(&self, a: SortId, b: SortId) -> bool {
         self.kind_of(a) == self.kind_of(b)

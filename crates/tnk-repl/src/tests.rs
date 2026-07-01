@@ -1547,3 +1547,73 @@ fn objects_io_through_repl() {
     );
 }
 
+/// Pillar 2.5-E — the object-oriented **surface language** (`omod`/`class`/`subclass`/`msg`). Each `omod`
+/// desugars to CONFIGURATION-based Core-Maude (`class C` → sort + `subsort C < Cid` + constant `op C`;
+/// attribute `a : S` → `op a :_ : S -> Attribute`; `subclass` → subsort; `msg` → `[ctor msg]` op) and
+/// auto-imports the **built-in** CONFIGURATION. Object-pattern completion (`ooTransform.cc`) is the
+/// load-bearing part: the `credit` rule names only `bal` yet fires on a `Savings` object that also carries
+/// `rate` (a fresh `Atts:AttributeSet` variable captures it) and whose class `Savings` is a **subclass** of
+/// the rule's `Account` (the class constant is rewritten to a fresh class-sorted variable, so `V:Account`
+/// matches `Savings`). Byte-identical to the reference
+/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects-omod.maude`).
+#[test]
+fn objects_omod_through_repl() {
+    let out = repl().eval(conformance_file!("objects-omod.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "omod build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // rewrite: credit fires on the Account and on the Savings subclass (its extra `rate` preserved).
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Account | bal : 50 > < b : Savings | bal : 125,",
+            "    rate : 5 >",
+            // getClass on the subclass instance returns its actual class.
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Savings: Savings",
+            // search: credit 5 then 7 reaches balance 12 (state 3 of 4).
+            "",
+            "Solution 1 (state 3)",
+            "states: 4  rewrites: 6 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "N --> 12",
+            "",
+            "No more solutions.",
+            "states: 4  rewrites: 8 in 0ms cpu (0ms real) (~ rewrites/second)",
+            // erewrite (object-message-fair): one pass delivers both credits.
+            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Account | bal : 50 > < b : Savings | bal : 125,",
+            "    rate : 5 >",
+            // erewrite ping-pong: [3] = three hand-offs; pong leftover, p1 at 2 turns, p2 at 1.
+            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
+            "    turns : 1 >",
+        ],
+        "omod/class/subclass/msg + object-pattern completion outcomes must match the reference: {out}"
+    );
+}
+
+/// Pillar 2.5-E — object-pattern completion **attribute edge cases** (`ooTransform.cc`), beyond the
+/// class-constant→variable + fresh-variable cases above: (1) a rule whose RHS omits an attribute its LHS
+/// matched — completion copies the pattern attribute back, so `applyRate` updates `bal` yet preserves
+/// `rate`; (2) a rule whose RHS sets an attribute its LHS did not match (`last`) — completion adds a fresh
+/// kind-variable attribute to the LHS pattern, so the rule fires only on objects already carrying it.
+/// Byte-identical to `~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-attrs.maude`.
+#[test]
+fn objects_omod_attrs_through_repl() {
+    let out = repl().eval(conformance_file!("objects-omod-attrs.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "omod-attrs build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // applyRate: bal := bal + rate (100 + 5); rate preserved via the missing-attribute copy.
+            "rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Object: < s1 : Savings | bal : 105, rate : 5 >",
+            // log: count := s count, last := 7 (last matched by a fresh kind-variable on the LHS).
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Object: < lg : Logger | count : 1, last : 7 >",
+        ],
+        "object-pattern completion attribute edge cases must match the reference: {out}"
+    );
+}
+

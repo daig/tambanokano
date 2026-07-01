@@ -40,6 +40,12 @@ impl Interner {
     pub fn resolve(&self, sym: Sym) -> &str {
         &self.strings[sym.0 as usize]
     }
+    /// The [`Sym`] for an already-interned string, or `None`. Immutable lookup (no interning) — used by
+    /// the surface parser (which holds `&Interner`) to obtain the mixfix fragment chars (`:`/`_`) it
+    /// splices into synthesized `omod` attribute-operator names; [`tokenize`] guarantees they are interned.
+    pub fn get(&self, s: &str) -> Option<Sym> {
+        self.lookup.get(s).copied()
+    }
 }
 
 /// The lexical class of a [`Token`], computed at scan time from its text.
@@ -222,6 +228,14 @@ fn is_float_literal(text: &str) -> bool {
 /// `---` line comments, the splitting punctuation, string literals, the terminator `.`, and maudeIds with
 /// backquote escaping.
 pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
+    // Guarantee the two mixfix fragment chars the `omod` class-desugaring splices into synthesized
+    // attribute-operator names (`bal` + `:` + `_` → `bal :_`) are interned, so the surface parser (which
+    // holds only `&Interner`) can look them up via `Interner::get`. The `:` separator is present in any
+    // real module (every op/var declaration), but the `_` hole may legitimately be absent from an object
+    // module's source — its objects are written `< O : C | ... >`, never a bare `_`.
+    interner.intern(":");
+    interner.intern("_");
+
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut i = 0;

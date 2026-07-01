@@ -148,9 +148,9 @@ pub fn flatten(
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
     let root = db.get(name);
-    let (kind, is_theory, is_strategy) = root
-        .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy))
-        .unwrap_or((ModuleKind::Functional, false, false));
+    let (kind, is_theory, is_strategy, is_object) = root
+        .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy, pm.is_object))
+        .unwrap_or((ModuleKind::Functional, false, false, false));
     // Carry the root module's own strategy declarations/definitions through (a strategy module flattened by
     // name keeps its own `strat`/`sd`; merging an *import's* strategies is the Pillar-2.4 follow-on).
     let (strat_decls, strat_defs) =
@@ -161,6 +161,9 @@ pub fn flatten(
         kind,
         is_theory,
         is_strategy,
+        // The flattened module keeps the root's object-orientation, so `load_statements` runs the
+        // object-pattern completion on its (own + imported) statements when the root is an `omod`.
+        is_object,
         // The flattened module is fully resolved: each parameter's copy (its `X$s` sorts) is inlined, so
         // no formal parameters remain.
         params: Vec::new(),
@@ -208,6 +211,7 @@ pub fn flatten_pre(
         kind: pm.kind,
         is_theory: pm.is_theory,
         is_strategy: pm.is_strategy,
+        is_object: pm.is_object,
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts,

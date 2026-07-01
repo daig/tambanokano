@@ -243,8 +243,23 @@ prelude load.
    **External IO deferred (2026-06-30) — embedding direction.** The remaining IO (the `mio` reactor, FILE/
    SOCKET/PROCESS, signals) is **not** being built in-engine; per the revised **D5** the engine stays a pure,
    instance-based kernel and a host program owns IO (native Rust), embedding it for computation. The minimal
-   embedding API is left undesigned for now. **Next: `omod`/`class`/`msg` desugaring** (the OO surface
-   language — frontend, independent of IO), then LOOP-MODE → Full Maude (Phase 3.4).
+   embedding API is left undesigned for now.
+   **Phase E done (`omod`/`class`/`msg`) — the OO surface language, a pure frontend desugaring
+   (`ooProcess.cc`/`ooTransform.cc`).** `omod … endom` (+ `oth`) parses; `class C | a : S` desugars to a
+   sort `C` + `subsort C < Cid` + constant `op C : -> C [ctor]` + attribute op `op a :_ : S -> Attribute
+   [ctor gather (&)]`; `subclass` → subsort; `msg` → `[ctor msg]` op; and an `omod` auto-imports the new
+   **built-in `CONFIGURATION`** (`tnk`'s first injected prelude module — the only one, added on demand when
+   imported and not user-defined; `objects.maude`'s own `CONFIGURATION` still wins). **Object-pattern
+   completion** (`ooTransform.cc`) runs on an object module's statements at build time (`load_statements`),
+   gated structurally by "class sort = strict subsort of `Cid`": each object pattern gets a fresh
+   `Atts:AttributeSet` variable (matching objects with extra attributes) and a class *constant* is rewritten
+   to a fresh class-sorted variable (subclass polymorphism), with missing-attribute copy-back and
+   subject-only kind-variable attributes handled too. `conformance/objects-omod.maude` (bank with a
+   `Savings < Account` subclass carrying an extra `rate`, + ping-pong) and `objects-omod-attrs.maude` (the
+   two attribute edge cases) are byte-identical to the reference (`objects_omod_through_repl`,
+   `objects_omod_attrs_through_repl`). Incidental: `input_complete`/module dispatch learned `omod`/`endom`;
+   `tokenize` pre-interns the `:`/`_` mixfix fragments the attribute-op desugaring splices in.
+   **Next:** LOOP-MODE → Full Maude (Phase 3.4).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
 

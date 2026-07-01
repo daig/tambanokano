@@ -35,6 +35,14 @@ pub struct PreModule {
     /// strategy declarations/definitions ([`strat_decls`](Self::strat_decls)/[`strat_defs`](Self::strat_defs)).
     /// Orthogonal to [`kind`](Self::kind) (a strategy module is a system module). Plain `mod`/`fmod` = `false`.
     pub is_strategy: bool,
+    /// `true` for an **object-oriented module** (`omod`/`oth`, Pillar 2.5-E). An object module is a system
+    /// module (rules allowed) that additionally permits `class`/`subclass`/`msg` declarations, which the
+    /// parser **desugars** into ordinary sorts/subsorts/ops (so [`ops`](Self::ops) etc. carry the lowered
+    /// form and the rest of the pipeline is unchanged). It auto-imports `CONFIGURATION`. The flag is
+    /// carried through flattening so `load_statements` runs the **object-pattern completion** transform
+    /// (`ooTransform.cc`) — splicing a fresh `AttributeSet` variable into each object pattern and turning a
+    /// class *constant* into a fresh class-sorted variable (subclass polymorphism) — only for object modules.
+    pub is_object: bool,
     /// `strat`/`strats` declarations (Pillar 2.4) — empty for a non-strategy module.
     pub strat_decls: Vec<StratDecl>,
     /// `sd`/`csd` strategy definitions (Pillar 2.4) — empty for a non-strategy module.

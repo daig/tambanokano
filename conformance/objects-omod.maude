@@ -1,0 +1,55 @@
+*** Pillar 2.5-E: omod/class/subclass/msg -- the object-oriented surface language. Each omod desugars to
+*** CONFIGURATION-based Core-Maude (class C to sort C + subsort C less-than Cid + constant op C : -> C
+*** [ctor]; attribute a : S to op a :_ : S -> Attribute [ctor gather (and)]; subclass to subsort; msg to
+*** op ... [ctor msg]) and auto-imports the built-in CONFIGURATION. The load-bearing case is object-pattern
+*** completion (ooTransform.cc): the credit rule names only bal, yet must fire on a Savings object that ALSO
+*** carries rate (captured by a fresh AttributeSet variable) and whose class Savings is a SUBCLASS of the
+*** rule's Account (the class constant is rewritten to a fresh class-sorted variable). BANK/PINGPONG behave
+*** identically to the hand-written CONFIGURATION encodings in objects.maude.
+***
+*** Oracle -- byte-for-byte, modulo the `====`/`Bye.` framing:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod.maude < /dev/null
+
+set show advisories off .
+
+*** The same minimal real NAT as objects.maude (SuccSymbol + ACU_NumberOpSymbol).
+fmod NAT is
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op _+_ : NzNat Nat -> NzNat [assoc comm prec 33 special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+endfm
+
+omod BANK is
+  protecting NAT .
+  class Account | bal : Nat .
+  class Savings | rate : Nat .
+  subclass Savings < Account .
+  ops a b : -> Oid [ctor] .
+  msg credit : Oid Nat -> Msg .
+  vars A : Oid .  vars N M : Nat .
+  rl [credit] : credit(A, M) < A : Account | bal : N > => < A : Account | bal : (N + M) > .
+endom
+
+omod PINGPONG is
+  protecting NAT .
+  class Player | turns : Nat .
+  ops p1 p2 : -> Oid [ctor] .
+  msgs ping pong : Oid Oid -> Msg .
+  vars X Y : Oid .  var N : Nat .
+  rl [ping] : ping(X, Y) < X : Player | turns : N > => pong(Y, X) < X : Player | turns : (s N) > .
+  rl [pong] : pong(X, Y) < X : Player | turns : N > => ping(Y, X) < X : Player | turns : (s N) > .
+endom
+
+*** rewrite: the credit rule fires on a plain Account and on a Savings (subclass) carrying an extra `rate`.
+rewrite in BANK : < a : Account | bal : 0 > < b : Savings | bal : 100, rate : 5 > credit(a, 50) credit(b, 25) .
+*** getClass on the subclass instance returns its actual class Savings.
+red in BANK : getClass(< b : Savings | bal : 100, rate : 5 >) .
+*** search: reach the fully-credited configuration.
+search in BANK : < a : Account | bal : 0 > credit(a, 5) credit(a, 7) =>* < a : Account | bal : N > .
+*** erewrite (object-message-fair): one pass delivers both credits.
+erewrite in BANK : < a : Account | bal : 0 > < b : Savings | bal : 100, rate : 5 > credit(a, 50) credit(b, 25) .
+*** erewrite ping-pong: one delivery per pass, [3] = three hand-offs.
+erewrite [3] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > .

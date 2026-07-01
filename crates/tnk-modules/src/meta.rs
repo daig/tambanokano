@@ -964,6 +964,9 @@ impl MetaDescent<'_> {
             kind,
             is_theory,
             is_strategy: false,
+            // Down-translated meta-modules install their statements post-build (not via the `is_object`-gated
+            // `load_statements`), so object-pattern completion does not apply to the meta path.
+            is_object: false,
             params: Vec::new(),
             imports,
             sorts,

@@ -14,5 +14,6 @@ pub mod db;
 pub mod flatten;
 pub mod load;
 pub mod meta;
+pub mod prelude;
 pub mod rename;
 pub mod view;
