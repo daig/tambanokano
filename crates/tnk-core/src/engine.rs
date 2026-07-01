@@ -2924,13 +2924,6 @@ impl Engine {
         matches!(self.sig.symbol(sym).theory(), Theory::Acu | Theory::Au)
     }
 
-    /// Whether `sym` is **associative-commutative** (ACU). Its `makeTerm` normal form flattens *and*
-    /// **sorts** arguments (`Term::compare`), whereas a merely-associative (AU) operator flattens but
-    /// keeps order — so only ACU arguments are reordered in the META up-translation.
-    pub fn symbol_is_acu(&self, sym: SymbolId) -> bool {
-        matches!(self.sig.symbol(sym).theory(), Theory::Acu)
-    }
-
     /// The object-oriented completion context (Pillar 2.5-E) — the CONFIGURATION symbols/sorts the
     /// `omod` object-pattern completion transform reads. `None` when no `object`-flagged constructor is
     /// in scope, or it does not have the `Oid Cid AttributeSet` shape, or no AttributeSet `_,_` is found.

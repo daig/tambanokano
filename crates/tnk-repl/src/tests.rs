@@ -1703,3 +1703,36 @@ fn objects_omod_meta_through_repl() {
     );
 }
 
+/// Pillar 2.5-E / META-LEVEL: an object THEORY's rule is object-pattern-completed and up-translates
+/// byte-identically. `upModule` of an `oth` yields a `th` whose rule shows the completed form
+/// (`'V:Acct` for the class constant, a fresh `'Atts:AttributeSet`, the attribute op spelled `` 'bal`:_ ``).
+/// Verified byte-identical against the reference (an `oth`'s non-`[nonexec]` axioms execute + complete, as
+/// in Maude, so they are retained and shown).
+#[test]
+fn objects_oth_meta_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "oth OT is\n",
+            "  protecting NAT .\n",
+            "  class Acct | bal : Nat .\n",
+            "  op c : -> Oid [ctor] .\n",
+            "  msg cr : Oid Nat -> Msg .\n",
+            "  vars A : Oid .  vars N M : Nat .\n",
+            "  rl [cr] : cr(A, M) < A : Acct | bal : N > => < A : Acct | bal : (N + M) > .\n",
+            "endoth\n",
+            "red in META-LEVEL : upModule('OT, false) .\n",
+        ))
+        .output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "oth meta: {out}");
+    // The oth up-translates to a `th` (theory), and its rule is completed and shown.
+    assert!(out.contains("th 'OT is"), "oth up-translates to a theory: {out}");
+    // The rule is object-pattern-completed: class constant -> fresh `'V:Acct`, a fresh attribute-set
+    // variable `'Atts:AttributeSet`, and the attribute op spelled with the backtick-blank. (The full rule
+    // wraps at 80 columns, so assert the individual completion markers.)
+    for marker in ["'V:Acct", "'Atts:AttributeSet", "'bal`:_[", "[label('cr)]"] {
+        assert!(out.contains(marker), "oth rule missing completion marker `{marker}`: {out}");
+    }
+}
+

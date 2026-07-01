@@ -2394,16 +2394,15 @@ fn up_pattern(
         Term::Op { symbol, args } => {
             let name = meta_op_name(source.engine.symbol(*symbol).name());
             // Flatten a nested associative operator to Maude's `makeTerm` normal form (`__(a, __(b,c))` ->
-            // `__(a,b,c)`) — tnk's parser stores ACU/AU patterns binary-nested — and additionally SORT an
-            // ACU operator's arguments by `Term::compare` (arity-first), so a multi-object configuration
-            // soup or an attribute set prints identically to the reference. Order/associativity are
-            // irrelevant to matching, so this is a meta-form-only normalization.
+            // `__(a,b,c)`) — tnk's parser stores ACU/AU patterns binary-nested. Associativity is irrelevant
+            // to matching, so this normalizes only the meta form. We deliberately DON'T reorder ACU
+            // arguments here: a user-written term (`N + M`) is stored in source order, which is already the
+            // reference's order (Maude sorts by `Term::compare`, whose variable tie-break is interning-order
+            // name codes — the same source order); an *added* attribute set is instead ordered at
+            // construction (`oo_complete::canonicalize_attr_set`).
             let mut flat: Vec<&Term> = Vec::new();
             if source.engine.symbol_is_assoc(*symbol) {
                 flatten_assoc_args(*symbol, args, &mut flat);
-                if source.engine.symbol_is_acu(*symbol) {
-                    flat.sort_by(|a, b| term_cmp(a, b));
-                }
             } else {
                 flat.extend(args.iter());
             }
@@ -2427,33 +2426,6 @@ fn flatten_assoc_args<'t>(symbol: SymbolId, args: &'t [Term], out: &mut Vec<&'t 
     }
 }
 
-/// Compare two pattern terms as Maude's `Term::compare` (for ACU `makeTerm` argument ordering):
-/// `orderInt = arity<<24 | creation`, so **arity first**, then symbol creation order (tnk `SymbolId`),
-/// then arguments; at equal arity a constant precedes a variable, and variables order by first-seen
-/// index (which tracks Maude's interning-order name code for a statement's own variables).
-fn term_cmp(a: &Term, b: &Term) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let arity = |t: &Term| match t {
-        Term::Op { args, .. } => args.len(),
-        _ => 0,
-    };
-    arity(a)
-        .cmp(&arity(b))
-        .then_with(|| matches!(a, Term::Var(_)).cmp(&matches!(b, Term::Var(_))))
-        .then_with(|| match (a, b) {
-            (Term::Op { symbol: sa, args: aa }, Term::Op { symbol: sb, args: ab }) => sa
-                .cmp(sb)
-                .then_with(|| {
-                    aa.iter()
-                        .zip(ab)
-                        .map(|(x, y)| term_cmp(x, y))
-                        .find(|o| *o != Ordering::Equal)
-                        .unwrap_or(Ordering::Equal)
-                }),
-            (Term::Var(va), Term::Var(vb)) => va.index.cmp(&vb.index),
-            _ => Ordering::Equal,
-        })
-}
 
 /// The declared range-sort name of operator `symbol` (its `SymbolSyntax`), for a constant's `'c.Sort`.
 fn sort_name_of(source: &BuiltModule, symbol: SymbolId) -> String {
