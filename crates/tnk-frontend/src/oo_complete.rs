@@ -432,8 +432,26 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
         atts
     } else {
         elems.push(atts);
+        canonicalize_attr_set(&mut elems);
         Term::op(info.attr_set_sym, elems)
     };
+}
+
+/// Order the elements of a rebuilt attribute set as Maude's ACU `makeTerm` does — by `Term::compare`
+/// (`orderInt = arity<<24 | creation`): the arity-0 `Atts` variable sorts before the arity-1 attribute
+/// operators, which sort among themselves by symbol creation order (`SymbolId`). ACU matching is order-
+/// independent, so this changes only the stored/meta-printed form (matching `upModule`/`show`), not any
+/// rewrite. (A single set variable and distinct attribute symbols mean no variable-vs-variable tie arises.)
+fn canonicalize_attr_set(elems: &mut [Term]) {
+    fn key(t: &Term) -> (usize, bool, Option<SymbolId>) {
+        match t {
+            // (arity, is-variable, symbol): arity first; at equal arity a constant precedes a variable.
+            Term::Op { symbol, args } => (args.len(), false, Some(*symbol)),
+            Term::Na { symbol, .. } => (0, false, Some(*symbol)),
+            Term::Var(_) => (0, true, None),
+        }
+    }
+    elems.sort_by(|a, b| key(a).cmp(&key(b)));
 }
 
 /// The kind (top/error sort) of an attribute operator's argument, for a fresh kind-variable attribute

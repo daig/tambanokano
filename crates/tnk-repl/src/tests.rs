@@ -1665,3 +1665,41 @@ fn objects_oth_through_repl() {
     );
 }
 
+/// Pillar 2.5-E / META-LEVEL: an object module round-trips through the meta level byte-identically to the
+/// reference. `upModule` of an `omod` yields a plain completed `mod` (Maude strips the OO fiction) whose
+/// message op carries `[ctor msg]`, whose attribute op is named `` 'bal`:_ `` (the backtick-blank Maude
+/// keeps in a spaced mixfix name — reconstructed by `meta_op_name`), and whose rule shows the completed
+/// form (`'V:Account`, `'Atts:AttributeSet` spliced in). `metaRewrite` over it delivers the message and
+/// reduces the balance, the result again spelling the attribute op `` 'bal`:_ ``. Verified byte-identical
+/// against `~/Downloads/Maude-3/maude` (see the diff in the commit).
+#[test]
+fn objects_omod_meta_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude")); // load the META-LEVEL tower
+    let out = r
+        .eval(concat!(
+            "omod BANK is\n",
+            "  protecting NAT .\n",
+            "  class Account | bal : Nat .\n",
+            "  ops a b : -> Oid [ctor] .\n",
+            "  msg credit : Oid Nat -> Msg .\n",
+            "  vars A : Oid .  vars N M : Nat .\n",
+            "  rl [credit] : credit(A, M) < A : Account | bal : N > => < A : Account | bal : (N + M) > .\n",
+            "endom\n",
+            "red in META-LEVEL : upModule('BANK, false) .\n",
+            "red in META-LEVEL : metaRewrite(upModule('BANK, false), ",
+            "'__['credit['a.Oid, 's_^5['0.Zero]], ",
+            "'<_:_|_>['a.Oid, 'Account.Account, 'bal`:_['0.Zero]]], unbounded) .\n",
+        ))
+        .output;
+    assert!(!out.contains("no parse") && !out.contains("error"), "omod meta: {out}");
+    // upModule: the message op is `[ctor msg]`, the attribute op is spelled with the backtick-blank.
+    assert!(out.contains("op 'credit : 'Oid 'Nat -> 'Msg [ctor msg] ."), "upModule [ctor msg]: {out}");
+    assert!(out.contains("op 'bal`:_ : 'Nat -> 'Attribute [ctor gather('&)] ."), "attr op name: {out}");
+    // metaRewrite: credit delivered, balance 0 -> 5, attribute op spelled `` 'bal`:_ `` in the result.
+    assert!(
+        out.contains("'bal`:_['s_^5["),
+        "metaRewrite result must spell the attribute op with the backtick-blank and reduce the balance: {out}"
+    );
+}
+

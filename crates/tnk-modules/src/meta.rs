@@ -1427,7 +1427,7 @@ fn down_leaf_to_term(text: &str, target: &BuiltModule, vars: &mut VarIndex) -> O
         Some(Term::var(vars.index_of(text, sort), sort))
     } else if let Some(dot) = text.rfind('.') {
         // Constant `name.Sort`: look up the arity-0 operator (literal NA constants are a follow-up).
-        let sym = *target.ops.get(&(text[..dot].to_string(), 0))?;
+        let sym = *target.ops.get(&(strip_op_blanks(&text[..dot]), 0))?;
         Some(Term::constant(sym))
     } else {
         None
@@ -1454,6 +1454,7 @@ fn down_arglist_to_term(
 /// Build a kernel [`Term`] application from a meta op-name + down-translated args: an iterated name
 /// `base^n` wraps the argument in `n` nested successor `Term::Op`s; otherwise the operator is `(name, arity)`.
 fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<Term> {
+    let head = strip_op_blanks(head); // normalize a meta Qid's backtick-blanks to the canonical op name
     if let Some((base, count)) = head.rsplit_once('^')
         && let Ok(n) = count.parse::<u64>()
     {
@@ -1464,7 +1465,7 @@ fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<T
         }
         return Some(t);
     }
-    let sym = *target.ops.get(&(head.to_string(), args.len()))?;
+    let sym = *target.ops.get(&(head.clone(), args.len()))?;
     Some(Term::op(sym, args))
 }
 
@@ -1574,13 +1575,72 @@ fn build_app(head: &str, args: Vec<DagId>, target: &mut BuiltModule) -> Option<D
     Some(target.engine.make_node(sym, args))
 }
 
+/// An operator's META name Qid string: its canonical (concatenated) name with a **backtick-blank**
+/// re-inserted between two consecutive *literal* fragments — Maude keeps the blank in a stored op name so
+/// that `bal :_` is `` bal`:_ `` (else `bal:_` would re-tokenize as one token), while `_,_`/`<_:_|_>`
+/// (literals separated by holes) are unchanged. Mirrors [`split_mixfix`](tnk_frontend::lex::split_mixfix)
+/// plus Maude's op-name blanking, without interning. tnk drops blanks between two space-separated *text*
+/// tokens at parse time (e.g. `foo bar_`), so only blanks around a split char (`:` in attribute ops) —
+/// the object-system case — are recoverable here; the general text-text case is a pre-existing limitation.
+fn meta_op_name(name: &str) -> String {
+    let is_punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',');
+    let mut out = String::new();
+    let mut in_literal = false; // accumulating a literal identifier run
+    let mut prev_literal = false; // the previous emitted fragment was a literal token
+    for ch in name.chars() {
+        if ch == '`' {
+            out.push('`'); // a pre-existing blank (tnk names normally have none) — pass through
+            in_literal = false;
+            prev_literal = false;
+        } else if ch == '_' {
+            out.push('_'); // a hole separates literal fragments (no blank needed)
+            in_literal = false;
+            prev_literal = false;
+        } else if ch == ':' || is_punct(ch) {
+            if in_literal || prev_literal {
+                out.push('`'); // split char adjacent to a literal → blank
+            }
+            out.push(ch);
+            in_literal = false;
+            prev_literal = true;
+        } else {
+            if !in_literal && prev_literal {
+                out.push('`'); // a new literal run adjacent to the previous literal → blank
+            }
+            out.push(ch);
+            in_literal = true;
+            prev_literal = true;
+        }
+    }
+    out
+}
+
+/// The inverse of [`meta_op_name`] for resolving a **down**-translated operator name: strip the
+/// backtick-blanks a meta Qid carries (`` bal`:_ `` → `bal:_`, `` _`,_ `` → `_,_`), mirroring the lexer's
+/// backquote-escape (a backtick is consumed and the next char kept). tnk stores op names blank-free, so a
+/// meta Qid must be normalized before it is looked up in the module's canonical op table.
+fn strip_op_blanks(name: &str) -> String {
+    let mut out = String::new();
+    let mut chars = name.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '`' {
+            if let Some(next) = chars.next() {
+                out.push(next); // backquote escapes the next char in; the backtick itself is dropped
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Up-translate an object DAG `t` (in `source`) into a meta-term built in `ctx`.
 fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId) -> DagId {
     let qid = hooks.ops["qidSymbol"];
     match source.engine.node(t).repr() {
         NodeRepr::App => {
             let sym = source.engine.node(t).symbol();
-            let name = source.engine.symbol(sym).name().to_string();
+            let name = meta_op_name(source.engine.symbol(sym).name());
             let kids: Vec<DagId> = source.engine.node(t).children().collect();
             if kids.is_empty() {
                 // a constant → `'name.sort`
@@ -1595,7 +1655,7 @@ fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
         }
         NodeRepr::Iter { count, arg } => {
             // `'base^count[up(arg)]` — `^count` only when count > 1 (`s^1` is `'s_[…]`).
-            let base = source.engine.symbol(source.engine.node(t).symbol()).name().to_string();
+            let base = meta_op_name(source.engine.symbol(source.engine.node(t).symbol()).name());
             let head = if count == "1" { base } else { format!("{base}^{count}") };
             let up_arg = up_term(ctx, hooks, source, arg);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
@@ -1639,7 +1699,7 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
     let sort = ctx.sort_name(ctx.sort_of(t)).to_string();
     let shape = match ctx.repr(t) {
         NodeRepr::App => {
-            let name = ctx.name(ctx.top(t)).to_string();
+            let name = meta_op_name(ctx.name(ctx.top(t)));
             let kids = ctx.children(t);
             if kids.is_empty() {
                 NodeShape::Leaf(format!("{name}.{sort}"))
@@ -1648,7 +1708,7 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
             }
         }
         NodeRepr::Iter { count, arg } => {
-            let base = ctx.name(ctx.top(t)).to_string();
+            let base = meta_op_name(ctx.name(ctx.top(t)));
             let head = if count == "1" { base } else { format!("{base}^{count}") };
             NodeShape::Iter(head, vec![arg])
         }
@@ -1697,7 +1757,7 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
     match shape {
         DShape::Const(text) => {
             let (name, _sort) = text.rsplit_once('.')?;
-            let sym = ctx.resolve_op(name, 0)?;
+            let sym = ctx.resolve_op(&strip_op_blanks(name), 0)?;
             Some(ctx.app(sym, vec![]))
         }
         DShape::App(head, arg_dags) => {
@@ -1706,10 +1766,10 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
             if let Some((base, count)) = head.rsplit_once('^')
                 && let Ok(n) = count.parse::<u64>()
             {
-                let sym = ctx.resolve_op(base, 1)?;
+                let sym = ctx.resolve_op(&strip_op_blanks(base), 1)?;
                 return Some(ctx.make_iter(sym, n, *args.first()?));
             }
-            let sym = ctx.resolve_op(&head, args.len())?;
+            let sym = ctx.resolve_op(&strip_op_blanks(&head), args.len())?;
             Some(ctx.app(sym, args))
         }
     }
@@ -1982,7 +2042,7 @@ fn up_ops_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, ops: &[UpOp
 /// domain as a `TypeList` (`__`-joined sort `Qid`s, `nil` for a constant), the range `Type`, the `AttrSet`.
 fn up_op_decl(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) -> Option<DagId> {
     let qid = hooks.ops["qidSymbol"];
-    let name = ctx.make_na(qid, NaValue::Qid(op.name.as_str().into()));
+    let name = ctx.make_na(qid, NaValue::Qid(meta_op_name(&op.name).into()));
     let dom_elems: Vec<DagId> =
         op.decl.domain.iter().map(|s| ctx.make_na(qid, NaValue::Qid(s.as_str().into()))).collect();
     let domain = up_set(ctx, dom_elems, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"]);
@@ -2306,7 +2366,7 @@ fn up_pattern(
             ctx.make_na(qid, NaValue::Qid(format!("{rendered}.{}", sort_name_of(source, *symbol)).into()))
         }
         Term::Op { symbol, args } if args.is_empty() => {
-            let name = source.engine.symbol(*symbol).name();
+            let name = meta_op_name(source.engine.symbol(*symbol).name());
             ctx.make_na(qid, NaValue::Qid(format!("{name}.{}", sort_name_of(source, *symbol)).into()))
         }
         // Iter-chain collapse: a successor chain `s(s(…x))` (nested unary `iter` ops, as a rule side stores
@@ -2325,14 +2385,14 @@ fn up_pattern(
                     break;
                 }
             }
-            let base = source.engine.symbol(*symbol).name();
-            let head = if count == 1 { base.to_string() } else { format!("{base}^{count}") };
+            let base = meta_op_name(source.engine.symbol(*symbol).name());
+            let head = if count == 1 { base } else { format!("{base}^{count}") };
             let up_inner = up_pattern(ctx, hooks, source, inner, names);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_inner])
         }
         Term::Op { symbol, args } => {
-            let name = source.engine.symbol(*symbol).name().to_string();
+            let name = meta_op_name(source.engine.symbol(*symbol).name());
             let up_args: Vec<DagId> =
                 args.iter().map(|a| up_pattern(ctx, hooks, source, a, names)).collect();
             let arglist = up_arglist(ctx, hooks, up_args);
