@@ -670,12 +670,21 @@ impl<'a> Parser<'a> {
                 // [ctor gather (&)]` (the `a :_` mixfix form).
                 let ctok = self.peek().ok_or("expected a class name after `class`")?;
                 let cname = self.name()?;
+                // A class name becomes a sort *and* a same-named constant operator; an underscore would
+                // make that operator a mixfix form with a hole (Maude rejects it — `ooProcess.cc`).
+                if cname.contains('_') {
+                    return Err(format!("underscore not allowed in class name `{cname}`"));
+                }
                 self.desugar_class(m, ctok, &cname);
                 if self.at("|") {
                     self.advance();
                     loop {
                         let atok = self.peek().ok_or("expected an attribute name")?;
-                        let _ = self.name()?; // the attribute name (its token is `atok`)
+                        let aname = self.name()?;
+                        // The attribute op name is `a` + `` `:_ ``; an underscore in `a` would corrupt it.
+                        if aname.contains('_') {
+                            return Err(format!("underscore not allowed in attribute name `{aname}`"));
+                        }
                         self.eat(":")?;
                         let asort = self.sort_name()?;
                         self.desugar_attribute(m, atok, asort);

@@ -1,0 +1,20 @@
+*** Pillar 2.5-E: `oth` (object THEORY) — the theory analogue of `omod`. Same class/subclass/msg
+*** desugaring path (gated on the object-oriented flag, not module-vs-theory), auto-importing CONFIGURATION.
+*** A theory's axioms are non-executable proof obligations, but its class/attribute/message SIGNATURE is
+*** real, so `getClass` (from CONFIGURATION, executable) resolves an object's class and a subclass instance
+*** returns its own class. Byte-identical to the reference:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-oth.maude < /dev/null
+
+set show advisories off .
+
+oth SHAPE is
+  class Shape | sides : Oid .
+  class Square .
+  subclass Square < Shape .
+  op o : -> Oid [ctor] .
+  msg draw : Oid -> Msg .
+endoth
+
+*** getClass on a Shape instance and on a Square (a subclass) instance.
+red in SHAPE : getClass(< o : Shape | sides : o >) .
+red in SHAPE : getClass(< o : Square | none >) .

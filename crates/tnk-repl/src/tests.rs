@@ -1617,3 +1617,51 @@ fn objects_omod_attrs_through_repl() {
     );
 }
 
+/// Pillar 2.5-E / erewrite — the object-message scheduler's **two paths**. `reward` is a single-object
+/// message rule (Maude's fast path: object + message, same name); `pair` is a MULTI-object rule (message +
+/// two objects), which is not an object-message pair, so it takes the generic **leftOver** path
+/// (`ConfigSymbol::leftOverRewrite`). tnk previously fired only the fast path, so a multi-object rule never
+/// delivered under `erewrite` though it did under plain `rewrite`. Byte-identical to the reference
+/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-multi.maude`).
+#[test]
+fn objects_omod_multi_through_repl() {
+    let out = repl().eval(conformance_file!("objects-omod-multi.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "multi build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // reward(a,5) via the fast path (a: 0->5, +1 for the `+`), then pair via leftOver (a->6, b->1) = 3.
+            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Member | pts : 6 > < b : Member | pts : 1 >",
+            // pair alone: one leftOver rewrite bumps both objects.
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Configuration: < a : Member | pts : 1 > < b : Member | pts : 1 >",
+        ],
+        "erewrite object-message fast path + multi-object leftOver path must match the reference: {out}"
+    );
+}
+
+/// Pillar 2.5-E: `oth` (object THEORY) — the theory analogue of `omod`. It shares the `omod`
+/// class/subclass/msg desugaring (gated on the object-oriented flag, not module-vs-theory), auto-imports
+/// CONFIGURATION, and builds; `getClass` (from CONFIGURATION) resolves an object's class, and a subclass
+/// instance returns its own class. Byte-identical to
+/// `~/Downloads/Maude-3/maude -no-banner conformance/objects-oth.maude`.
+#[test]
+fn objects_oth_through_repl() {
+    let out = repl().eval(conformance_file!("objects-oth.maude")).output;
+    assert!(!out.contains("no parse") && !out.contains("error in module"), "oth build: {out}");
+    assert!(!out.contains("parse error"), "no parse errors: {out}");
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Shape: Shape",
+            // getClass on a Square (a subclass of Shape) instance returns its own class.
+            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "result Square: Square",
+        ],
+        "oth (object theory) class/subclass/msg build + getClass must match the reference: {out}"
+    );
+}
+

@@ -67,11 +67,34 @@ struct SortConstraint {
 /// are applied **only** by `rewrite`/`frewrite`/`search` (Pillar A) — never by [`reduce`](Engine::reduce),
 /// which consults only `equations`. The frontend keeps this rule's source `Term`s + variable names +
 /// label at `rl_traces[id]` for the trace renderer and `show path` (`===[ rl ... ]===>`).
+/// The `erewrite` object-message role of a rule (Maude's `ConfigSymbol::compileRules` partition). A
+/// config-rooted rule whose lhs is exactly one object + one message with the **same name** (`checkArgs`)
+/// is delivered on the fast path, keyed by its message symbol; every other config rule (multi-object,
+/// no-message, unstable-name) takes the generic `leftOver` path. Non-config rules are irrelevant to the
+/// scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OoRuleKind {
+    NotConfig,
+    ObjectMessage(SymbolId),
+    LeftOver,
+}
+
+/// Which `erewrite` rule class [`Runtime::apply_first_rule_filtered`] considers.
+#[derive(Debug, Clone, Copy)]
+enum RuleFilter {
+    /// Fast-path object-message rules (any message symbol).
+    ObjectMessage,
+    /// Generic `leftOver` rules.
+    LeftOver,
+}
+
 struct CompiledRule {
     id: u32,
     lhs: LhsAutomaton,
     rhs: Term,
     nr_vars: u32,
+    /// The `erewrite` scheduler role, classified from the (uncompiled) lhs at registration.
+    oo: OoRuleKind,
     /// Condition fragments (empty for an unconditional `rl`); a `crl` may additionally carry a **rewrite**
     /// fragment `t => p` (Pillar A-v) — the one fragment kind equations/memberships may not have.
     condition: Vec<CompiledFragment>,
@@ -1052,16 +1075,62 @@ impl Signature {
         let id = self.next_rule_id;
         self.next_rule_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
+        let oo = self.classify_oo_rule(&lhs);
         let compiled = CompiledRule {
             id,
             lhs: LhsAutomaton::compile(lhs, self),
             rhs,
             nr_vars,
+            oo,
             condition: self.compile_condition(condition, CondOwner::Rule),
             rhs_shares,
         };
         self.rules.entry(top).or_default().push(compiled);
         id
+    }
+
+    /// Classify a rule's lhs for the `erewrite` scheduler (Maude's `ConfigSymbol::checkArgs`). An
+    /// object-message rule is a `config`-rooted lhs of exactly two arguments — one **object** constructor
+    /// and one **message** constructor, both stable (an application, not a top variable) and sharing the
+    /// same first argument (the object/target *name*). Everything else config-rooted is `LeftOver`.
+    fn classify_oo_rule(&self, lhs: &Term) -> OoRuleKind {
+        let Term::Op { symbol, args } = lhs else { return OoRuleKind::NotConfig };
+        if !self.symbol(*symbol).oo.config {
+            return OoRuleKind::NotConfig;
+        }
+        if args.len() != 2 {
+            return OoRuleKind::LeftOver;
+        }
+        let (mut object, mut message, mut name): (bool, Option<SymbolId>, Option<&Term>) =
+            (false, None, None);
+        for arg in args {
+            // Must be stable — an application whose first argument is the name (a top variable disqualifies).
+            let Term::Op { symbol: asym, args: aargs } = arg else { return OoRuleKind::LeftOver };
+            let Some(arg0) = aargs.first() else { return OoRuleKind::LeftOver };
+            let oo = self.symbol(*asym).oo;
+            if oo.object {
+                if object {
+                    return OoRuleKind::LeftOver;
+                }
+                object = true;
+            } else if oo.message {
+                if message.is_some() {
+                    return OoRuleKind::LeftOver;
+                }
+                message = Some(*asym);
+            } else {
+                return OoRuleKind::LeftOver;
+            }
+            match name {
+                None => name = Some(arg0),
+                Some(n) if n != arg0 => return OoRuleKind::LeftOver,
+                Some(_) => {}
+            }
+        }
+        match (object, message) {
+            (true, Some(msg)) => OoRuleKind::ObjectMessage(msg),
+            _ => OoRuleKind::LeftOver,
+        }
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort`, compiling its lhs to a theory
@@ -2281,6 +2350,20 @@ impl Runtime {
         node: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
     ) -> Option<(u32, DagId)> {
+        self.apply_first_rule_filtered(sig, node, cursors, None)
+    }
+
+    /// As [`apply_first_rule_at`](Self::apply_first_rule_at), but considering only rules of the given
+    /// `erewrite` class when `filter` is `Some` (the fast object-message path vs the generic `leftOver`
+    /// path — Maude's `ruleMap[msg]` vs `leftOver.rules`). `None` considers every rule (ordinary
+    /// `rewrite`/`frewrite`/`search`).
+    fn apply_first_rule_filtered(
+        &mut self,
+        sig: &Signature,
+        node: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+        filter: Option<RuleFilter>,
+    ) -> Option<(u32, DagId)> {
         let symbol = self.node(node).symbol();
         let rules = sig.rules.get(&symbol)?;
         let n = rules.len();
@@ -2295,6 +2378,14 @@ impl Runtime {
         for k in 0..n {
             let idx = (start + k) % n;
             let rule = &rules[idx];
+            // Skip rules outside the requested `erewrite` class (object-message vs leftOver).
+            match filter {
+                Some(RuleFilter::ObjectMessage) if !matches!(rule.oo, OoRuleKind::ObjectMessage(_)) => {
+                    continue
+                }
+                Some(RuleFilter::LeftOver) if rule.oo != OoRuleKind::LeftOver => continue,
+                _ => {}
+            }
             // Rule application happens outside `reduce`, so there are no outer reduce frames to root for a
             // conditional rule's re-entrant condition reduction; the caller keeps the whole term rooted
             // (and the REPL runs with GC off), so an empty frame slice is correct here.
@@ -3233,6 +3324,24 @@ impl Engine {
         self.rt.apply_first_rule_at(&self.sig, node, cursors).map(|(_, r)| r)
     }
 
+    /// Apply the first applicable rule of the given `erewrite` class (object-message vs `leftOver`) at
+    /// `node`; the scheduler restricts the fast path to object-message rules and the generic path to
+    /// `leftOver` rules, mirroring Maude's `ruleMap`/`leftOver` split.
+    fn rewrite_at_filtered(
+        &mut self,
+        node: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+        filter: RuleFilter,
+    ) -> Option<DagId> {
+        self.rt.apply_first_rule_filtered(&self.sig, node, cursors, Some(filter)).map(|(_, r)| r)
+    }
+
+    /// Whether the config operator `sym` has any `leftOver` (non-object-message) rule — the gate for the
+    /// generic `leftOverRewrite` path (a delivering system like bank/ping-pong has none).
+    fn has_leftover_rules(&self, sym: SymbolId) -> bool {
+        self.sig.rules.get(&sym).is_some_and(|rs| rs.iter().any(|r| r.oo == OoRuleKind::LeftOver))
+    }
+
     /// Reconstruct a node of `symbol` from `children` (the theory-aware constructor — Free/ACU/AU/CUI/S).
     /// Used by the `frewrite` traversal to rebuild a parent after rewriting a child.
     pub(crate) fn rebuild_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
@@ -3475,7 +3584,12 @@ impl Engine {
                 match obj {
                     Some(o) => {
                         let pair = self.make_acu(config_sym, vec![(o, 1), (msg, 1)]);
-                        match self.rewrite_at(pair, cursors).map(|r| self.reduce(r)) {
+                        // Fast path: only object-message rules may consume the isolated pair (a leftOver
+                        // rule — multi-object / no-message — is handled generically below, never here).
+                        match self
+                            .rewrite_at_filtered(pair, cursors, RuleFilter::ObjectMessage)
+                            .map(|r| self.reduce(r))
+                        {
                             Some(r) => {
                                 let (new_obj, others) = self.retrieve_object(r, name);
                                 obj = new_obj;
@@ -3503,7 +3617,20 @@ impl Engine {
                 remainder.push((o, 1)); // object survives the pass
             }
         }
-        self.make_acu(config_sym, remainder)
+        let remainder = self.make_acu(config_sym, remainder);
+        // Generic `leftOver` path (Maude's `leftOverRewrite`): apply one non-object-message config rule to
+        // the (reduced) remainder via ACU extension matching — a multi-object rule, or a rule that rewrites
+        // an object without consuming a fast-path message. Gated on the module actually having leftOver
+        // rules, so a purely delivering system (bank/ping-pong/STD-STREAM) keeps its exact prior behavior.
+        if self.has_leftover_rules(config_sym) {
+            let reduced = self.reduce(remainder);
+            if let Some(r) = self.rewrite_at_filtered(reduced, cursors, RuleFilter::LeftOver) {
+                *progress = true;
+                return r;
+            }
+            return reduced;
+        }
+        remainder
     }
 
     /// Pull the object named `name` out of a delivery result `r` (Maude's `retrieveObject`): the result is

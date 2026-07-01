@@ -59,8 +59,10 @@ struct ObjInfo {
     /// The class sort (a strict subsort of `Cid`): the sort of `V` if the class is a constant, or the
     /// declared sort of the class variable.
     class_sort: SortId,
-    /// The class argument is a constant (needs replacing with a fresh `V:class_sort` on all occurrences).
-    class_is_constant: bool,
+    /// The class argument's variable index if it is already a variable of class sort; `None` if it is a
+    /// class *constant* (which completion replaces with a fresh `V:class_sort` on all occurrences). A
+    /// class variable must not be used elsewhere in the statement (`checkVariables`).
+    class_var: Option<u32>,
     pattern: Occ,
     subjects: Vec<Occ>,
 }
@@ -111,7 +113,7 @@ pub fn complete_statement(
     let mut plans: HashMap<Term, ObjPlan> = HashMap::new();
     for obj in &objs {
         // Class constant → a fresh `V:class_sort` variable, shared across all occurrences.
-        let class_replace = obj.class_is_constant.then(|| {
+        let class_replace = obj.class_var.is_none().then(|| {
             let name = choose_fresh("V", vars);
             Term::var(vars.index_of(&name, obj.class_sort), obj.class_sort)
         });
@@ -146,12 +148,12 @@ pub fn complete_statement(
     }
 
     // --- Transform (mutable walk; rewrite each object occurrence from its plan). ---
-    transform(lhs, Mode::Pattern, &plans, info);
+    transform(lhs, Mode::Pattern, &plans, info, m);
     if let Some(rhs) = rhs {
-        transform(rhs, Mode::Subject, &plans, info);
+        transform(rhs, Mode::Subject, &plans, info, m);
     }
     for frag in cond.iter_mut() {
-        transform_condition(frag, &plans, info);
+        transform_condition(frag, &plans, info, m);
     }
 }
 
@@ -193,15 +195,15 @@ fn record_object(
         None => match mode {
             Mode::Pattern => {
                 // First occurrence, on the LHS — the defining (pattern) occurrence.
-                let Some((class_sort, class_is_constant)) = classify_class(class, info, m) else {
+                let Some((class_sort, class_var)) = classify_class(class, info, m) else {
                     *ignore = true; // class argument is neither a class constant nor a class-sorted variable
                     return;
                 };
-                let Some(pattern) = decompose_attr_set(atts, info) else {
+                let Some(pattern) = decompose_attr_set(atts, info, m) else {
                     *ignore = true;
                     return;
                 };
-                objs.push(ObjInfo { oid: oid.clone(), class_sort, class_is_constant, pattern, subjects: Vec::new() });
+                objs.push(ObjInfo { oid: oid.clone(), class_sort, class_var, pattern, subjects: Vec::new() });
             }
             // First seen on a RHS/condition: a "new" object with no LHS occurrence — quietly ignored.
             Mode::Subject => {}
@@ -212,7 +214,7 @@ fn record_object(
             // A duplicate object name on the LHS disables completion.
             Mode::Pattern => *ignore = true,
             Mode::CondPattern => *ignore = true,
-            Mode::Subject => match decompose_attr_set(atts, info) {
+            Mode::Subject => match decompose_attr_set(atts, info, m) {
                 Some(occ) => objs[idx].subjects.push(occ),
                 None => *ignore = true,
             },
@@ -245,14 +247,15 @@ fn gather_condition(
     }
 }
 
-/// Classify a class argument. Returns `(class_sort, is_constant)` for a class constant (an arity-0 ctor
-/// ranging on a class sort) or a class-sorted variable, else `None` (which disables completion).
-fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortId, bool)> {
+/// Classify a class argument. Returns `(class_sort, class_var_index)` for a class-sorted variable
+/// (`Some(index)`) or a class constant — an arity-0 ctor ranging on a class sort — (`None` index), else
+/// `None` (which disables completion). Mirrors `recordClassArgument`.
+fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortId, Option<u32>)> {
     match class {
-        Term::Var(v) => info.class_sorts.contains(&v.sort).then_some((v.sort, false)),
+        Term::Var(v) => info.class_sorts.contains(&v.sort).then_some((v.sort, Some(v.index))),
         Term::Op { symbol, args } if args.is_empty() => {
             let range = m.engine.symbol_declarations(*symbol).first()?.1;
-            info.class_sorts.contains(&range).then_some((range, true))
+            info.class_sorts.contains(&range).then_some((range, None))
         }
         _ => None,
     }
@@ -260,21 +263,18 @@ fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortI
 
 /// Decompose an attribute-set term into its individual attribute terms (keyed by head operator) plus at
 /// most one attribute-set variable. `None` (disabling completion) on a duplicate attribute, a second
-/// set variable, or an unrecognized subterm — mirroring `analyzeAttributeSetArgument`.
-fn decompose_attr_set(term: &Term, info: &OoInfo) -> Option<Occ> {
+/// set variable, a variable of a non-AttributeSet sort, or an unrecognized subterm — mirroring
+/// `analyzeAttributeSetArgument`.
+fn decompose_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule) -> Option<Occ> {
     let mut occ = Occ { attrs: Vec::new(), set_var: None };
-    if walk_attr_set(term, info, &mut occ) {
-        Some(occ)
-    } else {
-        None
-    }
+    walk_attr_set(term, info, m, &mut occ).then_some(occ)
 }
 
-fn walk_attr_set(term: &Term, info: &OoInfo, occ: &mut Occ) -> bool {
+fn walk_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule, occ: &mut Occ) -> bool {
     match term {
         // Nested `_,_` — recurse over the elements.
         Term::Op { symbol, args } if *symbol == info.attr_set_sym => {
-            args.iter().all(|a| walk_attr_set(a, info, occ))
+            args.iter().all(|a| walk_attr_set(a, info, m, occ))
         }
         // The attribute-set identity `none` — the empty set; contributes nothing.
         Term::Op { symbol, args } if args.is_empty() && Some(*symbol) == info.none_sym => true,
@@ -286,15 +286,26 @@ fn walk_attr_set(term: &Term, info: &OoInfo, occ: &mut Occ) -> bool {
             occ.set_var = Some(v.clone());
             true
         }
-        // Otherwise an attribute term, keyed by its head operator; a duplicate head disables completion.
-        _ => match term.top_symbol() {
-            Some(sym) if !occ.attrs.iter().any(|(s, _)| *s == sym) => {
-                occ.attrs.push((sym, term.clone()));
-                true
+        // An attribute term: its head must be an attribute operator (ranging on a strict subsort of
+        // AttributeSet, i.e. Attribute), keyed by head; a duplicate head disables completion.
+        Term::Op { symbol, .. } if is_attribute_op(*symbol, info, m) => {
+            if occ.attrs.iter().any(|(s, _)| s == symbol) {
+                return false; // duplicate attribute — disable
             }
-            _ => false,
-        },
+            occ.attrs.push((*symbol, term.clone()));
+            true
+        }
+        // Anything else (a non-attribute operator, a variable of the wrong sort) is unrecognized.
+        _ => false,
     }
+}
+
+/// Whether `sym` is an attribute operator — its result sort is a **strict** subsort of the AttributeSet
+/// sort (i.e. `Attribute`). Structural stand-in for Maude's `attributeSymbols` membership.
+fn is_attribute_op(sym: SymbolId, info: &OoInfo, m: &BuiltModule) -> bool {
+    m.engine.symbol_declarations(sym).first().is_some_and(|(_, range)| {
+        *range != info.attr_set_sort && m.engine.sorts().leq(*range, info.attr_set_sort)
+    })
 }
 
 /// Maude's `checkVariables`: a set variable in the pattern must appear (identically) in every subject
@@ -319,6 +330,13 @@ fn check_variables(
     }
     for obj in objs {
         let occurrences = 1 + obj.subjects.len();
+        // A class *variable* may be used only as the class of this object's occurrences (once per
+        // occurrence) — reusing it elsewhere disables completion (Maude's `classVariableName` check).
+        if let Some(cv) = obj.class_var
+            && counts.get(&cv).copied().unwrap_or(0) > occurrences
+        {
+            return false;
+        }
         match &obj.pattern.set_var {
             None => {
                 // No pattern set variable ⇒ no subject may carry one.
@@ -344,47 +362,53 @@ fn check_variables(
 }
 
 /// Rewrite each object occurrence in `term` under `mode` from its plan.
-fn transform(term: &mut Term, mode: Mode, plans: &HashMap<Term, ObjPlan>, info: &OoInfo) {
+fn transform(term: &mut Term, mode: Mode, plans: &HashMap<Term, ObjPlan>, info: &OoInfo, m: &BuiltModule) {
     if let Term::Op { symbol, args } = term {
         if *symbol == info.object_ctor
             && args.len() == 3
             && let Some(plan) = plans.get(&args[0])
         {
-            apply_object(args, mode, plan, info);
+            apply_object(args, mode, plan, info, m);
         }
         for a in args.iter_mut() {
-            transform(a, mode, plans, info);
+            transform(a, mode, plans, info, m);
         }
     }
 }
 
-fn transform_condition(frag: &mut ConditionFragment, plans: &HashMap<Term, ObjPlan>, info: &OoInfo) {
+fn transform_condition(
+    frag: &mut ConditionFragment,
+    plans: &HashMap<Term, ObjPlan>,
+    info: &OoInfo,
+    m: &BuiltModule,
+) {
     match frag {
         ConditionFragment::Equality { lhs, rhs } => {
-            transform(lhs, Mode::Subject, plans, info);
-            transform(rhs, Mode::Subject, plans, info);
+            transform(lhs, Mode::Subject, plans, info, m);
+            transform(rhs, Mode::Subject, plans, info, m);
         }
-        ConditionFragment::SortTest { term, .. } => transform(term, Mode::Subject, plans, info),
+        ConditionFragment::SortTest { term, .. } => transform(term, Mode::Subject, plans, info, m),
         ConditionFragment::Matching { pattern, subject, .. } => {
-            transform(pattern, Mode::CondPattern, plans, info);
-            transform(subject, Mode::Subject, plans, info);
+            transform(pattern, Mode::CondPattern, plans, info, m);
+            transform(subject, Mode::Subject, plans, info, m);
         }
         ConditionFragment::Rewrite { lhs, pattern, .. } => {
-            transform(lhs, Mode::Subject, plans, info);
-            transform(pattern, Mode::CondPattern, plans, info);
+            transform(lhs, Mode::Subject, plans, info, m);
+            transform(pattern, Mode::CondPattern, plans, info, m);
         }
     }
 }
 
 /// Apply one object's plan to a `< oid : class | atts >` argument vector (`args[1]` = class, `args[2]` =
 /// attribute set), rebuilding the attribute set per `mode`.
-fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo) {
+fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m: &BuiltModule) {
     if let Some(vt) = &plan.class_replace {
         args[1] = vt.clone();
     }
-    // The occurrence's own attributes + set variable, then the shared attribute-set variable.
+    // The occurrence's own attributes + set variable, then the shared attribute-set variable. (The set
+    // was validated during gather, so this re-walk succeeds.)
     let mut own = Occ { attrs: Vec::new(), set_var: None };
-    let _ = walk_attr_set(&args[2], info, &mut own);
+    let _ = walk_attr_set(&args[2], info, m, &mut own);
     let atts = own.set_var.as_ref().map_or_else(|| plan.atts_var.clone(), |v| Term::Var(v.clone()));
 
     let mut elems: Vec<Term> = Vec::new();

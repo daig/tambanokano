@@ -1,0 +1,34 @@
+*** Pillar 2.5-E / erewrite: the object-message scheduler's TWO paths in one system. `reward` is a
+*** single-object message rule (Maude's fast path — object + message, same name); `pair` is a MULTI-object
+*** rule (message + two objects), which is NOT an object-message pair, so it takes the generic `leftOver`
+*** path (ConfigSymbol::leftOverRewrite). Before this, tnk's erewrite fired only the fast path, so `pair`
+*** never delivered under erewrite though it did under plain rewrite. Byte-identical to the reference:
+***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-multi.maude < /dev/null
+
+set show advisories off .
+
+fmod NAT is
+  sorts Zero NzNat Nat .
+  subsort Zero NzNat < Nat .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op _+_ : NzNat Nat -> NzNat [assoc comm prec 33 special (id-hook ACU_NumberOpSymbol (+) op-hook succSymbol (s_ : Nat ~> NzNat))] .
+  op _+_ : Nat Nat -> Nat [ditto] .
+endfm
+
+omod CLUB is
+  protecting NAT .
+  class Member | pts : Nat .
+  ops a b : -> Oid [ctor] .
+  msg reward : Oid Nat -> Msg .
+  msg pair : Oid Oid -> Msg .
+  vars X Y : Oid .  vars I J K : Nat .
+  rl [reward] : reward(X, K) < X : Member | pts : I > => < X : Member | pts : (I + K) > .
+  rl [pair] : pair(X, Y) < X : Member | pts : I > < Y : Member | pts : J >
+              => < X : Member | pts : (s I) > < Y : Member | pts : (s J) > .
+endom
+
+*** reward (fast path) credits a by 5; pair (leftOver path) bumps both a and b by one.
+erewrite in CLUB : reward(a, 5) pair(a, b) < a : Member | pts : 0 > < b : Member | pts : 0 > .
+*** pair alone (only the leftOver path exercised).
+erewrite in CLUB : pair(a, b) < a : Member | pts : 0 > < b : Member | pts : 0 > .

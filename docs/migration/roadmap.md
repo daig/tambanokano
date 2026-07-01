@@ -259,6 +259,23 @@ prelude load.
    two attribute edge cases) are byte-identical to the reference (`objects_omod_through_repl`,
    `objects_omod_attrs_through_repl`). Incidental: `input_complete`/module dispatch learned `omod`/`endom`;
    `tokenize` pre-interns the `:`/`_` mixfix fragments the attribute-op desugaring splices in.
+   **Phase E parity hardening (object-system completeness).** Follow-ups closing the residuals: (1) the
+   **`erewrite` generic `leftOver` path** (`ConfigSymbol::leftOverRewrite`) — rules are classified at
+   registration into object-message pairs (fast path, `checkArgs`) vs `leftOver` (multi-object /
+   no-message), and a `leftOver` rule now fires against the reduced remainder via ACU extension matching, so
+   a **multi-object** object rule delivers under `erewrite` (it did under plain `rewrite` but not the
+   scheduler before); `conformance/objects-omod-multi.maude` exercises both paths (`objects_omod_multi_through_repl`).
+   (2) `ooTransform` completion guards: the **class-variable reuse** check (`checkVariables`), strict
+   **malformed attribute-set** disabling (`analyzeAttributeSetArgument`), and **underscore rejection** in
+   class/attribute names. (3) **`oth`** (object theory) builds/desugars/reduces byte-identically
+   (`conformance/objects-oth.maude`, `objects_oth_through_repl`). (4) **Meta-level**: `upModule` of an object
+   module emits a plain completed `mod` (Maude strips the OO fiction post-desugar) with the OO op attributes
+   (`config`/`object`/`msg`/`portal`) now up- **and** down-translated, so `metaReduce`/`metaRewrite` run over
+   object modules. *Known residuals (pre-existing, non-object-specific):* meta round-trip is not byte-exact
+   for spaced mixfix ops — an attribute op's canonical name is `bal:_` where Maude stores ``bal`:_`` (the
+   backtick-blank), a general lexer/naming divergence — and the meta `AttrSet`/attribute-set ACU print order
+   differs from Maude (the "ctor-order ACU divergence" already noted for `upModule`); object completion is
+   applied only to *executed* statements (a theory's nonexec axioms are not retained for `upModule`/`show`).
    **Next:** LOOP-MODE → Full Maude (Phase 3.4).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.

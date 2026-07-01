@@ -1123,6 +1123,14 @@ fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> O
             a.idem = true;
         } else if is("iterSymbol") {
             a.iter = true;
+        } else if is("configSymbol") {
+            a.config = true;
+        } else if is("objectSymbol") {
+            a.object = true;
+        } else if is("msgSymbol") {
+            a.message = true;
+        } else if is("portalSymbol") {
+            a.portal = true;
         } else if is("idSymbol") || is("leftIdSymbol") || is("rightIdSymbol") {
             // `id:`/`left-id:`/`right-id:` <term> — a single identity constant in practice; carry its name.
             a.id = Some(id_bubble(ctx, *ctx.children(attr).first()?, i)?);
@@ -2003,8 +2011,9 @@ fn up_attrs(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) ->
     }
     let mut elems = Vec::new();
     let flag = |name: &str, on: bool, ctx: &mut MetaCtx, elems: &mut Vec<DagId>| {
-        if on {
-            elems.push(ctx.app(hooks.ops[name], vec![]));
+        // Tolerant of a META-LEVEL that predates a given attribute symbol: skip rather than panic.
+        if on && let Some(&s) = hooks.ops.get(name) {
+            elems.push(ctx.app(s, vec![]));
         }
     };
     flag("ctorSymbol", a.ctor, ctx, &mut elems);
@@ -2012,6 +2021,12 @@ fn up_attrs(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) ->
     flag("commSymbol", a.comm, ctx, &mut elems);
     flag("idemSymbol", a.idem, ctx, &mut elems);
     flag("iterSymbol", a.iter, ctx, &mut elems);
+    // Object-system attributes (Pillar 2.5): `config`/`object`/`msg`/`portal`. An `omod`'s desugared ops
+    // carry these (e.g. `msg` on message operators), and Maude's `upModule` emits them on the plain `mod`.
+    flag("configSymbol", a.config, ctx, &mut elems);
+    flag("objectSymbol", a.object, ctx, &mut elems);
+    flag("msgSymbol", a.message, ctx, &mut elems);
+    flag("portalSymbol", a.portal, ctx, &mut elems);
     if let Some(prec) = a.prec {
         let n = up_nat(ctx, prec as u64)?;
         elems.push(ctx.app(hooks.ops["precSymbol"], vec![n]));
