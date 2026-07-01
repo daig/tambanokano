@@ -271,11 +271,17 @@ prelude load.
    (`conformance/objects-oth.maude`, `objects_oth_through_repl`). (4) **Meta-level**: `upModule` of an object
    module emits a plain completed `mod` (Maude strips the OO fiction post-desugar) with the OO op attributes
    (`config`/`object`/`msg`/`portal`) now up- **and** down-translated, so `metaReduce`/`metaRewrite` run over
-   object modules. *Known residuals (pre-existing, non-object-specific):* meta round-trip is not byte-exact
-   for spaced mixfix ops — an attribute op's canonical name is `bal:_` where Maude stores ``bal`:_`` (the
-   backtick-blank), a general lexer/naming divergence — and the meta `AttrSet`/attribute-set ACU print order
-   differs from Maude (the "ctor-order ACU divergence" already noted for `upModule`); object completion is
-   applied only to *executed* statements (a theory's nonexec axioms are not retained for `upModule`/`show`).
+   object modules. The attribute op is spelled ``'bal`:_`` — the backtick-blank Maude keeps in a spaced
+   mixfix op name, reconstructed by `meta_op_name` from the grammar fragments (grounded in Maude's
+   `token.cc`) and stripped back by `strip_op_blanks` on down-translation; a completed object's attribute
+   set is ordered as Maude's ACU `makeTerm` (`canonicalize_attr_set`); and a multi-object configuration soup
+   is flattened to `makeTerm` normal form in the up-translation. So `upModule` **and**
+   `metaReduce`/`metaRewrite` over single- and multi-object modules are **byte-identical to the reference**
+   (`objects_omod_meta_through_repl`, verified by diff). *Residuals (pre-existing, non-object-specific):*
+   tnk drops inter-token blanks between two space-separated *text* tokens of an op name (`foo bar_`),
+   recoverable only around a split char (the `:` in attribute ops — the object case is covered); explicit
+   `[nonexec]` statements are not retained for `upModule` (a general meta feature — a theory's *executable*
+   axioms are shown completed, but a hand-marked `[nonexec]` proof obligation is skipped).
    **Next:** LOOP-MODE → Full Maude (Phase 3.4).
 
 **Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
