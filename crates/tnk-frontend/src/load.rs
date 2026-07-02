@@ -117,6 +117,9 @@ fn load_statements(
                 // Capture the source-form trace metadata before the Terms are moved into the kernel; the
                 // kernel returns the dense equation id, which must index `eq_traces` (asserted).
                 reject_rewrite_fragment(&condition, "equation")?;
+                if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
+                    continue; // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+                }
                 let trace = EqTrace {
                     lhs: lhs_t.clone(),
                     rhs: rhs_t.clone(),
@@ -150,6 +153,9 @@ fn load_statements(
                 }
                 let nr = vars.count();
                 reject_rewrite_fragment(&condition, "membership")?;
+                if !statement_vars_bound(&lhs_t, &condition, None) {
+                    continue; // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
+                }
                 let trace = MbTrace {
                     lhs: lhs_t.clone(),
                     sort: sort_id,
@@ -183,6 +189,9 @@ fn load_statements(
                     );
                 }
                 let nr = vars.count();
+                if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
+                    continue; // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+                }
                 let trace = RlTrace {
                     lhs: lhs_t.clone(),
                     rhs: rhs_t.clone(),
@@ -433,6 +442,41 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
 }
 
 /// Collect a term's distinct variable indices, in first-seen order.
+/// Whether every variable a statement *instantiates* is bound by the time it is needed: rhs and each
+/// condition fragment's evaluated side may use only lhs variables plus the fresh binders of *earlier*
+/// `:=`/`=>` fragments (Maude's "used before it is bound" check). A violating statement is degraded to
+/// non-executable — parsed but never registered — instead of panicking at `instantiate` (§3.1 A1c); the
+/// warning text is deferred diagnostics (roadmap phase E).
+fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option<&Term>) -> bool {
+    let mut bound = Vec::new();
+    term_var_indices(lhs, &mut bound);
+    let ok = |t: &Term, bound: &Vec<u32>| {
+        let mut used = Vec::new();
+        term_var_indices(t, &mut used);
+        used.iter().all(|v| bound.contains(v))
+    };
+    for frag in condition {
+        let frag_ok = match frag {
+            ConditionFragment::Equality { lhs, rhs } => ok(lhs, &bound) && ok(rhs, &bound),
+            ConditionFragment::SortTest { term, .. } => ok(term, &bound),
+            ConditionFragment::Matching { subject, fresh_vars, .. } => {
+                let r = ok(subject, &bound);
+                bound.extend_from_slice(fresh_vars);
+                r
+            }
+            ConditionFragment::Rewrite { lhs, fresh_vars, .. } => {
+                let r = ok(lhs, &bound);
+                bound.extend_from_slice(fresh_vars);
+                r
+            }
+        };
+        if !frag_ok {
+            return false;
+        }
+    }
+    rhs.is_none_or(|r| ok(r, &bound))
+}
+
 pub(crate) fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
     match t {
         Term::Var(v) => {
