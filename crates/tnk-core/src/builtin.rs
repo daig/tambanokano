@@ -81,10 +81,13 @@ impl Runtime {
                 Some(self.make_na(sig, str_sym, NaValue::Str(q)))
             }
             QidOp::Qid => {
-                // `qid` accepts any string (even empty or with spaces) — the raw text is stored and the
-                // printer backquote-escapes special characters (`qid("a b")` prints as `'a`b`).
+                // `qid` normalizes the string to Maude's canonical token name at construction
+                // (Token::ropeToPrefixNameCode): whitespace/backquote runs become one backquote,
+                // specials get a preceding backquote. So `qid("a b")` and `qid("a`b")` build the
+                // SAME node ("a`b"), `string` returns the canonical text, and the printer is verbatim.
                 let s = self.as_str(arg)?;
-                Some(self.make_na(sig, qid_sym, NaValue::Qid(s)))
+                let canonical = normalize_qid_name(&s);
+                Some(self.make_na(sig, qid_sym, NaValue::Qid(canonical.into())))
             }
         }
     }
@@ -266,7 +269,13 @@ impl Runtime {
             let mut kids = self.node(id).children();
             (kids.next().expect("_==_ is binary"), kids.next().expect("_==_ is binary"))
         };
-        let chosen = if self.deep_equal(l, r) { eq } else { neq };
+        // Floats compare by IEEE value, not bit pattern: `- 0.0 == 0.0` is true (Maude's
+        // FloatDagNode compares the doubles; NaN never occurs — the float ops gate it out).
+        let equal = match (self.as_float(l), self.as_float(r)) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.deep_equal(l, r),
+        };
+        let chosen = if equal { eq } else { neq };
         Some(self.make_const(sig, chosen))
     }
 
@@ -413,7 +422,13 @@ impl Runtime {
                     NumOp::Gt => a[0] > a[1],
                     NumOp::Ge => a[0] >= a[1],
                     // `_divides_ : NzNat Nat -> Bool` — non-negative operands, so compare magnitudes.
-                    NumOp::Divides => a[0].magnitude().divides(&a[1].magnitude()),
+                    // A zero divisor is off the `NzNat` domain: `0 divides n` stays at `[Bool]`.
+                    NumOp::Divides => {
+                        if a[0].is_zero() {
+                            return None;
+                        }
+                        a[0].magnitude().divides(&a[1].magnitude())
+                    }
                     _ => unreachable!(),
                 };
                 let h = bool_.expect("a relational number op carries the true/false hooks");
@@ -446,13 +461,13 @@ impl Runtime {
                 let r = a[0].magnitude().mod_pow(&a[1].magnitude(), &a[2].magnitude());
                 self.make_int(sig, nat, Int::from_nat(&r))
             }
-            // `_>>_` / `_<<_ : Nat Nat -> Nat`: shift by a machine-width amount (a bignum shift count is
-            // unrepresentable ⇒ fall through). Non-negative operands.
+            // `_>>_` / `_<<_ : Int Nat -> Int`: arithmetic shifts on the signed value (`>>` floors toward
+            // −∞ — `-8 >> 1 = -4`, `-1 >> 100 = -1`; `-5 << 2 = -20`). Shift count is a machine `u64`
+            // (a bignum count is unrepresentable ⇒ fall through).
             NumOp::Shr | NumOp::Shl => {
                 let amount = a[1].magnitude().to_u64()?;
-                let base = a[0].magnitude();
-                let r = if matches!(op, NumOp::Shr) { base.shr(amount) } else { base.shl(amount) };
-                self.make_int(sig, nat, Int::from_nat(&r))
+                let r = if matches!(op, NumOp::Shr) { a[0].shr(amount) } else { a[0].shl(amount) };
+                self.make_int(sig, nat, r)
             }
             // ACU / CUI ops never reach the free path (the seam pairs each op with the right arm).
             NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max
@@ -705,10 +720,12 @@ impl Runtime {
                 }
             }
         };
-        // A partial op (`~>`) off its domain yields NaN, which does **not** reduce — `sqrt(-1.0)` /
-        // `log(-1.0)` / `asin(2.0)` / an indeterminate `^` stay in the kind `[Float]`. (`log(0.0)` =
-        // -inf is *not* NaN, so it reduces — matching the reference.) Total ops keep inf results.
-        if v.is_nan() && matches!(op, FltOp::Sqrt | FltOp::Log | FltOp::Asin | FltOp::Acos | FltOp::Pow) {
+        // NaN never reduces — a Maude Float value is never NaN (floatOpSymbol.cc gates every result on
+        // `!isNaN`): partial ops off their domain (`sqrt(-1.0)`, `log(-1.0)`, `asin(2.0)`) AND the
+        // indeterminate arithmetic forms (`Infinity - Infinity`, `Infinity * 0.0`, `Infinity / Infinity`,
+        // `Infinity rem 2.0`) all stay in the kind `[Float]`. (`log(0.0)` = -inf is *not* NaN, so it
+        // reduces; total ops keep inf results.)
+        if v.is_nan() {
             return None;
         }
         Some(make_f(self, v))
@@ -738,6 +755,31 @@ impl Runtime {
         }
         None // already in lowest terms
     }
+}
+
+/// A string's canonical Maude token name (`Token::ropeToPrefixNameCode`, `qid(String)`'s conversion):
+/// a run of whitespace/backquote characters becomes a single backquote separator before the next
+/// fragment, and each special char `( ) [ ] { } ,` is preceded by a backquote. `"a b"` and `` "a`b" ``
+/// both canonicalize to `` a`b ``, so the qids they build are identical.
+fn normalize_qid_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut need_bq = false;
+    for c in s.chars() {
+        if is_c_space(c) || c == '`' {
+            need_bq = true;
+        } else if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',') {
+            out.push('`');
+            out.push(c);
+            need_bq = false;
+        } else {
+            if need_bq {
+                out.push('`');
+            }
+            out.push(c);
+            need_bq = false;
+        }
+    }
+    out
 }
 
 /// Whether `c` is C-locale whitespace (`isspace`: space, tab, newline, CR, vertical tab, form feed) —

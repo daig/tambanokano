@@ -614,7 +614,9 @@ enum Leaf {
 
 /// A quoted identifier rendered with its leading `'` and Maude's name escaping: a space becomes a lone
 /// backquote, and each of `( ) [ ] { } ,` is preceded by a backquote (Maude's `Token` name encoding);
-/// everything else (letters, digits, `_`, `.`, …) is verbatim. So `qid("a b")` prints as `'a`b`.
+/// an existing backquote (canonical qid text, e.g. from `qid("a b")` → `` a`b ``) passes through
+/// verbatim; everything else (letters, digits, `_`, `.`, …) is verbatim. Kind qids built from raw
+/// bracket text (`[Nat]`) thus print `` '`[Nat`] `` exactly as Maude does.
 fn render_qid(q: &str) -> String {
     let mut out = String::with_capacity(q.len() + 1);
     out.push('\'');

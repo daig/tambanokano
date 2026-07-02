@@ -136,6 +136,16 @@ impl Int {
     pub(crate) fn mul(&self, other: &Int) -> Int {
         Int(&self.0 * &other.0)
     }
+    /// `self << amount` / `self >> amount` (INT `_<<_` / `_>>_`): **arithmetic** shifts on the signed
+    /// value — `>>` floors toward −∞ (GMP `mpz_fdiv_q_2exp`: `-8 >> 1 = -4`, `-1 >> k = -1` for any k),
+    /// `<<` is exact scaling (`-5 << 2 = -20`). Malachite's `Integer` shifts have exactly these semantics.
+    pub(crate) fn shl(&self, amount: u64) -> Int {
+        Int(&self.0 << amount)
+    }
+    pub(crate) fn shr(&self, amount: u64) -> Int {
+        Int(&self.0 >> amount)
+    }
+
     /// `(self / other, self % other)`, **truncated toward zero** (remainder takes the dividend's sign —
     /// Maude `quo`/`rem`). The caller guards `other != 0`.
     pub(crate) fn div_rem(&self, other: &Int) -> (Int, Int) {
@@ -194,10 +204,46 @@ pub(crate) fn f64_of_rational(num: &Int, den: &Nat) -> f64 {
     f64::rounding_from(&r, RoundingMode::Nearest).0
 }
 
-/// Parse a string to an `f64` (Maude's `float(String)` — `strtod`): the usual decimal / `e`-notation
-/// forms our float lexer also accepts. `None` if the whole string is not a float.
+/// Parse a string to an `f64` (Maude's `float(String)`): accepted iff it passes Maude's
+/// `looksLikeFloat` (Utility/macros.cc) — `[sign] ("Infinity" | digits with a `.` and/or an
+/// `e[sign]digits` exponent)`. Bare integers (`"5"`), `"NaN"`, `"nan"`, `"inf"`, dangling exponents
+/// (`"1.5e"`) and a lone `.` all stay unreduced — Rust's laxer `from_str` must not decide this.
 pub(crate) fn parse_double(s: &str) -> Option<f64> {
+    if !looks_like_float(s) {
+        return None;
+    }
     s.parse::<f64>().ok()
+}
+
+fn looks_like_float(s: &str) -> bool {
+    let t = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if t == "Infinity" {
+        return true;
+    }
+    let (mantissa, exponent) = match t.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (t, None),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let all_digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(int_part) || !frac_part.is_none_or(all_digits) {
+        return false;
+    }
+    // At least one digit somewhere in the mantissa…
+    if int_part.is_empty() && frac_part.is_none_or(str::is_empty) {
+        return false;
+    }
+    // …and a `.` or an exponent to make it a float rather than an integer numeral.
+    match exponent {
+        Some(e) => {
+            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !e.is_empty() && all_digits(e)
+        }
+        None => frac_part.is_some(),
+    }
 }
 
 /// Render an `f64` exactly as Maude's `doubleToString` (`Utility/macros.cc`): 17 significant digits, the
