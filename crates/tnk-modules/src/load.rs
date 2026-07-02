@@ -5,10 +5,10 @@
 //! the entry the B5 REPL consumes next round: load a file, hold the [`Program`] (modules + the command
 //! list + a name→index map), and run commands against the current module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{tokenize, Interner};
 use tnk_frontend::load::{build_loaded_module, LoadedModule};
-use tnk_frontend::surface::ast::{Command, Source};
+use tnk_frontend::surface::ast::{Command, ModuleExpr, PreModule, Source, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
@@ -24,6 +24,67 @@ pub struct Program {
     pub module_index: HashMap<String, usize>,
     pub views: ViewDb,
     pub commands: Vec<(usize, Command)>,
+}
+
+/// Collect every module/view name a module expression references — the bases and arguments of imports,
+/// summations `A + B`, renamings `M * (…)`, and instantiations `M{V, …}`. This is the dependency-tracking
+/// support for redefinition invalidation (A4c): it deliberately **over-approximates** — an instantiation
+/// argument that is really an enclosing parameter is captured too (harmless: it won't match a defined
+/// name), and a view name used as an instantiation argument is captured (so redefining a view re-flattens
+/// its users). Over-approximation can only cause an extra (semantically invisible) rebuild, never a missed
+/// one.
+fn collect_expr_names(e: &ModuleExpr, out: &mut HashSet<String>) {
+    match e {
+        ModuleExpr::Named(n) => {
+            out.insert(n.clone());
+        }
+        ModuleExpr::Sum(a, b) => {
+            collect_expr_names(a, out);
+            collect_expr_names(b, out);
+        }
+        ModuleExpr::Rename(inner, _) => collect_expr_names(inner, out),
+        ModuleExpr::Instantiation(base, args) => {
+            collect_expr_names(base, out);
+            for a in args {
+                collect_expr_names(a, out);
+            }
+        }
+    }
+}
+
+/// The direct module/view dependencies of a module: every name mentioned in its imports plus its parameter
+/// theories. The module's own name and its formal-parameter names are excluded (a parameter is bound
+/// locally, not a dependency). Used to invalidate cached dependents when a module/view is redefined (A4c).
+pub fn module_dep_names(pm: &PreModule) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for p in &pm.params {
+        out.insert(p.theory.clone());
+    }
+    for imp in &pm.imports {
+        collect_expr_names(&imp.expr, &mut out);
+    }
+    for p in &pm.params {
+        out.remove(&p.name);
+    }
+    out.remove(&pm.name);
+    out
+}
+
+/// The direct module/view dependencies of a view: its `from` source theory, its `to` target module
+/// expression, and any parameter theories. Its own name and formal-parameter names are excluded. Used to
+/// invalidate cached dependents when a view is redefined (A4c).
+pub fn view_dep_names(v: &ViewDecl) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for p in &v.params {
+        out.insert(p.theory.clone());
+    }
+    collect_expr_names(&v.from, &mut out);
+    collect_expr_names(&v.to, &mut out);
+    for p in &v.params {
+        out.remove(&p.name);
+    }
+    out.remove(&v.name);
+    out
 }
 
 /// Parse `src`, flatten every module's import closure, and build each. A module with no imports flattens

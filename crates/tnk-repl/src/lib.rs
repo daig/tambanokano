@@ -10,7 +10,7 @@
 mod trace;
 mod wrap;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
@@ -25,6 +25,7 @@ use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchAr
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::flatten::flatten;
+use tnk_modules::load::{module_dep_names, view_dep_names};
 use tnk_modules::meta::MetaDescent;
 use tnk_modules::view::{validate_view, ViewDb};
 use trace::{render_trace, TraceFlags};
@@ -46,6 +47,11 @@ pub struct Repl {
     modules: HashMap<String, LoadedModule>,
     /// Validated view definitions (B-ii), keyed by name.
     views: ViewDb,
+    /// The direct dependency set of every defined module **and** view, keyed by name (a module/view name →
+    /// the module/view names its flatten closure references directly). Maintained on every (re)definition
+    /// so that redefining a name can re-flatten its transitive dependents (A4c): a redefinition of `M`
+    /// leaves the *cached* build of an importer `N` referring to the old `M`, so we rebuild the importers.
+    deps: HashMap<String, HashSet<String>>,
     /// Module names in entry order (for `show modules`).
     order: Vec<String>,
     /// View names in entry order (for `show views`).
@@ -89,6 +95,7 @@ impl Repl {
             db: ModuleDb::new(),
             modules: HashMap::new(),
             views: ViewDb::new(),
+            deps: HashMap::new(),
             order: Vec::new(),
             view_order: Vec::new(),
             current: None,
@@ -198,6 +205,9 @@ impl Repl {
     fn enter_module(&mut self, pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
         self.last = None; // a (re)built module invalidates any saved rewrite continuation
+        // Record this module's direct dependencies (imports + parameter theories) so a later redefinition
+        // of anything it references can find and re-flatten it (A4c).
+        self.deps.insert(name.clone(), module_dep_names(&pm));
         // Inject any built-in prelude module this module imports (e.g. an `omod`'s auto-imported
         // `CONFIGURATION`) that the user has not defined, so flattening can resolve it.
         let imports = pm.imports.clone();
@@ -211,10 +221,15 @@ impl Repl {
                     self.order.push(name.clone());
                 }
                 self.modules.insert(name.clone(), lm);
-                self.current = Some(name);
+                self.current = Some(name.clone());
             }
             Err(e) => out.push_str(&format!("error in module `{name}`: {e}\n")),
         }
+        // A (re)definition of `name` invalidates the cached builds of every module that transitively
+        // depends on it: re-flatten and rebuild them so `reduce in <dependent>` uses the new definition.
+        // On a first definition this is a no-op (nothing built imports a name that was undefined until
+        // now), so ordinary loads pay only a cheap empty reverse-reachability walk.
+        self.rebuild_dependents(&name, out);
     }
 
     /// Define (or redefine) a view (B-ii): validate it against the module DB and store it. Silent on
@@ -223,12 +238,59 @@ impl Repl {
     fn enter_view(&mut self, v: ViewDecl, out: &mut String) {
         match validate_view(&v, &self.db, &mut self.interner) {
             Ok(()) => {
+                let name = v.name.clone();
+                // Record the view's direct dependencies (its from/to modules + parameter theories) and
+                // store it.
+                self.deps.insert(name.clone(), view_dep_names(&v));
                 if !self.views.contains(&v.name) {
                     self.view_order.push(v.name.clone());
                 }
                 self.views.insert(v);
+                // A redefined view leaves the cached builds of modules that instantiate with it stale
+                // (`M{V}` was flattened with the old view), so re-flatten its transitive dependents (A4c).
+                self.rebuild_dependents(&name, out);
             }
             Err(e) => out.push_str(&format!("error: {e}\n")),
+        }
+    }
+
+    /// Re-flatten and rebuild every currently-built module that transitively depends on `changed` (a
+    /// module or view name that was just (re)defined). Flattening reads the module database and view store
+    /// directly — never the cached [`modules`](Self::modules) map — so each dependent is rebuilt
+    /// independently (rebuild order is irrelevant) and picks up the new definition. A dependent's own
+    /// source is unchanged, so its recorded direct dependencies stay valid and need no refresh. If any
+    /// module is rebuilt, the saved rewrite/search continuation is dropped (its engine is replaced).
+    fn rebuild_dependents(&mut self, changed: &str, out: &mut String) {
+        // Reverse-reachability over the direct-dependency graph: every name that reaches `changed`.
+        let mut dependents: HashSet<String> = HashSet::new();
+        let mut frontier = vec![changed.to_string()];
+        while let Some(cur) = frontier.pop() {
+            for (name, ds) in &self.deps {
+                if ds.contains(&cur) && dependents.insert(name.clone()) {
+                    frontier.push(name.clone());
+                }
+            }
+        }
+        // Rebuild only the ones that are actually built modules (views aren't built; a dependent that
+        // failed to build earlier isn't cached). The changed name itself was already (re)built by the
+        // caller, so exclude it.
+        let mut rebuilt = false;
+        for name in dependents {
+            if name == changed || !self.modules.contains_key(&name) {
+                continue;
+            }
+            match flatten(&name, &self.db, &self.views, &mut self.interner)
+                .and_then(|flat| build_loaded_module(&flat, &mut self.interner))
+            {
+                Ok(lm) => {
+                    self.modules.insert(name, lm);
+                    rebuilt = true;
+                }
+                Err(e) => out.push_str(&format!("error in module `{name}`: {e}\n")),
+            }
+        }
+        if rebuilt {
+            self.last = None;
         }
     }
 
