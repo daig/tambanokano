@@ -170,10 +170,17 @@ impl<'a> Printer<'a> {
                 out.push(Work::Text { cat: Cat::Op, text: Cow::Borrowed(name) });
             }
             Item::Term(Term::Op { symbol, args }) => {
-                // A `Term` (pattern, in a trace) has no inferred sort to disambiguate with, so its
-                // children keep `range_known` true (Maude does not disambiguate inside statement printing).
-                let children: Vec<Item> = args.iter().map(Item::Term).collect();
-                self.layout_app(*symbol, &children, req_prec, lcap, rcap, true, out);
+                // A `nat_succ` tower over `nat_zero` folds to its decimal — `f(2)`, not `f(s s 0)`. The DAG
+                // stores a numeral as one `Iter` node (`layout_iter`), but a static pattern nests `succ`
+                // ops; Maude folds both when printing (fable-audit.md §3.3 B5).
+                if let Some(dec) = self.term_nat_decimal(*symbol, args) {
+                    out.push(Work::Text { cat: Cat::Lit, text: Cow::Owned(dec) });
+                } else {
+                    // A `Term` (pattern, in a trace) has no inferred sort to disambiguate with, so its
+                    // children keep `range_known` true (Maude does not disambiguate inside statement printing).
+                    let children: Vec<Item> = args.iter().map(Item::Term).collect();
+                    self.layout_app(*symbol, &children, req_prec, lcap, rcap, true, out);
+                }
             }
             // A built-in literal renders exactly as its DAG leaf would (string/qid/float).
             Item::Term(Term::Na { value, .. }) => {
@@ -529,6 +536,30 @@ impl<'a> Printer<'a> {
                 Some(count)
             }
             _ => None,
+        }
+    }
+
+    /// The decimal of a strictly-positive natural numeral **pattern** `s(s(…s(0)))` — a `nat_succ` tower
+    /// (depth ≥ 1) bottoming at the `nat_zero` constant; `None` otherwise. The `Term` mirror of
+    /// [`pos_nat_decimal`](Self::pos_nat_decimal) (a DAG numeral is one `Iter` node; a static pattern nests
+    /// `succ` ops). Iterative — a deep tower can't overflow the call stack (fable-audit.md §3.3 B5).
+    fn term_nat_decimal(&self, symbol: SymbolId, args: &[Term]) -> Option<String> {
+        if self.m.nat_succ != Some(symbol) || args.len() != 1 {
+            return None;
+        }
+        let mut count: u64 = 1;
+        let mut cur = &args[0];
+        loop {
+            match cur {
+                Term::Op { symbol: s, args } if self.m.nat_succ == Some(*s) && args.len() == 1 => {
+                    count += 1;
+                    cur = &args[0];
+                }
+                Term::Op { symbol: s, args } if self.m.nat_zero == Some(*s) && args.is_empty() => {
+                    return Some(count.to_string());
+                }
+                _ => return None,
+            }
         }
     }
 

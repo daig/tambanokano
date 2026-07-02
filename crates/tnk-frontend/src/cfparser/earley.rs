@@ -37,6 +37,15 @@ impl Chart {
         self.root_items(g, start).next().is_some()
     }
 
+    /// The furthest token index a valid partial parse reached — the largest set index that received any
+    /// item. Sets fill contiguously (set `j` gains items only when a token was scanned into it from set
+    /// `j-1`, or via predict/complete triggered by such a scan), so this is "one past the last token of a
+    /// valid partial parse" — Maude's `badTokenIndex` (`Parser/parser.hh`), reported by `metaParse` as the
+    /// `noParse(n)` failure position (fable-audit.md §3.3 B4).
+    pub fn furthest(&self) -> usize {
+        (0..self.sets.len()).rev().find(|&j| !self.sets[j].is_empty()).unwrap_or(0)
+    }
+
     /// The completed top-level items for `start` (origin 0, fully matched) in the final set — the roots of
     /// the parse forest. More than one ⇒ ambiguous (B4.4b).
     pub fn root_items<'a>(

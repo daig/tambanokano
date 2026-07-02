@@ -2608,7 +2608,7 @@ impl Runtime {
         nr_vars: u32,
         such_that: &[CompiledFragment],
         state: DagId,
-    ) -> Vec<Vec<DagId>> {
+    ) -> Vec<(Vec<DagId>, u64)> {
         let mut solutions = Vec::new();
         let mut subst = Subst::new();
         subst.reset(nr_vars);
@@ -2617,7 +2617,12 @@ impl Runtime {
         };
         while sp.next(self, sig, &mut subst) {
             if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state) {
-                solutions.push((0..nr_vars).map(|k| subst.get(k).expect("goal variable bound")).collect());
+                // Snapshot the rewrite count *after* the `such that` condition's equational reductions
+                // (the `rem`/`=/=` etc.): Maude bills those to the solution the condition admits, so the
+                // per-solution `rewrites:` count includes the condition evaluation (fable-audit.md §3.3
+                // B2a). An empty condition is 0-cost, so this equals the discovery count.
+                let bindings = (0..nr_vars).map(|k| subst.get(k).expect("goal variable bound")).collect();
+                solutions.push((bindings, self.rewrites()));
             }
         }
         solutions
@@ -3408,11 +3413,11 @@ impl Engine {
         // A `such that` condition may contain a rewrite (`=>`) fragment (a nested search), so it compiles
         // with the rule owner.
         let such_that = self.sig.compile_condition(such_that, CondOwner::Rule);
-        // State 0 is the reduced initial term; its reduction's rewrites count toward the search total.
+        // State 0 is the reduced initial term; its reduction's rewrites count toward the search total
+        // (they stay in the engine counter, read live for state 0's snapshot).
         let reduced = self.reduce(initial);
-        let rewrites = self.rewrites();
         let root = self.root(reduced);
-        Search::new(root, reduced, rewrites, goal, nr_vars, such_that, arrow, max_depth)
+        Search::new(root, reduced, goal, nr_vars, such_that, arrow, max_depth)
     }
 
     /// Structural hash of the DAG at `id`, consistent with [`deep_equal`](Self::deep_equal) — the `search`
@@ -3438,15 +3443,17 @@ impl Engine {
         self.reduce(succ)
     }
 
-    /// Match the compiled `goal` (filtered by `such_that`) against `state`, returning a binding vector per
-    /// solution — the `search` goal test.
+    /// Match the compiled `goal` (filtered by `such_that`) against `state`, returning `(bindings,
+    /// rewrites-at-acceptance)` per solution — the `search` goal test. The rewrite count is snapshotted
+    /// after each solution's `such that` condition evaluation, so the per-solution `rewrites:` count bills
+    /// the condition's reductions (fable-audit.md §3.3 B2a).
     pub(crate) fn eval_goal(
         &mut self,
         goal: &LhsAutomaton,
         nr_vars: u32,
         such_that: &[CompiledFragment],
         state: DagId,
-    ) -> Vec<Vec<DagId>> {
+    ) -> Vec<(Vec<DagId>, u64)> {
         self.rt.eval_goal(&self.sig, goal, nr_vars, such_that, state)
     }
 

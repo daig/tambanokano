@@ -60,7 +60,9 @@ use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{tokenize, Interner};
-use tnk_frontend::load::{build_command_dag, build_loaded_module, parse_statement_trace, LoadedModule, StmtTrace};
+use tnk_frontend::load::{
+    build_command_dag, build_loaded_module, command_parse_furthest, parse_statement_trace, LoadedModule, StmtTrace,
+};
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
@@ -873,7 +875,11 @@ impl MetaDescent<'_> {
                 ctx.app(*hooks.ops.get("resultPairSymbol")?, vec![ut, us])
             }
             Err(_) => {
-                let n = up_nat(ctx, 0)?; // the unparseable-token position (0 — full failure)
+                // The unparseable-token position: the furthest token a valid partial parse reached
+                // (Maude's `badTokenIndex`), so `'a 'b` over a module where `a` parses but nothing follows
+                // reports `noParse(1)`, not `noParse(0)` (fable-audit.md §3.3 B4).
+                let pos = command_parse_furthest(&loaded, self.interner, &tokens);
+                let n = up_nat(ctx, pos as u64)?;
                 ctx.app(*hooks.ops.get("noParseSymbol")?, vec![n])
             }
         };

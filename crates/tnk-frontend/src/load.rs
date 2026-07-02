@@ -623,6 +623,13 @@ pub fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) ->
     dag
 }
 
+/// The token index where a failed command/term parse got stuck — the furthest token a valid partial
+/// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (fable-audit.md
+/// §3.3 B4); parsed at the universal `Term` start, matching [`build_command_dag`].
+pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -> usize {
+    earley::parse(&lm.grammar, term, Nt::Term, i).furthest()
+}
+
 /// Begin a `rewrite` (rule-fair) session over `term` (Pillar A). The caller drives the returned
 /// [`Rewriting`] with [`Rewriting::run`] and stores it for `continue`.
 pub fn rewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<Rewriting, String> {

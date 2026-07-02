@@ -319,8 +319,10 @@ fn prelude_results(out: &str) -> Vec<String> {
 /// byte-identically (value, sort, **rewrite count**, and layout) to the reference: the reflection core
 /// (`metaReduce`/…/`metaSearchPath`, Stages 1–3.5) and the Stage-4 up*/query/syntax layer — the `up*`
 /// family (`upModule`/`up{Sorts,…,Rls}`/`upView`/`upTerm`/`downTerm`), the sort/kind queries
-/// (`sortLeq`/…/`maximalAritySet`), `metaParse`/`metaPrettyPrint`, and `metaWellFormed*`. (The two
-/// `metaSearch` rewrite counts pin our BFS-snapshot value — see `fable-audit.md`; value/sort/reachability match.)
+/// (`sortLeq`/…/`maximalAritySet`), `metaParse`/`metaPrettyPrint`, and `metaWellFormed*`. (The `=>!`
+/// `metaSearch` count now matches the oracle — the B2b normal-form-confirmation snapshot fix, §3.3; the
+/// `=>+` sol-1 count still pins tnk's BFS-snapshot value, a separate parallel-odometer divergence in
+/// `fable-audit.md` §3.3 — value/sort/reachability match.)
 ///
 /// Stage 1 (the parse/flatten fixes the meta-modules first exercise):
 ///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
@@ -368,7 +370,7 @@ fn prelude_meta_through_repl() {
             "[2] Substitution?: (noMatch).Substitution?",              // metaMatch: _+_ vs s^5 — no match
             "[2] ResultTriple: {'b.Elt, 'Elt, \n  'X:Elt <- 'b.Elt}",  // metaSearch =>+ sol 0: a=>b
             "[3] ResultTriple: {'c.Elt, 'Elt, \n  'X:Elt <- 'c.Elt}",  // metaSearch =>+ sol 1: a=>c (ab)
-            "[3] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! to normal form c
+            "[4] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! normal form c: snapshot at nf-confirmation (oracle rewrites: 4; fable-audit.md §3.3 B2b)
             // metaApply: the labelled rule `unwrap` (f(N) => N) at the top, its binding, or failure.
             "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, \n  'N:Nat <- 's_^3['0.Zero]}", // apply at top
             "[1] ResultTriple?: (failure).ResultTriple?",              // solution 1 — past the last

@@ -42,10 +42,6 @@ struct State {
     fwd: BTreeMap<usize, BTreeSet<u32>>,
     /// BFS depth (0 = initial).
     depth: u32,
-    /// `(states discovered, rewrites)` when this state was first reached — the counts reported with a
-    /// solution at this state.
-    states_at: usize,
-    rewrites_at: u64,
     /// Whether this state's successors have been generated.
     expanded: bool,
 }
@@ -102,13 +98,12 @@ pub struct Search {
 }
 
 impl Search {
-    /// Seed the graph with the reduced initial term as state 0. `init_rewrites` is the rewrite count
-    /// after that reduction (the initial state's snapshot).
+    /// Seed the graph with the reduced initial term as state 0. The initial reduction's rewrites are
+    /// already in the engine counter; per-solution snapshots are read live (see [`queue_solutions`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root: RootGuard,
         term: DagId,
-        init_rewrites: u64,
         goal: LhsAutomaton,
         goal_nr_vars: u32,
         such_that: Vec<CompiledFragment>,
@@ -122,8 +117,6 @@ impl Search {
             via: None,
             fwd: BTreeMap::new(),
             depth: 0,
-            states_at: 1,
-            rewrites_at: init_rewrites,
             expanded: false,
         };
         Search {
@@ -214,8 +207,6 @@ impl Search {
                     via: Some(rule_id),
                     fwd: BTreeMap::new(),
                     depth: succ_depth,
-                    states_at: new_idx + 1,
-                    rewrites_at: engine.rewrites(),
                     expanded: false,
                 });
                 self.index.entry(h).or_default().push(new_idx);
@@ -257,11 +248,18 @@ impl Search {
     }
 
     /// Match the goal (filtered by `such_that`) against state `s` and queue a [`Solution`] per match,
-    /// each tagged with the state's discovery snapshot counts.
+    /// each tagged with the counts **at the moment the solution is found** — Maude's per-solution snapshot.
+    ///
+    /// The snapshot is taken *live* (current `states` + `rewrites`) rather than from the state's discovery
+    /// counts, which matters in two ways: a `=>!` solution is found when its state is dequeued and
+    /// confirmed a normal form — *after* the frontier ahead of it was expanded (more states/rewrites than
+    /// at discovery — §3.3 B2b) — and a `such that` solution's rewrite count includes the condition's own
+    /// reductions, which `eval_goal` snapshots per binding (§3.3 B2a). For the plain `=>1`/`=>+`/`=>*`
+    /// cases the solution is found at discovery, so the live counts equal the old discovery snapshot.
     fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
         let term = self.states[s].term;
-        let (states, rewrites) = (self.states[s].states_at, self.states[s].rewrites_at);
-        for bindings in engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term) {
+        let states = self.states.len();
+        for (bindings, rewrites) in engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term) {
             self.solution_count += 1;
             self.pending.push_back(Solution { number: self.solution_count, state: s, bindings, states, rewrites });
         }

@@ -838,13 +838,12 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
         let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(*term));
         let value = print_pretty(&lm.built, i, *term, color);
         out.push_str(&format!("state {sidx}, {sort}: {value}\n"));
-        let mut arc_n = 0;
-        for (target, rules) in arcs {
-            for rid in rules {
-                let rb = trace::rule_body(&lm.built, i, *rid, color);
-                out.push_str(&format!("arc {arc_n} ===> state {target} ({rb})\n"));
-                arc_n += 1;
-            }
+        // One arc per distinct successor state; all rules reaching it are listed on that single arc, each
+        // in its own parens (Maude merges arcs by target — fable-audit.md §3.3 B5).
+        for (arc_n, (target, rules)) in arcs.iter().enumerate() {
+            let bodies: String =
+                rules.iter().map(|rid| format!(" ({})", trace::rule_body(&lm.built, i, *rid, color))).collect();
+            out.push_str(&format!("arc {arc_n} ===> state {target}{bodies}\n"));
         }
     }
     out.trim_end().to_string()
