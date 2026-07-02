@@ -1,0 +1,18 @@
+*** C3b-arity-rename — arity-disambiguated op rename of one overload (fable-audit.md §3.4)
+fmod M is
+  sorts A B C .
+  op a : -> A .
+  op b : -> B .
+  op f : A -> C .
+  op f : A B -> C .
+  ops r1 r2 : -> C .
+  var X : A .
+  var Y : B .
+  eq f(X) = r1 .
+  eq f(X, Y) = r2 .
+endfm
+fmod REN is
+  protecting M * (op f : A B -> C to g) .
+endfm
+reduce in REN : g(a, b) .
+reduce in REN : f(a) .

@@ -1,0 +1,22 @@
+*** PRELUDE
+*** C3d-opterm-views — op→term view with variable arguments (op lt(A,B) to term A < B) (fable-audit.md §3.4)
+fth TH is
+  protecting BOOL .
+  sort Elt .
+  op lt : Elt Elt -> Bool .
+endfth
+fmod P{X :: TH} is
+  protecting BOOL .
+  op check : X$Elt X$Elt -> Bool .
+  vars A B : X$Elt .
+  eq check(A, B) = lt(A, B) .
+endfm
+view V from TH to NAT is
+  sort Elt to Nat .
+  op lt(A:Elt, B:Elt) to term A:Nat < B:Nat .
+endv
+fmod TEST is
+  protecting P{V} .
+endfm
+reduce in TEST : check(1, 2) .
+reduce in TEST : check(3, 2) .

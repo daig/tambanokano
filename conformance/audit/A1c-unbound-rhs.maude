@@ -1,0 +1,31 @@
+*** A1c-unbound-rhs — unbound right-hand-side variable: oracle warns + leaves unreduced, tnk crashes (fable-audit.md §3.1)
+*** Direct route first: oracle accepts at load (warning only) and `reduce wrap(x)` stays unreduced.
+*** tnk panics (term.rs:371 "unbound variable in instantiation") on the reduce.
+fmod UNBOUND is
+  sort S .
+  op x : -> S [ctor] .
+  op wrap : S -> S .
+  eq wrap(A:S) = B:S .
+endfm
+red in UNBOUND : wrap(x) .
+
+*** Parameterized route after: the build-at-instance deferral makes the instance the first checkpoint,
+*** so the unbound rhs is re-encountered when USEP instantiates PWRAP. Oracle again leaves it unreduced.
+fth ELEM-TH is
+  sort Elt .
+endfth
+fmod ELEM is
+  sort E .
+  op e : -> E [ctor] .
+endfm
+view VE from ELEM-TH to ELEM is
+  sort Elt to E .
+endv
+fmod PWRAP{X :: ELEM-TH} is
+  op wrap : X$Elt -> X$Elt .
+  eq wrap(A:X$Elt) = B:X$Elt .
+endfm
+fmod USEP is
+  protecting PWRAP{VE} .
+endfm
+red in USEP : wrap(e) .

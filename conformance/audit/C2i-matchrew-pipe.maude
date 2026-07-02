@@ -1,0 +1,9 @@
+*** C2i-matchrew-pipe — bare user _|_ inside a matchrew pattern parses (not strategy union) (fable-audit.md §3.4)
+mod C2I is
+  sort S .
+  ops a b c d : -> S .
+  op _|_ : S S -> S [ctor] .
+  rl [r] : a => c .
+  vars X Y : S .
+endm
+srewrite in C2I : a | b using matchrew X | Y by X using r .

@@ -1,0 +1,12 @@
+*** C3g-decl-attrs — generated-by import mode + rpo op attribute (fable-audit.md §3.4)
+fmod BASE is
+  sort S .
+  ops a b : -> S [rpo 1] .
+endfm
+fmod M is
+  generated-by BASE .
+  op f : S -> S [rpo 2] .
+  var X : S .
+  eq f(X) = X .
+endfm
+reduce in M : f(a) .

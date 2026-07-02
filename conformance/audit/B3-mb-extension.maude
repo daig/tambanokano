@@ -1,0 +1,28 @@
+*** B3-mb-extension — AC (conditional) memberships are not applied through extension (fable-audit.md §3.3)
+*** Over AC _|_, a membership whose LHS is a proper sub-multiset of the subject must fire through extension.
+*** MB-EXT: mb a | a : Special. red a | a is 1 rewrite on both engines by a direct match. red a | a | a stays
+*** 1 rewrite on the oracle because it fires through extension, but is 0 on tnk.
+*** CMB-EXT: cmb a | a : Special if a = a. The subject a | a | h(h(a)) reduces h(h(a)) to a in 2 rewrites on
+*** both engines; the oracle then applies the cmb through extension for a third rewrite, so 3, tnk skips it, so 2.
+*** Result term a | a | a and its printed sort agree on both; the COUNT is the pin.
+fmod MB-EXT is
+  sorts E Special .
+  subsort Special < E .
+  op a : -> E [ctor] .
+  op _|_ : E E -> E [ctor assoc comm] .
+  mb (a | a) : Special .
+endfm
+red a | a .
+red a | a | a .
+
+fmod CMB-EXT is
+  sorts E Special .
+  subsort Special < E .
+  op a : -> E [ctor] .
+  op _|_ : E E -> E [ctor assoc comm] .
+  op h : E -> E .
+  eq h(a) = a .
+  cmb (a | a) : Special if a = a .
+endfm
+red a | a .
+red a | a | h(h(a)) .

@@ -1,0 +1,17 @@
+*** A4e-param-rename-shield — renaming a parameter-theory sort (X$Elt) is ignored with an advisory; module builds and computes (fable-audit.md §3.4)
+fth T is sort Elt . endfth
+fmod NN is sort Nat . op z : -> Nat [ctor] . endfm
+view SV from T to NN is sort Elt to Nat . endv
+fmod PAR{X :: T} is
+  op box : X$Elt -> X$Elt .
+  var A : X$Elt .
+  eq box(A) = A .
+endfm
+fmod USER{Y :: T} is
+  protecting PAR{Y} * (sort Y$Elt to Whatever) .
+  op probe : Y$Elt -> Y$Elt .
+  var A : Y$Elt .
+  eq probe(A) = box(A) .
+endfm
+fmod GROUND is protecting USER{SV} . endfm
+reduce in GROUND : probe(z) .

@@ -1,0 +1,11 @@
+*** C2b-stmt-recovery — one unparseable statement dropped, module + later commands survive (fable-audit.md §3.4)
+fmod C2B is
+  sort S .
+  ops a b good : -> S .
+  op f : S -> S .
+  eq f(a) = good .
+  eq zzz = xyzzy .
+  eq f(b) = a .
+endfm
+reduce in C2B : f(a) .
+reduce in C2B : f(b) .

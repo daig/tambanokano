@@ -1,0 +1,15 @@
+*** PRELUDE
+*** A5d-metanormalize — metaNormalize normalizes modulo axioms only, not user equations (fable-audit.md §3.2)
+fmod M is
+  sort S .
+  op a : -> S .
+  op b : -> S .
+  op g : S -> S .
+  op _+_ : S S -> S [assoc comm] .
+  eq g(a) = b .
+endfm
+fmod A5D is
+  protecting META-LEVEL .
+endfm
+reduce in A5D : metaNormalize(['M], 'g['a.S]) .
+reduce in A5D : metaNormalize(['M], '_+_['b.S, 'a.S]) .

@@ -1,0 +1,11 @@
+*** A4d-fake-param-sort — X$Foo (Foo not in the parameter theory) survives instantiation unrenamed; result sort prints X$Foo (fable-audit.md §3.2)
+fth T is sort Elt . endfth
+fmod NN is sort Nat . op z : -> Nat [ctor] . endfm
+view SV from T to NN is sort Elt to Nat . endv
+fmod FOO{X :: T} is
+  sort X$Foo .
+  subsort X$Foo < X$Elt .
+  op c : -> X$Foo .
+endfm
+fmod USE is protecting FOO{SV} . endfm
+reduce in USE : c .

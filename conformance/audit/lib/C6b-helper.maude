@@ -1,0 +1,8 @@
+*** C6b-helper — self-contained helper module loaded via load/sload by C6b-load-cmd.maude (no prelude modules)
+fmod C6BHELPER is
+  sort Color .
+  ops red green : -> Color .
+  op flip : Color -> Color .
+  eq flip(red) = green .
+  eq flip(green) = red .
+endfm

@@ -1,0 +1,12 @@
+*** PRELUDE
+*** D2c-infix-fold — infix builtin fold counts k-1 (2+3+4 = 2 rw), prefix gcd stays 1, upTerm count 3, trace two steps (fable-audit.md §3.3, §3.9.3)
+fmod D2CFOLD is
+  protecting NAT .
+  protecting META-LEVEL .
+endfm
+reduce in D2CFOLD : 2 + 3 + 4 .
+reduce in D2CFOLD : gcd(12, 18, 8) .
+reduce in D2CFOLD : upTerm(2 + 3 + 4) .
+set trace on .
+reduce in D2CFOLD : 2 + 3 + 4 .
+set trace off .

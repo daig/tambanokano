@@ -1,0 +1,3 @@
+*** C6c-standing-prelude — no PRELUDE marker (deliberate): oracle standing prelude computes NAT/BOOL; tnk without prelude errors (fable-audit.md §3.4)
+reduce in NAT : 2 + 2 .
+reduce in BOOL : true and false .

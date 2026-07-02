@@ -1,0 +1,22 @@
+*** PRELUDE
+*** C6a-implicit-bool — oracle auto-injects BOOL (==/and/if_then_else_fi work without import); set include BOOL off drops the eq, module survives (fable-audit.md §3.4)
+fmod C6AIMPL is
+  sort S .
+  ops a b : -> S .
+  op test : S S -> Bool .
+  op pick : S S -> S .
+  vars X Y : S .
+  eq test(X, Y) = (X == Y) and (Y == X) .
+  eq pick(X, Y) = if X == Y then a else b fi .
+endfm
+reduce in C6AIMPL : test(a, a) .
+reduce in C6AIMPL : pick(a, b) .
+set include BOOL off .
+fmod C6ANOBOOL is
+  sort T .
+  ops p q : -> T .
+  op chk : T T -> T .
+  vars U V : T .
+  eq chk(U, V) = if U == V then p else q fi .
+endfm
+reduce in C6ANOBOOL : chk(p, p) .

@@ -1,0 +1,12 @@
+*** A3a-rewrite-frozen — rewrite ignores frozen (full + partial frozen(2)); eqs still reduce inside frozen args (fable-audit.md §3.2, §3.9.2)
+mod FROZ is
+  sort S .
+  ops a b c d : -> S .
+  op g : S -> S [frozen] .
+  op h : S S -> S [frozen (2)] .
+  rl a => b .
+  eq c = d .
+endm
+rewrite in FROZ : g(a) .
+rewrite in FROZ : h(a, a) .
+rewrite in FROZ : g(c) .

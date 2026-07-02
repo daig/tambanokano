@@ -1,0 +1,16 @@
+*** A4a-mixfix-rename — renaming single-token mixfix op _+_ to _plus_: mixfix parse survives; renamed module carrying a _+_ statement builds (fable-audit.md §3.2)
+fmod MA is
+  sort V .
+  ops x y : -> V [ctor] .
+  op _+_ : V V -> V .
+endfm
+fmod MB is
+  sort W .
+  ops p q r : -> W [ctor] .
+  op _+_ : W W -> W .
+  eq p + q = r .
+endfm
+fmod USEA is protecting MA * (op _+_ to _plus_) . endfm
+fmod USEB is protecting MB * (op _+_ to _plus_) . endfm
+reduce in USEA : x plus y .
+reduce in USEB : p plus q .

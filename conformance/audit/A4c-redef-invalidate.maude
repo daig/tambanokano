@@ -1,0 +1,39 @@
+*** A4c-redef-invalidate — redefining an imported module (and a view target) recomputes dependents on the oracle; tnk stays stale (fable-audit.md §3.2)
+fmod M is
+  sort S .
+  ops a v1 v2 : -> S [ctor] .
+  op f : S -> S .
+  eq f(a) = v1 .
+endfm
+fmod N is
+  protecting M .
+  op gg : S -> S .
+  var X : S .
+  eq gg(X) = f(X) .
+endfm
+fmod M is
+  sort S .
+  ops a v1 v2 : -> S [ctor] .
+  op f : S -> S .
+  eq f(a) = v2 .
+endfm
+reduce in N : gg(a) .
+fth THV is sort Elt . op k : Elt -> Elt . endfth
+fmod TA is
+  sort D .
+  ops c r1 r2 : -> D [ctor] .
+  op p : D -> D .
+  op q : D -> D .
+  eq p(c) = r1 .
+  eq q(c) = r2 .
+endfm
+view W from THV to TA is sort Elt to D . op k to p . endv
+fmod USEV{X :: THV} is
+  op probe : X$Elt -> X$Elt .
+  var A : X$Elt .
+  eq probe(A) = k(A) .
+endfm
+fmod INST is protecting USEV{W} . endfm
+reduce in INST : probe(c) .
+view W from THV to TA is sort Elt to D . op k to q . endv
+reduce in INST : probe(c) .

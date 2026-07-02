@@ -1,0 +1,11 @@
+*** C2f-kind-brackets — multi-sort kind bracket [A,B] in op/var declarations (fable-audit.md §3.4)
+fmod C2F is
+  sorts A B Sh .
+  subsort Sh < A .
+  subsort Sh < B .
+  op sh : -> Sh .
+  op f : [A,B] -> [A,B] .
+  var K : [A,B] .
+  eq f(K) = sh .
+endfm
+reduce in C2F : f(sh) .

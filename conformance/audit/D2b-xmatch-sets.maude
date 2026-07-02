@@ -1,0 +1,23 @@
+*** PRELUDE
+*** D2b-xmatch-sets — xmatch enumeration: AU-with-id 10, iter-Nat 3, AU bare-var 3 (fable-audit.md §3.3)
+fmod D2BI is
+  sort Elt List .
+  subsort Elt < List .
+  op nil : -> List .
+  op __ : List List -> List [assoc id: nil] .
+  ops a b c : -> Elt .
+  vars X Y : List .
+endfm
+xmatch X Y <=? a b c .
+fmod D2BII is
+  protecting NAT .
+endfm
+xmatch X:Nat <=? 3 .
+fmod D2BIII is
+  sort Elt List .
+  subsort Elt < List .
+  op __ : List List -> List [assoc] .
+  ops a b c : -> Elt .
+  var X : List .
+endfm
+xmatch X <=? a b c .

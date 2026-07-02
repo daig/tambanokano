@@ -1,0 +1,11 @@
+*** PRELUDE
+*** C2c-bracket-lhs — rule LHS starting with a [_]-headed term parses as a term (fable-audit.md §3.4)
+mod C2C is
+  protecting NAT .
+  sort Obj .
+  op [_] : Nat -> Obj [ctor] .
+  var N : Nat .
+  rl [N] => [N + 1] .
+endm
+rewrite [1] in C2C : [3] .
+rewrite [2] in C2C : [3] .

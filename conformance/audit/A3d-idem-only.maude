@@ -1,0 +1,9 @@
+*** A3d-idem-only — [idem] without comm applies (a o a collapses at term build); a o b does not; nested case (fable-audit.md §3.2)
+fmod IDEM is
+  sort E .
+  ops a b : -> E [ctor] .
+  op _o_ : E E -> E [idem] .
+endfm
+reduce in IDEM : a o a .
+reduce in IDEM : (a o a) o (a o a) .
+reduce in IDEM : a o b .

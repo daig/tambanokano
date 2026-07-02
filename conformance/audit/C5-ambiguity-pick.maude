@@ -1,0 +1,28 @@
+*** C5-ambiguity-pick — ambiguous terms: oracle warns, picks the first (left) parse, computes; tnk hard-errors (fable-audit.md §3.4)
+fmod C5AMBIG-MIXFIX is
+  sort S .
+  op a : -> S .
+  op f_ : S -> S .
+  op _g : S -> S .
+  op FA : -> S .
+  op AG : -> S .
+  op resFAg : -> S .
+  op resFaG : -> S .
+  eq f a = FA .
+  eq a g = AG .
+  eq FA g = resFAg .
+  eq f AG = resFaG .
+endfm
+reduce in C5AMBIG-MIXFIX : f a g .
+fmod C5AMBIG-PLUS is
+  sort S .
+  op a : -> S .
+  op b : -> S .
+  op c : -> S .
+  op _+_ : S S -> S .
+  op win1 : -> S .
+  op win2 : -> S .
+  eq (a + b) + c = win1 .
+  eq a + (b + c) = win2 .
+endfm
+reduce in C5AMBIG-PLUS : a + b + c .

@@ -1,0 +1,9 @@
+*** C2g-id-forward-ref — id: naming a constant declared later in the module (fable-audit.md §3.4)
+fmod C2G is
+  sort S .
+  op a : -> S .
+  op _o_ : S S -> S [id: e] .
+  op e : -> S .
+endfm
+reduce in C2G : a o e .
+reduce in C2G : e o a .

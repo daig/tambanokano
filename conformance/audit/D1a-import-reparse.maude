@@ -1,0 +1,36 @@
+*** PRELUDE
+*** D1a-import-reparse — imported statements re-parsed in importer grammar: oracle builds, tnk hard-errors (fable-audit.md §3.4, §4.1)
+fmod D1ABASE is
+  sort S .
+  ops a b : -> S .
+  op h : S -> S .
+  var X : S .
+  eq h(X) = a .
+endfm
+fmod D1AEXT is
+  including D1ABASE .
+  op X : -> S .
+endfm
+reduce in D1AEXT : h(b) .
+reduce in D1AEXT : h(X) .
+fmod D1AM1 is
+  sort R .
+  ops good bad : -> R .
+  op w : R -> R .
+  var W : R .
+  eq w(W) = good .
+endfm
+fmod D1AM2 is
+  sort R .
+  op W : -> R .
+endfm
+fmod D1AM3 is
+  including D1AM1 .
+  including D1AM2 .
+endfm
+reduce in D1AM3 : w(bad) .
+fmod D1ACONV is
+  protecting CONVERSION .
+  protecting META-LEVEL .
+endfm
+reduce in D1ACONV : 1 + 1 .

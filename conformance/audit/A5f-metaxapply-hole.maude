@@ -1,0 +1,14 @@
+*** PRELUDE
+*** A5f-metaxapply-hole — metaXapply AC extension context is residue-first ('_+_['b.S, []]) (fable-audit.md §3.7)
+mod M is
+  sort S .
+  op a : -> S .
+  op b : -> S .
+  op c : -> S .
+  op _+_ : S S -> S [assoc comm] .
+  rl [lab] : a => c .
+endm
+fmod A5F is
+  protecting META-LEVEL .
+endfm
+reduce in A5F : metaXapply(['M], '_+_['a.S, 'b.S], 'lab, none, 0, unbounded, 0) .

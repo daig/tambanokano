@@ -1,0 +1,21 @@
+*** C3f-pconst — [pconst] on a theory constant, mapped through a view and instantiated (fable-audit.md §3.4)
+fth TH is
+  sort Elt .
+  op c : -> Elt [pconst] .
+endfth
+fmod P{X :: TH} is
+  op f : X$Elt -> X$Elt .
+  eq f(X$c) = X$c .
+endfm
+fmod TARGET is
+  sort D .
+  op d : -> D .
+endfm
+view V from TH to TARGET is
+  sort Elt to D .
+  op c to d .
+endv
+fmod TEST is
+  protecting P{V} .
+endfm
+reduce in TEST : f(d) .

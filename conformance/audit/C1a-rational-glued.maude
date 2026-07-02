@@ -1,0 +1,13 @@
+*** PRELUDE
+*** C1a-rational-glued — glued rational literals parse and compute (fable-audit.md §3.4)
+fmod C1A is
+  protecting RAT .
+  op probe : Rat -> Rat .
+  var Q : Rat .
+  eq probe(Q) = Q + Q .
+endfm
+reduce in RAT : 1/6 .
+reduce in RAT : 2/4 .
+reduce in RAT : -7/3 .
+reduce in RAT : 1/6 + 1/6 .
+reduce in C1A : probe(1/6) .

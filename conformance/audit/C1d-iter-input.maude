@@ -1,0 +1,11 @@
+*** PRELUDE
+*** C1d-iter-input — s_^k(t) iter input notation accepted (fable-audit.md §3.4)
+fmod C1D is
+  sort Foo .
+  op z : -> Foo [ctor] .
+  op s_ : Foo -> Foo [ctor iter] .
+endfm
+reduce in C1D : s_^10(z) .
+reduce in C1D : s_^18446744073709551616(z) .
+reduce in C1D : s_^2(s_^3(z)) .
+reduce in NAT : s_^5(0) .

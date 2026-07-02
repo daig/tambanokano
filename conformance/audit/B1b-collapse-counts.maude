@@ -1,0 +1,35 @@
+*** B1b-collapse-counts — collapse-under-identity undercounts by one per collapsed identity (fable-audit.md §3.2; ac-matcher-plan.md §3.2)
+*** Minimal reproducer: eq (S ; S) = S over [assoc comm id: e]. red e -> 1 rewrite (oracle) vs 0 (tnk);
+*** red f -> 2 (oracle) vs 1 (tnk). The collapse fires one-shot on the identity subject (§3.9.4) — value stays e.
+*** makeSet family (list -> dup-free set via idempotent ACU union): counts 2/4/6 (oracle) vs 1/3/5 (tnk); values identical.
+fmod EF-COUNTS is
+  sort St .
+  ops e f : -> St .
+  op _;_ : St St -> St [assoc comm id: e] .
+  var S : St .
+  eq (S ; S) = S .
+  eq f = e .
+endfm
+red e .
+red f .
+
+fmod MAKESET is
+  sorts Nat List Set .
+  op 0 : -> Nat [ctor] .
+  op s : Nat -> Nat [ctor] .
+  op nil : -> List [ctor] .
+  op __ : Nat List -> List [ctor] .
+  op empty : -> Set [ctor] .
+  op _;_ : Set Set -> Set [ctor assoc comm id: empty] .
+  op {_} : Nat -> Set [ctor] .
+  op makeSet : List -> Set .
+  var S : Set .
+  var E : Nat .
+  var L : List .
+  eq (S ; S) = S .
+  eq makeSet(nil) = empty .
+  eq makeSet(E L) = ({E} ; makeSet(L)) .
+endfm
+red makeSet(nil) .
+red makeSet(0 (s(0) nil)) .
+red makeSet(0 (s(0) (0 nil))) .

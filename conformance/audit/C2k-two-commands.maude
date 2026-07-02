@@ -1,0 +1,9 @@
+*** C2k-two-commands — two commands on one line: oracle rejects both, tnk runs both (fable-audit.md §3.4)
+fmod C2K is
+  sort S .
+  ops a b c : -> S .
+  eq a = c .
+  eq b = c .
+endfm
+red a . red b .
+red a .

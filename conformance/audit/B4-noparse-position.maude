@@ -1,0 +1,12 @@
+*** PRELUDE
+*** B4-noparse-position — metaParse reports the wrong failure position (fable-audit.md §3.3)
+*** Over PMOD, the token list 'a 'b parses the constant a (position 0 -> 1) then fails at b (position 1):
+*** the oracle returns noParse(1), tnk returns noParse(0). A non-empty variable set ('V:S, unused by the
+*** tokens) is passed so the command echo is byte-identical on both sides (avoids tnk printing the empty
+*** set none as (none).EmptyQidSet).
+fmod PMOD is
+  sort S .
+  op a : -> S .
+  op b : -> S .
+endfm
+red in META-LEVEL : metaParse(['PMOD], 'V:S, 'a 'b, anyType) .

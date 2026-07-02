@@ -1,0 +1,14 @@
+*** PRELUDE
+*** B2a-suchthat-counts — `such that` condition-evaluation rewrites are not counted (fable-audit.md §3.3)
+*** Counter increments c(N); the bounded =>+ search keeps only odd N. Each solution's condition costs 2
+*** extra rewrites on the oracle (the `rem` and `=/=` reductions): per-solution rewrites 4/12/20 (oracle)
+*** vs 2/10/18 (tnk); states 2/4/6 agree. The condition is written with an explicit `= true` so the search
+*** echo is byte-identical on both sides (avoids the §3.7 boolean-`such that` `= true` echo divergence).
+mod COUNTER is
+  protecting NAT .
+  sort Ct .
+  op c : Nat -> Ct [ctor] .
+  var N : Nat .
+  rl c(N) => c(N + 1) .
+endm
+search [3] c(0) =>+ c(N) such that N rem 2 =/= 0 = true .

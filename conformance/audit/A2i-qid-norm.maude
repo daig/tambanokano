@@ -1,0 +1,4 @@
+*** PRELUDE
+*** A2i-qid-norm — qid() normalizes blanks to backquote (fable-audit.md §3.2)
+red in QID : string(qid("a b")) .
+red in QID : qid("a b") == qid("a`b") .

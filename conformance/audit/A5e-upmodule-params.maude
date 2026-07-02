@@ -1,0 +1,6 @@
+*** PRELUDE
+*** A5e-upmodule-params — upModule of a parameterized module keeps its parameter list and ditto-inherited attrs (fable-audit.md §3.2)
+fmod A5E is
+  protecting META-LEVEL .
+endfm
+reduce in A5E : upModule('LIST, false) .

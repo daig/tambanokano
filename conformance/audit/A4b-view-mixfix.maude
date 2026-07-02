@@ -1,0 +1,33 @@
+*** A4b-view-mixfix — op→op views across the {prefix,mixfix}^2 matrix; only prefix→prefix builds in tnk, incl. op _#_ to _+_ (fable-audit.md §3.2)
+fth THP is sort Elt . op f : Elt Elt -> Elt . endfth
+fth THM is sort Elt . op _#_ : Elt Elt -> Elt . endfth
+fmod TGT is
+  sort D .
+  ops c1 c2 d : -> D [ctor] .
+  op g : D D -> D .
+  op _+_ : D D -> D .
+  eq g(c1, c2) = d .
+  eq c1 + c2 = d .
+endfm
+view VPP from THP to TGT is sort Elt to D . op f to g . endv
+view VPM from THP to TGT is sort Elt to D . op f to _+_ . endv
+view VMP from THM to TGT is sort Elt to D . op _#_ to g . endv
+view VMM from THM to TGT is sort Elt to D . op _#_ to _+_ . endv
+fmod USEP{X :: THP} is
+  op probe : X$Elt X$Elt -> X$Elt .
+  vars A B : X$Elt .
+  eq probe(A, B) = f(A, B) .
+endfm
+fmod USEM{X :: THM} is
+  op probe : X$Elt X$Elt -> X$Elt .
+  vars A B : X$Elt .
+  eq probe(A, B) = A # B .
+endfm
+fmod IPP is protecting USEP{VPP} . endfm
+fmod IPM is protecting USEP{VPM} . endfm
+fmod IMP is protecting USEM{VMP} . endfm
+fmod IMM is protecting USEM{VMM} . endfm
+reduce in IPP : probe(c1, c2) .
+reduce in IPM : probe(c1, c2) .
+reduce in IMP : probe(c1, c2) .
+reduce in IMM : probe(c1, c2) .

@@ -1,0 +1,20 @@
+*** A1b-opdecl-arity — op-decl underscore/arity mismatch: oracle disables, tnk crashes (fable-audit.md §3.1)
+*** Case 1: 2-hole name declared with 3 argument sorts. Oracle warns + disables the op; a use no longer
+*** parses and the session survives (the later `red a .` still computes). tnk loads it silently then panics
+*** at the engine.rs arity assert on the first use.
+fmod OPARITY is
+  sort A .
+  ops a b : -> A [ctor] .
+  op _+_ : A A A -> A .
+endfm
+red in OPARITY : a + b .
+red in OPARITY : a .
+
+*** Case 2 (LAST): 3-hole name declared unary. Oracle warns + disables; tnk panics at module BUILD
+*** in grammar/build.rs, so this module must come last or its pre-fix crash masks case 1.
+fmod OPUNARY is
+  sort A .
+  op a : -> A [ctor] .
+  op _;_;_ : A -> A .
+endfm
+red in OPUNARY : a .

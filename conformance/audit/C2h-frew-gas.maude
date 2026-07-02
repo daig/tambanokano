@@ -1,0 +1,9 @@
+*** C2h-frew-gas — two-number frewrite [bound, gas] form accepted (fable-audit.md §3.4)
+mod C2H is
+  sort S .
+  ops a b c d : -> S .
+  rl a => b .
+  rl b => c .
+  rl c => d .
+endm
+frewrite [6, 2] in C2H : a .

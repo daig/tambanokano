@@ -1,0 +1,11 @@
+*** C3c-label-rename — renaming a rule label; new label usable as a strategy (fable-audit.md §3.4)
+mod M is
+  sort S .
+  ops a b : -> S .
+  rl [l] : a => b .
+endm
+mod REN is
+  including M * (label l to m) .
+endm
+rewrite in REN : a .
+srewrite in REN : a using m .

@@ -1,0 +1,11 @@
+*** PRELUDE
+*** D2d-metaparse-nested — metaParse returns the true nested surface parse (binary _+_), not the flattened 3-arg (fable-audit.md §3.2)
+fmod D2DSIG is
+  sort S .
+  ops a b c : -> S .
+  op _+_ : S S -> S [assoc] .
+endfm
+fmod D2DPARSE is
+  protecting META-LEVEL .
+endfm
+reduce in D2DPARSE : metaParse(upModule('D2DSIG, false), 'a '+ 'b '+ 'c, 'S) .

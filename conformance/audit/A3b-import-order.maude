@@ -1,0 +1,11 @@
+*** A3b-import-order — local-statements-first donation order: rule pair, eq pair, 3-level search order (fable-audit.md §3.2)
+mod BASE1 is sort S . ops a b c : -> S . rl a => b . endm
+mod EXT1 is including BASE1 . rl a => c . endm
+rewrite in EXT1 : a .
+fmod BASE2 is sort T . ops p q r : -> T . eq p = q . endfm
+fmod EXT2 is including BASE2 . eq p = r . endfm
+reduce in EXT2 : p .
+mod GRAND is sort U . ops s0 g1 g2 g3 : -> U . rl s0 => g3 . endm
+mod MID is including GRAND . rl s0 => g2 . endm
+mod TOP is including MID . rl s0 => g1 . endm
+search in TOP : s0 =>* X:U .

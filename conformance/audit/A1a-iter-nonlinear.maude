@@ -1,0 +1,11 @@
+*** A1a-iter-nonlinear — non-linear equation over an [iter] constructor (fable-audit.md §3.1)
+fmod ITER-NL is
+  sorts Zero Nat .
+  subsort Zero < Nat .
+  op z : -> Zero [ctor] .
+  op s_ : Nat -> Nat [ctor iter] .
+  op f : Nat Nat -> Nat .
+  var X : Nat .
+  eq f(X, s X) = z .
+endfm
+red in ITER-NL : f(z, s z) .

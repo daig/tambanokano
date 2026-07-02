@@ -1,0 +1,21 @@
+*** C2d-junk-recovery — comment before select desyncs tnk; top-level junk skipped, next module loads (fable-audit.md §3.4)
+fmod MA is
+  sort SA .
+  ops a1 a2 : -> SA .
+  eq a1 = a2 .
+endfm
+fmod MB is
+  sort SB .
+  ops b1 b2 : -> SB .
+  eq b1 = b2 .
+endfm
+*** comment immediately before select
+select MA .
+reduce a1 .
+junkalpha junkbeta junkgamma
+fmod MC is
+  sort SC .
+  ops c1 c2 : -> SC .
+  eq c1 = c2 .
+endfm
+reduce c1 .

@@ -1,0 +1,16 @@
+*** PRELUDE
+*** C4b-free-param-import — importing a module left with a free parameter by a theory-target view (fable-audit.md §3.6)
+fmod P{X :: TRIV} is
+  sort D .
+  ops p q : -> D .
+  op g : D -> D .
+  var W : D .
+  eq g(W) = q .
+endfm
+view V from TRIV to TRIV is
+  sort Elt to Elt .
+endv
+fmod Q is
+  protecting P{V} .
+endfm
+reduce in Q : g(p) .

@@ -1,0 +1,16 @@
+*** PRELUDE
+*** A5c-meta-strat-attr — a meta-module carrying a strat op attribute must down-translate; metaReduce computes (fable-audit.md §3.2)
+fmod A5C is
+  protecting META-LEVEL .
+endfm
+reduce in A5C : metaReduce(
+  fmod 'M is
+    nil
+    sorts 'Foo .
+    none
+    op 'a : nil -> 'Foo [none] .
+    op 'g : 'Foo -> 'Foo [strat(1 0)] .
+    none
+    eq 'g['a.Foo] = 'a.Foo [none] .
+  endfm,
+  'g['a.Foo]) .

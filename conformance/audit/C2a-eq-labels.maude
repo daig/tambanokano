@@ -1,0 +1,23 @@
+*** PRELUDE
+*** C2a-eq-labels — leading bracketed labels on eq/ceq/mb/cmb parse and fire (fable-audit.md §3.4)
+fmod C2A is
+  protecting BOOL .
+  sorts S T .
+  subsort T < S .
+  ops p q : -> S .
+  ops r1 r2 : -> S .
+  op x : -> S .
+  op y : -> S .
+  op onlyT : T -> S .
+  op fired : -> S .
+  var Z : T .
+  eq [mylab] : p = r1 .
+  ceq [clab] : q = r2 if p == r1 .
+  mb [mlab] : x : T .
+  cmb [cmlab] : y : T if p == r1 .
+  eq onlyT(Z) = fired .
+endfm
+reduce in C2A : p .
+reduce in C2A : q .
+reduce in C2A : onlyT(x) .
+reduce in C2A : onlyT(y) .
