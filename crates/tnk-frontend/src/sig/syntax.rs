@@ -23,6 +23,9 @@ pub struct SymbolSyntax {
     /// keeps the theory `pub(crate)`); the grammar builder uses it to choose the flattened assoc-list
     /// prefix form `f(<assocList>)` over the positional `f(a, …)` form, and the right-associating gather.
     pub assoc: bool,
+    /// Whether the operator carries the `iter` axiom (the S theory — a stacked successor `s_`). The
+    /// grammar builder uses it to emit the `f^count(t)` iter-token input form (Maude's `iterSymbols`).
+    pub iter: bool,
     /// The `format (…)` directive words (one per mixfix gap), if declared — the pretty-printer's per-gap
     /// spacing/indent layout (`_<-_` substitutions, `rl_=>_[_].`, the `__` declaration/trace lists). `None`
     /// = Maude's default spacing.
@@ -142,6 +145,11 @@ pub struct BuiltModule {
     /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
     /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
     pub strat_defs: Vec<crate::surface::ast::StratDef>,
+    /// Operators declared with a **one-sided** identity (`assoc left id: e` / `right id: e`, fable-audit.md
+    /// §3.4): symbol → (side, identity-constant symbol). Such an op is registered in the kernel *without*
+    /// an identity (the kernel's collapse is two-sided), so command-term construction applies the
+    /// declared-side collapse itself ([`crate::load`]'s one-sided post-pass). Empty for the common case.
+    pub one_sided_id: HashMap<SymbolId, (crate::surface::ast::IdSide, SymbolId)>,
 }
 
 /// Another symbol shares this one's name ([`BuiltModule::overload`]).

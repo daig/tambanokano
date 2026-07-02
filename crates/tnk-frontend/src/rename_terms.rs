@@ -25,26 +25,28 @@ use std::collections::HashMap;
 pub struct OpRenamer {
     built: BuiltModule,
     grammar: CompiledGrammar,
-    /// from-op canonical name (`_,_`, `empty`) → the target op's literal fragment texts, in order
-    /// (`_;_` → `[";"]`, `none` → `["none"]`).
-    targets: HashMap<String, Vec<String>>,
+    /// from-op canonical name (`_,_`, `empty`, `f`) → the candidate renames of that name: each an optional
+    /// disambiguating **arity** (`Some(2)` for `op f : A B -> C to g`; `None` renames every overload) with
+    /// the target op's literal fragment texts, in order (`_;_` → `[";"]`, `none` → `["none"]`).
+    targets: HashMap<String, Vec<(Option<usize>, Vec<String>)>>,
 }
 
 impl OpRenamer {
     /// Build the grammar of `pm` (a flattened, pre-rename module) for the op renames `renames`
-    /// (`(from_name, to_name)` canonical mixfix names). Returns `None` if there is nothing to do; an
+    /// (`(from_name, arity, to_name)` — `arity` = `Some(n)` for an arity-disambiguated rename of one
+    /// overload, `None` for a plain rename of every overload). Returns `None` if there is nothing to do; an
     /// `Err` only if building the source module/grammar fails.
     pub fn new(
         pm: &PreModule,
-        renames: &[(String, String)],
+        renames: &[(String, Option<usize>, String)],
         interner: &mut Interner,
     ) -> Result<Option<Self>, String> {
         if renames.is_empty() {
             return Ok(None);
         }
-        let mut targets = HashMap::new();
-        for (from, to) in renames {
-            targets.insert(from.clone(), literal_frags(to, interner));
+        let mut targets: HashMap<String, Vec<(Option<usize>, Vec<String>)>> = HashMap::new();
+        for (from, arity, to) in renames {
+            targets.entry(from.clone()).or_default().push((*arity, literal_frags(to, interner)));
         }
         let built = build_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
@@ -86,7 +88,16 @@ impl OpRenamer {
         let prod = &self.grammar.prods[t.prod as usize];
         if let Action::MakeTerm(sym) = prod.action {
             let name = self.built.engine.symbol(sym).name();
-            if let Some(target) = self.targets.get(name) {
+            // This node's arity = the number of argument nonterminals in the production. An
+            // arity-disambiguated candidate matches only that arity; a plain (`None`) candidate matches any.
+            let arity = prod.rhs.iter().filter(|g| matches!(g, GSym::N(_))).count();
+            if let Some(target) = self.targets.get(name).and_then(|cands| {
+                cands
+                    .iter()
+                    .find(|(a, _)| *a == Some(arity))
+                    .or_else(|| cands.iter().find(|(a, _)| a.is_none()))
+                    .map(|(_, frags)| frags)
+            }) {
                 let mut cursor = t.start;
                 let mut child = 0;
                 let mut frag = 0;
@@ -125,11 +136,24 @@ impl OpRenamer {
 /// The from-name is a symbol of the source (parameter-theory) signature; the to-name is spelled in the
 /// target module's syntax — mirroring [`OpRenamer`], but generalized to a fixity change. Prefix→prefix and
 /// constant op→term maps stay on the caller's textual path; only maps with a mixfix side come here.
+/// The target of a view operator map that needs grammar-aware reconstruction: another operator (with a
+/// possibly different fixity), or a **term template** for an op→term map with variable arguments.
+#[derive(Clone)]
+pub enum ReconTarget {
+    /// op→op: the target operator's canonical name (`g`, `_+_`) — the application is re-emitted in its syntax.
+    Op(String),
+    /// op(A, B, …)→term: a term template. `formals` are the from-pattern's argument variable base-names in
+    /// order (`lt(A, B)` ⇒ `["A", "B"]`); `template` is the target term's tokens (`A < B`). At each
+    /// occurrence, every template variable whose base-name is a formal is replaced by the (rewritten,
+    /// parenthesized) actual argument at that position.
+    Term { formals: Vec<String>, template: Vec<Token> },
+}
+
 pub struct ViewOpSubst {
     built: BuiltModule,
     grammar: CompiledGrammar,
-    /// source op canonical name (`f`, `_#_`) → target op canonical name (`g`, `_+_`).
-    targets: HashMap<String, String>,
+    /// source op canonical name (`f`, `_#_`, `lt`) → its reconstruction target.
+    targets: HashMap<String, ReconTarget>,
 }
 
 impl ViewOpSubst {
@@ -138,7 +162,7 @@ impl ViewOpSubst {
     /// source module/grammar fails.
     pub fn new(
         pm: &PreModule,
-        maps: &[(String, String)],
+        maps: &[(String, ReconTarget)],
         interner: &mut Interner,
     ) -> Result<Option<Self>, String> {
         if maps.is_empty() {
@@ -173,7 +197,12 @@ impl ViewOpSubst {
             if let Some(target) = self.targets.get(name).cloned() {
                 let args: Vec<Vec<Token>> =
                     t.nt_children.iter().map(|c| self.emit(c, bubble, interner)).collect();
-                return emit_application(&target, &args, bubble, interner);
+                return match target {
+                    ReconTarget::Op(name) => emit_application(&name, &args, bubble, interner),
+                    ReconTarget::Term { formals, template } => {
+                        emit_template(&formals, &template, &args, bubble, interner)
+                    }
+                };
             }
         }
         let mut out = Vec::new();
@@ -242,6 +271,38 @@ fn emit_application(
                 out.extend_from_slice(a);
                 out.push(if k + 1 == args.len() { rp } else { comma });
             }
+        }
+    }
+    out
+}
+
+/// Emit a term template for an op→term view map (`op lt(A, B) to term A < B`), substituting each formal
+/// variable in `template` with the (already-rewritten) actual argument at the matching position. A template
+/// token is a placeholder iff its base-name (the text before any `:sort` suffix) is one of `formals`; the
+/// substituted argument is wrapped in parentheses so it re-parses at any precedence. Non-placeholder tokens
+/// (operators, literals, the target term's own free variables) are reproduced verbatim.
+fn emit_template(
+    formals: &[String],
+    template: &[Token],
+    args: &[Vec<Token>],
+    bubble: &[Token],
+    interner: &mut Interner,
+) -> Vec<Token> {
+    let line = args.iter().flatten().next().or_else(|| bubble.first()).map(|t| t.line).unwrap_or(0);
+    let lp = Token { sym: interner.intern("("), line, kind: TokKind::Punct };
+    let rp = Token { sym: interner.intern(")"), line, kind: TokKind::Punct };
+    let mut out = Vec::new();
+    for t in template {
+        let text = interner.resolve(t.sym);
+        let base = text.split(':').next().unwrap_or(text);
+        if let Some(idx) = formals.iter().position(|f| f == base)
+            && let Some(arg) = args.get(idx)
+        {
+            out.push(lp);
+            out.extend_from_slice(arg);
+            out.push(rp);
+        } else {
+            out.push(*t);
         }
     }
     out

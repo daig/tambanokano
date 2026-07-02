@@ -73,6 +73,12 @@ fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
         }
         Terminal::Float => tok.kind == TokKind::Float,
         Terminal::SmallNeg => tok.kind == TokKind::NegNumber,
+        Terminal::Rational => tok.kind == TokKind::Rational,
+        // An `iter` token `f^count` matches its own operator: the text before the `^` is the op name.
+        Terminal::IterSymbol(name) => {
+            tok.kind == TokKind::Iter
+                && matches!(i.resolve(tok.sym).rsplit_once('^'), Some((base, _)) if base == i.resolve(name))
+        }
         Terminal::Str => tok.kind == TokKind::Str,
         Terminal::Qid => tok.kind == TokKind::Qid,
         // `name:sort` on-the-fly variable: an identifier whose part after the last `:` is this sort's

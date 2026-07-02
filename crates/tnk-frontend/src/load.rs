@@ -13,7 +13,7 @@ use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
-use crate::grammar::{Nt, NtType};
+use crate::grammar::{Action, Nt, NtType};
 use crate::lex::{tokenize, Interner, Token};
 use crate::oo_complete;
 use crate::pretty::print_pretty;
@@ -96,6 +96,12 @@ fn load_statements(
         if stmt_is_nonexec(stmt) {
             continue;
         }
+        // A statement whose bubbles fail to parse/build is DROPPED (Maude warns per statement and keeps
+        // the module — fable-audit.md §3.4), so a later command still sees a whole module rather than a
+        // "no current module". The per-statement work runs in a closure; on `Err` the statement is
+        // skipped silently (our diagnostics are phase E). Nothing is registered before the fallible parse
+        // completes, so a drop leaves the engine (and the dense trace indices) consistent.
+        let mut load_stmt = || -> Result<(), String> {
         match stmt {
             Statement::Eq { lhs, rhs, cond, owise, label, .. } => {
                 // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
@@ -118,7 +124,7 @@ fn load_statements(
                 // kernel returns the dense equation id, which must index `eq_traces` (asserted).
                 reject_rewrite_fragment(&condition, "equation")?;
                 if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                    continue; // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+                    return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
                 }
                 let trace = EqTrace {
                     lhs: lhs_t.clone(),
@@ -154,7 +160,7 @@ fn load_statements(
                 let nr = vars.count();
                 reject_rewrite_fragment(&condition, "membership")?;
                 if !statement_vars_bound(&lhs_t, &condition, None) {
-                    continue; // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
+                    return Ok(()); // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
                 }
                 let trace = MbTrace {
                     lhs: lhs_t.clone(),
@@ -190,7 +196,7 @@ fn load_statements(
                 }
                 let nr = vars.count();
                 if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                    continue; // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+                    return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
                 }
                 let trace = RlTrace {
                     lhs: lhs_t.clone(),
@@ -208,6 +214,12 @@ fn load_statements(
                 assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
                 m.rl_traces.push(trace);
             }
+        }
+        Ok(())
+        };
+        if load_stmt().is_err() {
+            // Drop this statement and keep building the module (the diagnostic is phase E).
+            continue;
         }
     }
     Ok(())
@@ -584,7 +596,8 @@ pub fn command_echo(
     color: bool,
 ) -> Result<String, String> {
     let tree = parse_forest(term, &lm.grammar, i)?;
-    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i)?;
+    let dag = build_subject_dag(lm, &tree, term, i)?;
+    let dag = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag);
     Ok(print_pretty(&lm.built, i, dag, color))
 }
 
@@ -603,9 +616,10 @@ pub fn reduce_command(
     // DAG. The window must close before `reduce` (it spans only construction); end it even on a build
     // error, then propagate, so a failed parse never leaks an open window into the next command.
     lm.built.engine.begin_dedup();
-    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i);
+    let dag = build_subject_dag(lm, &tree, term, i);
     lm.built.engine.end_dedup();
     let dag = dag?;
+    let dag = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag);
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -618,9 +632,110 @@ pub fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) ->
     let tree = parse_forest(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
-    let dag = build_dag(&tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i);
+    let dag = build_subject_dag(lm, &tree, term, i);
     lm.built.engine.end_dedup();
-    dag
+    let dag = dag?;
+    Ok(collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag))
+}
+
+/// Build a command's subject DAG from its parse tree, handling BOTH ground terms (the [`build_dag`] fast
+/// path — compact literals/numerals) and **open** terms with variables. Maude reduces open terms (a
+/// variable is inert under reduction — `red X:A .`, `red g(X, a) .`, `red N + 1 .`, fable-audit.md §3.4);
+/// tnk's kernel DAG has no variable node, so each distinct variable is realized as a fresh nullary
+/// constant of its declared sort, named for the variable's print form — a declared var prints bare (`N`),
+/// an on-the-fly var with its sort (`X:A`), because that is the variable's source token. The [`VarIndex`]
+/// dedups by name, so a repeated variable shares one constant (`g(X, X)` stays linked). The atom is
+/// irreducible (no equation names it), so reduction is a no-op on it, exactly like Maude's inert variable.
+fn build_subject_dag(
+    lm: &mut LoadedModule,
+    tree: &PTree,
+    term: &[Token],
+    i: &Interner,
+) -> Result<DagId, String> {
+    if !tree_has_var(tree, &lm.grammar) {
+        return build_dag(
+            tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i,
+        );
+    }
+    let mut vars = VarIndex::new();
+    let t = build_term(tree, &lm.grammar, &lm.built, term, i, &mut vars)?;
+    let bindings: Vec<DagId> = (0..vars.count())
+        .map(|idx| {
+            let sym = lm.built.engine.add_op(vars.name(idx).to_string(), vec![], vars.sort(idx));
+            lm.built.engine.make_const(sym)
+        })
+        .collect();
+    Ok(lm.built.engine.instantiate_bindings(&t, &bindings))
+}
+
+/// Whether a parse tree contains a variable (a [`Action::MakeVariable`] production) — the ground/open
+/// dispatch for [`build_subject_dag`].
+fn tree_has_var(tree: &PTree, g: &CompiledGrammar) -> bool {
+    matches!(g.prods[tree.prod as usize].action, Action::MakeVariable(_))
+        || tree.nt_children.iter().any(|c| tree_has_var(c, g))
+}
+
+/// Apply the declared-side collapse for one-sided-`id:` operators (`assoc left id: e` / `right id: e`) to a
+/// freshly built command DAG. The kernel registered these ops **without** an identity — its collapse is
+/// two-sided (fable-audit.md §3.4) — so `make_au`/`make_cui` left the identity arguments in place; here the
+/// leading (left) / trailing (right) identity elements are dropped and the node rebuilt. Recurses so nested
+/// occurrences are handled. A no-op (returns `dag`) when the module declares no one-sided op (`map` empty),
+/// so ordinary reduction pays nothing. (Construction-time only — a faithful one-sided identity in matching
+/// and equation-rhs construction needs the kernel `make_au`, which is out of scope here.)
+fn collapse_one_sided(
+    engine: &mut tnk_core::engine::Engine,
+    map: &std::collections::HashMap<tnk_core::symbol::SymbolId, (crate::surface::ast::IdSide, tnk_core::symbol::SymbolId)>,
+    dag: DagId,
+) -> DagId {
+    use crate::surface::ast::IdSide;
+    if map.is_empty() {
+        return dag;
+    }
+    let sym = engine.node(dag).symbol();
+    let children: Vec<DagId> = engine.node(dag).children().collect();
+    if children.is_empty() {
+        return dag; // a leaf (constant / built-in literal) has no arguments to collapse
+    }
+    let new_children: Vec<DagId> =
+        children.iter().map(|&c| collapse_one_sided(engine, map, c)).collect();
+    let child_changed = new_children != children;
+    if let Some(&(side, idc)) = map.get(&sym) {
+        // An element is the identity constant iff it is `idc` applied to no arguments.
+        let mut kids = new_children;
+        match side {
+            IdSide::Left => {
+                while let Some(&c) = kids.first() {
+                    let n = engine.node(c);
+                    if n.symbol() == idc && n.children().next().is_none() {
+                        kids.remove(0);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            IdSide::Right => {
+                while let Some(&c) = kids.last() {
+                    let n = engine.node(c);
+                    if n.symbol() == idc && n.children().next().is_none() {
+                        kids.pop();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            IdSide::Both => {}
+        }
+        return match kids.len() {
+            0 => engine.make_const(idc),            // every element was the identity → the identity itself
+            1 => kids.into_iter().next().unwrap(),  // a lone survivor is the term (also avoids CUI's binary assert)
+            _ => engine.make_node(sym, kids),
+        };
+    }
+    if child_changed {
+        engine.make_node(sym, new_children)
+    } else {
+        dag
+    }
 }
 
 /// The token index where a failed command/term parse got stuck — the furthest token a valid partial

@@ -1359,13 +1359,17 @@ fn rewrite_condition_through_repl() {
     assert!(out.contains("rewrite in BIND : f(s(s(z))) .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult N: g(z)"), "binding:\n{out}");
 }
 
-/// A rewrite condition (`=>`) in an equation/membership is rejected — it is legal only in a rule.
+/// A rewrite condition (`=>`) is legal only in a rule. In an equation Maude warns "no parse for statement"
+/// and DROPS the statement, keeping the module usable (fable-audit.md §3.4 statement recovery — verified
+/// against the oracle: `reduce a` returns `a`, the dropped `ceq` never fires). Our diagnostics are phase E,
+/// so the drop is silent; the pin is that the module builds and the bad `ceq` has no effect.
 #[test]
-fn rewrite_condition_rejected_in_equation() {
+fn rewrite_condition_dropped_in_equation() {
     let out = repl()
-        .eval("fmod E is sort S . ops a b : -> S . var X : S . ceq a = b if X => b . endfm")
+        .eval("fmod E is sort S . ops a b : -> S . var X : S . ceq a = b if X => b . endfm\nreduce a .")
         .output;
-    assert!(out.contains("rewrite condition (`=>`) is only allowed in a rule"), "rejection: {out}");
+    assert!(out.contains("result S: a"), "module usable, bad ceq dropped: {out}");
+    assert!(!out.contains("result S: b"), "the dropped ceq must not fire: {out}");
 }
 
 /// On-the-fly colon variables `X:Sort` (one token) parse anywhere a term is expected — in an `eq`

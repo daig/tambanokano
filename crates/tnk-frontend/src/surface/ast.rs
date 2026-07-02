@@ -98,11 +98,22 @@ pub enum ModuleExpr {
 
 /// One mapping inside a renaming `* (…)`. Op renaming is by canonical mixfix name (`_,_ to _;_`);
 /// the optional `[ … ]` carries attribute *overrides* for the target op (the prelude uses `[prec 43]`
-/// on `op _,_ to _;_`). Disambiguated `op f : A -> B to g` is still a follow-up, rejected loudly.
+/// on `op _,_ to _;_`). An **arity-disambiguated** op rename `op f : A B -> C to g` carries
+/// [`dom_range`](RenameItem::Op::dom_range) — the source domain/range that selects *one* overload of a
+/// name shared by several (only that overload is renamed). A `label l to m` renames a statement label.
 #[derive(Debug, Clone)]
 pub enum RenameItem {
     Sort { from: String, to: String },
-    Op { from: String, to: String, attrs: Attrs },
+    Op {
+        from: String,
+        to: String,
+        /// `Some((domain, range))` for a disambiguated rename `op f : A B -> C to g` — selects the single
+        /// overload of `from` whose signature matches; `None` renames every overload of the name.
+        dom_range: Option<(Vec<String>, String)>,
+        attrs: Attrs,
+    },
+    /// `label l to m` — rename a statement label (rule/eq/mb label) `l` to `m`.
+    Label { from: String, to: String },
 }
 
 /// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
@@ -195,6 +206,27 @@ pub struct Attrs {
     pub message: bool,
     /// `portal` — the external-IO portal (`<>`).
     pub portal: bool,
+    /// `pconst` — a **parameter constant** of a theory (`op c : -> Elt [pconst]`). In a parameterized
+    /// module `P{X :: T}` such a constant is referred to as `X$c` (the parameter prefix, like a parameter
+    /// sort `X$s`); instantiating `P{V}` maps `X$c` through `V`'s op map for `c`.
+    pub pconst: bool,
+    /// Which side(s) the `id:` collapses: `left id:` / `right id:` collapse only that side (Maude's
+    /// one-sided identity), a plain `id:` is two-sided (fable-audit.md §3.4). Meaningful only when
+    /// [`id`](Self::id) is `Some`.
+    pub id_side: IdSide,
+}
+
+/// The side(s) on which an operator's `id:` identity element collapses at construction/matching. Maude's
+/// `assoc [left|right] id:` — a one-sided identity only absorbs an identity argument on its declared side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdSide {
+    /// A plain `id:` — collapses on either side (Maude's two-sided identity).
+    #[default]
+    Both,
+    /// `left id:` — only a leading identity argument collapses.
+    Left,
+    /// `right id:` — only a trailing identity argument collapses.
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,8 +343,9 @@ pub enum Command {
     Match { module: Option<String>, pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
     /// `rewrite [bound] term .` — rule-fair rewriting to a normal form (or `bound` rule applications).
     Rewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
-    /// `frewrite [bound] term .` — position-fair rewriting (Pillar A-ii).
-    Frewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
+    /// `frewrite [bound [, gas]] term .` — position-fair rewriting (Pillar A-ii). `gas` (default 1) is the
+    /// number of rule applications per position per pass (fable-audit.md §3.4).
+    Frewrite { module: Option<String>, bound: Option<u64>, gas: Option<u64>, term: Vec<Token> },
     /// `erewrite [bound [, gas]] term .` — object-message-fair rewriting of a configuration (Pillar 2.5).
     /// `bound` caps **deliveries** (config-level rule rewrites); `gas` (default 1) is the per-position gas
     /// for the non-config fallback.

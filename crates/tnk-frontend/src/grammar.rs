@@ -62,6 +62,13 @@ pub enum Terminal {
     Float,
     /// Any negative-integer literal token (Maude's `SMALL_NEG`); matched by [`crate::lex::TokKind::NegNumber`].
     SmallNeg,
+    /// Any glued rational literal token `[-]num/den` (Maude's `RATIONAL`); matched by
+    /// [`crate::lex::TokKind::Rational`]. Only emitted for a module that has a `DivisionSymbol` (RAT).
+    Rational,
+    /// An `iter`-symbol input token `f^count` (Maude's `ITER_SYMBOL`), matched by
+    /// [`crate::lex::TokKind::Iter`] whose base name (the text before the `^`) equals the held `Sym`
+    /// (the interned canonical op name, e.g. `s_`). The trailing digits are the iteration count.
+    IterSymbol(Sym),
     /// Any string literal token (Maude's `STRING_NT`).
     Str,
     /// Any quoted-identifier token (Maude's `QUOTED_ID`).
@@ -103,8 +110,13 @@ pub enum Action {
     /// Build a negative integer `-(s^n(0))` from a `SMALL_NEG` token, for the minus `symbol` (Maude's
     /// `MAKE_INTEGER` → `MinusSymbol::makeIntTerm`).
     MakeInteger(SymbolId),
-    /// Build `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`). Deferred with [`Nt::Iter`].
+    /// Build `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`): the token carries the count `n`,
+    /// the one nonterminal child the base term `t`; folded via `make_s` (`n` may be a bignum).
     MakeIter(SymbolId),
+    /// Build a glued rational literal `[-]num/den` (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`):
+    /// `division / num_or_minus(num) den`, where a non-negative numerator is `s^num(0)` and a negative one
+    /// is `minus(s^|num|(0))`. Carries the `DivisionSymbol` and the `MinusSymbol` (for a negative numerator).
+    MakeRational { division: SymbolId, minus: SymbolId },
     MakeFloat(SymbolId),
     MakeString(SymbolId),
     MakeQid(SymbolId),

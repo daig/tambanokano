@@ -11,9 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{tokenize, Interner, Token};
-use tnk_frontend::rename_terms::ViewOpSubst;
+use tnk_frontend::rename_terms::{ReconTarget, ViewOpSubst};
 use tnk_frontend::surface::ast::{
-    ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
+    Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
 };
 
 use crate::db::ModuleDb;
@@ -290,12 +290,25 @@ fn add_parameter_copy(
     let decls = tmp.into_decls();
     // The theory's genuine sorts (theory-declared, excluding module-origin) — the ones renamed to `X$s`.
     let param_sorts = theory_param_sorts(theory, db, views, interner)?;
-    let items: Vec<RenameItem> = decls
+    let mut items: Vec<RenameItem> = decls
         .sorts
         .iter()
         .filter(|s| param_sorts.contains(s.as_str()))
         .map(|s| RenameItem::Sort { from: s.clone(), to: format!("{param}${s}") })
         .collect();
+    // A parameter constant `op c : … [pconst]` is prefixed like a parameter sort: `c ↦ X$c` (the body
+    // refers to it as `X$c`, and instantiation maps `X$c` through the view's op map for `c`).
+    for op in &decls.ops {
+        if op.attrs.pconst {
+            let name: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
+            items.push(RenameItem::Op {
+                from: name.clone(),
+                to: format!("{param}${name}"),
+                dom_range: None,
+                attrs: Attrs::default(),
+            });
+        }
+    }
     let renamed = apply_renaming(decls, &items, interner)?;
     acc.add(renamed);
     Ok(())
@@ -318,6 +331,26 @@ fn theory_param_sorts(
     let mut module_sorts = HashSet::new();
     module_origin_sorts(theory, db, views, interner, &mut HashSet::new(), &mut module_sorts)?;
     Ok(sorts.into_iter().filter(|s| !module_sorts.contains(s)).collect())
+}
+
+/// The canonical names of a theory's **parameter constants** (`op c : … [pconst]`) — the constants a
+/// parameterized module refers to as `X$c` and that instantiation maps through the view's op map for `c`.
+fn theory_pconst_ops(
+    theory: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<HashSet<String>, String> {
+    let mut tmp = Acc::default();
+    let mut tmp_visited = HashSet::new();
+    collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
+    Ok(tmp
+        .into_decls()
+        .ops
+        .iter()
+        .filter(|op| op.attrs.pconst)
+        .map(|op| op.name.iter().map(|t| interner.resolve(t.sym)).collect())
+        .collect())
 }
 
 /// Collect the sorts theory `name` inherits from an imported **module** (vs. a theory) — recursively, so a
@@ -378,13 +411,27 @@ fn collect_expr(
             acc.add(renamed);
             Ok(())
         }
-        ModuleExpr::Instantiation(..) => {
+        ModuleExpr::Instantiation(base, args) => {
             // `M{A, …}` (or a chain `M{A}{B}`) merges once, keyed by its canonical instance name.
             if !visited.insert(canonical_key(expr)) {
                 return Ok(());
             }
+            // A **renamed** parameterized module instantiated — `(M * R){V}` (finding C3a; the shape stock
+            // `linear.maude` uses). Instantiate the inner module expression, then apply the renaming to the
+            // result: `R` targets `M`'s module-level sorts/ops, which survive the parameter substitution
+            // (a rename of a parameter-theory sort becomes a no-op post-substitution, matching the oracle's
+            // "ignore the mapping" — cf. A4e).
+            if let ModuleExpr::Rename(inner, items) = &**base {
+                let mut tmp = Acc::default();
+                let mut tmp_visited = HashSet::new();
+                let inst = ModuleExpr::Instantiation(inner.clone(), args.clone());
+                collect_expr(&inst, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
+                let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
+                acc.add(renamed);
+                return Ok(());
+            }
             let (mname, arg_lists) = unchain(expr).ok_or(
-                "the base of an instantiation must be a named module (a renaming/sum base is a follow-up)",
+                "the base of an instantiation must be a named module (a sum base is a follow-up)",
             )?;
             instantiate(mname, &arg_lists, db, views, acc, visited, interner, scope)
         }
@@ -445,7 +492,7 @@ fn instantiate(
     // sort images compose left-to-right; the structured-sort name is the whole chain (`ToT2}{C2`).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
-    let mut op_recon: Vec<(String, String)> = Vec::new();
+    let mut op_recon: Vec<(String, ReconTarget)> = Vec::new();
     let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
     for (i, param) in pm.params.iter().enumerate() {
         let chain: Vec<&ModuleExpr> = arg_lists.iter().map(|lvl| &lvl[i]).collect();
@@ -459,8 +506,17 @@ fn instantiate(
         if let Some(target) = &last.target {
             collect_expr(target, db, views, acc, visited, interner, scope)?;
         }
+        // A theory's parameter constants `c` (`[pconst]`) appear in the body as `X$c` (like a parameter
+        // sort `X$s`), so the view's op map for `c` keys the substitution under `param.name$c`.
+        let pconst_ops = theory_pconst_ops(&param.theory, db, views, interner)?;
         for r in &resolutions {
-            op_subst.extend(r.op_subst.clone());
+            for (k, val) in &r.op_subst {
+                if pconst_ops.contains(k) {
+                    op_subst.insert(format!("{}${}", param.name, k), val.clone());
+                } else {
+                    op_subst.insert(k.clone(), val.clone());
+                }
+            }
             op_recon.extend(r.op_recon.clone());
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
@@ -524,10 +580,22 @@ fn apply_view_op_recon(
     mname: &str,
     db: &ModuleDb,
     views: &ViewDb,
-    op_recon: &[(String, String)],
+    op_recon: &[(String, ReconTarget)],
     interner: &mut Interner,
 ) -> Result<(), String> {
-    let src = flatten(mname, db, views, interner)?;
+    let mut src = flatten(mname, db, views, interner)?;
+    // `flatten` de-duplicates variable *names* keeping the first (import) declaration, so a body variable
+    // that collides with an imported one (e.g. `A B : X$Elt` vs BOOL's `A B C : Bool`) is shadowed at the
+    // wrong sort in the source grammar, and a bubble like `lt(A, B)` fails to parse. The module's own
+    // variables must win here: drop every source declaration of an own-variable name, then re-add the own
+    // declarations authoritatively.
+    let own_var_names: HashSet<String> =
+        d.vars.iter().flat_map(|v| v.names.iter().cloned()).collect();
+    for vd in &mut src.vars {
+        vd.names.retain(|n| !own_var_names.contains(n));
+    }
+    src.vars.retain(|vd| !vd.names.is_empty());
+    src.vars.extend(d.vars.iter().cloned());
     let Some(mapper) = ViewOpSubst::new(&src, op_recon, interner)? else {
         return Ok(());
     };
@@ -583,9 +651,9 @@ struct ArgResolution {
     binding: ParamBinding,
     target: Option<ModuleExpr>,
     op_subst: HashMap<String, Vec<Token>>,
-    /// Mixfix op→op maps (source canonical → target canonical) that need grammar-aware reconstruction of
-    /// the parameterized module's statement bubbles ([`ViewOpSubst`]); see [`op_maps_of`].
-    op_recon: Vec<(String, String)>,
+    /// Op maps that need grammar-aware reconstruction of the parameterized module's statement bubbles
+    /// ([`ViewOpSubst`]): mixfix op→op (fixity change) and op→term with variable arguments; see [`op_maps_of`].
+    op_recon: Vec<(String, ReconTarget)>,
 }
 
 /// Resolve one instantiation argument against the enclosing parameter `scope`. A bare name in `scope` is a
@@ -697,13 +765,17 @@ fn resolve_arg(
 ///   so these route through [`ViewOpSubst`], which parses the bubble in the source grammar and re-emits the
 ///   application in the target's syntax.
 ///
-/// An op→*term* map whose source is mixfix is still a follow-up (rejected): a mixfix source with argument
-/// holes needs the term template instantiated per occurrence, beyond a fixity swap.
+/// - **term template** (`ReconTarget::Term`): an op→term map with *variable arguments* (`op lt(A, B) to term
+///   A < B`), the main use of op→term. The from-pattern's argument variables become the template's formal
+///   parameters; each `lt(e1, e2)` occurrence re-emits the template with the arguments substituted.
+///
+/// An op→term map whose source is *mixfix* (argument holes in the operator name itself) is still a follow-up
+/// (rejected): it needs the pattern's holes matched positionally against the source operator's own fixity.
 #[allow(clippy::type_complexity)]
 fn op_maps_of(
     v: &ViewDecl,
     i: &Interner,
-) -> Result<(HashMap<String, Vec<Token>>, Vec<(String, String)>), String> {
+) -> Result<(HashMap<String, Vec<Token>>, Vec<(String, ReconTarget)>), String> {
     let mut op_subst = HashMap::new();
     let mut op_recon = Vec::new();
     for m in &v.op_maps {
@@ -716,18 +788,73 @@ fn op_maps_of(
                 if from.len() == 1 && !from_canon.contains('_') && !to_canon.contains('_') {
                     op_subst.insert(from_canon, to.clone());
                 } else {
-                    op_recon.push((from_canon, to_canon));
+                    op_recon.push((from_canon, ReconTarget::Op(to_canon)));
                 }
             }
             OpMap::Term { from, to } => match from.as_slice() {
+                // A constant op→term (`op 0 to term 0.0`): a plain token substitution.
                 [tok] => {
                     op_subst.insert(i.resolve(tok.sym).to_string(), to.clone());
                 }
-                _ => return Err(format!("view `{}`: a mixfix operator→term map is a follow-up", v.name)),
+                // `op f(A, B, …) to term <template>`: a prefix source applied to argument variables.
+                _ => {
+                    let (name, formals) = op_pattern_formals(from, i).ok_or_else(|| {
+                        format!("view `{}`: a mixfix operator→term map is a follow-up", v.name)
+                    })?;
+                    op_recon.push((name, ReconTarget::Term { formals, template: to.clone() }));
+                }
             },
         }
     }
     Ok((op_subst, op_recon))
+}
+
+/// Parse an op→term from-pattern `name ( a1 , a2 , … )` into the operator name and its argument variables'
+/// base-names (the text before any `:sort` suffix), in order. `None` if it is not a prefix application of
+/// single-token argument variables (a mixfix source, or a non-variable argument — the follow-up case).
+fn op_pattern_formals(from: &[Token], i: &Interner) -> Option<(String, Vec<String>)> {
+    if from.len() < 3
+        || i.resolve(from[1].sym) != "("
+        || i.resolve(from[from.len() - 1].sym) != ")"
+    {
+        return None;
+    }
+    let name = i.resolve(from[0].sym).to_string();
+    let inner = &from[2..from.len() - 1];
+    let mut formals = Vec::new();
+    let mut depth = 0i32;
+    let mut seg: Vec<&Token> = Vec::new();
+    for t in inner {
+        match i.resolve(t.sym) {
+            "(" | "{" | "[" => {
+                depth += 1;
+                seg.push(t);
+            }
+            ")" | "}" | "]" => {
+                depth -= 1;
+                seg.push(t);
+            }
+            "," if depth == 0 => {
+                formals.push(seg_base_name(&seg, i)?);
+                seg.clear();
+            }
+            _ => seg.push(t),
+        }
+    }
+    formals.push(seg_base_name(&seg, i)?);
+    Some((name, formals))
+}
+
+/// The base variable name of a single-token argument segment `A:Elt` → `"A"`. `None` if the segment is not
+/// exactly one token (a compound argument is not a plain formal — the follow-up case).
+fn seg_base_name(seg: &[&Token], i: &Interner) -> Option<String> {
+    match seg {
+        [t] => {
+            let text = i.resolve(t.sym);
+            Some(text.split(':').next().unwrap_or(text).to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Substitute view parameters into a module expression (a parameterized view's `to` target): replace each
@@ -755,11 +882,20 @@ fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) ->
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
                     },
-                    RenameItem::Op { from, to, attrs } => RenameItem::Op {
+                    RenameItem::Op { from, to, dom_range, attrs } => RenameItem::Op {
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
+                        dom_range: dom_range.as_ref().map(|(d, r)| {
+                            (
+                                d.iter().map(|s| subst_param_name(s, &names)).collect(),
+                                subst_param_name(r, &names),
+                            )
+                        }),
                         attrs: attrs.clone(),
                     },
+                    RenameItem::Label { from, to } => {
+                        RenameItem::Label { from: from.clone(), to: to.clone() }
+                    }
                 })
                 .collect();
             ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map)), new_items)
@@ -997,7 +1133,11 @@ fn canonical_key(expr: &ModuleExpr) -> String {
                 .iter()
                 .map(|it| match it {
                     RenameItem::Sort { from, to } => format!("sort {from} to {to}"),
+                    RenameItem::Op { from, to, dom_range: Some((d, r)), .. } => {
+                        format!("op {from} : {} -> {r} to {to}", d.join(" "))
+                    }
                     RenameItem::Op { from, to, .. } => format!("op {from} to {to}"),
+                    RenameItem::Label { from, to } => format!("label {from} to {to}"),
                 })
                 .collect();
             format!("({} * ({}))", canonical_key(inner), parts.join(", "))

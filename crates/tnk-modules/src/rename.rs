@@ -17,6 +17,16 @@ use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, State
 
 use crate::flatten::FlatDecls;
 
+/// One `op … to …` renaming, resolved. `dom_range` (`Some((domain, range))`) restricts the rename to the
+/// single overload of `from` with that source signature (arity-disambiguated `op f : A B -> C to g`);
+/// `None` renames every overload. `attrs` overrides the target op's attributes.
+struct OpRenameSpec {
+    from: String,
+    to: String,
+    dom_range: Option<(Vec<String>, String)>,
+    attrs: Attrs,
+}
+
 /// Rewrite `d` under the renaming `items`. The grammar-aware mixfix path may fail to build the source
 /// module's parser, which is surfaced as an `Err`.
 pub fn apply_renaming(
@@ -25,43 +35,45 @@ pub fn apply_renaming(
     interner: &mut Interner,
 ) -> Result<FlatDecls, String> {
     let mut sort_map: HashMap<String, String> = HashMap::new();
-    // Every op rename, as (from canonical name, to canonical name, attribute override).
-    let mut op_renames: Vec<(String, String, Attrs)> = Vec::new();
+    // Every op rename, as an [`OpRenameSpec`] (from/to canonical names, optional disambiguating signature,
+    // attribute override). Statement labels rename separately (`label l to m`).
+    let mut op_renames: Vec<OpRenameSpec> = Vec::new();
+    let mut label_map: HashMap<String, String> = HashMap::new();
     for item in items {
         match item {
             RenameItem::Sort { from, to } => {
                 sort_map.insert(from.clone(), to.clone());
             }
-            RenameItem::Op { from, to, attrs } => {
-                op_renames.push((from.clone(), to.clone(), attrs.clone()));
+            RenameItem::Op { from, to, dom_range, attrs } => {
+                op_renames.push(OpRenameSpec {
+                    from: from.clone(),
+                    to: to.clone(),
+                    dom_range: dom_range.clone(),
+                    attrs: attrs.clone(),
+                });
+            }
+            RenameItem::Label { from, to } => {
+                label_map.insert(from.clone(), to.clone());
             }
         }
     }
 
-    // Single-token op renames (constants/prefix ops) substitute textually everywhere; a mixfix op
-    // rename needs grammar-aware term rewriting (only the parser can tell an operator fragment from an
-    // argument separator). Build that renamer over the **pre-rename** declarations, before any mutation.
-    let mixfix_pairs: Vec<(String, String)> = op_renames
+    // Single-token, non-disambiguated op renames (constants/prefix ops) substitute textually everywhere; a
+    // mixfix rename, or any arity-disambiguated rename (one overload of a shared name), needs grammar-aware
+    // term rewriting — only the parser can tell an operator fragment from an argument separator, and only
+    // the parse arity can pick the right overload. Build that renamer over the **pre-rename** declarations.
+    let grammar_renames: Vec<(String, Option<usize>, String)> = op_renames
         .iter()
-        .filter(|(from, ..)| !is_single_token(from, interner))
-        .map(|(from, to, _)| (from.clone(), to.clone()))
+        .filter(|s| s.dom_range.is_some() || !is_single_token(&s.from, interner))
+        .map(|s| (s.from.clone(), s.dom_range.as_ref().map(|(d, _)| d.len()), s.to.clone()))
         .collect();
-    let renamer = OpRenamer::new(&premodule_of(&d), &mixfix_pairs, interner)?;
+    let renamer = OpRenamer::new(&premodule_of(&d), &grammar_renames, interner)?;
 
     // Single-token op map (textual). Applied to statement bubbles and `id:` identity bubbles.
     let single_op_map: HashMap<String, String> = op_renames
         .iter()
-        .filter(|(from, ..)| is_single_token(from, interner))
-        .map(|(from, to, _)| (from.clone(), to.clone()))
-        .collect();
-    // Op-declaration rename map: canonical from-name → (target canonical name, attribute override). Covers
-    // single + mixfix. The declaration's name is replaced **wholesale** by the target's token vector (see
-    // the op loop) — not by per-fragment surgery, which would corrupt a single-token mixfix name like
-    // `_+_` (one token, no lexer-punctuation to split it) into a prefix op by overwriting the whole token
-    // with the target's first literal fragment.
-    let op_decl_map: HashMap<String, (String, Attrs)> = op_renames
-        .iter()
-        .map(|(from, to, a)| (from.clone(), (to.clone(), a.clone())))
+        .filter(|s| s.dom_range.is_none() && is_single_token(&s.from, interner))
+        .map(|s| (s.from.clone(), s.to.clone()))
         .collect();
 
     // Declarations.
@@ -72,18 +84,27 @@ pub fn apply_renaming(
         }
     }
     for op in &mut d.ops {
+        // Snapshot the pre-rename signature so an arity-disambiguated rename matches against the source
+        // sorts (a sort rename in the same renaming may rewrite the domain below).
+        let orig_domain = op.domain.clone();
+        let orig_range = op.range.clone();
         rename_each(&mut op.domain, &sort_map);
         if let Some(t) = sort_map.get(&op.range) {
             op.range = t.clone();
         }
         let canon: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
-        if let Some((to_name, ovr)) = op_decl_map.get(&canon) {
+        // Find the rename spec for this declaration: a disambiguated spec matches only the overload whose
+        // signature equals the spec's; a plain spec matches every overload of the name.
+        if let Some(spec) = op_renames.iter().find(|s| {
+            s.from == canon
+                && s.dom_range.as_ref().is_none_or(|(d, r)| *d == orig_domain && *r == orig_range)
+        }) {
             // Replace the op's name wholesale with the target's token vector. `tokenize` reproduces the
             // canonical spelling — one token for a hole-bearing name with no lexer-punctuation (`_plus_`,
             // `_;_`), split tokens for a punctuation name (`_,_` → `_ , _`) — so the rebuilt op keeps the
             // target's mixfix shape (holes preserved) rather than collapsing to a prefix op.
-            op.name = tokenize(to_name, interner);
-            apply_attr_override(&mut op.attrs, ovr);
+            op.name = tokenize(&spec.to, interner);
+            apply_attr_override(&mut op.attrs, &spec.attrs);
         }
         // The `id:` identity element is a constant — rename it like any other (single-token op / sort).
         if let Some(idb) = &mut op.attrs.id {
@@ -143,6 +164,20 @@ pub fn apply_renaming(
                 if let Some(c) = cond {
                     rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
+            }
+        }
+    }
+
+    // Statement-label renames (`label l to m`): rewrite the label field of each statement (rule/eq/mb).
+    if !label_map.is_empty() {
+        for st in &mut d.statements {
+            let (Statement::Eq { label, .. }
+            | Statement::Mb { label, .. }
+            | Statement::Rule { label, .. }) = st;
+            if let Some(l) = label
+                && let Some(to) = label_map.get(l)
+            {
+                *l = to.clone();
             }
         }
     }
@@ -293,7 +328,7 @@ mod tests {
     fn single_token_op_rename_ok() {
         let mut i = Interner::new();
         let single =
-            [RenameItem::Op { from: "f".into(), to: "g".into(), attrs: Attrs::default() }];
+            [RenameItem::Op { from: "f".into(), to: "g".into(), dom_range: None, attrs: Attrs::default() }];
         assert!(apply_renaming(empty(), &single, &mut i).is_ok());
     }
 

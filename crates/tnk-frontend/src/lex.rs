@@ -63,7 +63,8 @@ pub enum TokKind {
     /// last char). A string merely *glued into* a longer maudeId (`"x"y`, `foo"bar"`) is an `Ident`, not
     /// a `Str` — Maude's `Token::computeSpecialProperty` (`token.cc:478`).
     Str,
-    /// A float literal `[0-9]+.[0-9]+` (exponents are a follow-up).
+    /// A float literal — Maude's `looksLikeFloat` forms (see [`is_float_literal`]): `1.5`, `-1.5`,
+    /// `5.0e-1`, and the abbreviated `1.`, `.5`, `1.e3`, `.5e2`, `1e3`, `Infinity`.
     Float,
     /// A negative-integer literal `-[0-9]+` with a nonzero magnitude (Maude's `SMALL_NEG`): a `-` glued
     /// to digits, lexed as one token. `-1.5` is a Float (checked first); a *spaced* `-` stays its own
@@ -71,6 +72,14 @@ pub enum TokKind {
     NegNumber,
     /// A quoted identifier `'…`.
     Qid,
+    /// A glued rational literal `[-]num/den` (Maude's `RATIONAL`, [`is_rational_literal`]): `1/6`,
+    /// `-7/3`. A *spaced* `1 / 6` stays three tokens (the `_/_` division operator), so binary division
+    /// is unaffected — only a `/`-glued numeral pair reaches `classify` as one token, as in Maude.
+    Rational,
+    /// An `iter`-symbol input token `f^count` (Maude's `ITER_SYMBOL`, [`is_iter_token`]): `s_^10`,
+    /// `s_^18446744073709551616`. The text before the last `^` is the operator name, the trailing
+    /// (leading-nonzero) digits the iteration count.
+    Iter,
 }
 
 /// A lexical token: its interned text, source line, and class.
@@ -172,13 +181,18 @@ fn is_string_literal(text: &str) -> bool {
     false // unterminated
 }
 
-/// The class of a scanned maudeId text.
+/// The class of a scanned maudeId text. The order mirrors Maude's `Token::computeSpecialProperty`
+/// (`token.cc`): quoted-id / string, then `ITER_SYMBOL`, `FLOAT`, integer (`ZERO`/`SMALL_NEG`/
+/// `SMALL_NAT`), and finally `RATIONAL` — a token that is not any of these is an ordinary identifier.
 fn classify(text: &str) -> TokKind {
     if is_string_literal(text) {
         return TokKind::Str;
     }
     if text.starts_with('\'') && text.len() > 1 {
         return TokKind::Qid;
+    }
+    if is_iter_token(text) {
+        return TokKind::Iter;
     }
     if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
         return TokKind::Number;
@@ -189,7 +203,46 @@ fn classify(text: &str) -> TokKind {
     if is_neg_integer(text) {
         return TokKind::NegNumber;
     }
+    if is_rational_literal(text) {
+        return TokKind::Rational;
+    }
     TokKind::Ident
+}
+
+/// A glued rational literal — a faithful mirror of Maude's `Token::looksLikeRational` (`token.cc`): an
+/// optional leading `-`, a numerator (digits; a `0` numerator only as the unsigned `0/n`, never `-0/n`
+/// or `00/n`), a `/`, then a denominator that is digits with a nonzero leading digit (`den >= 1`, no
+/// leading zero). Examples: `1/6`, `2/4`, `-7/3`, `0/5`. Rejected: `1/0`, `1/06`, `-0/3`, `00/3`, `1/6/7`.
+fn is_rational_literal(text: &str) -> bool {
+    let (neg, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text),
+    };
+    let Some((num, den)) = rest.split_once('/') else { return false };
+    // Numerator: all digits, non-empty; a `0` numerator is allowed only unsigned and only as exactly `0`.
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if num.bytes().next() == Some(b'0') && (neg || num.len() != 1) {
+        return false;
+    }
+    // Denominator: all digits, non-empty, with a nonzero leading digit (>= 1, no leading zero) and no
+    // further `/`.
+    !den.is_empty()
+        && den.bytes().all(|b| b.is_ascii_digit())
+        && den.as_bytes()[0] != b'0'
+}
+
+/// An `iter`-symbol input token `f^count` — a faithful mirror of Maude's `ITER_SYMBOL` branch of
+/// `Token::computeSpecialProperty` (`token.cc`): a non-empty operator-name prefix, a `^`, then a
+/// maximal run of trailing digits whose first digit is nonzero (so `f^0`/`f^01` are *not* iter tokens).
+/// The prefix may itself contain `_` (`s_^10`). `k` may be a bignum (`s_^18446744073709551616`).
+fn is_iter_token(text: &str) -> bool {
+    let Some((prefix, digits)) = text.rsplit_once('^') else { return false };
+    !prefix.is_empty()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && digits.as_bytes()[0] != b'0'
 }
 
 /// A negative-integer literal: a `-` glued to one or more digits with a nonzero magnitude — Maude's
@@ -203,24 +256,43 @@ fn is_neg_integer(text: &str) -> bool {
         && digits.bytes().any(|b| b != b'0')
 }
 
-/// A float literal: an optional leading sign, an integer part, `.`, a fraction, and an optional
-/// exponent — `1.5`, `-1.5`, `5.0e-1`, `2.0E+3` (the forms Maude lexes and prints, e.g. `neg(1.5)`
-/// reduces to the literal `-1.5`). Tokens are whitespace-delimited, so `5.0 - 1.5` keeps `-` as its own
-/// token; only a sign written *attached* to the number (`-1.5`) reaches `classify` as a single token,
-/// exactly as in Maude.
+/// A float literal — a faithful mirror of Maude's `looksLikeFloat` (`Utility/macros.cc`), so the lexer
+/// accepts exactly the forms the term builder can `float(String)`: an optional sign, then either
+/// `Infinity` or a mantissa/exponent that carries at least one digit AND a `.` or an `[eE]` exponent.
+/// Accepted: `1.5`, `-1.5`, `5.0e-1`, `2.0E+3`, and the abbreviated forms `1.`, `.5`, `1.e3`, `.5e2`,
+/// `1e3`, `Infinity`. Rejected (fall through to `Ident`, no parse — as Maude rejects them): a dangling
+/// exponent `1.5e`, a lone `.`, and a bare integer numeral `5` (that is a `Number`, handled earlier in
+/// [`classify`]). Tokens are whitespace-delimited, so `5.0 - 1.5` keeps `-` as its own token; only a
+/// sign written *attached* to the number (`-1.5`) reaches `classify` as a single token, as in Maude.
 fn is_float_literal(text: &str) -> bool {
-    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
-    let Some((int_part, rest)) = body.split_once('.') else { return false };
-    let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !all_digits(int_part) {
+    let t = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if t == "Infinity" {
+        return true;
+    }
+    let (mantissa, exponent) = match t.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (t, None),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let all_digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(int_part) || !frac_part.is_none_or(all_digits) {
         return false;
     }
-    // The fraction, optionally followed by an `[eE][-+]?digits` exponent.
-    match rest.split_once(['e', 'E']) {
-        None => all_digits(rest),
-        Some((fraction, exp)) => {
-            all_digits(fraction) && all_digits(exp.strip_prefix(['-', '+']).unwrap_or(exp))
+    // At least one digit somewhere in the mantissa…
+    if int_part.is_empty() && frac_part.is_none_or(str::is_empty) {
+        return false;
+    }
+    // …and a `.` or an exponent to make it a float rather than an integer numeral. A present exponent
+    // must itself carry digits (a dangling `1.5e` is not a float).
+    match exponent {
+        Some(e) => {
+            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !e.is_empty() && all_digits(e)
         }
+        None => frac_part.is_some(),
     }
 }
 
@@ -633,9 +705,21 @@ mod tests {
         assert_eq!(classify("-3"), TokKind::NegNumber, "`-3` is a SMALL_NEG, parsed via the `-_` op");
         assert_eq!(classify("-7"), TokKind::NegNumber);
         assert_eq!(classify("-0"), TokKind::Ident, "`-0` (magnitude zero) is not SMALL_NEG");
-        assert_eq!(classify("1."), TokKind::Ident);
-        assert_eq!(classify(".5"), TokKind::Ident);
-        assert_eq!(classify("1.5e"), TokKind::Ident);
+        // Abbreviated float forms Maude's `looksLikeFloat` ACCEPTS (verified against Maude 3.5.1:
+        // `reduce in FLOAT : 1. .` → `result FiniteFloat: 1.0`, `.5` → `5.0e-1`, `1.e3`/`1e3` → `1.0e+3`,
+        // `.5e2` → `5.0e+1`, `Infinity` → `result Float: Infinity`). The prior pins asserted Maude
+        // rejected `1.`/`.5` — it does not (fable-audit.md §3.4, roadmap C1c).
+        assert_eq!(classify("1."), TokKind::Float);
+        assert_eq!(classify(".5"), TokKind::Float);
+        assert_eq!(classify("1.e3"), TokKind::Float);
+        assert_eq!(classify(".5e2"), TokKind::Float);
+        assert_eq!(classify("1e3"), TokKind::Float);
+        assert_eq!(classify("Infinity"), TokKind::Float);
+        assert_eq!(classify("-Infinity"), TokKind::Float, "signed Infinity");
+        // …and the forms it still REJECTS (verified: `1.5e` → `bad token 1.5e`, lone `.` → parse error).
+        assert_eq!(classify("1.5e"), TokKind::Ident, "a dangling exponent is not a float");
+        assert_eq!(classify("."), TokKind::Ident, "a lone dot is not a float");
+        assert_eq!(classify("5"), TokKind::Number, "a bare integer numeral is a Number, not a Float");
         // `5.0 - 1.5` keeps the spaced `-` as a separate Ident token (binary minus).
         let (_i, t) = lex("5.0 - 1.5");
         let decoded: Vec<(&str, TokKind)> = t.iter().map(|(s, k)| (s.as_str(), *k)).collect();

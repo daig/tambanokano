@@ -158,23 +158,29 @@ impl Repl {
     /// Dispatch ONE complete statement: a `set`/`show`/`select`/`quit` meta-command (by its first word),
     /// or a module definition / command parsed via [`Parser::parse_top_item`].
     fn dispatch_one(&mut self, input: &str) -> Eval {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
+        if input.trim().is_empty() {
             return Eval::default();
         }
-        // REPL meta-commands dispatch on the first word.
-        match trimmed.split_whitespace().next().unwrap_or("") {
+        // Tokenize once so the meta-command dispatch keys on the first *token* (comments already stripped
+        // by the lexer) rather than the first raw word: a `***`/`---` comment on the line before
+        // `select`/`show`/`set` no longer desyncs it (fable-audit.md §3.4 — the comment-before-select bug).
+        // The meta handlers re-space the tokens (`join_tokens`), which keeps structured names (`LIST{Nat}`)
+        // intact and drops the comment prefix.
+        let toks = tokenize(input, &mut self.interner);
+        let Some(first) = toks.first().map(|t| self.interner.resolve(t.sym)) else {
+            return Eval::default(); // comment-only / blank submission
+        };
+        match first {
             "quit" | "q" | "exit" => return Eval { output: "Bye.".into(), exit: true },
-            "select" => return self.meta_select(trimmed),
-            "show" => return self.meta_show(trimmed),
-            "set" => return self.meta_set(trimmed),
+            "select" => return self.meta_select(&join_tokens(&toks, &self.interner)),
+            "show" => return self.meta_show(&join_tokens(&toks, &self.interner)),
+            "set" => return self.meta_set(&join_tokens(&toks, &self.interner)),
             _ => {}
         }
 
         // Otherwise: module definitions and reduce/match/rewrite/search commands. Collect the parsed
         // items first so the `Parser`'s shared borrow of the interner is released before we mutate it.
         let mut output = String::new();
-        let toks = tokenize(input, &mut self.interner);
         let items = {
             let mut p = Parser::new(&toks, &self.interner);
             let mut items = Vec::new();
@@ -190,6 +196,22 @@ impl Repl {
             }
             items
         };
+        // Two commands on one line: Maude rejects the whole line (its command reader takes everything up to
+        // the terminating `.`, so trailing tokens make the command ill-formed). tnk buffers one physical
+        // submission at a time, so a *single-line* `red a . red b .` arrives here as several parsed items —
+        // reject the whole submission when any command is followed by another item. Commands on SEPARATE
+        // lines are separate submissions (each its own `dispatch_one`), so multi-command files are
+        // unaffected (fable-audit.md §3.4). A module/view followed by a trailing command is Maude-legal and
+        // left alone (the command is the last item — nothing follows it).
+        if items
+            .iter()
+            .enumerate()
+            .any(|(k, it)| matches!(it, TopItem::Command(_)) && k + 1 < items.len())
+        {
+            // The diagnostic text is stripped by the diff harness; the pin is that no results appear.
+            output.push_str("error: more than one command on a line.\n");
+            return Eval { output: output.trim_end().to_string(), exit: false };
+        }
         for item in items {
             match item {
                 TopItem::Module(pm) => self.enter_module(pm, &mut output),
@@ -388,16 +410,22 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
-            Command::Frewrite { bound, term, .. } => {
+            Command::Frewrite { bound, gas, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `frewrite` restarts the `counter` built-in
                 let echo = command_echo(lm, &self.interner, &term, self.color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
-                let bound_str = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
-                // Maude's `frewrite` default gas is one rule application per position per pass.
-                match frewrite_command(lm, &self.interner, &term, 1) {
+                // The echo shows the bound exactly as written (`[n]` or `[n, g]`); Maude's default gas is
+                // one rule application per position per pass (fable-audit.md §3.4).
+                let bound_str = match (bound, gas) {
+                    (Some(n), Some(g)) => format!(" [{n}, {g}]"),
+                    (Some(n), None) => format!(" [{n}]"),
+                    (None, Some(g)) => format!(" [, {g}]"),
+                    _ => String::new(),
+                };
+                match frewrite_command(lm, &self.interner, &term, gas.unwrap_or(1)) {
                     Ok(mut rw) => {
                         let body = render_rewriting(lm, &self.interner, self.trace, self.color, &mut rw, bound);
                         out.push_str(&format!("frewrite{bound_str} in {cur} : {echo} .\n{body}"));
@@ -633,19 +661,34 @@ impl Repl {
                 "endfm" | "endm" | "endfth" | "endth" | "endv" | "endsm" | "endsth" | "endom" | "endoth"
             )
         };
+        // A command keyword *claims* the statement it leads (`red …`, `search …`): a module-open keyword
+        // inside a command's term (`red fmod … endfm .`, `reduce metaReduce(…)`) is then an operator-name
+        // fragment, not a real module. Junk tokens do NOT claim the statement, so a module preceded by
+        // top-level junk (`junkalpha … fmod MC …`, fable-audit.md §3.4) is still recognized — the buffer
+        // must not complete mid-module at the module's first inner `.`.
+        let is_command = |s: &str| {
+            matches!(
+                s,
+                "reduce" | "red" | "rewrite" | "rew" | "frewrite" | "frew" | "erewrite" | "erew"
+                    | "search" | "match" | "xmatch" | "continue" | "cont" | "srewrite" | "srew"
+                    | "dsrewrite" | "dsrew"
+            )
+        };
         let mut open = false;
         let mut saw_open = false;
         let mut depth = 0i32;
         let mut leading = true; // start, just after a depth-0 `.`, or just after a module delimiter
+        let mut claimed = false; // the current statement is a command (its body is a term, not a module)
         for t in &toks {
             let txt = self.interner.resolve(t.sym);
-            // An *open* keyword only starts a module in statement-leading position at depth 0: this keeps
-            // a command's module-constructor term (`reduce metaReduce(['NAT], …)` / `red fmod … endfm .`)
-            // from looking like a module. A *close* keyword only counts at depth 0, so the meta-level's
-            // module-constructor operators (`getName(fmod Q is … endfm)`) — whose `endfm` is an
-            // operator-name fragment inside brackets — never close the surrounding module early.
+            // A command keyword at statement-leading position claims the statement (its module keywords are
+            // term fragments). A module-open keyword at depth 0 opens a module unless the statement is a
+            // command — the leading requirement is dropped so top-level junk before it stays transparent.
+            if depth == 0 && leading && is_command(txt) {
+                claimed = true;
+            }
             if depth == 0
-                && leading
+                && !claimed
                 && matches!(
                     txt,
                     "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" | "view"
@@ -662,7 +705,11 @@ impl Repl {
                 ")" | "]" | "}" => depth -= 1,
                 _ => {}
             }
-            leading = (t.kind == TokKind::Dot && depth == 0) || is_close(txt);
+            let boundary = (t.kind == TokKind::Dot && depth == 0) || is_close(txt);
+            leading = boundary;
+            if boundary {
+                claimed = false; // a new statement begins after a depth-0 `.` / module close
+            }
         }
         let last_txt = self.interner.resolve(last.sym);
         let module_closed = is_close(last_txt) && saw_open && !open && depth == 0;

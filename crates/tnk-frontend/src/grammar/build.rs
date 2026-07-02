@@ -149,10 +149,24 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
     let mut syms: Vec<SymbolId> = m.syntax.keys().copied().collect();
     syms.sort();
     for sym in syms {
-        symbol_productions(&mut g, m, sorts, sym, (lp, rp, comma));
+        symbol_productions(&mut g, m, sorts, sym, (lp, rp, comma), interner);
     }
 
     g
+}
+
+/// The canonical glued name of a mixfix operator — its fragments concatenated, holes written `_`
+/// (`[Tok(s), Hole]` → `s_`). Matches Maude's `Token::name` for the symbol; used to key the `iter`-token
+/// terminal against the base name of an `f^count` input token.
+fn glued_name(frags: &[Frag], interner: &Interner) -> String {
+    let mut s = String::new();
+    for f in frags {
+        match f {
+            Frag::Tok(t) => s.push_str(interner.resolve(*t)),
+            Frag::Hole => s.push('_'),
+        }
+    }
+    s
 }
 
 /// Productions for one operator (`makeSymbolProductions` body). All tokens it needs are either
@@ -163,6 +177,7 @@ fn symbol_productions(
     sorts: &Sorts,
     sym: SymbolId,
     (lp, rp, comma): (Terminal, Terminal, Terminal),
+    interner: &mut Interner,
 ) {
     let syn = &m.syntax[&sym];
     let nr_args = syn.domain.len();
@@ -202,7 +217,36 @@ fn symbol_productions(
         if m.minus_sym == Some(sym) {
             push(g, range_nt, vec![GSym::T(Terminal::SmallNeg)], 0, vec![], Action::MakeInteger(sym));
         }
-        // (Deferred B4.5: the `s_(t)` prefix form and the `f^n(t)` iter-token form.)
+        // A division symbol additionally accepts a glued rational literal: `<rangeTerm> ::= RATIONAL`
+        // (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`). A negative numerator needs the
+        // `MinusSymbol`; RAT always imports it (INT), but guard so the production is well-formed.
+        if m.division_sym == Some(sym) {
+            if let Some(minus) = m.minus_sym {
+                push(
+                    g,
+                    range_nt,
+                    vec![GSym::T(Terminal::Rational)],
+                    0,
+                    vec![],
+                    Action::MakeRational { division: sym, minus },
+                );
+            }
+        }
+        // An `iter` symbol additionally accepts the `f^count(t)` iter-token form: `<rangeTerm> ::=
+        // ITER_SYMBOL ( <argTerm> )` (Maude's `MAKE_ITER`). The `iter` axiom forces arity 1.
+        if syn.iter && nr_args == 1 {
+            let name_str = glued_name(&syn.frags, interner);
+            let name = interner.intern(&name_str);
+            push(
+                g,
+                range_nt,
+                vec![GSym::T(Terminal::IterSymbol(name)), GSym::T(lp), arg_nt(0), GSym::T(rp)],
+                0,
+                vec![PREFIX_GATHER],
+                Action::MakeIter(sym),
+            );
+        }
+        // (Deferred B4.5: the `s_(t)` prefix form.)
         return;
     }
 

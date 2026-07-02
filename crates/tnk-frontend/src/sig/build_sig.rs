@@ -78,14 +78,35 @@ fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
 /// op domains/ranges and variable sorts (Pass A onward), never for subsorts (resolved before close).
 fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) -> R<SortId> {
     if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        // Single-sort `[S]` or multi-sort `[A, B]` (the kind of the component that contains A and B —
+        // `kindNameDecember2022`). Every listed sort is in the same connected component, so its kind is
+        // the same; resolve the first (depth-aware, so a structured sort `Map{X,Y}` is not split at its
+        // inner `,`).
+        let first = first_kind_component(inner);
         let inner_id = sorts
-            .get(inner)
+            .get(first)
             .copied()
-            .ok_or_else(|| format!("unknown sort `{inner}` in kind `[{inner}]`"))?;
+            .ok_or_else(|| format!("unknown sort `{first}` in kind `[{inner}]`"))?;
         Ok(engine.sorts().error_sort(engine.sorts().kind_of(inner_id)))
     } else {
         sorts.get(name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
     }
+}
+
+/// The first comma-separated sort of a multi-sort kind bracket's inner text, respecting `{ … }` / `[ … ]`
+/// nesting so a structured sort (`Map{X,Y}`) is not split at its inner `,`. `[A,B]` → `A`; `[Map{X,Y}]`
+/// → `Map{X,Y}`.
+fn first_kind_component(inner: &str) -> &str {
+    let mut depth = 0i32;
+    for (idx, c) in inner.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            ',' if depth == 0 => return &inner[..idx],
+            _ => {}
+        }
+    }
+    inner
 }
 
 pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
@@ -122,8 +143,13 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // selects the declaration group.
     let mut sym_by_profile: HashMap<(String, Vec<KindId>, KindId), SymbolId> = HashMap::new();
     // Each source declaration maps to its kernel symbol(s): one for an ordinary op, or — for a
-    // `poly`/`Universal` op — one per kind (the per-kind expansion below). Later passes iterate it.
-    let mut op_syms: Vec<Vec<SymbolId>> = Vec::with_capacity(pm.ops.len());
+    // `poly`/`Universal` op — one per kind (the per-kind expansion below). Later passes iterate it by the
+    // source index, so it is pre-sized and each declaration stores at its own index (the loop below may
+    // visit the entries out of source order — constants first, see next).
+    let mut op_syms: Vec<Vec<SymbolId>> = vec![Vec::new(); pm.ops.len()];
+    // Operators declared with a one-sided `id:` (`left`/`right`), keyed by symbol → (side, identity
+    // constant); populated as each op is declared, consumed by the [`crate::load`] one-sided post-pass.
+    let mut one_sided_id: HashMap<SymbolId, (crate::surface::ast::IdSide, SymbolId)> = HashMap::new();
 
     // Pass A: declare every op (theory-dispatched), record name→id + syntax. A `poly` op is expanded
     // here — necessarily after `close_sorts`, which is what creates the kinds/error sorts. Each
@@ -132,7 +158,17 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // but eager over all kinds rather than lazy over used ones (reduction-identical; cf. `show module`).
     // `Universal` is never resolved as a sort: the `poly` list drives the substitution, so it can
     // never reach `sort_id` to become "unknown".
-    for od in &pm.ops {
+    //
+    // **Constants first** (Maude's "resolve identities after the whole op block"): a nullary op an
+    // `id:` refers to may be declared *later* in the source (`op _o_ : … [id: e] .` then `op e : -> S .`,
+    // fable-audit.md §3.4). Declaring every arity-0 op before any op with arguments makes its symbol
+    // available in `name_to_sym` when `declare_op` resolves an `id:` constant, without a separate fixup
+    // pass. A stable partition preserves source order within each group, so overload resolution is
+    // unchanged; results are stored at the source index (`op_syms[idx]`).
+    let mut decl_order: Vec<usize> = (0..pm.ops.len()).collect();
+    decl_order.sort_by_key(|&idx| !pm.ops[idx].domain.is_empty());
+    for &idx in &decl_order {
+        let od = &pm.ops[idx];
         let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
 
@@ -183,7 +219,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
                 existing
             } else {
-                let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
+                let (sym, one_sided) =
+                    declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
+                if let Some(info) = one_sided {
+                    one_sided_id.insert(sym, info);
+                }
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
                 name_to_sym.entry(cname.clone()).or_insert(sym);
@@ -211,6 +251,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                         prec,
                         gather,
                         assoc: od.attrs.assoc,
+                        iter: od.attrs.iter,
                         format,
                     },
                 );
@@ -218,7 +259,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             };
             decl_syms.push(sym);
         }
-        op_syms.push(decl_syms);
+        op_syms[idx] = decl_syms;
     }
 
     // Pass A2: record the built-in anchors (now every name resolves).
@@ -358,6 +399,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         false_sym,
         overload,
         strat_defs: pm.strat_defs.clone(),
+        one_sided_id,
     })
 }
 
@@ -401,7 +443,10 @@ fn compute_overload_flags(
     flags
 }
 
-/// Declare one operator via the kernel constructor for its theory (from the attribute flags).
+/// Declare one operator via the kernel constructor for its theory (from the attribute flags). Returns the
+/// symbol and, for a **one-sided** `id:` (`left`/`right`), the `(side, identity-constant)` to record — such
+/// an op is registered *without* a kernel identity (whose collapse is two-sided); the declared-side
+/// collapse is applied at command construction ([`crate::load`]'s one-sided post-pass, fable-audit.md §3.4).
 fn declare_op(
     engine: &mut Engine,
     name: &str,
@@ -410,7 +455,8 @@ fn declare_op(
     range: SortId,
     name_to_sym: &HashMap<String, SymbolId>,
     i: &Interner,
-) -> R<SymbolId> {
+) -> R<(SymbolId, Option<(crate::surface::ast::IdSide, SymbolId)>)> {
+    use crate::surface::ast::IdSide;
     // `id: <const>` — resolve the (already-declared) identity constant by name (the subset's `id:` is a
     // single constant).
     let identity = match &attrs.id {
@@ -420,19 +466,27 @@ fn declare_op(
         }
         None => None,
     };
-    Ok(if attrs.iter {
+    // A one-sided identity is withheld from the kernel (its collapse is two-sided); record it for the
+    // frontend collapse. A plain (two-sided) `id:` goes to the kernel as before.
+    let one_sided = match (attrs.id_side, identity) {
+        (IdSide::Both, _) | (_, None) => None,
+        (side, Some(c)) => Some((side, c)),
+    };
+    let kernel_id = if one_sided.is_some() { None } else { identity };
+    let sym = if attrs.iter {
         engine.add_op_iter(name.to_string(), domain.to_vec(), range)
     } else if attrs.assoc && attrs.comm {
-        engine.add_op_ac(name.to_string(), domain.to_vec(), range, identity)
+        engine.add_op_ac(name.to_string(), domain.to_vec(), range, kernel_id)
     } else if attrs.assoc {
-        engine.add_op_au(name.to_string(), domain.to_vec(), range, identity)
-    } else if attrs.comm || attrs.idem || identity.is_some() {
+        engine.add_op_au(name.to_string(), domain.to_vec(), range, kernel_id)
+    } else if attrs.comm || attrs.idem || kernel_id.is_some() || one_sided.is_some() {
         // Any non-assoc subset of {comm, id:, idem} is CUI (Maude's CUI_Theory) — an `id:`-only or
         // `idem`-only op still collapses at construction (§3.2 A3c); non-comm stays positional.
-        engine.add_op_cui(name.to_string(), domain.to_vec(), range, attrs.comm, attrs.idem, identity)
+        engine.add_op_cui(name.to_string(), domain.to_vec(), range, attrs.comm, attrs.idem, kernel_id)
     } else {
         engine.add_op(name.to_string(), domain.to_vec(), range)
-    })
+    };
+    Ok((sym, one_sided))
 }
 
 // ---- hook resolution ----

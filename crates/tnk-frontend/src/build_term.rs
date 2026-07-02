@@ -93,6 +93,30 @@ pub fn build_term(
             let zero = m.nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
             Ok(Term::op(minus, vec![numeral_term(succ, zero, n)]))
         }
+        Action::MakeRational { division, minus } => {
+            let text = tokens[tree.start].text(i);
+            let (neg, num, den) = rational_parts(text)?;
+            let succ = m.nat_succ.ok_or("MAKE_RATIONAL without a successor symbol")?;
+            let zero = m.nat_zero.ok_or("MAKE_RATIONAL without a zero symbol")?;
+            let num_n: u64 = num.parse().map_err(|_| format!("bad rational `{text}`"))?;
+            let den_n: u64 = den.parse().map_err(|_| format!("bad rational `{text}`"))?;
+            let numerator = if neg {
+                Term::op(minus, vec![numeral_term(succ, zero, num_n)])
+            } else {
+                numeral_term(succ, zero, num_n)
+            };
+            Ok(Term::op(division, vec![numerator, numeral_term(succ, zero, den_n)]))
+        }
+        Action::MakeIter(sym) => {
+            let text = tokens[tree.start].text(i);
+            let count: u64 = iter_count(text)?.parse().map_err(|_| format!("bad iter count `{text}`"))?;
+            let child = tree.nt_children.first().ok_or("MakeIter without an argument")?;
+            let mut t = build_term(child, g, m, tokens, i, vars)?;
+            for _ in 0..count {
+                t = Term::op(sym, vec![t]);
+            }
+            Ok(t)
+        }
         Action::MakeString(sym) => {
             Ok(Term::string(sym, &unquote_string(tokens[tree.start].text(i))))
         }
@@ -107,8 +131,6 @@ pub fn build_term(
         }
         Action::AssocList => Err("assoc-list node reached build_term directly".to_string()),
         Action::Nop => Err("sort production has no term".to_string()),
-        // The f^n iter-token form is the one remaining deferred literal action.
-        Action::MakeIter(_) => Err("the f^n iter-token form is deferred".into()),
     }
 }
 
@@ -172,6 +194,37 @@ fn numeral_term(succ: SymbolId, zero: SymbolId, n: u64) -> Term {
     t
 }
 
+/// Build `s^count(base)` for the `iter` successor `succ` from a decimal `count`, on the DAG side.
+/// The kernel count is a bignum `Nat` natively, so an arbitrary-size numeral
+/// (`1267650600228229401496703205376`, `s_^k` at any k) builds in one node.
+fn build_iter_dag(
+    engine: &mut Engine,
+    succ: SymbolId,
+    base: DagId,
+    count: &str,
+) -> Result<DagId, String> {
+    engine
+        .make_iter_decimal(succ, count, base)
+        .ok_or_else(|| format!("bad numeral `{count}`"))
+}
+
+/// The decimal count of an `iter`-token `f^count` (the text after the last `^`).
+fn iter_count(text: &str) -> Result<&str, String> {
+    text.rsplit_once('^')
+        .map(|(_, d)| d)
+        .ok_or_else(|| format!("iter token `{text}` has no `^count`"))
+}
+
+/// The signed numerator and positive denominator of a glued rational literal `[-]num/den`.
+fn rational_parts(text: &str) -> Result<(bool, &str, &str), String> {
+    let (neg, rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text),
+    };
+    let (num, den) = rest.split_once('/').ok_or_else(|| format!("bad rational `{text}`"))?;
+    Ok((neg, num, den))
+}
+
 /// The magnitude of a `SMALL_NEG` token `-N` (Maude builds `-(s^N(0))` via `MinusSymbol::makeIntTerm`).
 /// Like [`numeral_term`]'s caller it bounds the literal to `u64` (large literals are a deferred bignum
 /// path); the lexer guarantees the `-` prefix + digits.
@@ -207,19 +260,38 @@ pub fn build_dag(
         }
         Action::MakeNatural(succ) => {
             let text = tokens[tree.start].text(i);
-            let n: u64 = text.parse().map_err(|_| format!("bad numeral `{text}`"))?;
             let zero = nat_zero.ok_or("MAKE_NATURAL without a zero symbol")?;
             let base = engine.make_const(zero);
-            Ok(engine.make_iter(succ, n, base))
+            build_iter_dag(engine, succ, base, text)
         }
         Action::MakeInteger(minus) => {
             let text = tokens[tree.start].text(i);
-            let n: u64 = neg_magnitude(text)?;
+            let mag = text.strip_prefix('-').unwrap_or(text);
             let zero = nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
             let succ = nat_succ.ok_or("MAKE_INTEGER without a successor symbol")?;
             let base = engine.make_const(zero);
-            let nat = engine.make_iter(succ, n, base);
+            let nat = build_iter_dag(engine, succ, base, mag)?;
             Ok(engine.make_node(minus, vec![nat]))
+        }
+        Action::MakeRational { division, minus } => {
+            let text = tokens[tree.start].text(i);
+            let (neg, num, den) = rational_parts(text)?;
+            let zero = nat_zero.ok_or("MAKE_RATIONAL without a zero symbol")?;
+            let succ = nat_succ.ok_or("MAKE_RATIONAL without a successor symbol")?;
+            let base = engine.make_const(zero);
+            // numerator: `s^num(0)`, wrapped in `minus` when negative (Maude's `makeRatTerm`).
+            let num_base = engine.make_const(zero);
+            let num_nat = build_iter_dag(engine, succ, num_base, num)?;
+            let numerator = if neg { engine.make_node(minus, vec![num_nat]) } else { num_nat };
+            let denominator = build_iter_dag(engine, succ, base, den)?;
+            Ok(engine.make_node(division, vec![numerator, denominator]))
+        }
+        Action::MakeIter(sym) => {
+            let text = tokens[tree.start].text(i);
+            let count = iter_count(text)?;
+            let arg = tree.nt_children.first().ok_or("MakeIter without an argument")?;
+            let base = build_dag(arg, g, engine, nat_zero, nat_succ, tokens, i)?;
+            build_iter_dag(engine, sym, base, count)
         }
         Action::MakeString(sym) => Ok(engine.make_string(sym, &unquote_string(tokens[tree.start].text(i)))),
         Action::MakeQid(sym) => {
@@ -234,7 +306,6 @@ pub fn build_dag(
         Action::MakeVariable(_) => Err("a reduce-command term must be ground (no variables)".into()),
         Action::AssocList => Err("assoc-list node reached build_dag directly".into()),
         Action::Nop => Err("a sort production has no term".into()),
-        Action::MakeIter(_) => Err("the f^n iter-token form is deferred".into()),
     }
 }
 
