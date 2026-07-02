@@ -507,17 +507,35 @@ pub(crate) fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
 
 /// Parse a term token bubble to its (unambiguous) parse tree; rejects empty input, no-parse, and ambiguity.
 fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
+    let parsed = parse_forest_any(tokens, g, i)?;
+    if parsed.ambiguous {
+        let rendered = tokens.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ");
+        return Err(format!("ambiguous parse: `{rendered}`"));
+    }
+    Ok(parsed.tree)
+}
+
+/// Parse a **command** term bubble, warn-and-pick on ambiguity (decision D9): Maude warns and takes
+/// its first parse — our extraction is the same `extractFirstSubparse` walk (first split in
+/// chart/completion order, pass2.cc), so the picked tree is used; the warning text is deferred
+/// diagnostics (phase E). Statement bubbles keep the strict [`parse_forest`]: their ambiguity today
+/// is dominated by the import-reparse artifact (D1a), where a noisy error is the safer behavior
+/// until the home-grammar fix lands.
+fn parse_forest_pick(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
+    Ok(parse_forest_any(tokens, g, i)?.tree)
+}
+
+fn parse_forest_any(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    i: &Interner,
+) -> Result<forest::Parse, String> {
     if tokens.is_empty() {
         return Err("empty term".into());
     }
     let rendered = || tokens.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ");
     let chart = earley::parse(g, tokens, Nt::Term, i);
-    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term)
-        .map_err(|e| format!("{e}: `{}`", rendered()))?;
-    if parsed.ambiguous {
-        return Err(format!("ambiguous parse: `{}`", rendered()));
-    }
-    Ok(parsed.tree)
+    forest::extract(g, &chart, tokens.len(), Nt::Term).map_err(|e| format!("{e}: `{}`", rendered()))
 }
 
 /// Parse a term token bubble and build its kernel [`Term`] (the statement/pattern path).
@@ -595,7 +613,7 @@ pub fn command_echo(
     term: &[Token],
     color: bool,
 ) -> Result<String, String> {
-    let tree = parse_forest(term, &lm.grammar, i)?;
+    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     let dag = build_subject_dag(lm, &tree, term, i)?;
     let dag = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag);
     Ok(print_pretty(&lm.built, i, dag, color))
@@ -606,7 +624,7 @@ pub fn reduce_command(
     i: &Interner,
     term: &[Token],
 ) -> Result<(DagId, u64), String> {
-    let tree = parse_forest(term, &lm.grammar, i)?;
+    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     // Reset BEFORE building so this command's count starts clean. Construction itself does no rewrites
     // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
     // `reduce` below is where every equation and membership application is counted (Maude's accounting).
@@ -629,7 +647,7 @@ pub fn reduce_command(
 /// REPL's `reduce` (which then drives [`Engine::reduce_with`](tnk_core::engine::Engine::reduce_with) for
 /// META-LEVEL descent).
 pub fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<DagId, String> {
-    let tree = parse_forest(term, &lm.grammar, i)?;
+    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
     let dag = build_subject_dag(lm, &tree, term, i);
@@ -791,7 +809,7 @@ pub fn search_command(
     let nr = vars.count();
     // Subject as a ground DAG (reset the counter so the search's rewrites start clean).
     lm.built.engine.reset_rewrites();
-    let subj_tree = parse_forest(subject, &lm.grammar, i)?;
+    let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
     lm.built.engine.begin_dedup();
     let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
     lm.built.engine.end_dedup();
@@ -838,7 +856,7 @@ pub fn match_command(
     let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
     let nr = vars.count();
 
-    let subj_tree = parse_forest(subject, &lm.grammar, i)?;
+    let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
     // C7: dedup the subject's repeated subterms into shared nodes before reducing (see `reduce_command`).
     lm.built.engine.begin_dedup();
     let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
