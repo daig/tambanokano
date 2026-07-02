@@ -426,8 +426,10 @@ fn declare_op(
         engine.add_op_ac(name.to_string(), domain.to_vec(), range, identity)
     } else if attrs.assoc {
         engine.add_op_au(name.to_string(), domain.to_vec(), range, identity)
-    } else if attrs.comm {
-        engine.add_op_cui(name.to_string(), domain.to_vec(), range, attrs.idem, identity)
+    } else if attrs.comm || attrs.idem || identity.is_some() {
+        // Any non-assoc subset of {comm, id:, idem} is CUI (Maude's CUI_Theory) — an `id:`-only or
+        // `idem`-only op still collapses at construction (§3.2 A3c); non-comm stays positional.
+        engine.add_op_cui(name.to_string(), domain.to_vec(), range, attrs.comm, attrs.idem, identity)
     } else {
         engine.add_op(name.to_string(), domain.to_vec(), range)
     })

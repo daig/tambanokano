@@ -477,8 +477,11 @@ impl Symbol {
     }
 
     /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
-    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm` only →
-    /// [`Cui`](Theory::Cui); else [`Free`](Theory::Free). (`idem` rides along inside CUI.)
+    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm`, `id:`, or
+    /// `idem` (any subset, non-assoc) → [`Cui`](Theory::Cui) — Maude's CUI_Theory covers all {C,U,I}
+    /// combinations, and an `id:`-only / `idem`-only op must still collapse (§3.2 A3c) — else
+    /// [`Free`](Theory::Free). Non-comm CUI ops keep positional argument order everywhere; only the
+    /// collapse axioms apply.
     pub(crate) fn theory(&self) -> Theory {
         if self.axioms.iter {
             return Theory::S; // `iter` is mutually exclusive with assoc/comm (checked at registration)
@@ -487,7 +490,13 @@ impl Symbol {
             (true, true) => Theory::Acu,
             (true, false) => Theory::Au,
             (false, true) => Theory::Cui,
-            (false, false) => Theory::Free,
+            (false, false) => {
+                if self.identity.is_some() || self.axioms.idem {
+                    Theory::Cui
+                } else {
+                    Theory::Free
+                }
+            }
         }
     }
 

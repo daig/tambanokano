@@ -559,14 +559,15 @@ impl Signature {
         name: impl Into<String>,
         domain: Vec<SortId>,
         range: SortId,
+        comm: bool,
         idem: bool,
         identity: Option<SymbolId>,
     ) -> SymbolId {
-        assert_eq!(domain.len(), 2, "a `comm` operator must be binary");
+        assert_eq!(domain.len(), 2, "a CUI operator must be binary");
         let id = self.symbols.alloc(Symbol {
             name: name.into(),
             decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: false, comm: true, idem, iter: false },
+            axioms: Axioms { assoc: false, comm, idem, iter: false },
             identity,
             strategy: None,
             frozen: None,
@@ -657,8 +658,9 @@ impl Signature {
     /// operators are left untouched — their argument order is significant.
     fn commutative_sort_completion(&mut self, sym: SymbolId) {
         let s = self.symbols.get(sym);
-        if !matches!(s.theory(), Theory::Acu | Theory::Cui) {
-            return; // only commutative theories complete; AU / free stay positional
+        if !matches!(s.theory(), Theory::Acu | Theory::Cui) || !s.axioms.comm {
+            return; // only genuinely commutative ops complete; AU / free / non-comm CUI
+                    // (id:/idem-only) stay positional
         }
         // Snapshot the current declarations so the shared borrow ends before the mutable push below
         // (the sort ids are `Copy`, so this clone is cheap and small).
@@ -1598,8 +1600,9 @@ impl Runtime {
         if idem && self.dag_compare(x, y) == Ordering::Equal {
             return x;
         }
-        if self.dag_compare(x, y) == Ordering::Greater {
-            std::mem::swap(&mut x, &mut y); // canonical order for commutativity
+        if sig.symbol(symbol).axioms.comm && self.dag_compare(x, y) == Ordering::Greater {
+            std::mem::swap(&mut x, &mut y); // canonical order for commutativity (non-comm CUI:
+                                            // id:/idem-only ops keep positional order)
         }
         let sort = sig.compute_sort(symbol, &[self.dags.get(x).sort, self.dags.get(y).sort]);
         self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
@@ -2442,8 +2445,13 @@ impl Runtime {
                     let parent_idx = next_to_explore;
                     let d = stack[parent_idx].node;
                     let before = stack.len();
+                    let sym = self.node(d).symbol();
                     let children: Vec<DagId> = self.node(d).children().collect();
                     for (ai, c) in children.into_iter().enumerate() {
+                        if sig.symbol(sym).is_frozen_arg(ai) {
+                            continue; // frozen blocks rule application below (same check as frewrite;
+                                      // equational reduction is untouched — §3.9.2)
+                        }
                         stack.push(RedexPos { node: c, parent: parent_idx, arg_index: ai });
                     }
                     next_to_explore += 1;
@@ -3077,18 +3085,20 @@ impl Engine {
         self.sig.add_op_au(name, domain, range, identity)
     }
 
-    /// Register a **CUI** operator (`comm`, not associative, optionally `idem` and/or `id:`). Must be
-    /// binary; the two arguments are stored in canonical order, and `idem`/`id:` collapse `f(a,a)` /
-    /// `f(a,e)` to a single element at construction.
+    /// Register a **CUI** operator (any non-assoc subset of `comm` / `id:` / `idem` — Maude's
+    /// CUI_Theory). Must be binary; a `comm` op stores its two arguments in canonical order (non-comm
+    /// ops stay positional), and `idem`/`id:` collapse `f(a,a)` / `f(a,e)` to a single element at
+    /// construction.
     pub fn add_op_cui(
         &mut self,
         name: impl Into<String>,
         domain: Vec<SortId>,
         range: SortId,
+        comm: bool,
         idem: bool,
         identity: Option<SymbolId>,
     ) -> SymbolId {
-        self.sig.add_op_cui(name, domain, range, idem, identity)
+        self.sig.add_op_cui(name, domain, range, comm, idem, identity)
     }
 
     /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Must be
@@ -4313,7 +4323,7 @@ mod tests {
         e.close_sorts();
         let z = e.add_op("z", vec![], zero);
         let nz = e.add_op("nz", vec![], nznat);
-        let g = e.add_op_cui("g", vec![nznat, nat], nznat, false, None); // NzNat Nat -> NzNat
+        let g = e.add_op_cui("g", vec![nznat, nat], nznat, true, false, None); // NzNat Nat -> NzNat
         e.add_op_decl(g, vec![nat, nat], nat); // Nat Nat -> Nat
 
         let gg = |e: &mut Engine, a: SymbolId, b: SymbolId| {
@@ -5466,9 +5476,9 @@ mod tests {
         let a = e.add_op("a", vec![], s);
         let b = e.add_op("b", vec![], s);
         let unit = e.add_op("e", vec![], s);
-        let f = e.add_op_cui("f", vec![s, s], s, false, None);
-        let g = e.add_op_cui("g", vec![s, s], s, true, None); // idem
-        let h = e.add_op_cui("h", vec![s, s], s, false, Some(unit)); // id: e
+        let f = e.add_op_cui("f", vec![s, s], s, true, false, None);
+        let g = e.add_op_cui("g", vec![s, s], s, true, true, None); // idem
+        let h = e.add_op_cui("h", vec![s, s], s, true, false, Some(unit)); // id: e
 
         let fab = {
             let (x, y) = (e.make_const(a), e.make_const(b));
@@ -5503,7 +5513,7 @@ mod tests {
         let a = e.add_op("a", vec![], s);
         let b = e.add_op("b", vec![], s);
         let c = e.add_op("c", vec![], s);
-        let f = e.add_op_cui("f", vec![s, s], s, false, None);
+        let f = e.add_op_cui("f", vec![s, s], s, true, false, None);
         e.add_equation(Equation {
             lhs: Term::op(f, vec![Term::constant(a), Term::constant(b)]), // f(a, b)
             rhs: Term::constant(c),

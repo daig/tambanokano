@@ -53,16 +53,22 @@ impl CuiLhs {
     /// are enumerated lazily in [`CuiSubproblem::next`] (each argument is matched through the full
     /// matcher seam, which needs `&mut Runtime` for a theory-rooted argument); this phase only confirms
     /// the subject is a CUI node of this operator and captures its two arguments.
-    pub(crate) fn match_(&self, rt: &Runtime, _sig: &Signature, subject: DagId) -> Option<CuiSubproblem> {
+    pub(crate) fn match_(&self, rt: &Runtime, sig: &Signature, subject: DagId) -> Option<CuiSubproblem> {
         let (s1, s2) = match &rt.node(subject).term {
             NodeTerm::Cui { symbol, args } if *symbol == self.symbol => (args[0], args[1]),
             _ => return None,
+        };
+        // A non-comm CUI op (`id:`-only / `idem`-only) matches positionally: one pairing only.
+        let pairings = if sig.symbol(self.symbol).axioms.comm {
+            vec![(s1, s2), (s2, s1)]
+        } else {
+            vec![(s1, s2)]
         };
         Some(CuiSubproblem {
             p1: self.p1.clone(),
             p2: self.p2.clone(),
             var_indices: self.var_indices.clone(),
-            pairings: [(s1, s2), (s2, s1)],
+            pairings,
             solutions: None,
             cursor: 0,
             bound: Vec::new(),
@@ -94,7 +100,8 @@ pub(crate) struct CuiSubproblem {
     p1: Term,
     p2: Term,
     var_indices: Vec<u32>,
-    pairings: [(DagId, DagId); 2],
+    /// One positional pairing for a non-comm CUI op; both commutative pairings otherwise.
+    pairings: Vec<(DagId, DagId)>,
     /// Deduped pairing solutions; `None` until the first `next` enumerates them.
     solutions: Option<Vec<Vec<(u32, DagId)>>>,
     cursor: usize,
@@ -112,7 +119,7 @@ impl CuiSubproblem {
         self.bound.clear();
         if self.solutions.is_none() {
             let mut sols: Vec<Vec<(u32, DagId)>> = Vec::new();
-            for (a, b) in self.pairings {
+            for &(a, b) in &self.pairings {
                 let aliens = [(self.p1.clone(), a), (self.p2.clone(), b)];
                 for sol in enumerate_alien_solutions(rt, sig, subst, &aliens, &self.var_indices) {
                     // The two pairings coincide for symmetric matches (`f(X, X) <=? f(a, a)`).
@@ -157,7 +164,7 @@ mod tests {
         e.close_sorts();
         let a = e.add_op("a", vec![], s);
         let b = e.add_op("b", vec![], s);
-        let f = e.add_op_cui("f", vec![s, s], s, false, None);
+        let f = e.add_op_cui("f", vec![s, s], s, true, false, None);
         let (a0, b0) = (e.make_const(a), e.make_const(b));
         let subject = e.make_cui(f, a0, b0); // f(a, b)
         let pat = Term::op(f, vec![Term::var(0, s), Term::var(1, s)]);
