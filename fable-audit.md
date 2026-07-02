@@ -138,6 +138,10 @@ documented but materially understated. Every item verified with the minimal repr
   build-at-instance deferral makes the instance the first checkpoint).
 - **[N] Non-terminating rewrite-*condition* recursion stack-overflows** (`crl b => c if b => c .` + `rew b .`)
   where Maude spins forever. Both diverge; tnk aborts the process (vs Maude's interruptible loop).
+  **RESOLVED (773a0d4** — heap-backed stack growth at the condition seam; tnk now spins. Re-verification
+  note: on this machine the ORACLE itself exits 139 (SIGSEGV, its own stack overflow) on the minimal repro
+  within seconds, so "Maude spins forever" does not reproduce — tnk now degrades strictly more gracefully
+  than the reference.)
 
 ### 3.2 Silent wrong results (worst class: no error, different value)
 
@@ -145,7 +149,7 @@ documented but materially understated. Every item verified with the minimal repr
   (1 rewrite); oracle `g(a)` (0). Partial `frozen (i)` equally ignored. `frewrite` and `search` honor
   frozen correctly — only the rule-fair `rewrite` traversal skips the check (`engine.rs:2420` pushes all
   children). Any spec using frozen for controlled rule application gets wrong results under `rew`.
-- **[N] Statement application order across imports is REVERSED.** Maude applies the importing module's
+- **[N] Statement application order across imports is REVERSED.** **RESOLVED (601239d — root-own-first + post-order donations, coupled with the META up* leading-window flip; new fixture A3b2-meta-own-window guards the coupling.)** Maude applies the importing module's
   statements first (local-then-imported donation order); tnk applies imported-first. `BASE: rl a => b`,
   `EXT includes BASE + rl a => c`: `rew a` → oracle `c`, tnk `b`. The same reversal hits overlapping
   *equations* (`red a` on non-confluent eq pairs → different values) and `search` solution order. Every
