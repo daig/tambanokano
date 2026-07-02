@@ -1,4 +1,4 @@
-# Decision Record — foundational choices (D1–D8)
+# Decision Record — foundational choices (D1–D8) + correctness-goal defaults (D9–D11)
 
 The load-bearing tech decisions, ordered by blast radius. **D1–D4 and D8 are in force and validated** by the
 built engine (Phase 0/1 — the `Resolution`/`Amendment` notes record how); **D5 (IO/`mio`), D6 (BDD), D7 (SMT)
@@ -132,3 +132,31 @@ into crate names. The final public language name is deferred.
 **Impact.** Mechanical to rename later thanks to the prefix. **Confirmed 2026-06-19:** `tambanokano` is the
 project name and `tnk` the accepted crate prefix. **Revisit:** only the final public *language* name
 (distinct from the project name) remains deferred, after Phase 0/1.
+
+## D9 — Ambiguity policy: warn-and-pick (PROVISIONAL — flagged for user review)
+**Decision (2026-07-02, correctness-goal default).** On an ambiguous term, tnk picks a deterministic
+first parse and computes (the warning text arrives with the phase-E diagnostics sink), instead of
+hard-erroring. **Hard constraint:** the pick must match the oracle's pick on the C5 fixture cases
+(`f a g` → `(f a) g`; non-assoc `a + b + c` → `(a + b) + c` — the oracle picks left/first, verified
+live); if the Earley enumeration cannot structurally reproduce Maude's pick, STOP and escalate rather
+than shipping a divergent pick. Reproducing MSCP's full pick order (option a) is deliberately NOT
+attempted up front; revisit if differential testing surfaces real-world inputs where the pick differs.
+**Status: adopted as the C5 implementation target; awaiting user ratification.**
+
+## D10 — Statement representation: home-grammar point-fix ONLY (PROVISIONAL — flagged for user review)
+**Decision (2026-07-02, correctness-goal default).** Imported statement bubbles are parsed against
+their **home module's** grammar/var scope and installed into the flattened module (removes the
+context-dependent module-validity class: X-capture, importer-signature × imported-statement-text,
+META-MODULE+RAT coexistence / stock term-order.maude). The **full compiled-module-algebra rework**
+(import-stable compiled statements, Maude's semantic module algebra — unlocking build-time
+typechecking of parameterized modules, source-form `show module`, full meta fidelity) is a separate
+**user decision** and is deliberately NOT started. **Status: point-fix adopted as the D1a
+implementation target; the rework decision stays open.**
+
+## D11 — REPL identity: standing prelude + file commands (PROVISIONAL — flagged for user review)
+**Decision (2026-07-02, correctness-goal default).** The REPL (tool layer) gets: a standing prelude
+loaded by default at startup, `set include BOOL on/off` semantics (BOOL auto-injection per prelude
+line 3233), `load`/`sload` with a `MAUDE_LIB`-style search path, and the `-no-prelude`/`-no-banner`
+CLI flags. The **engine/library layer stays prelude-free** (consistent with D5's host-embedding
+stance): all of this is REPL-layer plumbing, none of it engine-deep. **Status: adopted as the C6
+implementation target; awaiting user ratification.**
