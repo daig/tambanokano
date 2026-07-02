@@ -2650,6 +2650,27 @@ impl Runtime {
         if condition.is_empty() {
             return true;
         }
+        // Every rewrite-condition recursion cycle passes through here (rule application →
+        // condition → nested search → rule application → …). Grow the stack on demand so an
+        // unboundedly recursive condition (`crl b => c if b => c .`) diverges the way Maude
+        // does — heap-growing, interruptible in principle — instead of aborting the process on
+        // call-stack overflow (§3.1d; manual-verify item, not oracle-diffable).
+        stacker::maybe_grow(128 * 1024, 8 * 1024 * 1024, || {
+            self.condition_holds_inner(sig, condition, subst, kind, stmt_id, frames, redex)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn condition_holds_inner(
+        &mut self,
+        sig: &Signature,
+        condition: &[CompiledFragment],
+        subst: &mut Subst,
+        kind: StmtKind,
+        stmt_id: u32,
+        frames: &[ReduceFrame],
+        redex: DagId,
+    ) -> bool {
         let restore = self.gc_interval.is_some().then(|| {
             let base = self.protected.len();
             for f in frames {
