@@ -940,14 +940,10 @@ impl MetaDescent<'_> {
             // with the flat build's trace vectors (which cover every executable statement, from index 0).
             merge_statement_traces(&flat_pm.statements, &loaded, self.interner, (0, 0, 0))
         } else {
-            // The module's own statements: executable ones are the trace suffix (imports are built first, so
-            // the k-th own executable statement of a kind is the k-th entry past the import prefix).
-            let b = &loaded.built;
-            let own_mb = pm.statements.iter().filter(|s| matches!(s, Statement::Mb { nonexec, .. } if !nonexec)).count();
-            let own_eq = pm.statements.iter().filter(|s| matches!(s, Statement::Eq { nonexec, .. } if !nonexec)).count();
-            let own_rl = pm.statements.iter().filter(|s| matches!(s, Statement::Rule { nonexec, .. } if !nonexec)).count();
-            let starts = (b.mb_traces.len() - own_mb, b.eq_traces.len() - own_eq, b.rl_traces.len() - own_rl);
-            merge_statement_traces(&pm.statements, &loaded, self.interner, starts)
+            // The module's own statements: executable ones are the trace PREFIX — the root's own
+            // statements flatten FIRST (Maude's nrOriginal* leading slice; the flatten rotation and
+            // this window are the A3b coupled pair and must stay in sync).
+            merge_statement_traces(&pm.statements, &loaded, self.interner, (0, 0, 0))
         };
         Some(ModulePieces {
             kind: flat_pm.kind,

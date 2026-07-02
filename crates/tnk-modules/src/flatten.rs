@@ -149,6 +149,14 @@ pub fn flatten(
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
     let root = db.get(name);
+    // Maude's statement order: the ROOT's own statements are inserted FIRST (process() runs before
+    // importStatements()), then each import donates post-order (deepest first, self-last) — so a chain
+    // GRAND ← MID ← TOP yields [TOP, GRAND, MID]. collect_named appended the root's own statements
+    // last (the donation order, correct for every *imported* module); rotate that own block to the
+    // front. Declarations keep import-first order (least-sort tiebreaks read declaration order).
+    if let Some(pm) = root {
+        acc.statements.rotate_right(pm.statements.len());
+    }
     let (kind, is_theory, is_strategy, is_object) = root
         .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy, pm.is_object))
         .unwrap_or((ModuleKind::Functional, false, false, false));
@@ -206,6 +214,8 @@ pub fn flatten_pre(
     let mut own = own_decls(pm);
     inline_shadowed_vars(&mut own, &acc, interner);
     acc.add(own);
+    // The transient IS the root module: its own statements go first (same rotation as `flatten`).
+    acc.statements.rotate_right(pm.statements.len());
     let d = acc.into_decls();
     Ok(PreModule {
         name: SENTINEL.to_string(),

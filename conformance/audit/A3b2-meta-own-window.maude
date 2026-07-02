@@ -1,0 +1,27 @@
+*** PRELUDE
+*** A3b2-meta-own-window — META up* own-statement window after the A3b statement-order flip:
+*** upEqs/upRls(_, false) must return ONLY the module's own statements (the LEADING slice of the
+*** flattened vectors), with cross-module statement overlap present (fable-audit.md §3.2; roadmap risk 1).
+mod A3B2-BASE is
+  sort St .
+  ops a b c d : -> St [ctor] .
+  op f : St -> St .
+  eq f(a) = b .
+  rl a => b .
+endm
+
+mod A3B2-EXT is
+  including A3B2-BASE .
+  eq f(c) = d .
+  rl c => d .
+endm
+
+fmod A3B2-META is
+  protecting META-LEVEL .
+endfm
+
+reduce in A3B2-META : upEqs('A3B2-EXT, false) .
+reduce in A3B2-META : upRls('A3B2-EXT, false) .
+*** flat=true probe uses rules only: the oracle's implicit-BOOL injection (finding C6a) would put
+*** BOOL's equations into upEqs('A3B2-EXT, true), coupling this fixture to C6a; BOOL has no rules.
+reduce in A3B2-META : upRls('A3B2-EXT, true) .
