@@ -171,12 +171,12 @@ documented but materially understated. Every item verified with the minimal repr
 - **[D] Strings are char-indexed (UTF-8) where Maude's are byte sequences.** **RESOLVED (501ff8f).** `length("héllo")` → tnk 5,
   oracle 6; `substr`/`find`/`ascii` shift the same way on any non-ASCII content (verified). ASCII content —
   every fixture and the prelude's own use — is identical.
-- **[N] `downTerm`/meta down-translation rejects flat (≥3-arg) assoc meta-terms — silently.**
+- **[N] `downTerm`/meta down-translation rejects flat (≥3-arg) assoc meta-terms — silently.** **RESOLVED (8fe4be2).**
   `downTerm('_+_['s_^2['0.Zero],'s_^3['0.Zero],'s_^4['0.Zero]], 99)` → tnk `99` (the fallback!), oracle `9`.
   Same root makes `metaReduce(['NAT], <flat term>)` inert. Maude metaprograms (and Maude's own `upTerm`)
   produce flat assoc meta-terms routinely; tnk's own internal rep is flat, yet the meta reader requires
   exact binary nesting (`meta.rs:1490,1596`, `descent.rs:74` resolve by exact (name, arity)).
-- **[N] `upModule` of a parameterized module drops the parameter list** (`fmod 'LIST is` vs oracle
+- **[N] `upModule` of a parameterized module drops the parameter list** **RESOLVED (8fe4be2)** (`fmod 'LIST is` vs oracle
   `fmod 'LIST{'X :: 'TRIV} is`) **and loses `ditto`-inherited attributes** on subsort overloads (bare
   `[ctor]` vs `[assoc ctor id(…) prec(25)]`). Metaprogramming over parameterized modules sees a different
   module than Maude shows.
@@ -188,29 +188,29 @@ documented but materially understated. Every item verified with the minimal repr
   surface parse (`'_+_[a,'_+_[b,c]]`) — the eager-flatten architecture visible as a wrong meta *value*
   (gaps.md claims flatten affects counts only). Same root shows the trace as one fold (`2+3+4 ---> 9`)
   vs Maude's two steps.
-- **[N] Meta-modules containing a `strat`-attributed op go inert.** The meta down-translation rejects the
+- **[N] Meta-modules containing a `strat`-attributed op go inert.** **RESOLVED (8fe4be2; the metaXapply hole-context order rode along — the metaMeta/upImports medium-confidence corners remain open.)** The meta down-translation rejects the
   `strat (…)` op *attribute*, so `metaReduce`/`metaRewrite`/`metaApply` over such a meta-module return
   unreduced (object-level `strat` works fine). Hits four of the C++ Meta tests directly. Related medium-
   confidence meta corners from the suite sweep: `metaMeta` (self-reflection) returns a degenerate module;
   a `metaXapply` extension-context hole lands in the wrong argument; `upImports` on an error-containing
   module returns a value where Maude stays unreduced (tnk has no "unusable module" tracking).
-- **[N] `metaNormalize` applies user equations.** It must normalize modulo structural axioms ONLY:
+- **[N] `metaNormalize` applies user equations.** **RESOLVED (8fe4be2).** It must normalize modulo structural axioms ONLY:
   oracle returns the term unchanged (`{'g['a.S], 'S}`); tnk fully reduces it (== `metaReduce`) —
   `meta.rs:94` routes `Reduce | Normalize` to one handler. (Pure AC-reordering cases coincide, masking it.)
 - **[N] `upModule` of a strategy module is wrong**: result sort `SModule` instead of `StratModule`, prints
   `mod`…`endm`, and **omits the `strat` declarations and `sd` definitions entirely** (mb/rl content is
   right). **[N]** `metaPrettyPrint` is inert even with the default `none` option set on a fresh module
   (docs and the fixture claim it done — the conformance pin evidently exercises a narrower path).
-- **[N] Renaming a single-token mixfix op silently produces a *prefix* op.** `M * (op _+_ to _plus_)` →
+- **[N] Renaming a single-token mixfix op silently produces a *prefix* op.** **RESOLVED (fe2485e — incl. the op→op mixfix view family.)** `M * (op _+_ to _plus_)` →
   `x plus y` no longer parses; only `plus(x, y)` does (`rename.rs:77-89` keeps just the first literal
   fragment). If the renamed op occurs in any statement, the renamed module is REJECTED outright. Same
   family: **op→op views break whenever either side is mixfix** (only prefix→prefix works; mapping
   `op _#_ to _+_` — the common case — fails to build the instance). Multi-token punctuation names
   (`_,_` → `_;_`, the prelude's own pattern) work, which masked this.
-- **[N] Module/view redefinition leaves dependents stale.** Redefine `M` after `N` imported it: `reduce in
+- **[N] Module/view redefinition leaves dependents stale.** **RESOLVED (ee4846b).** Redefine `M` after `N` imported it: `reduce in
   N` still uses the OLD `M` (oracle re-flattens with an advisory and recomputes). Silent wrong results in
   any interactive redefinition workflow.
-- **[N] Fake parameter sorts are wrongly substituted.** `sort X$Foo` where `Foo` isn't in the parameter
+- **[N] Fake parameter sorts are wrongly substituted.** **RESOLVED (fe2485e).** `sort X$Foo` where `Foo` isn't in the parameter
   theory must survive instantiation unchanged (only real `X$Elt` maps); tnk renames it to `Y$Foo`
   (`tests/Corner/fakeParameterSort` shape).
 
@@ -346,7 +346,7 @@ Each of these breaks real specs; several break stock library files.
   non-config term prints a computed sort where Maude says `(sort not calculated)`; zero-solution `search`
   says `No more solutions.` instead of `No solution.` (the srewrite path gets it right); boolean
   `such that` echo omits Maude's `= true`; a goal variable shadowing a declared var prints `N:Nat` vs `N`;
-  `metaXapply`'s AC hole context puts the hole first (`'_+_[[], 'b.S]` vs Maude's residue-first);
+  `metaXapply`'s AC hole context puts the hole first (`'_+_[[], 'b.S]` vs Maude's residue-first — RESOLVED (8fe4be2));
   `continue`-with-nothing-pending wording; meta-module echo grouping parens/element order; count-1 prefix
   iter prints `t c` (doesn't round-trip); no warnings/advisories anywhere (the single largest byte-diff
   source vs the oracle on real files).
