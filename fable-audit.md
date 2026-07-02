@@ -161,7 +161,7 @@ documented but materially understated. Every item verified with the minimal repr
   `op _o_ : E E -> E [id: e] .` `reduce a o e .` → tnk `a o e` (oracle `a`); `[idem]` `reduce a o a .` →
   tnk `a o a` (oracle `a`). (Maude 3.5.1 does accept and apply both; `comm idem` and two-sided `id:` with
   assoc/comm are handled correctly in tnk.)
-- **[D↑] Collapse-at-top under `id:`/CUI produces different VALUES, not just counts.** gaps.md calls this
+- **[D↑] Collapse-at-top under `id:`/CUI produces different VALUES, not just counts.** **RESOLVED (c6b9f36** — collapse indexing + identity-first enumeration + one-shot via the reduced cached identity dag; the Maude-loops case stays a loop, verified.) gaps.md calls this
   "rewrite count one lower, value same" — false in general: with `eq a + X = c` (`[assoc comm id: e]`),
   `reduce a` → tnk `a` (oracle `c`); `reduce a + b` → tnk `c` (oracle `b + c`). And a **termination
   divergence**: `eq X Y = c` over `[assoc id: nil]`, `reduce nil` → Maude loops forever, tnk halts. Bounded
@@ -223,19 +223,19 @@ documented but materially understated. Every item verified with the minimal repr
 - **[D] Infix ≥3-operand builtin folds count 1 vs k−1** (`2 + 3 + 4`: 1 vs 2). Prefix folds (`gcd(a,b,c)`)
   conform. Leaks through meta (`upTerm(2 + 3 + 4)`: 2 vs 3) and `set trace`.
 - **[N] `search … =>!` per-solution snapshots differ** (`states: 4 rewrites: 3` vs oracle `5/4` on the first
-  solution; totals agree — tnk explores lazily where Maude expands the frontier first).
+  solution; totals agree — tnk explores lazily where Maude expands the frontier first). **RESOLVED (a3291c8).**
 - **[N] `xmatch` over iter under-enumerates**: `xmatch X:Nat <=? 3 .` → 1 matcher (oracle 3: whole + s-residue
   portions). **[N]** AU bare-variable xmatch under-enumerates (1 vs 3). **[D-quantified]** AU-with-identity
   xmatch over-enumerates (20 vs 10 on `X Y <=? a b c`).
 - **[N] AC memberships are not applied through extension** (`mb (a | a) : Special` on `a | a | a`: 0 vs 1
   rewrite; cmb 2 vs 3; result terms equal).
-- **[N] `such that` condition-evaluation rewrites are not counted.** `search [3] c(0) =>+ c(N) such that
+- **[N] `such that` condition-evaluation rewrites are not counted.** **RESOLVED (a3291c8).** `search [3] c(0) =>+ c(N) such that
   N rem 2 =/= 0` → per-solution counts oracle 4/12/20 vs tnk 2/10/18 (the missing 2 = the `rem` and `=/=`
   reductions). Sort-test conditions (0-cost) match. Now confirmed at object level, not just meta.
-- **[D-concrete] `metaParse` failure position**: oracle `noParse(1)` on `'a 'b`, tnk `noParse(0)`.
+- **[D-concrete] `metaParse` failure position**: oracle `noParse(1)` on `'a 'b`, tnk `noParse(0)`. **RESOLVED (a3291c8).**
 - **[N] `show search graph` merges arcs differently**: two rules reaching the same successor are one arc
   listing both rules in Maude, two separate arcs in tnk; rule text in the graph prints `f(s s 0)` where
-  Maude prints `f(2)`.
+  Maude prints `f(2)`. **RESOLVED (a3291c8).**
 - **[D] `matchrew`/`amatchrew` and rewrite-condition substrategies run their sub-searches eagerly within a
   step**, so their per-solution cumulative counts can collapse to the final total when interleaved with
   unequal-depth parallel work (values, order, reachability faithful; `dsrewrite` coincides, which is how the
