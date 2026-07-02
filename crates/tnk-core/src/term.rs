@@ -9,6 +9,7 @@ use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::{SymbolId, Theory};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// A pattern variable: an index into the enclosing statement's substitution, plus its sort.
@@ -378,6 +379,58 @@ impl Runtime {
                 self.rebuild(sig, *symbol, arg_ids)
             }
         }
+    }
+
+    /// [`instantiate`](Self::instantiate) with Maude's `RhsBuilder` CSE: each **textually repeated**
+    /// compound subterm of the rhs is built once and reused (so it reduces once and counts once —
+    /// §3.9.5, the `< g(X), g(X) >` case), while *distinct* rhs subterms that merely instantiate to
+    /// equal values stay separate nodes and count separately — RAT's
+    /// `(I * M + J * N) / (N * M)` on `1/6 + 1/6` reduces `1 * 6` twice, exactly like Maude (a
+    /// value-keyed dedup window here undercounted by one).
+    pub(crate) fn instantiate_cse(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
+        let mut counts: HashMap<&Term, u32> = HashMap::new();
+        let mut stack = vec![term];
+        while let Some(cur) = stack.pop() {
+            if let Term::Op { args, .. } = cur {
+                let n = counts.entry(cur).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    stack.extend(args.iter());
+                }
+            }
+        }
+        let repeated: Vec<&Term> = counts.iter().filter(|&(_, &n)| n > 1).map(|(&t, _)| t).collect();
+        let mut memo: Vec<(&Term, DagId)> = Vec::new();
+        self.instantiate_cse_rec(sig, term, subst, &repeated, &mut memo)
+    }
+
+    fn instantiate_cse_rec<'t>(
+        &mut self,
+        sig: &Signature,
+        term: &'t Term,
+        subst: &Subst,
+        repeated: &[&'t Term],
+        memo: &mut Vec<(&'t Term, DagId)>,
+    ) -> DagId {
+        let shared = matches!(term, Term::Op { .. }) && repeated.iter().any(|r| *r == term);
+        if shared && let Some(&(_, d)) = memo.iter().find(|(k, _)| *k == term) {
+            return d;
+        }
+        let d = match term {
+            Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
+            Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
+            Term::Op { symbol, args } => {
+                let arg_ids: Vec<DagId> = args
+                    .iter()
+                    .map(|a| self.instantiate_cse_rec(sig, a, subst, repeated, memo))
+                    .collect();
+                self.rebuild(sig, *symbol, arg_ids)
+            }
+        };
+        if shared {
+            memo.push((term, d));
+        }
+        d
     }
 }
 

@@ -1358,20 +1358,99 @@ impl Runtime {
     }
 
     /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
-    /// `constrainToSmallerSort`): repeatedly find the first membership — they are ordered
-    /// **smallest-target-sort first** by [`add_membership`](Signature::add_membership) — whose target
-    /// is strictly below the node's current sort and whose lhs matches, lower the node's sort to it,
-    /// and retry from the top, to a fixpoint. **Each lowering counts as one rewrite** (Maude counts
-    /// membership applications in its `rewrites` total); the smallest-first order means a node drops
-    /// straight to its smallest applicable sort in one application, matching Maude's count. Non-confluent
-    /// membership sets (incomparable applicable targets) and matching modulo AC/`iter` are follow-ups.
+    /// `constrainToSmallerSort`): whole-match the node against each membership (see
+    /// [`constrain_node_whole`](Self::constrain_node_whole)) and, for an **AC** node, first replay
+    /// Maude's bottom-up fold so a membership fires through extension on the sub-multiset prefixes too
+    /// (see below). **Each application counts as one rewrite** (Maude counts membership applications in
+    /// its `rewrites` total). Non-confluent membership sets (incomparable applicable targets) and
+    /// matching modulo `iter` are follow-ups.
     ///
-    /// **Lazy timing (C1):** this is now called only at a node's reduce **normal-form point** (after its
+    /// **Lazy timing (C1):** this is called only at a node's reduce **normal-form point** (after its
     /// equations are exhausted), never at construction — mirroring Maude's `fastComputeTrueSort`. So a
     /// term an equation reduces away is never constrained (no over-count; a `cmb` whose condition loops
     /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
     /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
     fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
+        // B3: AC memberships fire **through extension** — on sub-multisets of an AC subject, not just
+        // the whole node. Maude does not pre-flatten `a | a | a`; it reduces the parsed, right-associated
+        // `a | (a | a)` **bottom-up**, so each intermediate node is a *prefix* multiset that reaches its
+        // own reduce normal-form point and is constrained there. Because ACU args are kept in canonical
+        // order (ascending, `dag_compare`) and the tree is right-associated, the k-th intermediate node
+        // is the multiset of the **k largest** elements: M₂ ⊂ M₃ ⊂ … ⊂ Mₙ (= the whole). tnk keeps the
+        // flattened multiset instead, so we replay that fold here: constrain each transient prefix
+        // M₂..Mₙ₋₁ (each application counts, and a `cmb`'s condition rewrites count) before the whole
+        // node (k = n). A prefix's sort refinement is discarded — Maude loses it when the parent
+        // re-flattens the intermediate node's *elements* — so only the count moves; the result term and
+        // its printed sort are unchanged. Fires exactly like Maude and terminates: n − 2 whole-matches
+        // over strictly-growing prefixes, no reapplication (a refined prefix carries a smaller sort that
+        // no further membership can lower).
+        //
+        // SCOPE NARROWING (verified). Maude does the fold over the subject's **written** parse order
+        // (right-associated), so its raw count is *written-order dependent* for a heterogeneous multiset:
+        // `b | b | a | a | a` counts 1 (inner `a | a` fires) but the same multiset written `a | a | a | b
+        // | b` counts 0. This is exactly the corner Maude warns is unsound (membership axioms on an AC
+        // symbol with non-kind-level declarations). tnk canonicalizes an AC subject to a sorted multiset
+        // eagerly (`make_acu`; do not disturb — B1), so it has no written order to fold over and instead
+        // reproduces the count of the **canonical (ascending) form** — which is Maude's count when the
+        // input is written canonically (cross-checked: tnk == oracle on canonically-written subjects;
+        // the fixture's `a | a | a` is homogeneous, hence order-independent). Reproducing Maude's
+        // order-dependent count would require preserving the parse tree, out of scope here. §3.3.
+        if !sig.memberships.is_empty()
+            && let NodeTerm::Acu { symbol, args } = &self.node(id).term
+            && sig.memberships.contains_key(symbol)
+        {
+            let symbol = *symbol;
+            let args = args.clone(); // ascending canonical order; borrow released for `constrain_node_whole`
+            let total: u32 = args.iter().map(|&(_, m)| m).sum();
+            // GC safety (F-2): a `cmb` condition in an earlier prefix can re-enter `reduce` and hit a
+            // safe-point GC; root `id` (and hence its element children, shared with every prefix we build)
+            // for the whole fold so it isn't swept out from under `args`/the final whole-node constrain.
+            // A no-op unless GC is enabled — mirrors `condition_holds_inner`.
+            let protect_base = self.gc_interval.is_some().then(|| {
+                let base = self.protected.len();
+                self.protected.push(id);
+                base
+            });
+            for k in 2..total {
+                let prefix = Self::top_k_multiset(&args, k);
+                let transient = self.make_acu(sig, symbol, prefix);
+                // Off the main reduce stack ⇒ no `Whole:` reconstruction (`None`); the refined sort is
+                // thrown away (the transient node is unreachable after this call).
+                self.constrain_node_whole(sig, transient, None, frames);
+            }
+            if let Some(base) = protect_base {
+                self.protected.truncate(base);
+            }
+        }
+        self.constrain_node_whole(sig, id, whole, frames);
+    }
+
+    /// The multiset of the `k` **largest** elements of an ascending-ordered ACU argument list — the k-th
+    /// intermediate node of Maude's right-associated bottom-up fold (see [`constrain_to_smaller_sort`]).
+    /// Takes from the high end; a partially-consumed element contributes its needed multiplicity.
+    fn top_k_multiset(args: &[(DagId, u32)], k: u32) -> Vec<(DagId, u32)> {
+        let mut need = k;
+        let mut out = Vec::new();
+        for &(e, m) in args.iter().rev() {
+            if need == 0 {
+                break;
+            }
+            let take = m.min(need);
+            out.push((e, take));
+            need -= take;
+        }
+        out
+    }
+
+    /// Constrain a **single** node by the memberships of its top symbol, whole-matched (Maude's
+    /// `constrainToSmallerSort2` at one node): repeatedly find the first membership — ordered
+    /// smallest-target-sort first by [`add_membership`](Signature::add_membership) — whose target is
+    /// strictly below the node's current sort and whose lhs matches (whole, no extension), lower the
+    /// node's sort to it, and retry from the top, to a fixpoint. **Each lowering counts as one rewrite**
+    /// (Maude counts membership applications); smallest-first means a node drops straight to its smallest
+    /// applicable sort in one application. [`constrain_to_smaller_sort`] wraps this with the AC prefix
+    /// fold so the extension case is covered too.
+    fn constrain_node_whole(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
         let symbol = self.node(id).symbol();
         let Some(constraints) = sig.memberships.get(&symbol) else { return };
         loop {
@@ -2466,16 +2545,14 @@ impl Runtime {
                     continue;
                 }
             }
-            // C7: an rhs with a repeated compound subterm (e.g. `< g(X), g(X) >`) is built inside a dedup
-            // window so the duplicate becomes one shared node — reduced once, like Maude's CSE'd
-            // `RhsBuilder`. The flag keeps the non-sharing common case (e.g. `fib`'s rhs) on the plain
-            // path. Save/restore the outer `dedup` (`None` during reduce, but a nested rhs build could
-            // re-enter) so the window is exactly this instantiate.
+            // C7: an rhs with a TEXTUALLY repeated compound subterm (e.g. `< g(X), g(X) >`) is built
+            // with per-subterm CSE so the duplicate becomes one shared node — reduced once, like
+            // Maude's `RhsBuilder`. Textual, not value-keyed: distinct rhs subterms that instantiate
+            // to equal values (RAT's `I * M` vs `J * N` on `1/6 + 1/6`) stay separate nodes and count
+            // separately, exactly like Maude. The flag keeps the non-sharing common case (`fib`) on
+            // the plain path.
             let built = if rhs_shares {
-                let saved = self.dedup.replace(HashMap::new());
-                let r = self.instantiate(sig, rhs, subst);
-                self.dedup = saved;
-                r
+                self.instantiate_cse(sig, rhs, subst)
             } else {
                 self.instantiate(sig, rhs, subst)
             };
@@ -3362,6 +3439,17 @@ impl Engine {
     /// `symbol` must be an `iter` operator (declared via [`add_op_iter`](Self::add_op_iter)).
     pub fn make_iter(&mut self, symbol: SymbolId, count: u64, arg: DagId) -> DagId {
         self.rt.make_s(&self.sig, symbol, Nat::from_u64(count), arg)
+    }
+
+    /// As [`make_iter`](Self::make_iter) with an arbitrary-precision decimal count — the frontend's
+    /// bignum numeral / `s_^k` literal bridge (`1267650600228229401496703205376` builds directly;
+    /// the kernel count is a bignum [`Nat`] natively). `None` if `count` is not a decimal numeral.
+    pub fn make_iter_decimal(&mut self, symbol: SymbolId, count: &str, arg: DagId) -> Option<DagId> {
+        let n = crate::num::Int::from_string_base(10, count)?;
+        if n.is_negative() {
+            return None;
+        }
+        Some(self.rt.make_s(&self.sig, symbol, n.magnitude(), arg))
     }
 
     /// Build a string-literal NA node (the `<Strings>` `StringSymbol`, B3.6); `symbol` is an arity-0
@@ -4591,6 +4679,134 @@ mod tests {
         let r3 = e.reduce(fzsz);
         assert_eq!(e.rewrites(), 0, "no membership, no equation");
         assert_eq!(e.node(r3).symbol(), f, "f(< z, s z >) is its own normal form");
+    }
+
+    /// B3 (== reference binary, conformance/audit/B3-mb-extension.maude): an AC membership fires
+    /// **through extension** — on a sub-multiset of the subject, not only the whole node. `mb (a | a) :
+    /// Special` fires once on `a | a` (whole match) *and* once on `a | a | a` (Maude reduces it as the
+    /// right-associated `a | (a | a)`, so the prefix `a | a` reaches a normal-form point and is
+    /// constrained). The count moves; the result term and its printed sort do not (`a | a | a` stays E
+    /// because refining the transient prefix to Special is discarded when the whole re-flattens).
+    #[test]
+    fn ac_membership_fires_through_extension() {
+        let mut e = Engine::new();
+        let et = e.add_sort("E");
+        let special = e.add_sort("Special");
+        e.add_subsort(special, et);
+        e.close_sorts();
+        let a = e.add_op("a", vec![], et);
+        let bar = e.add_op_ac("|", vec![et, et], et, None);
+        e.add_membership(Membership {
+            lhs: Term::op(bar, vec![Term::constant(a), Term::constant(a)]), // a | a
+            sort: special,
+            nr_vars: 0,
+        });
+
+        // red a | a — one application, whole match; result lowers to Special.
+        e.reset_rewrites();
+        let (a0, a1) = (e.make_const(a), e.make_const(a));
+        let aa = e.make_ac(bar, vec![a0, a1]);
+        let r = e.reduce(aa);
+        assert_eq!(e.rewrites(), 1, "a | a: one membership application (whole)");
+        assert_eq!(e.sort_of(r), special, "a | a : Special");
+
+        // red a | a | a — one application, through extension on the prefix `a | a`; whole stays E.
+        e.reset_rewrites();
+        let (b0, b1, b2) = (e.make_const(a), e.make_const(a), e.make_const(a));
+        let aaa = e.make_ac(bar, vec![b0, b1, b2]);
+        let r3 = e.reduce(aaa);
+        assert_eq!(e.rewrites(), 1, "a | a | a: one membership application (extension), not 0");
+        assert_eq!(e.sort_of(r3), et, "a | a | a : E (whole match fails; prefix refinement discarded)");
+    }
+
+    /// B3, conditional variant (CMB-EXT): `cmb (a | a) : Special if a = a` fires through extension too,
+    /// and the condition's (zero-cost, `a` already reduced) evaluation is accounted. `a | a | h(h(a))`
+    /// reduces `h(h(a))` to `a` in 2 rewrites (`eq h(a) = a` twice), then the cmb fires once on the
+    /// resulting `a | a | a` prefix — 3 total, matching the oracle (tnk was 2 before the extension seam).
+    #[test]
+    fn ac_conditional_membership_fires_through_extension() {
+        let mut e = Engine::new();
+        let et = e.add_sort("E");
+        let special = e.add_sort("Special");
+        e.add_subsort(special, et);
+        e.close_sorts();
+        let a = e.add_op("a", vec![], et);
+        let h = e.add_op("h", vec![et], et);
+        let bar = e.add_op_ac("|", vec![et, et], et, None);
+        e.add_equation(Equation {
+            lhs: Term::op(h, vec![Term::constant(a)]), // h(a) = a
+            rhs: Term::constant(a),
+            nr_vars: 0,
+        });
+        e.add_conditional_membership(
+            Term::op(bar, vec![Term::constant(a), Term::constant(a)]), // a | a
+            special,
+            0,
+            vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
+        );
+
+        // red a | a | h(h(a)) — 2 (h reductions) + 1 (cmb through extension) = 3.
+        e.reset_rewrites();
+        let (a0, a1) = (e.make_const(a), e.make_const(a));
+        let hha = {
+            let ac = e.make_const(a);
+            let ha = e.make_free(h, vec![ac]);
+            e.make_free(h, vec![ha])
+        };
+        let subject = e.make_ac(bar, vec![a0, a1, hha]);
+        let r = e.reduce(subject);
+        assert_eq!(e.rewrites(), 3, "2 h-reductions + 1 cmb-through-extension");
+        assert_eq!(e.sort_of(r), et, "a | a | a : E");
+        let three = {
+            let (c0, c1, c2) = (e.make_const(a), e.make_const(a), e.make_const(a));
+            e.make_ac(bar, vec![c0, c1, c2])
+        };
+        assert!(e.deep_equal(r, three), "result is a | a | a");
+    }
+
+    /// B3 GC safety: the extension fold builds transient prefix nodes and evaluates `cmb` conditions
+    /// (which re-enter `reduce` and can hit a safe-point GC) off the main reduce stack. With GC forced
+    /// on every allocation, the subject and its element children must stay rooted through the whole fold
+    /// (the `id` push into the F-2 `protected` set) — else the final whole-node constrain reads freed
+    /// nodes. Same scenario as the conditional-extension test, but under `set_gc_interval(Some(1))`.
+    #[test]
+    fn ac_conditional_membership_extension_survives_gc() {
+        let mut e = Engine::new();
+        let et = e.add_sort("E");
+        let special = e.add_sort("Special");
+        e.add_subsort(special, et);
+        e.close_sorts();
+        let a = e.add_op("a", vec![], et);
+        let h = e.add_op("h", vec![et], et);
+        let bar = e.add_op_ac("|", vec![et, et], et, None);
+        e.add_equation(Equation {
+            lhs: Term::op(h, vec![Term::constant(a)]),
+            rhs: Term::constant(a),
+            nr_vars: 0,
+        });
+        e.add_conditional_membership(
+            Term::op(bar, vec![Term::constant(a), Term::constant(a)]),
+            special,
+            0,
+            vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
+        );
+        e.set_gc_interval(Some(1)); // collect at every allocation — stress the fold's rooting
+        e.reset_rewrites();
+        let (a0, a1, a2, a3) = (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
+        // a | a | a | a | h(h(a)) — a 5-element prefix fold (M₂..M₄ transients) with a cmb condition.
+        let hha = {
+            let ac = e.make_const(a);
+            let ha = e.make_free(h, vec![ac]);
+            e.make_free(h, vec![ha])
+        };
+        let subject = e.make_ac(bar, vec![a0, a1, a2, a3, hha]);
+        let r = e.reduce(subject); // must not crash / read freed nodes
+        assert_eq!(e.rewrites(), 3, "2 h-reductions + 1 cmb (prefix a | a) under aggressive GC");
+        let five = {
+            let cs: Vec<DagId> = (0..5).map(|_| e.make_const(a)).collect();
+            e.make_ac(bar, cs)
+        };
+        assert!(e.deep_equal(r, five), "result is a | a | a | a | a");
     }
 
     /// B2.2 (== reference binary, MB-CHAIN): two memberships lower a sort two levels. The constrain

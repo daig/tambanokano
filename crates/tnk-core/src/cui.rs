@@ -250,7 +250,7 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(2);
         let (sig, rt) = e.parts_mut();
-        let mut sp = lhs.match_(rt, sig, subject).expect("f(X,Y) matches f(a,b)");
+        let mut sp = lhs.match_(rt, sig, subject, false).expect("f(X,Y) matches f(a,b)");
         let mut got: Vec<(Option<DagId>, Option<DagId>)> = Vec::new();
         while sp.next(rt, sig, &mut subst) {
             got.push((subst.get(0), subst.get(1)));
