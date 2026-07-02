@@ -126,13 +126,13 @@ documented but materially understated. Every item verified with the minimal repr
 
 ### 3.1 Session-killing crashes (Rust panics)
 
-- **[N] Iter pattern with a pre-bound variable panics.** `eq f(X, s X) = z .` (`s_` is `[iter]`), then
+- **[N] Iter pattern with a pre-bound variable panics.** **RESOLVED (ee20fa7).** `eq f(X, s X) = z .` (`s_` is `[iter]`), then
   `reduce f(z, s z) .` → panic `s.rs:222 "non-linear S variable is not yet supported"`. Maude: `z`. Any
   non-linear equation over an iter constructor kills the whole session.
-- **[N] Op-decl underscore/arity mismatch panics.** `op _+_ : A A A -> A .` loads silently, first use panics
+- **[N] Op-decl underscore/arity mismatch panics.** **RESOLVED (8b4522e).** `op _+_ : A A A -> A .` loads silently, first use panics
   (`engine.rs:1385` arity assert); a 3-hole unary op panics at module build (`grammar/build.rs:170`).
   Maude warns at load and disables the op. A one-character typo is a hard crash.
-- **[N] Unbound right-hand-side variable panics.** `eq wrap(A:S) = B:S .` is *accepted* at load (Maude warns
+- **[N] Unbound right-hand-side variable panics.** **RESOLVED (a2d6c86).** `eq wrap(A:S) = B:S .` is *accepted* at load (Maude warns
   and leaves the term unreduced); `reduce wrap(x) .` → panic `term.rs:371 "unbound variable in
   instantiation"`, process exit. Reachable through parameterized instantiation (the documented
   build-at-instance deferral makes the instance the first checkpoint).
@@ -141,7 +141,7 @@ documented but materially understated. Every item verified with the minimal repr
 
 ### 3.2 Silent wrong results (worst class: no error, different value)
 
-- **[N] `rewrite` ignores `frozen`.** `op g : S -> S [frozen]`, `rl a => b`: `rew g(a)` → tnk `g(b)`
+- **[N] `rewrite` ignores `frozen`.** **RESOLVED (b2c1cdc).** `op g : S -> S [frozen]`, `rl a => b`: `rew g(a)` → tnk `g(b)`
   (1 rewrite); oracle `g(a)` (0). Partial `frozen (i)` equally ignored. `frewrite` and `search` honor
   frozen correctly — only the rule-fair `rewrite` traversal skips the check (`engine.rs:2420` pushes all
   children). Any spec using frozen for controlled rule application gets wrong results under `rew`.
@@ -150,10 +150,10 @@ documented but materially understated. Every item verified with the minimal repr
   `EXT includes BASE + rl a => c`: `rew a` → oracle `c`, tnk `b`. The same reversal hits overlapping
   *equations* (`red a` on non-confluent eq pairs → different values) and `search` solution order. Every
   deterministic `rew`/bounded-`rew` trajectory over multi-module rule sets is suspect.
-- **[N] Negative INT shifts drop the sign.** `-8 >> 1` → tnk `4` (oracle `-4`); `-1 >> 100` → `0` (oracle
+- **[N] Negative INT shifts drop the sign.** **RESOLVED (d471d45).** `-8 >> 1` → tnk `4` (oracle `-4`); `-1 >> 100` → `0` (oracle
   `-1`); `-5 << 2` → `20` (oracle `-20`). `builtin.rs` shifts the magnitude. Plain arithmetic on ordinary
   specs is wrong.
-- **[N] `id:`-only and `idem`-only operators are treated as free** — the axiom is never applied.
+- **[N] `id:`-only and `idem`-only operators are treated as free** — **RESOLVED (b2c1cdc)** — the axiom is never applied.
   `op _o_ : E E -> E [id: e] .` `reduce a o e .` → tnk `a o e` (oracle `a`); `[idem]` `reduce a o a .` →
   tnk `a o a` (oracle `a`). (Maude 3.5.1 does accept and apply both; `comm idem` and two-sided `id:` with
   assoc/comm are handled correctly in tnk.)
@@ -162,13 +162,13 @@ documented but materially understated. Every item verified with the minimal repr
   `reduce a` → tnk `a` (oracle `c`); `reduce a + b` → tnk `c` (oracle `b + c`). And a **termination
   divergence**: `eq X Y = c` over `[assoc id: nil]`, `reduce nil` → Maude loops forever, tnk halts. Bounded
   to patterns Maude itself warns about, but the doc's claim is wrong.
-- **[N] tnk manufactures NaN floats.** `Infinity - Infinity`, `Infinity * 0.0`, `Infinity / Infinity`,
+- **[N] tnk manufactures NaN floats.** **RESOLVED (d471d45).** `Infinity - Infinity`, `Infinity * 0.0`, `Infinity / Infinity`,
   `Infinity rem 2.0` → tnk `Float: NaN`; Maude leaves all of them unreduced (NaN can never appear in a
   Maude value). Downstream float code sees a value Maude's semantics excludes.
-- **[N] String escapes broken in both directions.** Lexing: `"\101\102\103"` → tnk the 9-char literal text
+- **[N] String escapes broken in both directions.** **RESOLVED (501ff8f).** Lexing: `"\101\102\103"` → tnk the 9-char literal text
   (oracle `"ABC"`); `\a \b \f \r \v` are stripped to the bare letter. Printing: control/high bytes are
   emitted RAW (oracle escapes `\a`…`\r` + octal `\ooo`) — `char(13)` prints an actual CR into the output.
-- **[D] Strings are char-indexed (UTF-8) where Maude's are byte sequences.** `length("héllo")` → tnk 5,
+- **[D] Strings are char-indexed (UTF-8) where Maude's are byte sequences.** **RESOLVED (501ff8f).** `length("héllo")` → tnk 5,
   oracle 6; `substr`/`find`/`ascii` shift the same way on any non-ASCII content (verified). ASCII content —
   every fixture and the prelude's own use — is identical.
 - **[N] `downTerm`/meta down-translation rejects flat (≥3-arg) assoc meta-terms — silently.**
@@ -180,8 +180,8 @@ documented but materially understated. Every item verified with the minimal repr
   `fmod 'LIST{'X :: 'TRIV} is`) **and loses `ditto`-inherited attributes** on subsort overloads (bare
   `[ctor]` vs `[assoc ctor id(…) prec(25)]`). Metaprogramming over parameterized modules sees a different
   module than Maude shows.
-- **[N] `-0.0 == 0.0` → `false`** (bit-level equality; oracle `true`). IEEE `<`/`<=` conform.
-- **[N] Kind-only builtins reduced where Maude fails them:** `0 divides 5` → `false` (oracle: stays at
+- **[N] `-0.0 == 0.0` → `false`** (bit-level equality; oracle `true`). IEEE `<`/`<=` conform. **RESOLVED (d471d45).**
+- **[N] Kind-only builtins reduced where Maude fails them:** **RESOLVED (d471d45 divides/float/qid; 501ff8f char).** `0 divides 5` → `false` (oracle: stays at
   `[Bool]`); `char(256)` → `"Ā"` (oracle: unreduced, byte domain); `float("NaN")`/`float("5")` over-accepted;
   `string(qid("a b"))` → `"a b"` (oracle `"a`b"` — qid normalization missing).
 - **[N] `metaParse` returns the flattened parse** (`'_+_[a,b,c]`) where Maude returns the true nested
@@ -284,7 +284,9 @@ Each of these breaks real specs; several break stock library files.
   **OO renaming/view items** (`class`/`attr`/`msg to`) rejected, so valid OO renamings kill their module
   (OO *modules* work; OO *views* don't).
 - **[N] A renaming that touches a parameter-theory sort rejects the module** (oracle ignores the mapping
-  with an advisory and builds).
+  with an advisory and builds). **RESOLVED (pre-scoreboard: fixture A4e-param-rename-shield passes from
+  birth — tnk now recovers by ignoring the mapping, value-identical to the oracle; the rejection is only
+  reachable via the `(M * (renaming)){Args}` form, which is finding C3a. Kept as regression net.)**
 - **[N] Top-level junk-token recovery**: Maude warns and skips token-by-token; tnk hard-errors and can
   abandon the rest of the file (recovery inconsistent between cases). Related: **a `***`/`---` line comment
   immediately before `select` or `show` desyncs the command parser** (spurious "unexpected top-level
