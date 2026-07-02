@@ -235,6 +235,73 @@ pub fn flatten_pre(
     })
 }
 
+/// The base module/theory names in *module position* of an import expression (a plain name, a sum's sides,
+/// a renaming's inner, an instantiation's base — an instantiation's `{…}` *arguments* are views, not
+/// imported modules, so they are excluded). Used by the import-hygiene checks below.
+fn import_module_bases<'a>(expr: &'a ModuleExpr, out: &mut Vec<&'a str>) {
+    match expr {
+        ModuleExpr::Named(n) => out.push(n),
+        ModuleExpr::Sum(a, b) => {
+            import_module_bases(a, out);
+            import_module_bases(b, out);
+        }
+        ModuleExpr::Rename(inner, _) => import_module_bases(inner, out),
+        ModuleExpr::Instantiation(base, _) => import_module_bases(base, out),
+    }
+}
+
+/// Whether an import expression imports (in module position) a **theory** (`fth`/`th`). A plain module
+/// importing a theory is illegal (C4a): Maude recovers by ignoring the import.
+fn import_targets_theory(expr: &ModuleExpr, db: &ModuleDb) -> bool {
+    let mut bases = Vec::new();
+    import_module_bases(expr, &mut bases);
+    bases.iter().any(|n| db.get(n).is_some_and(|m| m.is_theory))
+}
+
+/// Whether an import expression directly names the importing module `name` (a self-import, C4c).
+fn import_names_self(expr: &ModuleExpr, name: &str) -> bool {
+    let mut bases = Vec::new();
+    import_module_bases(expr, &mut bases);
+    bases.contains(&name)
+}
+
+/// Whether the base of a module expression is a theory (`fth`/`th`) — the target of a view is a theory iff
+/// instantiating with that view leaves the parameter free.
+fn expr_base_is_theory(e: &ModuleExpr, db: &ModuleDb) -> bool {
+    match e {
+        ModuleExpr::Named(n) => db.get(n).is_some_and(|m| m.is_theory),
+        ModuleExpr::Instantiation(base, _) => expr_base_is_theory(base, db),
+        ModuleExpr::Rename(inner, _) => expr_base_is_theory(inner, db),
+        ModuleExpr::Sum(a, _) => expr_base_is_theory(a, db),
+    }
+}
+
+/// Whether an instantiation argument leaves its parameter free: a **theory-view** (its `to` target is a
+/// theory) does; a **module-view** grounds it; a **by-parameter** argument (an enclosing parameter, in
+/// `scope`) is free but legitimately bound by the importer's own parameter.
+fn arg_leaves_free_param(arg: &ModuleExpr, db: &ModuleDb, views: &ViewDb, scope: &[String]) -> bool {
+    match arg {
+        ModuleExpr::Named(p) if scope.iter().any(|n| n == p) => false, // by-parameter (bound by importer)
+        ModuleExpr::Named(v) => views.get(v).is_some_and(|view| expr_base_is_theory(&view.to, db)),
+        ModuleExpr::Instantiation(base, _) => match &**base {
+            ModuleExpr::Named(v) => views.get(v).is_some_and(|view| expr_base_is_theory(&view.to, db)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether importing `expr` would leave a free (unbound) parameter — a parameterized module instantiated
+/// only by a theory-view at its grounding (last) level (C4b). Maude refuses to import a module with free
+/// parameters. Only the last level of an instantiation chain grounds the parameter (`BOX{ToT2}{C2}` is
+/// grounded by `C2`), so only the last level is inspected; a renamed instance (`unchain` = `None`) is not
+/// gated here.
+fn import_leaves_free_param(expr: &ModuleExpr, db: &ModuleDb, views: &ViewDb, scope: &[String]) -> bool {
+    let Some((_, arg_lists)) = unchain(expr) else { return false };
+    let Some(last) = arg_lists.last() else { return false };
+    last.iter().any(|a| arg_leaves_free_param(a, db, views, scope))
+}
+
 fn collect_named(
     name: &str,
     db: &ModuleDb,
@@ -259,6 +326,27 @@ fn collect_named(
     // parameters stay free, so the imports are collected unsubstituted with `X` in scope.
     let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
+        // Import hygiene (fable-audit.md §3.6). A module importing ITSELF is a mutually-recursive import:
+        // Maude marks the module unusable due to unpatchable errors, so flattening fails and it is never
+        // built (C4c). Checked first, before the theory/free-param recoveries.
+        if import_names_self(&imp.expr, name) {
+            return Err(format!("mutually recursive import of module `{name}` ignored"));
+        }
+        // A plain module (`fmod`/`mod`) importing a THEORY (`fth`/`th`) is not allowed: Maude recovers by
+        // IGNORING the import — the module stays, minus the theory's contents (its axioms never run) (C4a).
+        // Only the module-imports-theory direction is illegal: a theory importing a theory/module, and a
+        // theory used as a parameter bound (via `add_parameter_copy`, not this loop), are legitimate.
+        if !pm.is_theory && import_targets_theory(&imp.expr, db) {
+            continue;
+        }
+        // Importing a module instance that still has FREE parameters — a theory-target view leaves the
+        // parameter free — is not allowed: Maude marks the importer unusable due to unpatchable errors (C4b).
+        if import_leaves_free_param(&imp.expr, db, views, &scope) {
+            return Err(format!(
+                "cannot import module `{}` because it has free parameters",
+                canonical_key(&imp.expr)
+            ));
+        }
         collect_expr(&imp.expr, db, views, acc, visited, interner, &scope)?;
     }
     let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion

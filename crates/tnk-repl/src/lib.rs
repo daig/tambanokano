@@ -318,6 +318,28 @@ impl Repl {
 
     /// Run a `reduce`/`match` command against the current module.
     fn run_command(&mut self, c: Command, out: &mut String) {
+        // A `[0]` component in a bracketed bound (`rewrite`/`frewrite`/`erewrite`/`search`) is illegal:
+        // Maude rejects it at parse ("bad token in / no parse for term|command") — before resolving the
+        // module — so the command produces no output, while the following legal commands still run
+        // (fable-audit.md §3.6, C4e). Every bound slot rejects a 0 (verified against the oracle: bound and
+        // gas for `frewrite [n, g]`/`erewrite`, and both solution/depth bounds for `search [n, m]`).
+        // `continue`'s bare number is a different grammar and DOES allow 0, so it is not checked here.
+        let zero_bound = match &c {
+            Command::Rewrite { bound, .. } => *bound == Some(0),
+            Command::Frewrite { bound, gas, .. } | Command::ERewrite { bound, gas, .. } => {
+                *bound == Some(0) || *gas == Some(0)
+            }
+            Command::Search { max_solutions, max_depth, .. } => {
+                *max_solutions == Some(0) || *max_depth == Some(0)
+            }
+            _ => false,
+        };
+        if zero_bound {
+            // The diagnostic is stripped by the diff harness (a `parse error:` line); the pin is that the
+            // rejected command emits no echo/result.
+            out.push_str("parse error: a `[0]` bound is not allowed.\n");
+            return;
+        }
         // An `in <MODULE> :` qualifier overrides the current module for this one command (Maude's
         // `red in NAT : t .`); without it, the current module is used.
         let m_override = match &c {

@@ -17,6 +17,10 @@ struct StmtAttrs {
     owise: bool,
     nonexec: bool,
     label: Option<String>,
+    /// The tokens of a `[print …]` attribute's content (the strings/variables after `print`), captured for
+    /// validation: a print variable must resolve to a variable of the statement (Maude rejects an unknown
+    /// token and drops the statement — fable-audit.md §3.6, C4f). Empty when there is no `print` attribute.
+    print: Vec<Token>,
 }
 
 pub struct Parser<'a> {
@@ -80,8 +84,10 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
         return sa; // a `[_]`-list / `{_}`-set term, not attributes
     }
     // `label`/`metadata` each take one following argument token; capture the label name (for META
-    // up-translation), skip metadata's, and ignore everything else token-by-token.
+    // up-translation), skip metadata's, and ignore everything else token-by-token. `print` captures its
+    // following string/variable list (until the next attribute keyword) for later validation (C4f).
     let mut want_arg: Option<&str> = None;
+    let mut in_print = false;
     for t in &body[open + 1..body.len() - 1] {
         let s = i.resolve(t.sym);
         if let Some(kw) = want_arg.take() {
@@ -90,15 +96,40 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
             }
             continue;
         }
+        // A string is always a print item (never an attribute keyword); a non-string keyword ends the list.
+        if in_print && (t.kind == TokKind::Str || !is_attr_kw(s)) {
+            sa.print.push(*t);
+            continue;
+        }
+        in_print = false;
         match s {
             "owise" => sa.owise = true,
             "nonexec" => sa.nonexec = true,
             "label" | "metadata" => want_arg = Some(s),
+            "print" => in_print = true,
             _ => {}
         }
     }
     body.truncate(open);
     sa
+}
+
+/// A `[print …]` attribute is well-formed iff each of its non-string items resolves to a variable of the
+/// statement: an on-the-fly typed variable (a token carrying `:`, self-declaring) or a bare name that is a
+/// declared `var`/`vars` of the module. Maude rejects any other token ("bad token X") and DROPS the whole
+/// statement — a bare name that only appears on-the-fly in the body is *not* accepted (fable-audit.md §3.6,
+/// C4f; a declared-but-unused variable IS accepted — Maude only warns, so it stays valid here).
+fn print_attr_ok(print: &[Token], m: &PreModule, i: &Interner) -> bool {
+    print.iter().all(|t| {
+        if t.kind == TokKind::Str {
+            return true; // a string literal is always a valid print item
+        }
+        let s = i.resolve(t.sym);
+        if s.contains(':') {
+            return true; // an on-the-fly typed variable `X:Sort` declares itself
+        }
+        m.vars.iter().any(|vd| vd.names.iter().any(|n| n == s))
+    })
 }
 
 impl<'a> Parser<'a> {
@@ -522,6 +553,14 @@ impl<'a> Parser<'a> {
             return Ok(format!("[{}]", inners.join(",")));
         }
         let mut name = self.name()?;
+        // A `.` inside a sort name is illegal (Maude: `A.B is not a valid sort name`). The lexer glues a
+        // non-terminator dot into the maudeId, so a dotted sort like `A.B` arrives as one token here; a
+        // legitimate structured/kind sort never has a `.` in its base identifier (it uses `{}`/`[]`). This
+        // rejects the whole declaration (bail-on-first-error), matching Maude's "module unusable" recovery
+        // (fable-audit.md §3.6, C4d).
+        if name.contains('.') {
+            return Err(format!("`{name}` is not a valid sort name (`.` not allowed)"));
+        }
         // A *chain* of `{ … }` groups, not just one: a nested instantiation's renaming names the inner
         // structured sort `NeList{STRICT-WEAK-ORDER}{X}` (Axis-A5), and `List{List{X}}` nests via the
         // recursive arg parse. Reassembled into Maude's canonical no-space spelling.
@@ -809,6 +848,11 @@ impl<'a> Parser<'a> {
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
+                // A `[print …]` referencing a non-variable token is rejected by Maude, which DROPS the
+                // statement and keeps the module (C4f). Drop it here (skip the push); the module survives.
+                if !print_attr_ok(&sa.print, m, self.i) {
+                    return Ok(());
+                }
                 let cond = if conditional {
                     let i = top_level_find(&body, self.i, "if", false)
                         .ok_or("`ceq` is missing its `if` condition")?;
@@ -844,6 +888,9 @@ impl<'a> Parser<'a> {
                 }
                 let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
+                if !print_attr_ok(&sa.print, m, self.i) {
+                    return Ok(()); // bad `[print …]` variable: drop the statement, keep the module (C4f)
+                }
                 m.statements.push(Statement::Mb { lhs, sort, cond, nonexec: sa.nonexec, label: leading.or(sa.label) });
             }
             "rl" | "crl" => {
@@ -866,6 +913,9 @@ impl<'a> Parser<'a> {
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
+                if !print_attr_ok(&sa.print, m, self.i) {
+                    return Ok(()); // bad `[print …]` variable: drop the statement, keep the module (C4f)
+                }
                 // The arrow `=>` lexes as one token (a run of non-punctuation chars); an unspaced `t=>p`
                 // lexes as a single token and so will not split here — rejected exactly as Maude rejects it.
                 let arrow = top_level_find(&body, self.i, "=>", false).ok_or("rule is missing `=>`")?;
@@ -1431,8 +1481,29 @@ impl<'a> Parser<'a> {
                         self.advance(); // its string argument (not retained)
                     }
                 }
+                "print" => {
+                    self.advance(); // 'print'
+                    // Capture the print list (strings/variables) until the next attribute keyword or `]`,
+                    // for validation (C4f); a string is always a print item, never a keyword.
+                    while let Some(t) = self.peek() {
+                        if self.at("]") {
+                            break;
+                        }
+                        let s = self.i.resolve(t.sym);
+                        let is_attr_kw = matches!(
+                            s,
+                            "owise" | "nonexec" | "label" | "metadata" | "print" | "format"
+                                | "variant" | "narrowing"
+                        );
+                        if t.kind != TokKind::Str && is_attr_kw {
+                            break;
+                        }
+                        sa.print.push(t);
+                        self.advance();
+                    }
+                }
                 _ => {
-                    self.advance(); // any other attribute (print, format, …): ignore token-by-token
+                    self.advance(); // any other attribute (format, …): ignore token-by-token
                 }
             }
         }
