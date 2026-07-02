@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{split_mixfix, tokenize, Frag, Interner, Token};
-use tnk_frontend::rename_terms::{literal_frags, OpRenamer};
+use tnk_frontend::rename_terms::OpRenamer;
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement};
 
 use crate::flatten::FlatDecls;
@@ -54,12 +54,14 @@ pub fn apply_renaming(
         .filter(|(from, ..)| is_single_token(from, interner))
         .map(|(from, to, _)| (from.clone(), to.clone()))
         .collect();
-    // Op-declaration rename map: canonical name → (target literal fragments, attribute override). Covers
-    // single + mixfix (literal-fragment surgery on the name tokens handles a constant `empty → none` and
-    // a mixfix `_,_ → _;_` alike).
-    let op_decl_map: HashMap<String, (Vec<String>, Attrs)> = op_renames
+    // Op-declaration rename map: canonical from-name → (target canonical name, attribute override). Covers
+    // single + mixfix. The declaration's name is replaced **wholesale** by the target's token vector (see
+    // the op loop) — not by per-fragment surgery, which would corrupt a single-token mixfix name like
+    // `_+_` (one token, no lexer-punctuation to split it) into a prefix op by overwriting the whole token
+    // with the target's first literal fragment.
+    let op_decl_map: HashMap<String, (String, Attrs)> = op_renames
         .iter()
-        .map(|(from, to, a)| (from.clone(), (literal_frags(to, interner), a.clone())))
+        .map(|(from, to, a)| (from.clone(), (to.clone(), a.clone())))
         .collect();
 
     // Declarations.
@@ -75,18 +77,12 @@ pub fn apply_renaming(
             op.range = t.clone();
         }
         let canon: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
-        if let Some((to_lits, ovr)) = op_decl_map.get(&canon) {
-            // Replace each literal (non-hole) fragment token of the name with the target's, in order;
-            // holes (`_`) are left in place.
-            let mut li = 0;
-            for t in &mut op.name {
-                if interner.resolve(t.sym) != "_" {
-                    if let Some(text) = to_lits.get(li) {
-                        t.sym = interner.intern(text);
-                    }
-                    li += 1;
-                }
-            }
+        if let Some((to_name, ovr)) = op_decl_map.get(&canon) {
+            // Replace the op's name wholesale with the target's token vector. `tokenize` reproduces the
+            // canonical spelling — one token for a hole-bearing name with no lexer-punctuation (`_plus_`,
+            // `_;_`), split tokens for a punctuation name (`_,_` → `_ , _`) — so the rebuilt op keeps the
+            // target's mixfix shape (holes preserved) rather than collapsing to a prefix op.
+            op.name = tokenize(to_name, interner);
             apply_attr_override(&mut op.attrs, ovr);
         }
         // The `id:` identity element is a constant — rename it like any other (single-token op / sort).

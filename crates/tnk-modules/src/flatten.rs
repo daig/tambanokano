@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{tokenize, Interner, Token};
+use tnk_frontend::rename_terms::ViewOpSubst;
 use tnk_frontend::surface::ast::{
     ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
 };
@@ -277,18 +278,36 @@ fn add_parameter_copy(
     let mut tmp_visited = HashSet::new();
     collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
     let decls = tmp.into_decls();
-    // The sorts that came from an imported module — not renamed.
-    let mut module_sorts = HashSet::new();
-    module_origin_sorts(theory, db, views, interner, &mut HashSet::new(), &mut module_sorts)?;
+    // The theory's genuine sorts (theory-declared, excluding module-origin) — the ones renamed to `X$s`.
+    let param_sorts = theory_param_sorts(theory, db, views, interner)?;
     let items: Vec<RenameItem> = decls
         .sorts
         .iter()
-        .filter(|s| !module_sorts.contains(s.as_str()))
+        .filter(|s| param_sorts.contains(s.as_str()))
         .map(|s| RenameItem::Sort { from: s.clone(), to: format!("{param}${s}") })
         .collect();
     let renamed = apply_renaming(decls, &items, interner)?;
     acc.add(renamed);
     Ok(())
+}
+
+/// The set of a parameter theory's own sorts — theory-declared sorts, excluding those inherited from an
+/// imported *module* ([`module_origin_sorts`]). These are exactly the `s` renamed to `param$s` by
+/// [`add_parameter_copy`]; equivalently, the `s` for which `X$s` is a genuine parameter sort. Any other
+/// `X$…` occurrence in a parameterized module's body is a "fake" parameter sort (A4d).
+fn theory_param_sorts(
+    theory: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<HashSet<String>, String> {
+    let mut tmp = Acc::default();
+    let mut tmp_visited = HashSet::new();
+    collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
+    let sorts = tmp.into_decls().sorts;
+    let mut module_sorts = HashSet::new();
+    module_origin_sorts(theory, db, views, interner, &mut HashSet::new(), &mut module_sorts)?;
+    Ok(sorts.into_iter().filter(|s| !module_sorts.contains(s)).collect())
 }
 
 /// Collect the sorts theory `name` inherits from an imported **module** (vs. a theory) — recursively, so a
@@ -416,6 +435,7 @@ fn instantiate(
     // sort images compose left-to-right; the structured-sort name is the whole chain (`ToT2}{C2`).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
+    let mut op_recon: Vec<(String, String)> = Vec::new();
     let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
     for (i, param) in pm.params.iter().enumerate() {
         let chain: Vec<&ModuleExpr> = arg_lists.iter().map(|lvl| &lvl[i]).collect();
@@ -431,6 +451,7 @@ fn instantiate(
         }
         for r in &resolutions {
             op_subst.extend(r.op_subst.clone());
+            op_recon.extend(r.op_recon.clone());
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
         let mut sort_image: HashMap<String, String> = HashMap::new();
@@ -445,6 +466,8 @@ fn instantiate(
         }
         let view_name =
             chain.iter().map(|a| canonical_key(a)).collect::<Vec<_>>().join("}{");
+        // The parameter theory's genuine sorts — so a fake `X$Foo` in the body survives (A4d).
+        let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
         bindings.insert(param.name.clone(), ParamBinding {
             view_name,
             // The by-parameter `$`-sort rename uses only the last level (the surviving parameter), not the
@@ -452,6 +475,7 @@ fn instantiate(
             final_name: last.binding.view_name.clone(),
             sort_image,
             by_param: last.binding.by_param,
+            theory_sorts: Some(theory_sorts),
         });
         // For re-instantiating `mname`'s imports that mention the parameter, the last level's argument is
         // the effective binding (an intervening theory-view changes only the theory, not the value).
@@ -467,7 +491,53 @@ fn instantiate(
         collect_expr(imp, db, views, acc, visited, interner, scope)?;
     }
     let pm = db.get(mname).expect("present");
-    acc.add(instantiate_decls(own_decls(pm), &bindings, &op_subst, interner));
+    let mut decls = own_decls(pm);
+    // Mixfix view op→op maps: rewrite the statement bubbles grammar-aware (fixity may change) *before* the
+    // textual instantiation pass inlines variables/sorts. The remaining (prefix→prefix, op→term) maps ride
+    // `op_subst` inside `instantiate_decls`.
+    if !op_recon.is_empty() {
+        apply_view_op_recon(&mut decls, mname, db, views, &op_recon, interner)?;
+    }
+    acc.add(instantiate_decls(decls, &bindings, &op_subst, interner));
+    Ok(())
+}
+
+/// Rewrite `d`'s statement bubbles for a view's mixfix op→op maps `op_recon` (source canonical → target
+/// canonical): build the source (parameterized) module `mname`'s grammar (flattened standalone, so the
+/// parameter-theory operators and the module's variables are in scope) and re-emit each mapped operator
+/// application in the target operator's syntax ([`ViewOpSubst`]). Runs on the *source* bubbles (bare
+/// variables, source ops), so the subsequent [`instantiate_decls`] pass still inlines variables/sorts and
+/// applies the textual `op_subst`. A condition fragment that does not parse as a single term is left
+/// unchanged (a mixfix map inside an eq/rule condition is not reconstructed — no current use).
+fn apply_view_op_recon(
+    d: &mut FlatDecls,
+    mname: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    op_recon: &[(String, String)],
+    interner: &mut Interner,
+) -> Result<(), String> {
+    let src = flatten(mname, db, views, interner)?;
+    let Some(mapper) = ViewOpSubst::new(&src, op_recon, interner)? else {
+        return Ok(());
+    };
+    for st in &mut d.statements {
+        match st {
+            Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => {
+                *lhs = mapper.rewrite(lhs, interner);
+                *rhs = mapper.rewrite(rhs, interner);
+                if let Some(c) = cond {
+                    *c = mapper.rewrite(c, interner);
+                }
+            }
+            Statement::Mb { lhs, cond, .. } => {
+                *lhs = mapper.rewrite(lhs, interner);
+                if let Some(c) = cond {
+                    *c = mapper.rewrite(c, interner);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -486,6 +556,13 @@ struct ParamBinding {
     final_name: String,
     sort_image: HashMap<String, String>,
     by_param: bool,
+    /// The parameter theory's own sorts — the sorts `s` for which `X$s` is a *genuine* parameter sort
+    /// (theory-declared, excluding module-origin sorts, exactly what [`add_parameter_copy`] renames).
+    /// Gates the `X$s` substitution in [`inst_sort`]: a "fake" parameter sort `X$Foo` (`Foo` not a theory
+    /// sort — declared directly in the parameterized module's body) must survive instantiation unchanged
+    /// (A4d). `None` means "do not gate" — used for the internal bindings of nested-view resolution, whose
+    /// consulted sorts are view-map targets (never fake `$`-sorts), preserving the prior behavior there.
+    theory_sorts: Option<HashSet<String>>,
 }
 
 /// One instantiation argument resolved to its parameter binding plus the module expression to import for
@@ -496,6 +573,9 @@ struct ArgResolution {
     binding: ParamBinding,
     target: Option<ModuleExpr>,
     op_subst: HashMap<String, Vec<Token>>,
+    /// Mixfix op→op maps (source canonical → target canonical) that need grammar-aware reconstruction of
+    /// the parameterized module's statement bubbles ([`ViewOpSubst`]); see [`op_maps_of`].
+    op_recon: Vec<(String, String)>,
 }
 
 /// Resolve one instantiation argument against the enclosing parameter `scope`. A bare name in `scope` is a
@@ -520,9 +600,11 @@ fn resolve_arg(
                 final_name: p.clone(),
                 sort_image: HashMap::new(),
                 by_param: true,
+                theory_sorts: None,
             },
             target: None,
             op_subst: HashMap::new(),
+            op_recon: Vec::new(),
         });
     }
     match arg {
@@ -533,15 +615,18 @@ fn resolve_arg(
                     "parameterized view `{view_name}` must be instantiated with arguments"
                 ));
             }
+            let (op_subst, op_recon) = op_maps_of(v, i)?;
             Ok(ArgResolution {
                 binding: ParamBinding {
                     view_name: view_name.clone(),
                     final_name: view_name.clone(),
                     sort_image: v.sort_maps.iter().cloned().collect(),
                     by_param: false,
+                    theory_sorts: None,
                 },
                 target: Some(v.to.clone()),
-                op_subst: op_subst_of(v, i)?,
+                op_subst,
+                op_recon,
             })
         }
         ModuleExpr::Instantiation(base, inner_args) => {
@@ -571,15 +656,18 @@ fn resolve_arg(
             let target = subst_params_in_expr(&v.to, &inner_to_arg);
             let sort_image =
                 v.sort_maps.iter().map(|(a, b)| (a.clone(), inst_sort(b, &inner))).collect();
+            let (op_subst, op_recon) = op_maps_of(v, i)?;
             Ok(ArgResolution {
                 binding: ParamBinding {
                     view_name: canonical_key(arg),
                     final_name: canonical_key(arg),
                     sort_image,
                     by_param: false,
+                    theory_sorts: None,
                 },
                 target: Some(target),
-                op_subst: op_subst_of(v, i)?,
+                op_subst,
+                op_recon,
             })
         }
         ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => {
@@ -590,22 +678,46 @@ fn resolve_arg(
     }
 }
 
-/// The op-map substitution of a view: each single-token source operator `f` to its target token(s)
-/// (`op f to g` / `op f to term t`, A1). A mixfix source op map is a follow-up, rejected loudly.
-fn op_subst_of(v: &ViewDecl, i: &Interner) -> Result<HashMap<String, Vec<Token>>, String> {
+/// The op-maps of a view, split into two application paths:
+/// - **textual** (`HashMap` source-token → target token(s)): a single-token prefix/constant source mapped
+///   to a hole-free (prefix/constant) target, or a constant `op f to term t` — the map is a plain token
+///   substitution on statement bubbles (`op f to g`, `empty to none`), the common case (A1).
+/// - **reconstruction** (`Vec` of (source canonical, target canonical)): any op→op map where a side is
+///   *mixfix* (`op f to _+_`, `op _#_ to g`, `op _#_ to _+_`). A token substitution cannot change fixity,
+///   so these route through [`ViewOpSubst`], which parses the bubble in the source grammar and re-emits the
+///   application in the target's syntax.
+///
+/// An op→*term* map whose source is mixfix is still a follow-up (rejected): a mixfix source with argument
+/// holes needs the term template instantiated per occurrence, beyond a fixity swap.
+#[allow(clippy::type_complexity)]
+fn op_maps_of(
+    v: &ViewDecl,
+    i: &Interner,
+) -> Result<(HashMap<String, Vec<Token>>, Vec<(String, String)>), String> {
     let mut op_subst = HashMap::new();
+    let mut op_recon = Vec::new();
     for m in &v.op_maps {
-        let (from, to) = match m {
-            OpMap::Op { from, to } | OpMap::Term { from, to } => (from, to),
-        };
-        match from.as_slice() {
-            [tok] => {
-                op_subst.insert(i.resolve(tok.sym).to_string(), to.clone());
+        match m {
+            OpMap::Op { from, to } => {
+                let from_canon: String = from.iter().map(|t| i.resolve(t.sym)).collect();
+                let to_canon: String = to.iter().map(|t| i.resolve(t.sym)).collect();
+                // A `_` in an op's canonical name is an argument hole (a literal underscore is backtick-
+                // escaped), so `contains('_')` distinguishes a mixfix name from a prefix/constant one.
+                if from.len() == 1 && !from_canon.contains('_') && !to_canon.contains('_') {
+                    op_subst.insert(from_canon, to.clone());
+                } else {
+                    op_recon.push((from_canon, to_canon));
+                }
             }
-            _ => return Err(format!("view `{}`: a mixfix operator map is a follow-up", v.name)),
+            OpMap::Term { from, to } => match from.as_slice() {
+                [tok] => {
+                    op_subst.insert(i.resolve(tok.sym).to_string(), to.clone());
+                }
+                _ => return Err(format!("view `{}`: a mixfix operator→term map is a follow-up", v.name)),
+            },
         }
     }
-    Ok(op_subst)
+    Ok((op_subst, op_recon))
 }
 
 /// Substitute view parameters into a module expression (a parameterized view's `to` target): replace each
@@ -818,6 +930,14 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some((param, s)) = name.split_once('$')
         && let Some(b) = bindings.get(param)
     {
+        // A "fake" parameter sort `X$Foo` — `Foo` not a sort of `X`'s theory — is just a sort name that
+        // happens to contain `$`; Maude qualifies only theory sorts, so it survives instantiation
+        // unchanged (A4d). `theory_sorts == None` (nested-view internal bindings) skips this gate.
+        if let Some(ts) = &b.theory_sorts
+            && !ts.contains(s)
+        {
+            return name.to_string();
+        }
         // By-parameter: prefix-rename `X$s ↦ p$s` (the parameter survives) — using the *final* level only,
         // so a chain `LIST{ORD}{X}` gives `X$Elt`, not the malformed chain `ORD}{X$Elt`. View: the view's
         // sort image.
