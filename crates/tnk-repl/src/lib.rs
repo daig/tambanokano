@@ -70,6 +70,13 @@ pub struct Repl {
     /// Pending `stdin` for `erewrite`'s `getLine` (Pillar 2.5-C). Set via [`set_stdin`](Self::set_stdin)
     /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
     stdin: String,
+    /// `set include BOOL on|off` (decision D11): while on, every entered module gets an implicit
+    /// `protecting BOOL .` (Maude's auto-import, prelude.maude:3233 turns it on after BOOL exists;
+    /// the prelude's own early modules build while it is off). Default off — the engine/library
+    /// layer stays prelude-free; the standing prelude flips it via its own `set include` line.
+    include_bool: bool,
+    /// Canonicalized paths already `load`ed — `sload` (skip-load) consults this and loads only once.
+    loaded_files: std::collections::HashSet<std::path::PathBuf>,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -103,6 +110,8 @@ impl Repl {
             trace: TraceFlags::default(),
             last: None,
             stdin: String::new(),
+            include_bool: false,
+            loaded_files: std::collections::HashSet::new(),
         }
     }
 
@@ -172,6 +181,19 @@ impl Repl {
         };
         match first {
             "quit" | "q" | "exit" => return Eval { output: "Bye.".into(), exit: true },
+            "load" | "sload" => {
+                // Filename = the raw text after the keyword on ITS line, to end of line (Maude:
+                // no `.` terminator). Comments may precede the load line in the chunk, so find
+                // the line whose first word is the keyword rather than slicing the raw input.
+                let path = input
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.split_whitespace().next() == Some(first))
+                    .and_then(|l| l.split_once(char::is_whitespace))
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("");
+                return self.meta_load(first == "sload", path);
+            }
             "select" => return self.meta_select(&join_tokens(&toks, &self.interner)),
             "show" => return self.meta_show(&join_tokens(&toks, &self.interner)),
             "set" => return self.meta_set(&join_tokens(&toks, &self.interner)),
@@ -225,7 +247,20 @@ impl Repl {
     /// Define (or redefine) a module: insert into the DB, flatten its import closure, build it, and make
     /// it current. Silent on success (as Maude is); flatten/build errors become output.
     fn enter_module(&mut self, pm: PreModule, out: &mut String) {
+        let mut pm = pm;
         let name = pm.name.clone();
+        // Implicit BOOL (D11 / fable-audit.md §3.4): while `set include BOOL on`, every module
+        // gets `protecting BOOL .` injected (Maude's auto-import). An explicit BOOL import
+        // dedups in flatten's visited set, so injection is idempotent.
+        if self.include_bool && name != "BOOL" && self.db.get("BOOL").is_some() {
+            pm.imports.insert(
+                0,
+                tnk_frontend::surface::ast::Import {
+                    mode: tnk_frontend::surface::ast::ImportMode::Protecting,
+                    expr: tnk_frontend::surface::ast::ModuleExpr::Named("BOOL".into()),
+                },
+            );
+        }
         self.last = None; // a (re)built module invalidates any saved rewrite continuation
         // Record this module's direct dependencies (imports + parameter theories) so a later redefinition
         // of anything it references can find and re-flatten it (A4c).
@@ -650,6 +685,16 @@ impl Repl {
             line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
         let out = match words.get(1).copied() {
             Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
+            // `set include BOOL on|off` (D11): toggle the implicit-BOOL auto-import. Other
+            // `set include <MOD>` names remain silent no-ops (nothing else is auto-imported).
+            Some("include") if words.get(2).copied() == Some("BOOL") => {
+                match words.get(3).copied() {
+                    Some("on") => self.include_bool = true,
+                    Some("off") => self.include_bool = false,
+                    _ => {}
+                }
+                String::new()
+            }
             // Every other interpreter directive (`set show advisories off`, `set include … on/off`,
             // `set oo include … on`, …) is a silent no-op, as the file-loading parser already treats
             // `set` (we never auto-import, and these toggles do not affect our output). Silence matches
@@ -657,6 +702,37 @@ impl Repl {
             _ => String::new(),
         };
         Eval { output: out, exit: false }
+    }
+
+    /// `load <file>` / `sload <file>` (D11): read the file and evaluate its contents in place
+    /// (modules + commands), resolving relative to the CWD then `$MAUDE_LIB` (colon-separated),
+    /// with and without an appended `.maude`. `sload` skips a file that was already loaded.
+    fn meta_load(&mut self, sload: bool, path: &str) -> Eval {
+        if path.is_empty() {
+            return Eval { output: "error: load needs a file name".into(), exit: false };
+        }
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        for base in [path.to_string(), format!("{path}.maude")] {
+            candidates.push(std::path::PathBuf::from(&base));
+            if let Ok(lib) = std::env::var("MAUDE_LIB") {
+                for dir in lib.split(':').filter(|d| !d.is_empty()) {
+                    candidates.push(std::path::Path::new(dir).join(&base));
+                }
+            }
+        }
+        let Some(found) = candidates.iter().find(|p| p.is_file()) else {
+            return Eval { output: format!("error: cannot open file `{path}`"), exit: false };
+        };
+        let canonical = std::fs::canonicalize(found).unwrap_or_else(|_| found.clone());
+        if sload && self.loaded_files.contains(&canonical) {
+            return Eval::default(); // already loaded: sload is a silent skip
+        }
+        let src = match std::fs::read_to_string(found) {
+            Ok(s) => s,
+            Err(e) => return Eval { output: format!("error: cannot read `{path}`: {e}"), exit: false },
+        };
+        self.loaded_files.insert(canonical);
+        self.eval_dispatch(&src)
     }
 
     /// Whether `input` forms a complete submission — the multi-line buffer boundary for the binary.
@@ -669,6 +745,17 @@ impl Repl {
         }
         if matches!(trimmed, "quit" | "q" | "exit") {
             return true;
+        }
+        // `load`/`sload` are line-terminated (no `.`): a submission whose first TOKEN is the
+        // keyword (leading comments stripped by the lexer) is complete at its line end — both
+        // drivers append whole lines, so the buffer already ends at one.
+        {
+            let toks = tokenize(input, &mut self.interner);
+            if let Some(t) = toks.first()
+                && matches!(self.interner.resolve(t.sym), "load" | "sload")
+            {
+                return true;
+            }
         }
         let toks = tokenize(input, &mut self.interner);
         let Some(last) = toks.last().copied() else { return false };

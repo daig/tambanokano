@@ -13,11 +13,12 @@
 #
 # Oracle:  MAUDE_LIB=$ORACLE_LIB maude -no-banner -no-advise <fixture> </dev/null
 # tnk:     target/release/tnk-repl
-#   Pre-C6c (TNK_STANDING_PRELUDE=0, the default): a fixture carrying a line
-#   `*** PRELUDE` gets $ORACLE_LIB/prelude.maude concatenated in front on the
-#   tnk side only (the oracle always has its standing prelude).
-#   Post-C6c (TNK_STANDING_PRELUDE=1): tnk is invoked directly on the fixture
-#   (standing prelude); fixtures WITHOUT the `*** PRELUDE` marker get -no-prelude.
+#   Post-C6c (TNK_STANDING_PRELUDE=1, the default since the C6c fix landed):
+#   tnk is invoked directly with MAUDE_LIB=$ORACLE_LIB -no-banner; fixtures
+#   WITHOUT the `*** PRELUDE` marker get -no-prelude (self-contained), marker'd
+#   fixtures run on the standing prelude — symmetrical with the oracle.
+#   Pre-C6c (TNK_STANDING_PRELUDE=0, kept for archaeology): a marker'd fixture
+#   gets $ORACLE_LIB/prelude.maude concatenated in front on the tnk side.
 #
 # Normalization (exact; §1.1 — NOTHING else may be stripped):
 #   - `====…` separator lines
@@ -37,7 +38,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
 ORACLE_BIN=${ORACLE_BIN:-maude}
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
-TNK_STANDING_PRELUDE=${TNK_STANDING_PRELUDE:-0}
+TNK_STANDING_PRELUDE=${TNK_STANDING_PRELUDE:-1}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 
 fixture=${1:-}
@@ -122,8 +123,8 @@ else
     tnk_input=$tmpdir/tnk-input.maude
   fi
 fi
-( cd "$fixdir" && timeout "$TIMEOUT_SECS" \
-    "$TNK_BIN" ${tnk_flags[@]+"${tnk_flags[@]}"} "$tnk_input" </dev/null ) \
+( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+    "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$tnk_input" </dev/null ) \
     >"$tmpdir/tnk.raw" 2>&1
 rc=$?
 if [ $rc -eq 124 ]; then

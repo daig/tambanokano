@@ -1713,11 +1713,26 @@ impl Runtime {
         }
 
         // (3) sort by the total order, then merge structurally-equal neighbours (summing mults).
+        // Two DISTINCT nodes merge only when both are already reduced: Maude normalizes ACU dags
+        // lazily, so value-equal-but-distinct UNREDUCED arguments (RAT's `I * M` / `J * N` both
+        // instantiating `1 * 6`; BOOL's `X == Y and Y == X`) are each reduced — and counted —
+        // before the merge happens at the parent's rebuild. Eagerly merging them here silently
+        // dropped one reduction (§3.3-adjacent undercount). The unmerged form is transient: the
+        // reduce loop's Phase-1 rebuild re-canonicalizes with reduced (mergeable) arguments, so
+        // matching only ever sees the merged canonical node.
         flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
+        let epoch = sig.eq_epoch();
         let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
         for (e, m) in flat {
             match args.last_mut() {
-                Some(last) if self.dag_compare(last.0, e) == Ordering::Equal => last.1 += m,
+                Some(last)
+                    if last.0 == e
+                        || (self.dag_compare(last.0, e) == Ordering::Equal
+                            && self.dags.get(last.0).reduced_epoch == epoch
+                            && self.dags.get(e).reduced_epoch == epoch) =>
+                {
+                    last.1 += m
+                }
                 _ => args.push((e, m)),
             }
         }
@@ -5697,9 +5712,14 @@ mod tests {
             rhs: Term::var(0, nat),
             nr_vars: 1,
         });
+        // Build inside the construction-dedup window, as every real command subject is (C7):
+        // the repeated `0`/`s 0` subterms become ONE shared node each, so the ACU multiset merges
+        // by node identity exactly as the frontend-built subject would.
+        e.begin_dedup();
         let (z0, z1) = (e.make_const(zero), e.make_const(zero));
         let (s0a, s0b) = (s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s));
         let subject = e.make_ac(set, vec![z0, s0a, z1, s0b]); // 0 ; s0 ; 0 ; s0
+        e.end_dedup();
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 2, "two duplicate-removals (== reference binary)");
         assert_eq!(e.node(r).children().count(), 2, "result is 0 ; s0");
@@ -5715,9 +5735,13 @@ mod tests {
             rhs: Term::var(0, s),
             nr_vars: 1,
         });
+        // Construction-dedup window, as every real command subject is built (C7): the four `a`
+        // occurrences share one node, so the multiset merges by identity as in the real pipeline.
+        e.begin_dedup();
         let (a0, a1, a2, a3) =
             (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
         let subject = e.make_ac(plus, vec![a0, a1, a2, a3]); // a + a + a + a
+        e.end_dedup();
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 3, "X binds a single `a` each step (== reference binary)");
         assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
