@@ -219,16 +219,21 @@ impl SSubproblem {
                 SState::Done => return false,
                 SState::Pat { .. } => unreachable!("a Pat sub-pattern is handled above"),
             };
-            assert!(
-                subst.get(index).is_none(),
-                "non-linear S variable is not yet supported (a follow-up)"
-            );
             let binding = rt.make_s(sig, symbol, j, base);
             if !sig.sorts().leq(rt.sort_of(binding), sort) {
                 continue; // this j violates the variable's sort; try the next (or finish)
             }
-            subst.bind(index, binding);
-            self.bound.push(index);
+            if let Some(existing) = subst.get(index) {
+                // Non-linear S variable, pre-bound elsewhere: a solution exists only where the
+                // absorbed portion agrees with the existing binding (Maude's S_LhsAutomaton
+                // bound-variable path); nothing new is bound.
+                if !rt.deep_equal(existing, binding) {
+                    continue;
+                }
+            } else {
+                subst.bind(index, binding);
+                self.bound.push(index);
+            }
             self.residue = residue;
             self.matched_whole = self.residue.is_zero();
             return true;
