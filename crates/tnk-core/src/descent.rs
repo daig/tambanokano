@@ -19,7 +19,7 @@
 use crate::dag::{DagId, NaValue, NodeRepr};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
-use crate::symbol::{MetaHooks, MetaOp, SymbolId};
+use crate::symbol::{MetaHooks, MetaOp, SymbolId, Theory};
 
 /// The current engine seen by a descent handler: reading the redex's meta-term arguments and building the
 /// up-translated result, both in the engine that is reducing. A thin public facade over `&mut Runtime` +
@@ -73,6 +73,12 @@ impl MetaCtx<'_> {
     /// [`MetaHooks`]) and down-translating `downTerm`'s argument into this module. `None` if undeclared.
     pub fn resolve_op(&self, name: &str, arity: usize) -> Option<SymbolId> {
         self.sig.resolve_symbol(name, arity)
+    }
+    /// Whether `sym` is an **associative** operator (ACU or AU). A flat (≥3-arg) meta-term over an
+    /// assoc op is legal — the op is declared binary but a nested application denotes the same flattened
+    /// term — so `down_term_ctx` resolves the binary symbol and folds the flat args onto it.
+    pub fn symbol_is_assoc(&self, sym: SymbolId) -> bool {
+        matches!(self.sig.symbol(sym).theory(), Theory::Acu | Theory::Au)
     }
     /// The arity (declared domain length) of symbol `sym`.
     pub fn arity(&self, sym: SymbolId) -> usize {

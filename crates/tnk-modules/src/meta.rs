@@ -65,7 +65,8 @@ use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use tnk_frontend::surface::ast::{
-    Attrs, GatherElem, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, Statement,
+    Attrs, GatherElem, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap, Parameter, PreModule,
+    Statement,
 };
 
 use crate::db::ModuleDb;
@@ -89,9 +90,10 @@ impl DescentOps for MetaDescent<'_> {
         redex: DagId,
     ) -> Option<DagId> {
         match op {
-            // `metaReduce` and `metaNormalize` differ only in whether membership/sort computation runs;
-            // our `reduce` already computes sorts, so both map to the same object reduction here.
-            MetaOp::Reduce | MetaOp::Normalize => self.meta_reduce(ctx, hooks, redex),
+            // `metaReduce` runs the module's equations to normal form; `metaNormalize` normalizes modulo
+            // the STRUCTURAL AXIOMS ONLY (AC order, id/idem collapse — no user equations).
+            MetaOp::Reduce => self.meta_reduce(ctx, hooks, redex),
+            MetaOp::Normalize => self.meta_normalize(ctx, hooks, redex),
             // The rewriting/matching/search family (Stage 3): down/up + the engine's rewrite/match/search.
             MetaOp::Rewrite => self.meta_rewrite(ctx, hooks, redex, false),
             MetaOp::Frewrite => self.meta_rewrite(ctx, hooks, redex, true),
@@ -168,6 +170,27 @@ impl MetaDescent<'_> {
         ctx.add_rewrites(loaded.built.engine.rewrites());
         let ut = up_term(ctx, hooks, &loaded.built, result);
         let us = up_sort(ctx, hooks, &loaded.built, result);
+        let rp = *hooks.ops.get("resultPairSymbol")?;
+        Some(ctx.app(rp, vec![ut, us]))
+    }
+
+    /// `metaNormalize(M, T)` → `{up(t'), up(leastSort(t'))}` where `t'` is `down(T)` normalized modulo the
+    /// module's **structural axioms only** — AC/ACU ordering, `id:`/`idem` collapse, `iter` fold — with **no
+    /// user equations applied** (Maude's `Term::normalize(true)`, which `down_term`'s construction already
+    /// performs). The inverse temptation is `meta_reduce`, which additionally runs the equations to normal
+    /// form; `metaNormalize` must leave `g(a)` as `g(a)` even when `eq g(a) = b` exists. No object rewrites
+    /// are counted (Maude does not `addInCount` here).
+    fn meta_normalize(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        if kids.len() != 2 {
+            return None;
+        }
+        let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+        // `down_term` builds the canonical DAG (construction canonicalizes AC order / collapses id/idem /
+        // folds iter) — that *is* the axiom-normal form; no `reduce` call, so no equation ever fires.
+        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built)?;
+        let ut = up_term(ctx, hooks, &loaded.built, subj);
+        let us = up_sort(ctx, hooks, &loaded.built, subj);
         let rp = *hooks.ops.get("resultPairSymbol")?;
         Some(ctx.app(rp, vec![ut, us]))
     }
@@ -735,7 +758,14 @@ impl MetaDescent<'_> {
         let name = qid_text(ctx, *kids.first()?)?;
         let flat = down_bool(ctx, *kids.get(1)?)?;
         let p = self.module_pieces(&name, flat)?;
-        let header = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
+        let name_qid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
+        // A parameterized module's header carries its parameter list (`'LIST{'X :: 'TRIV}`); the flat form
+        // and a non-parameterized module use the bare name Qid (Maude's `upHeader`).
+        let header = if flat || p.params.is_empty() {
+            name_qid
+        } else {
+            up_header(ctx, hooks, name_qid, &p.params)?
+        };
         let imports = up_imports(ctx, hooks, &p.imports)?;
         let sorts = up_sorts_dag(ctx, hooks, &p.sorts);
         let subsorts = up_subsorts_dag(ctx, hooks, &p.subsorts);
@@ -922,6 +952,7 @@ impl MetaDescent<'_> {
         Some(ModulePieces {
             kind: flat_pm.kind,
             is_theory: flat_pm.is_theory,
+            params: pm.params.clone(),
             sorts,
             subsorts,
             ops,
@@ -1136,6 +1167,11 @@ fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> O
             a.id = Some(id_bubble(ctx, *ctx.children(attr).first()?, i)?);
         } else if is("precSymbol") {
             a.prec = down_nat(ctx, *ctx.children(attr).first()?);
+        } else if is("stratSymbol") {
+            // `strat(<NatList>)` — the per-op evaluation strategy (1-based arg positions, `0` = whole
+            // term). Reconstructed like an object-level `strat` declaration; `build_sig` applies it via
+            // `set_strategy` when the down-translated module is built.
+            a.strat = Some(down_nat_list(ctx, hooks, *ctx.children(attr).first()?)?);
         } else if is("gatherSymbol")
             || is("formatSymbol")
             || is("metadataSymbol")
@@ -1158,6 +1194,16 @@ fn id_bubble(ctx: &MetaCtx, t: DagId, i: &mut Interner) -> Option<Vec<tnk_fronte
     let text = qid_text(ctx, t)?;
     let name = text.rsplit_once('.').map(|(n, _)| n).unwrap_or(&text);
     Some(tokenize(name, i))
+}
+
+/// A meta `NatList` (a single `Nat`, or `__`/`natListSymbol`-joined `Nat`s) → the `u32` position list —
+/// the inverse of [`up_nat_list`] (a `strat(…)` op attribute's argument).
+fn down_nat_list(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Vec<u32>> {
+    if Some(ctx.top(d)) == hooks.ops.get("natListSymbol").copied() {
+        ctx.children(d).iter().map(|&c| down_nat(ctx, c)).collect()
+    } else {
+        Some(vec![down_nat(ctx, d)?])
+    }
 }
 
 /// A meta `Nat` (`'0.Zero`, `'s_^n['0.Zero]`, or a NAT numeral) → its `u32` value (for `prec`).
@@ -1474,6 +1520,23 @@ fn down_arglist_to_term(
     }
 }
 
+/// Resolve a meta op-name applied to `arity` args against `target`, honouring associativity: try the exact
+/// `(name, arity)` operator; failing that, a flat (≥3-arg) application of an **associative** op resolves the
+/// binary `(name, 2)` symbol (the op is declared binary, but a nested application denotes the same flattened
+/// term — `make_node`/`Term::op` build the flattened ACU/AU form).
+fn resolve_flat_assoc(name: &str, arity: usize, target: &BuiltModule) -> Option<SymbolId> {
+    if let Some(&sym) = target.ops.get(&(name.to_string(), arity)) {
+        return Some(sym);
+    }
+    if arity >= 3
+        && let Some(&sym) = target.ops.get(&(name.to_string(), 2))
+        && target.engine.symbol_is_assoc(sym)
+    {
+        return Some(sym);
+    }
+    None
+}
+
 /// Build a kernel [`Term`] application from a meta op-name + down-translated args: an iterated name
 /// `base^n` wraps the argument in `n` nested successor `Term::Op`s; otherwise the operator is `(name, arity)`.
 fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<Term> {
@@ -1488,7 +1551,7 @@ fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<T
         }
         return Some(t);
     }
-    let sym = *target.ops.get(&(head.clone(), args.len()))?;
+    let sym = resolve_flat_assoc(&head, args.len(), target)?;
     Some(Term::op(sym, args))
 }
 
@@ -1594,7 +1657,7 @@ fn build_app(head: &str, args: Vec<DagId>, target: &mut BuiltModule) -> Option<D
         let sym = *target.ops.get(&(base.to_string(), 1))?;
         return Some(target.engine.make_iter(sym, n, *args.first()?));
     }
-    let sym = *target.ops.get(&(head.to_string(), args.len()))?;
+    let sym = resolve_flat_assoc(head, args.len(), target)?;
     Some(target.engine.make_node(sym, args))
 }
 
@@ -1798,7 +1861,15 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
                 let sym = ctx.resolve_op(&strip_op_blanks(base), 1)?;
                 return Some(ctx.make_iter(sym, n, *args.first()?));
             }
-            let sym = ctx.resolve_op(&strip_op_blanks(&head), args.len())?;
+            let name = strip_op_blanks(&head);
+            // Resolve by (name, arity); if that fails on a flat (≥3-arg) application, resolve the binary
+            // symbol of an associative op and fold the flat args onto it (`ctx.app` builds the flattened
+            // ACU/AU node — tnk's internal rep is already flat).
+            let sym = ctx.resolve_op(&name, args.len()).or_else(|| {
+                (args.len() >= 3)
+                    .then(|| ctx.resolve_op(&name, 2).filter(|&s| ctx.symbol_is_assoc(s)))
+                    .flatten()
+            })?;
             Some(ctx.app(sym, args))
         }
     }
@@ -1954,6 +2025,9 @@ enum UpPart {
 struct ModulePieces {
     kind: ModuleKind,
     is_theory: bool,
+    /// Formal parameters `{X :: T, …}` of a parameterized module (empty otherwise) — emitted in the
+    /// `upModule` header (`fmod 'LIST{'X :: 'TRIV} is`) for the non-flat form.
+    params: Vec<Parameter>,
     sorts: Vec<String>,
     subsorts: Vec<Vec<Vec<String>>>,
     ops: Vec<UpOp>,
@@ -2052,6 +2126,33 @@ fn up_set(ctx: &mut MetaCtx, elems: Vec<DagId>, empty: SymbolId, join: SymbolId)
     }
 }
 
+/// Up-translate a parameterized-module header to `_{_}(name, ParameterDeclList)` (`headerSymbol`): each
+/// parameter `X :: T` becomes `_::_('X, upModuleExpr(T))` (`parameterDeclSymbol`), joined by `_,_`
+/// (`parameterDeclListSymbol`) — Maude's `upHeader`/`upParameterDecls`. `None` if the header symbols are
+/// absent (a META-LEVEL predating parameterized headers).
+fn up_header(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    name_qid: DagId,
+    params: &[Parameter],
+) -> Option<DagId> {
+    let qid = hooks.ops["qidSymbol"];
+    let decl_sym = *hooks.ops.get("parameterDeclSymbol")?;
+    let decls: Vec<DagId> = params
+        .iter()
+        .map(|p| {
+            let pname = ctx.make_na(qid, NaValue::Qid(p.name.as_str().into()));
+            let theory = ctx.make_na(qid, NaValue::Qid(p.theory.as_str().into()));
+            ctx.app(decl_sym, vec![pname, theory])
+        })
+        .collect();
+    let decl_list = match decls.len() {
+        1 => decls.into_iter().next().unwrap(),
+        _ => ctx.app(*hooks.ops.get("parameterDeclListSymbol")?, decls),
+    };
+    Some(ctx.app(*hooks.ops.get("headerSymbol")?, vec![name_qid, decl_list]))
+}
+
 /// Up-translate an import list (`including_./protecting_./extending_.` of each module expression, joined by
 /// `__`). Only a **named** module expression is handled; a sum/renaming/instantiation import returns `None`.
 fn up_imports(ctx: &mut MetaCtx, hooks: &MetaHooks, imports: &[Import]) -> Option<DagId> {
@@ -2119,14 +2220,30 @@ fn up_ops_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, ops: &[UpOp
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut elems = Vec::with_capacity(sorted.len());
     for op in sorted {
-        elems.push(up_op_decl(ctx, hooks, m, op)?);
+        // `ditto` inherits the operator's full (symbol-wide) attribute set from its primary declaration —
+        // the same-name non-`ditto` op. Maude's `upModule` emits the *expanded* attributes on every subsort
+        // overload (`[assoc ctor id(…) prec(25)]`), not the bare `[ctor ditto]` the source carries.
+        let attr_op = if op.decl.attrs.ditto {
+            ops.iter().find(|o| o.name == op.name && !o.decl.attrs.ditto).unwrap_or(op)
+        } else {
+            op
+        };
+        elems.push(up_op_decl(ctx, hooks, m, op, attr_op)?);
     }
     Some(up_set(ctx, elems, hooks.ops["emptyOpDeclSetSymbol"], hooks.ops["opDeclSetSymbol"]))
 }
 
 /// Up-translate one operator declaration `op N : D -> R [A] .` (`opDeclSymbol`): the name `Qid`, the
 /// domain as a `TypeList` (`__`-joined sort `Qid`s, `nil` for a constant), the range `Type`, the `AttrSet`.
-fn up_op_decl(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) -> Option<DagId> {
+/// `op` supplies the name/domain/range; `attr_op` supplies the attribute set (they differ only for a
+/// `ditto` overload, whose attributes come from the operator's primary declaration).
+fn up_op_decl(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    m: &BuiltModule,
+    op: &UpOp,
+    attr_op: &UpOp,
+) -> Option<DagId> {
     let qid = hooks.ops["qidSymbol"];
     let name = ctx.make_na(qid, NaValue::Qid(meta_op_name(&op.name).into()));
     let dom_elems: Vec<DagId> =
@@ -2142,7 +2259,7 @@ fn up_op_decl(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) 
         op.decl.range.clone()
     };
     let range = ctx.make_na(qid, NaValue::Qid(range_name.into()));
-    let attrs = up_attrs(ctx, hooks, m, op)?;
+    let attrs = up_attrs(ctx, hooks, m, attr_op)?;
     Some(ctx.app(hooks.ops["opDeclSymbol"], vec![name, domain, range, attrs]))
 }
 
@@ -2426,17 +2543,33 @@ fn up_context(
     let sym = source.engine.node(node).symbol();
     let name = source.engine.symbol(sym).name().to_string();
     let children: Vec<DagId> = source.engine.node(node).children().collect();
-    let up_args: Vec<DagId> = children
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            if i == head {
-                up_context(ctx, hooks, source, c, rest)
-            } else {
-                up_term(ctx, hooks, source, c)
-            }
-        })
-        .collect();
+    let up_args: Vec<DagId> = if rest.is_empty() && source.engine.symbol_is_assoc(sym) {
+        // AC/AU **extension** context: the matched subterm is a direct child of an associative node, so the
+        // hole stands for the matched sub-multiset. Maude places the residue arguments first and the hole
+        // LAST (`'_+_['b.S, []]`), independent of the matched child's canonical index — not the child's slot.
+        let mut args: Vec<DagId> = children
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != head)
+            .map(|(_, &c)| up_term(ctx, hooks, source, c))
+            .collect();
+        args.push(ctx.app(hooks.ops["holeSymbol"], vec![]));
+        args
+    } else {
+        // Free (positional) node, or a rewrite strictly *inside* one associative argument (not an extension
+        // at this node): keep every argument in its slot, recursing into the hole-carrying child.
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                if i == head {
+                    up_context(ctx, hooks, source, c, rest)
+                } else {
+                    up_term(ctx, hooks, source, c)
+                }
+            })
+            .collect()
+    };
     let arglist = up_arglist(ctx, hooks, up_args);
     let opqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
     ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])

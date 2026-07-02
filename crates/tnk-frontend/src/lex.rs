@@ -462,6 +462,16 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
             }
             if ch == '_' {
                 frags.push(Frag::Hole);
+            } else if ch == ':' {
+                // A maximal run of `:` is ONE maudeId token in the main lexer (`::` in `X :: Y`),
+                // so it must be one fragment here too — split per-char, `_::_`'s two `:` fragments
+                // could never match a term's single `::` token, and printed with an inner space.
+                let mut run = String::from(":");
+                while chars.peek() == Some(&':') {
+                    chars.next();
+                    run.push(':');
+                }
+                frags.push(Frag::Tok(interner.intern(&run)));
             } else {
                 frags.push(Frag::Tok(interner.intern(ch.encode_utf8(&mut [0u8; 4]))));
             }
