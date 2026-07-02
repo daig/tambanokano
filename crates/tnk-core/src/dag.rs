@@ -84,11 +84,14 @@ pub(crate) enum NodeTerm {
 }
 
 /// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
-/// reference-counted backing (`Rc<str>`, cheap to clone); the float arm lands with `FLOAT` (B3.7).
+/// reference-counted backing (cheap to clone); the float arm lands with `FLOAT` (B3.7). A **string** is a
+/// raw **byte** sequence (`Rc<[u8]>`), exactly Maude's `Rope` of `char`s — it is NOT required to be UTF-8
+/// (`substr("héllo", 1, 1)` is the lone byte `0xC3`). The derived `Eq`/`Ord`/`Hash` on the byte slice is
+/// byte-lexicographic, matching Maude's Rope comparison. A `Qid` stays `Rc<str>` (identifiers are text).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NaValue {
-    /// A string literal / result (the `<Strings>` `StringSymbol`).
-    Str(std::rc::Rc<str>),
+    /// A string literal / result (the `<Strings>` `StringSymbol`) — a raw byte sequence.
+    Str(std::rc::Rc<[u8]>),
     /// A quoted identifier (the `<Qids>` `QuotedIdentifierSymbol`).
     Qid(std::rc::Rc<str>),
     /// An IEEE double, stored as its bit pattern (`f64::to_bits`) so `NaValue` keeps a total
@@ -98,6 +101,15 @@ pub enum NaValue {
     /// float ops are free (never AC, so `dag_compare` is not exercised on floats) and `==` on floats is
     /// not used (the float relational ops compare values directly).
     Float(u64),
+}
+
+/// Compare two string byte sequences exactly as Maude's `Rope::compare` does — as sequences of **signed**
+/// `char` (the C `int d = *p - *q`), so a high byte (0x80–0xFF, negative as a signed char) orders *before*
+/// an ASCII byte. Both the `_<_`/`_>_`/`_<=_`/`_>=_` string ops and the DAG canonical order
+/// ([`Runtime::dag_compare`](crate::engine::Runtime)) use this: unsigned byte-lexicographic would put high
+/// bytes last, diverging from the reference (`"\303" < "b"` is true in Maude, false unsigned).
+pub(crate) fn rope_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.iter().map(|&x| x as i8).cmp(b.iter().map(|&x| x as i8))
 }
 
 /// A static empty child slice — the children of a leaf ([`NodeTerm::Na`]) without allocating.
@@ -115,8 +127,8 @@ pub enum NodeRepr<'a> {
     App,
     /// An `iter` successor `s^count(arg)`; `count` is the base-10 rendering (it may be a bignum).
     Iter { count: String, arg: DagId },
-    /// A string constant's value (the content, without surrounding quotes).
-    Str(&'a str),
+    /// A string constant's value (the raw bytes, without surrounding quotes).
+    Str(&'a [u8]),
     /// A quoted-identifier constant's name (without the leading quote).
     Qid(&'a str),
     /// A float constant's value.

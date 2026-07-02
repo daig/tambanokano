@@ -633,17 +633,32 @@ fn render_qid(q: &str) -> String {
     out
 }
 
-/// A string constant rendered with surrounding quotes and the usual escapes.
-fn render_string(s: &str) -> String {
+/// A string constant (raw bytes) rendered with surrounding quotes and Maude's escaping (`Token::
+/// ropeToString`): a printable ASCII byte (0x20–0x7E) verbatim (with `"` and `\` backslash-escaped), the
+/// named control escapes `\a \b \f \n \r \t \v`, and EVERY other byte (0x00–0x06, 0x0E–0x1F, 0x7F, and
+/// all of 0x80–0xFF) as a 3-digit octal `\ooo`. The output is pure ASCII — no raw control/high bytes.
+fn render_string(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
+    for &b in s {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(b as char), // printable ASCII, verbatim
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x0b => out.push_str("\\v"),
+            _ => {
+                // 0x00–0x06, 0x0E–0x1F, 0x7F, 0x80–0xFF → 3-digit octal.
+                out.push('\\');
+                out.push((b'0' + b / 64) as char);
+                out.push((b'0' + (b / 8) % 8) as char);
+                out.push((b'0' + b % 8) as char);
+            }
         }
     }
     out.push('"');

@@ -285,22 +285,49 @@ fn flatten_dag_assoc(
     Ok(rev)
 }
 
-/// Strip a string literal's surrounding quotes and undo its escapes (the lexer keeps the quotes).
-fn unquote_string(tok: &str) -> String {
+/// Strip a string literal's surrounding quotes and undo its escapes (the lexer keeps the quotes),
+/// yielding the raw **byte** value. Maude strings are byte sequences, so this iterates the token text's
+/// bytes — a source literal `"héllo"` is UTF-8 in the file, so its 6 source bytes become 6 value bytes.
+/// Ported from `Token::stringToRope`: the named control escapes `\a`(7) `\b`(8) `\f`(12) `\n \r \t`
+/// `\v`(11), `\"`, `\\`, a 1–3 digit octal escape `\ooo` (value truncated to a byte, C semantics), and
+/// any other `\c` → the bare byte `c` (e.g. `\q` → `q`, verified against the oracle).
+fn unquote_string(tok: &str) -> Vec<u8> {
     let inner = tok.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(tok);
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other), // \" \\ and any other escaped char
-                None => {}
-            }
-        } else {
-            out.push(c);
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
         }
+        i += 1; // consume the backslash
+        let Some(&c) = bytes.get(i) else { break }; // a trailing backslash is dropped
+        match c {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                // 1–3 octal digits; the value wraps to a byte (C `char` truncation: `\400` → 0).
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 3 && matches!(bytes.get(i), Some(b'0'..=b'7')) {
+                    val = val * 8 + u32::from(bytes[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push(val as u8);
+                continue; // `i` already advanced past the digits
+            }
+            other => out.push(other), // \" \\ and any other escaped byte → the bare byte
+        }
+        i += 1;
     }
     out
 }

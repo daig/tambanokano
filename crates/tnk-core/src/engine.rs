@@ -801,7 +801,7 @@ impl Signature {
             return s;
         }
         let special = match value {
-            NaValue::Str(s) => s.chars().count() == 1,
+            NaValue::Str(s) => s.len() == 1,
             NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
             NaValue::Qid(_) => true,
         };
@@ -1744,7 +1744,12 @@ impl Runtime {
                     ord => ord,
                 }
             }
-            // An NA constant orders by its scalar value (consistent with the `deep_equal` Na arm).
+            // An NA constant orders by its scalar value (consistent with the `deep_equal` Na arm). A string
+            // value compares as Maude's `Rope` does — signed bytes (`StringDagNode::compareArguments`), not
+            // the derived unsigned byte order — so a high byte orders before an ASCII one.
+            (NodeTerm::Na { value: NaValue::Str(xs), .. }, NodeTerm::Na { value: NaValue::Str(ys), .. }) => {
+                crate::dag::rope_cmp(xs, ys)
+            }
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
@@ -3168,8 +3173,8 @@ impl Engine {
     }
 
     /// Build a string-literal NA node (the `<Strings>` `StringSymbol`, B3.6); `symbol` is an arity-0
-    /// string-constant operator.
-    pub fn make_string(&mut self, symbol: SymbolId, value: &str) -> DagId {
+    /// string-constant operator. The value is a raw byte sequence (Maude strings are bytes, not UTF-8).
+    pub fn make_string(&mut self, symbol: SymbolId, value: &[u8]) -> DagId {
         self.rt.make_na(&self.sig, symbol, NaValue::Str(value.into()))
     }
     /// Build a quoted-identifier NA node (the `<Qids>` `QuotedIdentifierSymbol`, B3.6).
@@ -3739,6 +3744,9 @@ impl Engine {
             }
             let (me, target, payload) = (args[1], args[0], args[2]);
             let Some(text) = self.rt.as_str(payload) else { return false };
+            // The buffers are `String`; strings are bytes — decode lossily at this I/O boundary (the
+            // pinned STD-STREAM traffic is ASCII, so this is exact for it).
+            let text = String::from_utf8_lossy(&text);
             match stream {
                 StdStream::Stdout => self.rt.external_out.push_str(&text),
                 StdStream::Stderr => self.rt.external_err.push_str(&text),
@@ -3759,11 +3767,12 @@ impl Engine {
             }
             let (me, target, prompt) = (args[1], args[0], args[2]);
             if let Some(p) = self.rt.as_str(prompt) {
-                self.rt.external_out.push_str(&p); // the prompt goes to stdout
+                self.rt.external_out.push_str(&String::from_utf8_lossy(&p)); // the prompt goes to stdout
             }
             let line = self.rt.read_line();
             if let (Some(got), Some(str_sym)) = (got_line_msg, string_sym) {
-                let line_dag = self.rt.make_na(&self.sig, str_sym, crate::dag::NaValue::Str(line.into()));
+                let line_dag =
+                    self.rt.make_na(&self.sig, str_sym, crate::dag::NaValue::Str(line.into_bytes().into()));
                 let reply = self.make_free(got, vec![me, target, line_dag]); // gotLine(me, self, line)
                 self.rt.incoming.push(reply);
             }
@@ -5966,26 +5975,26 @@ mod tests {
 
         let dstr = |e: &Engine, id: DagId| -> String {
             match &e.node(id).term {
-                NodeTerm::Na { value: NaValue::Str(v), .. } => v.to_string(),
+                NodeTerm::Na { value: NaValue::Str(v), .. } => String::from_utf8_lossy(v).into_owned(),
                 _ => panic!("not a string node"),
             }
         };
 
         // concat
         e.reset_rewrites();
-        let (a, b) = (e.make_string(strsym, "ab"), e.make_string(strsym, "cd"));
+        let (a, b) = (e.make_string(strsym, b"ab"), e.make_string(strsym, b"cd"));
         let q = e.make_free(concat, vec![a, b]);
         let r = e.reduce(q);
         assert_eq!((dstr(&e, r), e.rewrites()), ("abcd".into(), 1), "\"ab\" . \"cd\" = \"abcd\"");
 
         // length → Nat (sort follows the value)
         e.reset_rewrites();
-        let h = e.make_string(strsym, "hello");
+        let h = e.make_string(strsym, b"hello");
         let q = e.make_free(len, vec![h]);
         let r = e.reduce(q);
         assert_eq!((decode_nat(&e, r), e.rewrites()), (5, 1), "len(\"hello\") = 5");
         assert_eq!(e.sorts().name(e.sort_of(r)), "NzNat");
-        let empty = e.make_string(strsym, "");
+        let empty = e.make_string(strsym, b"");
         let q = e.make_free(len, vec![empty]);
         let r = e.reduce(q);
         assert_eq!(decode_nat(&e, r), 0, "len(\"\") = 0");
@@ -5993,7 +6002,7 @@ mod tests {
 
         // substr(s, start, len)
         e.reset_rewrites();
-        let (hh, n1, n3) = (e.make_string(strsym, "hello"), iter_num(&mut e, z, s, 1), iter_num(&mut e, z, s, 3));
+        let (hh, n1, n3) = (e.make_string(strsym, b"hello"), iter_num(&mut e, z, s, 1), iter_num(&mut e, z, s, 3));
         let q = e.make_free(sub, vec![hh, n1, n3]);
         let r = e.reduce(q);
         assert_eq!((dstr(&e, r), e.rewrites()), ("ell".into(), 1), "sub(\"hello\", 1, 3) = \"ell\"");
@@ -6001,7 +6010,7 @@ mod tests {
         // string comparison + NA equality (string + qid)
         let cmp = |e: &mut Engine, op: SymbolId, x: &str, y: &str| -> SymbolId {
             e.reset_rewrites();
-            let (a, b) = (e.make_string(strsym, x), e.make_string(strsym, y));
+            let (a, b) = (e.make_string(strsym, x.as_bytes()), e.make_string(strsym, y.as_bytes()));
             let q = e.make_free(op, vec![a, b]);
             let r = e.reduce(q);
             assert_eq!(e.rewrites(), 1);

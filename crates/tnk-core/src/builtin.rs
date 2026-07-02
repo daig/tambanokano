@@ -77,16 +77,18 @@ impl Runtime {
         let arg = self.node(id).children().next().expect("string/qid is unary");
         match op {
             QidOp::String => {
+                // The qid's canonical text (already valid UTF-8) as the string's raw bytes.
                 let q = self.as_qid(arg)?;
-                Some(self.make_na(sig, str_sym, NaValue::Str(q)))
+                Some(self.make_na(sig, str_sym, NaValue::Str(q.as_bytes().into())))
             }
             QidOp::Qid => {
                 // `qid` normalizes the string to Maude's canonical token name at construction
                 // (Token::ropeToPrefixNameCode): whitespace/backquote runs become one backquote,
                 // specials get a preceding backquote. So `qid("a b")` and `qid("a`b")` build the
                 // SAME node ("a`b"), `string` returns the canonical text, and the printer is verbatim.
+                // A qid is text: a non-UTF-8 byte string is not a valid identifier, so it falls through.
                 let s = self.as_str(arg)?;
-                let canonical = normalize_qid_name(&s);
+                let canonical = normalize_qid_name(std::str::from_utf8(&s).ok()?);
                 Some(self.make_na(sig, qid_sym, NaValue::Qid(canonical.into())))
             }
         }
@@ -163,18 +165,19 @@ impl Runtime {
                 } else {
                     format!("{}/{}", num.to_string_base(base), Int::from_nat(&den).to_string_base(base))
                 };
-                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into())))
+                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into_bytes().into())))
             }
             // `rat : String NzNat -> Rat` — a rational parsed from the base (`I` or `I/N`).
             ConvOp::StringToRat => {
                 let nat = nat?;
                 let s = self.as_str(kids[0])?;
+                let s = std::str::from_utf8(&s).ok()?; // non-UTF-8 bytes are not a numeral ⇒ fall through
                 let base = conv_base(self.as_nat(kids[1], nat)?)?;
                 let (num, den) = match s.split_once('/') {
                     Some((n, d)) => {
                         (Int::from_string_base(base, n)?, Int::from_string_base(base, d)?.magnitude())
                     }
-                    None => (Int::from_string_base(base, &s)?, Nat::one()),
+                    None => (Int::from_string_base(base, s)?, Nat::one()),
                 };
                 if den.is_zero() {
                     return None;
@@ -184,11 +187,12 @@ impl Runtime {
             // `string : Float -> String` — the float's canonical decimal string (Maude's `doubleToString`).
             ConvOp::FloatToString => {
                 let s = num::double_to_string(self.as_float(kids[0])?);
-                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into())))
+                Some(self.make_na(sig, str_sym?, NaValue::Str(s.into_bytes().into())))
             }
             // `float : String -> Float` — parse the string (partial: not every string is a float).
             ConvOp::StringToFloat => {
-                let f = num::parse_double(&self.as_str(kids[0])?)?;
+                let s = self.as_str(kids[0])?;
+                let f = num::parse_double(std::str::from_utf8(&s).ok()?)?;
                 Some(self.make_na(sig, float_sym?, NaValue::Float(f.to_bits())))
             }
             // `decFloat : Float Nat -> DecFloat` — decompose into `< sign, "digits", exp >` with the value
@@ -210,7 +214,7 @@ impl Runtime {
                     Int::from_nat(&Nat::from_u64(exp as u64))
                 };
                 let sign_dag = self.make_int(sig, nat, sign_val)?;
-                let digits_dag = self.make_na(sig, str_sym?, NaValue::Str(digits.into()));
+                let digits_dag = self.make_na(sig, str_sym?, NaValue::Str(digits.into_bytes().into()));
                 let exp_dag = self.make_int(sig, nat, exp_val)?;
                 Some(self.make_free(sig, dec_float?, vec![sign_dag, digits_dag, exp_dag]))
             }
@@ -496,8 +500,8 @@ impl Runtime {
         }
     }
 
-    /// Read a string value from a `NodeTerm::Na::Str`, or `None` (not a string literal/result).
-    pub(crate) fn as_str(&self, id: DagId) -> Option<Rc<str>> {
+    /// Read a string value (raw bytes) from a `NodeTerm::Na::Str`, or `None` (not a string literal/result).
+    pub(crate) fn as_str(&self, id: DagId) -> Option<Rc<[u8]>> {
         match &self.node(id).term {
             NodeTerm::Na { value: NaValue::Str(s), .. } => Some(s.clone()),
             _ => None,
@@ -528,16 +532,21 @@ impl Runtime {
         not_found: Option<SymbolId>,
     ) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
-        let make_str = |this: &mut Self, s: String| this.make_na(sig, str_sym, NaValue::Str(s.into()));
+        let make_str = |this: &mut Self, s: Vec<u8>| this.make_na(sig, str_sym, NaValue::Str(s.into()));
         match op {
             StrOp::Concat => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
-                Some(make_str(self, format!("{a}{b}")))
+                let mut v = a.to_vec();
+                v.extend_from_slice(&b);
+                Some(make_str(self, v))
             }
+            // `length : String -> Nat` — the **byte** count (Maude's Rope length).
             StrOp::Length => {
-                let len = self.as_str(kids[0])?.chars().count();
+                let len = self.as_str(kids[0])?.len();
                 self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(len as u64)))
             }
+            // `substr : String Nat Nat -> String` — a **byte** slice with skip/take clamping (start beyond
+            // the end ⇒ empty; overlong length ⇒ truncated), exactly like the char form but over bytes.
             StrOp::Substr => {
                 let nat = nat?;
                 let a = self.as_str(kids[0])?;
@@ -546,30 +555,28 @@ impl Runtime {
                     return None;
                 }
                 let (start, len) = (start.magnitude().to_usize()?, len.magnitude().to_usize()?);
-                let r: String = a.chars().skip(start).take(len).collect();
+                let r: Vec<u8> = a.iter().copied().skip(start).take(len).collect();
                 Some(make_str(self, r))
             }
-            // `ascii : Char -> Nat` — the code of a one-character string (else fall through). For an ASCII
-            // char the scalar value equals Maude's byte value (the strings here are byte/ASCII-oriented).
+            // `ascii : Char -> Nat` — the byte value of a one-**byte** string (else fall through).
             StrOp::Ascii => {
                 let s = self.as_str(kids[0])?;
-                let mut cs = s.chars();
-                match (cs.next(), cs.next()) {
-                    (Some(c), None) => {
-                        self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(u32::from(c) as u64)))
-                    }
-                    _ => None, // not a single character
+                match s.as_ref() {
+                    [b] => self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(u64::from(*b)))),
+                    _ => None, // not a single byte
                 }
             }
-            // `char : Nat ~> Char` — the one-character string for a code (partial: a valid scalar value).
+            // `char : Nat ~> Char` — the one-**byte** string for a code `0..=255` (256+ falls through: A2f).
             StrOp::Char => {
                 let n = self.as_int(kids[0], nat?)?;
                 if n.is_negative() {
                     return None;
                 }
-                let code = u32::try_from(n.magnitude().to_u64()?).ok()?;
-                let c = char::from_u32(code)?;
-                Some(make_str(self, c.to_string()))
+                let code = n.magnitude().to_u64()?;
+                if code > 255 {
+                    return None; // byte domain is 0..=255
+                }
+                Some(make_str(self, vec![code as u8]))
             }
             // `find` / `rfind : String String Nat -> FindResult` — C++ `std::string::find`/`rfind`
             // semantics over the byte sequence (≡ char index for ASCII): first/last occurrence of `pat`
@@ -582,7 +589,7 @@ impl Runtime {
                     return None;
                 }
                 let start = start.magnitude().to_usize()?;
-                let (hay, needle) = (s.as_bytes(), pat.as_bytes());
+                let (hay, needle) = (s.as_ref(), pat.as_ref());
                 let found = if matches!(op, StrOp::Find) {
                     byte_find(hay, needle, start)
                 } else {
@@ -602,18 +609,18 @@ impl Runtime {
                 let s = self.as_str(kids[0])?;
                 Some(make_str(self, s.to_ascii_lowercase()))
             }
-            // `isX : Char -> Bool` — the C `ctype` class of a single character (else fall through).
+            // `isX : Char -> Bool` — the C `ctype` class of a single **byte** (else fall through). A byte
+            // ≥ 128 maps to a non-ASCII `char`, which every `is_ascii_*` check rejects (in no C-locale class).
             StrOp::IsClass(class) => {
                 let s = self.as_str(kids[0])?;
-                let mut cs = s.chars();
-                let c = match (cs.next(), cs.next()) {
-                    (Some(c), None) => c,
-                    _ => return None, // not a single character
+                let b = match s.as_ref() {
+                    [b] => *b,
+                    _ => return None, // not a single byte
                 };
                 let h = bool_?;
-                Some(self.make_const(sig, if char_in_class(c, class) { h.true_ } else { h.false_ }))
+                Some(self.make_const(sig, if char_in_class(b as char, class) { h.true_ } else { h.false_ }))
             }
-            // `startsWith` / `endsWith : String String -> Bool`.
+            // `startsWith` / `endsWith : String String -> Bool` (byte prefix/suffix).
             StrOp::StartsWith | StrOp::EndsWith => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
                 let res = if matches!(op, StrOp::StartsWith) {
@@ -624,19 +631,26 @@ impl Runtime {
                 let h = bool_?;
                 Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
             }
-            // `trim` / `trimStart` / `trimEnd : String -> String` — strip C-whitespace.
+            // `trim` / `trimStart` / `trimEnd : String -> String` — strip C-whitespace **bytes**.
             StrOp::Trim | StrOp::TrimStart | StrOp::TrimEnd => {
                 let s = self.as_str(kids[0])?;
-                let t = match op {
-                    StrOp::TrimStart => s.trim_start_matches(is_c_space),
-                    StrOp::TrimEnd => s.trim_end_matches(is_c_space),
-                    _ => s.trim_matches(is_c_space),
-                };
-                Some(make_str(self, t.to_string()))
+                let (mut lo, mut hi) = (0, s.len());
+                if matches!(op, StrOp::Trim | StrOp::TrimStart) {
+                    while lo < hi && is_c_space(s[lo] as char) {
+                        lo += 1;
+                    }
+                }
+                if matches!(op, StrOp::Trim | StrOp::TrimEnd) {
+                    while hi > lo && is_c_space(s[hi - 1] as char) {
+                        hi -= 1;
+                    }
+                }
+                Some(make_str(self, s[lo..hi].to_vec()))
             }
             StrOp::Lt | StrOp::Le | StrOp::Gt | StrOp::Ge => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
-                let ord = a.as_ref().cmp(b.as_ref());
+                // Maude's `Rope::compare`: signed-byte lexicographic (a high byte sorts before ASCII).
+                let ord = crate::dag::rope_cmp(&a, &b);
                 let res = match op {
                     StrOp::Lt => ord.is_lt(),
                     StrOp::Le => ord.is_le(),

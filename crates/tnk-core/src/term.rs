@@ -47,8 +47,8 @@ impl Term {
     pub fn float(symbol: SymbolId, value: f64) -> Self {
         Term::Na { symbol, value: NaValue::Float(value.to_bits()) }
     }
-    /// A string literal (`<Strings>`).
-    pub fn string(symbol: SymbolId, value: &str) -> Self {
+    /// A string literal (`<Strings>`) — a raw byte sequence (Maude strings are bytes, not UTF-8).
+    pub fn string(symbol: SymbolId, value: &[u8]) -> Self {
         Term::Na { symbol, value: NaValue::Str(Rc::from(value)) }
     }
     /// A quoted-identifier literal (`<Qids>`), stored without the leading quote.

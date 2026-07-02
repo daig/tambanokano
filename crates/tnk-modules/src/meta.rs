@@ -870,7 +870,8 @@ impl MetaDescent<'_> {
         let term = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
         let printed = print_pretty(&loaded.built, self.interner, term, false);
         if to_string {
-            return Some(ctx.make_na(hooks.ops["stringSymbol"], NaValue::Str(printed.into())));
+            // A string value is raw bytes; the printed ASCII text becomes those bytes.
+            return Some(ctx.make_na(hooks.ops["stringSymbol"], NaValue::Str(printed.into_bytes().into())));
         }
         let tokens = tokenize(&printed, self.interner);
         let texts: Vec<String> = tokens.iter().map(|t| self.interner.resolve(t.sym).to_string()).collect();
@@ -1740,7 +1741,7 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
             let head = if count == "1" { base } else { format!("{base}^{count}") };
             NodeShape::Iter(head, vec![arg])
         }
-        NodeRepr::Str(s) => NodeShape::Leaf(format!("{s:?}.{sort}")),
+        NodeRepr::Str(s) => NodeShape::Leaf(format!("{:?}.{sort}", String::from_utf8_lossy(s))),
         NodeRepr::Qid(q) => NodeShape::Leaf(format!("'{q}.{sort}")),
         NodeRepr::Float(f) => NodeShape::Leaf(format!("{f}.{sort}")),
     };
@@ -2462,7 +2463,7 @@ fn up_pattern(
         }
         Term::Na { symbol, value } => {
             let rendered = match value {
-                NaValue::Str(s) => format!("{s:?}"),
+                NaValue::Str(s) => format!("{:?}", String::from_utf8_lossy(s)),
                 NaValue::Qid(q) => format!("'{q}"),
                 NaValue::Float(b) => format!("{}", f64::from_bits(*b)),
             };
