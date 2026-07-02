@@ -420,4 +420,4 @@ C++ source `~/code/maude-lang/Maude/src/`: drivers `Mixfix/{erewrite,execute,loo
 `*ManagerSymbol.{hh,cc}` (+ `*Actions/*Stuff/*Async/*Outcomes/*Signature.cc`); signals/REPL
 `Mixfix/{interact,loopSymbol}.cc`; syntax `Mixfix/{lexer.ll,modules.yy,process.cc,ooProcess.cc,fancySymbols.cc}`;
 prelude `src/Main/prelude.maude` (CONFIGURATION/LOOP-MODE) + `src/Main/{file,socket,process}.maude` (protocols).
-Decision: `03-open-decisions.md` §D5. Roadmap: `roadmap.md` Phase 2 item 5.
+Decision: `03-open-decisions.md` §D5. Roadmap: `roadmap.md` §G6 (prelude tail + IO stance).

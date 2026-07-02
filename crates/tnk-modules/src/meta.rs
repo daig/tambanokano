@@ -39,8 +39,8 @@
 //! combinator + matchrew + conditional-rule surface) is **complete and conformant** in `tnk-frontend::strategy`
 //! (Phase 2.4 A–D); only the strategy *meta-reflection* (`upStratDecls`/`upSds`/`metaParseStrategy`/
 //! `metaPrettyPrintStrategy` — the Stage-5 strategy tail) stays inert here, pending sort-aware constructor
-//! resolution + a non-desugaring parse + the StratExpr→Strategy up-translation/inverse (`gaps.md`). The residuals are orthogonal corners, each riding its own
-//! subsystem (`gaps.md`): the Stage-3
+//! resolution + a non-desugaring parse + the StratExpr→Strategy up-translation/inverse (`fable-audit.md`). The residuals are orthogonal corners, each riding its own
+//! subsystem (`fable-audit.md`): the Stage-3
 //! compute corners (conditional-rule `metaApply`, conditioned `metaMatch`, the partial substitution, the
 //! AC-residue `metaXmatch` context, the exhausted-search count); and the Stage-4 boundaries (flat-mode
 //! builtin imports — `special`/`poly` op hooks *and* the imported builtin module's statements, both leaving

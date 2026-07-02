@@ -1450,7 +1450,7 @@ impl Runtime {
     /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
     /// across two separate strat frames* in one reduction would be refined once per frame — a narrow edge
     /// needing `strat` + `mb` + a repeated strat-skipped compound. C7's construction dedup can now produce
-    /// such sharing, but no observed case hits it; see `gaps.md`.)
+    /// such sharing, but no observed case hits it; see `fable-audit.md`.)
     fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>, frames: &[ReduceFrame]) {
         if self.node(id).reduced_epoch == sig.eq_epoch() || !seen.insert(id) {
             return; // already at its true sort, or already refined in this pass
@@ -3422,7 +3422,7 @@ impl Engine {
     }
 
     /// One position-fair traversal pass of `node` (Pillar A-ii): post-order (leaves first, left to
-    /// right — a *clean*, well-defined order; see the `frewrite` divergence note in `gaps.md`), giving
+    /// right — a *clean*, well-defined order; see the `frewrite` divergence note in `fable-audit.md`), giving
     /// each **non-frozen** position up to `gas` rule applications with an equational reduce between each.
     /// `remaining` bounds the rewrites across the whole run (`None` = unbounded); `progress` records
     /// whether any rule fired (the pass loop repeats while it does). Faithful to Maude's `fairTraversal`

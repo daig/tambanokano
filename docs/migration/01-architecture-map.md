@@ -6,11 +6,12 @@ manual. Per-subsystem deep-dives in `reports/A1`…`A8`.* This doubles as the **
 strategy (now largely realized — see `03-open-decisions.md`).
 
 > **Build status.** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3 Built-ins** — DONE (the
-> matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf gap, `gaps.md`). **L5
+> matcher uses naive backtracking, not Maude's bipartite/Diophantine solver — a perf gap, `fable-audit.md`). **L5
 > Frontend** (lexer incl. bracketed comments / structured colon-vars, mixfix grammar, Earley parser,
 > pretty-printer incl. `(t).Sort` disambiguation) — DONE. **L4 Operational — rules + rewriting (Pillar A)
 > DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`);
-> strategies / objects / external-IO **NOT STARTED**. **L6 Modules + parameterization — DONE**: import /
+> strategies + objects **DONE**; external-IO stays host-embedded per revised **D5** (not built in-engine).
+> **L6 Modules + parameterization — DONE**: import /
 > flatten / `+` / rename, *and* the whole parameterization layer (theories/views/parameterized-modules/
 > instantiation `M{V}` + all of "Axis A": op-maps, parameterized views, dedup, theory/module sorts, and
 > free-vs-bound nested instantiation — all three argument kinds — incl. cross-kind ad-hoc overloading) — a
@@ -19,11 +20,12 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > `RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION` + the containers `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* the
 > reflection core: `META-LEVEL` builds, and its descent family (`metaReduce`/`metaRewrite`/`metaApply`/
 > `metaMatch`/`metaSearch`/`metaSearchPath`/… + the `format`-attribute display) computes byte-identically
-> (`roadmap.md` item 3(c), Stages 1–3.5).
-> **→ IMMEDIATE NEXT: the META `up*`/query/parse layer** (`upModule`/`metaParse`/`metaPrettyPrint`/the
-> sort-kind queries — Stage 4), then the strategy language, then objects/IO. **L7 Reflection/meta** core is
-> done; its **symbolic** half (unify/variant/narrow) and **L8 Symbolic** are Phase 3.2/3.3 (NOT STARTED).
-> Feature inventory (§3) = the remaining to-do list.
+> — as do the META `up*`/query/parse layer, the strategy language, and the object system
+> (`omod`/`erewrite`/STD-STREAM). **L7 Reflection/meta** core is done; its **symbolic** half
+> (unify/variant/narrow) and **L8 Symbolic** are NOT STARTED (`roadmap.md` §G).
+> **Current verified state incl. all known deviations: `../../fable-audit.md`** (the 2026-07-01
+> differential audit); forward plan: `roadmap.md` (correctness-first, rewritten post-audit). Feature
+> inventory (§3) remains the parity target list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*

@@ -1,344 +1,266 @@
-# Roadmap — what remains (Phase 2 and beyond)
+# Roadmap — migration completion (rewritten 2026-07-01, post-audit)
 
-Phase 1 (functional engine) and Phase 1.5 (correctness hardening) are complete. This is the forward plan.
-Each phase ends at a runnable, conformance-verified milestone and grows the `conformance/` suite. The C++
-subsystem detail behind each item is in `reports/A1–A8`; the foundational tech choices are in
-`03-open-decisions.md` (D5/D6/D7 are the still-pending forward decisions).
+Ground truth for current state: **`fable-audit.md`** (repo root) — the 2026-07-01 differential audit
+against Maude 3.5.1. This roadmap sequences the remaining work; every "§" reference below is into the
+audit. The build history that used to live here (Phases 0–2, all landed) is in git history.
 
-## Phase 2 — System modules + modularity
+**Ordering principle: correctness before new feature surface.** Nothing new gets built on top of a layer
+with known wrong values. Concretely: first make every *accepted* input compute what Maude computes and
+every panic impossible (A, B); then make tnk *accept* what Maude accepts (C); then the two architecture
+reworks that block classes of fidelity (D); then diagnostics and the tool surface (E, F); only then the
+genuinely new subsystems (G). Within each phase, items are independent unless a coupling hazard is noted.
 
-The jump from a *functional* engine to a *rewriting* one, plus the module algebra that lets the real
-prelude load.
+Per project rule, no implementation-time estimates — each item instead notes what the work touches and
+where it is fragile.
 
-1. **Rules + rewriting (Pillar A) — DONE.** `rl`/`crl` (incl. the `=>` rewrite-condition), `rewrite`
-   (rule-fair) / `frewrite` (position-fair, frozen-aware), `search` (`=>1`/`=>+`/`=>*`/`=>!`, `such that`,
-   bounds, `show path`/`graph`), `continue` — all byte-conformant (`conformance/{rewrite,frewrite,crl,
-   search,rewrite-cond}.maude`). Built on a separate rule table (never read by `reduce`), the shared
-   `drive_match` seam, and a lazy hash-consed state-transition graph (`search.rs`). **Still open (Phase 2):**
-   object-message-fair `frewrite`/`erewrite` (needs objects, item 5); `frozen`'s lazy-`strat` interaction +
-   search/rewrite-condition trace (`gaps.md`). Reference: `reports/A6-operational.md`.
-2. **Parameterized programming (Pillar B) — DONE (mechanism + all of "Axis A").** Theories `fth`/`th`,
-   views (sort + op→op/op→term maps), parameterized modules (`{X :: T}`, `X$Elt`, structured sorts `List{X}`),
-   and instantiation `M{V}` — including every Axis-A corner case: view op-maps (A1), import/target dedup (A3),
-   theory/module-declared sorts (A4), and the entangled hard pair **parameterized views + free-vs-bound nested
-   instantiation** (A2/A5 — all three C++ argument kinds: module-view, by-parameter, theory-view; incl.
-   `LIST{List{Nat}}` nesting, cross-kind ad-hoc overloading with `(t).Sort` disambiguation, and structured-sort
-   memberships). The whole layer is a pure `tnk-modules` `PreModule → PreModule` transform — the kernel
-   (`build_module`/grammar) is **unchanged** (`List{X}` / `X$Elt` are string-keyed sorts). All byte-conformant
-   (`conformance/{theory-*,view-*,param-*,instantiation-*}.maude`). The **chained multi-level instantiation**
-   `M{ToTheory}{Arg}` (the SORTABLE-LIST family — `LIST{STRICT-WEAK-ORDER}{X}` renamed to `List{X}`) now
-   loads too: the parameter's `$`-sort binds to the final chain level, and chained imports' renaming items
-   are parameter-substituted so the chain name collapses level by level (`conformance/instantiation-chained.maude`;
-   `SORTABLE-LIST{Nat<}` sorts byte-identically). The one residual (orthogonal, in `gaps.md`):
-   identity-collapse rewrite **count** (the AC matcher, reproduces non-parameterized). Reference:
-   `reports/A5-modules-parameterization-repl.md`.
-3. **The real prelude — `poly`/`Universal` + loading the actual library. ← DONE on the data path; the only
-   non-loading modules are objects-gated.** The data library + the **whole META-LEVEL surface** (item (c),
-   Stages 1–5) are complete; the remaining prelude modules (`LEXICAL`/`LOOP-MODE`, the `[object]` attribute)
-   need objects/IO (Phase 2 item 5), and the symbolic/SMT/strategy *implementations* are Phase 3.2/3.3 /
-   item 4. The real
-   `BOOL`, `NAT`, `LIST{Nat}`, the container library, **and all the built-in data types** (`INT`/`RAT`/
-   `FLOAT`/`STRING`/`QID`/`CONVERSION` + the leaf specials) load and reduce **byte-identically** to the
-   reference. **`META-LEVEL` now builds and computes byte-identically across the descent family AND the
-   level-shift / query / syntax layer** (item (c), Stages 1–5 — the down/up maps, the whole
-   `metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/… family, **the `up*` family**
-   (`upModule`/`upImports`/`up{Sorts,SubsortDecls,OpDecls,Mbs,Eqs,Rls}`/`upView`/`upTerm`/`downTerm`), **the
-   sort/kind queries** (`sortLeq`/`sameKind`/`leastSort`/`lesserSorts`/`glbSorts`/`completeName`/
-   `getKind(s)`/`maximal`/`minimalSorts`/`maximalAritySet`), **`metaParse`/`metaPrettyPrint`/
-   `metaPrintToString`**, and **`metaWellFormed*`** — including `format`-attribute display). The
-   symbolic/SMT/strategy descent is declared and **reduces inert** (Stage 5 — `descend`'s exhaustive
-   `=> None` arm; never misfires) until its backends land. The only prelude modules that still **don't**
-   build are the few that import `QID-LIST`/objects (the parameterized-view gap + the `[object]` attribute —
-   both off the data path, Phase 2 item 5). `poly-universal-prelude.md` is a record of the gateway. What
-   landed:
-   - **`poly` / the `Universal` sort** — a `Universal`-typed op (`_==_`/`_=/=_`/`if_then_else_fi`) is expanded
-     into one concrete instance **per connected component** (eager per-kind, in `build_sig` after
-     `close_sorts`); no new kernel reduction code (the existing `Equality`/`Branch` special ops reduce each
-     instance). The `SystemTrue`/`SystemFalse` anchors and bare-boolean conditions came with it. **(M0)**
-   - **NAT built-ins** — the `~>` partial arrow + the arithmetic / bitwise / shift codes
-     (`xor`/`&`/`|`/`sd`/`modExp`/`>>`/`<<`) over `malachite` bignums. **(M1)**
-   - **The container substrate** — module-local variable aliases (the flattener was leaking imported `var`s,
-     mistyping `LIST`'s `append`) and **AU identity-collapse matching** (a pattern `E L` matches a singleton
-     `c` as `c nil`) — the two things `LIST{Nat}` needed beyond the existing Pillar-B module algebra. **(M2)**
+---
 
-   **Prelude work, in dependency order (all ✅ DONE — the data path loads & runs end-to-end):**
-   - **(a) Container library — ✅ DONE (the data structures).** `EXT-BOOL`, `SET{Nat}`, `MAP{Nat,Nat}`,
-     `ARRAY{Nat,Nat0}` all load and reduce byte-identically (`conformance/prelude-{set,map,array}.maude`). It
-     took the **`[Sort]` kind notation** (`var B : [Bool]`, `op undefined : -> [Y$Elt]` → `error_sort(kind_of
-     S)`), **ACU identity-collapse matching** (the AU analog), and three problems they surfaced: **non-linear
-     ACU** matching (`E in (E, S)` — the pure path now deep-equal-checks pre-bound vars), the **assoc-list
-     separator spacing**, and the **`id:`-attribute parse** bug (`collect_until(["]"])` swallowed `prec`/
-     `format`, defaulting the constructor precedence). CUI collapse is unneeded (no comm-only-with-`id:` op).
-     The whole **container-view frontend** now loads: parameterized view declarations + structured-sort
-     renamings parse, the eq parser handles a `[_]`-list rhs / trailing `[owise]`, and **chained
-     instantiation** `M{ToTheory}{Arg}` flattens correctly — so `NAT-LIST`/`QID-LIST`/`QID-SET` build &
-     reduce, the `[_]`-list `LIST*`/`SET*` build, and the `SORTABLE-LIST` family loads (`SORTABLE-LIST{Nat<}`
-     sorts byte-identically). Coverage: `conformance/{view-parameterized,eq-bracket-rhs,instantiation-chained}.maude`.
-   - **(b) The remaining built-in data types — ✅ DONE.** `INT` (`abs`, `~`, signed two's-complement
-     bitwise), `RAT`, `FLOAT` (the full op set — `rem`/`^`/`floor`/`ceiling`/`min`/`max`/`exp`/`log`/trig —
-     and Maude's **partiality**: `/0` and out-of-domain NaN don't reduce, leaving the term at kind `[Float]`,
-     while `log(0.0) = -Infinity` does), `STRING`/`QID` (`ascii`/`char`/`find`/`rfind`/case, the STRING-OPS
-     `ctype` predicates + `startsWith`/`endsWith`/`trim`, `string`/`qid`), `CONVERSION` (`float`/`rat` —
-     exact float↔rational — `string`/`rat` base conversion, `string`/`float`, `decFloat`); plus the leaf
-     special ops `CommutativeDecomposeEqualitySymbol` (INITIAL-EQUALITY-PREDICATE), `RandomOpSymbol`
-     (RANDOM — MT19937 seed 0), and `CounterSymbol` (COUNTER — a stateful *rule*-special: inert under
-     `reduce`, advancing 0,1,2,… under `rewrite`/`frewrite`, reset per command). All byte-identical to the
-     reference (`conformance/prelude-tier2.maude`, 43 reduces; `prelude_tier2_through_repl`). This needed
-     four cross-cutting pieces beyond "more codes": the **`in <MODULE> :` command qualifier** (reduce in any
-     loaded module — the natural way to exercise the real prelude); a **`Term::Na` literal** (so a float/
-     string/qid constant can sit in an equation rhs — `eq pi = 3.14…`); **value-dependent NA sorts**
-     (length-1 string → `Char`, finite float → `FiniteFloat`); **`~>` partiality tracking** (a partial op's
-     range is its kind); and a **punctuation-aware `split_mixfix`** (so the `_=[_]_` / `<_,_,_>` / `[]` / `{}`
-     operators whose names lex with brackets parse and print). Breadth, plus that handful of seams.
-   - **(c) The reflective wall — `META-LEVEL`** (META-TERM/MODULE/VIEW/LEVEL + descent functions
-     `metaReduce`/`metaApply`/…). A major new subsystem (= Phase 3 item 1), gated on STRING/QID. **✅ DONE —
-     Stages 1–5** (`conformance/prelude-meta.maude`, `prelude_meta_through_repl`): the reflection core (the
-     descent family), the `up*`/query/parse/wellformed layer (Stage 4), and the inert symbolic/SMT/strategy
-     declarations (Stage 5) — the whole implementable surface computes byte-identically; only the
-     backend-gated *implementations* (Phase 3.2/3.3, item 4) remain. **Stage
-     2 — the reflection core: `metaReduce`/`metaNormalize` compute, byte-identically** (value, sort, and
-     rewrite count). The
-     descent seam is a `DescentOps` trait + a `MetaCtx` view of the engine, defined in `tnk-core` and
-     threaded through `reduce` (kernel-internal callers pass a `NullDescent`); the handler (`tnk-modules`,
-     which owns the build pipeline + module db) **down**-translates the meta-module argument into a real
-     object module (a reconstructed `PreModule` → the ordinary `flatten`+`build`; `flatten_pre` flattens a
-     transient root), down-translates the subject meta-term, reduces in it (folding the object rewrites into
-     the command's count, Maude's accounting), and **up**-translates the result `{term, type}` (constants
-     `'c.S`, applications `'f[…]`, the iter form `'s_^n[…]`). The meta-rep symbols are resolved from each
-     descent op's `op-hook` list by **signature** (name + kinds) into `MetaHooks`. This also needed the
-     **`<Qids>` classification** — a `Qid` constant's least sort is text-dependent (`'0.Zero` → Constant,
-     `'NzNat` → Sort, `'X:S` → Variable, `'[K]` → Kind), which also makes META-TERM's `getName`/`getType`
-     reduce. **Scope of Stage 2:** the module argument is an **import expression** (`[Q]` = `sth Q is
-     including Q . … endsth`, the `['NAT]`/`['BOOL]` form); a meta-module with **inline declarations** (what
-     `upModule` emits) returned `None` at the time (stayed at kind level) — `down_module`'s declaration
-     parsing + the rest of the descent family landed in Stage 3 (below). **Stage 1 — the whole tower parses and loads with no errors**;
-     the descent functions are declared via a new `SpecialOp::Meta` (`MetaLevelOpSymbol` → `MetaOp`).
-     Getting there closed
-     five general parse/flatten gaps the meta-modules are the first to hit (none specific to reflection):
-     **grammar-aware mixfix op renaming** (`op _,_ to _;_ [prec 43]` over QID-SET — an operator comma vs an
-     argument separator can only be told apart by parsing, so the source module's parser marks the operator
-     occurrences; the optional `[…]` overrides the target op's attributes); **two-instantiation constant
-     disambiguation** (NAT-LIST + QID-LIST both inline LIST's `nil`, so a bare `nil` is sort-qualified
-     `(nil).NatList`/`(nil).QidList` on inline — the constant analogue of the existing variable inlining);
-     the **`input_complete` chunker** counting `fmod`/`endfm` only as real delimiters (depth-0, statement-
-     leading), not as the meta module-constructor operators' name fragments (`getName(fmod Q is … endfm)`);
-     **kind-homogeneous equation parsing** (a bare overloaded `none` rhs parses at the lhs's kind); and the
-     module-constructor operators whose names carry `.`/`is`/`endfm` fragments. **Stage 3 — inline
-     `down_module` + the rewriting/matching/search family.** The module argument now carries **inline
-     declarations** (sorts, subsorts, attributed ops, memberships, equations, rules), not only imports:
-     `down_module` reconstructs the full `PreModule` → the ordinary flatten/build, then installs the inline
-     statements by down-translating their meta-terms straight into the engine (`down_term_to_term` — the
-     `Term`-producing mirror of `down_term`, with indexed variables). On it the whole family computes,
-     byte-identically (value + rewrite count): **`metaRewrite`/`metaFrewrite`** (rule-/position-fair →
-     `ResultPair`), **`metaMatch`** (→ `Substitution?`), **`metaSearch`** (BFS reachability → `ResultTriple?`
-     with the goal substitution), **`metaApply`** (a labelled rule at the top → `ResultTriple?`),
-     **`metaXapply`** (a rule at any position, with the hole **context** `'f[[]]` → `Result4Tuple?`),
-     **`metaXmatch`** (extension match + context → `MatchPair?`), and **`metaSearchPath`** (the witness
-     `Trace` of up-translated rules). New plumbing: `up_substitution`, the hole-`context` up-map +
-     `up_pattern`/`up_rule` (the first of the `up*` family), and three general fixes the inline form is the
-     first to hit — **`shareWith` hook inheritance** (every descent op but `metaReduce` declares only
-     `op-hook shareWith (metaReduce …)`), **parenthesized op-name quoting** (`op (op_:_->_[_].) : …` — the
-     outer quoting parens are stripped, fixing both the grammar production and the by-profile hook resolve),
-     and **constants-first op ordering** (an `id(c)` identity resolves against an already-declared `c`). The
-     **`[]`/`{}` constant pretty-printer** (all name fragments, not just the first) came with the hole.
-     **Stage 3.5 — the `format` display layer — DONE.** `print_pretty` now honors the `format (…)` operator
-     attribute: one directive word per mixfix **gap** (`d` = the existing default spacing, `s` space, `t`
-     tab, `n` newline, `i` indent to the current level, `+`/`-` indent-level — composing as `n++i`/`ni`/`--`),
-     applied on both the binary and the assoc-fold print paths (the work-stack gained newline/indent items +
-     an indent counter); an op whose format uses an unmodelled directive (`r`/`o`, on some IO/array ops)
-     falls back to the default, so a partial model never mis-renders. The whole META descent family now
-     renders **byte-identically to the reference — value, rewrite count, *and* layout**: `_<-_`'s
-     `format (n++i d d --)` newline-indents each substitution binding (so an `Assignment` / a
-     `ResultTriple`-with-substitution / a `MatchPair` break onto continuation lines), `rl_=>_[_].`'s `s`
-     directives space `[attrs]`/`.` (so `metaSearchPath`'s up-rule prints `'c.Elt [label('ab)] .`), and
-     `__`'s `format (d n d)` newlines each element of a folded list (a two-step `metaSearchPath` `Trace` —
-     the same fold path `upModule`'s declaration lists will reuse in Stage 4). The conformance test now
-     captures each result's full multi-line value, pinned to the reference's exact bytes. So Stage 4 starts
-     on a clean compute surface — its `up*` results conform on display from the first reduce.
-     **Stage 4 — the `up*`/query/parse layer — DONE.** The inverse of Stage 3's down maps, plus the lattice
-     queries and the syntax ops, all byte-conformant (`conformance/prelude-meta.maude`'s Stage-4 block,
-     `prelude_meta_through_repl` — value + sort + count + layout). What landed:
-     `upModule`/`upImports`/`up{Sorts,SubsortDecls,OpDecls,Mbs,Eqs,Rls}` decompose a *named* module (resolved
-     in the db, flattened + built) back to its meta-rep — mirroring `down_sorts`/`down_subsorts`/`down_ops`/
-     `install_{membs,eqs,rules}`. The `Bool` (flat) flag selects the whole import closure vs. the module's own
-     declarations (the suffix of the flat build's trace vectors — flatten appends own statements last); empty
-     sets render `none`. `up_pattern` gained iter-chain collapse (`s s X` → `'s_^2['X:S]`) + NA literals;
-     `up_rule`/the new `up_condition` reconstruct conditional rules/equations. `upTerm`/`downTerm` are the
-     term-level wrappers over the **current** module — a new `MetaCtx` name resolver (`resolve_op`/`make_iter`,
-     backed by `Signature::resolve_symbol` + a stamped-id `Arena::iter`) is the seam, since they read/build in
-     the engine the redex is reducing in (not a down-translated object module). `upView` decomposes a view
-     (header + from/to module exprs + sort/op maps) from the view db. `metaParse` reuses the per-module grammar
-     (`build_command_dag`'s Earley parse, no reduce) → `ResultPair?`/`noParse`; `metaPrettyPrint`/
-     `metaPrintToString` reuse the format-aware `print_pretty` → `QidList`/`String`. The sort/kind queries
-     (`sortLeq`/`sameKind`/`leastSort`/`lesserSorts`/`glbSorts`/`completeName`/`getKind(s)`/`maximal`/
-     `minimalSorts`/`maximalAritySet`, the last reading per-overload op declarations via a new
-     `Engine::symbol_declarations`) read the engine's sort lattice; `metaWellFormed{Module,Term,Substitution}`
-     are structural checks (a kind-match walk catches the ill-typed term/binding the kernel builds permissively).
-     The Stage-4 boundaries (each its own surface, `gaps.md`): flat-mode builtin imports (op `special`/`poly`
-     hooks *and* the imported builtin module's statements — the inverse of `down_attrs`' boundary — so a flat
-     `up*` over a builtin closure stays partial/inert); the multi-attribute `ctor`-order ACU divergence;
-     non-`mixfix` print options; structured (non-`Named`) module expressions + op→term view maps. (Own
-     `[nonexec]` axioms + equation/membership labels are now retained — parsed on demand from their bubbles.)
-     **Stage 5 — the inert declarations, finalized — DONE.** The symbolic (unify/variant/narrow, Phase 3.2,
-     D6 BDD), SMT (Phase 3.3, D7 Z3), and strategy (Phase 2.4) descent — `MetaOp::Deferred` plus the
-     strategy-up maps `upStratDecls`/`upSds` — are declared, parse (the tower loads), and **reduce inert** to
-     the kind level via a single exhaustive `descend` arm (`Deferred | UpStratDecls | UpSds => None`), so a
-     newly-added descent op now forces a dispatch choice at compile time and a deferred op can never misfire.
-     `conformance/prelude-meta.maude`'s Stage-5 reduces pin the inert kind-level result (ours, not the
-     reference's — that's the point of the boundary). The implementations themselves are the respective later
-     phases. **Orthogonal residuals — *not* a subphase; each rides its own subsystem (`gaps.md`).** None
-     gates Stage 4 and Stage 4 produces none of them, so forcing them into a stage would misrepresent their
-     independence: the descent **condition evaluator** (→ conditional-rule `metaApply` + conditioned
-     `metaMatch`) and a non-empty **partial substitution** (→ `metaApply`/`metaXapply`) are reflection compute
-     corners; the **AC-residue `metaXmatch` context** rides the AC/Diophantine matcher and the
-     **exhausted-search failure count** the search engine. All conform on value + rewrite count today; only
-     the corner inputs are unhandled.
-   - Residuals, off the reduce path (`gaps.md`): the parameterized **sortable-list views** parse gap
-     (`expected 'to', found "{"`); the **`xmatch`-with-extension** over-enumeration; the ≥3-operand-infix
-     number-fold rewrite-**count** delta. The **Diophantine solver** stays separable (an AC-matcher throughput
-     optimization; the naive matcher already gives correct counts), needed for heavy AC `search`, not to load.
-4. **Strategy language** (`srew`/`dsrew`, combinators, `matchrew`, calls, strategy modules). **← LANGUAGE
-   COMPLETE: Phase 2.4 A–D done and conformant; E (meta) documented as a follow-on.** `smod`/`sth` modules
-   parse (`strat`/`strats`, `sd`/`csd`), the `srewrite`/`dsrewrite … using …` commands run, and the **whole
-   surface** enumerates solutions **byte-identically to the reference** (values + order;
-   `conformance/strategy.maude`, `strategy_core_through_repl`, 45 srew/dsrew cases): the core combinators
-   (`idle`/`fail`/`all`/rule-application-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+ `try`/`not`/`test`/
-   `or-else`)), the `match`/`xmatch`/`amatch` tests (with `such that`), **`matchrew`/`amatchrew`** (with
-   `such that` + a by-list cartesian product), **conditional rules** in application (equality/sort/matching
-   fragments solved natively; rewrite `=>` fragments driven by the application's substrategies `L{E,…}`), the
-   **application substitution** `L[x<-t]`, and strategy **definitions + calls** (`sd` — parameterless-recursive
-   cycle-detected on `(dag, name)`, parameterized via inline parameter substitution). A surface `StratExpr`
-   combinator tree (term parts as bubbles) → a resolved `RStrat` (`tnk-frontend::strategy`) → a faithful port
-   of Maude's strategic-search **process + task model**: a `VecDeque` of `(term, pending-strategy-stack, task)`
-   processes (decompose = schedule-only; rule application = a resumable per-step `AppState`; empty pending = a
-   solution); `srewrite` appends successors (FIFO round-robin), `dsrewrite` prepends (LIFO); branch/`one`/`!`
-   spawn child tasks whose sub-searches interleave with a slave-count exhaustion check. **Fair `srewrite` is
-   byte-exact** — value, order, AND per-solution cumulative rewrite count, in both modes
-   (`strategy_fair_counts_through_repl` pins the unequal-depth interleavings, e.g. `r2|(r1;p)|(r1;p;pp)` →
-   c[1] d[5] g[6]). **Remaining (narrow, scoped in `gaps.md`):** the eager-sub-search per-solution *count* for
-   `matchrew`/`amatchrew` + conditional rewrite-condition substrategies (Maude's parallel `SubtermTask`/
-   `rewriteTask` odometer; values/order/reachability faithful); a narrow `one`/`!`-after-union order swap;
-   **`xmatchrew`** (extension-rewrite residue reassembly) and **`csd`** (runtime condition bindings into the
-   body), both erroring clearly at resolve; and the strategy **meta** ops (Phase 2.4 E) — the META-LEVEL
-   Stage-5 strategy tail, kept inert. Plan: `strategy-plan.md`.
-5. **Objects / external IO** (configurations, classes/messages, fair object-message rewriting; standard
-   streams / files / sockets / processes; Ctrl-C). Brings in the **D5** `mio` reactor + `signal-hook`
-   decision. **Greenfield** — plain `rewrite`/`search` over a configuration already work (the ACU engine),
-   so the new runtime is `erewrite`'s object-message-fair scheduler (the C++ `ConfigSymbol`) + the reactor
-   (the C++ `PseudoThread`); the OO syntax (`omod`/`class`/`msg`) is Core-Maude C++, a frontend desugaring
-   here. Full C++-grounded plan (context stack / fairness / manager protocols / reactor contract / signals /
-   LOOP-MODE / phasing): `objects-io-plan.md`. **Phase A done** — the build-layer plumbing (OO op attributes
-   recorded onto the kernel symbol; `ObjectConstructorSymbol` resolved; real `CONFIGURATION` loads) with
-   `conformance/objects.maude` (bank + ping-pong) byte-identical under plain `rewrite`/`search`. Incidental
-   fixes it forced: `split_mixfix` splits on `:` (attribute ops `bal :_` now parse) and `dag_compare` orders
-   ACU elements arity-first (Maude's `orderInt`), which also resolved the old `x + 5`/`5 + x` print delta.
-   **Phase B done** — `erewrite` (the object-message-fair `ConfigSymbol` scheduler): a `config` soup's
-   `msg`-flagged messages deliver object-by-object (oid order), the `[n]` bound counts delivering passes, with
-   bank/ping-pong `erewrite` byte-identical to the reference (`objects_through_repl`). Residuals: the generic
-   `leftOver` path (multi-object rules / un-`msg` messages) and per-message-symbol round-robin.
-   **Phase C STD-STREAM done** — `erewrite` EXTERNAL mode with a `<>` portal: `write(stdout, me, str)` →
-   `stdout` manager (`StreamManagerSymbol`) emits `str` + replies `wrote` (synchronous); `getLine(stdin, me,
-   prompt)` writes the prompt + reads a line (incl. its `\n`, EOF → `""`) over a scripted/piped input buffer +
-   replies `gotLine`. `conformance/objects-io.maude` (`objects_io_through_repl`, GREET/TICKER/ECHO) is
-   byte-identical to the reference.
-   **External IO deferred (2026-06-30) — embedding direction.** The remaining IO (the `mio` reactor, FILE/
-   SOCKET/PROCESS, signals) is **not** being built in-engine; per the revised **D5** the engine stays a pure,
-   instance-based kernel and a host program owns IO (native Rust), embedding it for computation. The minimal
-   embedding API is left undesigned for now.
-   **Phase E done (`omod`/`class`/`msg`) — the OO surface language, a pure frontend desugaring
-   (`ooProcess.cc`/`ooTransform.cc`).** `omod … endom` (+ `oth`) parses; `class C | a : S` desugars to a
-   sort `C` + `subsort C < Cid` + constant `op C : -> C [ctor]` + attribute op `op a :_ : S -> Attribute
-   [ctor gather (&)]`; `subclass` → subsort; `msg` → `[ctor msg]` op; and an `omod` auto-imports the new
-   **built-in `CONFIGURATION`** (`tnk`'s first injected prelude module — the only one, added on demand when
-   imported and not user-defined; `objects.maude`'s own `CONFIGURATION` still wins). **Object-pattern
-   completion** (`ooTransform.cc`) runs on an object module's statements at build time (`load_statements`),
-   gated structurally by "class sort = strict subsort of `Cid`": each object pattern gets a fresh
-   `Atts:AttributeSet` variable (matching objects with extra attributes) and a class *constant* is rewritten
-   to a fresh class-sorted variable (subclass polymorphism), with missing-attribute copy-back and
-   subject-only kind-variable attributes handled too. `conformance/objects-omod.maude` (bank with a
-   `Savings < Account` subclass carrying an extra `rate`, + ping-pong) and `objects-omod-attrs.maude` (the
-   two attribute edge cases) are byte-identical to the reference (`objects_omod_through_repl`,
-   `objects_omod_attrs_through_repl`). Incidental: `input_complete`/module dispatch learned `omod`/`endom`;
-   `tokenize` pre-interns the `:`/`_` mixfix fragments the attribute-op desugaring splices in.
-   **Phase E parity hardening (object-system completeness).** Follow-ups closing the residuals: (1) the
-   **`erewrite` generic `leftOver` path** (`ConfigSymbol::leftOverRewrite`) — rules are classified at
-   registration into object-message pairs (fast path, `checkArgs`) vs `leftOver` (multi-object /
-   no-message), and a `leftOver` rule now fires against the reduced remainder via ACU extension matching, so
-   a **multi-object** object rule delivers under `erewrite` (it did under plain `rewrite` but not the
-   scheduler before); `conformance/objects-omod-multi.maude` exercises both paths (`objects_omod_multi_through_repl`).
-   (2) `ooTransform` completion guards: the **class-variable reuse** check (`checkVariables`), strict
-   **malformed attribute-set** disabling (`analyzeAttributeSetArgument`), and **underscore rejection** in
-   class/attribute names. (3) **`oth`** (object theory) builds/desugars/reduces byte-identically
-   (`conformance/objects-oth.maude`, `objects_oth_through_repl`). (4) **Meta-level**: `upModule` of an object
-   module emits a plain completed `mod` (Maude strips the OO fiction post-desugar) with the OO op attributes
-   (`config`/`object`/`msg`/`portal`) now up- **and** down-translated, so `metaReduce`/`metaRewrite` run over
-   object modules. The attribute op is spelled ``'bal`:_`` — the backtick-blank Maude keeps in a spaced
-   mixfix op name, reconstructed by `meta_op_name` from the grammar fragments (grounded in Maude's
-   `token.cc`) and stripped back by `strip_op_blanks` on down-translation; a completed object's attribute
-   set is ordered as Maude's ACU `makeTerm` (`canonicalize_attr_set`); and a multi-object configuration soup
-   is flattened to `makeTerm` normal form in the up-translation. So `upModule` **and**
-   `metaReduce`/`metaRewrite` over single- and multi-object modules are **byte-identical to the reference**
-   (`objects_omod_meta_through_repl`, verified by diff). *Residuals (pre-existing, non-object-specific):*
-   tnk drops inter-token blanks between two space-separated *text* tokens of an op name (`foo bar_`),
-   recoverable only around a split char (the `:` in attribute ops — the object case is covered); explicit
-   `[nonexec]` statements are not retained for `upModule` (a general meta feature — a theory's *executable*
-   axioms are shown completed, but a hand-marked `[nonexec]` proof obligation is skipped).
-   **Next:** LOOP-MODE → Full Maude (Phase 3.4).
+## 0. Verification method (cross-cutting; institute before phase A)
 
-**Milestone:** Core-Maude system-module level; the prelude library loads & runs end-to-end.
+- **Oracle-in-the-loop CI.** Adopt the audit's `diffmaude.sh` discipline as a checked-in harness: run
+  every `conformance/*.maude` through the live `maude` 3.5.1 (prelude pinned via `MAUDE_LIB` to
+  `~/code/maude-lang/maude/src/Main`) and the tnk binary, normalize only the cosmetic set (`====`, banner,
+  `Bye.`, timing tails), and diff. This kills the pin-drift class the audit found (§4.7: several pins are
+  tnk's own divergent output and invisible to the in-repo suite). Where a divergence is *accepted*, encode
+  the normalization explicitly in the harness, never in the pin.
+- **Fixture policy.** Every fix in phases A–F lands with the audit's minimal repro as a fixture, diffed
+  against the live oracle — including fixtures that only a warning line distinguishes (they activate when
+  phase E lands).
+- **Progress metric.** The C++ suite (`~/code/maude-lang/maude/tests`, 231 tests) is the external KPI:
+  8 clean passes at audit time, ~100 gated on phase-G subsystems. Track the clean-pass count per phase;
+  phase C+E should move `ResolvedBugs`/`Corner`/`Misc` en masse.
 
-## Phase 3 — Reflection, symbolic reasoning, verification (full parity)
+## A. Panics and silent wrong values — localized fixes (§3.1, §3.2)
 
-1. **Reflection / meta-level.** `META-LEVEL` descent functions (`metaReduce`/`metaRewrite`/`metaApply`/
-   `metaMatch`/`metaSearch`/…), up/down maps, meta-interpreters (nested interpreter objects). Per **D1**,
-   descent runs as an in-heap sub-context of the same engine; true meta-interpreters are separate engines.
-   Reference: `reports/A7-meta-builtins.md`.
-2. **Symbolic.** Order-sorted **unification** modulo axioms; **variants** + variant unification; **narrowing**
-   (`vu-narrow`/`fvu-narrow`). Brings in the **D6** pure-Rust BDD backend (`biodivine-lib-bdd`) for the
-   order-sorted unifier, ACU Diophantine selection, and LTL labels. Reference: `reports/A8-symbolic-smt-ltl.md`.
-3. **SMT + verification.** `check`/`smt-search` over the **D7** `z3` trait backend (+ variant satisfiability as
-   a `.maude` library); **LTL model checking** (LTL→Büchi via Gastin-Oddoux + nested DFS, counterexamples);
-   invariant model checking via search. Reference: `reports/A8-symbolic-smt-ltl.md`.
-4. **OO + Full Maude** as a frontend desugaring pass + a `.maude` meta-level library.
+The highest-severity, mostly-independent repairs. Target behavior in every case is what the oracle does;
+where Maude's behavior is warn-and-degrade, the minimal A-phase form is degrade-without-the-warning-text
+(the text arrives with phase E).
 
-**Milestone:** Maude 3 feature parity across the manual; conformance suite green.
+- **A1. Kill the panic classes (§3.1).** (a) non-linear iter patterns (`s.rs:222` assert → implement the
+  pre-bound-count subproblem, or fail the match cleanly); (b) op-decl hole/arity mismatch
+  (`engine.rs:1385`, `grammar/build.rs:170` → validate at declaration, disable the op as Maude does);
+  (c) unbound RHS/condition variables (`term.rs:371` → reject/disable the statement at build; reachable
+  via parameterized instantiation, so the check must run wherever statements are built); (d) the
+  rewrite-condition recursion stack overflow → iterative, same transform as the A1/C12 reducer work.
+  Fragility: low; each is a guard or a small state machine at a known site.
+- **A2. Builtin value bugs (§3.2).** Negative `>>`/`<<` (arithmetic shift, `mpz_fdiv_q_2exp` semantics);
+  never produce NaN (gate every float op on `!isNaN(result)` — `floatOpSymbol.cc:398` is the reference);
+  string escape lexing (`\a\b\f\r\v` + octal `\ooo`) and printing (escape control/high bytes, octal form);
+  `0 divides _` stays unreduced; `char(n > 255)` stays unreduced; `float(String)` acceptance =
+  `looksLikeFloat`, not Rust `from_str`; `-0.0 == 0.0` → true; `qid(String)` normalizes specials the way
+  `Token` does (`"a b"` ⇒ `` 'a`b ``). Fragility: low; all in `builtin.rs`/`build_term.rs`/`pretty.rs`
+  with the C++ reference cited per item in the audit.
+- **A3. Engine semantics (§3.2).** (a) `rewrite` honors `frozen` — copy `frewrite_pass`'s check into
+  `rewrite_step` (`engine.rs:2420`); remember §3.9.2: frozen blocks *rules only*, never equational
+  reduction. (b) **Import statement-application order** — Maude applies the importing module's statements
+  first; tnk applies imported-first. The flatten's statement order must flip to local-then-imported.
+  **Coupling hazard:** the META `up*` family reads a module's *own* statements as the suffix of the
+  flattened trace vectors — flipping the order breaks that suffix assumption, and trace/statement ids
+  shift; land the flatten change and the `up*` indexing change together, then re-diff the whole suite
+  (no current fixture exercises cross-module statement overlap, so green fixtures do NOT prove this fix —
+  add ones that do). (c) `id:`-only and `idem`-only ops classify as CUI, not Free
+  (`symbol.rs:482-490`), so their axioms actually apply.
+- **A4. Module-algebra wrong values (§3.2).** (a) The mixfix rename family: `rename.rs:77-89` keeps only
+  the first literal fragment of a single-token mixfix name — fix the renamed op's syntax record so
+  `op _+_ to _plus_` yields a mixfix `_plus_`; the same root breaks op→op views involving mixfix (only
+  prefix→prefix works today) — fix in the shared symbol-substitution path, and add the rename/view ×
+  {prefix,mixfix}² matrix as fixtures. (b) Redefinition invalidation: redefining a module or view must
+  dirty its transitive dependents (re-flatten on next use — the Rc/dirty-set cache design from
+  `01-architecture-map.md` §4.5 that was never built). (c) Fake parameter sorts: only substitute `X$s`
+  when `s` is declared by the parameter's theory. (d) Renaming items that touch a parameter-theory sort
+  are ignored-with-advisory, not applied. Fragility: (a) is the delicate one — the bubble re-writer and
+  the decl path must agree on the new spelling.
+- **A5. Meta reader/up-translator wrong values (§3.2).** (a) Flat (≥3-arg) assoc meta-terms must
+  down-translate: resolution by (name, arity) (`meta.rs:1490,1596`, `descent.rs:74`) needs an
+  assoc-aware arm (arity ≥ 2 folds onto the binary symbol) — fixes silent `downTerm` fallbacks and inert
+  `metaReduce` on standard metaprogram input. (b) Accept the `strat (…)` op attribute in down-translated
+  meta-modules. (c) `metaNormalize` must normalize modulo structural axioms only — split it from
+  `meta_reduce` (`meta.rs:94`). (d) `upModule` emits the parameter list of a parameterized module and
+  expands `ditto` to full per-decl attribute sets. (e) `metaXapply` AC hole-context argument order
+  (residue-first). Fragility: low-to-medium; (d) touches how PreModule parameters are represented at
+  up-translation and partially depends on D1's decision.
 
-## Ports vs. rethink (for the as-yet-unbuilt layers)
+## B. Counts and enumeration — the separable ones (§3.3)
 
-**PORT faithfully** (the algorithm is sound and data-oriented): `rewrite`/`frewrite` traversal & fairness;
-the AC **bipartite + Diophantine** matcher (currently a naive backtracking stand-in — see `gaps.md`); variant
-**folding** (most-general + descendant eviction); narrowing (v3 only); **LTL→Büchi** + nested-DFS model
-checking; the parameter/view instantiation algebra; the `.maude` prelude.
+Count fidelity that does *not* ride the AC rework (that part is D2):
 
-**RETHINK** (the C++ idiom does not survive Rust): backtracking via pointers/`goto` → iterators / resumable
-state machines; module donation + manual module-GC → the pure flatten transform already in `tnk-modules`;
-the meta descent fn-ptr table → an enum/registry; SMT build-time backend pick → the **D7** runtime trait;
-the global poll-reactor + signal plumbing → the **D5** `mio` reactor.
+- **B1. Collapse-at-top under `id:`/CUI** — pull `ac-matcher-plan.md` Phase 4 forward (it is explicitly
+  separable): unique/multiway collapse matching including the `identity == subject` branch. The
+  termination discipline is the trap (§3.9.4: one-shot — `red e` = exactly 1 rewrite; fixpoint hangs,
+  skipping undercounts; captured numeric targets in the plan §3.2). This converts the audit's
+  wrong-*value* collapse cases (§3.2 [D↑]) into conformance, not just counts. Highest-fragility item in
+  this phase — differential-test heavily, watch for loops.
+- **B2. `such that` condition rewrites count** (search per-solution counts, §3.3) and the **`=>!`
+  solution-snapshot accounting** (snapshot at normal-form confirmation, not state discovery —
+  `search.rs:218`; also fixes the metaSearch `'!` delta). Fragility: low; accounting placement.
+- **B3. AC memberships through extension** (mb/cmb against sub-multisets). Small matcher-seam addition;
+  results already agree, only counts move.
+- **B4. `metaParse` failure position** (`noParse(n)` with the real token index).
+- Deferred to D2 (do NOT attempt locally): infix builtin-fold counts, xmatch solution *sets* (AU-id
+  over-enumeration, iter/AU-bare-var under-enumeration), match-solution order. §3.9.3 explains why the
+  fold count is unfixable on the flat representation.
 
-**DROP** (no parity-v1 obligation): `FullCompiler` (experimental C++ codegen); the dead narrowing
-generations (keep v3); `freePreNet` codegen; LaTeX/XML pretty buffers; `LOOP-MODE`; redundant BDD debug
-cross-checks.
+## C. Input acceptance — accept what Maude accepts (§3.4, §3.6)
 
-## Risk register (forward items)
+- **C1. Literal/token classes (§4.6).** Glued rationals (`1/6` — a Rational token class + grammar
+  terminal), numerals > 2^64−1 (`build_term.rs:85,210` — bignum literals; the S-count is already bignum),
+  float forms (`1.`, `.5`, `1.e3`, `1e3`, `Infinity` — match `looksLikeFloat`; fix the lexer unit tests
+  that encode the wrong oracle model, `lex.rs:626`), iter input `s_^k(t)` (wire the deferred
+  `Nt::Iter`/`MakeIter`). Closes every prints-what-it-can't-read asymmetry. Fragility: low, lexer-local;
+  re-run the full suite for token-classification regressions.
+- **C2. Statement syntax + recovery.** Leading bracketed labels on `eq`/`ceq`/`mb`/`cmb` (parser.rs — the
+  rl/crl peel generalized); a bad statement drops the *statement*, not the module (and later commands must
+  not see a half-module); `[_]`-headed LHS terms; top-level junk-token recovery (warn-and-skip
+  token-by-token, consistent across contexts — also fixes the comment-before-`select` desync); `left id:`/
+  `right id:`; `[A,B]` multi-sort kind brackets; `id:` forward references (resolve identities after the
+  whole op block, constants-first pass); `frewrite [n, gas]`; bare `|` in matchrew patterns; non-ground
+  `reduce`/`rewrite` terms (`build_term.rs:234` — build open terms; variables print per Maude's
+  declared-vs-on-the-fly rule).
+- **C3. Module-expression forms.** `(M * (renaming)){Args}` (stock `linear.maude`); arity-disambiguated
+  op renaming (stock `machine-int.maude`); `label l to m`; op→term views with variable arguments; OO
+  renaming/view items (`class`/`attr`/`msg to` desugar to sort/op maps); `pconst`.
+- **C4. Hygiene enforcement (§3.6 — tnk currently accepts what Maude rejects).** Theories import only as
+  parameters (and their axioms must not execute in modules); no importing free-parameter modules; no
+  self/circular imports; reject dotted sort names; validate `[print …]` contents; reject `[0]` bounds.
+  Fragility: low; each is a check at build/flatten with a clear oracle behavior.
+- **C5. Ambiguity policy — decision needed (record as D9 in `03-open-decisions.md`).** Maude warns and
+  deterministically takes its first parse; tnk hard-errors (§3.4), which already breaks a stock library
+  file through the D1 reparse amplification. Options: (a) reproduce MSCP's pick order (faithful, but an
+  MSCP internal — investigate before committing), (b) warn-and-pick tnk's own deterministic first parse
+  (documented divergence: same acceptance, possibly different tree on genuinely ambiguous input),
+  (c) keep the error (documented stricter divergence). Default recommendation: (b) with the warning,
+  revisit (a) if differential testing surfaces real-world inputs where the pick differs.
+- **C6. REPL identity — decision needed (record as D11).** To run real `.maude` files: implicit-import
+  machinery (`set include <MOD> on/off`, BOOL on by default post-prelude — prelude.maude:31/3233),
+  `load`/`sload`/`in` with a search path (`MAUDE_LIB` analog), a standing prelude by default with a
+  `-no-prelude` opt-out, and the core CLI flags (`-no-banner`, `-no-prelude`, `-batch`,
+  `-random-seed`, `-no-advise`). This intentionally revises the "no standing prelude" stance for the
+  *tool*; the embedding/engine layer stays prelude-free (consistent with D5).
 
-1. **Parameterization corner cases** (Phase 2, "Axis A" — the B-iv deferrals) — **RESOLVED**: A1–A5 all
-   landed, differentially verified with hand-rolled fixtures. The one residual is a rewrite-**count** delta
-   from identity-collapse matching (item 3 below — orthogonal to parameterization, reproduces without it).
-2. **`poly`/`Universal` polymorphism** (Phase 2 item 3) gates loading the *real* `BOOL`→`NAT`→`LIST` chain
-   (a `Universal`-typed op instantiated per connected component); a separate feature from parameterization.
-   → Differential against `prelude.maude`'s `TRUTH`/`BOOL`/`NAT`.
-3. **AC/collapse matching at scale** — the naive matcher is correct but un-optimized; porting Maude's
-   bipartite/Diophantine matcher is a perf prerequisite for heavy AC search. → Differential `xmatch`/`search`.
-3. **BDD backend maturity** (Phase 3) gates all symbolic features. → Prototype `biodivine-lib-bdd` early
-   (the `SortBdds` sort-function + AllSat path) before committing.
-4. **Incompleteness propagation** (assoc unification) — must thread unify→variant→narrow as a flag so the
-   right warnings fire end-to-end.
-5. **Fresh-variable families** (`#n`/`%n`) — centralize in one generator.
-6. **Search/state-graph memory** — the bounded-memory re-entrant reduction (C6/F-2) is in place; the state
-   graph itself needs the same GC discipline.
+**Milestone M-accept:** stock `term-order.maude` (needs D1's point-fix below), `machine-int.maude`,
+`linear.maude` load; the C++ suite's REJECT-class diffs disappear; unpatched real-world specs parse.
 
-## Conformance strategy (cross-cutting, unchanged)
+## D. The two architecture reworks (§4.1, §4.2, §3.5)
 
-Every "PORT" claim above is validated against the C++ binary, not from memory: same input through
-`~/Downloads/Maude-3/maude` and our build, diffing canonical output. Seed new fixtures from the prelude, the
-manual's worked examples, and `~/code/maude-lang/Maude/tests`.
+- **D1. Import-stable statements — decision needed (record as D10).** Today imports re-parse imported
+  statement bubbles in the importer's grammar, making module validity context-dependent (§3.4 fundamental;
+  breaks META-MODULE+RAT coexistence, i.e. stock `term-order.maude`). Two tiers:
+  - *Point-fix (do first, unconditionally):* parse each imported bubble against its **home module's**
+    grammar/var-scope, installing the resulting term into the flattened module. Removes the breakage class
+    without restructuring; sibling-var scoping already works this way, so this closes the
+    importer-signature × imported-statement exposure.
+  - *Full rework (the D10 decision):* compiled, import-stable statement representation (Maude's semantic
+    module algebra). Unlocks: build-time typechecking of parameterized modules (not at-instance),
+    source-form `show module`, faithful `upModule` parameters (with A5d), and is the natural foundation
+    for Full Maude (G7). Decide scope after the point-fix lands and phase F's `show` work quantifies how
+    much fidelity the PreModule representation can still deliver.
+  Fragility: the point-fix touches flatten's hottest path; the full rework is the largest single item on
+  this roadmap — that is *why* it is a recorded decision, not a default.
+- **D2. AC matcher port + surface-preserving representation** — execute `ac-matcher-plan.md` (already
+  updated with audit targets). Audit-driven re-prioritization: the throughput payoff is no longer
+  "forward-looking" — a 30-element set hangs (§3.5), so the Diophantine core is a live correctness-of-
+  availability fix. The plan's Phase 6 (surface-preserving representation) now owns three fidelity
+  targets, not one: infix fold counts, `metaParse` parse-tree values, and trace shape (§3.2, §3.9.3).
+  Phase 5 (extension/residue) owns the xmatch solution-set corners (§3.3), including the S-theory/iter and
+  AU-bare-variable under-enumeration the audit added. B1 (collapse) will already have landed — keep its
+  fixtures as the Phase-4 regression net.
+- **D3. Front-end scaling (§3.5).** The ~cubic parse/build of large well-formed terms (5000-element AC
+  sum: >60s vs oracle 30ms) — profile the Earley + term-build path on flat-chain input; likely a
+  representation/algorithmic fix in the forest→term walk, independent of D2. Plus the documented
+  garbage-term Earley blowup: add a parse-effort cap with a clean error. Fragility: medium — measure
+  first, the audit only bounded the exponent, not the site.
+
+## E. Diagnostics surface (§2, §4.4)
+
+One warning/advisory sink (line-numbered, module-attributed, suppressible — `-no-advise`/
+`set show advisories`) threaded through lexer, parser, build, flatten, and runtime. Then the specific
+classes the audit hit: preregularity, collapse-at-top, ambiguity (per C5), import hygiene (per C4),
+statement drops/"discarding module", op-decl mismatches (per A1b), unbound-variable statements (per A1c),
+"unusable module" tracking (which also fixes `upImports`-on-broken-module, §3.2). This phase is wide but
+shallow; it converts a large fraction of the C++ suite's residual byte-diffs (Corner/ResolvedBugs) and
+makes real Maude workflows legible. The warning *texts* should be byte-matched to the oracle where
+fixtures assert them.
+
+## F. Tool surface (§2)
+
+Existing-Maude commands, in impact order:
+
+- **F1. `set print` family** — actually wire the flags (`flat`, `with parentheses`, `number`, `rat`,
+  `graph`, `conceal`, `attribute` incl. statement `[print …]` execution, `format` off, color). The
+  renderer hooks exist (`print_pretty`); this is plumbing plus per-flag conformance fixtures.
+- **F2. `show` family** — source-form module rendering (imports as imports, own decls with full
+  attributes, `special (…)` hooks, correct module keyword, `endfm`) — fidelity ceiling depends on D1's
+  tier; plus `show sorts/kinds/ops/vars/mbs/eqs/rls/strats/sds/summary/components/all/desugared`,
+  `show modules`/`views` in Maude's format, `show path labels/states`.
+- **F3. `parse` command; `search`/`continue` wording parity; timing display** (real cpu/real/rew-per-sec
+  in the `rewrites:` line); **Ctrl-C interruptibility** (signal-checked safe points in reduce/rewrite/
+  search — the audit's only way to survive runaway input interactively).
+- **F4. Trace completeness** — trace inside `search` and rewrite-condition sub-searches (verified gap),
+  `set trace select/exclude`, `break select` + the debugger loop (`debug`/`step`/`where`/`resume`/
+  `abort`), profiling (`set profile`, `show profile`).
+- **F5. The remaining REPL affordances** — `pwd`/`cd`/`ls`, `popd`-family, `eof`, `do clear memo`,
+  `set clear …` semantics, `memo` attribute actually caching (with `set clear memo`).
+
+## G. Remaining subsystems — new feature surface (last)
+
+Ordered by (dependency, size); references are the kept deep-dives.
+
+- **G1. Strategy-meta tail** (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`,
+  `metaSrewrite`). Prerequisites are structural, not incidental (§3.9.8): meta-constructor resolution by
+  result sort, and preserving the un-desugared surface strategy form through resolution. Also fixes the
+  §3.2 `upModule`-of-`smod` wrong result (SModule/strat-decl omission). Small relative to G2–G4; do first.
+- **G2. Symbolic:** order-sorted unification modulo axioms → variants (folding: most-general + descendant
+  eviction) → narrowing (v3 only). Brings in **D6** (`biodivine-lib-bdd` behind the facade) — prototype
+  the `SortBdds` sort-function + AllSat path *before* committing (unchanged risk). Unlocks ~30 C++ suite
+  tests and the `metaUnify`/`metaVariant*`/`metaNarrow*` descent tier. Reference: `reports/A8`.
+- **G3. SMT** (`check`, `smt-search`) over **D7** (`z3` trait backend); variant satisfiability as a
+  `.maude` library on top of G2.
+- **G4. Model checking:** LTL→Büchi (Gastin-Oddoux) + nested DFS with counterexamples; SAT-solver hook
+  for the `SatSolverSymbol`/`ModelCheckerSymbol` id-hooks so `model-checker.maude` loads. Reference:
+  `reports/A8`.
+- **G5. Meta-interpreters** (`metaInterpreter.maude`): separate `Engine` instances communicating by
+  term translation, per **D1**. Reference: `reports/A7`.
+- **G6. Prelude tail + IO stance.** `LEXICAL` (`printTokens`/`tokenize` hooks) and `LOOP-MODE`
+  (`LoopSymbol`) so the prelude finally loads whole. External IO stays host-owned per revised **D5**:
+  design the minimal embedding API when embedding is taken up; the shelved in-engine reactor plan lives
+  in `objects-io-plan.md` §§2.5–2.9/4-C,D if that stance ever reverses.
+- **G7. Full Maude** as a meta-level `.maude` library — gated on A5 + D1 + G1 (it metaprograms
+  parameterized modules; the audit's meta-fidelity items are exactly its substrate).
+
+**Milestone M-parity:** Maude 3.5.1 manual parity modulo the recorded accepted divergences; C++ suite
+clean-pass limited only by deliberate drops (LaTeX/XML buffers, `FullCompiler`, dead narrowing
+generations — the drop list in `01-architecture-map.md` §5 stands).
+
+## Decision points to record in `03-open-decisions.md` when taken
+
+- **D9 — ambiguity policy** (C5): reproduce MSCP's pick / warn-and-pick-ours / keep-error.
+- **D10 — statement representation** (D1): PreModule + home-grammar parse vs compiled module algebra.
+- **D11 — REPL identity** (C6): standing prelude + implicit imports + file commands by default, engine
+  stays pure; flag surface.
+
+## Risk register
+
+1. **Import-order fix ↔ META `up*` suffix coupling** (A3b) — land together, add cross-module-overlap
+   fixtures; green existing fixtures prove nothing here.
+2. **Collapse one-shot termination** (B1) — the known hang/undercount knife-edge; instrument Maude first.
+3. **AC enumeration order** (D2) — fixes downstream search/xmatch/strategy counts; port the Diophantine
+   sequence exactly and keep the naive matcher as the live cross-check oracle.
+4. **D1 full-rework blast radius** — every layer reads flattened modules; hence point-fix first, decision
+   second.
+5. **Ambiguity-policy faithfulness** (C5/D9) — MSCP's pick order may be impractical to reproduce; decide
+   with evidence, not aspiration.
+6. **BDD backend maturity** (G2, unchanged) — prototype before committing.
+7. **Incompleteness propagation** (G2, unchanged) — thread the assoc-unification incompleteness flag
+   unify→variant→narrow so warnings fire end-to-end.
+8. **Fresh-variable families** (`#n`/`%n`, G2) — centralize one generator before three subsystems invent
+   their own.
+9. **Search/state-graph memory** (unchanged) — the state graph needs the same GC discipline the
+   re-entrant reducer got.
+
+## Conformance strategy (unchanged in spirit, upgraded in mechanism)
+
+Every claim is validated against the C++ binary, never from memory — now continuously (phase 0's CI
+harness), with the audit's severity taxonomy (CRASH / WRONG-RESULT / WRONG-COUNT / REJECT / EXTRA /
+COSMETIC / DIAGNOSTIC) as the triage vocabulary and `fable-audit.md` as the ledger to update as items
+close. Seed new fixtures from the audit's minimal repros, the C++ `tests/` suite, and the manual's worked
+examples.

@@ -31,9 +31,10 @@ overloading with `(t).Sort` disambiguation, and structured-sort memberships). Al
 — the whole data library (`BOOL`/`NAT`/`INT`/`RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION`, and the container
 library `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* **the reflection core**: `META-LEVEL` builds, and its descent
 family (`metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/`metaSearchPath`/… + the
-`format`-attribute display) computes byte-identically (`roadmap.md` item 3(c), Stages 1–3.5). **Next:** the
-META `up*`/query/parse layer (`upModule`/`metaParse`/`metaPrettyPrint`/the sort-kind queries — Stage 4),
-then the strategy language, then objects/IO. See `roadmap.md`.
+`format`-attribute display) computes byte-identically. The META `up*`/query/parse layer, the strategy
+language, and the object system (`omod`/`erewrite`/STD-STREAM) have since landed too. **The verified
+current state — including every known deviation — is `../../fable-audit.md`** (the 2026-07-01 differential
+audit); the forward plan is `roadmap.md` (correctness-first, rewritten post-audit).
 
 ## Crate layout
 
@@ -54,9 +55,8 @@ tnk-repl      the interactive shell (lib + bin); reuses everything below
 | `README.md` (this) | orientation | what it is, status, crate map, doc index, the conformance discipline |
 | `architecture map`<br>(`01-architecture-map.md`) | current + reference | Maude's layered architecture, the feature inventory (with build status), and the cross-cutting C++→Rust strategy |
 | `decisions`<br>(`03-open-decisions.md`) | motivation | the foundational decisions **D1–D8** (engine model, GC, dispatch, bignum, IO, BDD, SMT, naming) + why |
-| `gaps.md` | known gaps | where the **built** engine differs from / simplifies Maude — accepted cosmetic divergences + deferred optimizations |
-| `roadmap.md` | remaining plan | Phase 2 (system modules + parameterization + strategies + prelude) and Phase 3 (reflection + symbolic + verification) |
-| `poly-universal-prelude.md` | bootstrap (transient) | self-contained design doc for the next task — `poly`/`Universal` polymorphism + loading the real `.maude` prelude; retire once the prelude loads |
+| `../../fable-audit.md` | conformance ground truth | the 2026-07-01 differential audit vs Maude 3.5.1 — verified deviations, missing features, non-obvious fix constraints (supersedes the retired `gaps.md`) |
+| `roadmap.md` | remaining plan | correctness-first completion plan (post-audit): panics/wrong values → counts → input acceptance → the two architecture reworks → diagnostics/tool surface → new subsystems |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 
 The detailed **current behavior** lives in the code (the crates carry thorough module/function doc comments);

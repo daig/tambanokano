@@ -169,7 +169,7 @@ fn strategy_solutions(out: &str) -> Vec<String> {
 /// Phase 2.4 — the core strategy language. `srewrite`/`dsrewrite` over `STRAT-CORE` exercising
 /// `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+`try`/`not`)/`match`/`amatch`:
 /// the solution values + order are byte-identical to the reference. (The per-solution `srewrite` rewrite
-/// count follows the BFS snapshot — see `gaps.md` — so this pins the solution values/structure.)
+/// count follows the BFS snapshot — see `fable-audit.md` — so this pins the solution values/structure.)
 #[test]
 fn strategy_core_through_repl() {
     let out = repl().eval(conformance_file!("strategy.maude")).output;
@@ -200,7 +200,7 @@ fn strategy_core_through_repl() {
             "d",                 // dsrewrite (r1 | r2) ; r3
             // Phase C — strategy definitions (`sd`) + calls. `go := r1 ; r3`, `go2 := go | r2`, and the
             // recursive `reach := idle | ((r1|r2|r3|r4) ; reach)` (cycle-detected). `dsrewrite` for the
-            // multi-solution calls (the fair `srewrite` order is the BFS follow-on, gaps.md).
+            // multi-solution calls (the fair `srewrite` order is the BFS follow-on, fable-audit.md).
             "d",                 // srewrite go
             "d ; c",             // dsrewrite go2
             "a ; b ; d ; c",     // dsrewrite reach — all states reachable from a (recursion terminates)
@@ -320,7 +320,7 @@ fn prelude_results(out: &str) -> Vec<String> {
 /// (`metaReduce`/…/`metaSearchPath`, Stages 1–3.5) and the Stage-4 up*/query/syntax layer — the `up*`
 /// family (`upModule`/`up{Sorts,…,Rls}`/`upView`/`upTerm`/`downTerm`), the sort/kind queries
 /// (`sortLeq`/…/`maximalAritySet`), `metaParse`/`metaPrettyPrint`, and `metaWellFormed*`. (The two
-/// `metaSearch` rewrite counts pin our BFS-snapshot value — see `gaps.md`; value/sort/reachability match.)
+/// `metaSearch` rewrite counts pin our BFS-snapshot value — see `fable-audit.md`; value/sort/reachability match.)
 ///
 /// Stage 1 (the parse/flatten fixes the meta-modules first exercise):
 ///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
@@ -446,7 +446,7 @@ fn prelude_meta_through_repl() {
             // Stage 5 — the symbolic/SMT/strategy descent is declared (the tower loads) but stays INERT:
             // it reduces to OUR kind-level term, never misfiring, until the Phase-3.2/3.3 (D6/D7) and
             // strategy (Phase 2.4) backends land. (These two pin our inert result, *not* the reference's —
-            // the reference computes `none` for a strat-free module; see gaps.md. The symbolic/SMT ops go
+            // the reference computes `none` for a strat-free module; see fable-audit.md. The symbolic/SMT ops go
             // through the same exhaustive `=> None` arm.)
             "[0] [StratDeclSet]: upStratDecls('S4-FOO, false)",
             "[0] [StratDefSet]: upSds('S4-FOO, false)",
@@ -678,7 +678,7 @@ fn bare_condition_through_repl() {
 /// (modExp parses), the ACU bitwise folds `xor`/`&`/`|` (multiplicity-aware — `5 xor 5 = 0`), the CUI
 /// `sd` (`|m−n|`, commutative), `modExp` (modpow), and the `>>`/`<<` shifts (incl. the bignum
 /// `1 << 64`). Each value/sort/count is the reference binary's (`red in NAT : …`); all cases are
-/// 2-operand or prefix N-ary, whose counts match exactly (see gaps.md for the ≥3-operand-infix delta).
+/// 2-operand or prefix N-ary, whose counts match exactly (see fable-audit.md for the ≥3-operand-infix delta).
 #[test]
 fn prelude_nat_m1_through_repl() {
     let out = repl().eval(conformance_file!("prelude-nat.maude")).output;
@@ -800,7 +800,7 @@ fn prelude_tier2_through_repl() {
 /// container helpers use on the builtin chain — `protecting LIST{Qid} * (sort NeList{Qid} to NeQidList)`
 /// (`QID-LIST`/`NAT-LIST`/`QID-SET`, verified byte-identical against the loaded prelude). Byte-identical to
 /// the reference. (Chained multi-level instantiation — `LIST{A}{B}`, the SORTABLE-LIST family — is the
-/// separate Axis-A5 residual in `gaps.md`.)
+/// separate Axis-A5 residual in `fable-audit.md`.)
 #[test]
 fn view_parameterized_through_repl() {
     let out = repl().eval(conformance_file!("view-parameterized.maude")).output;
