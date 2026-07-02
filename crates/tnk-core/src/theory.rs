@@ -31,6 +31,7 @@ use crate::term::{Subst, Term};
 /// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); this slice has
 /// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
 /// automata and are pure additions behind this type.
+#[derive(Clone)]
 pub(crate) enum LhsAutomaton {
     /// Free theory, **all-free** pattern: matched by direct structural recursion
     /// ([`Engine::match_pattern`]), a single deterministic solution. The hot path (this is what `fib`
@@ -101,8 +102,9 @@ impl LhsAutomaton {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
             }
             LhsAutomaton::Au(lhs) => lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Au),
-            // CUI is binary with no extension, so it ignores `ext_allowed`.
-            LhsAutomaton::Cui(lhs) => lhs.match_(rt, sig, subject).map(Subproblem::Cui),
+            LhsAutomaton::Cui(lhs) => {
+                lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Cui)
+            }
             // S reads only the runtime (the count comparison) — no `sig`/`subst` in its first phase.
             LhsAutomaton::S(lhs) => lhs.match_(rt, subject, ext_allowed).map(Subproblem::S),
         }

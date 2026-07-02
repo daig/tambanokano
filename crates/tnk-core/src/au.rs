@@ -25,6 +25,7 @@ use crate::term::{Subst, Term};
 use crate::theory::LhsAutomaton;
 
 /// A compiled AU left-hand side: the flattened pattern as an ordered list of elements.
+#[derive(Clone)]
 pub(crate) struct AuLhs {
     symbol: SymbolId,
     elements: Vec<AuElem>,

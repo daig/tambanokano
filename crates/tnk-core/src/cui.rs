@@ -21,6 +21,7 @@ use crate::term::{Subst, Term};
 use crate::theory::enumerate_alien_solutions;
 
 /// A compiled CUI left-hand side: the binary pattern `f(p1, p2)` plus the variable indices it binds.
+#[derive(Clone)]
 pub(crate) struct CuiLhs {
     symbol: SymbolId,
     p1: Term,
@@ -49,22 +50,62 @@ impl CuiLhs {
         CuiLhs { symbol, p1, p2, var_indices }
     }
 
-    /// Match the binary pattern against a CUI subject of the same operator. The two commutative pairings
-    /// are enumerated lazily in [`CuiSubproblem::next`] (each argument is matched through the full
-    /// matcher seam, which needs `&mut Runtime` for a theory-rooted argument); this phase only confirms
-    /// the subject is a CUI node of this operator and captures its two arguments.
-    pub(crate) fn match_(&self, rt: &Runtime, sig: &Signature, subject: DagId) -> Option<CuiSubproblem> {
-        let (s1, s2) = match &rt.node(subject).term {
-            NodeTerm::Cui { symbol, args } if *symbol == self.symbol => (args[0], args[1]),
-            _ => return None,
-        };
-        // A non-comm CUI op (`id:`-only / `idem`-only) matches positionally: one pairing only.
-        let pairings = if sig.symbol(self.symbol).axioms.comm {
-            vec![(s1, s2), (s2, s1)]
-        } else {
-            vec![(s1, s2)]
-        };
+    /// Match the binary pattern against a subject. Pairings are enumerated lazily in
+    /// [`CuiSubproblem::next`] (each argument is matched through the full matcher seam, which needs
+    /// `&mut Runtime` for a theory-rooted argument); this phase classifies the subject and builds the
+    /// pairing list:
+    /// - a CUI node of this operator: the whole-node pairings (both orders when `comm`), preceded —
+    ///   when extension is allowed and the op has `id:` — by the **collapse-extension** pairings
+    ///   (one pattern operand takes the identity, the other matches ONE argument, the remaining
+    ///   argument is the residue: `eq a * X = c` on `a * b` gives `b * c`, oracle-verified;
+    ///   identity-first ordering).
+    /// - any other subject, for an op with `id:`/`idem`: the **collapse** arms (Maude's
+    ///   id0/id1/idemCollapseMatch) — one operand vs the identity dag and the other vs the whole
+    ///   subject (id), or both operands vs the subject (idem).
+    pub(crate) fn match_(
+        &self,
+        rt: &Runtime,
+        sig: &Signature,
+        subject: DagId,
+        ext_allowed: bool,
+    ) -> Option<CuiSubproblem> {
+        let sym = sig.symbol(self.symbol);
+        let comm = sym.axioms.comm;
+        let idem = sym.axioms.idem;
+        let identity = sym.identity;
+        let mut pairings: Vec<Pairing> = Vec::new();
+        match &rt.node(subject).term {
+            NodeTerm::Cui { symbol, args } if *symbol == self.symbol => {
+                let (s1, s2) = (args[0], args[1]);
+                if ext_allowed && identity.is_some() {
+                    // Identity-first: the collapse-extension options precede the whole matches.
+                    pairings.push(Pairing { t1: Target::Dag(s1), t2: Target::Identity, residue: Some(s2) });
+                    pairings.push(Pairing { t1: Target::Dag(s2), t2: Target::Identity, residue: Some(s1) });
+                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(s1), residue: Some(s2) });
+                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(s2), residue: Some(s1) });
+                }
+                pairings.push(Pairing { t1: Target::Dag(s1), t2: Target::Dag(s2), residue: None });
+                if comm {
+                    pairings.push(Pairing { t1: Target::Dag(s2), t2: Target::Dag(s1), residue: None });
+                }
+            }
+            _ => {
+                // Collapse arms against a non-`f` subject (whole matches, no residue).
+                if identity.is_some() {
+                    pairings.push(Pairing { t1: Target::Dag(subject), t2: Target::Identity, residue: None });
+                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(subject), residue: None });
+                }
+                if idem {
+                    pairings.push(Pairing { t1: Target::Dag(subject), t2: Target::Dag(subject), residue: None });
+                }
+                if pairings.is_empty() {
+                    return None;
+                }
+            }
+        }
         Some(CuiSubproblem {
+            symbol: self.symbol,
+            identity,
             p1: self.p1.clone(),
             p2: self.p2.clone(),
             var_indices: self.var_indices.clone(),
@@ -72,8 +113,25 @@ impl CuiLhs {
             solutions: None,
             cursor: 0,
             bound: Vec::new(),
+            residue: None,
         })
     }
+}
+
+/// One pattern-operand target: a subject node, or the operator's (cached, already-reduced)
+/// identity dag — resolved lazily in `next` (building/refreshing the dag needs `&mut Runtime`).
+#[derive(Clone, Copy)]
+enum Target {
+    Dag(DagId),
+    Identity,
+}
+
+/// One way of pairing the two pattern operands with targets, with an optional unmatched residue
+/// argument (the CUI collapse-extension case).
+struct Pairing {
+    t1: Target,
+    t2: Target,
+    residue: Option<DagId>,
 }
 
 /// Collect the distinct variable indices of a (free) pattern term, in first-seen order.
@@ -97,15 +155,19 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
 /// pairings are enumerated lazily on the first [`next`](CuiSubproblem::next) — each argument is matched
 /// through the full matcher seam, so a theory-rooted argument needs `&mut Runtime` — then replayed.
 pub(crate) struct CuiSubproblem {
+    symbol: SymbolId,
+    identity: Option<SymbolId>,
     p1: Term,
     p2: Term,
     var_indices: Vec<u32>,
-    /// One positional pairing for a non-comm CUI op; both commutative pairings otherwise.
-    pairings: Vec<(DagId, DagId)>,
-    /// Deduped pairing solutions; `None` until the first `next` enumerates them.
-    solutions: Option<Vec<Vec<(u32, DagId)>>>,
+    /// The pairing options, in match-preference order (identity/collapse first).
+    pairings: Vec<Pairing>,
+    /// Deduped pairing solutions (bindings + the pairing's residue); `None` until the first `next`.
+    solutions: Option<Vec<(Vec<(u32, DagId)>, Option<DagId>)>>,
     cursor: usize,
     bound: Vec<u32>,
+    /// The most recent solution's unmatched argument (collapse-extension), spliced by `build_result`.
+    residue: Option<DagId>,
 }
 
 impl CuiSubproblem {
@@ -118,19 +180,29 @@ impl CuiSubproblem {
         }
         self.bound.clear();
         if self.solutions.is_none() {
-            let mut sols: Vec<Vec<(u32, DagId)>> = Vec::new();
-            for &(a, b) in &self.pairings {
+            // Resolve Identity targets to the cached (already-reduced) identity dag now that
+            // `&mut Runtime` is available — the reduced stamp is refreshed here, which is what
+            // makes a bare-variable rhs bound to it one-shot (see Runtime::identity_dag).
+            let id_dag = self.identity.map(|id_sym| rt.identity_dag(sig, id_sym));
+            let resolve = |t: Target| match t {
+                Target::Dag(d) => d,
+                Target::Identity => id_dag.expect("Identity target only built when id: present"),
+            };
+            let mut sols: Vec<(Vec<(u32, DagId)>, Option<DagId>)> = Vec::new();
+            for p in &self.pairings {
+                let (a, b) = (resolve(p.t1), resolve(p.t2));
                 let aliens = [(self.p1.clone(), a), (self.p2.clone(), b)];
                 for sol in enumerate_alien_solutions(rt, sig, subst, &aliens, &self.var_indices) {
-                    // The two pairings coincide for symmetric matches (`f(X, X) <=? f(a, a)`).
-                    if !sols.contains(&sol) {
-                        sols.push(sol);
+                    // Distinct pairings can coincide for symmetric matches (`f(X, X) <=? f(a, a)`).
+                    let entry = (sol, p.residue);
+                    if !sols.contains(&entry) {
+                        sols.push(entry);
                     }
                 }
             }
             self.solutions = Some(sols);
         }
-        let binds = {
+        let (binds, residue) = {
             let sols = self.solutions.as_ref().expect("just enumerated");
             if self.cursor >= sols.len() {
                 return false;
@@ -142,12 +214,17 @@ impl CuiSubproblem {
             subst.bind(idx, b);
             self.bound.push(idx);
         }
+        self.residue = residue;
         true
     }
 
-    /// CUI matching is always a whole match (no extension), so the result is just the instantiated rhs.
-    pub(crate) fn build_result(&self, _rt: &mut Runtime, _sig: &Signature, rhs: DagId) -> DagId {
-        rhs
+    /// A whole match is just the instantiated rhs; a collapse-extension match re-seats the rhs
+    /// beside the unmatched argument (the CUI residue: `eq a * X = c` on `a * b` -> `b * c`).
+    pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
+        match self.residue {
+            Some(res) => rt.make_cui(sig, self.symbol, rhs, res),
+            None => rhs,
+        }
     }
 }
 

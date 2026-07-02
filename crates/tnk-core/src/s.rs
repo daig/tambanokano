@@ -27,6 +27,7 @@ use crate::theory::enumerate_alien_solutions;
 
 /// A compiled S left-hand side `s^count(sub)`: the peeled successor `count` (≥ 1) and the residual
 /// sub-pattern.
+#[derive(Clone)]
 pub(crate) struct SLhs {
     symbol: SymbolId,
     count: Nat,
@@ -34,6 +35,7 @@ pub(crate) struct SLhs {
 }
 
 /// The residual sub-pattern after peeling the successors.
+#[derive(Clone)]
 enum SSub {
     /// A bare variable — absorbs a run of successors over the base.
     Var { index: u32, sort: SortId },

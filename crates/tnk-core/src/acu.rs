@@ -29,6 +29,7 @@ use crate::theory::LhsAutomaton;
 /// (each consumes one structurally-equal subject element), **aliens** (non-ground non-variable
 /// subterms, each matched recursively by its own automaton — Maude's `NonGroundAlien`), and distinct
 /// variables.
+#[derive(Clone)]
 pub(crate) struct AcuLhs {
     symbol: SymbolId,
     /// Ground, free-matchable sub-patterns; each must match one structurally-equal subject element
@@ -54,6 +55,7 @@ struct AcuAlien {
     multiplicity: u32,
 }
 
+#[derive(Clone)]
 struct AcuVar {
     index: u32,
     /// How many times this variable index occurs in the pattern (the Diophantine coefficient).
@@ -129,9 +131,11 @@ impl AcuLhs {
         // (e.g. SET's `_,_ [assoc comm id: empty]`) matches a singleton set `c` as `E = c, S = empty`,
         // which arises whenever the pattern is an *argument* (`$intersect((E, S), …)` on a singleton),
         // not only at the top. A collapsed subject is the whole multiset, so extension is off for it.
+        let mut subject_is_identity = false;
         let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
             NodeTerm::Acu { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
             NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == self.identity => {
+                subject_is_identity = true;
                 (Vec::new(), false)
             }
             _ => (vec![(subject, 1)], false),
@@ -156,7 +160,13 @@ impl AcuLhs {
         // `b`, not `b + c`). With aliens present we defer to `next` instead: matching an alien builds
         // binding nodes, so it needs `&mut Runtime` the immutable first phase does not have.
         let candidates = if self.aliens.is_empty() {
-            let lone_linear = self.vars.len() == 1 && self.vars[0].count == 1;
+            // The lone-variable collector (force the whole remainder) is Maude's no-identity
+            // behavior; a variable that can take the identity is enumerated smallest-first
+            // instead (`a + X = b` on `a + c + c`: no id ⇒ `b`; with `id: e` ⇒ `b + c + c`,
+            // X := e first with the rest as extension residue — both oracle-verified).
+            let lone_linear = self.vars.len() == 1
+                && self.vars[0].count == 1
+                && !(ext && self.identity.is_some());
             enumerate_distributions(
                 &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
                 &var_coeffs,
@@ -164,6 +174,7 @@ impl AcuLhs {
                 self.identity.is_some(),
                 !self.grounds.is_empty(),
                 lone_linear,
+                subject_is_identity,
             )
         } else {
             Vec::new()
@@ -226,6 +237,7 @@ struct Candidate {
 /// the Cartesian product of per-element compositions and filter by the global constraints:
 /// every variable non-empty unless an identity exists, and the matched portion non-empty (skip the
 /// identity no-op). Results are ordered **minimal-matched-first**.
+#[allow(clippy::too_many_arguments)]
 fn enumerate_distributions(
     mults: &[u32],
     coeffs: &[u32],
@@ -233,6 +245,7 @@ fn enumerate_distributions(
     identity: bool,
     has_grounds: bool,
     lone_linear: bool,
+    subject_is_identity: bool,
 ) -> Vec<Candidate> {
     let r = coeffs.len();
     // Collector strategy: the one linear variable takes the whole remainder (matched whole).
@@ -264,7 +277,12 @@ fn enumerate_distributions(
         }
         let all_vars_filled = identity || var_total.iter().all(|&t| t > 0);
         let matched: u32 = coeffs.iter().zip(&var_total).map(|(&c, &t)| c * t).sum();
-        if all_vars_filled && (has_grounds || matched > 0) {
+        // The all-identity assignment (matched == 0, nothing consumed) is a real Maude match
+        // ONLY when the subject IS the identity element (`eq (S ; S) = S` fires once on `e`);
+        // on any other subject an empty match is not offered (oracle: `red a` under that eq is
+        // 0 rewrites). With grounds present, a zero VARIABLE contribution still consumed the
+        // grounds, which is a genuine match (`eq a + X = c` on `a`, X := e).
+        if all_vars_filled && (has_grounds || matched > 0 || subject_is_identity) {
             out.push(Candidate {
                 to_var: chosen.iter().map(|s| s.to_var.clone()).collect(),
                 residue: chosen.iter().map(|s| s.residue).collect(),
@@ -425,7 +443,9 @@ impl AcuSubproblem {
                         .collect();
                     let binding = if pairs.is_empty() {
                         match self.identity {
-                            Some(id_sym) => rt.make_const(sig, id_sym),
+                            // The CACHED identity dag (already-reduced): what makes the
+                            // collapse rewrite one-shot (see Runtime::identity_dag).
+                            Some(id_sym) => rt.identity_dag(sig, id_sym),
                             None => {
                                 ok = false; // unreachable: filtered when no identity
                                 break;
@@ -602,6 +622,7 @@ impl AcuSubproblem {
             self.identity.is_some(),
             true,
             lone_linear,
+            false,
         );
         for cand in cands {
             let mut binds = prebound.clone();
@@ -613,7 +634,7 @@ impl AcuSubproblem {
                     .collect();
                 let binding = if pairs.is_empty() {
                     match self.identity {
-                        Some(id_sym) => rt.make_const(sig, id_sym),
+                        Some(id_sym) => rt.identity_dag(sig, id_sym),
                         None => {
                             ok = false;
                             break;

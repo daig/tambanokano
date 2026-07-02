@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
 /// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
 /// The public [`Equation`] (lhs as a [`Term`]) is compiled into this by [`Engine::add_equation`].
+#[derive(Clone)]
 struct CompiledEquation {
     /// Dense per-module id (assigned by [`Signature::push_equation`]); the frontend keeps this
     /// equation's source `Term`s + variable names at `eq_traces[id]` for the trace renderer.
@@ -106,6 +107,7 @@ struct CompiledRule {
 /// matching fragment's pattern compiled to an [`LhsAutomaton`]. Built by
 /// [`Signature::compile_condition`]. The `fresh_vars` of a matching fragment are unbound before each
 /// match attempt so backtracking re-binds cleanly.
+#[derive(Clone)]
 pub(crate) enum CompiledFragment {
     Equality { lhs: Term, rhs: Term },
     SortTest { term: Term, sort: SortId },
@@ -363,6 +365,12 @@ pub enum StmtKind {
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
+    /// Per-identity-constant cached DAG node (Maude's `BinarySymbol::getIdentityDag`, born REDUCED):
+    /// the node a collapse match binds an identity-absorbed variable to. Being already stamped
+    /// reduced is what makes the collapse rewrite one-shot (`red e` = exactly 1 rewrite) while fresh
+    /// RHS constructions still loop (`eq a = a` parity, §3.9.1/.4). Keyed by the identity constant's
+    /// symbol; values are GC roots.
+    identity_dags: HashMap<SymbolId, DagId>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic). `pub(crate)` so the rewrite-
     /// path `counter` special ([`Runtime::try_counter`]) can count its step like a rule application.
     pub(crate) rewrite_count: u64,
@@ -998,6 +1006,12 @@ impl Signature {
         let id = self.next_eq_id;
         self.next_eq_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
+        // Collapse indexing (Maude's Module::indexEquation): an equation whose lhs can COLLAPSE —
+        // its top operator's identity/idem axioms can erase it, leaving a term rooted elsewhere —
+        // must also be offered to the symbols it can collapse to, so `eq a + X = c` (id: e) is tried
+        // on a bare subject `a`, and `eq (S ; S) = S` on the identity constant `e` (§3.2 collapse,
+        // §3.9.4). Computed before `lhs` moves into the automaton.
+        let extra_targets = self.collapse_targets(&lhs, top);
         let compiled = CompiledEquation {
             id,
             lhs: LhsAutomaton::compile(lhs, self),
@@ -1007,11 +1021,102 @@ impl Signature {
             owise,
             rhs_shares,
         };
+        for t in extra_targets {
+            self.equations.entry(t).or_default().push(compiled.clone());
+        }
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
         // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
         self.eq_epoch += 1;
         id
+    }
+
+    /// The extra symbols an equation must be indexed under because its lhs can collapse to a term
+    /// rooted there (Maude computes `Term::collapseSymbols` and offers such equations beyond the top
+    /// symbol; each symbol's `mightMatchPattern` filter makes the effective set exactly {top} ∪
+    /// collapse targets). For a top operator with `id:`: every argument that is a bare variable can
+    /// absorb the identity, so with **all** arguments variables the pattern collapses to the identity
+    /// constant itself (all-identity assignment; a multiplicity-1 variable additionally makes it
+    /// collapse to *anything* — approximated here by every symbol, like Maude's offer-to-all), and
+    /// with exactly **one** non-variable argument it collapses to that argument's top symbol. CUI
+    /// `idem` patterns `f(P, P')` collapse to the shape both operands can match. ≥2 non-variable
+    /// arguments cannot collapse below two elements — no extra targets.
+    fn collapse_targets(&self, lhs: &Term, top: SymbolId) -> Vec<SymbolId> {
+        let sym = self.symbols.get(top);
+        let has_id = sym.identity.is_some();
+        let idem = sym.axioms.idem;
+        if !(has_id || idem) || sym.axioms.iter {
+            return Vec::new();
+        }
+        let args = match lhs {
+            Term::Op { args, .. } => args,
+            _ => return Vec::new(),
+        };
+        let mut targets: Vec<SymbolId> = Vec::new();
+        let mut push = |t: SymbolId, targets: &mut Vec<SymbolId>| {
+            if t != top && !targets.contains(&t) {
+                targets.push(t);
+            }
+        };
+        if has_id {
+            let id_sym = sym.identity.expect("has_id");
+            let nonvars: Vec<&Term> = args.iter().filter(|a| !matches!(a, Term::Var(_))).collect();
+            match nonvars.len() {
+                0 => {
+                    // All variables. A variable occurring exactly once can be the lone survivor of
+                    // any shape → offer everywhere (Maude's offer-to-all); with every variable
+                    // repeated (e.g. `S ; S`) only the all-identity collapse remains.
+                    let mut single_occurrence = false;
+                    for a in args {
+                        if let Term::Var(v) = a
+                            && args
+                                .iter()
+                                .filter(|b| matches!(b, Term::Var(w) if w.index == v.index))
+                                .count()
+                                == 1
+                        {
+                            single_occurrence = true;
+                        }
+                    }
+                    if single_occurrence {
+                        for (s, _) in self.symbols.iter() {
+                            push(s, &mut targets);
+                        }
+                    } else {
+                        push(id_sym, &mut targets);
+                    }
+                }
+                1 => {
+                    if let Some(t) = nonvars[0].top_symbol() {
+                        push(t, &mut targets);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if idem && args.len() == 2 {
+            // Idem collapse `f(P, P')` vs a single subject: both operands must match it. A variable
+            // operand matches anything → the other operand's top bounds the shape; two variables →
+            // any symbol.
+            match (&args[0], &args[1]) {
+                (Term::Var(_), Term::Var(_)) => {
+                    for (s, _) in self.symbols.iter() {
+                        push(s, &mut targets);
+                    }
+                }
+                (Term::Var(_), other) | (other, Term::Var(_)) => {
+                    if let Some(t) = other.top_symbol() {
+                        push(t, &mut targets);
+                    }
+                }
+                (a, _) => {
+                    if let Some(t) = a.top_symbol() {
+                        push(t, &mut targets);
+                    }
+                }
+            }
+        }
+        targets
     }
 
     /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test fragments
@@ -1473,6 +1578,25 @@ impl Runtime {
         self.make_free(sig, symbol, Vec::new())
     }
 
+    /// The cached identity DAG node for identity-constant symbol `id_sym` (Maude's `getIdentityDag`):
+    /// built once, and stamped **already reduced in the current equation epoch** on every fetch. A
+    /// collapse match binds an identity-absorbed variable to this node — never to a fresh
+    /// `make_const` — so a bare-variable RHS hands the reduce loop an already-normal node and the
+    /// collapse rewrite fires exactly once (`red e` = 1). Fresh RHS constructions never carry the
+    /// stamp, so `eq a = a` still diverges exactly like Maude (§3.9.1/.4).
+    pub(crate) fn identity_dag(&mut self, sig: &Signature, id_sym: SymbolId) -> DagId {
+        let d = match self.identity_dags.get(&id_sym) {
+            Some(&d) => d,
+            None => {
+                let d = self.make_const(sig, id_sym);
+                self.identity_dags.insert(id_sym, d);
+                d
+            }
+        };
+        self.dags.get_mut(d).reduced_epoch = sig.eq_epoch();
+        d
+    }
+
     /// Build a canonical **ACU** node for `symbol` from `raw_args` (`(element, multiplicity)` pairs).
     /// Canonicalizes to the AC(+U) normal form (Maude's `normalizeAtTop` → `insertAlien` →
     /// `sortAndUniquize`): (1) flatten arguments that are themselves `symbol`-rooted ACU nodes (scaling
@@ -1815,6 +1939,12 @@ impl Runtime {
     fn safe_point_gc(&mut self, frames: &[ReduceFrame], child_result: Option<DagId>) {
         self.dags.clear_marks();
         self.mark_registered_roots();
+        // The cached identity dags are engine-lifetime roots: collapse matches bind variables to them
+        // (and their reduced stamps are load-bearing), so they must survive every collection.
+        let identity_roots: Vec<DagId> = self.identity_dags.values().copied().collect();
+        for d in identity_roots {
+            self.mark_reachable(d);
+        }
         for frame in frames {
             self.mark_reachable(frame.original);
             // `start` is the node this frame will memoize at completion (C7 forwarding). Once the frame
@@ -2013,6 +2143,30 @@ impl Runtime {
             // this frame's slot for the rewritten term.
             if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent) {
                 self.rewrite_count += 1;
+                // Maude's `while (!isReduced())` exit: a rewrite whose result is ALREADY reduced (a
+                // bare-variable rhs bound to the cached identity dag — the collapse one-shot, §3.9.4)
+                // terminates this position immediately; the rewrite above still counted. Fresh RHS
+                // nodes never carry the stamp, so `eq a = a` keeps looping (§3.9.1).
+                if self.node(next).reduced_epoch == sig.eq_epoch() {
+                    let done = self.node(next).nf.unwrap_or(next);
+                    if self.record_whole && self.tracing() {
+                        let before = self.reconstruct_whole(sig, &stack, rebuilt);
+                        let after = self.reconstruct_whole(sig, &stack, done);
+                        self.patch_whole(before, after);
+                    }
+                    let start = stack.last().expect("empty reduce stack").start;
+                    if start != done {
+                        let n = self.dags.get_mut(start);
+                        n.nf = Some(done);
+                        n.reduced_epoch = sig.eq_epoch();
+                    }
+                    stack.pop();
+                    if stack.is_empty() {
+                        return done;
+                    }
+                    child_result = Some(done);
+                    continue;
+                }
                 // Faithful `set trace whole`: reconstruct the whole root term before/after this top
                 // rewrite (the redex `rebuilt` / result `next` threaded up through the ancestor frames)
                 // and patch the just-recorded `Rewrite` event. Gated — off by default; only allocates
@@ -2190,10 +2344,12 @@ impl Runtime {
             }
             return Some(r);
         }
-        // ACU/AU/S rewriting matches *modulo* the axioms with extension: a pattern may match a
-        // sub-multiset (ACU), a contiguous sub-sequence (AU), or a successor prefix `s^k` of an `s^n`
-        // subject (S), leaving a residue to splice back. The free/CUI theories match the whole node.
-        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
+        // ACU/AU/S/CUI rewriting matches *modulo* the axioms with extension: a pattern may match a
+        // sub-multiset (ACU), a contiguous sub-sequence (AU), a successor prefix `s^k` of an `s^n`
+        // subject (S), or — for a CUI op with identity — a single argument via pattern collapse,
+        // leaving a residue to splice back. The free theory matches the whole node.
+        let ext_allowed =
+            matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S | Theory::Cui);
         let eqs = sig.equations.get(&symbol)?;
         // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
         // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
