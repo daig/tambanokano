@@ -227,7 +227,7 @@ documented but materially understated. Every item verified with the minimal repr
 - **[N] `xmatch` over iter under-enumerates**: `xmatch X:Nat <=? 3 .` → 1 matcher (oracle 3: whole + s-residue
   portions). **[N]** AU bare-variable xmatch under-enumerates (1 vs 3). **[D-quantified]** AU-with-identity
   xmatch over-enumerates (20 vs 10 on `X Y <=? a b c`).
-- **[N] AC memberships are not applied through extension** (`mb (a | a) : Special` on `a | a | a`: 0 vs 1
+- **[N] AC memberships are not applied through extension** **RESOLVED (5028a8e — canonical prefix fold; written-order corner documented.)** (`mb (a | a) : Special` on `a | a | a`: 0 vs 1
   rewrite; cmb 2 vs 3; result terms equal).
 - **[N] `such that` condition-evaluation rewrites are not counted.** **RESOLVED (a3291c8).** `search [3] c(0) =>+ c(N) such that
   N rem 2 =/= 0` → per-solution counts oracle 4/12/20 vs tnk 2/10/18 (the missing 2 = the `rem` and `=/=`
@@ -251,7 +251,7 @@ documented but materially understated. Every item verified with the minimal repr
 
 Each of these breaks real specs; several break stock library files.
 
-- **[N] No implicit BOOL import.** Maude injects BOOL into every module (`set include BOOL on`, prelude
+- **[N] No implicit BOOL import.** **RESOLVED (6e963ae — set include BOOL wired + auto-import).** Maude injects BOOL into every module (`set include BOOL on`, prelude
   line 3233); `a == b`, `if_then_else_fi`, `and` fail to parse in any tnk module that doesn't explicitly
   `protecting BOOL`. Virtually every published Maude spec relies on it. (The repo's fixtures all
   explicitly import BOOL — the suite can't see this gap.)
@@ -264,24 +264,24 @@ Each of these breaks real specs; several break stock library files.
   with their own module's vars); the exposure is importer-signature × imported-statement-text. Always a noisy
   build error (the original parse stays as a candidate), never a silent re-parse — but module validity is
   context-dependent, which Maude's module algebra forbids.
-- **[N] Glued rational literals never parse**: `reduce in RAT : 1/6 .` → no parse (spaced `1 / 6` works);
+- **[N] Glued rational literals never parse**: **RESOLVED (04f7515; the 1/6+1/6 count via 6e963ae's lazy ACU merge).** `reduce in RAT : 1/6 .` → no parse (spaced `1 / 6` works);
   tnk *prints* `1/6`, so its own output doesn't re-read. Fixtures avoided the glued form entirely.
-- **[N] Numeric literal classes capped/missing**: integers > 2^64−1 → `bad numeral` (tnk computes and
+- **[N] Numeric literal classes capped/missing**: **RESOLVED (04f7515 + 5028a8e bignum facade).** integers > 2^64−1 → `bad numeral` (tnk computes and
   prints them fine — asymmetric); float forms `1.`, `.5`, `1.e3`, `1e3`, `Infinity` rejected (the lexer
   unit test asserts Maude rejects these — it doesn't); iter input `s_^k(t)` unparseable at ANY k (tnk
   prints that form for k ≥ 2).
-- **[N] `eq [label] : lhs = rhs .` (leading bracketed labels on eq/ceq/mb/cmb) rejected** — only rl/crl
+- **[N] `eq [label] : lhs = rhs .` (leading bracketed labels on eq/ceq/mb/cmb) rejected** **RESOLVED (04f7515.)** — only rl/crl
   accept them; the ubiquitous labeled-equation style kills whole modules.
-- **[N] A single bad statement kills its whole module** (Maude drops the statement, keeps the module) —
+- **[N] A single bad statement kills its whole module** **RESOLVED (04f7515 — statement dropped, module kept.)** (Maude drops the statement, keeps the module) —
   compounding every parse-level gap above; subsequent commands then fail with "no current module".
-- **[N] Ambiguous terms hard-error** where Maude warns, picks the first parse, and computes (`reduce f a g .`,
+- **[N] Ambiguous terms hard-error** **RESOLVED (40a68e7 — command-term warn-and-pick per D9; pick matches the oracle on the C5 cases; statement bubbles stay strict pending D1a.)** where Maude warns, picks the first parse, and computes (`reduce f a g .`,
   non-assoc `a + b + c`). tnk gives no result. (Matching Maude's pick requires reproducing MSCP's
   enumeration order — a real architecture question for the Earley parser.)
-- **[N] `reduce`/`rewrite` of non-ground terms rejected** (`red X + a .` etc. — Maude reduces open terms;
+- **[N] `reduce`/`rewrite` of non-ground terms rejected** **RESOLVED (04f7515 — inert variable atoms.)** (`red X + a .` etc. — Maude reduces open terms;
   `build_term.rs:234` demands groundness).
-- **[N] `left id:` / `right id:` rejected at parse** (one-sided identities unusable). **[N]** `pconst`
+- **[N] `left id:` / `right id:` rejected at parse** **RESOLVED (04f7515 — construction-side; matcher sidedness noted as follow-up.)** (one-sided identities unusable). **[N]** `pconst`
   (parameter constants) likewise rejected, failing the enclosing theory.
-- **[N] `(M * (renaming)){Args}` — instantiating a renamed module expression — unparseable**; breaks stock
+- **[N] `(M * (renaming)){Args}` — instantiating a renamed module expression — unparseable** **RESOLVED (04f7515 — incl. arity-disambiguated renames, label renames, op->term views with args, OO items, pconst.)**; breaks stock
   `linear.maude`. **[N]** Arity-disambiguated renaming `op f : A B -> C to g` is a self-reported stub
   ("B5 follow-up"); breaks stock `machine-int.maude`. **[N]** `label l to m` renaming items and **op→term
   views with variable arguments** (`op lt(A, B) to term A < B` — the main use of op→term) rejected;
@@ -291,20 +291,20 @@ Each of these breaks real specs; several break stock library files.
   with an advisory and builds). **RESOLVED (pre-scoreboard: fixture A4e-param-rename-shield passes from
   birth — tnk now recovers by ignoring the mapping, value-identical to the oracle; the rejection is only
   reachable via the `(M * (renaming)){Args}` form, which is finding C3a. Kept as regression net.)**
-- **[N] Top-level junk-token recovery**: Maude warns and skips token-by-token; tnk hard-errors and can
+- **[N] Top-level junk-token recovery**: **RESOLVED (04f7515 — warn-and-skip + comment-before-select fix.)** Maude warns and skips token-by-token; tnk hard-errors and can
   abandon the rest of the file (recovery inconsistent between cases). Related: **a `***`/`---` line comment
   immediately before `select` or `show` desyncs the command parser** (spurious "unexpected top-level
   token"; `reduce`/`rewrite`/`search` after a comment are fine) — breaks two C++ suite tests.
-- **[N] `id:` referencing a constant declared later in the module** → `unknown id: constant`, module
+- **[N] `id:` referencing a constant declared later in the module** **RESOLVED (04f7515 — constants declared first.)** → `unknown id: constant`, module
   unusable (declaration-order dependence Maude doesn't have; breaks `ResolvedBugs/physArgIndexOct2018`).
-- **[N] Multi-sort kind brackets `[A,B]` in declarations** rejected (`kindNameDecember2022`); single-sort
+- **[N] Multi-sort kind brackets `[A,B]` in declarations** rejected **RESOLVED (04f7515.)** (`kindNameDecember2022`); single-sort
   `[A]` works. **[N]** `generated-by` declarations and the `rpo` attribute rejected.
-- **[N] `frewrite [bound, gas]`** (the two-number form) rejected — the gas parameter is stuck at its
+- **[N] `frewrite [bound, gas]`** (the two-number form) rejected **RESOLVED (04f7515 — incl. the [_]-headed LHS and matchrew-pipe items in the same bullet.)** — the gas parameter is stuck at its
   default of 1 (`erewrite [n,m]` parses fine). **[N]** A statement whose LHS starts with a `[_]`-headed
   term (`rl [N] => [N + 1] .` over `op [_] : Nat -> Obj`) fails with "empty term" — the leading `[` is
   taken for a label/attribute bracket; nested occurrences work. **[N]** A bare `|` inside a
   `matchrew`/`amatchrew` pattern is misparsed as strategy union (parenthesizing works).
-- **[D] Two commands on one line**: tnk runs both; oracle rejects both (documented dot-heuristic risk, now
+- **[D] Two commands on one line**: tnk runs both; oracle rejects both **RESOLVED (04f7515 — whole line rejected, files with one command per line unaffected.)** (documented dot-heuristic risk, now
   characterized: tnk is more permissive).
 
 ### 3.5 Scale/robustness
@@ -325,16 +325,16 @@ Each of these breaks real specs; several break stock library files.
 
 ### 3.6 Extra acceptance (tnk accepts what Maude rejects)
 
-- **[N] A theory imported into a plain module is accepted — and its axioms EXECUTE.** `fmod M is protecting
+- **[N] A theory imported into a plain module is accepted — and its axioms EXECUTE.** **RESOLVED (70768e8 — import ignored, axioms never run.)** `fmod M is protecting
   TH .` (TH an `fth`): oracle refuses (theories import only as parameters); tnk builds M and runs the
   theory's equations as if they were module equations. The theory/module semantic distinction is not
   enforced.
-- **[N] Importing a module with FREE parameters is accepted** (instantiation through a theory-target view
+- **[N] Importing a module with FREE parameters is accepted** **RESOLVED (70768e8.)** (instantiation through a theory-target view
   leaves the parameter free; oracle refuses to import such a module; tnk builds and reduces).
-- **[N] Self-import accepted** (`fmod M is protecting M .`) — no import-cycle detection.
-- **[N]** `sort A.B .` (dotted sort names) accepted and usable; Maude rejects with warnings.
-- **[N]** Zero bounds `rew [0]`/`search [0]` accepted and run 0 steps; Maude rejects a `[0]` bound at parse.
-- **[N]** Malformed `[print …]` attribute contents parse-ignored (Maude validates and drops the statement —
+- **[N] Self-import accepted** **RESOLVED (70768e8.)** (`fmod M is protecting M .`) — no import-cycle detection.
+- **[N]** `sort A.B .` (dotted sort names) accepted and usable; **RESOLVED (70768e8.)** Maude rejects with warnings.
+- **[N]** Zero bounds `rew [0]`/`search [0]` accepted and run 0 steps; **RESOLVED (70768e8.)** Maude rejects a `[0]` bound at parse.
+- **[N]** Malformed `[print …]` attribute contents parse-ignored **RESOLVED (70768e8 — statement dropped per the oracle's validation rule.)** (Maude validates and drops the statement —
   effective ruleset differs). `[otherwise]` on a *rule* runs silently (Maude warns, then runs — same result).
 - **[N]** `exit` quits (not a Maude command).
 
