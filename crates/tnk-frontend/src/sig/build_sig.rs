@@ -5,7 +5,7 @@
 //! built-in anchors (succ/zero/string/float/qid) once all names resolve → **pass B** attach
 //! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
 
-use crate::lex::{Interner, Token, is_punct, split_mixfix};
+use crate::lex::{Frag, Interner, Token, is_punct, split_mixfix};
 use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use crate::surface::ast::{Attrs, PreModule, SpecialSpec};
 use std::collections::HashMap;
@@ -187,17 +187,31 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
                 name_to_sym.entry(cname.clone()).or_insert(sym);
-                let frags = split_mixfix(&cname, interner);
+                let mut frags = split_mixfix(&cname, interner);
+                let holes = frags.iter().filter(|f| matches!(f, Frag::Hole)).count();
+                let mut prec = od.attrs.prec;
+                let mut gather = od.attrs.gather.clone();
+                let mut format = od.attrs.format.clone();
+                if holes != 0 && holes != domain.len() {
+                    // Underscore count ≠ arity: Maude warns and clears the mixfix syntax
+                    // (entry.cc "number of underscores does not match number of arguments"),
+                    // leaving the prefix form usable; prec/gather/format go with it. The
+                    // warning text itself is deferred diagnostics (roadmap phase E).
+                    frags = vec![Frag::Tok(interner.intern(&cname))];
+                    prec = None;
+                    gather = None;
+                    format = None;
+                }
                 syntax.insert(
                     sym,
                     SymbolSyntax {
                         frags,
                         domain: domain.clone(),
                         range,
-                        prec: od.attrs.prec,
-                        gather: od.attrs.gather.clone(),
+                        prec,
+                        gather,
                         assoc: od.attrs.assoc,
-                        format: od.attrs.format.clone(),
+                        format,
                     },
                 );
                 sym
