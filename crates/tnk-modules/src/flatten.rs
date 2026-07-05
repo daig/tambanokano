@@ -553,7 +553,13 @@ fn collect_expr(
                 let mut tmp_visited = HashSet::new();
                 let inst = ModuleExpr::Instantiation(inner.clone(), args.clone());
                 collect_expr(&inst, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
-                let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
+                // The rename's structured names reference the INNER module's parameters
+                // (`sort Array{X,Y} to Vector{Y}` over ARRAY{X :: TRIV, Y :: TRIV}); the
+                // instance's sorts carry the ARGUMENT names (`Array{Nat,Int0}`), so substitute
+                // the parameters positionally into the items before matching (stock
+                // linear.maude's VECTOR/MATRIX shape).
+                let items = subst_rename_item_params(inner, args, db, items);
+                let renamed = apply_renaming(tmp.into_decls(), &items, interner)?;
                 acc.add(renamed, None);
                 return Ok(());
             }
@@ -581,6 +587,74 @@ fn unchain(expr: &ModuleExpr) -> Option<(&str, Vec<&[ModuleExpr]>)> {
         },
         _ => None,
     }
+}
+
+/// Substitute an instantiation's parameter names into a renaming's structured sort names,
+/// positionally (`Array{X,Y}` over `ARRAY{X :: TRIV, Y :: TRIV}` instantiated `{Nat, Int0}` →
+/// `Array{Nat,Int0}`; the `to` side likewise, `Vector{Y}` → `Vector{Int0}`), so the rename items
+/// match the instance's sort spellings. Non-structured names and op items pass through (an op
+/// rename's from/to get the same brace-argument treatment).
+fn subst_rename_item_params(
+    inner: &ModuleExpr,
+    args: &[ModuleExpr],
+    db: &ModuleDb,
+    items: &[RenameItem],
+) -> Vec<RenameItem> {
+    let ModuleExpr::Named(mname) = inner else { return items.to_vec() };
+    let Some(pm) = db.get(mname) else { return items.to_vec() };
+    let map: HashMap<&str, String> = pm
+        .params
+        .iter()
+        .zip(args)
+        .map(|(p, a)| (p.name.as_str(), canonical_key(a)))
+        .collect();
+    let subst = |name: &str| subst_brace_args(name, &map);
+    items
+        .iter()
+        .map(|it| match it {
+            RenameItem::Sort { from, to } => {
+                RenameItem::Sort { from: subst(from), to: subst(to) }
+            }
+            RenameItem::Op { from, to, attrs, dom_range, .. } => RenameItem::Op {
+                from: subst(from),
+                to: subst(to),
+                attrs: attrs.clone(),
+                dom_range: dom_range
+                    .as_ref()
+                    .map(|(d, r)| (d.iter().map(|s| subst(s)).collect(), subst(r))),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Rewrite each top-level brace argument of a structured name through `map` (depth-aware; nested
+/// structured arguments recurse): `Array{X,Y}` with `{X → Nat, Y → Int0}` → `Array{Nat,Int0}`.
+fn subst_brace_args(name: &str, map: &HashMap<&str, String>) -> String {
+    let Some(open) = name.find('{') else {
+        return map.get(name).cloned().unwrap_or_else(|| name.to_string());
+    };
+    if !name.ends_with('}') {
+        return name.to_string();
+    }
+    let base = &name[..open];
+    let inner = &name[open + 1..name.len() - 1];
+    let mut out_args: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, c) in inner.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out_args.push(subst_brace_args(inner[start..idx].trim(), map));
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out_args.push(subst_brace_args(inner[start..].trim(), map));
+    format!("{base}{{{}}}", out_args.join(","))
 }
 
 /// Instantiate the parameterized module `mname` with the argument-list chain `arg_lists` (one list per
@@ -625,7 +699,7 @@ fn instantiate(
         let chain: Vec<&ModuleExpr> = arg_lists.iter().map(|lvl| &lvl[i]).collect();
         let resolutions: Vec<ArgResolution> = chain
             .iter()
-            .map(|a| resolve_arg(a, views, interner, scope))
+            .map(|a| resolve_arg(a, views, db, interner, scope))
             .collect::<Result<_, _>>()
             .map_err(|e| format!("instantiation `{mname}{{…}}`: {e}"))?;
         // Import the grounding (last) target; compose op maps across the chain.
@@ -679,7 +753,7 @@ fn instantiate(
     // `LIST{X}` becomes its argument — `LIST{ToN}` for a view, `LIST{Y}` for an enclosing parameter), then
     // its own declarations under the binding. Deduped via `visited`.
     let imports: Vec<ModuleExpr> =
-        pm.imports.iter().map(|imp| subst_params_in_expr(&imp.expr, &param_to_arg)).collect();
+        pm.imports.iter().map(|imp| subst_params_in_expr(&imp.expr, &param_to_arg, db)).collect();
     for imp in &imports {
         collect_expr(imp, db, views, acc, visited, interner, scope)?;
     }
@@ -793,6 +867,7 @@ struct ArgResolution {
 fn resolve_arg(
     arg: &ModuleExpr,
     views: &ViewDb,
+    db: &ModuleDb,
     i: &Interner,
     scope: &[String],
 ) -> Result<ArgResolution, String> {
@@ -856,11 +931,11 @@ fn resolve_arg(
             let mut inner: HashMap<String, ParamBinding> = HashMap::new();
             let mut inner_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
             for (vp, ia) in v.params.iter().zip(inner_args) {
-                let r = resolve_arg(ia, views, i, scope)?;
+                let r = resolve_arg(ia, views, db, i, scope)?;
                 inner_to_arg.insert(vp.name.clone(), ia.clone());
                 inner.insert(vp.name.clone(), r.binding);
             }
-            let target = subst_params_in_expr(&v.to, &inner_to_arg);
+            let target = subst_params_in_expr(&v.to, &inner_to_arg, db);
             let sort_image =
                 v.sort_maps.iter().map(|(a, b)| (a.clone(), inst_sort(b, &inner))).collect();
             let (op_subst, op_recon) = op_maps_of(v, i)?;
@@ -989,12 +1064,36 @@ fn seg_base_name(seg: &[&Token], i: &Interner) -> Option<String> {
 /// Substitute view parameters into a module expression (a parameterized view's `to` target): replace each
 /// `Named(p)` that is a parameter with its argument expression, recursing through sums/renamings/nested
 /// instantiations. `BoxV`'s target `BOX{X}` with `X ↦ ToColor` becomes `BOX{ToColor}`.
-fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) -> ModuleExpr {
+/// Whether the expression's spine contains an instantiation (its root module's parameters are
+/// bound somewhere below).
+fn spine_has_instantiation(e: &ModuleExpr) -> bool {
+    match e {
+        ModuleExpr::Instantiation(..) => true,
+        ModuleExpr::Rename(inner, _) => spine_has_instantiation(inner),
+        ModuleExpr::Named(_) | ModuleExpr::Sum(..) => false,
+    }
+}
+
+/// The root named module of an expression, through renamings and instantiation chains.
+fn expr_root_name(e: &ModuleExpr) -> Option<&str> {
+    match e {
+        ModuleExpr::Named(n) => Some(n),
+        ModuleExpr::Rename(inner, _) => expr_root_name(inner),
+        ModuleExpr::Instantiation(base, _) => expr_root_name(base),
+        ModuleExpr::Sum(..) => None,
+    }
+}
+
+fn subst_params_in_expr(
+    expr: &ModuleExpr,
+    map: &HashMap<String, ModuleExpr>,
+    db: &ModuleDb,
+) -> ModuleExpr {
     match expr {
         ModuleExpr::Named(n) => map.get(n).cloned().unwrap_or_else(|| expr.clone()),
         ModuleExpr::Sum(a, b) => ModuleExpr::Sum(
-            Box::new(subst_params_in_expr(a, map)),
-            Box::new(subst_params_in_expr(b, map)),
+            Box::new(subst_params_in_expr(a, map, db)),
+            Box::new(subst_params_in_expr(b, map, db)),
         ),
         ModuleExpr::Rename(inner, items) => {
             use tnk_frontend::surface::ast::RenameItem;
@@ -1002,8 +1101,29 @@ fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) ->
             // import's renaming `sort List{STO}{X} to List{X}` must become `List{STO}{Nat<} to List{Nat<}`
             // when the enclosing module is instantiated, so its FROM matches the chain-named instance sort
             // `List{STO}{Nat<}` (which `WSL{STO}{Nat<}` produces) and its TO collapses it to `List{Nat<}`.
-            let names: HashMap<String, String> =
-                map.iter().map(|(p, a)| (p.clone(), canonical_key(a))).collect();
+            // SHADOWING: a rename written over a parameterized module (`(ARRAY * (sort
+            // Array{X,Y} to Vector{Y})){Nat, X}`) names the INNER module's own parameters in
+            // its items; an enclosing parameter with the same name (VECTOR's X) must not be
+            // substituted into them — the rename semantically applies BEFORE instantiation
+            // (the positional substitution happens at the instantiate-then-rename site).
+            // …but ONLY when the inner spine is an UNINSTANTIATED parameterized module
+            // (`Rename(Named(ARRAY), …)` under an outer instantiation): a rename over an
+            // already-instantiated inner (`Rename(Instantiation(LIST,[X]), sort Lst{X} to …)`,
+            // the chained-import form) names chain sorts whose brace args ARE the enclosing
+            // parameters and must keep substituting.
+            let inner_params: HashSet<&str> = if spine_has_instantiation(inner) {
+                HashSet::new()
+            } else {
+                expr_root_name(inner)
+                    .and_then(|n| db.get(n))
+                    .map(|pm| pm.params.iter().map(|p| p.name.as_str()).collect())
+                    .unwrap_or_default()
+            };
+            let names: HashMap<String, String> = map
+                .iter()
+                .filter(|(p, _)| !inner_params.contains(p.as_str()))
+                .map(|(p, a)| (p.clone(), canonical_key(a)))
+                .collect();
             let new_items: Vec<RenameItem> = items
                 .iter()
                 .map(|it| match it {
@@ -1027,11 +1147,11 @@ fn subst_params_in_expr(expr: &ModuleExpr, map: &HashMap<String, ModuleExpr>) ->
                     }
                 })
                 .collect();
-            ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map)), new_items)
+            ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map, db)), new_items)
         }
         ModuleExpr::Instantiation(base, args) => ModuleExpr::Instantiation(
-            Box::new(subst_params_in_expr(base, map)),
-            args.iter().map(|a| subst_params_in_expr(a, map)).collect(),
+            Box::new(subst_params_in_expr(base, map, db)),
+            args.iter().map(|a| subst_params_in_expr(a, map, db)).collect(),
         ),
     }
 }
@@ -1293,7 +1413,7 @@ mod tests {
         let db = ModuleDb::from_modules(s.modules);
         let mut views = ViewDb::new();
         for v in s.views {
-            crate::view::validate_view(&v, &db, &mut i).expect("valid view");
+            crate::view::validate_view(&v, &db, &views, &mut i).expect("valid view");
             views.insert(v);
         }
         (db, views, i)

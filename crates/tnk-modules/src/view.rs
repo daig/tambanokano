@@ -57,7 +57,12 @@ fn expr_base_name(e: &ModuleExpr) -> Result<&str, String> {
 /// Signature-validate a view against the module database. On success the view is well-formed enough to be
 /// stored and (later) used in an instantiation; on failure returns a diagnostic mirroring the reference
 /// binary's wording.
-pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Result<(), String> {
+pub fn validate_view(
+    v: &ViewDecl,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<(), String> {
     let from_name = expr_base_name(&v.from)?;
     let to_name = expr_base_name(&v.to)?;
 
@@ -70,10 +75,10 @@ pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Re
     db.get(to_name)
         .ok_or_else(|| format!("view `{}`: target module `{to_name}` is not defined", v.name))?;
 
-    // Flatten the source theory so its imported sorts (`Elt` from `including TRIV`, `Bool` from
-    // `protecting BOOL`) are in scope; a theory has no instantiations, so an empty view table suffices.
-    let no_views = ViewDb::new();
-    let from_flat = flatten(from_name, db, &no_views, interner)?;
+    // Flatten the source theory / target module with the REAL view table: a target may itself be
+    // built from instantiations (`INT-VECTOR = VECTOR{Int0} * (…)`, stock linear.maude), so an
+    // empty table wrongly failed its flatten ("view `Int0` is not defined").
+    let from_flat = flatten(from_name, db, views, interner)?;
     let from_sorts: HashSet<&str> = from_flat.sorts.iter().map(String::as_str).collect();
 
     // Sort-map sources must be sorts of the theory.
@@ -92,7 +97,7 @@ pub fn validate_view(v: &ViewDecl, db: &ModuleDb, interner: &mut Interner) -> Re
     if v.params.is_empty()
         && let ModuleExpr::Named(_) = &v.to
     {
-        let to_flat = flatten(to_name, db, &no_views, interner)?;
+        let to_flat = flatten(to_name, db, views, interner)?;
         let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
         for (a, b) in &v.sort_maps {
             if !to_sorts.contains(b.as_str()) {
@@ -139,7 +144,7 @@ mod tests {
              fmod NUM is sort N . op z : -> N [ctor] . endfm\n\
              view ToNum from TRIV to NUM is sort Elt to N . endv\n",
         );
-        assert!(validate_view(&views[0], &db, &mut i).is_ok());
+        assert!(validate_view(&views[0], &db, &ViewDb::new(), &mut i).is_ok());
     }
 
     /// Mapping a theory sort to a sort the target does not have is the binary's `failed to find sort` error.
@@ -150,7 +155,7 @@ mod tests {
              fmod NUM is sort N . op z : -> N [ctor] . endfm\n\
              view Bad from TRIV to NUM is sort Elt to NoSuch . endv\n",
         );
-        let err = validate_view(&views[0], &db, &mut i).unwrap_err();
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
         assert!(err.contains("failed to find sort NoSuch in NUM"), "got: {err}");
     }
 
@@ -162,7 +167,7 @@ mod tests {
              fmod NUM is sort N . endfm\n\
              view V from A to NUM is sort Elt to N . endv\n",
         );
-        let err = validate_view(&views[0], &db, &mut i).unwrap_err();
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
         assert!(err.contains("is not a theory"), "got: {err}");
     }
 
@@ -176,7 +181,7 @@ mod tests {
              fmod NUM is sort N . endfm\n\
              view V from TWO to NUM is sort Elt to N . endv\n",
         );
-        let err = validate_view(&views[0], &db, &mut i).unwrap_err();
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
         assert!(err.contains("failed to find sort Key in NUM"), "got: {err}");
     }
 }

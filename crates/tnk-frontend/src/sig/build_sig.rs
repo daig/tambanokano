@@ -616,7 +616,10 @@ fn special_op(
         "RandomOpSymbol" => SpecialOp::Random { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "CounterSymbol" => SpecialOp::Counter { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "QuotedIdentifierOpSymbol" => SpecialOp::QidOp {
-            op: qid_op(code.ok_or("QuotedIdentifierOpSymbol code")?)?,
+            op: match qid_op(code.ok_or("QuotedIdentifierOpSymbol code")?) {
+                Ok(op) => op,
+                Err(_) => return Ok(None), // unimplemented quoted-id op (printTokens/tokenize): inert
+            },
             qid_sym: op_hook_sym(spec, "quotedIdentifierSymbol", name_to_sym, i)
                 .ok_or("QuotedIdentifierOpSymbol quotedIdentifierSymbol")?,
             str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
@@ -660,7 +663,12 @@ fn special_op(
             get_line_msg: op_hook_sym(spec, "getLineMsg", name_to_sym, i),
             got_line_msg: op_hook_sym(spec, "gotLineMsg", name_to_sym, i),
         },
-        other => return Err(format!("unsupported special id-hook `{other}`")),
+        // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol,
+        // SatSolverSymbol, InterpreterManagerSymbol, …): declare the operator WITHOUT a special
+        // binding — the module loads and everything else in it works; the op itself is inert
+        // (never reduces). This is the §2 graceful-degrade stance (stock linear.maude's
+        // DIOPHANTINE, the prelude's LOOP-MODE/LEXICAL); the advisory text is phase E.
+        _other => return Ok(None),
     };
     Ok(Some(op))
 }

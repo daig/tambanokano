@@ -121,7 +121,7 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     // the load with the reference binary's diagnostic.
     let mut views = ViewDb::new();
     for v in pre_views {
-        validate_view(&v, &db, &mut interner)?;
+        validate_view(&v, &db, &views, &mut interner)?;
         views.insert(v);
     }
 

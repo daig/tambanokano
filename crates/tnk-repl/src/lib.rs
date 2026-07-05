@@ -299,7 +299,7 @@ impl Repl {
     /// success (as Maude is); a validation error becomes output. A view is the argument of an
     /// instantiation `M{V}` (B-iv); on its own it is just validated and shown (`show view`).
     fn enter_view(&mut self, v: ViewDecl, out: &mut String) {
-        match validate_view(&v, &self.db, &mut self.interner) {
+        match validate_view(&v, &self.db, &self.views, &mut self.interner) {
             Ok(()) => {
                 let name = v.name.clone();
                 // Record the view's direct dependencies (its from/to modules + parameter theories) and

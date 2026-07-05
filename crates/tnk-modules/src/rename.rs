@@ -111,6 +111,43 @@ pub fn apply_renaming(
             subst_tokens(idb, &single_op_map, interner);
             subst_tokens(idb, &sort_map, interner);
         }
+        // `special (op-hook …)` signatures reference OTHER ops by name (build_sig resolves hooks by
+        // name), so a renamed referenced op must be tracked — INT * (op s_ : Nat -> NzNat to $succ)
+        // must repoint every succSymbol op-hook at $succ or the renamed module loses its builtins
+        // (stock machine-int.maude). Sort names inside hook signatures and term-hook constants
+        // rename like everything else.
+        if let Some(sp) = &mut op.attrs.special {
+            for (_purpose, toks) in &mut sp.op_hooks {
+                let Some(colon) = toks.iter().position(|t| interner.resolve(t.sym) == ":") else {
+                    continue;
+                };
+                let name_canon: String =
+                    toks[..colon].iter().map(|t| interner.resolve(t.sym)).collect();
+                let arrow = toks.iter().position(|t| interner.resolve(t.sym) == "~>");
+                let (dom, rng): (Vec<String>, Option<String>) = match arrow {
+                    Some(a) => (
+                        toks[colon + 1..a].iter().map(|t| interner.resolve(t.sym).to_string()).collect(),
+                        toks.get(a + 1).map(|t| interner.resolve(t.sym).to_string()),
+                    ),
+                    None => (Vec::new(), None),
+                };
+                if let Some(r) = op_renames.iter().find(|s| {
+                    s.from == name_canon
+                        && s.dom_range
+                            .as_ref()
+                            .is_none_or(|(d, rr)| *d == dom && Some(rr) == rng.as_ref())
+                }) {
+                    let mut new_toks = tokenize(&r.to, interner);
+                    new_toks.extend_from_slice(&toks[colon..]);
+                    *toks = new_toks;
+                }
+                subst_tokens(toks, &sort_map, interner);
+            }
+            for (_purpose, toks) in &mut sp.term_hooks {
+                subst_tokens(toks, &single_op_map, interner);
+                subst_tokens(toks, &sort_map, interner);
+            }
+        }
     }
     for v in &mut d.vars {
         if let Some(t) = sort_map.get(&v.sort) {
