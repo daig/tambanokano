@@ -622,6 +622,10 @@ mod tests {
             let x = e.make_const(a);
             e.make_au(cat, vec![x, bc])
         };
+        // Nested same-symbol arguments splice LAZILY (as in make_acu): unreduced nested forms
+        // stay nested at construction; canonical equality holds at the reduce normal-form point.
+        let abc_left = e.reduce(abc_left);
+        let abc_right = e.reduce(abc_right);
         assert!(e.deep_equal(abc_left, abc_right), "(a b) c == a (b c)");
         assert_eq!(e.node(abc_left).children().count(), 3, "flattened to 3 ordered children");
 

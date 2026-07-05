@@ -1781,13 +1781,19 @@ impl Runtime {
     pub(crate) fn make_au(&mut self, sig: &Signature, symbol: SymbolId, raw_args: Vec<DagId>) -> DagId {
         debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Au, "make_au on a non-AU symbol");
         let identity = sig.symbol(symbol).identity();
+        // Lazy splice, as in make_acu: an UNREDUCED nested same-symbol argument keeps the parse
+        // shape (metaParse returns the nested surface parse; bottom-up reduction sees each level),
+        // and the reduce loop's normal-form rebuild — whose children are then reduced — flattens.
+        let epoch = sig.eq_epoch();
         let mut args: Vec<DagId> = Vec::with_capacity(raw_args.len());
         for arg in raw_args {
             if identity.is_some_and(|id_sym| self.is_constant(arg, id_sym)) {
                 continue; // an identity argument vanishes
             }
             match &self.dags.get(arg).term {
-                NodeTerm::Au { symbol: inner, args: inner_args } if *inner == symbol => {
+                NodeTerm::Au { symbol: inner, args: inner_args }
+                    if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch =>
+                {
                     args.extend_from_slice(inner_args);
                 }
                 _ => args.push(arg),
@@ -2234,7 +2240,7 @@ impl Runtime {
                 let f = stack.last_mut().expect("empty reduce stack");
                 let mut changed = f.args != f.orig;
                 if !changed
-                    && matches!(sig.symbol(f.symbol).theory(), Theory::Acu)
+                    && matches!(sig.symbol(f.symbol).theory(), Theory::Acu | Theory::Au)
                     && f.args.iter().any(|&c| self.node(c).symbol() == f.symbol)
                 {
                     changed = true; // force the deferred splice/merge renormalization
