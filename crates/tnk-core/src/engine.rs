@@ -1426,9 +1426,8 @@ impl Runtime {
 
     /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
     /// `constrainToSmallerSort`): whole-match the node against each membership (see
-    /// [`constrain_node_whole`](Self::constrain_node_whole)) and, for an **AC** node, first replay
-    /// Maude's bottom-up fold so a membership fires through extension on the sub-multiset prefixes too
-    /// (see below). **Each application counts as one rewrite** (Maude counts membership applications in
+    /// [`constrain_node_whole`](Self::constrain_node_whole)).
+    /// **Each application counts as one rewrite** (Maude counts membership applications in
     /// its `rewrites` total). Non-confluent membership sets (incomparable applicable targets) and
     /// matching modulo `iter` are follow-ups.
     ///
@@ -1438,75 +1437,15 @@ impl Runtime {
     /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
     /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
     fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
-        // B3: AC memberships fire **through extension** — on sub-multisets of an AC subject, not just
-        // the whole node. Maude does not pre-flatten `a | a | a`; it reduces the parsed, right-associated
-        // `a | (a | a)` **bottom-up**, so each intermediate node is a *prefix* multiset that reaches its
-        // own reduce normal-form point and is constrained there. Because ACU args are kept in canonical
-        // order (ascending, `dag_compare`) and the tree is right-associated, the k-th intermediate node
-        // is the multiset of the **k largest** elements: M₂ ⊂ M₃ ⊂ … ⊂ Mₙ (= the whole). tnk keeps the
-        // flattened multiset instead, so we replay that fold here: constrain each transient prefix
-        // M₂..Mₙ₋₁ (each application counts, and a `cmb`'s condition rewrites count) before the whole
-        // node (k = n). A prefix's sort refinement is discarded — Maude loses it when the parent
-        // re-flattens the intermediate node's *elements* — so only the count moves; the result term and
-        // its printed sort are unchanged. Fires exactly like Maude and terminates: n − 2 whole-matches
-        // over strictly-growing prefixes, no reapplication (a refined prefix carries a smaller sort that
-        // no further membership can lower).
-        //
-        // SCOPE NARROWING (verified). Maude does the fold over the subject's **written** parse order
-        // (right-associated), so its raw count is *written-order dependent* for a heterogeneous multiset:
-        // `b | b | a | a | a` counts 1 (inner `a | a` fires) but the same multiset written `a | a | a | b
-        // | b` counts 0. This is exactly the corner Maude warns is unsound (membership axioms on an AC
-        // symbol with non-kind-level declarations). tnk canonicalizes an AC subject to a sorted multiset
-        // eagerly (`make_acu`; do not disturb — B1), so it has no written order to fold over and instead
-        // reproduces the count of the **canonical (ascending) form** — which is Maude's count when the
-        // input is written canonically (cross-checked: tnk == oracle on canonically-written subjects;
-        // the fixture's `a | a | a` is homogeneous, hence order-independent). Reproducing Maude's
-        // order-dependent count would require preserving the parse tree, out of scope here. §3.3.
-        if !sig.memberships.is_empty()
-            && let NodeTerm::Acu { symbol, args } = &self.node(id).term
-            && sig.memberships.contains_key(symbol)
-        {
-            let symbol = *symbol;
-            let args = args.clone(); // ascending canonical order; borrow released for `constrain_node_whole`
-            let total: u32 = args.iter().map(|&(_, m)| m).sum();
-            // GC safety (F-2): a `cmb` condition in an earlier prefix can re-enter `reduce` and hit a
-            // safe-point GC; root `id` (and hence its element children, shared with every prefix we build)
-            // for the whole fold so it isn't swept out from under `args`/the final whole-node constrain.
-            // A no-op unless GC is enabled — mirrors `condition_holds_inner`.
-            let protect_base = self.gc_interval.is_some().then(|| {
-                let base = self.protected.len();
-                self.protected.push(id);
-                base
-            });
-            for k in 2..total {
-                let prefix = Self::top_k_multiset(&args, k);
-                let transient = self.make_acu(sig, symbol, prefix);
-                // Off the main reduce stack ⇒ no `Whole:` reconstruction (`None`); the refined sort is
-                // thrown away (the transient node is unreachable after this call).
-                self.constrain_node_whole(sig, transient, None, frames);
-            }
-            if let Some(base) = protect_base {
-                self.protected.truncate(base);
-            }
-        }
+        // B3: AC memberships fire **through extension** — on sub-multisets of an AC subject.
+        // Maude's mechanism is simply bottom-up reduction of the UNFLATTENED right-associated
+        // parse: each intermediate node reaches its own reduce normal-form point and is
+        // whole-constrained there. Since make_acu now splices nested same-symbol arguments
+        // LAZILY (an unreduced nested node stays nested until its parent's rebuild), tnk's
+        // subjects keep the parse shape through reduction and the same mechanism fires
+        // naturally — including Maude's written-order-dependent counts on heterogeneous
+        // multisets (the earlier synthetic canonical-prefix replay is gone). §3.3.
         self.constrain_node_whole(sig, id, whole, frames);
-    }
-
-    /// The multiset of the `k` **largest** elements of an ascending-ordered ACU argument list — the k-th
-    /// intermediate node of Maude's right-associated bottom-up fold (see [`constrain_to_smaller_sort`]).
-    /// Takes from the high end; a partially-consumed element contributes its needed multiplicity.
-    fn top_k_multiset(args: &[(DagId, u32)], k: u32) -> Vec<(DagId, u32)> {
-        let mut need = k;
-        let mut out = Vec::new();
-        for &(e, m) in args.iter().rev() {
-            if need == 0 {
-                break;
-            }
-            let take = m.min(need);
-            out.push((e, take));
-            need -= take;
-        }
-        out
     }
 
     /// Constrain a **single** node by the memberships of its top symbol, whole-matched (Maude's
@@ -1761,6 +1700,14 @@ impl Runtime {
         let identity = sig.symbol(symbol).identity();
 
         // (1) flatten nested same-symbol nodes + (2) drop identity elements.
+        // The SPLICE is lazy, like the merge below (and like Maude's on-demand ACU
+        // normalization): an UNREDUCED nested same-symbol argument stays nested, so the reduce
+        // loop's bottom-up Phase 1 reduces it — counting its own builtin fold — before the
+        // parent's rebuild (whose children are then reduced) splices it flat. This makes the
+        // infix chain `2 + 3 + 4` count 2 rewrites (`3 + 4 ---> 7`, then `2 + 7 ---> 9`, the
+        // oracle's trace) while a prefix n-ary `gcd(12, 18, 8)` — born flat, never nested —
+        // still folds once (§3.9.3). Matching only ever sees the post-rebuild canonical form.
+        let epoch = sig.eq_epoch();
         let mut flat: Vec<(DagId, u32)> = Vec::with_capacity(raw_args.len());
         for (arg, mult) in raw_args {
             if mult == 0 {
@@ -1770,7 +1717,9 @@ impl Runtime {
                 continue; // an identity argument vanishes
             }
             match &self.dags.get(arg).term {
-                NodeTerm::Acu { symbol: inner, args } if *inner == symbol => {
+                NodeTerm::Acu { symbol: inner, args }
+                    if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch =>
+                {
                     for &(e, m) in args {
                         flat.push((e, m * mult));
                     }
@@ -1788,7 +1737,6 @@ impl Runtime {
         // reduce loop's Phase-1 rebuild re-canonicalizes with reduced (mergeable) arguments, so
         // matching only ever sees the merged canonical node.
         flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
-        let epoch = sig.eq_epoch();
         let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
         for (e, m) in flat {
             match args.last_mut() {
@@ -2277,10 +2225,20 @@ impl Runtime {
                 }
             }
 
-            // Phase 1 complete (strategy exhausted): rebuild iff some argument changed, else keep the id.
+            // Phase 1 complete (strategy exhausted): rebuild iff some argument changed — or the node
+            // is an ACU node still holding a same-symbol child (the lazy splice deferred its
+            // flattening to exactly this rebuild; without forcing it, a pure-constructor nested
+            // chain whose child IDS never change would be stamped normal in NESTED form and AC
+            // matching over it would silently fail).
             let (symbol, original, args, changed) = {
                 let f = stack.last_mut().expect("empty reduce stack");
-                let changed = f.args != f.orig;
+                let mut changed = f.args != f.orig;
+                if !changed
+                    && matches!(sig.symbol(f.symbol).theory(), Theory::Acu)
+                    && f.args.iter().any(|&c| self.node(c).symbol() == f.symbol)
+                {
+                    changed = true; // force the deferred splice/merge renormalization
+                }
                 // `mem::take` moves the args out (no clone) — the frame is about to be reused or popped,
                 // so its `args` is no longer needed.
                 let args = if changed { std::mem::take(&mut f.args) } else { Vec::new() };
@@ -4792,10 +4750,13 @@ mod tests {
         assert_eq!(e.rewrites(), 1, "a | a: one membership application (whole)");
         assert_eq!(e.sort_of(r), special, "a | a : Special");
 
-        // red a | a | a — one application, through extension on the prefix `a | a`; whole stays E.
+        // red a | a | a — one application, through extension: the subject is built right-nested
+        // `a | (a | a)` as the parser builds it (the lazy splice keeps the unreduced inner node
+        // nested), so the inner `a | a` reaches its own normal-form point and fires the mb there.
         e.reset_rewrites();
         let (b0, b1, b2) = (e.make_const(a), e.make_const(a), e.make_const(a));
-        let aaa = e.make_ac(bar, vec![b0, b1, b2]);
+        let inner = e.make_ac(bar, vec![b1, b2]);
+        let aaa = e.make_ac(bar, vec![b0, inner]);
         let r3 = e.reduce(aaa);
         assert_eq!(e.rewrites(), 1, "a | a | a: one membership application (extension), not 0");
         assert_eq!(e.sort_of(r3), et, "a | a | a : E (whole match fails; prefix refinement discarded)");
@@ -4827,7 +4788,9 @@ mod tests {
             vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
         );
 
-        // red a | a | h(h(a)) — 2 (h reductions) + 1 (cmb through extension) = 3.
+        // red a | a | h(h(a)) — 2 (h reductions) + 1 (cmb on the inner node) = 3. Right-nested
+        // `a | (a | h(h(a)))`, the parse shape: the inner node reduces to `a | a` and its
+        // normal-form point fires the cmb before the parent splices it flat.
         e.reset_rewrites();
         let (a0, a1) = (e.make_const(a), e.make_const(a));
         let hha = {
@@ -4835,7 +4798,8 @@ mod tests {
             let ha = e.make_free(h, vec![ac]);
             e.make_free(h, vec![ha])
         };
-        let subject = e.make_ac(bar, vec![a0, a1, hha]);
+        let inner = e.make_ac(bar, vec![a1, hha]);
+        let subject = e.make_ac(bar, vec![a0, inner]);
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 3, "2 h-reductions + 1 cmb-through-extension");
         assert_eq!(e.sort_of(r), et, "a | a | a : E");
@@ -4872,16 +4836,20 @@ mod tests {
             0,
             vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
         );
-        e.set_gc_interval(Some(1)); // collect at every allocation — stress the fold's rooting
+        e.set_gc_interval(Some(1)); // collect at every allocation — stress nested-reduction rooting
         e.reset_rewrites();
         let (a0, a1, a2, a3) = (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
-        // a | a | a | a | h(h(a)) — a 5-element prefix fold (M₂..M₄ transients) with a cmb condition.
+        // a | (a | (a | (a | h(h(a))))) — the right-nested parse shape; the innermost node's cmb
+        // condition re-enters reduce under per-allocation GC.
         let hha = {
             let ac = e.make_const(a);
             let ha = e.make_free(h, vec![ac]);
             e.make_free(h, vec![ha])
         };
-        let subject = e.make_ac(bar, vec![a0, a1, a2, a3, hha]);
+        let l1 = e.make_ac(bar, vec![a3, hha]);
+        let l2 = e.make_ac(bar, vec![a2, l1]);
+        let l3 = e.make_ac(bar, vec![a1, l2]);
+        let subject = e.make_ac(bar, vec![a0, l3]);
         let r = e.reduce(subject); // must not crash / read freed nodes
         assert_eq!(e.rewrites(), 3, "2 h-reductions + 1 cmb (prefix a | a) under aggressive GC");
         let five = {
@@ -5632,6 +5600,12 @@ mod tests {
             let (x, y, z) = (e.make_const(a), e.make_const(b), e.make_const(c));
             e.make_ac(plus, vec![x, y, z])
         };
+        // Nested same-symbol arguments splice LAZILY (Maude's on-demand normalization): the
+        // unreduced nested forms stay nested at construction, and canonical equality holds at
+        // the reduce normal-form point (a 0-rewrite normalization here — no equations).
+        let abc_left = e.reduce(abc_left);
+        let abc_right = e.reduce(abc_right);
+        let abc_flat = e.reduce(abc_flat);
         assert!(e.deep_equal(abc_left, abc_right), "(a+b)+c == a+(b+c)");
         assert!(e.deep_equal(abc_left, abc_flat), "(a+b)+c == a+b+c");
         assert_eq!(e.node(abc_flat).children().count(), 3, "flattened to 3 children");
