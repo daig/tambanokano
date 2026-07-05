@@ -7,13 +7,30 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{tokenize, Interner};
-use tnk_frontend::load::{build_loaded_module, LoadedModule};
+use tnk_frontend::load::{build_loaded_module_homed, LoadedModule};
 use tnk_frontend::surface::ast::{Command, ModuleExpr, PreModule, Source, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
-use crate::flatten::flatten;
+use crate::flatten::flatten_with_homes;
 use crate::view::{validate_view, ViewDb};
+
+/// Flatten `name`'s import closure and build it into a runnable [`LoadedModule`], applying the **D1a
+/// import-reparse point-fix**: a statement the flattened grammar parses ambiguously is re-parsed against
+/// its home module's own grammar. `home_mod` resolves an imported statement's home name to its
+/// already-built module (the caller's module cache — `load_program`'s in-progress map, or the REPL's
+/// `modules`); a home not found there simply keeps the flattened-grammar behavior. This is the single
+/// entry both `load_program` and the REPL use to build an import-aware module.
+pub fn flatten_and_build<'m>(
+    name: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+) -> Result<LoadedModule, String> {
+    let (flat, homes) = flatten_with_homes(name, db, views, interner)?;
+    build_loaded_module_homed(&flat, &homes, home_mod, interner)
+}
 
 /// A loaded program: the shared interner, every module **flattened** (one [`LoadedModule`] per top-level
 /// `fmod`, in file order), a name→index map (for the REPL's `select`), the validated views (B-ii), and the
@@ -112,14 +129,22 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     // inject any built-in prelude module the module imports (e.g. an `omod`'s auto-imported
     // `CONFIGURATION`) that the user has not defined — in file order, so an imported module's own
     // built-in needs are satisfied by the time a later importer is flattened.
-    let mut modules = Vec::with_capacity(names.len());
-    let mut module_index = HashMap::new();
+    let mut modules: Vec<LoadedModule> = Vec::with_capacity(names.len());
+    let mut module_index: HashMap<String, usize> = HashMap::new();
     for (idx, name) in names.iter().enumerate() {
         let imports = db.get(name).map(|pm| pm.imports.clone()).unwrap_or_default();
         crate::prelude::ensure_builtins(&imports, &mut db, &mut interner);
-        let flat = flatten(name, &db, &views, &mut interner)?;
-        modules.push(build_loaded_module(&flat, &mut interner)?);
+        // Resolve an imported statement's home to its already-built module (built earlier in file order —
+        // imports precede importers in a well-formed file). Scoped to a block so the immutable borrows of
+        // `modules`/`module_index` end before this module is pushed.
+        let lm = {
+            let built = &modules;
+            let built_ix = &module_index;
+            let home_mod = |n: &str| built_ix.get(n).map(|&ix| &built[ix]);
+            flatten_and_build(name, &db, &views, &home_mod, &mut interner)?
+        };
         module_index.insert(name.clone(), idx);
+        modules.push(lm);
     }
     Ok(Program { interner, modules, module_index, views, commands })
 }

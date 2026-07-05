@@ -40,11 +40,19 @@ struct Acc {
     vars: Vec<VarDecl>,
     var_set: HashSet<String>,
     statements: Vec<Statement>,
+    /// Per-statement **home** module name, parallel to [`statements`](Self::statements) (D1a import-reparse
+    /// point-fix). `Some(name)` for a plain named-module donation (its statement re-parses in that module's
+    /// own grammar if the flattened grammar makes it ambiguous); `None` for a renamed/instantiated/parameter-
+    /// copy donation (whose bubbles are already rewritten in-place, so they parse against the flattened
+    /// grammar as before). The root's own statements carry `Some(root_name)`, which the loader treats as
+    /// "self" (flattened grammar). Kept in lockstep with `statements` through every merge and rotation.
+    statement_homes: Vec<Option<String>>,
 }
 
 impl Acc {
-    /// Merge a declaration bundle: new sorts/var-names once each, everything else appended.
-    fn add(&mut self, d: FlatDecls) {
+    /// Merge a declaration bundle: new sorts/var-names once each, everything else appended. `home` tags
+    /// every one of `d`'s statements with its origin module (see [`Acc::statement_homes`]).
+    fn add(&mut self, d: FlatDecls, home: Option<&str>) {
         for s in d.sorts {
             if self.sort_set.insert(s.clone()) {
                 self.sorts.push(s);
@@ -59,6 +67,8 @@ impl Acc {
                 self.vars.push(VarDecl { names, sort: v.sort });
             }
         }
+        self.statement_homes
+            .extend(std::iter::repeat(home.map(str::to_string)).take(d.statements.len()));
         self.statements.extend(d.statements);
     }
 
@@ -143,6 +153,21 @@ pub fn flatten(
     views: &ViewDb,
     interner: &mut Interner,
 ) -> Result<PreModule, String> {
+    flatten_with_homes(name, db, views, interner).map(|(pm, _)| pm)
+}
+
+/// Like [`flatten`], but also return the per-statement **home** module names (parallel to the returned
+/// module's `statements`) — the D1a import-reparse point-fix input. An imported statement whose parse the
+/// flattened grammar makes ambiguous is re-parsed against its home module's own grammar
+/// ([`crate::load::flatten_and_build`] → [`tnk_frontend::load::build_loaded_module_homed`]). `None` means
+/// "no distinct home" (renamed/instantiated donation, or the root's own statements) — use the flattened
+/// grammar, exactly the pre-fix behavior.
+pub fn flatten_with_homes(
+    name: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<(PreModule, Vec<Option<String>>), String> {
     let mut acc = Acc::default();
     let mut visited = HashSet::new();
     collect_named(name, db, views, &mut acc, &mut visited, interner)?;
@@ -153,9 +178,11 @@ pub fn flatten(
     // importStatements()), then each import donates post-order (deepest first, self-last) — so a chain
     // GRAND ← MID ← TOP yields [TOP, GRAND, MID]. collect_named appended the root's own statements
     // last (the donation order, correct for every *imported* module); rotate that own block to the
-    // front. Declarations keep import-first order (least-sort tiebreaks read declaration order).
+    // front. Declarations keep import-first order (least-sort tiebreaks read declaration order). The
+    // parallel `statement_homes` rotates in lockstep so each statement keeps its home tag.
     if let Some(pm) = root {
         acc.statements.rotate_right(pm.statements.len());
+        acc.statement_homes.rotate_right(pm.statements.len());
     }
     let (kind, is_theory, is_strategy, is_object) = root
         .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy, pm.is_object))
@@ -164,8 +191,10 @@ pub fn flatten(
     // name keeps its own `strat`/`sd`; merging an *import's* strategies is the Pillar-2.4 follow-on).
     let (strat_decls, strat_defs) =
         root.map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone())).unwrap_or_default();
+    let homes = std::mem::take(&mut acc.statement_homes);
     let d = acc.into_decls();
-    Ok(PreModule {
+    debug_assert_eq!(homes.len(), d.statements.len(), "statement_homes parallel to statements");
+    let pm = PreModule {
         name: name.to_string(),
         kind,
         is_theory,
@@ -184,7 +213,8 @@ pub fn flatten(
         statements: d.statements,
         strat_decls,
         strat_defs,
-    })
+    };
+    Ok((pm, homes))
 }
 
 /// Flatten a **transient** module given directly as a [`PreModule`] (not registered in `db`) — its
@@ -213,9 +243,12 @@ pub fn flatten_pre(
     }
     let mut own = own_decls(pm);
     inline_shadowed_vars(&mut own, &acc, interner);
-    acc.add(own);
+    // The transient's own statements parse against the flattened (down-translated) grammar — meta's
+    // established behavior — so tag them `None` (no distinct home). `flatten_pre` discards homes anyway.
+    acc.add(own, None);
     // The transient IS the root module: its own statements go first (same rotation as `flatten`).
     acc.statements.rotate_right(pm.statements.len());
+    acc.statement_homes.rotate_right(pm.statements.len());
     let d = acc.into_decls();
     Ok(PreModule {
         name: SENTINEL.to_string(),
@@ -352,7 +385,9 @@ fn collect_named(
     let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
     let mut own = own_decls(pm);
     inline_shadowed_vars(&mut own, acc, interner); // module-local aliases vs imports (see fn doc)
-    acc.add(own); // the module's own declarations, after its imports
+    // A plain named-module donation: tag its statements with `name` as their home so the loader can
+    // re-parse them in this module's own grammar if the flattened grammar makes them ambiguous (D1a).
+    acc.add(own, Some(name)); // the module's own declarations, after its imports
     Ok(())
 }
 
@@ -398,7 +433,9 @@ fn add_parameter_copy(
         }
     }
     let renamed = apply_renaming(decls, &items, interner)?;
-    acc.add(renamed);
+    // A parameter copy's statements are renamed in-place; parse them against the flattened grammar as
+    // before (no distinct home) — D1a is scoped to plain named imports.
+    acc.add(renamed, None);
     Ok(())
 }
 
@@ -496,7 +533,9 @@ fn collect_expr(
             let mut tmp_visited = HashSet::new();
             collect_expr(inner, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
             let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
-            acc.add(renamed);
+            // Renamed donation: bubbles are rewritten in-place, parse against the flattened grammar (D1a
+            // scoped to plain named imports).
+            acc.add(renamed, None);
             Ok(())
         }
         ModuleExpr::Instantiation(base, args) => {
@@ -515,7 +554,7 @@ fn collect_expr(
                 let inst = ModuleExpr::Instantiation(inner.clone(), args.clone());
                 collect_expr(&inst, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
                 let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
-                acc.add(renamed);
+                acc.add(renamed, None);
                 return Ok(());
             }
             let (mname, arg_lists) = unchain(expr).ok_or(
@@ -652,7 +691,9 @@ fn instantiate(
     if !op_recon.is_empty() {
         apply_view_op_recon(&mut decls, mname, db, views, &op_recon, interner)?;
     }
-    acc.add(instantiate_decls(decls, &bindings, &op_subst, interner));
+    // Instantiated donation: variables/sorts inlined into the bubbles, so parse against the flattened
+    // grammar (no distinct home) — D1a is scoped to plain named imports.
+    acc.add(instantiate_decls(decls, &bindings, &op_subst, interner), None);
     Ok(())
 }
 

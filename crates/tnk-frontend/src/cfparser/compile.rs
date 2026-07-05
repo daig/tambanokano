@@ -20,7 +20,12 @@ pub struct CProd {
 
 /// A grammar in working form: productions plus an index `lhs nonterminal → production numbers` used by
 /// the Earley predictor.
-#[derive(Debug)]
+///
+/// `Clone` supports the D1a import-reparse point-fix: a home module's compiled grammar is cloned and its
+/// production *actions* re-pointed at a flattened module's symbol table
+/// ([`crate::load::remap_home_grammar`]), so an imported statement re-parses in its home grammar while
+/// building over the flattened module's symbols.
+#[derive(Debug, Clone)]
 pub struct CompiledGrammar {
     pub prods: Vec<CProd>,
     by_lhs: HashMap<Nt, Vec<u32>>,

@@ -17,15 +17,14 @@ use tnk_core::rewrite::Rewriting;
 use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::load::{
-    build_command_dag, build_loaded_module, command_echo, erewrite_command, format_matchers,
+    build_command_dag, command_echo, erewrite_command, format_matchers,
     frewrite_command, match_command, rewrite_command, search_command, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
-use tnk_modules::flatten::flatten;
-use tnk_modules::load::{module_dep_names, view_dep_names};
+use tnk_modules::load::{flatten_and_build, module_dep_names, view_dep_names};
 use tnk_modules::meta::MetaDescent;
 use tnk_modules::view::{validate_view, ViewDb};
 use trace::{render_trace, TraceFlags};
@@ -270,8 +269,15 @@ impl Repl {
         let imports = pm.imports.clone();
         self.db.insert(pm);
         tnk_modules::prelude::ensure_builtins(&imports, &mut self.db, &mut self.interner);
-        let built = flatten(&name, &self.db, &self.views, &mut self.interner)
-            .and_then(|flat| build_loaded_module(&flat, &mut self.interner));
+        // Flatten + build with the D1a import-reparse point-fix: an imported statement the flattened
+        // grammar parses ambiguously re-parses against its home module's own (already-built) grammar. The
+        // module cache resolves each statement's home; the borrow of `self.modules` is scoped so this
+        // module's own insertion below is unobstructed.
+        let built = {
+            let mods = &self.modules;
+            let home_mod = |n: &str| mods.get(n);
+            flatten_and_build(&name, &self.db, &self.views, &home_mod, &mut self.interner)
+        };
         match built {
             Ok(lm) => {
                 if !self.modules.contains_key(&name) {
@@ -336,9 +342,12 @@ impl Repl {
             if name == changed || !self.modules.contains_key(&name) {
                 continue;
             }
-            match flatten(&name, &self.db, &self.views, &mut self.interner)
-                .and_then(|flat| build_loaded_module(&flat, &mut self.interner))
-            {
+            let built = {
+                let mods = &self.modules;
+                let home_mod = |n: &str| mods.get(n);
+                flatten_and_build(&name, &self.db, &self.views, &home_mod, &mut self.interner)
+            };
+            match built {
                 Ok(lm) => {
                     self.modules.insert(name, lm);
                     rebuilt = true;

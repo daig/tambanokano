@@ -21,11 +21,12 @@ use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::{Arrow, Search};
 use tnk_core::sort::{KindId, SortId};
+use tnk_core::symbol::SymbolId;
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
 /// A fully loaded module: its kernel state (signature + statements) and its mixfix grammar (for parsing
@@ -54,6 +55,94 @@ pub fn build_loaded_module(pm: &PreModule, interner: &mut Interner) -> Result<Lo
     Ok(LoadedModule { built, grammar })
 }
 
+/// Build a flattened `PreModule` into a [`LoadedModule`] with the **D1a import-reparse point-fix**: each
+/// statement whose flattened-grammar parse is ambiguous is re-parsed against its home module's own grammar
+/// (see [`load_statements_homed`]). `homes` (parallel to `pm.statements`, from
+/// `tnk_modules::flatten::flatten_with_homes`) tags each statement's origin module; `home_mod` resolves a
+/// home name to an already-built [`LoadedModule`] (the loader's / REPL's module cache). Signature-identical
+/// to [`build_loaded_module`] up to those two extra inputs; the module system routes flattened modules here.
+pub fn build_loaded_module_homed<'m>(
+    pm: &PreModule,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+) -> Result<LoadedModule, String> {
+    let mut built = build_module(pm, interner)?;
+    let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+    load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
+    Ok(LoadedModule { built, grammar })
+}
+
+/// Produce a copy of `home`'s compiled grammar whose semantic **actions** resolve symbols and sorts in
+/// `flat`'s tables instead of `home`'s — so a bubble parsed against the home module's (unambiguous) grammar
+/// builds a kernel term over the *flattened* module's symbols (the D1a point-fix seam). The grammar's
+/// structure (nonterminals/terminals/precedence) is `home`'s, so it disambiguates exactly as the home
+/// module does; only the resolved [`SymbolId`]/[`SortId`] each action carries is re-pointed.
+///
+/// Matching is by intrinsic identity: an operator by `(name, domain kinds, range kind)` — the same key
+/// `build_module` uses, and invariant across a symbol's subsort-overloaded declarations — with kinds
+/// translated home→flat through any shared declared sort name; a sort by name (an error/kind sort by its
+/// kind). Because a plain import copies every home sort/operator into the flattened module under the same
+/// name and profile, every action resolves. Returns `None` if any action references a home symbol/sort with
+/// no flattened counterpart (e.g. a renamed donation reached here) — the caller then keeps the flattened
+/// grammar, i.e. the pre-fix behavior; never a *wrong* symbol.
+pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<CompiledGrammar> {
+    let hsorts = home.built.engine.sorts();
+    let fsorts = flat.engine.sorts();
+    // home kind → flat kind, via any declared sort the two modules share by name (a plain import copies
+    // home's sorts verbatim, so every home kind has such a witness).
+    let mut kind_map: HashMap<KindId, KindId> = HashMap::new();
+    for (name, &hsort) in &home.built.sorts {
+        if let Some(&fsort) = flat.sorts.get(name) {
+            kind_map.entry(hsorts.kind_of(hsort)).or_insert_with(|| fsorts.kind_of(fsort));
+        }
+    }
+    // flat operator table keyed by intrinsic identity (name, domain kinds, range kind).
+    let mut flat_by_profile: HashMap<(&str, Vec<KindId>, KindId), SymbolId> = HashMap::new();
+    for (&fsym, syn) in &flat.syntax {
+        let name = flat.engine.symbol(fsym).name();
+        let dom: Vec<KindId> = syn.domain.iter().map(|&s| fsorts.kind_of(s)).collect();
+        flat_by_profile.insert((name, dom, fsorts.kind_of(syn.range)), fsym);
+    }
+    let map_sort = |hs: SortId| -> Option<SortId> {
+        // A declared sort maps by name; an error/kind sort by its kind (its name isn't in the `sorts` map).
+        let name = hsorts.name(hs);
+        if let Some(&f) = flat.sorts.get(name) {
+            return Some(f);
+        }
+        Some(fsorts.error_sort(*kind_map.get(&hsorts.kind_of(hs))?))
+    };
+    let map_sym = |hsym: SymbolId| -> Option<SymbolId> {
+        let syn = home.built.syntax.get(&hsym)?;
+        let name = home.built.engine.symbol(hsym).name();
+        let dom: Vec<KindId> =
+            syn.domain.iter().map(|&s| kind_map.get(&hsorts.kind_of(s)).copied()).collect::<Option<_>>()?;
+        let rng = *kind_map.get(&hsorts.kind_of(syn.range))?;
+        flat_by_profile.get(&(name, dom, rng)).copied()
+    };
+    let remap = |a: Action| -> Option<Action> {
+        Some(match a {
+            Action::MakeTerm(s) => Action::MakeTerm(map_sym(s)?),
+            Action::MakeVariable(s) => Action::MakeVariable(map_sort(s)?),
+            Action::MakeNatural(s) => Action::MakeNatural(map_sym(s)?),
+            Action::MakeInteger(s) => Action::MakeInteger(map_sym(s)?),
+            Action::MakeIter(s) => Action::MakeIter(map_sym(s)?),
+            Action::MakeString(s) => Action::MakeString(map_sym(s)?),
+            Action::MakeQid(s) => Action::MakeQid(map_sym(s)?),
+            Action::MakeFloat(s) => Action::MakeFloat(map_sym(s)?),
+            Action::MakeRational { division, minus } => {
+                Action::MakeRational { division: map_sym(division)?, minus: map_sym(minus)? }
+            }
+            keep @ (Action::PassThru | Action::AssocList | Action::Nop) => keep,
+        })
+    };
+    let mut g = home.grammar.clone();
+    for prod in &mut g.prods {
+        prod.action = remap(prod.action)?;
+    }
+    Some(g)
+}
+
 /// Surface-parse `src`, then build every module (signature + grammar + statements). This loader builds
 /// each module **standalone** (no import resolution); a module with `imports` is rejected — use the
 /// `tnk-modules` `load_program`, which flattens first. (Keeps the frontend's own import-free tests here.)
@@ -77,19 +166,43 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
     Ok(Loaded { interner, modules, commands })
 }
 
-/// Parse + build + add each of the module's statement bubbles to the engine.
+/// Parse + build + add each of the module's statement bubbles to the engine, all against the flattened
+/// module's own grammar `g`. The import-free / meta / REPL-legacy entry (no home information); the module
+/// system's [`build_loaded_module_homed`] adds the D1a per-statement home grammars on top.
 fn load_statements(
     pm: &PreModule,
     m: &mut BuiltModule,
     g: &CompiledGrammar,
     i: &Interner,
 ) -> Result<(), String> {
+    load_statements_homed(pm, m, g, &[], &|_| None, i)
+}
+
+/// Parse + build + add each statement, with the **D1a import-reparse point-fix**: a statement that fails
+/// to parse in the flattened grammar `g` (typically because an importer's operator/constant made an
+/// imported bubble ambiguous) is retried against its **home** module's own grammar — re-pointed at this
+/// flattened module's symbol table by [`remap_home_grammar`]. `homes[k]` is the home-module name of
+/// `pm.statements[k]` (from `flatten_with_homes`), `None` or the flattened module's own name meaning "use
+/// the flattened grammar"; `home_mod` resolves a home name to its already-built [`LoadedModule`] (the
+/// REPL's / loader's module cache). When `homes` is empty this is exactly the pre-fix loader.
+pub fn load_statements_homed<'m>(
+    pm: &PreModule,
+    m: &mut BuiltModule,
+    g: &CompiledGrammar,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    i: &Interner,
+) -> Result<(), String> {
     // Object-pattern completion context (Pillar 2.5-E): resolved once for an `omod`'s flattened module
     // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
     // module, or one with no object constructor in scope — completion then never runs.
     let oo = pm.is_object.then(|| m.engine.oo_info()).flatten();
+    // Cache of home-module grammars remapped onto this flattened module's symbols (built lazily, only when
+    // a statement actually fails the flattened parse — so the common path pays nothing). `None` = the home
+    // is not resolvable / could not be remapped, so no retry.
+    let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
 
-    for stmt in &pm.statements {
+    for (idx, stmt) in pm.statements.iter().enumerate() {
         // Skip `nonexec` axioms — proof obligations never applied during reduction/rewriting (every
         // theory axiom is `[nonexec]`; a module statement may be too). They still carry through parsing
         // and flattening (for later view-obligation checking) but are not registered in the engine.
@@ -98,128 +211,168 @@ fn load_statements(
         }
         // A statement whose bubbles fail to parse/build is DROPPED (Maude warns per statement and keeps
         // the module — fable-audit.md §3.4), so a later command still sees a whole module rather than a
-        // "no current module". The per-statement work runs in a closure; on `Err` the statement is
-        // skipped silently (our diagnostics are phase E). Nothing is registered before the fallible parse
-        // completes, so a drop leaves the engine (and the dense trace indices) consistent.
-        let mut load_stmt = || -> Result<(), String> {
-        match stmt {
-            Statement::Eq { lhs, rhs, cond, owise, label, .. } => {
-                // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
-                // one variable index. Then add via the matching kernel facade.
-                let mut vars = VarIndex::new();
-                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
-                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-                let mut condition = match cond {
-                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
-                    None => Vec::new(),
-                };
-                let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
-                if let Some(info) = &oo {
-                    oo_complete::complete_statement(
-                        info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
-                    );
-                }
-                let nr = vars.count();
-                // Capture the source-form trace metadata before the Terms are moved into the kernel; the
-                // kernel returns the dense equation id, which must index `eq_traces` (asserted).
-                reject_rewrite_fragment(&condition, "equation")?;
-                if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                    return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
-                }
-                let trace = EqTrace {
-                    lhs: lhs_t.clone(),
-                    rhs: rhs_t.clone(),
-                    condition: condition.clone(),
-                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
-                    owise: *owise,
-                    label: label.clone(),
-                    nonexec: false, // engine-registered ⇒ executable
-                };
-                let id = if *owise {
-                    m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition)
-                } else if condition.is_empty() {
-                    m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr })
-                } else {
-                    m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition)
-                };
-                assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
-                m.eq_traces.push(trace);
+        // "no current module". `load_one_stmt` registers nothing before its fallible parse completes, so a
+        // failed attempt leaves the engine (and the dense trace indices) consistent and can be retried.
+        let flat_err = match load_one_stmt(stmt, m, g, false, &oo, i) {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
+        // Failed against the flattened grammar. If this statement was donated by a distinct home module,
+        // retry against that home's own grammar (re-pointed at this module's symbols) — the D1a point-fix.
+        if let Some(home) = homes.get(idx).and_then(|h| h.as_deref())
+            && home != m.name
+        {
+            if !home_grammars.contains_key(home) {
+                let remapped = home_mod(home).and_then(|lm| remap_home_grammar(lm, m));
+                home_grammars.insert(home.to_string(), remapped);
             }
-            Statement::Mb { lhs, sort, cond, label, .. } => {
-                let mut vars = VarIndex::new();
-                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
-                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-                let sort_id = resolve_sort(sort, m, i)?;
-                let mut condition = match cond {
-                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
-                    None => Vec::new(),
-                };
-                if let Some(info) = &oo {
-                    oo_complete::complete_statement(info, m, &mut vars, &mut lhs_t, None, &mut condition);
-                }
-                let nr = vars.count();
-                reject_rewrite_fragment(&condition, "membership")?;
-                if !statement_vars_bound(&lhs_t, &condition, None) {
-                    return Ok(()); // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
-                }
-                let trace = MbTrace {
-                    lhs: lhs_t.clone(),
-                    sort: sort_id,
-                    condition: condition.clone(),
-                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
-                    label: label.clone(),
-                    nonexec: false, // engine-registered ⇒ executable
-                };
-                let id = if condition.is_empty() {
-                    m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr })
-                } else {
-                    m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition)
-                };
-                assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
-                m.mb_traces.push(trace);
-            }
-            Statement::Rule { label, lhs, rhs, cond, .. } => {
-                // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
-                // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
-                let mut vars = VarIndex::new();
-                let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
-                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-                let mut condition = match cond {
-                    Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
-                    None => Vec::new(),
-                };
-                let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
-                if let Some(info) = &oo {
-                    oo_complete::complete_statement(
-                        info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
-                    );
-                }
-                let nr = vars.count();
-                if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                    return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
-                }
-                let trace = RlTrace {
-                    lhs: lhs_t.clone(),
-                    rhs: rhs_t.clone(),
-                    condition: condition.clone(),
-                    var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
-                    label: label.clone(),
-                    nonexec: false, // engine-registered ⇒ executable
-                };
-                let id = if condition.is_empty() {
-                    m.engine.add_rule(lhs_t, rhs_t, nr)
-                } else {
-                    m.engine.add_conditional_rule(lhs_t, rhs_t, nr, condition)
-                };
-                assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
-                m.rl_traces.push(trace);
+            if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref)
+                && load_one_stmt(stmt, m, hg, true, &oo, i).is_ok()
+            {
+                continue;
             }
         }
-        Ok(())
-        };
-        if load_stmt().is_err() {
-            // Drop this statement and keep building the module (the diagnostic is phase E).
-            continue;
+        if std::env::var("TNK_DEBUG_DROP").is_ok() {
+            eprintln!("DROP[{}]: {flat_err}", m.name);
+        }
+        // Drop this statement and keep building the module (the diagnostic is phase E).
+    }
+    Ok(())
+}
+
+/// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
+/// the D1a home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
+/// unambiguous home grammar, so the flattened-grammar kind-homogeneity trick is neither needed nor valid —
+/// its `Nt::Comp(kind, …)` start would name a *flattened* kind absent from the home grammar). Registers
+/// nothing before the last fallible parse, so a returned `Err` leaves `m` unchanged (safe to retry).
+fn load_one_stmt(
+    stmt: &Statement,
+    m: &mut BuiltModule,
+    g: &CompiledGrammar,
+    home: bool,
+    oo: &Option<tnk_core::engine::OoInfo>,
+    i: &Interner,
+) -> Result<(), String> {
+    // Parse + build the rhs: kind-homogeneous with the lhs against the flattened grammar (disambiguates a
+    // bare overloaded constant), or universal in the home-grammar path.
+    let build_rhs = |rhs: &[Token], lhs_t: &Term, m: &BuiltModule, vars: &mut VarIndex| {
+        if home {
+            parse_build(rhs, g, m, i, vars)
+        } else {
+            parse_build_rhs(rhs, lhs_t, g, m, i, vars)
+        }
+    };
+    match stmt {
+        Statement::Eq { lhs, rhs, cond, owise, label, .. } => {
+            // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
+            // one variable index. Then add via the matching kernel facade.
+            let mut vars = VarIndex::new();
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let mut condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
+            if let Some(info) = oo {
+                oo_complete::complete_statement(
+                    info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                );
+            }
+            let nr = vars.count();
+            // Capture the source-form trace metadata before the Terms are moved into the kernel; the
+            // kernel returns the dense equation id, which must index `eq_traces` (asserted).
+            reject_rewrite_fragment(&condition, "equation")?;
+            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
+                return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+            }
+            let trace = EqTrace {
+                lhs: lhs_t.clone(),
+                rhs: rhs_t.clone(),
+                condition: condition.clone(),
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                owise: *owise,
+                label: label.clone(),
+                nonexec: false, // engine-registered ⇒ executable
+            };
+            let id = if *owise {
+                m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition)
+            } else if condition.is_empty() {
+                m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr })
+            } else {
+                m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition)
+            };
+            assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
+            m.eq_traces.push(trace);
+        }
+        Statement::Mb { lhs, sort, cond, label, .. } => {
+            let mut vars = VarIndex::new();
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let sort_id = resolve_sort(sort, m, i)?;
+            let mut condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            if let Some(info) = oo {
+                oo_complete::complete_statement(info, m, &mut vars, &mut lhs_t, None, &mut condition);
+            }
+            let nr = vars.count();
+            reject_rewrite_fragment(&condition, "membership")?;
+            if !statement_vars_bound(&lhs_t, &condition, None) {
+                return Ok(()); // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
+            }
+            let trace = MbTrace {
+                lhs: lhs_t.clone(),
+                sort: sort_id,
+                condition: condition.clone(),
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                label: label.clone(),
+                nonexec: false, // engine-registered ⇒ executable
+            };
+            let id = if condition.is_empty() {
+                m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr })
+            } else {
+                m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition)
+            };
+            assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
+            m.mb_traces.push(trace);
+        }
+        Statement::Rule { label, lhs, rhs, cond, .. } => {
+            // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
+            // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
+            let mut vars = VarIndex::new();
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+            let mut condition = match cond {
+                Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
+                None => Vec::new(),
+            };
+            let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
+            if let Some(info) = oo {
+                oo_complete::complete_statement(
+                    info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                );
+            }
+            let nr = vars.count();
+            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
+                return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+            }
+            let trace = RlTrace {
+                lhs: lhs_t.clone(),
+                rhs: rhs_t.clone(),
+                condition: condition.clone(),
+                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                label: label.clone(),
+                nonexec: false, // engine-registered ⇒ executable
+            };
+            let id = if condition.is_empty() {
+                m.engine.add_rule(lhs_t, rhs_t, nr)
+            } else {
+                m.engine.add_conditional_rule(lhs_t, rhs_t, nr, condition)
+            };
+            assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
+            m.rl_traces.push(trace);
         }
     }
     Ok(())
