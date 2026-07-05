@@ -27,10 +27,12 @@ pub mod term;
 // yet (review: keep the closed LhsAutomaton/Subproblem enums crate-private until a cross-crate
 // consumer exists).
 pub(crate) mod acu;
+pub(crate) mod acu_matcher;
 pub(crate) mod au;
 // B3: built-in operator reduction (the `special (id-hook …)` seam).
 pub(crate) mod builtin;
 pub(crate) mod cui;
+pub(crate) mod diophantine;
 // B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
 // named outside `num`.
 pub(crate) mod num;

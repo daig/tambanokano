@@ -18,7 +18,9 @@
 //! with two-sided identity. **Alien** (non-ground, non-variable) subterms under the AC operator, the
 //! red-black tree representation, and lazy subproblems are follow-ups.
 
+use crate::acu_matcher::{AcuMatcher, MatcherVar};
 use crate::dag::{DagId, NodeTerm};
+use crate::diophantine::UNBOUNDED;
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
@@ -61,6 +63,12 @@ struct AcuVar {
     /// How many times this variable index occurs in the pattern (the Diophantine coefficient).
     count: u32,
     sort: SortId,
+    /// Diophantine **lower bound** on the binding size: `0` if the variable can take the identity
+    /// (Maude's `takeIdentity`), else `1`. Computed at compile from the operator + variable sort.
+    lower_bound: i32,
+    /// Diophantine **upper bound** on the binding size (Maude's `sortBound`): `1` for an element sort,
+    /// [`UNBOUNDED`] for a collector. Distinguishes stripper rows from collector rows.
+    upper_bound: i32,
 }
 
 /// Structural equality on patterns (same operator + recursively-equal args, or the same variable
@@ -83,6 +91,9 @@ impl AcuLhs {
     pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("ACU lhs must be an application");
         let identity = sig.symbol(symbol).identity();
+        // Per-sort bounds for this operator's kind (Maude's `sortBound`), computed once: each top
+        // variable's Diophantine row `maxSize` (element vs collector) — see [`AcuVar`].
+        let sort_bounds = sig.acu_sort_bounds(symbol);
         let mut grounds: Vec<Term> = Vec::new();
         let mut aliens: Vec<AcuAlien> = Vec::new();
         let mut vars: Vec<AcuVar> = Vec::new();
@@ -93,7 +104,17 @@ impl AcuLhs {
                 Term::Op { symbol: s, args } if s == symbol => stack.extend(args),
                 Term::Var(v) => match vars.iter_mut().find(|av| av.index == v.index) {
                     Some(av) => av.count += 1,
-                    None => vars.push(AcuVar { index: v.index, count: 1, sort: v.sort }),
+                    None => {
+                        let lower_bound = if sig.acu_take_identity(symbol, v.sort) { 0 } else { 1 };
+                        let upper_bound = sort_bounds.get(&v.sort).copied().unwrap_or(UNBOUNDED);
+                        vars.push(AcuVar {
+                            index: v.index,
+                            count: 1,
+                            sort: v.sort,
+                            lower_bound,
+                            upper_bound,
+                        });
+                    }
                 },
                 // A built-in literal is a ground, free-matchable leaf — same fast path as a ground Op.
                 t @ Term::Na { .. } => grounds.push(t),
@@ -152,32 +173,38 @@ impl AcuLhs {
             }
         }
 
-        let elements: Vec<DagId> = multiset.iter().map(|&(e, _)| e).collect();
         let var_coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
-        // No aliens: precompute the variable distributions eagerly (pure, the proven B1 fast path). A
-        // single linear variable is the *collector* (Maude's LONE_VARIABLE) — it absorbs the entire
-        // remainder, a correctness rule not just an ordering one (`eq a + X = b` on `a + c + c` gives
-        // `b`, not `b + c`). With aliens present we defer to `next` instead: matching an alien builds
-        // binding nodes, so it needs `&mut Runtime` the immutable first phase does not have.
-        let candidates = if self.aliens.is_empty() {
-            // The lone-variable collector (force the whole remainder) is Maude's no-identity
-            // behavior; a variable that can take the identity is enumerated smallest-first
-            // instead (`a + X = b` on `a + c + c`: no id ⇒ `b`; with `id: e` ⇒ `b + c + c`,
-            // X := e first with the rest as extension residue — both oracle-verified).
-            let lone_linear = self.vars.len() == 1
-                && self.vars[0].count == 1
-                && !(ext && self.identity.is_some());
-            enumerate_distributions(
-                &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
-                &var_coeffs,
+        // No aliens: the whole match is a pure Diophantine distribution of the residual multiset among
+        // the top variables (+ an extension row). The [`AcuMatcher`] enumerates it **lazily** in
+        // Maude's order — the D2a fix (the naive path materialised every distribution eagerly). With
+        // aliens present we defer to the alien path in `next` instead (matching an alien builds binding
+        // nodes, so it needs `&mut Runtime` the immutable first phase does not have).
+        let matcher = if self.aliens.is_empty() {
+            let elements: Vec<DagId> = multiset.iter().map(|&(e, _)| e).collect();
+            let mult: Vec<u32> = multiset.iter().map(|&(_, m)| m).collect();
+            let mvars: Vec<MatcherVar> = self
+                .vars
+                .iter()
+                .map(|v| MatcherVar {
+                    index: v.index,
+                    coeff: v.count,
+                    lower_bound: v.lower_bound,
+                    upper_bound: v.upper_bound,
+                    sort: v.sort,
+                })
+                .collect();
+            Some(AcuMatcher::new(
+                self.symbol,
+                self.identity,
+                elements,
+                mult,
+                mvars,
                 ext,
-                self.identity.is_some(),
                 !self.grounds.is_empty(),
-                lone_linear,
                 subject_is_identity,
-            )
+            ))
         } else {
-            Vec::new()
+            None
         };
         let mut alien_var_indices: Vec<u32> = Vec::new();
         for a in &self.aliens {
@@ -188,12 +215,10 @@ impl AcuLhs {
             symbol: self.symbol,
             identity: self.identity,
             ext_allowed: ext,
-            elements,
+            matcher,
             var_indices: self.vars.iter().map(|v| v.index).collect(),
             var_sorts: self.vars.iter().map(|v| v.sort).collect(),
             var_coeffs,
-            candidates,
-            cursor: 0,
             aliens: self.aliens.clone(),
             multiset,
             alien_var_indices,
@@ -382,10 +407,8 @@ pub(crate) struct AcuSubproblem {
     var_indices: Vec<u32>,
     var_sorts: Vec<SortId>,
     var_coeffs: Vec<u32>,
-    // ---- no-alien path: precomputed variable distributions over `elements` ----
-    elements: Vec<DagId>,
-    candidates: Vec<Candidate>,
-    cursor: usize,
+    // ---- no-alien path: the lazy Diophantine enumerator (`None` ⇒ the alien path below) ----
+    matcher: Option<AcuMatcher>,
     // ---- alien path (when `aliens` is non-empty): lazily enumerated on the first `next` ----
     /// Alien sub-patterns to match recursively (empty ⇒ the no-alien fast path above).
     aliens: Vec<AcuAlien>,
@@ -418,91 +441,23 @@ impl AcuSubproblem {
     /// binding violates a variable's sort is skipped. Dispatches to the alien path when the pattern has
     /// alien subterms, else the proven no-alien variable-distribution path.
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
-        for &idx in &self.bound {
-            subst.unbind(idx);
-        }
-        self.bound.clear();
-
         if !self.aliens.is_empty() {
+            for &idx in &self.bound {
+                subst.unbind(idx);
+            }
+            self.bound.clear();
             return self.next_alien(rt, sig, subst);
         }
 
-        while self.cursor < self.candidates.len() {
-            let ci = self.cursor;
-            self.cursor += 1;
-            let r = self.var_indices.len();
-            let mut to_bind: Vec<(u32, DagId)> = Vec::with_capacity(r);
-            let mut residue: Vec<(DagId, u32)> = Vec::new();
-            let mut ok = true;
-            {
-                let cand = &self.candidates[ci];
-                for k in 0..r {
-                    let pairs: Vec<(DagId, u32)> = (0..self.elements.len())
-                        .filter(|&i| cand.to_var[i][k] > 0)
-                        .map(|i| (self.elements[i], cand.to_var[i][k]))
-                        .collect();
-                    let binding = if pairs.is_empty() {
-                        match self.identity {
-                            // The CACHED identity dag (already-reduced): what makes the
-                            // collapse rewrite one-shot (see Runtime::identity_dag).
-                            Some(id_sym) => rt.identity_dag(sig, id_sym),
-                            None => {
-                                ok = false; // unreachable: filtered when no identity
-                                break;
-                            }
-                        }
-                    } else {
-                        rt.make_acu(sig, self.symbol, pairs)
-                    };
-                    if !sig.sorts().leq(rt.sort_of(binding), self.var_sorts[k]) {
-                        ok = false;
-                        break;
-                    }
-                    to_bind.push((self.var_indices[k], binding));
-                }
-                if ok {
-                    for (i, &res) in cand.residue.iter().enumerate() {
-                        if res > 0 {
-                            residue.push((self.elements[i], res));
-                        }
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            // Apply the bindings, honoring any variable **already bound** by an outer subterm — a
-            // non-linear occurrence across arguments, e.g. `E in (E, S)` binds `E` from the first
-            // argument, so the enumerated multiset binding must equal it (else this candidate is no
-            // solution). The free matcher does the same deep-equal check (`term.rs`); the alien path
-            // already seeds from the incoming subst.
-            let mut consistent = true;
-            for &(idx, b) in &to_bind {
-                match subst.get(idx) {
-                    Some(existing) => {
-                        if !rt.deep_equal(existing, b) {
-                            consistent = false;
-                            break;
-                        }
-                    }
-                    None => {
-                        subst.bind(idx, b);
-                        self.bound.push(idx);
-                    }
-                }
-            }
-            if !consistent {
-                for &idx in &self.bound {
-                    subst.unbind(idx);
-                }
-                self.bound.clear();
-                continue;
-            }
-            self.matched_whole = residue.is_empty();
-            self.residue = residue;
-            return true;
+        // No-alien path: the lazy Diophantine enumerator owns its own bind/unbind lifecycle.
+        let matcher = self.matcher.as_mut().expect("no-alien subproblem has a matcher");
+        if matcher.next(rt, sig, subst) {
+            self.residue = matcher.residue().to_vec();
+            self.matched_whole = matcher.matched_whole();
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// The alien-path counterpart of the candidate loop: on the first call, fully enumerate the
@@ -721,6 +676,121 @@ mod tests {
         out
     }
 
+    /// The **naive** no-alien matcher (the pre-Diophantine algorithm), kept live as a test-gated
+    /// cross-check oracle per the AC-matcher plan's discipline. Replicates the old `match_` phase-1
+    /// (collapse / ground consumption) + eager `enumerate_distributions` + candidate→binding build,
+    /// returning the same `(bindings, residue)` stream. Used by [`differential_naive_vs_diophantine`]
+    /// to assert the new lazy path yields the identical solution multiset on small subjects.
+    fn naive_match_all(
+        e: &mut Engine,
+        pattern: Term,
+        subject: DagId,
+        ext_allowed: bool,
+        nr_vars: u32,
+    ) -> Solutions {
+        let lhs = AcuLhs::compile(pattern, e.signature());
+        assert!(lhs.aliens.is_empty(), "naive cross-check is for the no-alien path");
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        let (sig, rt) = e.parts_mut();
+        // Phase 1: collapse detection + ground consumption (identical to `match_`).
+        let mut subject_is_identity = false;
+        let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
+            NodeTerm::Acu { symbol, args } if *symbol == lhs.symbol => (args.clone(), ext_allowed),
+            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == lhs.identity => {
+                subject_is_identity = true;
+                (Vec::new(), false)
+            }
+            _ => (vec![(subject, 1)], false),
+        };
+        let mut throwaway = Subst::new();
+        throwaway.reset(0);
+        for g in &lhs.grounds {
+            let Some(pos) = multiset.iter().position(|&(el, _)| rt.match_pattern(sig, g, el, &mut throwaway))
+            else {
+                return Vec::new();
+            };
+            multiset[pos].1 -= 1;
+            if multiset[pos].1 == 0 {
+                multiset.remove(pos);
+            }
+        }
+        let elements: Vec<DagId> = multiset.iter().map(|&(el, _)| el).collect();
+        let var_coeffs: Vec<u32> = lhs.vars.iter().map(|v| v.count).collect();
+        let lone_linear =
+            lhs.vars.len() == 1 && lhs.vars[0].count == 1 && !(ext && lhs.identity.is_some());
+        let candidates = enumerate_distributions(
+            &multiset.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
+            &var_coeffs,
+            ext,
+            lhs.identity.is_some(),
+            !lhs.grounds.is_empty(),
+            lone_linear,
+            subject_is_identity,
+        );
+        let mut out = Vec::new();
+        for cand in &candidates {
+            let mut ok = true;
+            let mut to_bind: Vec<(u32, DagId)> = Vec::new();
+            for (k, v) in lhs.vars.iter().enumerate() {
+                let pairs: Vec<(DagId, u32)> = (0..elements.len())
+                    .filter(|&i| cand.to_var[i][k] > 0)
+                    .map(|i| (elements[i], cand.to_var[i][k]))
+                    .collect();
+                let binding = if pairs.is_empty() {
+                    match lhs.identity {
+                        Some(id_sym) => rt.identity_dag(sig, id_sym),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    rt.make_acu(sig, lhs.symbol, pairs)
+                };
+                if !sig.sorts().leq(rt.sort_of(binding), v.sort) {
+                    ok = false;
+                    break;
+                }
+                to_bind.push((v.index, binding));
+            }
+            if !ok {
+                continue;
+            }
+            let residue: Vec<(DagId, u32)> = cand
+                .residue
+                .iter()
+                .enumerate()
+                .filter(|&(_, &r)| r > 0)
+                .map(|(i, &r)| (elements[i], r))
+                .collect();
+            let bindings: Vec<Option<DagId>> = (0..nr_vars)
+                .map(|i| to_bind.iter().find(|&&(idx, _)| idx == i).map(|&(_, b)| b))
+                .collect();
+            out.push((bindings, residue));
+        }
+        out
+    }
+
+    /// Canonicalize a solution stream to a *set* of comparable name-tuples (per-variable binding
+    /// name-multiset + residue name-multiset), so two matchers' outputs can be compared ignoring
+    /// enumeration order and node identity.
+    fn solution_set(e: &Engine, sols: &Solutions, nr_vars: u32) -> std::collections::BTreeSet<Vec<Vec<String>>> {
+        sols.iter()
+            .map(|(binds, residue)| {
+                let mut row: Vec<Vec<String>> = (0..nr_vars as usize)
+                    .map(|i| binds[i].map(|d| names(e, d)).unwrap_or_default())
+                    .collect();
+                let mut res: Vec<String> = residue.iter().flat_map(|&(d, m)| {
+                    std::iter::repeat_n(names(e, d), m as usize).flatten()
+                }).collect();
+                res.sort();
+                row.push(res);
+                row
+            })
+            .collect()
+    }
+
     /// Decode a term into a sorted multiset of leaf-constant names (an AC binding `b+c` → `["b","c"]`,
     /// a constant `a` → `["a"]`), so a solution's bindings can be compared against the reference.
     fn names(e: &Engine, id: DagId) -> Vec<String> {
@@ -732,6 +802,62 @@ mod tests {
             let mut out: Vec<String> = kids.into_iter().flat_map(|c| names(e, c)).collect();
             out.sort();
             out
+        }
+    }
+
+    /// Differential cross-check (AC-matcher plan discipline): the new lazy Diophantine path and the
+    /// retained naive `enumerate_distributions` path must yield the **identical solution multiset** on
+    /// small subjects. Exercises several shapes: 2 collectors, a coefficient-2 variable, an element +
+    /// collector pair, the identity-collapse case, and extension.
+    #[test]
+    fn differential_naive_vs_diophantine() {
+        // Build a small AC signature with an identity and an element sort, plus a plain-AC sibling.
+        let mut e = Engine::new();
+        let elt = e.add_sort("Elt");
+        let ne = e.add_sort("NeS");
+        let set = e.add_sort("S");
+        e.add_subsort(elt, ne);
+        e.add_subsort(ne, set);
+        e.close_sorts();
+        let a = e.add_op("a", vec![], elt);
+        let b = e.add_op("b", vec![], elt);
+        let c = e.add_op("c", vec![], elt);
+        let empty = e.add_op("empty", vec![], set);
+        // _,_ : S S -> S [assoc comm id: empty]  (element sort Elt has sortBound 1).
+        let comma = e.add_op_ac(",", vec![set, set], set, Some(empty));
+        let (a0, b0, c0) = (e.make_const(a), e.make_const(b), e.make_const(c));
+
+        let mk = |e: &mut Engine, ids: &[DagId]| e.make_ac(comma, ids.to_vec());
+        let two = mk(&mut e, &[a0, b0]);
+        let three = mk(&mut e, &[a0, b0, c0]);
+        // a,a,b (a with multiplicity 2)
+        let aab = mk(&mut e, &[a0, a0, b0]);
+
+        // Each case: (pattern, subject, ext, nr_vars).
+        let cases: Vec<(Term, DagId, bool, u32)> = vec![
+            // X , Y  (two collectors) over a,b,c  — with id: also offers identity bindings.
+            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), three, false, 2),
+            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), two, false, 2),
+            // E , S  (element + collector) over a,b,c — the D2a shape at small size.
+            (Term::op(comma, vec![Term::var(0, elt), Term::var(1, set)]), three, false, 2),
+            // X , X  (coefficient-2 variable) over a,a,b.
+            (Term::op(comma, vec![Term::var(0, set), Term::var(0, set)]), aab, false, 1),
+            // ground a , X  with extension over a,b,c (the collapse/identity-first case).
+            (Term::op(comma, vec![Term::constant(a), Term::var(0, set)]), three, true, 1),
+            // X , Y with extension over a,b (residue splits).
+            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), two, true, 2),
+        ];
+        for (i, (pat, subj, ext, nv)) in cases.into_iter().enumerate() {
+            let new_sols = match_all(&mut e, pat.clone(), subj, ext, nv);
+            let naive_sols = naive_match_all(&mut e, pat, subj, ext, nv);
+            let new_set = solution_set(&e, &new_sols, nv);
+            let naive_set = solution_set(&e, &naive_sols, nv);
+            assert_eq!(
+                new_set, naive_set,
+                "case {i}: Diophantine and naive matchers disagree (new={} naive={})",
+                new_sols.len(),
+                naive_sols.len()
+            );
         }
     }
 

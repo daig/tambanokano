@@ -923,6 +923,73 @@ impl Signature {
         acc
     }
 
+    /// Whether a variable of sort `sort` under associative operator `op` can be bound to the
+    /// operator's identity element (Maude's `BinarySymbol::takeIdentity`): `true` iff `op` has an
+    /// identity and the identity constant's sort is `<= sort`. This is the variable's Diophantine
+    /// **lower bound** discriminator — an identity-capable variable has lower bound 0 (may bind the
+    /// empty multiset), else 1.
+    pub(crate) fn acu_take_identity(&self, op: SymbolId, sort: SortId) -> bool {
+        match self.symbol(op).identity() {
+            Some(id_sym) => {
+                let id_sort = self.symbols.get(id_sym).decls()[0].range;
+                self.sorts.leq(id_sort, sort)
+            }
+            None => false,
+        }
+    }
+
+    /// The per-sort **bound** for associative operator `op` (Maude's `AssociativeSymbol::sortBound` via
+    /// `associativeSortBoundsAnalysis`): the maximum number of `op`-arguments a term of sort `s` can
+    /// have — `1` for an *element* sort (two arguments joined escape it, e.g. SET's `X$Elt`),
+    /// [`UNBOUNDED`](crate::diophantine::UNBOUNDED) for a *collector* sort (any number stays `<= s`,
+    /// e.g. `Set`). Returned as a map over the operator's kind's member sorts; a sort not present is
+    /// treated `UNBOUNDED` by callers. This distinguishes the Diophantine *stripper* rows (maxSize 1)
+    /// from *collector* rows (unbounded), fixing both efficiency and the enumeration order.
+    ///
+    /// Ports the fixpoint over the sort diagram. Sort constraints (memberships) on `op` — which force
+    /// their target sorts unbounded — are **not** modelled: no conformance AC operator with a variable
+    /// top-variable carries one (B3's membership pattern is ground).
+    pub(crate) fn acu_sort_bounds(&self, op: SymbolId) -> std::collections::HashMap<SortId, i32> {
+        use crate::diophantine::UNBOUNDED;
+        let range = self.symbols.get(op).decls()[0].range;
+        let kind = self.sorts.kind_of(range);
+        let members: Vec<SortId> = self.sorts.kind(kind).members.clone();
+        let error = self.sorts.error_sort(kind);
+        let mut bounds: std::collections::HashMap<SortId, i32> =
+            members.iter().map(|&s| (s, UNBOUNDED)).collect();
+        // Sorts `>= s` within the component (Maude's `insertGreaterOrEqualSorts`).
+        let ge = |s: SortId| -> Vec<SortId> {
+            members.iter().copied().filter(|&m| self.sorts.leq(s, m)).collect()
+        };
+        let mut largest_bound = 1;
+        let mut i = 1;
+        while i <= largest_bound {
+            let mut too_big: std::collections::HashSet<SortId> = std::collections::HashSet::new();
+            for &j in &members {
+                let j_bound = bounds[&j];
+                for &k in &members {
+                    let k_bound = bounds[&k];
+                    if j_bound == UNBOUNDED || k_bound == UNBOUNDED || j_bound + k_bound > i {
+                        let result = self.compute_sort(op, &[j, k]);
+                        if result != error && !too_big.contains(&result) {
+                            for s in ge(result) {
+                                too_big.insert(s);
+                            }
+                        }
+                    }
+                }
+            }
+            for &j in &members {
+                if !too_big.contains(&j) && bounds[&j] == UNBOUNDED {
+                    bounds.insert(j, i);
+                    largest_bound = 2 * i;
+                }
+            }
+            i += 1;
+        }
+        bounds
+    }
+
     /// Least sort of an **S** node `s^count(arg)` (Maude's `S_Symbol::computeBaseSort` /
     /// `SortPath::computeSortIndex`). The successor's unary sort function, iterated over the argument
     /// sort, is eventually periodic (it maps a finite kind into itself), so the sort follows a **lead**
