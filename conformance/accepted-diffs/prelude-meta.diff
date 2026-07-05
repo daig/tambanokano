@@ -1,0 +1,11 @@
+--- oracle
++++ tnk
+@@ -143,7 +143,7 @@
+   rl 'b.Elt => 'c.Elt [label('r2)] .)
+   rl 'a.Elt => 'b.Elt [label('r1)] .
+ endm, 'a.Elt, 'X:Elt, nil, '+, unbounded, 1) .
+-rewrites: 2
++rewrites: 3
+ result ResultTriple: {'c.Elt, 'Elt, 
+   'X:Elt <- 'c.Elt}
+ reduce in META-LEVEL : metaSearch(mod 'FOO is

@@ -1074,26 +1074,27 @@ impl<'a> Parser<'a> {
                 self.eat(")")?;
                 if txt == "top" { StratExpr::Top(e) } else { StratExpr::One(e) }
             }
-            // Derived branch forms (sugar over `? :`).
+            // Derived branch forms — kept in surface spelling (echo fidelity); resolution desugars.
             "try" | "not" | "test" => {
                 self.advance();
                 self.eat("(")?;
-                let e = Box::new(self.strategy()?);
+                let e = self.strategy()?;
                 self.eat(")")?;
-                let (success, failure) = match txt {
-                    "not" => (StratExpr::Fail, StratExpr::Idle),
-                    _ => (StratExpr::Idle, StratExpr::Fail), // try / test
+                let kind = match txt {
+                    "not" => StratSugar::NotS,
+                    "test" => StratSugar::TestS,
+                    _ => StratSugar::Try,
                 };
-                StratExpr::Branch { test: e, success: Box::new(success), failure: Box::new(failure) }
+                StratExpr::Sugar { kind, args: vec![e] }
             }
             "or-else" => {
                 self.advance();
                 self.eat("(")?;
-                let a = Box::new(self.strategy()?);
+                let a = self.strategy()?;
                 self.eat(",")?;
                 let b = self.strategy()?;
                 self.eat(")")?;
-                StratExpr::Branch { test: a, success: Box::new(StratExpr::Idle), failure: Box::new(b) }
+                StratExpr::Sugar { kind: StratSugar::OrElse, args: vec![a, b] }
             }
             "match" | "xmatch" | "amatch" => {
                 self.advance();

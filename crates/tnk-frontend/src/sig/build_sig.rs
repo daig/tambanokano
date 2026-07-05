@@ -411,13 +411,19 @@ fn compute_overload_flags(
     syntax: &HashMap<SymbolId, SymbolSyntax>,
 ) -> HashMap<SymbolId, u8> {
     use crate::sig::syntax::{OVL_ADHOC, OVL_DOMAIN, OVL_RANGE};
-    // Group symbols by name, recording each one's domain/range *kinds*.
+    // Group symbols by (name, ARITY), recording each one's domain/range *kinds*: a k-argument
+    // application can only be confused with other k-argument declarations of the same name, so a
+    // different-arity overload (META-LEVEL's 4-arg vs 3-arg metaParse) must not force
+    // disambiguation — Maude echoes `metaParse(M, none, Q, T)` with a bare `none`.
     type Profile = (SymbolId, Vec<KindId>, KindId);
-    let mut by_name: HashMap<&str, Vec<Profile>> = HashMap::new();
+    let mut by_name: HashMap<(&str, usize), Vec<Profile>> = HashMap::new();
     for (&sym, syn) in syntax {
         let dom: Vec<KindId> = syn.domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
         let range = engine.sorts().kind_of(syn.range);
-        by_name.entry(engine.symbol(sym).name()).or_default().push((sym, dom, range));
+        by_name
+            .entry((engine.symbol(sym).name(), dom.len()))
+            .or_default()
+            .push((sym, dom, range));
     }
     let mut flags: HashMap<SymbolId, u8> = HashMap::new();
     for group in by_name.values() {

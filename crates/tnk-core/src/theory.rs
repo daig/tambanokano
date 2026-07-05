@@ -22,7 +22,7 @@
 use crate::acu::{AcuLhs, AcuSubproblem};
 use crate::au::{AuLhs, AuSubproblem};
 use crate::cui::{CuiLhs, CuiSubproblem};
-use crate::dag::DagId;
+use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::s::{SLhs, SSubproblem};
 use crate::symbol::Theory;
@@ -78,6 +78,12 @@ impl LhsAutomaton {
     /// `ext_allowed` enables *extension* (matching a sub-multiset of an AC subject and leaving a
     /// residue) — the free theory ignores it; ACU uses it for top-level rewriting and `xmatch`
     /// (audit F-3).
+    ///
+    /// `command` is set only for the `match`/`xmatch` **commands** (not reduce/rewrite/search): it
+    /// enables the extension refinements that Maude's interactive matcher shows but the rewrite engine
+    /// takes the first solution of — the AU `bigEnough` floor + `SequencePartition` order, and the
+    /// subject-driven *bare-variable* extension (`matchVariableWithExtension`). Keeping it off the
+    /// rewrite path guarantees reduce/rewrite behaviour is unchanged (fable-audit.md §3.3).
     pub(crate) fn match_(
         &self,
         rt: &Runtime,
@@ -85,11 +91,44 @@ impl LhsAutomaton {
         subject: DagId,
         subst: &mut Subst,
         ext_allowed: bool,
+        command: bool,
     ) -> Option<Subproblem> {
         match self {
-            LhsAutomaton::Free(pat) => rt
-                .match_pattern(sig, pat, subject, subst)
-                .then_some(Subproblem::FreeOnce { pending: true }),
+            LhsAutomaton::Free(pat) => {
+                // A **bare variable** with extension, as an `xmatch` command over a theory node, matches a
+                // sub-part of the subject (Maude dispatches on the *subject*'s theory —
+                // `DagNode::matchVariableWithExtension`). Only the S and AU cases occur in the audit; any
+                // other subject (free constant, ACU, CUI, …) falls through to the whole-subject match,
+                // which prints no `Matched portion` line.
+                if command && ext_allowed && let Term::Var(v) = pat {
+                    match &rt.node(subject).term {
+                        NodeTerm::S { symbol, count, arg } => {
+                            return Some(Subproblem::S(SSubproblem::match_variable_with_extension(
+                                *symbol,
+                                count.clone(),
+                                *arg,
+                                v.index,
+                                v.sort,
+                            )));
+                        }
+                        NodeTerm::Au { symbol, args } => {
+                            let identity = sig.symbol(*symbol).identity();
+                            return Some(Subproblem::Au(AuSubproblem::match_variable_with_extension(
+                                rt,
+                                sig,
+                                args.clone(),
+                                *symbol,
+                                identity,
+                                v.index,
+                                v.sort,
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                rt.match_pattern(sig, pat, subject, subst)
+                    .then_some(Subproblem::FreeOnce { pending: true })
+            }
             LhsAutomaton::FreeWithAliens(pat) => {
                 // Match the free skeleton (binding the free variables), collecting the theory-rooted
                 // alien subterms, then compose their subproblems into a Sequence (C8). The skeleton is
@@ -101,7 +140,9 @@ impl LhsAutomaton {
             LhsAutomaton::Acu(lhs) => {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
             }
-            LhsAutomaton::Au(lhs) => lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Au),
+            LhsAutomaton::Au(lhs) => {
+                lhs.match_(rt, sig, subject, ext_allowed, command).map(Subproblem::Au)
+            }
             LhsAutomaton::Cui(lhs) => {
                 lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Cui)
             }
@@ -150,6 +191,22 @@ impl Subproblem {
             Subproblem::Cui(sp) => sp.next(rt, sig, subst),
             Subproblem::S(sp) => sp.next(rt, sig, subst),
             Subproblem::Sequence(sp) => sp.next(rt, sig, subst),
+        }
+    }
+
+    /// Extension-match status of the *current* solution, for the `xmatch` command's display. `None`
+    /// means the match carried no extension info (a free-theory subject, or a non-extension match) — so
+    /// no `Matched portion` line is printed; `Some(true)` is `(whole)`; `Some(false)` a genuine
+    /// sub-portion (the caller builds it from the instantiated pattern). Mirrors Maude's
+    /// `ExtensionInfo != 0` / `matchedWhole()` test in `Mixfix/match.cc`.
+    pub(crate) fn matched_status(&self) -> Option<bool> {
+        match self {
+            Subproblem::FreeOnce { .. } | Subproblem::Sequence(_) => None,
+            Subproblem::Acu(sp) => sp.matched_status(),
+            Subproblem::Au(sp) => sp.matched_status(),
+            // CUI extension display is unexercised by the audit; report no portion line.
+            Subproblem::Cui(_) => None,
+            Subproblem::S(sp) => sp.matched_status(),
         }
     }
 
@@ -262,7 +319,7 @@ fn rec_aliens(
     let (pat, subj) = &aliens[idx];
     let automaton = LhsAutomaton::compile(pat.clone(), sig);
     let checkpoint = scratch.clone();
-    if let Some(mut sp) = automaton.match_(rt, sig, *subj, scratch, false) {
+    if let Some(mut sp) = automaton.match_(rt, sig, *subj, scratch, false, false) {
         while sp.next(rt, sig, scratch) {
             rec_aliens(idx + 1, aliens, var_indices, rt, sig, scratch, out);
         }
@@ -308,7 +365,7 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(1);
         let (sig, rt) = e.parts_mut();
-        let mut sp = lhs.match_(rt, sig, subject, &mut subst, false).expect("f(a,a) matches f(X,a)");
+        let mut sp = lhs.match_(rt, sig, subject, &mut subst, false, false).expect("f(a,a) matches f(X,a)");
         assert!(sp.next(rt, sig, &mut subst), "the one solution");
         assert_eq!(subst.get(0), Some(a0), "X bound to the first argument");
         assert!(!sp.next(rt, sig, &mut subst), "free theory has a single solution");
@@ -335,7 +392,7 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(1);
         assert!(
-            lhs.match_(e.runtime(), e.signature(), subject, &mut subst, false).is_none(),
+            lhs.match_(e.runtime(), e.signature(), subject, &mut subst, false, false).is_none(),
             "f(b,b) does not match f(X,a)"
         );
     }

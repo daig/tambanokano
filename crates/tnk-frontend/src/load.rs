@@ -23,6 +23,7 @@ use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
 use std::collections::{BTreeSet, HashMap};
 use tnk_core::dag::DagId;
+use tnk_core::engine::MatchedPortion;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::{Arrow, Search};
 use tnk_core::sort::{KindId, SortId};
@@ -983,8 +984,10 @@ pub fn search_command(
 struct RawSolution {
     /// One `DagId` per pattern variable, indexed `0..nr_vars`.
     bindings: Vec<DagId>,
-    /// The matched portion (`xmatch` only); `None` for a plain `match`.
-    portion: Option<DagId>,
+    /// The matched portion (`xmatch` only): `None` prints no `Matched portion` line (plain `match`, or an
+    /// `xmatch` whose subject carried no extension info); `Some(Whole)` prints `(whole)`; `Some(Portion)`
+    /// prints the built sub-portion.
+    portion: Option<MatchedPortion>,
 }
 
 /// Parse + build + enumerate the solutions of a `match`/`xmatch` command. Returns one rendered block
@@ -1025,7 +1028,7 @@ pub fn match_command(
             let bindings = (0..nr)
                 .map(|k| sols.binding(k).expect("the matcher binds every pattern variable"))
                 .collect();
-            let portion = xmatch.then(|| sols.matched_portion());
+            let portion = if xmatch { sols.matched_portion_display() } else { None };
             raws.push(RawSolution { bindings, portion });
         }
     }
@@ -1038,8 +1041,12 @@ pub fn match_command(
 /// Maude's index order) or `empty substitution` when the pattern is ground.
 fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarIndex) -> String {
     let mut lines: Vec<String> = Vec::new();
-    if let Some(p) = sol.portion {
-        lines.push(format!("Matched portion = {}", print_pretty(m, i, p, false)));
+    match sol.portion {
+        Some(MatchedPortion::Whole) => lines.push("Matched portion = (whole)".to_string()),
+        Some(MatchedPortion::Portion(p)) => {
+            lines.push(format!("Matched portion = {}", print_pretty(m, i, p, false)));
+        }
+        None => {}
     }
     if sol.bindings.is_empty() {
         lines.push("empty substitution".to_string());

@@ -93,8 +93,15 @@ impl SLhs {
         let diff = n.checked_sub(&self.count)?; // None ⇒ n < k ⇒ no match
         let state = match &self.sub {
             SSub::Var { index, sort } if ext_allowed => {
-                // X absorbs j of the surplus, j = diff … 0 (lazy — diff is a bignum).
-                SState::VarExt { index: *index, sort: *sort, diff: diff.clone(), next_j: Some(diff) }
+                // X absorbs j of the surplus, j = diff … 0 (lazy — diff is a bignum). A peeled-successor
+                // pattern (`s^k X`) has floor 0; the bare-variable case (constructed separately) uses 1.
+                SState::VarExt {
+                    index: *index,
+                    sort: *sort,
+                    diff: diff.clone(),
+                    next_j: Some(diff),
+                    floor: Nat::zero(),
+                }
             }
             SSub::Var { index, sort } => {
                 // No extension: X absorbs the whole surplus (residue 0).
@@ -120,6 +127,7 @@ impl SLhs {
             bound: Vec::new(),
             residue: Nat::zero(),
             matched_whole: true,
+            extension: ext_allowed,
         })
     }
 }
@@ -136,13 +144,18 @@ pub(crate) struct SSubproblem {
     /// Residue of the most recent solution: the rhs is wrapped in `s^residue` (`build_result`).
     residue: Nat,
     matched_whole: bool,
+    /// `true` when this was an extension match against an S node — governs the `xmatch` `Matched
+    /// portion` line (`false` prints no line, as for a non-theory subject).
+    extension: bool,
 }
 
 /// The per-pattern-shape enumerator state.
 enum SState {
-    /// Variable + extension: bind `X = s^j(base)` for `j` descending from `next_j` to `0`, residue
-    /// `diff − j`. Lazy because `diff` may be astronomically large.
-    VarExt { index: u32, sort: SortId, diff: Nat, next_j: Option<Nat> },
+    /// Variable + extension: bind `X = s^j(base)` for `j` descending from `next_j` to `floor`, residue
+    /// `diff − j`. Lazy because `diff` may be astronomically large. `floor` is 0 for a peeled `s^k X`
+    /// pattern and 1 for a bare variable (Maude's `S_Subproblem` `mustMatchAtLeast`, so the matched
+    /// portion keeps at least one successor).
+    VarExt { index: u32, sort: SortId, diff: Nat, next_j: Option<Nat>, floor: Nat },
     /// Variable, no extension: a single solution `X = s^j(base)`, residue 0.
     VarWhole { index: u32, sort: SortId, j: Nat },
     /// Non-variable sub-pattern matched against the base (through the full matcher seam, so it may be
@@ -154,6 +167,41 @@ enum SState {
 }
 
 impl SSubproblem {
+    /// A **bare variable** matched with extension against an S node `s^n(base)` (Maude's
+    /// `S_DagNode::matchVariableWithExtension` → `S_Subproblem` with `mustMatchAtLeast = 1`): bind
+    /// `X = s^j(base)` for `j = n, n−1, …, 1`, leaving `residue = n − j` surplus successors. The floor of
+    /// 1 keeps at least one successor in the matched portion (so `xmatch X:Nat <=? 3` yields the whole
+    /// plus the `2` and `1` portions — not the bare `0`; fable-audit.md §3.3).
+    pub(crate) fn match_variable_with_extension(
+        symbol: SymbolId,
+        n: Nat,
+        base: DagId,
+        var_index: u32,
+        var_sort: SortId,
+    ) -> SSubproblem {
+        SSubproblem {
+            symbol,
+            base,
+            state: SState::VarExt {
+                index: var_index,
+                sort: var_sort,
+                diff: n.clone(),
+                next_j: Some(n),
+                floor: Nat::one(),
+            },
+            bound: Vec::new(),
+            residue: Nat::zero(),
+            matched_whole: true,
+            extension: true,
+        }
+    }
+
+    /// Extension-match status of the *current* solution, for the `xmatch` display: `None` when this was
+    /// not an extension match (no `Matched portion` line), else whether the whole subject was matched.
+    pub(crate) fn matched_status(&self) -> Option<bool> {
+        self.extension.then_some(self.matched_whole)
+    }
+
     /// Advance to the next solution, binding its variable(s) into `subst` and recording the residue;
     /// `false` when exhausted. Builds binding nodes (needs `&mut Runtime`).
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
@@ -204,11 +252,16 @@ impl SSubproblem {
             // residue)` (releasing the `self.state` borrow), build `s^j(base)`, bind. Sort-violating `j`
             // skips to the next.
             let (index, sort, j, residue) = match &mut self.state {
-                SState::VarExt { index, sort, diff, next_j } => match next_j.take() {
+                SState::VarExt { index, sort, diff, next_j, floor } => match next_j.take() {
                     None => return false,
                     Some(j) => {
-                        *next_j =
-                            if j.is_zero() { None } else { Some(j.checked_sub(&Nat::one()).unwrap()) };
+                        // Descend to `floor` (0 for `s^k X`, 1 for a bare variable — Maude's
+                        // `mustMatchAtLeast`), so a bare variable never yields the zero-successor portion.
+                        *next_j = if j == *floor {
+                            None
+                        } else {
+                            Some(j.checked_sub(&Nat::one()).unwrap())
+                        };
                         let residue = diff.checked_sub(&j).unwrap();
                         (*index, *sort, j, residue)
                     }

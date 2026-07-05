@@ -523,7 +523,7 @@ impl AcuSubproblem {
             }
             let checkpoint = scratch.clone();
             // An alien consumes a whole element — no extension on the sub-match.
-            if let Some(mut sp) = automaton.match_(rt, sig, elem, scratch, false) {
+            if let Some(mut sp) = automaton.match_(rt, sig, elem, scratch, false, false) {
                 while sp.next(rt, sig, scratch) {
                     let mut reduced = multiset.to_vec();
                     reduced[i].1 -= alien.multiplicity;
@@ -642,6 +642,12 @@ impl AcuSubproblem {
     #[cfg(test)]
     pub(crate) fn residue(&self) -> &[(DagId, u32)] {
         &self.residue
+    }
+
+    /// Extension-match status of the *current* solution, for the `xmatch` display: `None` when this was
+    /// not an extension match (no `Matched portion` line), else whether the whole subject was matched.
+    pub(crate) fn matched_status(&self) -> Option<bool> {
+        self.ext_allowed.then_some(self.matched_whole)
     }
 }
 

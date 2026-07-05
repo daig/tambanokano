@@ -152,7 +152,26 @@ impl DescentOps for MetaDescent<'_> {
             // `MetaOp::Deferred` is the symbolic/SMT/legacy set (`metaUnify`/`metaVariant*`/`metaNarrow*`/
             // `metaSmtSearch`/`metaCheck`/`metaSrewrite`/`metaParseStrategy`/…); `UpStratDecls`/`UpSds` are
             // the strategy-declaration up maps. The match is exhaustive so a new descent op forces a choice.
-            MetaOp::Deferred | MetaOp::UpStratDecls | MetaOp::UpSds => None,
+            // Strategy-meta up maps are structurally deferred (G1, §3.9.8) — but the EMPTY sets
+            // need none of G1's prerequisites: a module with no strat declarations/definitions
+            // up-translates to the empty-set constant ((none).StratDeclSet, 1 rewrite), as Maude
+            // does. Nonempty sets stay inert until G1.
+            MetaOp::UpStratDecls | MetaOp::UpSds => {
+                let kids = ctx.children(redex);
+                let name = qid_text(ctx, *kids.first()?)?;
+                let _flat = down_bool(ctx, *kids.get(1)?)?;
+                let pm = self.db.get(&name)?;
+                let (empty_hook, is_empty) = match op {
+                    MetaOp::UpStratDecls => ("emptyStratDeclSetSymbol", pm.strat_decls.is_empty()),
+                    _ => ("emptyStratDefSetSymbol", pm.strat_defs.is_empty()),
+                };
+                if !is_empty {
+                    return None; // nonempty strategy meta-reflection is G1
+                }
+                let sym = *hooks.ops.get(empty_hook)?;
+                Some(ctx.app(sym, Vec::new()))
+            }
+            MetaOp::Deferred => None,
         }
     }
 }

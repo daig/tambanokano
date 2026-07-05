@@ -23,7 +23,7 @@
 use crate::build_term::VarIndex;
 use crate::lex::{Interner, Token};
 use crate::load::{parse_build, parse_condition, term_var_indices, LoadedModule};
-use crate::surface::ast::{StratExpr, TestKind};
+use crate::surface::ast::{StratSugar, StratExpr, TestKind};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 use tnk_core::dag::DagId;
@@ -179,8 +179,49 @@ pub fn srewrite_command(
 
 /// Render a strategy expression back to source text (the echo). Best-effort.
 pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
+    /// Maude's echo precedence (tightest first): atoms/calls/keyword forms (0), postfix
+    /// iteration `* + !` (1), `;` (2), `|` (3), `? :` (4). A child prints parenthesized only
+    /// when its precedence exceeds what the position admits; an iteration over an atomic child
+    /// prints spaced (`r1 *`), over a compound child glued to the parens (`(r1 | r2)!`) —
+    /// oracle-probed spellings.
+    fn prec(e: &StratExpr) -> u8 {
+        match e {
+            StratExpr::Star(_) | StratExpr::Plus(_) | StratExpr::Normalize(_) => 1,
+            StratExpr::Seq(..) => 2,
+            StratExpr::Union(..) => 3,
+            StratExpr::Branch { .. } => 4,
+            _ => 0,
+        }
+    }
+    fn child(e: &StratExpr, i: &Interner, max: u8) -> String {
+        let s = print_strategy(e, i);
+        if prec(e) > max { format!("({s})") } else { s }
+    }
+    fn iteration(a: &StratExpr, i: &Interner, op: &str) -> String {
+        if prec(a) == 0 {
+            format!("{} {op}", print_strategy(a, i))
+        } else {
+            format!("({}){op}", print_strategy(a, i))
+        }
+    }
+    // Punctuation-aware token spacing, matching Maude's pattern echo (`f(X:S, Y:S)`, not
+    // `f ( X:S , Y:S )`): no space after an opener or before a closer/comma.
     fn join(toks: &[Token], i: &Interner) -> String {
-        toks.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ")
+        let mut out = String::new();
+        for t in toks {
+            let s = i.resolve(t.sym);
+            let no_space = out.is_empty()
+                || out.ends_with(['(', '[', '{'])
+                || matches!(s, ")" | "]" | "}" | ",")
+                // application: `f(` glues when the preceding token is word-like (`f(X:S, Y:S)`),
+                // while an operator keeps its space (`a + (b + c)`) — Maude's echo spacing.
+                || (s == "(" && out.chars().last().is_some_and(|c| c.is_alphanumeric()));
+            if !no_space {
+                out.push(' ');
+            }
+            out.push_str(s);
+        }
+        out
     }
     match e {
         StratExpr::Idle => "idle".into(),
@@ -204,13 +245,13 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
         }
         StratExpr::Top(a) => format!("top({})", print_strategy(a, i)),
         StratExpr::One(a) => format!("one({})", print_strategy(a, i)),
-        StratExpr::Seq(a, b) => format!("{} ; {}", print_strategy(a, i), print_strategy(b, i)),
-        StratExpr::Union(a, b) => format!("{} | {}", print_strategy(a, i), print_strategy(b, i)),
-        StratExpr::Star(a) => format!("{} *", print_strategy(a, i)),
-        StratExpr::Plus(a) => format!("{} +", print_strategy(a, i)),
-        StratExpr::Normalize(a) => format!("{} !", print_strategy(a, i)),
+        StratExpr::Seq(a, b) => format!("{} ; {}", child(a, i, 2), child(b, i, 2)),
+        StratExpr::Union(a, b) => format!("{} | {}", child(a, i, 3), child(b, i, 3)),
+        StratExpr::Star(a) => iteration(a, i, "*"),
+        StratExpr::Plus(a) => iteration(a, i, "+"),
+        StratExpr::Normalize(a) => iteration(a, i, "!"),
         StratExpr::Branch { test, success, failure } => {
-            format!("{} ? {} : {}", print_strategy(test, i), print_strategy(success, i), print_strategy(failure, i))
+            format!("{} ? {} : {}", child(test, i, 3), child(success, i, 3), child(failure, i, 3))
         }
         StratExpr::Test { kind, pattern, cond } => {
             let k = match kind {
@@ -232,11 +273,27 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             };
             let by = subs
                 .iter()
-                .map(|(v, st)| format!("{} using {}", join(v, i), print_strategy(st, i)))
+                .map(|(v, st)| {
+                    // A by-clause substrategy binds tighter than the `,` separating clauses:
+                    // `;`/`|`/`? :` need parens (oracle: `by X:S using (r1 | r2), …`).
+                    let s = print_strategy(st, i);
+                    let s = if prec(st) >= 2 { format!("({s})") } else { s };
+                    format!("{} using {}", join(v, i), s)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let st = cond.as_ref().map(|c| format!(" such that {}", join(c, i))).unwrap_or_default();
             format!("{kw} {}{st} by {by}", join(pattern, i))
+        }
+        StratExpr::Sugar { kind, args } => {
+            let kw = match kind {
+                StratSugar::Try => "try",
+                StratSugar::NotS => "not",
+                StratSugar::TestS => "test",
+                StratSugar::OrElse => "or-else",
+            };
+            let a = args.iter().map(|e| print_strategy(e, i)).collect::<Vec<_>>().join(", ");
+            format!("{kw}({a})")
         }
         StratExpr::Call { name, args } => {
             if args.is_empty() {
@@ -283,6 +340,24 @@ fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner, depth: u32) -> Result
         StratExpr::Star(a) => RStrat::Star(resolve(a, lm, i, depth)?),
         StratExpr::Plus(a) => RStrat::Plus(resolve(a, lm, i, depth)?),
         StratExpr::Normalize(a) => RStrat::Normalize(resolve(a, lm, i, depth)?),
+        // Surface sugar desugars here (the parser preserves the spelling for the echo):
+        // try(a) = a ? idle : fail ; test(a) likewise (the test/try semantic distinction is the
+        // documented simplification); not(a) = a ? fail : idle ; or-else(a, b) = a ? idle : b.
+        StratExpr::Sugar { kind, args } => {
+            let branch = |t: &StratExpr, s: StratExpr, f: StratExpr| StratExpr::Branch {
+                test: Box::new(t.clone()),
+                success: Box::new(s),
+                failure: Box::new(f),
+            };
+            let desugared = match kind {
+                StratSugar::Try | StratSugar::TestS => {
+                    branch(&args[0], StratExpr::Idle, StratExpr::Fail)
+                }
+                StratSugar::NotS => branch(&args[0], StratExpr::Fail, StratExpr::Idle),
+                StratSugar::OrElse => branch(&args[0], StratExpr::Idle, args[1].clone()),
+            };
+            return resolve(&desugared, lm, i, depth);
+        }
         StratExpr::Branch { test, success, failure } => RStrat::Branch {
             test: resolve(test, lm, i, depth)?,
             success: resolve(success, lm, i, depth)?,
@@ -422,6 +497,10 @@ fn subst_strat_tokens(e: &StratExpr, find: &[Token], repl: &[Token]) -> StratExp
         StratExpr::Star(a) => StratExpr::Star(Box::new(subst_strat_tokens(a, find, repl))),
         StratExpr::Plus(a) => StratExpr::Plus(Box::new(subst_strat_tokens(a, find, repl))),
         StratExpr::Normalize(a) => StratExpr::Normalize(Box::new(subst_strat_tokens(a, find, repl))),
+        StratExpr::Sugar { kind, args } => StratExpr::Sugar {
+            kind: *kind,
+            args: args.iter().map(|e| subst_strat_tokens(e, find, repl)).collect(),
+        },
         StratExpr::Branch { test, success, failure } => StratExpr::Branch {
             test: Box::new(subst_strat_tokens(test, find, repl)),
             success: Box::new(subst_strat_tokens(success, find, repl)),

@@ -296,7 +296,16 @@ pub enum TestKind {
 /// A **strategy expression** (the combinator tree, Table 10.1). Term-carrying parts (a rule label's initial
 /// substitution / its rewrite-condition substrategies, a test/matchrew pattern + condition, a call's
 /// arguments) are raw token bubbles, parsed against the module grammar at execution time. The derived forms
-/// `try`/`not`/`test`/`or-else` desugar to [`StratExpr::Branch`] in the parser.
+/// `try`/`not`/`test`/`or-else` keep their surface spelling ([`StratExpr::Sugar`]) for the command echo
+/// and desugar to [`StratExpr::Branch`] at resolution (fable-audit.md §3.9.8 ii).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StratSugar {
+    Try,
+    NotS,
+    TestS,
+    OrElse,
+}
+
 #[derive(Debug, Clone)]
 pub enum StratExpr {
     /// `idle` — pass the subject through unchanged (one solution).
@@ -329,6 +338,10 @@ pub enum StratExpr {
     Test { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>> },
     /// `matchrew P [s.t. C] by x1 using E1, …` — match `P`, run `Eᵢ` on the subterm bound to `xᵢ`, rebuild.
     MatchRew { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>>, subs: Vec<(Vec<Token>, StratExpr)> },
+    /// A derived branch form kept in its SURFACE spelling for the command echo — `try(α)`, `not(α)`,
+    /// `test(α)`, `or-else(α, β)` — resolution desugars to the `? :` branch (fable-audit.md §3.9.8 ii:
+    /// the round-trip must preserve the surface form).
+    Sugar { kind: StratSugar, args: Vec<StratExpr> },
     /// A named strategy `s` / `s(args)`, resolved against the module's `sd`/`csd` definitions.
     Call { name: String, args: Vec<Vec<Token>> },
 }

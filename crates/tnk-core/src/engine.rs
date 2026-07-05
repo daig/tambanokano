@@ -1510,7 +1510,7 @@ impl Runtime {
     ) -> Option<Vec<Option<DagId>>> {
         let mut subst = Subst::new();
         subst.reset(sc.nr_vars);
-        let mut sp = sc.lhs.match_(self, sig, id, &mut subst, false)?;
+        let mut sp = sc.lhs.match_(self, sig, id, &mut subst, false, false)?;
         while sp.next(self, sig, &mut subst) {
             if sc.condition.is_empty() {
                 return Some(if self.tracing() { Self::snapshot_subst(&subst) } else { Vec::new() });
@@ -2561,7 +2561,7 @@ impl Runtime {
         accept: &mut dyn FnMut(&mut Runtime, DagId) -> Flow,
     ) -> Option<DagId> {
         subst.reset(nr_vars);
-        let mut sp = lhs.match_(self, sig, subject, subst, ext_allowed)?;
+        let mut sp = lhs.match_(self, sig, subject, subst, ext_allowed, false)?;
         let rewrite_kind = match ctx.kind {
             StmtKind::Equation => RewriteKind::Equation,
             StmtKind::Rule => RewriteKind::Rule,
@@ -2891,7 +2891,7 @@ impl Runtime {
         let mut solutions = Vec::new();
         let mut subst = Subst::new();
         subst.reset(nr_vars);
-        let Some(mut sp) = goal.match_(self, sig, state, &mut subst, false) else {
+        let Some(mut sp) = goal.match_(self, sig, state, &mut subst, false, false) else {
             return solutions;
         };
         while sp.next(self, sig, &mut subst) {
@@ -3093,7 +3093,7 @@ impl Runtime {
                 for &fv in fresh_vars {
                     subst.unbind(fv); // fresh slate, so a backtracking re-entry rebinds cleanly
                 }
-                let satisfied = match pattern.match_(self, sig, subj, subst, false) {
+                let satisfied = match pattern.match_(self, sig, subj, subst, false, false) {
                     Some(mut sp) => {
                         let mut ok = false;
                         let mut first = true;
@@ -3175,7 +3175,7 @@ impl Runtime {
             for &fv in fresh_vars {
                 subst.unbind(fv);
             }
-            if let Some(mut sp) = pattern.match_(self, sig, state, subst, false) {
+            if let Some(mut sp) = pattern.match_(self, sig, state, subst, false, false) {
                 while sp.next(self, sig, subst) {
                     self.end_fragment(kind, stmt_id, i, depth, true, subst);
                     if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
@@ -4229,7 +4229,9 @@ impl Engine {
         subst.reset(nr_vars);
         let subproblem = {
             let (sig, rt) = self.parts_mut();
-            automaton.match_(rt, sig, subject, &mut subst, extension)
+            // `command = true`: the interactive `match`/`xmatch` seam (extension refinements the rewrite
+            // engine does not need — the AU `bigEnough` floor / partition order, bare-variable extension).
+            automaton.match_(rt, sig, subject, &mut subst, extension, true)
         };
         Solutions { engine: self, pattern, subproblem, subst }
     }
@@ -4279,6 +4281,27 @@ impl Solutions<'_> {
     pub fn matched_portion(&mut self) -> DagId {
         self.engine.instantiate(&self.pattern, &self.subst)
     }
+
+    /// The matched portion rendered for the `xmatch` **command** display — mirroring Maude's
+    /// `Mixfix/match.cc`: `None` when the match carried no extension info (a free-theory subject, or a
+    /// non-extension match), so no `Matched portion` line is printed; `Some(Whole)` when the whole
+    /// subject was matched (`(whole)`); otherwise `Some(Portion(dag))` with the built sub-part. Valid
+    /// only after a successful [`advance`](Self::advance).
+    pub fn matched_portion_display(&mut self) -> Option<MatchedPortion> {
+        match self.subproblem.as_ref()?.matched_status()? {
+            true => Some(MatchedPortion::Whole),
+            false => Some(MatchedPortion::Portion(self.engine.instantiate(&self.pattern, &self.subst))),
+        }
+    }
+}
+
+/// The matched portion of an `xmatch` command solution (see [`Solutions::matched_portion_display`]):
+/// either the whole subject (`(whole)`) or a genuine sub-portion carrying its built DAG.
+pub enum MatchedPortion {
+    /// The extension match covered the whole subject — Maude prints `(whole)`.
+    Whole,
+    /// A proper sub-portion of the subject; the caller renders this DAG.
+    Portion(DagId),
 }
 
 #[cfg(test)]
@@ -4360,6 +4383,8 @@ mod tests {
             let mut sols = e.match_solutions(ground, 0, subject, true);
             assert!(sols.advance(), "one extension solution");
             let p = sols.matched_portion();
+            // The display view reports a partial portion (not `(whole)`) for `a + b <=? a + b + c`.
+            assert!(matches!(sols.matched_portion_display(), Some(MatchedPortion::Portion(_))));
             assert!(!sols.advance(), "exactly one");
             p
         };

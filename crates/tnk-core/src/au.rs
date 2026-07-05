@@ -91,6 +91,7 @@ impl AuLhs {
         sig: &Signature,
         subject: DagId,
         ext_allowed: bool,
+        command: bool,
     ) -> Option<AuSubproblem> {
         // **Collapse matching.** A subject not rooted at this operator is a one-element sequence — or,
         // if it is the operator's identity, the empty sequence. So a pattern like `E L` (with `__
@@ -143,17 +144,28 @@ impl AuLhs {
             });
         }
 
-        let n = seq.len();
-        let mut throwaway = Subst::new();
-        throwaway.reset(0);
-        let mut candidates: Vec<Candidate> = Vec::new();
-        let last_start = if ext { n } else { 0 };
-        for start in 0..=last_start {
-            let mut lengths = Vec::with_capacity(self.elements.len());
-            self.walk(rt, sig, &seq, start, 0, start, ext, &mut lengths, &mut throwaway, &mut candidates);
-        }
-        // Maximal matched portion first → a lone linear variable absorbs the remainder (collector).
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.matched()));
+        let candidates: Vec<Candidate> = if command && ext {
+            // `xmatch` command over an AU node: Maude's FULL matcher (AU_Layer + SequencePartition)
+            // enumerates each matched portion in partition order, filtered by AU_ExtensionInfo::bigEnough
+            // (the matched portion must span >= 2 subject subterms). Fixes the `X Y <=? a b c`
+            // over-enumeration (20 → 10; fable-audit.md §3.3 / ac-matcher-plan Phase 5). No maximal-first
+            // re-sort — partition order *is* the reference order.
+            let var_min: i64 = if self.identity.is_some() { 0 } else { 1 };
+            seq_partition_candidates(rt, sig, &seq, &self.elements, var_min, 2)
+        } else {
+            let n = seq.len();
+            let mut throwaway = Subst::new();
+            throwaway.reset(0);
+            let mut candidates: Vec<Candidate> = Vec::new();
+            let last_start = if ext { n } else { 0 };
+            for start in 0..=last_start {
+                let mut lengths = Vec::with_capacity(self.elements.len());
+                self.walk(rt, sig, &seq, start, 0, start, ext, &mut lengths, &mut throwaway, &mut candidates);
+            }
+            // Maximal matched portion first → a lone linear variable absorbs the remainder (collector).
+            candidates.sort_by_key(|c| std::cmp::Reverse(c.matched()));
+            candidates
+        };
 
         let var_at: Vec<Option<(u32, SortId)>> = self
             .elements
@@ -296,6 +308,181 @@ impl Candidate {
     }
 }
 
+/// Sentinel for an unbounded part length (Maude's `UNBOUNDED`); `uplus` saturates at it.
+const UNBOUNDED: i64 = i64::MAX;
+fn uplus(a: i64, b: i64) -> i64 {
+    a.saturating_add(b)
+}
+
+/// A faithful port of Maude's `SequencePartition` (`Utility/sequencePartition.{hh,cc}`): enumerate every
+/// way to split `sequence_length` positions among ordered parts, each `[min_length, max_length]`
+/// (`max_length == UNBOUNDED` for a variable part), in Maude's exact order — the leftmost start that can
+/// legally move right is incremented first, so the *last* part's boundary varies slowest. This is the
+/// enumeration order the AU FULL matcher shows for `xmatch`; reproducing it byte-exactly is why we port
+/// the algorithm rather than approximate it.
+struct SeqPartition {
+    sequence_length: i64,
+    parts: Vec<SeqPart>,
+    min_sum: i64,
+    max_sum: i64,
+    closed: bool,
+    failed: bool,
+}
+
+struct SeqPart {
+    min_length: i64,
+    max_length: i64,
+    sum_prev_min: i64,
+    sum_prev_max: i64,
+    start: i64,
+}
+
+impl SeqPartition {
+    fn new(sequence_length: i64, est_parts: usize) -> Self {
+        SeqPartition {
+            sequence_length,
+            parts: Vec::with_capacity(est_parts),
+            min_sum: 0,
+            max_sum: 0,
+            closed: false,
+            failed: false,
+        }
+    }
+
+    fn insert_part(&mut self, min_length: i64, max_length: i64) {
+        let sum_prev_min = self.min_sum;
+        let sum_prev_max = self.max_sum;
+        self.parts.push(SeqPart { min_length, max_length, sum_prev_min, sum_prev_max, start: 0 });
+        self.min_sum += min_length;
+        self.max_sum = uplus(self.max_sum, max_length);
+    }
+
+    fn start(&self, part_nr: i64) -> i64 {
+        self.parts[part_nr as usize].start
+    }
+
+    /// Advance to the next partition (or the first, on the initial call); `false` once exhausted.
+    fn solve(&mut self) -> bool {
+        let find_first = !self.closed;
+        if find_first {
+            self.closed = true;
+            if self.sequence_length < self.min_sum || self.sequence_length > self.max_sum {
+                self.failed = true;
+                return false;
+            }
+        }
+        if self.failed {
+            return false;
+        }
+        self.main_solve(find_first)
+    }
+
+    fn main_solve(&mut self, find_first: bool) -> bool {
+        let nr_parts = self.parts.len() as i64;
+        // On find_first we finish from the top (i = nrParts); otherwise from the incremented start.
+        let mut i: i64 = nr_parts;
+        let mut next_start: i64 = self.sequence_length;
+        if !find_first {
+            let mut found = false;
+            i = 0;
+            while i < nr_parts {
+                let p_start = self.parts[i as usize].start;
+                let p_sum_prev_max = self.parts[i as usize].sum_prev_max;
+                let p_min = self.parts[i as usize].min_length;
+                if p_start < p_sum_prev_max {
+                    let ns = if i == nr_parts - 1 {
+                        self.sequence_length
+                    } else {
+                        self.parts[(i + 1) as usize].start
+                    };
+                    if p_start + p_min < ns {
+                        self.parts[i as usize].start += 1;
+                        next_start = self.parts[i as usize].start;
+                        found = true;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if !found {
+                self.failed = true;
+                return false;
+            }
+        }
+        // finishPartition: move the starts of parts 0..i-1 to their leftmost legal positions.
+        i -= 1;
+        while i >= 0 {
+            let sum_prev_min = self.parts[i as usize].sum_prev_min;
+            let max_length = self.parts[i as usize].max_length;
+            let mut start = sum_prev_min;
+            if next_start - start > max_length {
+                start = next_start - max_length; // respect our max length
+            }
+            self.parts[i as usize].start = start;
+            next_start = start;
+            i -= 1;
+        }
+        true
+    }
+}
+
+/// Generate the AU FULL-matcher candidates for an extension `xmatch` in Maude's `SequencePartition`
+/// order, filtered by the `bigEnough` floor. The parts are `[leftExt] ++ elements ++ [rightExt]`, both
+/// extensions unbounded `[0, ∞)`; each variable element is `[var_min, ∞)` and each ground `[1, 1]`. A
+/// partition survives when its matched portion (the span of all `elements`) is at least `floor` subterms
+/// and each ground element structurally matches at its position; variable *sort* checks stay in
+/// [`AuSubproblem::next`] (a rejected candidate is simply skipped, preserving order). `elements` must be
+/// the pure path (grounds + variables — no aliens).
+fn seq_partition_candidates(
+    rt: &Runtime,
+    sig: &Signature,
+    seq: &[DagId],
+    elements: &[AuElem],
+    var_min: i64,
+    floor: i64,
+) -> Vec<Candidate> {
+    let n = seq.len() as i64;
+    let m = elements.len();
+    let mut sp = SeqPartition::new(n, m + 2);
+    sp.insert_part(0, UNBOUNDED); // left extension
+    for e in elements {
+        match e {
+            AuElem::Ground(_) => sp.insert_part(1, 1),
+            _ => sp.insert_part(var_min, UNBOUNDED),
+        }
+    }
+    sp.insert_part(0, UNBOUNDED); // right extension
+
+    let mut throwaway = Subst::new();
+    throwaway.reset(0);
+    let mut out = Vec::new();
+    while sp.solve() {
+        let matched_start = sp.start(1);
+        let matched_end = sp.start(m as i64 + 1); // exclusive: start of the right extension
+        if matched_end - matched_start < floor {
+            continue; // AU_ExtensionInfo::bigEnough — matched portion too small
+        }
+        let mut lengths = Vec::with_capacity(m);
+        let mut ok = true;
+        for (ei, e) in elements.iter().enumerate() {
+            let s = sp.start(ei as i64 + 1);
+            let len = sp.start(ei as i64 + 2) - s;
+            if let AuElem::Ground(g) = e {
+                // A ground part is [1, 1]; verify it actually matches at this position.
+                if !rt.match_pattern(sig, g, seq[s as usize], &mut throwaway) {
+                    ok = false;
+                    break;
+                }
+            }
+            lengths.push(len as usize);
+        }
+        if ok {
+            out.push(Candidate { start: matched_start as usize, lengths });
+        }
+    }
+    out
+}
+
 /// A resumable enumerator over the solutions of an [`AuLhs`] against a subject (an arm of the closed
 /// [`crate::theory::Subproblem`] enum). Owns its state, so it survives the `&mut Runtime` calls the
 /// driver makes between solutions.
@@ -334,6 +521,50 @@ struct AuRecorded {
 }
 
 impl AuSubproblem {
+    /// A **bare variable** matched with extension against an AU node (Maude's
+    /// `AU_DagNode::matchVariableWithExtension`): the single top variable spans a contiguous portion of
+    /// the subject, leaving an ordered prefix/suffix residue. The variable's lower bound is 2 (a
+    /// two-sided / no identity op is never `oneSidedId`, so tnk — which models only two-sided identities
+    /// — always uses 2), and the matched portion must be `bigEnough` (>= 2 subterms). Enumerated in
+    /// `SequencePartition` order (`xmatch X <=? a b c` → `a b`, `(whole)`, `b c`; fable-audit.md §3.3).
+    pub(crate) fn match_variable_with_extension(
+        rt: &Runtime,
+        sig: &Signature,
+        subject_args: Vec<DagId>,
+        symbol: SymbolId,
+        identity: Option<SymbolId>,
+        var_index: u32,
+        var_sort: SortId,
+    ) -> AuSubproblem {
+        let elements = [AuElem::Var { index: var_index, sort: var_sort }];
+        let candidates = seq_partition_candidates(rt, sig, &subject_args, &elements, 2, 2);
+        AuSubproblem {
+            symbol,
+            identity,
+            subject: subject_args,
+            var_at: vec![Some((var_index, var_sort))],
+            candidates,
+            cursor: 0,
+            complex: false,
+            elements: Vec::new(),
+            ext_allowed: true,
+            all_var_indices: Vec::new(),
+            recorded: None,
+            rec_cursor: 0,
+            bound: Vec::new(),
+            prefix: Vec::new(),
+            suffix: Vec::new(),
+            matched_whole: true,
+        }
+    }
+
+    /// Extension-match status of the *current* solution, for the `xmatch` display: `None` when this was
+    /// not an extension match (no `Matched portion` line), else whether the whole subject was matched.
+    /// (`Some(true)` → `(whole)`; `Some(false)` → the built portion.)
+    pub(crate) fn matched_status(&self) -> Option<bool> {
+        self.ext_allowed.then_some(self.matched_whole)
+    }
+
     /// Advance to the next solution, binding its variables (each to the AU node of its run) and
     /// recording the prefix/suffix residue; `false` when exhausted. A candidate whose binding violates
     /// a variable's sort is skipped.
@@ -478,7 +709,7 @@ impl AuSubproblem {
                     let automaton = LhsAutomaton::compile(t.clone(), sig);
                     let checkpoint = scratch.clone();
                     // An alien consumes one element — no extension on the sub-match.
-                    if let Some(mut sp) = automaton.match_(rt, sig, self.subject[pos], scratch, false) {
+                    if let Some(mut sp) = automaton.match_(rt, sig, self.subject[pos], scratch, false, false) {
                         while sp.next(rt, sig, scratch) {
                             self.rec_complex(elem_idx + 1, pos + 1, start, rt, sig, scratch, out);
                         }
@@ -548,7 +779,7 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
-        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed) else { return Vec::new() };
+        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed, false) else { return Vec::new() };
         let mut out = Vec::new();
         while sp.next(rt, sig, &mut subst) {
             out.push((0..nr_vars).map(|i| subst.get(i)).collect());

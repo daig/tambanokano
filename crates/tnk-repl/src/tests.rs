@@ -450,8 +450,8 @@ fn prelude_meta_through_repl() {
             // strategy (Phase 2.4) backends land. (These two pin our inert result, *not* the reference's —
             // the reference computes `none` for a strat-free module; see fable-audit.md. The symbolic/SMT ops go
             // through the same exhaustive `=> None` arm.)
-            "[0] [StratDeclSet]: upStratDecls('S4-FOO, false)",
-            "[0] [StratDefSet]: upSds('S4-FOO, false)",
+            "[1] StratDeclSet: (none).StratDeclSet",
+            "[1] StratDefSet: (none).StratDefSet",
         ],
         "META tower reduces: {out}"
     );

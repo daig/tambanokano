@@ -1,0 +1,69 @@
+--- oracle
++++ tnk
+@@ -2,46 +2,46 @@
+ Decision time: 0ms cpu (0ms real)
+ 
+ Matcher 1
+-X --> a
+-Y --> b + c
++X --> b + c
++Y --> a
+ 
+ Matcher 2
+-X --> b
+-Y --> a + c
++X --> a + c
++Y --> b
+ 
+ Matcher 3
+-X --> c
+-Y --> a + b
+-
+-Matcher 4
+ X --> a + b
+ Y --> c
+ 
++Matcher 4
++X --> c
++Y --> a + b
++
+ Matcher 5
+-X --> a + c
+-Y --> b
++X --> b
++Y --> a + c
+ 
+ Matcher 6
+-X --> b + c
+-Y --> a
++X --> a
++Y --> b + c
+ match in ACU-MATCH : X # Y <=? a # b .
+ Decision time: 0ms cpu (0ms real)
+ 
+ Matcher 1
+-X --> e
+-Y --> a # b
++X --> a # b
++Y --> e
+ 
+ Matcher 2
+-X --> a
+-Y --> b
+-
+-Matcher 3
+ X --> b
+ Y --> a
+ 
++Matcher 3
++X --> a
++Y --> b
++
+ Matcher 4
+-X --> a # b
+-Y --> e
++X --> e
++Y --> a # b
+ xmatch in ACU-MATCH : a + b <=? a + b + c .
+ Decision time: 0ms cpu (0ms real)
+ 

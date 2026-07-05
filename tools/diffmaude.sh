@@ -101,8 +101,13 @@ normalize() {
 }
 
 # ---- oracle side -----------------------------------------------------------
+# BOTH_NO_PRELUDE=1: run BOTH binaries prelude-free (the legacy prelude-* fixtures define their
+# own copies of prelude modules from scratch — with a standing prelude the oracle refuses to
+# redefine its protected modules, so the designed comparison is prelude-free on both sides).
+oracle_flags=()
+[ "${BOTH_NO_PRELUDE:-0}" = "1" ] && oracle_flags+=(-no-prelude)
 ( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
-    "$ORACLE_BIN" -no-banner -no-advise "$fixture" </dev/null ) \
+    "$ORACLE_BIN" -no-banner -no-advise ${oracle_flags[@]+"${oracle_flags[@]}"} "$fixture" </dev/null ) \
     >"$tmpdir/oracle.raw" 2>&1
 rc=$?
 if [ $rc -eq 124 ]; then
@@ -113,8 +118,12 @@ fi
 # ---- tnk side --------------------------------------------------------------
 tnk_input=$fixture
 tnk_flags=()
-if [ "$TNK_STANDING_PRELUDE" = "1" ]; then
-  if ! grep -q '^\*\*\* PRELUDE' "$fixture"; then
+if [ "${BOTH_NO_PRELUDE:-0}" = "1" ]; then
+  tnk_flags+=(-no-prelude)
+elif [ "$TNK_STANDING_PRELUDE" = "1" ]; then
+  # TNK_ASSUME_PRELUDE=1: treat every fixture as prelude-dependent (the legacy-corpus sweep —
+  # those fixtures predate the marker convention; the oracle always has its prelude standing).
+  if [ "${TNK_ASSUME_PRELUDE:-0}" != "1" ] && ! grep -q '^\*\*\* PRELUDE' "$fixture"; then
     tnk_flags+=(-no-prelude)
   fi
 else

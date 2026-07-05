@@ -1,0 +1,11 @@
+--- oracle
++++ tnk
+@@ -20,7 +20,7 @@
+ result Configuration: ping(p1, p2) < p1 : Player | turns : 2 > < p2 : Player |
+     turns : 2 >
+ search [1] in PINGPONG : (< p1 : Player | turns : 0 > < p2 : Player | turns : 0
+-    >) ping(p1, p2) =>+ C:Configuration pong(p2, p1) .
++    >) ping(p1, p2) =>+ pong(p2, p1) C:Configuration .
+ 
+ Solution 1 (state 1)
+ states: 2  rewrites: 1
