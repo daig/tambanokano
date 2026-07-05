@@ -1,5 +1,14 @@
 # Migration audit — tnk vs Maude 3.5.1 (2026-07-01)
 
+> **Ledger state (2026-07-05, correctness goal `docs/migration/correctness-goal.md`):** every finding
+> in the goal's frozen manifest is closed — `tools/audit-scoreboard.sh` = **74/74 PASS**, the legacy
+> corpus is **87/87 CLEAN** (`tools/legacy-sweep.sh`; two counts-only recorded divergences of the
+> §3.3 [D] matchrew/exploration-schedule class are flagged for user review in
+> `conformance/accepted-diffs/README.md`), `cargo test --release` fully green, and the stock
+> `term-order.maude` / `machine-int.maude` / `linear.maude` load clean through the binary. Findings
+> below carry per-item `RESOLVED (<commit>)` annotations; still-open items are the out-of-scope
+> subsystems (§2/roadmap E–G) and the §3.7 cosmetic classes.
+
 Independent differential audit of the Rust port against the C++ oracle (`maude` 3.5.1 on PATH; source at
 `~/code/maude-lang/maude`, same version). Method: a shared normalizing diff harness (strips only `====`
 separators, banner, `Bye.`, timing tails, and the two documented LEXICAL/LOOP-MODE build errors); roughly a
@@ -188,7 +197,7 @@ documented but materially understated. Every item verified with the minimal repr
 - **[N] Kind-only builtins reduced where Maude fails them:** **RESOLVED (d471d45 divides/float/qid; 501ff8f char).** `0 divides 5` → `false` (oracle: stays at
   `[Bool]`); `char(256)` → `"Ā"` (oracle: unreduced, byte domain); `float("NaN")`/`float("5")` over-accepted;
   `string(qid("a b"))` → `"a b"` (oracle `"a`b"` — qid normalization missing).
-- **[N] `metaParse` returns the flattened parse** (`'_+_[a,b,c]`) where Maude returns the true nested
+- **[N] `metaParse` returns the flattened parse** **RESOLVED (ce71c36 — lazy AU splice; metaParse up-translates the nested surface parse; trace shows the two steps.)** (`'_+_[a,b,c]`) where Maude returns the true nested
   surface parse (`'_+_[a,'_+_[b,c]]`) — the eager-flatten architecture visible as a wrong meta *value*
   (gaps.md claims flatten affects counts only). Same root shows the trace as one fold (`2+3+4 ---> 9`)
   vs Maude's two steps.
@@ -220,11 +229,11 @@ documented but materially understated. Every item verified with the minimal repr
 
 ### 3.3 Wrong counts / enumerations (value right, accounting or solution-set off)
 
-- **[D] Infix ≥3-operand builtin folds count 1 vs k−1** (`2 + 3 + 4`: 1 vs 2). Prefix folds (`gcd(a,b,c)`)
+- **[D] Infix ≥3-operand builtin folds count 1 vs k−1** **RESOLVED (dd46724 — lazy ACU splice preserves the surface nesting through bottom-up reduction; prefix n-ary folds still count 1, §3.9.3.)** (`2 + 3 + 4`: 1 vs 2). Prefix folds (`gcd(a,b,c)`)
   conform. Leaks through meta (`upTerm(2 + 3 + 4)`: 2 vs 3) and `set trace`.
 - **[N] `search … =>!` per-solution snapshots differ** (`states: 4 rewrites: 3` vs oracle `5/4` on the first
   solution; totals agree — tnk explores lazily where Maude expands the frontier first). **RESOLVED (a3291c8).**
-- **[N] `xmatch` over iter under-enumerates**: `xmatch X:Nat <=? 3 .` → 1 matcher (oracle 3: whole + s-residue
+- **[N] `xmatch` over iter under-enumerates**: **RESOLVED (b6e9656 — command-gated extension refinements: AU-with-id 10, iter 3, AU bare-var 3.)** `xmatch X:Nat <=? 3 .` → 1 matcher (oracle 3: whole + s-residue
   portions). **[N]** AU bare-variable xmatch under-enumerates (1 vs 3). **[D-quantified]** AU-with-identity
   xmatch over-enumerates (20 vs 10 on `X Y <=? a b c`).
 - **[N] AC memberships are not applied through extension** **RESOLVED (5028a8e — canonical prefix fold; written-order corner documented.)** (`mb (a | a) : Special` on `a | a | a`: 0 vs 1
@@ -255,7 +264,7 @@ Each of these breaks real specs; several break stock library files.
   line 3233); `a == b`, `if_then_else_fi`, `and` fail to parse in any tnk module that doesn't explicitly
   `protecting BOOL`. Virtually every published Maude spec relies on it. (The repo's fixtures all
   explicitly import BOOL — the suite can't see this gap.)
-- **[N — fundamental] Imports re-parse imported statements in the importer's grammar.** Adding a constant
+- **[N — fundamental] Imports re-parse imported statements in the importer's grammar.** **RESOLVED (3538530 — home-grammar point-fix per D10: imported statements parse against their home module's grammar, flattened-first with home reparse on failure; plain named imports; the full compiled-module-algebra rework remains a user decision.)** Adding a constant
   or op in an importer can make an *imported, already-valid* module's statement ambiguous → the importing
   module fails to build. Minimal: BASE has `var X : S . eq h(X) = a .`; EXT = `including BASE . op X : -> S .`
   → `error in module EXT: ambiguous parse: h ( X )`; oracle is fine (statements are parsed once, at home).
@@ -309,11 +318,11 @@ Each of these breaks real specs; several break stock library files.
 
 ### 3.5 Scale/robustness
 
-- **[N] Naive AC matching hangs on trivially small inputs.** `Misc/dataStructures`: computing the size of a
+- **[N] Naive AC matching hangs on trivially small inputs.** **RESOLVED (41e22a7 — Diophantine matcher core, ac-matcher-plan phases 1-3; 30-element set <1ms, N=100 flat; naive matcher retained as cross-check.)** `Misc/dataStructures`: computing the size of a
   30-element `Set{Nat}` (`| gen(30,13) |`) times out (>60s) where the oracle finishes the whole test in
   seconds. The documented "AC matcher is perf-only" framing understates this: real container workloads at
   double-digit sizes are already unusable, independent of the separate large-term parse/build issue below.
-- **[N] Super-linear (~cubic) handling of large well-formed terms**: a flat 2000-element AC sum takes 14s
+- **[N] Super-linear (~cubic) handling of large well-formed terms**: **RESOLVED (dd46724 + earlier frontend work — the 2000-element chain parses, reduces (1999 counted folds), and prints oracle-equal well inside the budget; D3 fixture passes.)** a flat 2000-element AC sum takes 14s
   (oracle: milliseconds), 5000 elements > 60s vs oracle 30ms. Distinct from the documented garbage-bubble
   Earley blowup — this is the well-formed path (parse/build dominates; AC contributes the larger factor).
 - **[D] Garbage-term Earley blowup** (the distinct, documented case — not re-reproduced this audit): a
