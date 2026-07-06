@@ -112,6 +112,15 @@ avoid BuDDy's global-state clash with the multi-engine model (D1).
 **Impact.** Facade isolates the choice across three consumers. **Revisit:** **Phase 3** — prototype the
 `SortBdds` sort-function + AllSat path first to confirm perf.
 
+**Resolution (2026-07-05, S0 gate — binding).** Spike ran (`spikes/bdd-spike/`, report
+`docs/migration/reports/S0-bdd-spike.md`): full `SortBdds` + sort functions + maximality + AllSat slice on
+`biodivine-lib-bdd` 0.5.27, validated against pointwise semantics and brute-force maximal sets. **GO.**
+Per-problem sort-solving ~100–350µs at realistic scale (656µs at a 128-sort stress case); AllSat ~2–5ns per
+solution; enumeration-order fidelity by ROBDD canonicity + a verbatim port of the reference walk. Facade
+deltas recorded in the report §6: op list gains fused apply-quantify, order-preserving block shift (the one
+`unsafe`, precondition-documented), and substitute (the veccompose seam; native veccompose is the recorded
+escape hatch if S1 fixtures surface large bound terms). BuDDy-FFI fallback stays recorded but unmotivated.
+
 ## D7 — SMT: `z3` crate default, behind a trait
 **Decision.** Default to the **`z3` crate** behind `trait SmtEngine` (assert/check/push/pop/fresh-var),
 **runtime/feature-selectable** (not build-time-fixed as in C++). cvc5/yices2 remain feature alternates.

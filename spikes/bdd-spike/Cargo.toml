@@ -1,0 +1,15 @@
+[package]
+name = "bdd-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+biodivine-lib-bdd = "0.5"
+num-bigint = "0.4"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[profile.release]
+debug = true
