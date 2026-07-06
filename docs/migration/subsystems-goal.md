@@ -177,7 +177,7 @@ Definition-of-done per item; frozen fixture lists are appended here by each phas
 
 ## 5. Status ledger (append commit hashes as items complete)
 
-- [ ] S0 BDD spike + D6 resolution —
+- [x] S0 BDD spike + D6 resolution — ee77559 (GO; report `reports/S0-bdd-spike.md`)
 - [ ] S1 unification —
 - [ ] S2 variants —
 - [ ] S3 narrowing —
