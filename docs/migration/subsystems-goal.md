@@ -197,8 +197,10 @@ deterministic across runs modulo the normalized timing tails). Fresh probe:
 - **D12** (I0) — content checklist above; written and committed before phase-I implementation.
 - **D6** binds at S0 (spike gate); **D7** binds at phase T start (confirm z3 incremental push/pop
   matches `smt-search` pruning before the trait is frozen).
-- Awaiting user ratification, carried from the correctness goal: D9/D10/D11 and the criterion-3
-  amendment (`conformance/accepted-diffs/README.md`). None block this goal.
+- RATIFIED 2026-07-05: D9/D10/D11 and the criterion-3 amendment (`conformance/accepted-diffs/`
+  `README.md`). D12 recorded 2026-07-05 (ahead of phase I). D7 bound 2026-07-05 by its gate spike
+  (`spikes/smt-spike/`, report `docs/migration/reports/T0-smt-spike.md`): z3 crate confirmed; the
+  oracle is now the Yices2-enabled rebuild (baseline-neutral, verified).
 
 ## 4. Working rules (carried over; deltas in bold)
 

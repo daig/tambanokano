@@ -131,6 +131,15 @@ push/pop for `smt-search`.
 **Impact.** Per-backend work is `DagNode → solver term` translation + sort mapping, isolated by the trait.
 **Revisit:** **Phase 3** (confirm Z3 incremental semantics match `smt-search`'s pruning).
 
+**Resolution (2026-07-06, T0 gate spike — binding, run early by user decision).** Spike ran
+(`spikes/smt-spike/`, report `docs/migration/reports/T0-smt-spike.md`): **z3 crate confirmed.**
+Incremental push/pop verdicts are identical to fresh-solver-per-node semantics across 894 randomized
+search-tree nodes (the `smt-search` pruning model); verdicts match the reference on every fixture
+shape; bignum/rational mapping via string numerals. Key context: Maude 3.5.1's SMT output surface is
+verdict-only (no model values anywhere), so solver identity cannot leak into fixture bytes — the
+oracle now runs the Yices2-enabled rebuild (`Opt-buddy-bison-yices2`, validated against upstream's
+`smtTest.expected` and baseline-neutral on F1/F2) while tnk uses z3, safely.
+
 ## D8 — Naming: codename `tambanokano`, `tnk-` crate prefix
 **Decision.** Repo/umbrella codename **`tambanokano`**; crates prefixed **`tnk-`** (`tnk-core`,
 `tnk-frontend`, `tnk-modules`, `tnk-engine`, `tnk-symbolic`, `tnk-meta`; binary `tnk`). Internal modules
@@ -142,7 +151,7 @@ into crate names. The final public language name is deferred.
 project name and `tnk` the accepted crate prefix. **Revisit:** only the final public *language* name
 (distinct from the project name) remains deferred, after Phase 0/1.
 
-## D9 — Ambiguity policy: warn-and-pick (PROVISIONAL — flagged for user review)
+## D9 — Ambiguity policy: warn-and-pick (RATIFIED 2026-07-05)
 **Decision (2026-07-02, correctness-goal default).** On an ambiguous term, tnk picks a deterministic
 first parse and computes (the warning text arrives with the phase-E diagnostics sink), instead of
 hard-erroring. **Hard constraint:** the pick must match the oracle's pick on the C5 fixture cases
@@ -150,9 +159,10 @@ hard-erroring. **Hard constraint:** the pick must match the oracle's pick on the
 live); if the Earley enumeration cannot structurally reproduce Maude's pick, STOP and escalate rather
 than shipping a divergent pick. Reproducing MSCP's full pick order (option a) is deliberately NOT
 attempted up front; revisit if differential testing surfaces real-world inputs where the pick differs.
-**Status: adopted as the C5 implementation target; awaiting user ratification.**
+**Status: RATIFIED by user 2026-07-05.** The hard constraint stands: a divergent pick found by
+differential testing is an escalation, never shipped.
 
-## D10 — Statement representation: home-grammar point-fix ONLY (PROVISIONAL — flagged for user review)
+## D10 — Statement representation: home-grammar point-fix ONLY (RATIFIED 2026-07-05; rework stays open)
 **Decision (2026-07-02, correctness-goal default).** Imported statement bubbles are parsed against
 their **home module's** grammar/var scope and installed into the flattened module (removes the
 context-dependent module-validity class: X-capture, importer-signature × imported-statement-text,
@@ -160,12 +170,44 @@ META-MODULE+RAT coexistence / stock term-order.maude). The **full compiled-modul
 (import-stable compiled statements, Maude's semantic module algebra — unlocking build-time
 typechecking of parameterized modules, source-form `show module`, full meta fidelity) is a separate
 **user decision** and is deliberately NOT started. **Status: point-fix adopted as the D1a
-implementation target; the rework decision stays open.**
+implementation target; RATIFIED by user 2026-07-05. The full compiled-module-algebra rework remains a
+separate, open user decision (revisit at the harness era). Known residual of the point-fix model:
+statements donated by renamed/instantiated modules still parse against the merged grammar
+(fable-audit.md §3.10 E2 fixed the command-grammar half).**
 
-## D11 — REPL identity: standing prelude + file commands (PROVISIONAL — flagged for user review)
+## D11 — REPL identity: standing prelude + file commands (RATIFIED 2026-07-05)
 **Decision (2026-07-02, correctness-goal default).** The REPL (tool layer) gets: a standing prelude
 loaded by default at startup, `set include BOOL on/off` semantics (BOOL auto-injection per prelude
 line 3233), `load`/`sload` with a `MAUDE_LIB`-style search path, and the `-no-prelude`/`-no-banner`
 CLI flags. The **engine/library layer stays prelude-free** (consistent with D5's host-embedding
 stance): all of this is REPL-layer plumbing, none of it engine-deep. **Status: adopted as the C6
-implementation target; awaiting user ratification.**
+implementation target; RATIFIED by user 2026-07-05.**
+
+## D12 — Meta-interpreter concurrency: coordination-only async on thread-confined engines (RECORDED 2026-07-05, ahead of phase I)
+
+**Decision (user, 2026-07-05; recorded per subsystems-goal.md §2 I0 before any phase-I code).**
+
+1. **Async is coordination only.** Evaluation is blocking CPU work performed on **thread-confined
+   engines**: an engine (interpreter/Session) is created on its thread and never moves. The engine's
+   non-`Send` internals (`Rc`, cell-based arenas) are a **deliberate compile-time guarantee** of that
+   confinement, not a defect to engineer away.
+2. **The core session API is runtime-agnostic.** Concurrency is plain threads + channels. Any
+   async-executor integration (tokio or otherwise) is a thin adapter *outside* the core: neither
+   `tnk-core` nor the session layer ever grows an executor dependency.
+3. **Conformance boundary.** Message protocols, per-request results, and per-request rewrite counts
+   are conformance targets (local synchronous mode is oracle-diffable; async mode must agree with it
+   under the deterministic test schedule, §1.3 of the goal). Inter-message scheduling — timing and
+   interleaving across concurrent requests — is implementation-defined.
+4. **Process backend trigger.** The sole recorded trigger for a future OS-process interpreter backend
+   is a **sandboxing requirement** (memory/crash isolation or per-child resource limits). If it
+   arrives, it arrives as an embedding-host service per D5 — never as engine code.
+
+**Why.** Rewriting is CPU-bound with no engine-internal await points, so an async runtime buys nothing
+inside evaluation; thread confinement makes the single-threaded engine sound without locks; the
+boundary statement keeps async mode testable (differential self-check) while conceding only what
+Maude itself never specified (its own interleaving is scheduler-dependent).
+**Impact.** Phase-I shape: I1 Session extraction (observationally invisible), I2 local synchronous
+children (oracle-diffable), I3 cooperative cancellation at safe points, I4 the thread-backed
+`newProcess` semantics with documented deltas (no memory/abort isolation; cooperative abandonment;
+panic containment with the unwinding-panic build setting pinned). **Revisit:** only via the recorded
+process-backend trigger.

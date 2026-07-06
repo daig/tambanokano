@@ -4,7 +4,7 @@
 > in the goal's frozen manifest is closed — `tools/audit-scoreboard.sh` = **77/77 PASS** (74 at goal
 > close; §3.10's post-goal E-fixtures grew the denominator), the legacy
 > corpus is **87/87 CLEAN** (`tools/legacy-sweep.sh`; two counts-only recorded divergences of the
-> §3.3 [D] matchrew/exploration-schedule class are flagged for user review in
+> §3.3 [D] matchrew/exploration-schedule class were ratified by the user 2026-07-05 in
 > `conformance/accepted-diffs/README.md`), `cargo test --release` fully green, and the stock
 > `term-order.maude` / `machine-int.maude` / `linear.maude` load clean through the binary. Findings
 > below carry per-item `RESOLVED (<commit>)` annotations; still-open items are the out-of-scope

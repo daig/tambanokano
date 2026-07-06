@@ -14,7 +14,7 @@ the recording (tools/legacy-sweep.sh); any drift beyond the recording fails the 
   odometer — a scheduler change, not a counting tweak"; the lazy-vs-frontier note under =>!).
   These were NOT in the goal's four enumerated accepted divergences — they are audit-documented,
   deliberately unfixtured (the manifest pinned this class only where dsrewrite coincides), and
-  recording them here is FLAGGED FOR USER REVIEW as a criterion-3 amendment. Object-level
+  recording them here was flagged as a criterion-3 amendment and RATIFIED by the user 2026-07-05. Object-level
   search/srewrite counts are oracle-conformant (fixtures B2a/B2b, the search/strategy corpora);
   the residual is confined to (i) matchrew per-solution cumulative counts and (ii) metaSearch
   indexed-solution billing where the meta-down rule order interacts with lazy exploration.

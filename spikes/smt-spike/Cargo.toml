@@ -1,0 +1,11 @@
+[package]
+name = "smt-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+z3 = "0.12"
+rand = { version = "0.8", features = ["small_rng"] }
