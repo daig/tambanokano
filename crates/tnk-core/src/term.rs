@@ -46,6 +46,8 @@ impl Term {
     }
     /// A float literal (`<Floats>`), stored as IEEE bits like [`NaValue::Float`].
     pub fn float(symbol: SymbolId, value: f64) -> Self {
+        // "don't allow IEEE-754 -0.0" (floatTerm.cc) — mirror the dag-level normalization.
+        let value = if value == 0.0 { 0.0 } else { value };
         Term::Na { symbol, value: NaValue::Float(value.to_bits()) }
     }
     /// A string literal (`<Strings>`) — a raw byte sequence (Maude strings are bytes, not UTF-8).

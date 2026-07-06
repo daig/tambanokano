@@ -92,6 +92,29 @@ pub struct Symbol {
     /// for `reduce`/`rewrite`/`frewrite`/`search` — the `config` ACU `__` rewrites as an ordinary ACU
     /// soup. Consumed by the `erewrite` object-message scheduler (Phase 2.5-B) to partition the soup.
     pub(crate) oo: OoFlags,
+    /// Classification for the decompose-equality stability analysis (Maude's `SymbolType` basic
+    /// types, collapsed to what `.=.` consults). `Standard` is every ordinary user operator.
+    pub(crate) class: SymbolClass,
+}
+
+/// The `.=.`-relevant slice of Maude's `SymbolType` basic types: a symbol is *equationally stable*
+/// (its top cannot change under instantiation, axioms, or equational rewriting — the precondition
+/// for `CommutativeDecomposeEqualitySymbol` to decompose or decide `false`) only when it is
+/// `Standard`, has no `special`, no identity element, and no equations indexed at it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SymbolClass {
+    #[default]
+    Standard,
+    /// A command-subject variable realized as a fresh nullary constant (`build_subject_dag`):
+    /// Maude's `VariableSymbol` — never stable, never ground. `rank` is the variable's interned
+    /// name-token index (Maude's `Token` code): same-sort variables order by `id() - id()` on name
+    /// codes (variableDagNode.cc `compareArguments`), which `dag_compare` mirrors.
+    Variable { rank: u32 },
+    /// A builtin marker-class symbol whose id-hook attaches no [`SpecialOp`] (`s_`'s `SuccSymbol`,
+    /// `<Floats>`/`<Strings>`/`<Qids>`, `true`/`false`, the object constructor): non-`STANDARD` in
+    /// Maude's `SymbolType`, hence never equationally stable (verified: NAT's builtin `s X .=. s Y`
+    /// stays unreduced in the oracle while a user `[iter ctor]` op decomposes).
+    Marker,
 }
 
 /// The object-system role of an operator — Maude's `SymbolType` `CONFIG`/`OBJECT`/`MESSAGE`/`PORTAL`
@@ -134,6 +157,19 @@ pub enum SpecialOp {
     /// rewrite to `eq` if equal else `neq` (the `equalTerm`/`notEqualTerm` constants, swapped for
     /// `=/=`).
     Equality { eq: SymbolId, neq: SymbolId },
+    /// `_.=._` (Maude's `CommutativeDecomposeEqualitySymbol`, INITIAL-EQUALITY-PREDICATE): the
+    /// initial-model equality predicate. On symbolic (non-ground) arguments it *decomposes* over
+    /// equationally-stable constructors — free/iter/comm/assoc/AC — into conjunctions/disjunctions
+    /// of smaller `.=.` problems, decides `false` where the tops provably differ, and otherwise
+    /// stays unreduced. `siblings[k]` is this polymorph's instance at kind `k` (tnk expands `poly`
+    /// ops eagerly per kind, so the table is total at build time — Maude instantiates lazily).
+    DecomposeEquality {
+        eq: SymbolId,
+        neq: SymbolId,
+        conj: Option<SymbolId>,
+        disj: Option<SymbolId>,
+        siblings: std::rc::Rc<[Option<SymbolId>]>,
+    },
     /// `if_then_else_fi` (Maude's `BranchSymbol`): with the condition reduced (the seam installs a lazy
     /// `strat (1 0)`), select the branch whose position matches the condition among `tests` (the
     /// `term-hook` constants, e.g. `[true, false]`), returning it **unreduced** — the dead branch is

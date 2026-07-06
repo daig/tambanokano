@@ -11,7 +11,8 @@ use crate::engine::{Runtime, Signature};
 use crate::num::{Int, Nat};
 use crate::num;
 use crate::symbol::{
-    BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolClass,
+    SymbolId,
 };
 use std::rc::Rc;
 
@@ -26,6 +27,9 @@ impl Runtime {
     ) -> Option<DagId> {
         match op {
             SpecialOp::Equality { eq, neq } => self.reduce_equality(sig, id, *eq, *neq),
+            SpecialOp::DecomposeEquality { eq, neq, conj, disj, siblings } => {
+                self.reduce_decompose_equality(sig, id, *eq, *neq, *conj, *disj, siblings)
+            }
             SpecialOp::Branch { tests } => self.reduce_branch(id, tests),
             SpecialOp::AcuNumberOp { op, nat } => self.reduce_acu_number_op(sig, id, *op, nat),
             SpecialOp::NumberOp { op, nat, bool_ } => {
@@ -281,6 +285,456 @@ impl Runtime {
         };
         let chosen = if equal { eq } else { neq };
         Some(self.make_const(sig, chosen))
+    }
+
+    /// `_.=._` (Maude's `CommutativeDecomposeEqualitySymbol`,
+    /// `src/Mixfix/commutativeDecomposeEqualitySymbol.cc` ported line-for-line): the initial-model
+    /// equality predicate. Equal reduced dags → `true`; unequal ground dags → `false`; otherwise
+    /// decompose over equationally-stable tops (free / iter / comm / assoc / AC) or decide `false`
+    /// where tops provably differ; `None` (stay unreduced, user equations may apply) when nothing is
+    /// provable — e.g. `X .=. Y` for distinct variables.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_decompose_equality(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        eq: SymbolId,
+        neq: SymbolId,
+        conj: Option<SymbolId>,
+        disj: Option<SymbolId>,
+        siblings: &Rc<[Option<SymbolId>]>,
+    ) -> Option<DagId> {
+        let (l, r) = {
+            let mut kids = self.node(id).children();
+            (kids.next().expect("_.=._ is binary"), kids.next().expect("_.=._ is binary"))
+        };
+        // Equal dags are always equal (arguments arrive reduced — standard strategy).
+        if self.deep_equal(l, r) {
+            return Some(self.make_const(sig, eq));
+        }
+        // Unequal ground dags are always unequal.
+        if self.dag_is_ground(sig, l) && self.dag_is_ground(sig, r) {
+            return Some(self.make_const(sig, neq));
+        }
+        let ls = self.node(l).symbol();
+        let rs = self.node(r).symbol();
+        if equationally_stable(sig, ls) {
+            // Left top symbol cannot change under instantiation and equational rewriting.
+            if self.has_immediate_subterm(l, r) {
+                return Some(self.make_const(sig, neq)); // occurs-style check
+            }
+            if ls == rs {
+                if let Some(d) = self.decompose(sig, id, l, r, neq, conj, disj, siblings) {
+                    return Some(d);
+                }
+            } else if equationally_stable(sig, rs) || self.dag_is_ground(sig, r) {
+                return Some(self.make_const(sig, neq));
+            }
+        } else if equationally_stable(sig, rs) {
+            // Converse case: rs is inert and either l is ground or r has an immediate subterm l.
+            if self.dag_is_ground(sig, l) || self.has_immediate_subterm(r, l) {
+                return Some(self.make_const(sig, neq));
+            }
+        }
+        None
+    }
+
+    /// Whether `id` contains no variable anywhere (Maude's `determineGround`, uncached — `.=.`
+    /// subjects are small). tnk realizes command-subject variables as [`SymbolClass::Variable`]
+    /// constants, so groundness is a class walk.
+    fn dag_is_ground(&self, sig: &Signature, id: DagId) -> bool {
+        if matches!(sig.symbol(self.node(id).symbol()).class, SymbolClass::Variable { .. }) {
+            return false;
+        }
+        self.node(id).children().all(|c| self.dag_is_ground(sig, c))
+    }
+
+    /// Whether some immediate argument of `bigger` equals `smaller`.
+    fn has_immediate_subterm(&self, bigger: DagId, smaller: DagId) -> bool {
+        self.node(bigger).children().any(|c| self.deep_equal(c, smaller))
+    }
+
+    /// The `.=.` polymorph instance for the kind of `sort` (Maude's
+    /// `instantiatePolymorph(polymorphIndex, kindIndex)`; tnk's per-kind eager expansion makes it a
+    /// table lookup).
+    fn dec_sibling(
+        &self,
+        sig: &Signature,
+        siblings: &Rc<[Option<SymbolId>]>,
+        sort: crate::sort::SortId,
+    ) -> Option<SymbolId> {
+        siblings.get(sig.sorts().kind_of(sort).index()).copied().flatten()
+    }
+
+    /// Build one decomposed `.=.` pair, sharing the node with any content-equal pair already built
+    /// in this decomposition. Maude gets this sharing from compare-based ACU normalization; tnk's
+    /// `make_acu` merges distinct nodes only once both are reduced, and a fresh pair that reduces to
+    /// itself never triggers the parent's re-canonicalization — so without this, `f(X,Y) .=. f(Y,X)`
+    /// would decompose to an `_and_` whose two structurally-equal arguments stay unmerged and the
+    /// prelude's idempotence equation cannot match.
+    fn make_dec_pair(
+        &mut self,
+        sig: &Signature,
+        sym: SymbolId,
+        x: DagId,
+        y: DagId,
+        seen: &mut Vec<DagId>,
+    ) -> DagId {
+        let p = self.make_cui(sig, sym, x, y);
+        if let Some(&prev) = seen.iter().find(|&&q| q != p && self.deep_equal(q, p)) {
+            return prev;
+        }
+        seen.push(p);
+        p
+    }
+
+    /// The theory-decomposition arms of `CommutativeDecomposeEqualitySymbol::decompose`. `None` =
+    /// no decomposition possible (stay unreduced). Both tops are `ls == rs` and equationally stable
+    /// (hence: no identity element — the AU/ACU/CUI arms only ever see pure assoc / pure AC / pure
+    /// comm(+idem) nodes).
+    fn decompose(
+        &mut self,
+        sig: &Signature,
+        subject: DagId,
+        l: DagId,
+        r: DagId,
+        neq: SymbolId,
+        conj: Option<SymbolId>,
+        disj: Option<SymbolId>,
+        siblings: &Rc<[Option<SymbolId>]>,
+    ) -> Option<DagId> {
+        let subject_sym = self.node(subject).symbol();
+        let mut seen: Vec<DagId> = Vec::new();
+        let (lterm, rterm) = (self.node(l).term.clone(), self.node(r).term.clone());
+        match (&lterm, &rterm) {
+            // Free theory: decompose into a conjunction of per-argument `.=.` problems.
+            (NodeTerm::Free { symbol, args: la }, NodeTerm::Free { args: ra, .. }) => {
+                let arity = la.len();
+                if arity == 0 || (arity > 1 && conj.is_none()) {
+                    return None;
+                }
+                let domain = sig.symbol(*symbol).decls[0].domain.clone();
+                let mut subterms = Vec::with_capacity(arity);
+                for i in 0..arity {
+                    let sibling = self.dec_sibling(sig, siblings, domain[i])?;
+                    subterms.push(self.make_dec_pair(sig, sibling, la[i], ra[i], &mut seen));
+                }
+                Some(if arity == 1 {
+                    subterms[0]
+                } else {
+                    self.make_acu(sig, conj.unwrap(), subterms.into_iter().map(|s| (s, 1)).collect())
+                })
+            }
+            // Iter theory: peel the common successor count; domain kind == range kind, so the
+            // subject's own instance is the sibling.
+            (
+                NodeTerm::S { symbol, count: lc, arg: la },
+                NodeTerm::S { count: rc, arg: ra, .. },
+            ) => {
+                let (x, y) = if lc > rc {
+                    let d = lc.checked_sub(rc).expect("lc > rc");
+                    (self.make_s(sig, *symbol, d, *la), *ra)
+                } else if lc < rc {
+                    let d = rc.checked_sub(lc).expect("rc > lc");
+                    let shrunk = self.make_s(sig, *symbol, d, *ra);
+                    (*la, shrunk)
+                } else {
+                    (*la, *ra)
+                };
+                Some(self.make_cui(sig, subject_sym, x, y))
+            }
+            // Commutative (CUI) theory: four single-pair cases, else a disjunction of the two
+            // pairings.
+            (NodeTerm::Cui { symbol, args: la }, NodeTerm::Cui { args: ra, .. }) => {
+                let sibling = self.dec_sibling(sig, siblings, sig.symbol(*symbol).decls[0].domain[0])?;
+                let (l0, l1, r0, r1) = (la[0], la[1], ra[0], ra[1]);
+                for (a, b, c, d) in
+                    [(l0, r0, l1, r1), (l1, r1, l0, r0), (l0, r1, l1, r0), (l1, r0, l0, r1)]
+                {
+                    if self.deep_equal(a, b) {
+                        return Some(self.make_cui(sig, sibling, c, d));
+                    }
+                }
+                let (conj, disj) = (conj?, disj?);
+                let p00 = self.make_dec_pair(sig, sibling, l0, r0, &mut seen);
+                let p11 = self.make_dec_pair(sig, sibling, l1, r1, &mut seen);
+                let and1 = self.make_acu(sig, conj, vec![(p00, 1), (p11, 1)]);
+                let p01 = self.make_dec_pair(sig, sibling, l0, r1, &mut seen);
+                let p10 = self.make_dec_pair(sig, sibling, l1, r0, &mut seen);
+                let and2 = self.make_acu(sig, conj, vec![(p01, 1), (p10, 1)]);
+                Some(self.make_acu(sig, disj, vec![(and1, 1), (and2, 1)]))
+            }
+            (NodeTerm::Au { symbol, args: la }, NodeTerm::Au { args: ra, .. }) => self
+                .associative_decompose(
+                    sig,
+                    *symbol,
+                    la.clone(),
+                    ra.clone(),
+                    subject_sym,
+                    neq,
+                    conj,
+                ),
+            (NodeTerm::Acu { symbol, args: la }, NodeTerm::Acu { args: ra, .. }) => {
+                self.ac_decompose(sig, *symbol, la.clone(), ra.clone(), subject_sym, neq)
+            }
+            _ => None,
+        }
+    }
+
+    /// AU (pure assoc) arm: peel provably-pairable arguments from both ends, prove inequality where
+    /// the peel exposes it, and decompose the peels + remainder into a conjunction. Port of
+    /// `associativeDecompose` (the peel loops bound by the shorter side — the C++ `maxEnd` read past
+    /// the shorter vector is unreachable-by-construction there and plain-bounded here).
+    fn associative_decompose(
+        &mut self,
+        sig: &Signature,
+        f: SymbolId,
+        left_args: Vec<DagId>,
+        right_args: Vec<DagId>,
+        subject_sym: SymbolId,
+        neq: SymbolId,
+        conj: Option<SymbolId>,
+    ) -> Option<DagId> {
+        let mut left_peels: Vec<DagId> = Vec::new();
+        let mut right_peels: Vec<DagId> = Vec::new();
+        let min_end = left_args.len().min(right_args.len());
+
+        // Can this (leftArg, rightArg) position peel? Ok(true) = peel, Ok(false) = stop peeling,
+        // Err(()) = whole equality is provably false.
+        let mut try_pair = |rt: &mut Self, la: DagId, ra: DagId| -> Result<bool, ()> {
+            if rt.deep_equal(la, ra) {
+                return Ok(true); // equal arguments peel silently
+            }
+            let (ls, rs) = (rt.node(la).symbol(), rt.node(ra).symbol());
+            if rt.dag_is_ground(sig, la) {
+                if rt.dag_is_ground(sig, ra) {
+                    return Err(()); // unequal ground terms decompose to false
+                }
+                if !equationally_stable(sig, rs) {
+                    return Ok(false);
+                }
+            } else {
+                if !equationally_stable(sig, ls) {
+                    return Ok(false);
+                }
+                if !(equationally_stable(sig, rs) || rt.dag_is_ground(sig, ra)) {
+                    return Ok(false);
+                }
+            }
+            if ls != rs {
+                return Err(()); // stable-or-ground tops that differ decompose to false
+            }
+            Ok(true)
+        };
+
+        // Peel from the start.
+        let mut start_marker = 0usize;
+        while start_marker < min_end {
+            let (la, ra) = (left_args[start_marker], right_args[start_marker]);
+            match try_pair(self, la, ra) {
+                Err(()) => return Some(self.make_const(sig, neq)),
+                Ok(false) => break,
+                Ok(true) => {
+                    if !self.deep_equal(la, ra) {
+                        left_peels.push(la);
+                        right_peels.push(ra);
+                    }
+                    start_marker += 1;
+                }
+            }
+        }
+        // Peel from the end.
+        let mut left_end = left_args.len();
+        let mut right_end = right_args.len();
+        while left_end > start_marker && right_end > start_marker {
+            let (la, ra) = (left_args[left_end - 1], right_args[right_end - 1]);
+            match try_pair(self, la, ra) {
+                Err(()) => return Some(self.make_const(sig, neq)),
+                Ok(false) => break,
+                Ok(true) => {
+                    if !self.deep_equal(la, ra) {
+                        left_peels.push(la);
+                        right_peels.push(ra);
+                    }
+                    left_end -= 1;
+                    right_end -= 1;
+                }
+            }
+        }
+
+        let left_remaining = left_end - start_marker;
+        let right_remaining = right_end - start_marker;
+        if (left_remaining == 0) != (right_remaining == 0) {
+            return Some(self.make_const(sig, neq));
+        }
+        // Try to prove the remainders unequal via the multiset (commutative-relaxation) argument.
+        let mut left_ms = self.make_multiset(&left_args[start_marker..left_end]);
+        let mut right_ms = self.make_multiset(&right_args[start_marker..right_end]);
+        if self.ac_provably_unequal(sig, &mut left_ms, &mut right_ms) {
+            return Some(self.make_const(sig, neq));
+        }
+        if left_remaining == left_args.len() {
+            return None; // no progress — bail to avoid rebuilding the subject forever
+        }
+        // Build the decomposition: one `.=.` per peel pair, plus the remainders re-wrapped.
+        let arity = left_peels.len() + usize::from(left_remaining != 0);
+        debug_assert!(arity != 0, "0 arity from peeling unequal assoc terms");
+        if arity > 1 && conj.is_none() {
+            return None;
+        }
+        let mut seen: Vec<DagId> = Vec::new();
+        let mut and_args = Vec::with_capacity(arity);
+        for (la, ra) in left_peels.iter().zip(&right_peels) {
+            let p = self.make_dec_pair(sig, subject_sym, *la, *ra, &mut seen);
+            and_args.push(p);
+        }
+        if left_remaining != 0 {
+            let lrest = if left_remaining == 1 {
+                left_args[start_marker]
+            } else {
+                self.make_au(sig, f, left_args[start_marker..left_end].to_vec())
+            };
+            let rrest = if right_remaining == 1 {
+                right_args[start_marker]
+            } else {
+                self.make_au(sig, f, right_args[start_marker..right_end].to_vec())
+            };
+            let p = self.make_dec_pair(sig, subject_sym, lrest, rrest, &mut seen);
+            and_args.push(p);
+        }
+        Some(if arity == 1 {
+            and_args[0]
+        } else {
+            self.make_acu(sig, conj.unwrap(), and_args.into_iter().map(|a| (a, 1)).collect())
+        })
+    }
+
+    /// ACU (pure AC) arm: cancel common subterms between the argument multisets; prove inequality
+    /// by the stable-or-ground cardinality/pairing arguments; if cancellation made progress,
+    /// decompose to a smaller `.=.`. Port of `acDecompose`.
+    fn ac_decompose(
+        &mut self,
+        sig: &Signature,
+        f: SymbolId,
+        left_args: Vec<(DagId, u32)>,
+        right_args: Vec<(DagId, u32)>,
+        subject_sym: SymbolId,
+        neq: SymbolId,
+    ) -> Option<DagId> {
+        let nr_left: u64 = left_args.iter().map(|&(_, m)| u64::from(m)).sum();
+        let mut left_ms = left_args;
+        let mut right_ms = right_args;
+        if self.ac_provably_unequal(sig, &mut left_ms, &mut right_ms) {
+            return Some(self.make_const(sig, neq));
+        }
+        let left_remaining: u64 = left_ms.iter().map(|&(_, m)| u64::from(m)).sum();
+        if left_remaining < nr_left {
+            // Cancellation happened: decompose to the smaller problem.
+            let lrest = self.rebuild_ac(sig, f, left_ms);
+            let rrest = self.rebuild_ac(sig, f, right_ms);
+            return Some(self.make_cui(sig, subject_sym, lrest, rrest));
+        }
+        None
+    }
+
+    /// Collect a slice of arguments into a multiset (merging `deep_equal` duplicates).
+    fn make_multiset(&self, args: &[DagId]) -> Vec<(DagId, u32)> {
+        let mut ms: Vec<(DagId, u32)> = Vec::with_capacity(args.len());
+        for &a in args {
+            match ms.iter_mut().find(|(d, _)| self.deep_equal(*d, a)) {
+                Some((_, m)) => *m += 1,
+                None => ms.push((a, 1)),
+            }
+        }
+        ms
+    }
+
+    /// Re-wrap a (non-empty) canceled multiset: a single occurrence is the element itself, more
+    /// re-form the AC node.
+    fn rebuild_ac(&mut self, sig: &Signature, f: SymbolId, ms: Vec<(DagId, u32)>) -> DagId {
+        let total: u64 = ms.iter().map(|&(_, m)| u64::from(m)).sum();
+        debug_assert!(total >= 1, "empty multiset after unequal-cancel");
+        if total == 1 { ms[0].0 } else { self.make_acu(sig, f, ms) }
+    }
+
+    /// Port of `acProvablyUnequal`: try to prove two argument multisets can never be made equal
+    /// under substitution, axioms, and equational rewriting. As a side effect, cancels common
+    /// subterms from both multisets (kept by the caller for the decompose-on-progress path).
+    fn ac_provably_unequal(
+        &self,
+        sig: &Signature,
+        left: &mut Vec<(DagId, u32)>,
+        right: &mut Vec<(DagId, u32)>,
+    ) -> bool {
+        // Cancel equal subterms (min multiplicity) from each side. Elements within one canonical
+        // multiset are pairwise distinct, so at most one partner exists.
+        for i in 0..left.len() {
+            let ld = left[i].0;
+            for (rd, rm) in right.iter_mut() {
+                if *rm > 0 && self.deep_equal(ld, *rd) {
+                    let common = left[i].1.min(*rm);
+                    left[i].1 -= common;
+                    *rm -= common;
+                    break;
+                }
+            }
+        }
+        left.retain(|&(_, m)| m > 0);
+        right.retain(|&(_, m)| m > 0);
+        if left.is_empty() {
+            return !right.is_empty();
+        }
+        if right.is_empty() {
+            return true;
+        }
+        // Both sides non-empty. If one side is all stable-or-ground, a cardinality or top-symbol
+        // pairing argument may prove inequality.
+        let count = |ms: &Vec<(DagId, u32)>| ms.iter().map(|&(_, m)| u64::from(m)).sum::<u64>();
+        let stable_or_ground = |rt: &Self, ms: &Vec<(DagId, u32)>| {
+            ms.iter().all(|&(d, _)| {
+                equationally_stable(sig, rt.node(d).symbol()) || rt.dag_is_ground(sig, d)
+            })
+        };
+        let mut swap = false;
+        let mut try_pairing = false;
+        if stable_or_ground(self, right) {
+            if count(left) > count(right) {
+                return true; // proof by cardinality
+            }
+            swap = true;
+            try_pairing = true;
+        }
+        if stable_or_ground(self, left) {
+            if count(left) < count(right) {
+                return true; // proof by cardinality
+            }
+            swap = false;
+            try_pairing = true;
+        }
+        if try_pairing {
+            let (constrained, other): (&Vec<_>, &Vec<_>) =
+                if swap { (right, left) } else { (left, right) };
+            // `constrained` holds only subterms whose top symbol is fixed; every stable-or-ground
+            // subterm of `other` must pair with a same-top subterm of `constrained`, else unequal.
+            let mut budget: Vec<(SymbolId, u64)> = Vec::new();
+            for &(d, m) in constrained {
+                let s = self.node(d).symbol();
+                match budget.iter_mut().find(|(bs, _)| *bs == s) {
+                    Some((_, n)) => *n += u64::from(m),
+                    None => budget.push((s, u64::from(m))),
+                }
+            }
+            for &(d, m) in other {
+                let s = self.node(d).symbol();
+                if equationally_stable(sig, s) || self.dag_is_ground(sig, d) {
+                    match budget.iter_mut().find(|(bs, _)| *bs == s) {
+                        Some((_, n)) if *n >= u64::from(m) => *n -= u64::from(m),
+                        _ => return true, // nothing left it could equal
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// `if_then_else_fi` (Maude's `BranchSymbol`): the condition (arg 0) is reduced (the seam's lazy
@@ -769,6 +1223,18 @@ impl Runtime {
         }
         None // already in lowest terms
     }
+}
+
+/// Maude's `CommutativeDecomposeEqualitySymbol::isEquationallyStable`: the symbol cannot disappear
+/// or change by instantiation (not a variable, no identity-collapse axiom), by equational rewriting
+/// (no equations indexed at it), or by built-in rewriting (`STANDARD` basic type — no [`SpecialOp`]
+/// and not a marker-class builtin).
+fn equationally_stable(sig: &Signature, s: SymbolId) -> bool {
+    let sym = sig.symbol(s);
+    sym.class == SymbolClass::Standard
+        && sym.special.is_none()
+        && sym.identity.is_none()
+        && !sig.has_equations(s)
 }
 
 /// A string's canonical Maude token name (`Token::ropeToPrefixNameCode`, `qid(String)`'s conversion):

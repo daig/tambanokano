@@ -19,7 +19,9 @@ use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
 use crate::sort::{KindId, SortId, Sorts};
-use crate::symbol::{Axioms, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolId, Theory};
+use crate::symbol::{
+    Axioms, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolClass, SymbolId, Theory,
+};
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
@@ -365,6 +367,11 @@ pub enum StmtKind {
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
+    /// Name-token ranks of the pseudo-variable constants realized for non-ground command subjects
+    /// ([`SymbolClass::Variable`]): same-sort variables order by name code in Maude
+    /// (variableDagNode.cc), and [`dag_compare`](Self::dag_compare) mirrors that here. Empty unless a
+    /// non-ground subject was built, so the ground hot path pays one `is_empty` check.
+    var_ranks: HashMap<SymbolId, u32>,
     /// Per-identity-constant cached DAG node (Maude's `BinarySymbol::getIdentityDag`, born REDUCED):
     /// the node a collapse match binds an identity-absorbed variable to. Being already stamped
     /// reduced is what makes the collapse rewrite one-shot (`red e` = exactly 1 rewrite) while fresh
@@ -507,6 +514,7 @@ impl Signature {
             frozen: None,
             special: None,
             oo: OoFlags::default(),
+            class: SymbolClass::default(),
         })
     }
 
@@ -531,6 +539,7 @@ impl Signature {
             frozen: None,
             special: None,
             oo: OoFlags::default(),
+            class: SymbolClass::default(),
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -556,6 +565,7 @@ impl Signature {
             frozen: None,
             special: None,
             oo: OoFlags::default(),
+            class: SymbolClass::default(),
         })
     }
 
@@ -581,6 +591,7 @@ impl Signature {
             frozen: None,
             special: None,
             oo: OoFlags::default(),
+            class: SymbolClass::default(),
         });
         self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
         id
@@ -605,8 +616,15 @@ impl Signature {
             frozen: None,
             special: None,
             oo: OoFlags::default(),
+            class: SymbolClass::default(),
         })
     }
+    /// Whether any (conditional or not) equation is indexed at `s` — the `equationFree()` half of
+    /// the decompose-equality stability test.
+    pub(crate) fn has_equations(&self, s: SymbolId) -> bool {
+        self.equations.get(&s).is_some_and(|v| !v.is_empty())
+    }
+
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
     }
@@ -1870,6 +1888,12 @@ impl Runtime {
     /// Build an atomic **NA** constant node carrying `value` (a string/qid/float). The sort is
     /// `symbol`'s range (`symbol` is an arity-0 NA-constant symbol — Maude's `StringSymbol` etc.).
     pub(crate) fn make_na(&mut self, sig: &Signature, symbol: SymbolId, value: NaValue) -> DagId {
+        // "don't allow IEEE-754 -0.0" (floatDagNode.cc): -0.0 normalizes to +0.0, so bit-level
+        // structural equality (deep_equal, dag_compare, `.=.`) coincides with value equality.
+        let value = match value {
+            NaValue::Float(bits) if f64::from_bits(bits) == 0.0 => NaValue::Float(0.0f64.to_bits()),
+            v => v,
+        };
         let sort = sig.compute_na_sort(symbol, &value);
         self.alloc_node(sort, NodeTerm::Na { symbol, value })
     }
@@ -1937,7 +1961,24 @@ impl Runtime {
         // objects, regardless of which was declared first. Mirror that: compare arity, then `SymbolId`
         // (our per-build creation index, the `symbolCount` analog). Same-arity elements keep the
         // existing index order, so NAT/SET/MAP conformance (uniform arity) is unchanged.
-        match Self::node_arity(na).cmp(&Self::node_arity(nb)).then_with(|| na.symbol().cmp(&nb.symbol())) {
+        match Self::node_arity(na).cmp(&Self::node_arity(nb)) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+        // Same-sort command-subject variables order by their name-token code (Maude shares one
+        // `VariableSymbol` per sort and `compareArguments` is `id() - id()` on name codes), not by
+        // tnk's per-command symbol creation order. Cross-sort variables keep the symbol-order
+        // fallback (Maude compares distinct `VariableSymbol`s by creation order there, which the
+        // `SymbolId` order approximates).
+        if na.symbol() != nb.symbol()
+            && !self.var_ranks.is_empty()
+            && na.sort == nb.sort
+            && let (Some(&ra), Some(&rb)) =
+                (self.var_ranks.get(&na.symbol()), self.var_ranks.get(&nb.symbol()))
+        {
+            return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
+        }
+        match na.symbol().cmp(&nb.symbol()) {
             Ordering::Equal => {}
             ord => return ord,
         }
@@ -1952,30 +1993,42 @@ impl Runtime {
                 }
                 Ordering::Equal // same symbol ⇒ same arity ⇒ all pairs compared
             }
+            // ACU compares the argument COUNT first, then each pair's multiplicity BEFORE its
+            // element (ACU_DagNode::compareArguments) — observable wherever same-symbol AC nodes of
+            // different sizes sit in an enclosing canonical order (e.g. `_and_` conjunctions inside
+            // an `_xor_` soup: the oracle orders the 2-conjunct terms before the 4-conjunct one).
             (NodeTerm::Acu { args: xa, .. }, NodeTerm::Acu { args: ya, .. }) => {
+                match xa.len().cmp(&ya.len()) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
                 for (&(xe, xm), &(ye, ym)) in xa.iter().zip(ya.iter()) {
-                    match self.dag_compare(xe, ye) {
-                        Ordering::Equal => {}
-                        ord => return ord,
-                    }
                     match xm.cmp(&ym) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
+                    match self.dag_compare(xe, ye) {
+                        Ordering::Equal => {}
+                        ord => return ord,
+                    }
                 }
-                xa.len().cmp(&ya.len()) // a proper prefix orders before the longer sequence
+                Ordering::Equal
             }
-            // AU (ordered sequence) and CUI (canonically-ordered pair) compare the same way: an equal
-            // top symbol means the same arm, so the cross cases can't arise.
+            // AU: length first, then elementwise (AU_DagNode::compareArguments). CUI always has
+            // exactly two arguments, so the shared length compare is a no-op there.
             (NodeTerm::Au { args: xa, .. }, NodeTerm::Au { args: ya, .. })
             | (NodeTerm::Cui { args: xa, .. }, NodeTerm::Cui { args: ya, .. }) => {
+                match xa.len().cmp(&ya.len()) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
                 for (&x, &y) in xa.iter().zip(ya.iter()) {
                     match self.dag_compare(x, y) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
                 }
-                xa.len().cmp(&ya.len()) // lexicographic, then by length
+                Ordering::Equal
             }
             // S successor: the scalar `count` is part of identity (not a child), so compare it first,
             // then the argument (Maude's `S_DagNode::compareArguments`). This keeps the order consistent
@@ -3361,6 +3414,16 @@ impl Engine {
     /// equations. Hook references are passed already resolved to [`SymbolId`]s (the future parser does
     /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]). A
     /// [`SpecialOp::Branch`](crate::symbol::SpecialOp) auto-installs its lazy `strat (1 0)`.
+    /// Classify `sym` for the decompose-equality stability analysis (see [`SymbolClass`]): the
+    /// frontend marks builtin marker-class symbols at module build, and command evaluation marks the
+    /// pseudo-variable constants it realizes for a non-ground subject.
+    pub fn set_symbol_class(&mut self, sym: SymbolId, class: SymbolClass) {
+        if let SymbolClass::Variable { rank } = class {
+            self.rt.var_ranks.insert(sym, rank);
+        }
+        self.sig.symbols.get_mut(sym).class = class;
+    }
+
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         self.sig.set_special(sym, op);
     }

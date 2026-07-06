@@ -1,0 +1,26 @@
+*** E1b-decompose-equality-edges — `.=.` stability edges, oracle-pinned (fable-audit.md §3.10 E1):
+*** builtin `s_` (SuccSymbol, non-STANDARD) does NOT decompose while a user `[iter]` op does; ops with
+*** an identity element are unstable (no decompose); float zeros normalize (-0.0 parses as 0.0, so
+*** `.=.` sees equal dags); `true`/`false` are marker-class (no decompose); free-ctor decompose
+*** cascades to `false`; occurs-style immediate-subterm cases decide `false`.
+*** PRELUDE
+set show timing off .
+fmod EDGES is
+  protecting INITIAL-EQUALITY-PREDICATE .
+  protecting NAT .
+  protecting FLOAT .
+  sort Pair .
+  op p : Nat Nat -> Pair [ctor] .
+  op g : Nat Nat -> Nat [ctor assoc comm id: 0] .
+  op h : Nat Nat -> Nat [ctor comm id: 0] .
+endfm
+red s(X:Nat) .=. s(Y:Nat) .
+red s(s(X:Nat)) .=. s(Y:Nat) .
+red -0.0 .=. 0.0 .
+red 1.0 .=. X:Float .
+red true .=. X:Bool .
+red g(X:Nat, 1) .=. g(Y:Nat, 2) .
+red h(X:Nat, 1) .=. h(Y:Nat, 2) .
+red p(X:Nat, 1) .=. p(Y:Nat, 2) .
+red X:Nat .=. p(Y:Nat, 1) .
+red p(X:Nat, Y:Nat) .=. X:Nat .

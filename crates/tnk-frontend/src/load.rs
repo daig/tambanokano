@@ -834,6 +834,12 @@ fn build_subject_dag(
     let bindings: Vec<DagId> = (0..vars.count())
         .map(|idx| {
             let sym = lm.built.engine.add_op(vars.name(idx).to_string(), vec![], vars.sort(idx));
+            // Class the atom as a variable: `.=.`'s stability/groundness analysis must see Maude's
+            // VariableSymbol (never stable, never ground), and comm/AC canonical ordering must
+            // compare same-sort variables by name-token code (the variable's source token is
+            // guaranteed interned — it was lexed), not by symbol creation order.
+            let rank = i.get(vars.name(idx)).map(|s| s.index()).unwrap_or(u32::MAX);
+            lm.built.engine.set_symbol_class(sym, tnk_core::symbol::SymbolClass::Variable { rank });
             lm.built.engine.make_const(sym)
         })
         .collect();

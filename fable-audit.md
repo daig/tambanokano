@@ -1,7 +1,8 @@
 # Migration audit — tnk vs Maude 3.5.1 (2026-07-01)
 
 > **Ledger state (2026-07-05, correctness goal `docs/migration/correctness-goal.md`):** every finding
-> in the goal's frozen manifest is closed — `tools/audit-scoreboard.sh` = **74/74 PASS**, the legacy
+> in the goal's frozen manifest is closed — `tools/audit-scoreboard.sh` = **77/77 PASS** (74 at goal
+> close; §3.10's post-goal E-fixtures grew the denominator), the legacy
 > corpus is **87/87 CLEAN** (`tools/legacy-sweep.sh`; two counts-only recorded divergences of the
 > §3.3 [D] matchrew/exploration-schedule class are flagged for user review in
 > `conformance/accepted-diffs/README.md`), `cargo test --release` fully green, and the stock
@@ -432,6 +433,37 @@ naturally rediscovered, and getting them wrong produces a new divergence:
    `try`/`not`/`test`/`or-else` into the `_?_:_` branch (verified in `strategy.rs`), but the meta-rep
    keeps them as distinct constructors — a faithful round-trip needs the surface form preserved through
    resolution.
+
+### 3.10 Post-goal findings (phase-S seeding sweep, 2026-07-05; fixtures `E*`, denominator 74 → 77)
+
+Uncovered while seeding the subsystems-goal phase-S fixtures (the reference suite's
+`initialEqualityPredicate` test); both fixed in the same commit as their fixtures, per the
+denominator-growth rule.
+
+- **[E1] `.=.` misfired on symbolic arguments (silent wrong value — §3.2 class).** **RESOLVED (with
+  fixtures E1a/E1b).** `CommutativeDecomposeEqualitySymbol` was wired to the plain structural
+  `EqualitySymbol` rule, so any non-ground `.=.` decided `false` (`red X .=. Y` → `false`; oracle
+  leaves it unreduced; `f(X,Y) .=. f(Y,Z)` → `false`; oracle decomposes to `Z .=. Y and X .=. Y`).
+  Ported the full decompose semantics (commutativeDecomposeEqualitySymbol.cc): stability analysis
+  (STANDARD basic type, no identity, equation-free — variables and marker-class builtins like the
+  NAT `s_` are never stable), free/iter/comm decomposition with per-kind polymorph siblings, AU
+  end-peeling, AC multiset cancellation (`acProvablyUnequal`). Fallout fixes surfaced by byte-diffing
+  the reference test: (i) command-subject pseudo-variables now carry Maude's name-token-code order
+  for comm/AC canonical placement (`Z .=. Y` because prelude line 424 interns `Z` before `Y`);
+  (ii) ACU dag comparison is argument-count-first, then multiplicity-before-element per pair, and AU
+  is length-first (ACU_/AU_DagNode `compareArguments`) — observable in `_xor_` soups of `_and_`
+  conjunctions; (iii) float `-0.0` normalizes to `+0.0` at Term/dag construction ("don't allow
+  IEEE-754 -0.0", floatTerm.cc), so structural and value equality of float zeros coincide. The three
+  `s^k`-notation commands of the reference test stay with the §3.4 iter-input-notation finding;
+  fixture E1a spells them as nested applications.
+- **[E2] Imported variable aliases shadowed the module's own in commands (rejection + wrong sort —
+  §3.4 class).** **RESOLVED (with fixture E2a).** The flatten's shared first-wins variable namespace
+  let prelude BOOL-OPS's `vars A B C : Bool` capture those names for the command grammar of every
+  importing module: `red c(A, B) .` with local `vars A B C : Nat` failed to parse (and `red A .`
+  typed `A` at Bool). Variable aliases are module-local in Maude; the flattened module's variable
+  list now repairs the root module's names authoritatively. Statements were already correct
+  (imported statements parse against home grammars per D1a; the root's own collisions were inlined
+  to colon variables), so only the command view changed.
 
 ## 4. Architecture: where we may be boxed in
 

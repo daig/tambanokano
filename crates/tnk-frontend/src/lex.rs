@@ -48,6 +48,15 @@ impl Interner {
     }
 }
 
+impl Sym {
+    /// The raw intern index — assigned in first-occurrence order, exactly Maude's `Token` name code.
+    /// The variable-vs-variable dag order is `id() - id()` on name codes (variableDagNode.cc), so this
+    /// is the rank a command-subject pseudo-variable carries into the kernel.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// The lexical class of a [`Token`], computed at scan time from its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokKind {

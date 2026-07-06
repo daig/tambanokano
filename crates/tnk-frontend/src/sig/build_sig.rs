@@ -315,7 +315,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             continue; // attributes inherited from the prior declaration (shared symbol)
         }
         let arity = od.domain.len();
-        let special = match &od.attrs.special {
+        let mut special = match &od.attrs.special {
             Some(spec) => special_op(
                 spec,
                 arity,
@@ -329,6 +329,13 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             )?,
             None => None,
         };
+        // `_.=._`'s decompose needs its own polymorph instance at each argument kind. Pass A expanded
+        // the `poly` op eagerly one instance per kind *in kind order*, so `op_syms[idx]` IS the
+        // kind-indexed sibling table.
+        if let Some(SpecialOp::DecomposeEquality { siblings, .. }) = &mut special {
+            let n = engine.sorts().num_kinds();
+            *siblings = (0..n).map(|k| op_syms[idx].get(k).copied()).collect();
+        }
         // META-TERM's `<Qids> : -> Sort/Kind/Constant/Variable` declarations record the quoted-identifier
         // classification sorts, so a `Qid` constant's least sort becomes text-dependent (a `'NzNat` is a
         // `Sort`, `'0.Zero` a `Constant`, …) — needed for the meta-representation to be well-sorted.
@@ -340,7 +347,23 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             let range = resolve_sort(&engine, &sorts, &od.range)?;
             engine.set_qid_class(code, range);
         }
+        // Marker-class builtins (id-hooks that attach no SpecialOp: `s_`, `<Floats>`/`<Strings>`/
+        // `<Qids>`, `true`/`false`, the object constructor) are non-`STANDARD` in Maude's SymbolType,
+        // which the `.=.` stability analysis must see (a builtin `s X .=. s Y` stays unreduced while a
+        // user `[iter]` op decomposes — oracle-verified).
+        let marker = matches!(
+            od.attrs.special.as_ref().and_then(|s| s.id_hook.as_ref()),
+            Some((class, _))
+                if matches!(
+                    class.as_str(),
+                    "SuccSymbol" | "StringSymbol" | "FloatSymbol" | "QuotedIdentifierSymbol"
+                        | "SystemTrue" | "SystemFalse" | "ObjectConstructorSymbol"
+                )
+        );
         for &sym in &op_syms[idx] {
+            if marker {
+                engine.set_symbol_class(sym, tnk_core::symbol::SymbolClass::Marker);
+            }
             if od.attrs.ctor {
                 engine.set_ctor(sym);
             }
@@ -577,12 +600,21 @@ fn special_op(
         "ObjectConstructorSymbol" => return Ok(None),
         "MinusSymbol" => SpecialOp::Minus { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
         "DivisionSymbol" => SpecialOp::Division { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
-        // `_==_`/`_=/=_` and the initial-equality predicate `_.=._` (the latter is `comm`/`poly` and, for
-        // symbolic terms, decomposes into `_and_`/`_or_` — but on the **ground, reduced** terms a
-        // functional reduce produces, both are decided by structural equality → `equalTerm`/`notEqualTerm`).
-        "EqualitySymbol" | "CommutativeDecomposeEqualitySymbol" => SpecialOp::Equality {
+        // `_==_`/`_=/=_`: structural equality of the two reduced arguments (ground or not — Maude
+        // decides `X == Y` as `false` for distinct variables too).
+        "EqualitySymbol" => SpecialOp::Equality {
             eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("equalTerm")?,
             neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("notEqualTerm")?,
+        },
+        // The initial-equality predicate `_.=._`: decides ground/provably-unequal cases and
+        // *decomposes* symbolic ones over stable constructors into `_and_`/`_or_` of smaller
+        // problems. The per-kind sibling-instance table is filled by Pass B (it needs `op_syms`).
+        "CommutativeDecomposeEqualitySymbol" => SpecialOp::DecomposeEquality {
+            eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("equalTerm")?,
+            neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("notEqualTerm")?,
+            conj: op_hook_sym(spec, "conjunctionSymbol", name_to_sym, i),
+            disj: op_hook_sym(spec, "disjunctionSymbol", name_to_sym, i),
+            siblings: std::rc::Rc::from(Vec::new()),
         },
         "BranchSymbol" => {
             // term-hooks "1", "2", … are the test constants, in order.

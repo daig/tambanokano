@@ -192,7 +192,23 @@ pub fn flatten_with_homes(
     let (strat_decls, strat_defs) =
         root.map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone())).unwrap_or_default();
     let homes = std::mem::take(&mut acc.statement_homes);
-    let d = acc.into_decls();
+    let mut d = acc.into_decls();
+    // Variable aliases are module-local in Maude: a command in module M parses with M's OWN `var`
+    // declarations taking priority, never an import's (prelude BOOL-OPS's `vars A B C : Bool` must
+    // not shadow the root's `vars A B C D : Nat` — the oracle parses `red c(A, B) ...` at Nat).
+    // The merge above kept the FIRST (import) declaration of each name; repair the root's names
+    // authoritatively. Statements are unaffected: imported ones parse against their home grammars
+    // (D1a) and the root's own collisions were already inlined to colon variables
+    // (`inline_shadowed_vars`), so only the command/grammar view changes.
+    if let Some(pm) = root {
+        let own_var_names: HashSet<String> =
+            pm.vars.iter().flat_map(|v| v.names.iter().cloned()).collect();
+        for vd in &mut d.vars {
+            vd.names.retain(|n| !own_var_names.contains(n));
+        }
+        d.vars.retain(|vd| !vd.names.is_empty());
+        d.vars.extend(pm.vars.iter().cloned());
+    }
     debug_assert_eq!(homes.len(), d.statements.len(), "statement_homes parallel to statements");
     let pm = PreModule {
         name: name.to_string(),
