@@ -501,7 +501,7 @@ impl Runtime {
 
         // Can this (leftArg, rightArg) position peel? Ok(true) = peel, Ok(false) = stop peeling,
         // Err(()) = whole equality is provably false.
-        let mut try_pair = |rt: &mut Self, la: DagId, ra: DagId| -> Result<bool, ()> {
+        let try_pair = |rt: &mut Self, la: DagId, ra: DagId| -> Result<bool, ()> {
             if rt.deep_equal(la, ra) {
                 return Ok(true); // equal arguments peel silently
             }

@@ -14,6 +14,7 @@ pub mod arena;
 pub mod dag;
 pub mod descent;
 pub mod engine;
+pub mod fresh;
 pub mod id;
 pub mod root;
 // Pillar A: resumable `rewrite`/`frewrite` sessions over the rule machinery in `engine`.

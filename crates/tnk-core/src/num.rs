@@ -64,6 +64,10 @@ impl Nat {
     pub(crate) fn divides(&self, other: &Nat) -> bool {
         (&other.0).divisible_by(&self.0)
     }
+    /// Parse a base-10 numeral (the fresh-variable name predicates); `None` on any non-digit.
+    pub(crate) fn from_decimal(s: &str) -> Option<Nat> {
+        Natural::from_string_base(10, s).map(Nat)
+    }
     /// As a machine `usize` if it fits — the S-theory sort-path index (always small).
     pub(crate) fn to_usize(&self) -> Option<usize> {
         usize::try_from(&self.0).ok()
