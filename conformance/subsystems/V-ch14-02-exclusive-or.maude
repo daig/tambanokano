@@ -1,0 +1,26 @@
+*** ch14-02-exclusive-or — FVP exclusive-or theory (AC): irredundant variants, irreducibility constraint, filtered variant unify (Maude manual §14.2, §14.4, §14.5, §14.9)
+
+fmod EXCLUSIVE-OR is
+ sorts Nat NatSet .
+ op 0 : -> Nat [ctor] .
+ op s : Nat -> Nat [ctor] .
+
+ subsort Nat < NatSet .
+ op mt : -> NatSet [ctor] .
+ op _*_ : NatSet NatSet -> NatSet [ctor assoc comm] .
+
+ vars X Y Z W : [NatSet] .
+ eq [idem] :    X * X = mt   [variant] .
+ eq [idem-Coh] : X * X * Z = Z [variant] .
+ eq [id] :      X * mt = X   [variant] .
+endfm
+
+*** §14.4: 7 irredundant variants of X * Y
+get irredundant variants in EXCLUSIVE-OR : X * Y .
+
+*** §14.5: irreducibility constraint leaves only Variant 1
+get irredundant variants in EXCLUSIVE-OR :
+       X * Y such that X * Y irreducible .
+
+*** §14.9: xor unification is unitary — plain variant unify gives 57 unifiers, filtered gives 1
+filtered variant unify in EXCLUSIVE-OR : X * Y =? Z * W .

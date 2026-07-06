@@ -1,0 +1,14 @@
+*** N-probe-01-vu-narrow-basic — minimal vu-narrow probe: one narrowing rule, bounded and unbounded
+*** searches, =>1 / =>* / =>! arrows, and a no-solution case.
+set show timing off .
+mod COUNT is
+  sort N .
+  op z : -> N .
+  op s : N -> N .
+  var X : N .
+  rl [up] : X => s(X) [narrowing] .
+endm
+vu-narrow [1] s(X) =>1 s(s(z)) .
+vu-narrow [2] X =>* s(z) .
+vu-narrow [1, 3] z =>! s(s(s(z))) .
+vu-narrow [1] s(X) =>* z .

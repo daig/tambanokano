@@ -1,0 +1,18 @@
+set show timing off .
+
+*** U-probe-01-maximal-sorts — order-sorted unification with incomparable maximal
+*** lower bounds: X:S1 =? Y:S2 where glb(S1,S2) does not exist forces one unifier
+*** per maximal lower bound, in reference order (the SortBdds/AllSat surface).
+fmod MAXSORTS is
+  sorts A B S1 S2 T .
+  subsorts A B < S1 .
+  subsorts A B < S2 .
+  subsorts S1 S2 < T .
+  op a : -> A [ctor] .
+  op b : -> B [ctor] .
+  op f : T T -> T [ctor] .
+endfm
+
+unify in MAXSORTS : X:S1 =? Y:S2 .
+unify in MAXSORTS : f(X:S1, X:S1) =? f(Y:S2, Z:S2) .
+unify in MAXSORTS : X:A =? Y:B .

@@ -1,0 +1,21 @@
+*** ch15-01-nat-narrowing — free-theory narrowing on Peano addition (Maude manual §15.1/§15.3)
+*** DEVIATION: the §15.1 listing predates §15.5 and omits the [narrowing] rule
+*** attribute; it is added here, otherwise Maude 3.5.1 vu-narrow finds nothing.
+*** The commands realize the three §15.3 prose reachability problems; the second
+*** and third are bounded ([1] / [, 5]) because full narrowing does not terminate.
+mod NAT-NARROWING is
+ sort Nat .
+ op 0 : -> Nat [ctor] .
+ op s : Nat -> Nat [ctor] .
+ op _+_ : Nat Nat -> Nat .
+ vars X Y : Nat .
+ rl [base] : 0 + Y => Y [narrowing] .
+ rl [ind] : s(X) + Y => s(X + Y) [narrowing] .
+endm
+
+*** expected: Solution 1 with X --> s(Y) (composed), then no more solutions
+vu-narrow in NAT-NARROWING : 0 + X =>* s(Y) .
+*** expected: Solution 1 with X --> s(0), Z --> 0 (nonterminating beyond bound)
+vu-narrow [1] in NAT-NARROWING : X + s(0) =>* s(s(Z:Nat)) .
+*** expected: No solution (up to depth 5; unprovable in general)
+vu-narrow [, 5] in NAT-NARROWING : X + s(0) =>* 0 .

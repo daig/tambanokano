@@ -1,0 +1,24 @@
+*** ch15-10-multiple-initial — narrowing from a disjunction of initial terms with {fold} (Maude manual §15.6.6)
+mod FOLDING-NARROWING-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ c > => < M > [narrowing] .
+ rl [buy-a] : < M $ a > => < M q > [narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: 1 solution from initial state < M3:Marking c c >, M3 --> $ $ %1:Marking
+{fold} vu-narrow in FOLDING-NARROWING-VENDING-MACHINE :
+< M1:Marking a c > \/ < M2:Marking a a > \/ < M3:Marking c c > =>* < empty > .
+*** expected: *** frontier is empty ***
+show frontier states .
+*** expected: single most general state < %1:Marking >
+show most general states .

@@ -1,0 +1,23 @@
+*** ch14-01-nat-variant — non-FVP addition theory: incremental variant generation and incremental variant unification (Maude manual §14.2, §14.6, §14.11)
+
+fmod NAT-VARIANT is
+ sort Nat .
+ op 0 : -> Nat [ctor] .
+ op s : Nat -> Nat [ctor] .
+ op _+_ : Nat Nat -> Nat .
+ vars X Y : Nat .
+ eq [base] : 0 + Y = Y [variant] .
+ eq [ind]  : s(X) + Y = s(X + Y) [variant] .
+endfm
+
+*** §14.6: finite set of most general variants (1 variant) despite non-FVP theory
+get variants in NAT-VARIANT : s(0) + X:Nat .
+
+*** §14.6: bounded approximation of an infinite set of most general variants (10 variants)
+get variants [10] in NAT-VARIANT : X:Nat + s(0) .
+
+*** §14.11: one unifier, terminates with "No more unifiers."
+variant unify in NAT-VARIANT : s(0) + X:Nat =? s(s(s(0)))  .
+
+*** §14.11: bound [1] required — without it Maude would not stop
+variant unify [1] in NAT-VARIANT : X:Nat + s(0) =? s(s(s(0)))  .

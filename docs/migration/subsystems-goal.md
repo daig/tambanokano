@@ -100,6 +100,51 @@ Definition-of-done per item; frozen fixture lists are appended here by each phas
 - **S3 — narrowing.** `vu-narrow`/`fvu-narrow` (v3 semantics only, per roadmap) with
   reference-identical solutions, order, and counts.
 
+#### Phase-S manifest (frozen 2026-07-05; 60 fixtures in `conformance/subsystems/`, all oracle-verified at authoring, all expected to FAIL until their sub-phase lands)
+
+**U\* — unification (S1), 27 fixtures.**
+Reference-suite lifts (verbatim + header/PRELUDE marker): `U01-unification`, `U02-unification2`,
+`U03-unification3`, `U04-assoc-unification`, `U05-au-unification`, `U06-au-irred-unification`,
+`U07-au-a-edge-cases`, `U08-cu-unification` (from `tests/Misc/`), `U09-meta-unify`,
+`U10-legacy-meta-unify`, `U11-check-unifiers` (from `tests/Meta/`). Manual ch. 13 worked examples
+(each oracle-diffed at authoring; where the printed manual disagrees with the live 3.5.1 oracle the
+oracle is ground truth, deviations noted in-file): `U-ch13-01` … `U-ch13-15`. Fresh probe:
+`U-probe-01-maximal-sorts` (incomparable maximal lower bounds → one unifier per maximal sort, in
+reference order — the SortBdds/AllSat surface). Note: `U-ch13-07-iter-comm` additionally requires
+the `s_^k` *input notation* (recorded §3.4 audit finding) — it lands with S1.
+
+**V\* — variants (S2), 18 fixtures.**
+Reference-suite lifts: `V01-variant-unification`, `V02-variant-matching`,
+`V03-filtered-variant-unification`, `V04-meseguer-finite-variant`, `V05-variant-narrowing`
+(despite the name: `get variants`) from `tests/Misc/`; `V06-meta-get-variant`,
+`V07-legacy-meta-get-variant`, `V08-meta-variant-unify`, `V09-meta-variant-unify2`,
+`V10-legacy-meta-variant-unify`, `V11-meta-variant-match` from `tests/Meta/`. Manual ch. 14:
+`V-ch14-01` … `V-ch14-06`. Fresh probe: `V-probe-01-idem-variants`. Note: `V09` runs into the
+tnk-side 60s harness timeout until S2 (the test loops on an inert `metaVariantUnify` by design —
+an honest slow FAIL, self-healing when S2 lands).
+
+**N\* — narrowing (S3), 15 fixtures.**
+Reference-suite lifts: `N01-narrow` (`vu-narrow`/`fvu-narrow`), `N02-narrow2` (`{fold}`/`{vfold}`)
+from `tests/Misc/`; `N03-meta-narrow` (`metaNarrowingApply`/`metaNarrowingSearch`/
+`metaNarrowingSearchPath` + legacy `metaNarrow`) from `tests/Meta/`. Manual ch. 15: `N-ch15-01` …
+`N-ch15-11` (`N-ch15-07/08` include the oracle's `set verbose on` state-count lines — verified
+deterministic across runs modulo the normalized timing tails). Fresh probe:
+`N-probe-01-vu-narrow-basic`.
+
+**Enumerated exclusions (phase-S seeding; nothing silent).**
+- `tests/Meta/metaInt*` (17 files) and `tests/Meta/russianDolls*` (non-`Proc` variants) —
+  meta-interpreter surface: seeded at phase I as `I*` fixtures (local mode only, per §1.2).
+- `tests/Meta/metaProc*` (17 files) and `russianDolls*Proc*` — OS-process interpreter backend:
+  §6 non-goal (D5/D12 territory).
+- `tests/Misc/smtTest` — phase T seeding.
+- `tests/Misc/dekker` (and the model-checker examples) — phase M seeding.
+- `tests/Misc/initialEqualityPredicate` — not gated on the symbolic engine: its gap was the `.=.`
+  decompose semantics, found during this seeding, fixed, and landed as **audit** fixtures
+  E1a/E1b/E2a (fable-audit.md §3.10; audit denominator 74 → 77).
+- Manual examples skipped inside chapters are listed per-file in the fixtures' headers or were
+  prose-only (no runnable command/output pair); ch. 13 §13.4.6 verbose diagnostics and the
+  381-unifier dump are representative examples.
+
 ### Phase T — SMT (after S; soft dependency: variant satisfiability layers on S2)
 
 - `check` and `smt-search` against the `z3` crate behind the D7 `SmtEngine` trait,

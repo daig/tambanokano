@@ -1,0 +1,24 @@
+*** ch13-14-assoc — associative (A) unification: linear problem (finitary), easy no-unifier, one-sided non-linearity, cycle detection and depth-bound incompleteness warnings (Maude manual §13.4.6)
+*** PRELUDE
+
+fmod UNIFICATION-EX4 is
+ protecting NAT .
+ sort NList .
+ subsort Nat < NList .
+ op _:_ : NList NList -> NList [assoc] .
+endfm
+
+unify in UNIFICATION-EX4 :
+      X:NList : Y:NList : Z:NList =? P:NList : Q:NList .
+
+unify in UNIFICATION-EX4 :
+      X:NList : X:NList =? Y:NList : 1 : Y:NList .
+
+unify in UNIFICATION-EX4 :
+      P:NList : P:NList =? 1 : Q:NList : 2 .
+
+unify in UNIFICATION-EX4 : 0 : Q:NList =? Q:NList : 0 .
+
+unify in UNIFICATION-EX4 :
+      X:NList : X:NList : X:NList
+        =? Y:NList : Y:NList : Z:NList : Y:NList .

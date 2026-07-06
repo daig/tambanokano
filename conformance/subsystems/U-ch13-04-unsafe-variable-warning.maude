@@ -1,0 +1,4 @@
+*** ch13-04-unsafe-variable-warning — #n:Sort variables are reserved as fresh; using them in a problem triggers a warning (Maude manual §13.4)
+*** PRELUDE
+
+unify in NAT : X:Nat ^ #1:Nat =? #2:Nat .

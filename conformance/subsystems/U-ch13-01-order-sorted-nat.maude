@@ -1,0 +1,14 @@
+*** ch13-01-order-sorted-nat — order-sorted syntactic unification over NAT with overloaded f; sort downgrading, non-unitary unification, two-equation problem (Maude manual §13.4)
+*** PRELUDE
+
+fmod UNIFICATION-EX1 is
+ extending NAT .
+ op f : Nat Nat -> Nat .
+ op f : NzNat Nat -> NzNat .
+ op f : Nat NzNat -> NzNat .
+endfm
+
+unify f(X:Nat, Y:Nat) ^ B:NzNat =? A:NzNat ^ f(Y:Nat, Z:Nat) .
+
+unify f(X:Nat, Y:NzNat) =? f(Z:NzNat, U:Nat)
+      /\ V:NzNat =? f(X:Nat, U:Nat) .

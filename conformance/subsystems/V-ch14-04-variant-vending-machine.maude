@@ -1,0 +1,47 @@
+*** ch14-04-variant-vending-machine — ACU vending machine with variant change equation: variants, irreducibility, variant unify (plain/filtered/constrained), variant match (Maude manual §14.4, §14.5, §14.9, §14.10, §14.13)
+
+mod VARIANT-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > .
+ rl [buy-a] : < M $ > => < M a q > .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** §14.4: 4 irredundant variants of the __ symbol (FVP check)
+get irredundant variants in VARIANT-VENDING-MACHINE :
+       X:Marking Y:Marking .
+
+*** §14.4: 2 irredundant variants of the state < $ q q X:Marking >
+get irredundant variants in VARIANT-VENDING-MACHINE :
+       < $ q q X:Marking > .
+
+*** §14.5: irreducibility constraints leave only Variant 1
+get irredundant variants in VARIANT-VENDING-MACHINE :
+       < $ q q X:Marking >
+       such that q q X:Marking, q X:Marking, X:Marking irreducible .
+
+*** §14.9: 2 variant unifiers (not minimal)
+variant unify in VARIANT-VENDING-MACHINE :
+       < q q X:Marking > =? < $ Y:Marking >  .
+
+*** §14.9: filtered version returns the single most general unifier
+filtered variant unify in VARIANT-VENDING-MACHINE :
+       < q q X:Marking > =? < $ Y:Marking >  .
+
+*** §14.10: irreducibility constraints discard the q q %1:Marking unifier
+variant unify in VARIANT-VENDING-MACHINE :
+       < q q X:Marking > =? < $ Y:Marking >
+       such that q q X:Marking, q X:Marking, X:Marking irreducible .
+
+*** §14.13: variant match — righthand side treated as ground
+variant match in VARIANT-VENDING-MACHINE :
+       < q q X:Marking > <=? < $ Y:Marking >  .

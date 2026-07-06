@@ -1,0 +1,24 @@
+*** ch15-11-extravar — narrowing with extra variables in righthand sides ([nonexec narrowing]) (Maude manual §15.7)
+mod FOLDING-NARROWING-VENDING-MACHINE-EXTRAVAR is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking . var Mo : Money .
+ rl [buy-c] : < M $ c > => < M > [narrowing] .
+ rl [buy-a] : < M $ a > => < M q > [narrowing] .
+ rl [add]  : < M >    => < M Mo > [nonexec narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: 6 solutions (manual shows all six), then No more solutions
+vu-narrow [, 2] in FOLDING-NARROWING-VENDING-MACHINE-EXTRAVAR :
+    < empty > =>* < M > .
+*** expected: 2 solutions (folding makes the graph finite), then No more solutions
+fvu-narrow in FOLDING-NARROWING-VENDING-MACHINE-EXTRAVAR :
+       < empty > =>* < M > .

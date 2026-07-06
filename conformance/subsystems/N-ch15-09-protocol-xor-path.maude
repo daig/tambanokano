@@ -1,0 +1,78 @@
+*** ch15-09-protocol-xor-path — {vfold,path} vu-narrow {filter,delay} plus show path / show path states (Maude manual §15.6.5)
+*** DEVIATION: the manual shows the solution at state 32 and "show path 32 .";
+*** Maude 3.5.1 reports "Solution 1 (state 18)" with path 0,1,4,8,14,16,18
+*** versus the manual's 0,1,5,12,22,28,32. Same recv/snd/recv/snd/recv/snd trace and terms.
+fmod EXCLUSIVE-OR is
+ sort XOR .
+ op mt : -> XOR .
+ op _*_ : XOR XOR -> XOR [assoc comm] .
+ vars X Y Z U V : [XOR] .
+ eq [nilp] :    X * X = mt   [variant] .
+ eq [nilp-Coh] : X * X * Z = Z [variant] .
+ eq [id] :      X * mt = X   [variant] .
+endfm
+
+mod PROTOCOL-SYNTAX is
+ sorts Name Nonce Fresh Msg .
+ subsort Name Nonce < Msg .
+
+ ops a b i : -> Name . --- Alice Bob Intruder
+ op n : Name Fresh -> Nonce . --- Nonces
+ ops r1 r2 r3 : -> Fresh .
+ op pk : Name Msg -> Msg . --- Public encryption
+
+ sort SMsg .
+ ops + - : Msg -> SMsg .
+
+ sort SMsgList . subsort SMsg < SMsgList .
+ op nil : -> SMsgList .
+ op _,_ : SMsgList SMsgList -> SMsgList [assoc] .
+
+ sort Strand .
+ op [_|_] : SMsgList SMsgList -> Strand .
+
+ sort StrandSet .
+ subsort Strand < StrandSet .
+ op mt : -> StrandSet .
+ op _&_ : StrandSet StrandSet -> StrandSet [assoc comm id: mt] .
+
+ sort IKnowledge .
+ op mt : -> IKnowledge .
+ op inI : Msg -> IKnowledge . --- Intruder knows
+ op nI : Msg -> IKnowledge . --- Intruder doesn't know
+ op _,_ : IKnowledge IKnowledge -> IKnowledge [assoc comm id: mt] .
+
+ sort State .
+ op {_{_}} : StrandSet IKnowledge -> State .
+endm
+
+mod PROTOCOL-XOR is
+ extending EXCLUSIVE-OR .
+ extending PROTOCOL-SYNTAX .
+ subsort Nonce < XOR < Msg .
+ var IK : IKnowledge .  var SS : StrandSet .
+ var M : Msg .        vars L1 L2 : SMsgList .
+
+ --- Intruder knows receiving message of a strand
+ rl [recv] : { (SS & [ ( L1 , -(M)) | L2 ])  { (inI(M) , IK) } } =>
+           { (SS & [ L1 | (-(M) , L2) ])  { (inI(M) , IK) } } [narrowing] .
+ --- Intruder learns a sending message of a strand
+ rl [snd] : { (SS & [ (L1 , +(M)) | L2 ])  { (inI(M) , IK) } } =>
+           { (SS & [ L1 | (+(M) , L2) ])  { (nI(M) , IK) } } [narrowing] .
+endm
+
+{vfold,path} vu-narrow {filter,delay}
+         {
+           [ nil, -(pk(a, X:Msg)), +(pk(b, n(a, r2))), -(X:Msg * n(a, r2)) | nil] &
+           [ nil, +(pk(a, n(b, r1))), -(pk(b, Y:Msg)), +(Y:Msg * n(b, r1)) | nil]
+           { inI(X:Msg * n(a, r2)), inI(pk(b, Y:Msg)), inI(pk(a, X:Msg)) }
+         }
+      =>* {
+           [ nil | -(pk(a, X:Msg)), +(pk(b, n(a, r2))), -(X:Msg * n(a, r2)), nil] &
+           [ nil | +(pk(a, n(b, r1))), -(pk(b, Y:Msg)), +(Y:Msg * n(b, r1)), nil]
+           { nI(X:Msg * n(a, r2)), nI(pk(b, Y:Msg)), nI(pk(a, X:Msg)) }
+         } .
+*** expected: 7-state path alternating rules recv and snd, full rule statements
+show path 18 .
+*** expected: same path with only rule labels between states
+show path states 18 .

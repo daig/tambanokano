@@ -1,0 +1,16 @@
+*** ch13-13-comm-id — unification modulo commutativity + identity (CU): duplicated unifier in unify, minimal via irredundant unify (Maude manual §13.4.5)
+
+mod COMM-ID-UNIFICATION-EX is
+ sorts Magma Elem .
+ subsorts Elem < Magma .
+ op __ : Magma Magma -> Magma [gather (E e) comm id: e] .
+ ops a b c d e : -> Elem .
+endm
+
+unify in COMM-ID-UNIFICATION-EX : X:Magma a =? Y:Magma a a .
+
+irredundant unify in COMM-ID-UNIFICATION-EX :
+      X:Magma a =? Y:Magma a a .
+
+*** manual writes "in COMM-ID-UNIFICATION-EXAMPLE" here (typo); module is COMM-ID-UNIFICATION-EX
+unify in COMM-ID-UNIFICATION-EX : a X:Magma =? a a Y:Magma .

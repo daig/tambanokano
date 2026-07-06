@@ -1,0 +1,25 @@
+*** ch15-05-vending-fold — fvu-narrow folding, show most general states / frontier states (Maude manual §15.6.3)
+mod NARROWING-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > [narrowing] .
+ rl [buy-a] : < M $ > => < M a q > [narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: same single solution as vu-narrow [,3]
+fvu-narrow [,3] in NARROWING-VENDING-MACHINE : < M:Money > =>* < a c > .
+*** expected: 10 most general states, < #1:Money > ... < q a a a %1:Money >
+show most general states .
+*** expected: 4 open leaves
+show frontier states .
+*** expected: 1 solution (everything folds into the initial state), No more solutions
+fvu-narrow in NARROWING-VENDING-MACHINE : < M:Marking > =>* < a c > .

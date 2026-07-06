@@ -1,0 +1,23 @@
+*** ch13-08-acu-vending-machine — ACU unification in the vending machine module; unify (non-minimal set) vs irredundant unify (Maude manual §13.4.4)
+
+mod UNIF-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > .
+ rl [buy-a] : < M $ > => < M a q > .
+ eq [change]: q q q q = $ .
+endm
+
+unify in UNIF-VENDING-MACHINE :
+      < q q X:Marking > =? < $ Y:Marking > .
+
+irredundant unify in UNIF-VENDING-MACHINE :
+      < q q X:Marking > =? < $ Y:Marking > .

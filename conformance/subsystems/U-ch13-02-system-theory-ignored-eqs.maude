@@ -1,0 +1,16 @@
+*** ch13-02-system-theory-ignored-eqs — same unification problems in a system theory: extra equations and rules are ignored, unifiers identical to UNIFICATION-EX1 (Maude manual §13.4)
+*** PRELUDE
+
+th UNIFICATION-EX2 is
+ including NAT .
+ op f : Nat Nat -> Nat .
+ op f : NzNat Nat -> NzNat .
+ op f : Nat NzNat -> NzNat .
+ eq f(f(N:Nat, M:Nat), K:Nat) = f(N:Nat, M:Nat) .
+ rl f(N:Nat, M:Nat) => 0 .
+endth
+
+unify f(X:Nat, Y:Nat) ^ B:NzNat =? A:NzNat ^ f(Y:Nat, Z:Nat) .
+
+unify f(X:Nat, Y:NzNat) =? f(Z:NzNat, U:Nat)
+      /\ V:NzNat =? f(X:Nat, U:Nat) .

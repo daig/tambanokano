@@ -1,0 +1,13 @@
+*** ch13-05-idem-unsupported — idem operator: non-ground occurrence fails with warning; ground-only occurrences succeed with Ax u Ax'-unifiers (Maude manual §13.4.1)
+*** PRELUDE
+
+fmod UNIFICATION-EX3 is
+ extending NAT .
+ op f : Nat Nat -> Nat [idem] .
+endfm
+
+*** NOTE: manual shows one warning mentioning flattened term f(X:Nat, Y:Nat, Z:Nat);
+*** Maude 3.5.1 emits two warnings, for f(X:Nat, Y:Nat) and f(f(X:Nat, Y:Nat), Z:Nat).
+unify f(f(X:Nat, Y:Nat), Z:Nat) =? f(A:Nat, B:Nat) .
+
+unify X:Nat + f(f(41, 42),43) =? Y:Nat + f(41,f(42,43)) .

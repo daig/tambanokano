@@ -1,0 +1,5 @@
+*** ch13-06-ac-nat-bound — AC unification over NAT's _+_ with a bound of 100 unifiers (problem has 381 most general unifiers total) (Maude manual §13.4.2)
+*** PRELUDE
+
+unify [100] in NAT :
+      X:Nat + X:Nat + Y:Nat =? A:Nat + B:Nat + C:Nat .

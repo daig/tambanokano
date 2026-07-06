@@ -1,0 +1,23 @@
+*** ch15-06-folding-vending — consuming vending machine where folding yields a finite graph (Maude manual §15.6.3)
+mod FOLDING-NARROWING-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ c > => < M > [narrowing] .
+ rl [buy-a] : < M $ a > => < M q > [narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: 1 solution, M --> $ $ %1:Marking, then No more solutions
+fvu-narrow in FOLDING-NARROWING-VENDING-MACHINE :
+       < M:Marking c c > =>* < empty > .
+*** expected: 1 solution, M:Money --> $ $ %1:Money (tree already finite)
+vu-narrow in FOLDING-NARROWING-VENDING-MACHINE :
+       < M:Money c c > =>* < empty > .

@@ -1,0 +1,25 @@
+*** ch13-09-acu-vending-machine-mb — memberships are ignored in unification: sort Quarter populated only by an mb is treated as empty, so no unifier (Maude manual §13.4.4)
+
+mod UNIF-VENDING-MACHINE-MB is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+
+ sort Quarter .
+ subsort Quarter < Coin .
+ mb q : Quarter .
+
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > .
+ rl [buy-a] : < M $ > => < M a q > .
+ eq [change]: q q q q = $ .
+endm
+
+unify in UNIF-VENDING-MACHINE-MB :
+      < q q X:Marking > =? < $ Y:Quarter Z:Quarter > .

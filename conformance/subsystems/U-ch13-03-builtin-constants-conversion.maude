@@ -1,0 +1,6 @@
+*** ch13-03-builtin-constants-conversion — unification in predefined CONVERSION: built-in constants handled, built-in functions not evaluated (Maude manual §13.4)
+*** PRELUDE
+
+unify in CONVERSION :
+      X:String < "foo" + Y:Char =?
+        Z:String + string(pi) < "foo" + Z:String .

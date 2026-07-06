@@ -1,0 +1,13 @@
+*** ch13-15-assoc-id — associative with identity (AU) unification: irredundant unify yields the 3-element minimal set (plain unify would give 32) (Maude manual §13.4.7)
+*** PRELUDE
+
+fmod UNIFICATION-EX5 is
+ protecting NAT .
+ sort NList .
+ op nil : -> NList .
+ subsort Nat < NList .
+ op _:_ : NList NList -> NList [assoc id: nil] .
+endfm
+
+irredundant unify in UNIFICATION-EX5 :
+      X:NList : Y:NList : Z:NList =? P:NList : Q:NList .

@@ -1,0 +1,26 @@
+*** ch15-03-vending-filter — vu-narrow with {filter} and {filter,delay} variant unification options (Maude manual §15.6.1)
+mod NARROWING-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > [narrowing] .
+ rl [buy-a] : < M $ > => < M a q > [narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: 9 solutions (manual shows Solution 1 and Solution 9)
+vu-narrow [, 2] in NARROWING-VENDING-MACHINE :
+       < $ q q q M1:Money > =>* < a c M2:Money > .
+*** expected: 3 solutions
+vu-narrow {filter} [, 2] in NARROWING-VENDING-MACHINE :
+       < $ q q q M1:Money > =>* < a c M2:Money > .
+*** expected: 2 solutions (minimal set of most general variant unifiers)
+vu-narrow {filter,delay} [, 2] in NARROWING-VENDING-MACHINE :
+       < $ q q q M1:Money > =>* < a c M2:Money > .

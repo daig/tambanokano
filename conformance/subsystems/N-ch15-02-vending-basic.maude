@@ -1,0 +1,30 @@
+*** ch15-02-vending-basic — vu-narrow =>* / =>! and show frontier states on the narrowing vending machine (Maude manual §15.6)
+mod NARROWING-VENDING-MACHINE is
+ sorts Coin Item Marking Money State .
+ subsort Coin < Money .
+ op empty : -> Money .
+ op __ : Money Money -> Money [assoc comm id: empty] .
+ subsort Money Item < Marking .
+ op __ : Marking Marking -> Marking [assoc comm id: empty] .
+ op <_> : Marking -> State .
+ ops $ q : -> Coin .
+ ops a c : -> Item .
+ var M : Marking .
+ rl [buy-c] : < M $ > => < M c > [narrowing] .
+ rl [buy-a] : < M $ > => < M a q > [narrowing] .
+ eq [change] : q q q q M = $ M [variant] .
+endm
+
+*** expected: 1 solution, M:Money --> $ q q q #1:Money, #1:Money --> empty
+vu-narrow [1] in NARROWING-VENDING-MACHINE : < M:Money > =>* < a c > .
+*** expected: same single solution at depth 3, then No more solutions
+vu-narrow [,3] in NARROWING-VENDING-MACHINE : < M:Money > =>* < a c > .
+*** expected: 20 open leaves, < c c c @1:Money > ... < q a a a %1:Money >
+show frontier states .
+*** expected: No solution (states with rules not terminating are never =>!-final)
+vu-narrow [,3] in NARROWING-VENDING-MACHINE : < M:Money > =>! < a c > .
+*** expected: 4 solutions (q q q $ permutations), then No more solutions
+vu-narrow in NARROWING-VENDING-MACHINE :
+       < C1:Coin C2:Coin C3:Coin C4:Coin > =>! < M:Money a c > .
+*** expected: *** frontier is empty ***
+show frontier states .

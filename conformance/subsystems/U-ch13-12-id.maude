@@ -1,0 +1,14 @@
+*** ch13-12-id — unification modulo two-sided identity (U): unifiers for variables at either side (Maude manual §13.4.5)
+
+mod ID-UNIFICATION-EX is
+ sorts Magma Elem .
+ subsorts Elem < Magma .
+ op __ : Magma Magma -> Magma [gather (E e) id: e] .
+ ops a b c d e : -> Elem .
+endm
+
+unify in ID-UNIFICATION-EX : X:Magma a =? Y:Magma a a .
+
+irredundant unify in ID-UNIFICATION-EX : X:Magma a =? Y:Magma a a .
+
+unify in ID-UNIFICATION-EX : a X:Magma =? a a Y:Magma .
