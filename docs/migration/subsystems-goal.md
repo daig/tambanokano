@@ -28,8 +28,8 @@ divergence question to one phase with its own containment machinery.
 
 ### 1.1 Frozen invariants (every phase, every commit — regressions are failures)
 
-- **F1** `tools/audit-scoreboard.sh` → `SCOREBOARD 74/74 PASS` (denominator may grow per §1.2 of
-  `correctness-goal.md`; it may never shrink).
+- **F1** `tools/audit-scoreboard.sh` → `SCOREBOARD n/n PASS`, all pass (77/77 as of 2026-07-06 —
+  the denominator grows per §1.2 of `correctness-goal.md` and may never shrink; 74 at goal start).
 - **F2** `tools/legacy-sweep.sh` → `LEGACY 87/87 CLEAN` (accepted-diff recordings in
   `conformance/accepted-diffs/` compare byte-exact; drift fails).
 - **F3** `cargo test --release` fully green.
