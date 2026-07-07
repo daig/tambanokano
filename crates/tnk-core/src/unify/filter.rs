@@ -82,7 +82,7 @@ fn subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
     let equations: Vec<(DagId, DagId)> = lhs.into_iter().zip(rhs).collect();
     let mut names = ScratchNames::default();
     let mut env = UnifyEnv { e, names: &mut names };
-    let mut prob = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, 0);
+    let mut prob = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
     prob.find_next(&mut env).is_some()
 }
 

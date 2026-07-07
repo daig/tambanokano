@@ -59,9 +59,10 @@ use tnk_core::sort::SortId;
 use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 use tnk_frontend::build_term::VarIndex;
-use tnk_frontend::lex::{tokenize, Interner};
+use tnk_frontend::lex::{tokenize, Interner, Sym};
 use tnk_frontend::load::{
-    build_command_dag, build_loaded_module, command_parse_furthest, parse_statement_trace, LoadedModule, StmtTrace,
+    build_command_dag, build_loaded_module, command_parse_furthest, parse_statement_trace, InternerNames,
+    LoadedModule, StmtTrace,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::sig::build_sig::canonical_name;
@@ -171,6 +172,10 @@ impl DescentOps for MetaDescent<'_> {
                 let sym = *hooks.ops.get(empty_hook)?;
                 Some(ctx.app(sym, Vec::new()))
             }
+            // Order-sorted unification descent (S1f).
+            MetaOp::Unify { disjoint, irredundant, legacy } => {
+                self.meta_unify(ctx, hooks, redex, disjoint, irredundant, legacy)
+            }
             MetaOp::Deferred => None,
         }
     }
@@ -270,6 +275,180 @@ impl MetaDescent<'_> {
         let result = match bindings {
             Some(b) => up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &b),
             None => ctx.app(*hooks.ops.get("noMatchSubstSymbol")?, vec![]),
+        };
+        Some(result)
+    }
+
+    /// `metaUnify`/`metaDisjointUnify`/`metaIrredundant{,Disjoint}Unify(M, UP, Qid, n)` → the `(n+1)`-th
+    /// unifier of the problem `UP` in `M`, up-translated as a `UnificationPair` `{Substitution, familyQid}`
+    /// (or a `UnificationTriple` `{Subst_lhs, Subst_rhs, familyQid}` for the disjoint variants), or
+    /// `noUnifier`/`noUnifierIncomplete`. The result's fresh-variable family is Maude's
+    /// `variableFamilyToUse`: `'#` unless the hint argument is `'#`, then `'%` (unificationProblem.cc:61).
+    /// `disjoint` renames the two sides' variables apart and splits the solution; `irredundant` keeps only
+    /// the most-general unifiers (Maude's `UnifierFilter`) before indexing.
+    fn meta_unify(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        disjoint: bool,
+        irredundant: bool,
+        legacy: bool,
+    ) -> Option<DagId> {
+        use tnk_core::fresh::VariableFamily;
+        use tnk_core::unify::problem::{UnifyProblem, VarSpec};
+        use tnk_core::unify::UnifyEnv;
+
+        let kids = ctx.children(redex);
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+
+        // 3rd argument. Current signature: a variable-family Qid whose result family is Maude's
+        // `variableFamilyToUse` ('#' unless the hint IS '#', then '%'), and the `ok` family for the
+        // safe-name check is the hint itself. Legacy signature: a `Nat` base for fresh-variable numbering
+        // in family '#' — the result carries the *next* free index (a `Nat`) instead of a family Qid, and
+        // the safe-name check has no reserved family (NONE).
+        let (used_family, base, ok_family) = if legacy {
+            // The base is an unbounded `Nat` (Maude's `mpz`); keep it as a decimal string.
+            let base = down_nat_decimal(ctx, *kids.get(2)?)?;
+            (VariableFamily::Unify, base, None)
+        } else {
+            let incoming = VariableFamily::of_root(&qid_text(ctx, *kids.get(2)?)?)?;
+            let used = if incoming == VariableFamily::Unify {
+                VariableFamily::Variant
+            } else {
+                VariableFamily::Unify
+            };
+            (used, "0".to_string(), Some(incoming))
+        };
+        let family_root = match used_family {
+            VariableFamily::Unify => "#",
+            VariableFamily::Variant => "%",
+            VariableFamily::Narrow => "@",
+        };
+        let sol_nr = down_nat64(ctx, *kids.get(3)?)? as usize;
+
+        // Down-translate the problem into (lhs, rhs) Term pairs + the original variables' (name, sort) in
+        // slot order; `n_lhs` is the disjoint split point (lhs-side variables occupy slots `0..n_lhs`).
+        let mut specs_raw: Vec<(String, SortId)> = Vec::new();
+        let (pairs, n_lhs) =
+            down_unification_problem(ctx, hooks, *kids.get(1)?, &loaded.built, &mut specs_raw, disjoint)?;
+        let n_vars = specs_raw.len();
+
+        // Internal name codes per slot. A disjoint problem's rhs variables (slots `n_lhs..`) must be
+        // distinct from the lhs even when they share a source name — the kernel compares variables by
+        // name code (deep_equal), so a shared code would collapse `X+Y =? X'+Y'` to the trivial
+        // `X+Y =? X+Y`. We give them a per-slot internal name (Maude's `Token::flaggedCode`); the result's
+        // substitution keys still render from the original names (`specs_raw`), and solution *order* is by
+        // slot index, so lhs (`0..n_lhs`) precedes rhs — matching the reference.
+        let codes: Vec<u32> = (0..n_vars)
+            .map(|k| {
+                let internal = if disjoint && k >= n_lhs {
+                    format!("{}\u{1}{k}", specs_raw[k].0)
+                } else {
+                    specs_raw[k].0.clone()
+                };
+                self.interner.intern(&internal).index()
+            })
+            .collect();
+
+        // Genuine Var-leaf dags per slot; instantiate each side and theory-normalize (the `unify`
+        // command's pipeline; one-sided-id collapse is a no-op for every metaUnify operator).
+        let bindings: Vec<DagId> =
+            (0..n_vars).map(|k| loaded.built.engine.make_var(specs_raw[k].1, codes[k], k as u32)).collect();
+        let mut equations: Vec<(DagId, DagId)> = Vec::new();
+        for (l, r) in &pairs {
+            let ld = loaded.built.engine.instantiate_bindings(l, &bindings);
+            let ld = loaded.built.engine.normalize_for_unify(ld);
+            let rd = loaded.built.engine.instantiate_bindings(r, &bindings);
+            let rd = loaded.built.engine.normalize_for_unify(rd);
+            equations.push((ld, rd));
+        }
+        let specs: Vec<VarSpec> =
+            (0..n_vars).map(|k| VarSpec { sort: specs_raw[k].1, name: codes[k] }).collect();
+
+        // Safe-name check (Maude's `variableNameConflict`): a problem variable named like the fresh
+        // family (`#1` when the used family is `#`) is unsafe → no reduction (advisory only).
+        // The `ok` family is the *hint* argument (Maude passes `incomingVariableFamily`): a problem
+        // variable that looks like a fresh variable of any *other* family will clash with the fresh
+        // variables this call generates.
+        let namegen = tnk_core::fresh::FreshVariableGenerator::new();
+        for (name, _) in &specs_raw {
+            let bare = name.split(':').next().unwrap_or("");
+            if namegen.variable_name_conflict(bare, ok_family) {
+                return None;
+            }
+        }
+
+        // Enumerate. Irredundant: collect all, filter, then index. Otherwise: the (n+1)-th directly.
+        let mut collected: Vec<Vec<DagId>> = Vec::new();
+        let incomplete;
+        let last_var_index; // legacy result's `Nat` = base + nrFreeVariables of the chosen unifier
+        {
+            let mut names = InternerNames(self.interner);
+            let mut env = UnifyEnv { e: &mut loaded.built.engine, names: &mut names };
+            let mut prob = UnifyProblem::new(&mut env, equations, specs, used_family, &base);
+            if !prob.problem_okay() {
+                return None; // unimplemented-theory screen — no reduction
+            }
+            if irredundant {
+                while let Some(u) = prob.find_next(&mut env) {
+                    collected.push(u);
+                }
+            } else {
+                for _ in 0..=sol_nr {
+                    match prob.find_next(&mut env) {
+                        Some(b) => collected.push(b),
+                        None => break,
+                    }
+                }
+            }
+            incomplete = prob.is_incomplete();
+            last_var_index = prob.last_var_index_decimal();
+        }
+        let unifiers = if irredundant {
+            tnk_core::unify::filter::irredundant(&mut loaded.built.engine, collected)
+        } else {
+            collected
+        };
+
+        // The result's third component: a family `Qid` (current) or the next free-variable index `Nat`
+        // (legacy `base + nrFreeVariables`).
+        let result = match unifiers.get(sol_nr) {
+            None => {
+                let hook = match (disjoint, incomplete) {
+                    (true, false) => "noUnifierTripleSymbol",
+                    (true, true) => "noUnifierIncompleteTripleSymbol",
+                    (false, false) => "noUnifierPairSymbol",
+                    (false, true) => "noUnifierIncompletePairSymbol",
+                };
+                ctx.app(*hooks.ops.get(hook)?, vec![])
+            }
+            Some(bindings) => {
+                let third = if legacy {
+                    up_nat_big(ctx, &last_var_index)?
+                } else {
+                    ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(family_root.into()))
+                };
+                if disjoint {
+                    let (lhs_b, rhs_b) = bindings.split_at(n_lhs);
+                    let lhs_names: Vec<&str> =
+                        specs_raw[..n_lhs].iter().map(|(n, _)| n.as_str()).collect();
+                    let rhs_names: Vec<&str> =
+                        specs_raw[n_lhs..].iter().map(|(n, _)| n.as_str()).collect();
+                    let sl = up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &lhs_names, lhs_b);
+                    let sr = up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &rhs_names, rhs_b);
+                    let hook = if legacy { "legacyUnificationTripleSymbol" } else { "unificationTripleSymbol" };
+                    ctx.app(*hooks.ops.get(hook)?, vec![sl, sr, third])
+                } else {
+                    let names: Vec<&str> = specs_raw.iter().map(|(n, _)| n.as_str()).collect();
+                    let sub =
+                        up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &names, bindings);
+                    // The current `{_,_}:Substitution Qid` UnificationPair coincides with `matchPairSymbol`
+                    // at the kind level (metaUp.cc); the legacy `{_,_}:Substitution Nat` is its own symbol.
+                    let hook = if legacy { "legacyUnificationPairSymbol" } else { "matchPairSymbol" };
+                    ctx.app(*hooks.ops.get(hook)?, vec![sub, third])
+                }
+            }
         };
         Some(result)
     }
@@ -2384,6 +2563,17 @@ fn up_nat(ctx: &mut MetaCtx, n: u64) -> Option<DagId> {
     }
 }
 
+/// [`up_nat`] for an unbounded decimal count (the legacy `metaUnify` next-index `Nat`, which may exceed
+/// `u64`): `s_^count(0)`, or `0` when `count` is `"0"`.
+fn up_nat_big(ctx: &mut MetaCtx, count: &str) -> Option<DagId> {
+    let zero = ctx.app(ctx.resolve_op("0", 0)?, vec![]);
+    if count == "0" {
+        Some(zero)
+    } else {
+        ctx.make_iter_decimal(ctx.resolve_op("s_", 1)?, count, zero)
+    }
+}
+
 /// Up-translate a 1-based position list to a meta `NatList` (`__`-joined `Nat`s; a singleton stays a `Nat`).
 fn up_nat_list(ctx: &mut MetaCtx, hooks: &MetaHooks, positions: &[u32]) -> Option<DagId> {
     let nats: Vec<DagId> = positions.iter().map(|&p| up_nat(ctx, p as u64)).collect::<Option<_>>()?;
@@ -2557,6 +2747,139 @@ fn up_substitution(
 /// The `VarIndex`'s variable names as the `&[String]` [`up_substitution`] expects.
 fn var_names(vars: &VarIndex) -> Vec<String> {
     (0..vars.count()).map(|k| vars.name(k).to_string()).collect()
+}
+
+/// Down-translate a meta `UnificationProblem` (`_=?_` unificand pairs, optionally joined by the `_/\_`
+/// conjunction) into kernel `(lhs, rhs)` [`Term`] pairs. `specs` is filled with each original variable's
+/// `(name, sort)` in slot order; the returned `n_lhs` is the disjoint split point (lhs-side variables at
+/// slots `0..n_lhs`, rhs-side at `n_lhs..`). A non-disjoint problem shares variables by name across the
+/// two sides; a disjoint one gives the rhs its own slots (renamed apart) — its Terms' variable indices
+/// shifted up by `n_lhs`.
+fn down_unification_problem(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    problem: DagId,
+    target: &BuiltModule,
+    specs: &mut Vec<(String, SortId)>,
+    disjoint: bool,
+) -> Option<(Vec<(Term, Term)>, usize)> {
+    let conj = hooks.ops.get("unificationConjunctionSymbol").copied();
+    let pair_sym = hooks.ops.get("unificandPairSymbol").copied();
+    let pair_dags: Vec<DagId> =
+        if Some(ctx.top(problem)) == conj { ctx.children(problem) } else { vec![problem] };
+
+    let mut vars_l = VarIndex::new();
+    let mut vars_r = VarIndex::new(); // disjoint only
+    let mut lhs_terms = Vec::new();
+    let mut rhs_terms = Vec::new();
+    for pd in &pair_dags {
+        if Some(ctx.top(*pd)) != pair_sym {
+            return None;
+        }
+        let k = ctx.children(*pd);
+        let l = down_term_to_term(ctx, hooks, *k.first()?, target, &mut vars_l)?;
+        let r_vars = if disjoint { &mut vars_r } else { &mut vars_l };
+        let r = down_term_to_term(ctx, hooks, *k.get(1)?, target, r_vars)?;
+        lhs_terms.push(l);
+        rhs_terms.push(r);
+    }
+    let n_lhs = vars_l.count() as usize;
+    for k in 0..vars_l.count() {
+        specs.push((vars_l.name(k).to_string(), vars_l.sort(k)));
+    }
+    let pairs = if disjoint {
+        for k in 0..vars_r.count() {
+            specs.push((vars_r.name(k).to_string(), vars_r.sort(k)));
+        }
+        lhs_terms.into_iter().zip(rhs_terms).map(|(l, r)| (l, shift_term_vars(&r, n_lhs as u32))).collect()
+    } else {
+        lhs_terms.into_iter().zip(rhs_terms).collect()
+    };
+    Some((pairs, n_lhs))
+}
+
+/// A copy of `t` with every variable index shifted up by `offset` (re-slotting a disjoint unification
+/// problem's rhs variables into their own range).
+fn shift_term_vars(t: &Term, offset: u32) -> Term {
+    match t {
+        Term::Var(v) => Term::var(v.index + offset, v.sort),
+        Term::Na { symbol, value } => Term::Na { symbol: *symbol, value: value.clone() },
+        Term::Op { symbol, args } => {
+            Term::op(*symbol, args.iter().map(|a| shift_term_vars(a, offset)).collect())
+        }
+    }
+}
+
+/// Up-translate a unifier's bindings into a meta `Substitution` (`'X:Sort <- up(value) ; …`), like
+/// [`up_substitution`] but the values may contain fresh **variable** leaves (a unifier is not a ground
+/// match), so it uses [`up_meta_term_sym`]. `names[k]` is the `k`-th variable's meta-Qid text.
+fn up_unifier_substitution(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: &Interner,
+    names: &[&str],
+    bindings: &[DagId],
+) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    let assign = hooks.ops["assignmentSymbol"];
+    let mut assigns = Vec::new();
+    for (k, name) in names.iter().enumerate() {
+        let Some(&val) = bindings.get(k) else { continue };
+        let var_qid = ctx.make_na(qid, NaValue::Qid((*name).into()));
+        let up_val = up_meta_term_sym(ctx, hooks, source, interner, val);
+        assigns.push(ctx.app(assign, vec![var_qid, up_val]));
+    }
+    match assigns.len() {
+        0 => ctx.app(hooks.ops["emptySubstitutionSymbol"], vec![]),
+        1 => assigns.into_iter().next().unwrap(),
+        _ => ctx.app(hooks.ops["substitutionSymbol"], assigns),
+    }
+}
+
+/// [`up_term`] extended to render genuine variable leaves (`'name:Sort`, the name resolved through the
+/// session `interner`) — the metaUnify result path, whose substitution values carry fresh variables.
+fn up_meta_term_sym(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: &Interner,
+    t: DagId,
+) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    match source.engine.node(t).repr() {
+        NodeRepr::Var { name } => {
+            let bare = interner.resolve(Sym::from_raw(name)).to_string();
+            let sort = source.engine.sorts().name(source.engine.sort_of(t));
+            ctx.make_na(qid, NaValue::Qid(format!("{bare}:{sort}").into()))
+        }
+        NodeRepr::App => {
+            let sym = source.engine.node(t).symbol();
+            let opname = meta_op_name(source.engine.symbol(sym).name());
+            let kids: Vec<DagId> = source.engine.node(t).children().collect();
+            if kids.is_empty() {
+                let sort = source.engine.sorts().name(source.engine.sort_of(t));
+                ctx.make_na(qid, NaValue::Qid(format!("{opname}.{sort}").into()))
+            } else {
+                let up_args: Vec<DagId> =
+                    kids.iter().map(|&c| up_meta_term_sym(ctx, hooks, source, interner, c)).collect();
+                let arglist = up_arglist(ctx, hooks, up_args);
+                let opqid = ctx.make_na(qid, NaValue::Qid(opname.into()));
+                ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
+            }
+        }
+        NodeRepr::Iter { count, arg } => {
+            let base = meta_op_name(source.engine.symbol(source.engine.node(t).symbol()).name());
+            let head = if count == "1" { base } else { format!("{base}^{count}") };
+            let up_arg = up_meta_term_sym(ctx, hooks, source, interner, arg);
+            let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
+            ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_arg])
+        }
+        NodeRepr::Str(_) | NodeRepr::Qid(_) | NodeRepr::Float(_) => {
+            let sort = source.engine.sorts().name(source.engine.sort_of(t));
+            ctx.make_na(qid, NaValue::Qid(format!("?.{sort}").into()))
+        }
+    }
 }
 
 /// Up-translate `node` (in `source`) into a meta `Context` — its [`up_term`], except the subterm at `path`
@@ -2775,6 +3098,18 @@ fn down_nat64(ctx: &MetaCtx, d: DagId) -> Option<u64> {
     match ctx.repr(d) {
         NodeRepr::Iter { count, .. } => count.parse().ok(),
         _ => Some(0), // the zero constant
+    }
+}
+
+/// A meta `Nat` as its decimal string (`s_^count(0)` → `count`; the zero constant → `"0"`) — for the
+/// unbounded (bignum) `metaUnify` base index, which need not fit `u64`.
+fn down_nat_decimal(ctx: &MetaCtx, d: DagId) -> Option<String> {
+    match ctx.repr(d) {
+        NodeRepr::Iter { count, .. } => {
+            let c = count.to_string();
+            c.bytes().all(|b| b.is_ascii_digit()).then_some(c)
+        }
+        _ => Some("0".to_string()), // the zero constant
     }
 }
 

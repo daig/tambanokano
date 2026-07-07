@@ -338,6 +338,11 @@ pub enum MetaOp {
     UpView,
     UpTerm,
     DownTerm,
+    /// Order-sorted unification descent (S1f). `disjoint` splits the solution across the two sides'
+    /// variables (`UnificationTriple`); `irredundant` filters to the most-general unifiers; `legacy`
+    /// selects the older `Nat`-family signature (result `{Substitution, Nat}` instead of
+    /// `{Substitution, Qid}`).
+    Unify { disjoint: bool, irredundant: bool, legacy: bool },
     /// Symbolic / SMT / strategy descent — declared so the tower loads, but inert (kind-level).
     Deferred,
 }

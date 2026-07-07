@@ -68,6 +68,11 @@ impl MetaCtx<'_> {
     pub fn make_iter(&mut self, sym: SymbolId, count: u64, arg: DagId) -> DagId {
         self.rt.make_s(self.sig, sym, crate::num::Nat::from_u64(count), arg)
     }
+    /// Build an `iter` successor with a **decimal** (unbounded) count — for a `Nat` result that does not
+    /// fit `u64` (the legacy `metaUnify` next-index). `None` if `count` is not a decimal numeral.
+    pub fn make_iter_decimal(&mut self, sym: SymbolId, count: &str, arg: DagId) -> Option<DagId> {
+        Some(self.rt.make_s(self.sig, sym, crate::num::Nat::from_decimal(count)?, arg))
+    }
     /// Resolve an operator by canonical name + arity in the **current** module (the engine the redex is
     /// reducing in) — for building result constants (`true`/`false`/`leastSort`'s qids resolve from
     /// [`MetaHooks`]) and down-translating `downTerm`'s argument into this module. `None` if undeclared.

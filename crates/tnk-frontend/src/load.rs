@@ -1177,7 +1177,7 @@ pub fn unify_command(
     // The object-level command uses the `#` family starting at 0 (metaUnify supplies its own base).
     let mut names = InternerNames(i);
     let mut env = tnk_core::unify::UnifyEnv { e: &mut lm.built.engine, names: &mut names };
-    let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, 0);
+    let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
 
     Ok(UnifyCommand { echo, var_names, names_ok, problem })
 }

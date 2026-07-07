@@ -246,26 +246,27 @@ impl Sorts {
         let mut kind_of: Vec<KindId> = vec![Id::from_raw(0); n0];
         for members in groups.into_values() {
             let kid: KindId = Id::from_raw(self.kinds.len() as u32);
-            // Name the kind after its MAXIMAL sorts (Maude's `printKind`: the component's top sorts), not the
-            // first-declared member. A maximal sort has no user supersort (empty `up`). For the common
-            // single-top kind this is exact (`[Nat]`); for multiple incomparable tops we list them in
-            // declaration (`SortId`) order — Maude lists them in its component sort-index order (a DFS
-            // topological numbering), which differs only for a kind-level term in a multi-top component
-            // (rare, cosmetic — the same unported component index underlies the C3 incomparable-mb tiebreak).
-            let repr = members
-                .iter()
-                .filter(|m| self.up[m.index()].is_empty())
-                .map(|m| self.sorts[m.index()].name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
+            // Name the kind after its MAXIMAL sorts (Maude's `printKind`: the component's top sorts), a
+            // maximal sort having no user supersort (empty `up`). List them in Maude's component
+            // sort-index order (`index_order`, a DFS topological numbering) rather than declaration order —
+            // they differ for a multi-top component, and a kind-level term prints its kind as this name
+            // (e.g. `metaUnify`'s undefined result `[UnificationPair?,MatchOrUnificationPair,MatchPair?]`).
             let err: SortId = Id::from_raw(self.sorts.len() as u32);
-            self.sorts.push(Sort { name: format!("[{repr}]"), is_error: true });
+            self.sorts.push(Sort { name: String::new(), is_error: true }); // name filled once ordered
             self.up.push(Vec::new());
             self.down.push(Vec::new());
             for &m in &members {
                 kind_of[m.index()] = kid;
             }
             let index_order = Self::kind_index_order(&self.up, &self.down, &members, err);
+            // The maximal sorts are exactly `index_order`'s entries (after the error sort) with empty `up`.
+            let repr = index_order
+                .iter()
+                .filter(|&&s| s != err && self.up[s.index()].is_empty())
+                .map(|&s| self.sorts[s.index()].name.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            self.sorts[err.index()].name = format!("[{repr}]");
             self.kinds.push(Kind { members, error: err, index_order });
         }
 
@@ -440,7 +441,8 @@ mod tests {
     }
 
     /// Maximal sorts are appended in the DFS's visit order, which follows the *declaration order*
-    /// of subsort edges — reversing the declarations reverses the maximal sorts' indices.
+    /// of subsort edges — reversing the declarations reverses the maximal sorts' indices, and the
+    /// kind's printed name (`printKind`) lists them in that same component sort-index order.
     #[test]
     fn component_index_order_follows_declaration_order() {
         let build = |flip: bool| {
@@ -460,7 +462,7 @@ mod tests {
             k.index_order.iter().map(|&x| s.name(x).to_string()).collect::<Vec<_>>()
         };
         assert_eq!(build(false), vec!["[TopA,TopB]", "TopA", "TopB", "Bot"]);
-        assert_eq!(build(true), vec!["[TopA,TopB]", "TopB", "TopA", "Bot"]);
+        assert_eq!(build(true), vec!["[TopB,TopA]", "TopB", "TopA", "Bot"]);
     }
 
     /// A singleton component: just the error sort above the lone member.

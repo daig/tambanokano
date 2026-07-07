@@ -83,10 +83,12 @@ impl UnifyProblem {
         equations: Vec<(DagId, DagId)>,
         var_specs: Vec<VarSpec>,
         family: VariableFamily,
-        base: u64,
+        base: &str,
     ) -> UnifyProblem {
         let n_original = var_specs.len();
-        let base = Nat::from_u64(base);
+        // The fresh-variable base counter — a decimal string so `metaUnify`'s bignum `Nat` base
+        // (Maude's `mpz`) survives; the object command and the current-signature descent pass "0".
+        let base = Nat::from_decimal(base).unwrap_or_else(Nat::zero);
         let mut prob = UnifyProblem {
             equations,
             n_original,
@@ -137,6 +139,13 @@ impl UnifyProblem {
     /// The number of free variables in the current unifier (for the `irredundant` filter later).
     pub fn nr_free_variables(&self) -> usize {
         self.order_sorted.as_ref().map_or(0, |os| os.free.len())
+    }
+
+    /// The **next** fresh-variable index as a decimal string — `base + nrFreeVariables` — Maude's
+    /// `lastVarIndex` for the legacy `metaUnify`/`metaDisjointUnify` result's `Nat` component. A string
+    /// (not a `u64`) because the base is an unbounded `Nat`.
+    pub fn last_var_index_decimal(&self) -> String {
+        self.base.add(&Nat::from_u64(self.nr_free_variables() as u64)).to_decimal()
     }
 
     /// The next unifier as the value of each original variable (slot order), or `None` when
@@ -505,7 +514,7 @@ mod tests {
         let specs = vec![VarSpec { sort: s1, name: xname }, VarSpec { sort: s2, name: yname }];
 
         let mut prob =
-            UnifyProblem::new(&mut env, vec![(x, y)], specs, VariableFamily::Unify, 0);
+            UnifyProblem::new(&mut env, vec![(x, y)], specs, VariableFamily::Unify, "0");
         assert!(prob.problem_okay());
 
         let hash1 = env.names.code("#1");
@@ -538,7 +547,7 @@ mod tests {
         let z1 = env.e.make_const(zero);
         let z2 = env.e.make_const(zero);
         let mut ok =
-            UnifyProblem::new(&mut env, vec![(z1, z2)], vec![], VariableFamily::Unify, 0);
+            UnifyProblem::new(&mut env, vec![(z1, z2)], vec![], VariableFamily::Unify, "0");
         let mut n = 0;
         while let Some(b) = ok.find_next(&mut env) {
             assert!(b.is_empty());
@@ -549,7 +558,7 @@ mod tests {
         let o = env.e.make_const(one);
         let z = env.e.make_const(zero);
         let mut clash =
-            UnifyProblem::new(&mut env, vec![(o, z)], vec![], VariableFamily::Unify, 0);
+            UnifyProblem::new(&mut env, vec![(o, z)], vec![], VariableFamily::Unify, "0");
         assert!(clash.find_next(&mut env).is_none(), "1 =? 0 has no unifier");
     }
 }

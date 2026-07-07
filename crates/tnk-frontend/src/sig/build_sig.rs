@@ -767,7 +767,17 @@ fn meta_op(code: &str) -> MetaOp {
         "metaUpView" => MetaOp::UpView,
         "metaUpTerm" => MetaOp::UpTerm,
         "metaDownTerm" => MetaOp::DownTerm,
-        // Symbolic (unification/variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
+        // Order-sorted unification descent (S1f). Current signature (variable-family `Qid` 3rd arg) and
+        // legacy signature (fresh-variable-count `Nat` 3rd arg) carry distinct id-hook codes.
+        "metaUnify" => MetaOp::Unify { disjoint: false, irredundant: false, legacy: false },
+        "metaDisjointUnify" => MetaOp::Unify { disjoint: true, irredundant: false, legacy: false },
+        "metaIrredundantUnify" => MetaOp::Unify { disjoint: false, irredundant: true, legacy: false },
+        "metaIrredundantDisjointUnify" => {
+            MetaOp::Unify { disjoint: true, irredundant: true, legacy: false }
+        }
+        "legacyMetaUnify" => MetaOp::Unify { disjoint: false, irredundant: false, legacy: true },
+        "legacyMetaDisjointUnify" => MetaOp::Unify { disjoint: true, irredundant: false, legacy: true },
+        // Symbolic (variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
         _ => MetaOp::Deferred,
     }
 }
