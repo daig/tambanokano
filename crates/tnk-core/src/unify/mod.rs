@@ -26,6 +26,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod cui;
+pub mod problem;
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
@@ -160,6 +161,12 @@ impl UnifyContext {
         }
     }
 
+    /// The raw binding slice (`Substitution` values), for `instantiate` and the driver's
+    /// sorted-solution clone.
+    pub(crate) fn values(&self) -> &[Option<DagId>] {
+        &self.values
+    }
+
     /// Every live dag the context holds (bindings + tracked variables) — the GC-root surface the
     /// owning problem must report.
     pub(crate) fn gc_roots(&self) -> impl Iterator<Item = DagId> + '_ {
@@ -239,7 +246,7 @@ pub(crate) fn insert_variables(e: &Engine, id: DagId, occurs: &mut BTreeSet<usiz
 /// Instantiate `id` under the context (`DagNode::instantiate` with invariants maintained):
 /// `None` = unchanged. Rebuilding goes through the canonical `make_*` builders, so collapse,
 /// flattening, ordering, and base sorts are maintained exactly as at construction.
-pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Option<DagId> {
+pub(crate) fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Option<DagId> {
     enum Rep {
         Free(SymbolId, Vec<DagId>),
         Acu(SymbolId, Vec<(DagId, u32)>),
@@ -248,7 +255,7 @@ pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Opti
         S(SymbolId, Nat, DagId),
     }
     let rep = match &e.node(id).term {
-        NodeTerm::Var { index, .. } => return ctx.value(*index as usize),
+        NodeTerm::Var { index, .. } => return values.get(*index as usize).copied().flatten(),
         NodeTerm::Na { .. } => return None,
         NodeTerm::Free { symbol, args } => Rep::Free(*symbol, args.clone()),
         NodeTerm::Acu { symbol, args } => Rep::Acu(*symbol, args.clone()),
@@ -260,7 +267,7 @@ pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Opti
         Rep::Free(symbol, mut args) => {
             let mut changed = false;
             for a in &mut args {
-                if let Some(n) = instantiate(e, ctx, *a) {
+                if let Some(n) = instantiate(e, values, *a) {
                     *a = n;
                     changed = true;
                 }
@@ -273,7 +280,7 @@ pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Opti
         Rep::Acu(symbol, mut pairs) => {
             let mut changed = false;
             for (a, _) in &mut pairs {
-                if let Some(n) = instantiate(e, ctx, *a) {
+                if let Some(n) = instantiate(e, values, *a) {
                     *a = n;
                     changed = true;
                 }
@@ -286,7 +293,7 @@ pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Opti
         Rep::Au(symbol, mut args) => {
             let mut changed = false;
             for a in &mut args {
-                if let Some(n) = instantiate(e, ctx, *a) {
+                if let Some(n) = instantiate(e, values, *a) {
                     *a = n;
                     changed = true;
                 }
@@ -297,15 +304,15 @@ pub(crate) fn instantiate(e: &mut Engine, ctx: &UnifyContext, id: DagId) -> Opti
             })
         }
         Rep::Cui(symbol, x, y) => {
-            let nx = instantiate(e, ctx, x);
-            let ny = instantiate(e, ctx, y);
+            let nx = instantiate(e, values, x);
+            let ny = instantiate(e, values, y);
             if nx.is_none() && ny.is_none() {
                 return None;
             }
             let (sig, rt) = e.parts_mut();
             Some(rt.make_cui(sig, symbol, nx.unwrap_or(x), ny.unwrap_or(y)))
         }
-        Rep::S(symbol, count, arg) => instantiate(e, ctx, arg).map(|n| {
+        Rep::S(symbol, count, arg) => instantiate(e, values, arg).map(|n| {
             let (sig, rt) = e.parts_mut();
             rt.make_s(sig, symbol, count, n)
         }),
@@ -665,11 +672,13 @@ impl PendingStack {
         // All unification problems solved — check for compound cycles.
         match self.find_cycle(env.e, ctx) {
             None => {
-                // Complete: instantiate bound variables in dependency order.
-                for &index in &self.variable_order.clone() {
-                    if let Some(v) = ctx.value(index)
-                        && let Some(d) = instantiate(env.e, ctx, v)
-                    {
+                // Complete: instantiate bound variables in dependency order (live — a later slot's
+                // instantiation must see its already-instantiated dependencies, which precede it in
+                // `variable_order`). The `values()` borrow ends when `instantiate` returns `d`.
+                for index in self.variable_order.clone() {
+                    let Some(v) = ctx.value(index) else { continue };
+                    let d = instantiate(env.e, ctx.values(), v);
+                    if let Some(d) = d {
                         ctx.bind(index, Some(d));
                     }
                 }

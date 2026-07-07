@@ -3363,8 +3363,8 @@ impl Engine {
     }
 
     /// Shared access to the immutable signature half (sorts/symbols/equations). Used by the matcher
-    /// seam's tests to drive [`LhsAutomaton`](crate::theory) directly over the two halves.
-    #[cfg(test)]
+    /// seam's tests to drive [`LhsAutomaton`](crate::theory) directly over the two halves, and by
+    /// the order-sorted-unification driver (which builds `SortBdds` and reads sorts/symbols).
     pub(crate) fn signature(&self) -> &Signature {
         &self.sig
     }

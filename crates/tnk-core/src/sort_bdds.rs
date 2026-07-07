@@ -171,6 +171,14 @@ impl SortBdds {
         self.real0
     }
 
+    /// A `true`/`false` BDD in this instance's universe (the driver's unifier seed / sort-fn zero).
+    pub(crate) fn mk_true(&self) -> Bdd {
+        self.universe.mk_true()
+    }
+    pub(crate) fn mk_false(&self) -> Bdd {
+        self.universe.mk_false()
+    }
+
     fn set_index_bits(&self, cube: &mut BddPartialValuation, first: u16, bits: u16, index: u32) {
         for k in 0..bits {
             cube.set_value(self.vars[(first + k) as usize], index >> k & 1 == 1);
@@ -449,8 +457,8 @@ const UNDEFINED: i8 = -1;
 /// reference walk order (low-branch-first DFS, don't-care set in variable-index order, binary
 /// counting over don't-cares, node-stack backtrack). The enumeration order IS the observable
 /// order-sorted unifier order (the S1 pass criterion).
-pub(crate) struct AllSat<'a> {
-    formula: &'a Bdd,
+pub(crate) struct AllSat {
+    formula: Bdd,
     first_variable: usize,
     last_variable: usize,
     node_stack: Vec<BddPointer>,
@@ -459,8 +467,10 @@ pub(crate) struct AllSat<'a> {
     first_assignment: bool,
 }
 
-impl<'a> AllSat<'a> {
-    pub(crate) fn new(formula: &'a Bdd, first_variable: u16, last_variable: u16) -> AllSat<'a> {
+impl AllSat {
+    /// Owns `formula` so a caller (the unification driver) can hold the enumerator across the
+    /// solved form's lifetime without a self-referential borrow.
+    pub(crate) fn new(formula: Bdd, first_variable: u16, last_variable: u16) -> AllSat {
         AllSat {
             formula,
             first_variable: first_variable as usize,
@@ -661,7 +671,7 @@ mod tests {
 
         let last_real = real0 + vbits - 1;
         let mut got: Vec<String> = Vec::new();
-        let mut all = AllSat::new(&maximal, real0, last_real);
+        let mut all = AllSat::new(maximal.clone(), real0, last_real);
         while all.next_assignment() {
             let asg = all.assignment();
             let mut li = 0u32;
@@ -727,7 +737,7 @@ mod tests {
     fn allsat_dont_care_low_first() {
         let universe = BddVariableSet::new_anonymous(1);
         let t = universe.mk_true();
-        let mut all = AllSat::new(&t, 0, 0);
+        let mut all = AllSat::new(t.clone(), 0, 0);
         let mut seq = Vec::new();
         while all.next_assignment() {
             seq.push(all.assignment()[0]);
