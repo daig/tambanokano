@@ -340,6 +340,21 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 TopItem::Command(Command::Match { module, pattern, subject, xmatch })
             }
+            "unify" | "irredundant" | "irred" => {
+                // `[irredundant] unify [[n]] [in M :] T1 =? T2 [/\ …] .`. The body (the
+                // `=?`/`/\`-separated bubble) is collected whole and split by the command builder,
+                // reusing the condition machinery (`=?` and `/\` each lex as a single token).
+                let irredundant = txt != "unify";
+                self.advance(); // `unify` / `irredundant` / `irred`
+                if irredundant {
+                    self.eat("unify")?;
+                }
+                let bound = self.opt_bound()?;
+                let module = self.opt_in_module()?;
+                let body = self.collect_until(&[]);
+                self.eat_dot()?;
+                TopItem::Command(Command::Unify { module, bound, irredundant, body })
+            }
             "rewrite" | "rew" => {
                 self.advance();
                 let bound = self.opt_bound()?;

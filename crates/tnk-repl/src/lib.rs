@@ -18,7 +18,8 @@ use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::load::{
     build_command_dag, command_echo, erewrite_command, format_matchers,
-    frewrite_command, match_command, rewrite_command, search_command, LoadedModule,
+    frewrite_command, match_command, render_unifier, rewrite_command, search_command, unify_command,
+    InternerNames, LoadedModule,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
@@ -76,6 +77,10 @@ pub struct Repl {
     include_bool: bool,
     /// Canonicalized paths already `load`ed — `sload` (skip-load) consults this and loads only once.
     loaded_files: std::collections::HashSet<std::path::PathBuf>,
+    /// `set show timing on|off` (Maude default on): gates the `Decision time:` line of
+    /// `match`/`xmatch`/`unify` (the only commands whose output the flag affects — `reduce`/`rewrite`
+    /// timing tails are already normalized away). Other timing-tail lines are hardcoded 0ms.
+    show_timing: bool,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -111,6 +116,7 @@ impl Repl {
             stdin: String::new(),
             include_bool: false,
             loaded_files: std::collections::HashSet::new(),
+            show_timing: true,
         }
     }
 
@@ -393,6 +399,7 @@ impl Repl {
             | Command::Frewrite { module, .. }
             | Command::ERewrite { module, .. }
             | Command::Search { module, .. }
+            | Command::Unify { module, .. }
             | Command::Srewrite { module, .. } => module.clone(),
             Command::Continue { .. } => None,
         };
@@ -449,10 +456,10 @@ impl Repl {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // the match's subject-reduce is not traced (yet)
                 lm.built.engine.set_record_whole(false);
+                let dtime = if self.show_timing { "Decision time: 0ms cpu (0ms real)\n" } else { "" };
                 match match_command(lm, &self.interner, &pattern, &subject, xmatch) {
                     Ok(blocks) => out.push_str(&format!(
-                        "{kw} in {cur} : {pe} <=? {se} .\n\
-                         Decision time: 0ms cpu (0ms real)\n\n{}\n",
+                        "{kw} in {cur} : {pe} <=? {se} .\n{dtime}\n{}\n",
                         format_matchers(&blocks)
                     )),
                     Err(e) => out.push_str(&format!("error: {e}\n")),
@@ -588,6 +595,59 @@ impl Repl {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
+            Command::Unify { bound, irredundant, body, .. } => {
+                self.last = None;
+                let limit = bound.unwrap_or(u64::MAX);
+                let irr = if irredundant { "irredundant " } else { "" };
+                let bnd = bound.map(|n| format!("[{n}] ")).unwrap_or_default();
+                // The interner and the module engine are disjoint fields — borrow both.
+                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let lm = modules.get_mut(&cur).expect("current module is built");
+                match unify_command(lm, interner, &body) {
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                    Ok(mut uc) => {
+                        out.push_str(&format!("{irr}unify {bnd}in {cur} : {} .\n", uc.echo));
+                        if !uc.names_ok || !uc.problem.problem_okay() {
+                            // Screening failure (unimplemented theory) or an unsafe variable name —
+                            // Maude emits only the (stripped) warning, no Decision time / unifiers.
+                        } else {
+                            // Collect unifiers (up to the bound) while the engine is borrowed, then
+                            // render — print_pretty needs the interner immutably afterwards.
+                            let mut unifiers: Vec<Vec<DagId>> = Vec::new();
+                            let incomplete;
+                            {
+                                let mut names = InternerNames(interner);
+                                let mut env = tnk_core::unify::UnifyEnv {
+                                    e: &mut lm.built.engine,
+                                    names: &mut names,
+                                };
+                                while (unifiers.len() as u64) < limit {
+                                    match uc.problem.find_next(&mut env) {
+                                        Some(b) => unifiers.push(b),
+                                        None => break,
+                                    }
+                                }
+                                incomplete = uc.problem.is_incomplete();
+                            }
+                            let _ = incomplete; // the incomplete-warning text is phase-E (stripped)
+                            if self.show_timing {
+                                out.push_str("Decision time: 0ms cpu (0ms real)\n");
+                            }
+                            if unifiers.is_empty() {
+                                out.push_str("No unifier.\n");
+                            } else {
+                                for (n, u) in unifiers.iter().enumerate() {
+                                    out.push_str(&format!(
+                                        "\nUnifier {}\n{}\n",
+                                        n + 1,
+                                        render_unifier(&lm.built, interner, &uc.var_names, u)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Command::Continue { bound } => match self.last.take() {
                 Some((m, Continuation::Rewrite(mut rw))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
@@ -704,6 +764,15 @@ impl Repl {
                 }
                 String::new()
             }
+            // `set show timing on|off`: gates the `Decision time:` line of match/xmatch/unify.
+            Some("show") if words.get(2).copied() == Some("timing") => {
+                match words.get(3).copied() {
+                    Some("on") => self.show_timing = true,
+                    Some("off") => self.show_timing = false,
+                    _ => {}
+                }
+                String::new()
+            }
             // Every other interpreter directive (`set show advisories off`, `set include … on/off`,
             // `set oo include … on`, …) is a silent no-op, as the file-loading parser already treats
             // `set` (we never auto-import, and these toggles do not affect our output). Silence matches
@@ -789,7 +858,7 @@ impl Repl {
                 s,
                 "reduce" | "red" | "rewrite" | "rew" | "frewrite" | "frew" | "erewrite" | "erew"
                     | "search" | "match" | "xmatch" | "continue" | "cont" | "srewrite" | "srew"
-                    | "dsrewrite" | "dsrew"
+                    | "dsrewrite" | "dsrew" | "unify" | "irredundant" | "irred"
             )
         };
         let mut open = false;

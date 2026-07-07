@@ -374,6 +374,11 @@ pub enum Command {
         pattern: Vec<Token>,
         such_that: Option<Vec<Token>>,
     },
+    /// `[irredundant] unify [[bound]] [in M :] T1 =? T2 [/\ …] .` (Pillar S1): order-sorted
+    /// unification. `bound` = `[n]` (max unifiers before continuation); `irredundant` selects the
+    /// minimal-complete-set filter. `body` is the raw `=?`/`/\`-separated bubble, split by the
+    /// command builder.
+    Unify { module: Option<String>, bound: Option<u64>, irredundant: bool, body: Vec<Token> },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
     /// `srewrite [in M :] T using E .` (fair) / `dsrewrite …` (depth-first) — strategy-controlled rewriting

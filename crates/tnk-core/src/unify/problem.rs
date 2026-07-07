@@ -40,6 +40,8 @@ pub struct UnifyProblem {
     n_original: usize,
     var_specs: Vec<VarSpec>,
     family: VariableFamily,
+    /// Fresh-variable base number (the `metaUnify` counter; 0 for the object-level command). A
+    /// `Nat` internally (Maude's is a bignum), constructed from the `u64` API parameter.
     base: Nat,
     ctx: UnifyContext,
     pending: PendingStack,
@@ -51,10 +53,10 @@ pub struct UnifyProblem {
     order_sorted: Option<OrderSorted>,
 }
 
-/// The order-sorted state for one unsorted solved form.
+/// The order-sorted state for one unsorted solved form. `AllSat` owns its `Bdd`, so the `SortBdds`
+/// instance is not retained past `find_order_sorted_unifiers`.
 struct OrderSorted {
     all_sat: AllSat,
-    sb: SortBdds,
     /// The unsorted solved form (bound slots fully instantiated over the free variables).
     template: Vec<Option<DagId>>,
     /// One entry per free variable, in ascending slot order.
@@ -81,9 +83,10 @@ impl UnifyProblem {
         equations: Vec<(DagId, DagId)>,
         var_specs: Vec<VarSpec>,
         family: VariableFamily,
-        base: Nat,
+        base: u64,
     ) -> UnifyProblem {
         let n_original = var_specs.len();
+        let base = Nat::from_u64(base);
         let mut prob = UnifyProblem {
             equations,
             n_original,
@@ -263,7 +266,7 @@ impl UnifyProblem {
             })
             .collect();
 
-        self.order_sorted = Some(OrderSorted { all_sat, sb, template, free });
+        self.order_sorted = Some(OrderSorted { all_sat, template, free });
     }
 
     /// `bindFreeVariables`: decode each free variable's assigned sort from the current AllSat
@@ -486,7 +489,7 @@ mod tests {
         let specs = vec![VarSpec { sort: s1, name: xname }, VarSpec { sort: s2, name: yname }];
 
         let mut prob =
-            UnifyProblem::new(&mut env, vec![(x, y)], specs, VariableFamily::Unify, Nat::zero());
+            UnifyProblem::new(&mut env, vec![(x, y)], specs, VariableFamily::Unify, 0);
         assert!(prob.problem_okay());
 
         let hash1 = env.names.code("#1");
@@ -519,7 +522,7 @@ mod tests {
         let z1 = env.e.make_const(zero);
         let z2 = env.e.make_const(zero);
         let mut ok =
-            UnifyProblem::new(&mut env, vec![(z1, z2)], vec![], VariableFamily::Unify, Nat::zero());
+            UnifyProblem::new(&mut env, vec![(z1, z2)], vec![], VariableFamily::Unify, 0);
         let mut n = 0;
         while let Some(b) = ok.find_next(&mut env) {
             assert!(b.is_empty());
@@ -530,7 +533,7 @@ mod tests {
         let o = env.e.make_const(one);
         let z = env.e.make_const(zero);
         let mut clash =
-            UnifyProblem::new(&mut env, vec![(o, z)], vec![], VariableFamily::Unify, Nat::zero());
+            UnifyProblem::new(&mut env, vec![(o, z)], vec![], VariableFamily::Unify, 0);
         assert!(clash.find_next(&mut env).is_none(), "1 =? 0 has no unifier");
     }
 }

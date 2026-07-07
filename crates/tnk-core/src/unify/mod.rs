@@ -20,9 +20,9 @@
 //! central [`FreshVariableGenerator`]; their interned codes come from the session's [`NameCodes`]
 //! source, so name-code order matches the reference's token-encounter order.
 
-// The solved-form core and per-theory solvers are complete but not yet wired to a caller: the
-// UnificationProblem driver (S1d) and the `unify` command / `metaUnify` (S1e/S1f) consume them.
-// Scoped dead-code allowance until then; removed when the driver lands (subsystems-goal §5 S1).
+// A few solved-form helpers (`flag_as_incomplete`, `UnifyContext::family`) have no caller until the
+// AC/ACU and A/AU solvers land (S1c) and the `metaUnify` descent (S1f). Scoped dead-code allowance
+// until then (subsystems-goal §5 S1); the object-level `unify` command already drives the rest.
 #![allow(dead_code)]
 
 pub(crate) mod cui;

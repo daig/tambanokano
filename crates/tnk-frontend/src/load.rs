@@ -16,7 +16,7 @@ use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, Nt, NtType};
 use crate::lex::{tokenize, Interner, Token};
 use crate::oo_complete;
-use crate::pretty::print_pretty;
+use crate::pretty::{print_pretty, print_term};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
@@ -1077,6 +1077,126 @@ pub fn format_matchers(blocks: &[String]) -> String {
         .map(|(n, b)| format!("Matcher {}\n{}", n + 1, b))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// A [`NameCodes`](tnk_core::unify::NameCodes) source over the session interner: fresh-variable
+/// names (`#1`, `#2`, …) are interned into the same code space as user variable names, so the
+/// kernel's variable ordering (`dag_compare` on name codes) matches Maude's token-code order. `pub`
+/// so the REPL can build one for its own `find_next` loop after `unify_command` returns.
+pub struct InternerNames<'a>(pub &'a mut Interner);
+impl tnk_core::unify::NameCodes for InternerNames<'_> {
+    fn code(&mut self, name: &str) -> u32 {
+        self.0.intern(name).index()
+    }
+}
+
+/// The built pieces of a `unify` command: the pretty-printed echo body (`T1 =? T2 /\ …`, without
+/// the `unify in M :` frame or trailing ` .`), the original variables' print names (slot order),
+/// and the resumable [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
+pub struct UnifyCommand {
+    pub echo: String,
+    pub var_names: Vec<String>,
+    /// `false` if any unificand variable has a name that could collide with a fresh `#n`/`%n`/`@n`
+    /// variable (Maude's `variableNameConflict`) — the caller then emits only the (stripped)
+    /// "unsafe variable name" warning, like a screening failure.
+    pub names_ok: bool,
+    pub problem: tnk_core::unify::problem::UnifyProblem,
+}
+
+/// Build a `unify` command: split the body into `=?`-separated pairs (over `/\`), parse both sides
+/// of every pair sharing one [`VarIndex`] (so variable slots are assigned in first-encounter order
+/// — the observable order), build the echo and the genuine-`Var`-leaf dags, and construct the
+/// order-sorted [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
+pub fn unify_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    body: &[Token],
+) -> Result<UnifyCommand, String> {
+    use tnk_core::fresh::VariableFamily;
+    use tnk_core::unify::problem::{UnifyProblem, VarSpec};
+
+    // Split on `/\` into conjuncts, each on `=?` into (lhs, rhs); parse both sides sharing `vars`.
+    let mut vars = VarIndex::new();
+    let mut pairs: Vec<(Term, Term)> = Vec::new();
+    for conj in split_on_text(body, "/\\", i) {
+        let sides = split_on_text(conj, "=?", i);
+        if sides.len() != 2 {
+            return Err("unify: each conjunct must be `T1 =? T2`".to_string());
+        }
+        let lhs = parse_build(sides[0], &lm.grammar, &lm.built, i, &mut vars)?;
+        let rhs = parse_build(sides[1], &lm.grammar, &lm.built, i, &mut vars)?;
+        pairs.push((lhs, rhs));
+    }
+
+    // Echo: each side pretty-printed via the Term printer (variables by their source names), joined
+    // with ` =? ` and ` /\ `. Line-wrapping is the REPL's global post-process.
+    let var_names: Vec<String> = (0..vars.count()).map(|k| vars.name(k).to_string()).collect();
+
+    // Safe-name check (Maude's `variableNameConflict`): a unificand variable named like a fresh
+    // variable (`#1`, `%2`, `@3`) would clash. The bare id is the text before the on-the-fly `:Sort`.
+    let namegen = tnk_core::fresh::FreshVariableGenerator::new();
+    let names_ok = var_names.iter().all(|n| {
+        let bare = n.split(':').next().unwrap_or(n);
+        !namegen.variable_name_conflict(bare, None)
+    });
+    let echo = pairs
+        .iter()
+        .map(|(l, r)| {
+            format!(
+                "{} =? {}",
+                print_term(&lm.built, i, l, &var_names, false),
+                print_term(&lm.built, i, r, &var_names, false)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" /\\ ");
+
+    // Genuine `Var`-leaf dags: instantiate each side's Term over per-slot `Var` bindings. `Var`
+    // leaves carry the interned base-name code; the one-sided-id collapse matches Maude's normalize.
+    let bindings: Vec<DagId> = (0..vars.count())
+        .map(|k| {
+            let name = i.intern(vars.name(k)).index();
+            lm.built.engine.make_var(vars.sort(k), name, k)
+        })
+        .collect();
+    let mut equations: Vec<(DagId, DagId)> = Vec::new();
+    for (l, r) in &pairs {
+        let ld = lm.built.engine.instantiate_bindings(l, &bindings);
+        let ld = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, ld);
+        let rd = lm.built.engine.instantiate_bindings(r, &bindings);
+        let rd = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, rd);
+        equations.push((ld, rd));
+    }
+
+    let specs: Vec<VarSpec> = (0..vars.count())
+        .map(|k| VarSpec { sort: vars.sort(k), name: i.intern(vars.name(k)).index() })
+        .collect();
+
+    // The object-level command uses the `#` family starting at 0 (metaUnify supplies its own base).
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv { e: &mut lm.built.engine, names: &mut names };
+    let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, 0);
+
+    Ok(UnifyCommand { echo, var_names, names_ok, problem })
+}
+
+/// Render one unifier's substitution (`name --> value` lines, or `empty substitution`), matching
+/// `UserLevelRewritingContext::printSubstitution`.
+pub fn render_unifier(
+    m: &BuiltModule,
+    i: &Interner,
+    var_names: &[String],
+    values: &[DagId],
+) -> String {
+    if values.is_empty() {
+        return "empty substitution".to_string();
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| format!("{} --> {}", var_names[k], print_pretty(m, i, v, false)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
