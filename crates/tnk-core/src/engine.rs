@@ -504,6 +504,11 @@ impl Signature {
     pub(crate) fn sorts(&self) -> &Sorts {
         &self.sorts
     }
+    /// Iterate every symbol (id + data). Used by the order-sorted-unification `SortBdds` to size
+    /// its domain-bit block to the widest operator in the module.
+    pub(crate) fn symbols_iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> + '_ {
+        self.symbols.iter()
+    }
 
     pub(crate) fn add_op(
         &mut self,
