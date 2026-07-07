@@ -2169,11 +2169,18 @@ impl Runtime {
                 crate::dag::rope_cmp(xs, ys)
             }
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
-            // Two variables of the same (per-sort) variable symbol order by name-token code —
-            // `variableDagNode.cc compareArguments` is `id() - id()`. Cross-sort variables never
-            // reach here (distinct symbols; the SymbolId order above mirrors Maude's creation-order
-            // symbol compare). The substitution `index` is bookkeeping, not identity.
-            (NodeTerm::Var { name: xn, .. }, NodeTerm::Var { name: yn, .. }) => xn.cmp(yn),
+            // Two variables of the same (per-sort) variable symbol order by their substitution
+            // `index` = the problem's variable slot (first-encounter/creation order): the original
+            // command variables in `lhs, rhs` encounter order, then mid-solve fresh variables in
+            // creation order. This is the order-sorted engine's stable canonical order for ACU/CUI
+            // argument sorting. It deliberately does NOT use the interned name code: over the
+            // standing prelude a command variable's name may be pre-interned at an arbitrary code,
+            // which would scramble the AC subterm order relative to the fresh variables (whose names
+            // are always freshly interned) and permute the enumerated unifiers. Index↔name is a
+            // bijection within a problem (each variable has one slot), so this stays consistent with
+            // `deep_equal` (same index ⟺ same name). Cross-sort variables never reach here (distinct
+            // per-sort symbols, ordered by the SymbolId compare above).
+            (NodeTerm::Var { index: xi, .. }, NodeTerm::Var { index: yi, .. }) => xi.cmp(yi),
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
     }
