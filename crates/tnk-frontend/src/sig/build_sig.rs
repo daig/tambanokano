@@ -495,14 +495,16 @@ fn declare_op(
     i: &Interner,
 ) -> R<(SymbolId, Option<(crate::surface::ast::IdSide, SymbolId)>)> {
     use crate::surface::ast::IdSide;
-    // `id: <const>` — resolve the (already-declared) identity constant by name (the subset's `id:` is a
-    // single constant).
+    // `id: <const>` — resolve the (already-declared) identity **constant** by name. Only a single-token
+    // (constant) identity is representable as a `SymbolId`; a compound identity term like `id: g(a)`
+    // (Maude allows it) is not yet supported, so it is dropped here — the operator becomes pure-AC/AU
+    // for construction and unification (no crash; a general identity-term dag is a later
+    // generalization). The audit notes this limitation; U03's `id: g(a)` modules exercise it.
     let identity = match &attrs.id {
-        Some(toks) => {
-            let first = toks.first().ok_or("empty id: term")?;
-            Some(*name_to_sym.get(i.resolve(first.sym)).ok_or("unknown id: constant")?)
+        Some(toks) if toks.len() == 1 => {
+            Some(*name_to_sym.get(i.resolve(toks[0].sym)).ok_or("unknown id: constant")?)
         }
-        None => None,
+        _ => None,
     };
     // A one-sided identity is withheld from the kernel (its collapse is two-sided); record it for the
     // frontend collapse. A plain (two-sided) `id:` goes to the kernel as before.
