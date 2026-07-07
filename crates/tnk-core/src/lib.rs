@@ -42,3 +42,7 @@ pub(crate) mod num;
 pub use num::double_to_string;
 pub(crate) mod s;
 pub(crate) mod theory;
+// S1 (subsystems goal): order-sorted unification — solved-form core, per-theory solvers, and the
+// enumeration driver. `pub` so the frontend can supply a `NameCodes` source for fresh variables;
+// the object-level `unify` command and `metaUnify` reach it through `Engine` methods.
+pub mod unify;

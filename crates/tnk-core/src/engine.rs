@@ -20,7 +20,8 @@ use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
 use crate::sort::{KindId, SortId, Sorts};
 use crate::symbol::{
-    Axioms, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolClass, SymbolId, Theory,
+    Axioms, IdentitySide, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolClass,
+    SymbolId, Theory,
 };
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
@@ -515,6 +516,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms::default(),
             identity: None,
+            one_sided_id: None,
             strategy: None,
             frozen: None,
             special: None,
@@ -540,6 +542,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: true, idem: false, iter: false },
             identity,
+            one_sided_id: None,
             strategy: None,
             frozen: None,
             special: None,
@@ -566,6 +569,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: true, comm: false, idem: false, iter: false },
             identity,
+            one_sided_id: None,
             strategy: None,
             frozen: None,
             special: None,
@@ -592,6 +596,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { assoc: false, comm, idem, iter: false },
             identity,
+            one_sided_id: None,
             strategy: None,
             frozen: None,
             special: None,
@@ -617,6 +622,7 @@ impl Signature {
             decls: vec![OpDeclaration { domain, range, ctor: false }],
             axioms: Axioms { iter: true, ..Default::default() },
             identity: None,
+            one_sided_id: None,
             strategy: None,
             frozen: None,
             special: None,
@@ -3451,6 +3457,15 @@ impl Engine {
         self.sig.symbols.get_mut(sym).class = class;
     }
 
+    /// Record a **one-sided** identity (`left id:` / `right id:`) on `sym` for the symbolic
+    /// engine. Deliberately does NOT touch [`Symbol`]'s two-sided `identity`: construction-time
+    /// collapse of one-sided identities stays in the frontend (fable-audit §3.4), so
+    /// reduction/matching behavior is unchanged — only unification consults this (the CUI collapse
+    /// alternatives; the associative-with-one-sided-id unimplemented-theory screen).
+    pub fn set_one_sided_identity(&mut self, sym: SymbolId, side: IdentitySide, id_const: SymbolId) {
+        self.sig.symbols.get_mut(sym).one_sided_id = Some((side, id_const));
+    }
+
     /// The per-sort variable symbol backing genuine `Var` leaves — Maude's
     /// `Module::instantiateVariable(sort)`. Created **lazily, in demand order** (command parse →
     /// mid-solve fresh kinds → unifier extraction) and cached for the module's lifetime: the
@@ -3632,6 +3647,11 @@ impl Engine {
     }
     pub fn sort_of(&self, id: DagId) -> SortId {
         self.rt.sort_of(id)
+    }
+    /// The canonical total order on DAG nodes (`DagNode::compare`) — the key the CUI commutative
+    /// unification decision procedure compares arguments by.
+    pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
+        self.rt.dag_compare(a, b)
     }
     /// Number of live DAG nodes (post-GC this is the reachable set).
     pub fn live_nodes(&self) -> usize {

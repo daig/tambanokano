@@ -223,6 +223,15 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                     declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
                 if let Some(info) = one_sided {
                     one_sided_id.insert(sym, info);
+                    // Mirror the side into the kernel for the symbolic engine (unification's CUI
+                    // collapse alternatives + the assoc-with-one-sided-id unimplemented screen);
+                    // construction collapse stays frontend-side, so reduction is untouched.
+                    let side = match info.0 {
+                        crate::surface::ast::IdSide::Left => tnk_core::symbol::IdentitySide::Left,
+                        crate::surface::ast::IdSide::Right => tnk_core::symbol::IdentitySide::Right,
+                        crate::surface::ast::IdSide::Both => unreachable!("two-sided id is not one-sided"),
+                    };
+                    engine.set_one_sided_identity(sym, side, info.1);
                 }
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)

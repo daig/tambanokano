@@ -78,6 +78,15 @@ pub struct Symbol {
     /// identity *term* is a later generalization. Canonicalization drops identity arguments and a
     /// matched AC variable may bind this constant (the "collapse to unit" solutions).
     pub(crate) identity: Option<SymbolId>,
+    /// A **one-sided** identity (`left id:` / `right id:`), recorded for the symbolic engine only.
+    /// Construction-time collapse of one-sided identities stays in the *frontend* (which withholds
+    /// them from [`identity`] so the kernel's two-sided collapse never fires — fable-audit §3.4);
+    /// unification, however, must know the side: Maude's `CUI_Symbol::leftId()/rightId()` drive the
+    /// CUI collapse alternatives, and an *associative* operator with a one-sided identity is an
+    /// unimplemented unification theory (`AU_DagNode::computeBaseSortForGroundSubterms`). Read via
+    /// [`left_identity`](Self::left_identity)/[`right_identity`](Self::right_identity), which fold
+    /// the two-sided case in.
+    pub(crate) one_sided_id: Option<(IdentitySide, SymbolId)>,
     /// Evaluation strategy `strat (…)` (B2.4): the 0-based argument positions to reduce, in order,
     /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
     /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
@@ -95,6 +104,14 @@ pub struct Symbol {
     /// Classification for the decompose-equality stability analysis (Maude's `SymbolType` basic
     /// types, collapsed to what `.=.` consults). `Standard` is every ordinary user operator.
     pub(crate) class: SymbolClass,
+}
+
+/// Which side a one-sided identity collapses on (`left id:` / `right id:`) — the symbolic-engine
+/// mirror of the frontend's `IdSide` (two-sided identities live in [`Symbol::identity`] instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitySide {
+    Left,
+    Right,
 }
 
 /// The `.=.`-relevant slice of Maude's `SymbolType` basic types: a symbol is *equationally stable*
@@ -548,6 +565,30 @@ impl Symbol {
     /// The identity constant symbol, if this operator was declared with `id:`.
     pub(crate) fn identity(&self) -> Option<SymbolId> {
         self.identity
+    }
+
+    /// The identity that collapses on the **left** (`f(e, x) = x`): a two-sided `id:` or a
+    /// `left id:` — Maude's `CUI_Symbol::leftId()`-guarded identity access.
+    pub(crate) fn left_identity(&self) -> Option<SymbolId> {
+        self.identity.or(match self.one_sided_id {
+            Some((IdentitySide::Left, c)) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// The identity that collapses on the **right** (`f(x, e) = x`): a two-sided `id:` or a
+    /// `right id:`.
+    pub(crate) fn right_identity(&self) -> Option<SymbolId> {
+        self.identity.or(match self.one_sided_id {
+            Some((IdentitySide::Right, c)) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Whether this operator has an identity on exactly one side (`AU_Symbol::oneSidedId`) — an
+    /// associative operator with one is an unimplemented unification theory.
+    pub(crate) fn one_sided_identity(&self) -> bool {
+        self.one_sided_id.is_some()
     }
 
     /// The operator's built-in reduction rule (`special (id-hook …)`), if any (B3).
