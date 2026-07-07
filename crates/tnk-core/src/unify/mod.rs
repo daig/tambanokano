@@ -25,6 +25,7 @@
 // until then (subsystems-goal §5 S1); the object-level `unify` command already drives the rest.
 #![allow(dead_code)]
 
+pub(crate) mod acu;
 pub(crate) mod cui;
 pub mod problem;
 
@@ -371,8 +372,7 @@ fn unimplemented_theory(e: &Engine, symbol: SymbolId) -> bool {
     let sym = e.symbol(symbol);
     match sym.theory() {
         Theory::Cui => sym.axioms.idem,
-        Theory::Au => sym.one_sided_identity() || true, // TEMPORARY: A/AU solver lands in S1c
-        Theory::Acu => true,                            // TEMPORARY: AC/ACU solver lands in S1c
+        Theory::Au => sym.one_sided_identity() || true, // TEMPORARY: A/AU solver lands next in S1c
         _ => false,
     }
 }
@@ -787,8 +787,9 @@ fn make_unification_subproblem(e: &Engine, symbol: SymbolId) -> UnifySubproblem 
                 UnifySubproblem::C(cui::CSubproblem::default())
             }
         }
-        UnifyTheory::Acu | UnifyTheory::Au => {
-            unreachable!("AC/ACU and A/AU tops are screened until their solvers land (S1c)")
+        UnifyTheory::Acu => UnifySubproblem::Acu(acu::AcuSubproblem::new(e, symbol)),
+        UnifyTheory::Au => {
+            unreachable!("A/AU tops are screened until their solver lands (S1c)")
         }
         UnifyTheory::Free | UnifyTheory::S => {
             unreachable!("free and S theories never push subproblems")
@@ -805,6 +806,7 @@ pub(crate) enum UnifySubproblem {
     CompoundCycle(CompoundCycleSubproblem),
     C(cui::CSubproblem),
     CuiWithId(cui::CuiIdSubproblem),
+    Acu(acu::AcuSubproblem),
 }
 
 impl UnifySubproblem {
@@ -824,6 +826,7 @@ impl UnifySubproblem {
             }
             UnifySubproblem::C(c) => c.add_unification(lhs, rhs, marked),
             UnifySubproblem::CuiWithId(c) => c.add_unification(env, ctx, pending, lhs, rhs, marked),
+            UnifySubproblem::Acu(c) => c.add_unification(env.e, ctx, lhs, rhs, marked),
         }
     }
 
@@ -839,6 +842,7 @@ impl UnifySubproblem {
             UnifySubproblem::CompoundCycle(c) => c.solve(env, find_first, ctx, pending),
             UnifySubproblem::C(c) => c.solve(env, find_first, ctx, pending),
             UnifySubproblem::CuiWithId(c) => c.solve(env, find_first, ctx, pending),
+            UnifySubproblem::Acu(c) => c.solve(env, find_first, ctx, pending),
         }
     }
 
@@ -852,6 +856,7 @@ impl UnifySubproblem {
             }
             UnifySubproblem::C(c) => c.gc_roots(),
             UnifySubproblem::CuiWithId(c) => c.gc_roots(),
+            UnifySubproblem::Acu(c) => c.gc_roots(),
         }
     }
 }

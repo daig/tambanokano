@@ -162,21 +162,26 @@ fn flatten_assoc(
     i: &Interner,
     vars: &mut VarIndex,
 ) -> Result<Vec<Term>, String> {
-    let mut rev = Vec::new();
+    // Collect the element subtrees walking the left-recursive list (right child, then descend
+    // left), then reverse to left-to-right BEFORE building — so variables are indexed into `vars`
+    // in source (left-to-right) order, matching Maude's post-normalize `indexVariables`. (Building
+    // during the right-to-left walk would index them reversed: invisible to reduce/match but wrong
+    // for the observable `unify` slot/print order.)
+    let mut subtrees: Vec<&PTree> = Vec::new();
     let mut cur = node;
     loop {
         // An assoc-list production is binary: `<list> ::= <left> , <right>`.
-        rev.push(build_term(&cur.nt_children[1], g, m, tokens, i, vars)?);
+        subtrees.push(&cur.nt_children[1]);
         let left = &cur.nt_children[0];
         if is_assoc_list(g, left) {
             cur = left;
         } else {
-            rev.push(build_term(left, g, m, tokens, i, vars)?);
+            subtrees.push(left);
             break;
         }
     }
-    rev.reverse();
-    Ok(rev)
+    subtrees.reverse();
+    subtrees.iter().map(|st| build_term(st, g, m, tokens, i, vars)).collect()
 }
 
 fn is_assoc_list(g: &CompiledGrammar, t: &PTree) -> bool {

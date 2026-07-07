@@ -359,7 +359,23 @@ fn generalized_sort(
             let (symbol, count, arg) = (*symbol, count.clone(), *arg);
             s_generalized_sort(e, sig, sb, real_to_bdd, symbol, &count, arg)
         }
-        // Free / CUI (and one-sided-id Free) applications: compose the children's sorts.
+        // ACU / AU applications are N-ary but the sort function is binary: left-fold
+        // `operator_compose` over the flattened element sequence (children() expands ACU
+        // multiplicities). The AC sort function is symmetric, so the fold direction is immaterial.
+        NodeTerm::Acu { .. } | NodeTerm::Au { .. } => {
+            let symbol = e.node(id).symbol();
+            let children: Vec<DagId> = e.node(id).children().collect();
+            let mut acc = generalized_sort(e, sig, sb, real_to_bdd, children[0]);
+            for &c in &children[1..] {
+                let cs = generalized_sort(e, sig, sb, real_to_bdd, c);
+                let mut inputs = acc;
+                inputs.extend(cs);
+                acc = sb.operator_compose(sig, symbol, &inputs);
+            }
+            acc
+        }
+        // Free / CUI (and one-sided-id Free) applications: arity matches the sort function; compose
+        // all children's sorts at once.
         _ => {
             let symbol = e.node(id).symbol();
             let children: Vec<DagId> = e.node(id).children().collect();
