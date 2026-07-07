@@ -34,6 +34,8 @@ pub(crate) mod au;
 pub(crate) mod builtin;
 pub(crate) mod cui;
 pub(crate) mod diophantine;
+// S1c: Contejean–Devie minimal-solution (Hilbert-basis) enumerator for ACU unification.
+pub(crate) mod int_system;
 // B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
 // named outside `num`.
 pub(crate) mod num;
