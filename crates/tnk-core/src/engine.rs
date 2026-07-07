@@ -1809,6 +1809,97 @@ impl Runtime {
         }
     }
 
+    /// Eagerly put `dag` into **theory normal form** for the symbolic engine (unification/variants):
+    /// flatten nested same-symbol ACU/AU nodes and merge equal ACU elements **unconditionally**,
+    /// unlike [`make_acu`](Self::make_acu)'s lazy, rewrite-count-preserving splice (which only
+    /// flattens/merges already-*reduced* nodes). Maude's `Term::normalize(true)` does this before
+    /// unification; without it a parse-nested `X + X + Y` (from a `prec`/`gather` binary parse) would
+    /// reach the ACU solver as `{(X+X): 1, Y: 1}` instead of `{X: 2, Y: 1}`. Bottom-up; leaves and
+    /// free/S/CUI nodes are rebuilt from normalized children.
+    pub(crate) fn normalize_for_unify(&mut self, sig: &Signature, dag: DagId) -> DagId {
+        match self.dags.get(dag).term.clone() {
+            NodeTerm::Var { .. } | NodeTerm::Na { .. } => dag,
+            NodeTerm::Free { symbol, args } => {
+                let nargs: Vec<DagId> =
+                    args.iter().map(|&a| self.normalize_for_unify(sig, a)).collect();
+                if nargs == args { dag } else { self.make_free(sig, symbol, nargs) }
+            }
+            NodeTerm::Cui { symbol, args } => {
+                let x = self.normalize_for_unify(sig, args[0]);
+                let y = self.normalize_for_unify(sig, args[1]);
+                self.make_cui(sig, symbol, x, y)
+            }
+            NodeTerm::S { symbol, count, arg } => {
+                let na = self.normalize_for_unify(sig, arg);
+                self.make_s(sig, symbol, count, na)
+            }
+            NodeTerm::Acu { symbol, args } => {
+                let mut flat: Vec<(DagId, u32)> = Vec::new();
+                for (e, m) in args {
+                    let ne = self.normalize_for_unify(sig, e);
+                    match &self.dags.get(ne).term {
+                        NodeTerm::Acu { symbol: inner, args: inner_args } if *inner == symbol => {
+                            for &(ie, im) in inner_args {
+                                flat.push((ie, im * m));
+                            }
+                        }
+                        _ => flat.push((ne, m)),
+                    }
+                }
+                self.build_acu_eager(sig, symbol, flat)
+            }
+            NodeTerm::Au { symbol, args } => {
+                let mut flat: Vec<DagId> = Vec::new();
+                for a in args {
+                    let na = self.normalize_for_unify(sig, a);
+                    match &self.dags.get(na).term {
+                        NodeTerm::Au { symbol: inner, args: inner_args } if *inner == symbol => {
+                            flat.extend(inner_args.iter().copied());
+                        }
+                        _ => flat.push(na),
+                    }
+                }
+                self.make_au(sig, symbol, flat) // flat already spliced; make_au drops identities/collapses
+            }
+        }
+    }
+
+    /// The eager ACU canonicalizer used by [`normalize_for_unify`]: sort + **unconditionally** merge
+    /// equal elements (summing multiplicities) + collapse, over an already-flattened element list.
+    fn build_acu_eager(&mut self, sig: &Signature, symbol: SymbolId, flat: Vec<(DagId, u32)>) -> DagId {
+        let identity = sig.symbol(symbol).identity();
+        let mut flat: Vec<(DagId, u32)> = flat
+            .into_iter()
+            .filter(|&(arg, m)| m != 0 && !identity.is_some_and(|id| self.is_constant(arg, id)))
+            .collect();
+        flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
+        let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
+        for (e, m) in flat {
+            match args.last_mut() {
+                Some(last) if last.0 == e || self.dag_compare(last.0, e) == Ordering::Equal => {
+                    last.1 += m
+                }
+                _ => args.push((e, m)),
+            }
+        }
+        let total: u64 = args.iter().map(|&(_, m)| u64::from(m)).sum();
+        match total {
+            0 => {
+                let id_sym = identity.expect("an empty ACU multiset requires an identity element");
+                self.make_const(sig, id_sym)
+            }
+            1 => args[0].0,
+            _ => {
+                let elem_sorts: Vec<SortId> = args
+                    .iter()
+                    .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
+                    .collect();
+                let sort = sig.compute_sort_fold(symbol, &elem_sorts);
+                self.alloc_node(sort, NodeTerm::Acu { symbol, args })
+            }
+        }
+    }
+
     /// Build a canonical **AU** node for `symbol` from `raw_args` (an ordered argument list). Mirrors
     /// [`make_acu`](Self::make_acu) for the associative-only theory: flatten arguments that are
     /// themselves `symbol`-rooted AU nodes (preserving order), drop identity elements, then collapse —
@@ -3494,6 +3585,12 @@ impl Engine {
     pub fn make_var(&mut self, sort: SortId, name: u32, index: u32) -> DagId {
         let sym = self.variable_symbol(sort);
         self.rt.make_var(&self.sig, sym, name, index)
+    }
+
+    /// Eagerly theory-normalize `dag` (flatten/merge ACU/AU) for the symbolic engine — the
+    /// `Term::normalize(true)` the `unify` command applies to each unificand before solving.
+    pub fn normalize_for_unify(&mut self, dag: DagId) -> DagId {
+        self.rt.normalize_for_unify(&self.sig, dag)
     }
 
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {

@@ -1163,8 +1163,10 @@ pub fn unify_command(
     for (l, r) in &pairs {
         let ld = lm.built.engine.instantiate_bindings(l, &bindings);
         let ld = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, ld);
+        let ld = lm.built.engine.normalize_for_unify(ld);
         let rd = lm.built.engine.instantiate_bindings(r, &bindings);
         let rd = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, rd);
+        let rd = lm.built.engine.normalize_for_unify(rd);
         equations.push((ld, rd));
     }
 
