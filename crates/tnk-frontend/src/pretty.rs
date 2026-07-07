@@ -208,6 +208,14 @@ impl<'a> Printer<'a> {
                 NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
                 NodeRepr::Qid(q) => Some(Leaf::Atom(render_qid(q))),
                 NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
+                // A genuine variable leaf (symbolic-engine DAGs): `base:Sort`, the form Maude
+                // prints for a `VariableDagNode` (only fresh `#n`/`%n`/`@n` variables survive into
+                // printed unifiers, and those always print with their sort).
+                NodeRepr::Var { name } => Some(Leaf::Atom(format!(
+                    "{}:{}",
+                    self.i.resolve(crate::lex::Sym::from_raw(name)),
+                    self.m.engine.sorts().name(self.m.engine.sort_of(d))
+                ))),
             }
         };
         match leaf {

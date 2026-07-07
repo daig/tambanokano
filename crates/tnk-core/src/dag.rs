@@ -81,6 +81,17 @@ pub(crate) enum NodeTerm {
     /// the `value` is scalar payload, not a child, so equality/order need theory-specific arms. Has no
     /// children; matches only itself (Maude's `NA_DagNode`). Built only by `make_na`.
     Na { symbol: SymbolId, value: NaValue },
+    /// A **variable** leaf (Maude's `VariableDagNode`) — the symbolic engine's genuine logic
+    /// variable; appears only in unification/variant/narrowing DAGs, never during ordinary
+    /// reduction. `symbol` is the per-sort variable symbol ([`Engine::variable_symbol`]
+    /// (crate::engine::Engine::variable_symbol), Maude's `Module::instantiateVariable`); the node's
+    /// cached `sort` equals that symbol's range sort. `name` is the interned **base-name token
+    /// code** (Maude's `NamedEntity::id()`): identity and canonical order among same-sort variables
+    /// (`variableDagNode.cc compareArguments` is `id() - id()`), resolved back to text by the
+    /// frontend for printing. `index` is the variable's slot in the owning problem's substitution
+    /// (`VariableDagNode::index`) — bookkeeping, deliberately **not** part of equality or order.
+    /// Built only by `make_var`.
+    Var { symbol: SymbolId, name: u32, index: u32 },
 }
 
 /// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
@@ -133,6 +144,9 @@ pub enum NodeRepr<'a> {
     Qid(&'a str),
     /// A float constant's value.
     Float(f64),
+    /// A variable ([`NodeTerm::Var`]): `name` is the interned base-name token code the frontend
+    /// resolves to text; the sort for the printed `name:Sort` form is the node's [`sort`](DagNode::sort).
+    Var { name: u32 },
 }
 
 impl DagNode {
@@ -161,8 +175,8 @@ impl DagNode {
             }
             // The S successor has exactly one child (`arg`); `count` is scalar, not a child.
             NodeTerm::S { arg, .. } => f(*arg),
-            // An atomic NA constant is a leaf — no children.
-            NodeTerm::Na { .. } => {}
+            // An atomic NA constant or a variable is a leaf — no children.
+            NodeTerm::Na { .. } | NodeTerm::Var { .. } => {}
         }
     }
 
@@ -180,8 +194,8 @@ impl DagNode {
             NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
             // The S successor's single child reuses the slice iterator via `from_ref` — no new arm.
             NodeTerm::S { arg, .. } => ChildIter::Free(std::slice::from_ref(arg).iter()),
-            // An atomic NA constant is a leaf — an empty child iterator.
-            NodeTerm::Na { .. } => ChildIter::Free(NO_CHILDREN.iter()),
+            // An atomic NA constant or a variable is a leaf — an empty child iterator.
+            NodeTerm::Na { .. } | NodeTerm::Var { .. } => ChildIter::Free(NO_CHILDREN.iter()),
         }
     }
 
@@ -192,7 +206,8 @@ impl DagNode {
             | NodeTerm::Au { symbol, .. }
             | NodeTerm::Cui { symbol, .. }
             | NodeTerm::S { symbol, .. }
-            | NodeTerm::Na { symbol, .. } => *symbol,
+            | NodeTerm::Na { symbol, .. }
+            | NodeTerm::Var { symbol, .. } => *symbol,
         }
     }
 
@@ -216,6 +231,7 @@ impl DagNode {
                 NaValue::Qid(q) => NodeRepr::Qid(q),
                 NaValue::Float(bits) => NodeRepr::Float(f64::from_bits(*bits)),
             },
+            NodeTerm::Var { name, .. } => NodeRepr::Var { name: *name },
         }
     }
 }

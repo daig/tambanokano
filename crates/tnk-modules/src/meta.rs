@@ -1780,6 +1780,12 @@ fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
             let sort = source.engine.sorts().name(source.engine.sort_of(t)).to_string();
             ctx.make_na(qid, NaValue::Qid(format!("?.{sort}").into()))
         }
+        // A genuine variable leaf exists only in symbolic-engine DAGs; the metaUnify result path
+        // (S1f) up-translates its substitutions itself (`upVariable`, name resolved through the
+        // session interner) — no other meta surface can receive one.
+        NodeRepr::Var { .. } => {
+            unreachable!("Var leaf reached up_term outside the metaUnify result path")
+        }
     }
 }
 
@@ -1828,6 +1834,11 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
         NodeRepr::Str(s) => NodeShape::Leaf(format!("{:?}.{sort}", String::from_utf8_lossy(s))),
         NodeRepr::Qid(q) => NodeShape::Leaf(format!("'{q}.{sort}")),
         NodeRepr::Float(f) => NodeShape::Leaf(format!("{f}.{sort}")),
+        // upTerm's argument is an eagerly-reduced object DAG of the current module — genuine
+        // variable leaves exist only inside symbolic-engine problems (see `up_term`'s Var arm).
+        NodeRepr::Var { .. } => {
+            unreachable!("Var leaf reached up_term_ctx outside the metaUnify result path")
+        }
     };
     match shape {
         NodeShape::Leaf(text) => ctx.make_na(qid, NaValue::Qid(text.into())),

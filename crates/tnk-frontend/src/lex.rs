@@ -55,6 +55,13 @@ impl Sym {
     pub fn index(self) -> u32 {
         self.0
     }
+
+    /// Rebuild a [`Sym`] from a raw intern index previously obtained via [`index`](Self::index) —
+    /// the inverse used when a name code comes back out of a kernel `Var` leaf for printing. The
+    /// caller must pass an index minted by the same [`Interner`].
+    pub fn from_raw(raw: u32) -> Sym {
+        Sym(raw)
+    }
 }
 
 /// The lexical class of a [`Token`], computed at scan time from its text.

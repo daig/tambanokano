@@ -110,6 +110,15 @@ pub enum SymbolClass {
     /// name-token index (Maude's `Token` code): same-sort variables order by `id() - id()` on name
     /// codes (variableDagNode.cc `compareArguments`), which `dag_compare` mirrors.
     Variable { rank: u32 },
+    /// The per-sort variable symbol backing genuine unification variables
+    /// ([`Var`](crate::dag::NodeRepr::Var) leaves) — Maude's `VariableSymbol` as created by
+    /// `Module::instantiateVariable(sort)`. Created lazily in demand order (command parse →
+    /// mid-solve fresh kinds → unifier extraction), so its `SymbolId` creation index mirrors
+    /// Maude's symbol-index compare between distinct variable symbols. Distinct from
+    /// [`Variable`](Self::Variable): that realizes a command-*subject* variable as a pseudo
+    /// nullary constant; this one heads no `Free` node — it gives `Var` leaves a total `symbol()`
+    /// and a range sort. Never stable, never ground.
+    SortVariable,
     /// A builtin marker-class symbol whose id-hook attaches no [`SpecialOp`] (`s_`'s `SuccSymbol`,
     /// `<Floats>`/`<Strings>`/`<Qids>`, `true`/`false`, the object constructor): non-`STANDARD` in
     /// Maude's `SymbolType`, hence never equationally stable (verified: NAT's builtin `s X .=. s Y`

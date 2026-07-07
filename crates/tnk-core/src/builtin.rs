@@ -341,9 +341,13 @@ impl Runtime {
 
     /// Whether `id` contains no variable anywhere (Maude's `determineGround`, uncached — `.=.`
     /// subjects are small). tnk realizes command-subject variables as [`SymbolClass::Variable`]
-    /// constants, so groundness is a class walk.
+    /// constants, so groundness is a class walk; a genuine `Var` leaf (symbolic-engine DAGs) is
+    /// likewise caught via its `SortVariable`-classed symbol.
     fn dag_is_ground(&self, sig: &Signature, id: DagId) -> bool {
-        if matches!(sig.symbol(self.node(id).symbol()).class, SymbolClass::Variable { .. }) {
+        if matches!(
+            sig.symbol(self.node(id).symbol()).class,
+            SymbolClass::Variable { .. } | SymbolClass::SortVariable
+        ) {
             return false;
         }
         self.node(id).children().all(|c| self.dag_is_ground(sig, c))

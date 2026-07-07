@@ -237,11 +237,13 @@ impl Runtime {
                 // The recursive free matcher never matches a theory subject: those are matched by
                 // their own automata, and a free Op pattern's symbol differs from any theory symbol.
                 // (A *variable* pattern still binds such a subject — that is the `Term::Var` arm.)
+                // A `Var` leaf only occurs in symbolic-engine DAGs, which are never match subjects.
                 NodeTerm::Acu { .. }
                 | NodeTerm::Au { .. }
                 | NodeTerm::Cui { .. }
                 | NodeTerm::S { .. }
-                | NodeTerm::Na { .. } => false,
+                | NodeTerm::Na { .. }
+                | NodeTerm::Var { .. } => false,
             },
         }
     }
@@ -296,7 +298,8 @@ impl Runtime {
                 | NodeTerm::Au { .. }
                 | NodeTerm::Cui { .. }
                 | NodeTerm::S { .. }
-                | NodeTerm::Na { .. } => false,
+                | NodeTerm::Na { .. }
+                | NodeTerm::Var { .. } => false,
             },
         }
     }
@@ -342,6 +345,16 @@ impl Runtime {
             // values are (same shape — equal symbols ⇒ both the Na arm). A leaf — `continue` on equal
             // (process the rest of the pair-stack), fail on unequal.
             if let (NodeTerm::Na { value: vx, .. }, NodeTerm::Na { value: vy, .. }) =
+                (&nx.term, &ny.term)
+            {
+                if vx != vy {
+                    return false;
+                }
+                continue;
+            }
+            // A variable's identity is its name-token code (Maude `VariableDagNode::equal`:
+            // symbol + id); the substitution `index` is bookkeeping. A leaf, like Na.
+            if let (NodeTerm::Var { name: vx, .. }, NodeTerm::Var { name: vy, .. }) =
                 (&nx.term, &ny.term)
             {
                 if vx != vy {

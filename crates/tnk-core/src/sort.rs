@@ -26,6 +26,14 @@ pub struct Kind {
     pub members: Vec<SortId>,
     /// The synthesized error/top sort: a supersort of every member.
     pub error: SortId,
+    /// The component's sorts in **Maude's per-component index order** (`sorts[i]` of
+    /// `ConnectedComponent`): `index_order[0]` is the error sort, then the maximal sorts in the
+    /// registration DFS's append order, then the rest by Kahn's algorithm over declaration-ordered
+    /// subsort lists (`Sort::registerConnectedSorts` / `Sort::processSubsorts`). A linear extension
+    /// with supersorts first: `s <= t` implies `index(s) >= index(t)`. This order is **load-bearing
+    /// for unification**: the BDD sort encoding uses these indices, so the AllSat walk — and hence
+    /// the observable unifier enumeration order — depends on it.
+    pub index_order: Vec<SortId>,
 }
 
 /// The sort signature: declare sorts and subsort edges, then [`Sorts::close`] computes kinds and
@@ -34,14 +42,20 @@ pub struct Kind {
 pub struct Sorts {
     sorts: Vec<Sort>,
     kinds: Vec<Kind>,
-    /// Declared immediate supersorts: `up[sub]` lists each `sup` with `sub < sup`.
+    /// Declared immediate supersorts: `up[sub]` lists each `sup` with `sub < sup`, in declaration
+    /// order (Maude's `Sort::supersorts`).
     up: Vec<Vec<SortId>>,
+    /// Declared immediate subsorts: `down[sup]` lists each `sub` with `sub < sup`, in declaration
+    /// order (Maude's `Sort::subsorts`). Drives the per-component index order (see [`Kind`]).
+    down: Vec<Vec<SortId>>,
     /// Computed: `geq[s]` = every `x` with `s <= x` (includes `s` and `s`'s kind error sort).
     geq: Vec<BTreeSet<SortId>>,
     /// Computed: `leqs[r]` = every `y` with `y <= r` — the **down-set** of `r` (Maude's
     /// `Sort::getLeqSorts`). The inverse of `geq`; the key B2's least-sort resolution intersects.
     leqs: Vec<BTreeSet<SortId>>,
     kind_of: Vec<KindId>,
+    /// Computed: each sort's index within its kind's [`Kind::index_order`] (error sorts get 0).
+    component_index: Vec<u32>,
     closed: bool,
 }
 
@@ -55,6 +69,7 @@ impl Sorts {
         let id = Id::from_raw(self.sorts.len() as u32);
         self.sorts.push(Sort { name: name.into(), is_error: false });
         self.up.push(Vec::new());
+        self.down.push(Vec::new());
         id
     }
 
@@ -62,6 +77,7 @@ impl Sorts {
     pub fn add_subsort(&mut self, sub: SortId, sup: SortId) {
         assert!(!self.closed, "cannot add subsorts after close()");
         self.up[sub.index()].push(sup);
+        self.down[sup.index()].push(sub);
     }
 
     pub fn sort(&self, s: SortId) -> &Sort {
@@ -122,6 +138,79 @@ impl Sorts {
         self.kind_of(a) == self.kind_of(b)
     }
 
+    /// A sort's index within its kind's [`Kind::index_order`] (Maude's `Sort::index()`).
+    /// Error sorts are index 0. Requires [`close`](Self::close).
+    pub fn component_index(&self, s: SortId) -> u32 {
+        debug_assert!(self.closed, "component_index before close()");
+        self.component_index[s.index()]
+    }
+
+    /// Maude's per-component sort index order (`ConnectedComponent::ConnectedComponent`):
+    /// the error sort takes index 0; then a DFS from the component's first-declared sort
+    /// (`registerConnectedSorts`: explore declared subsorts first, then supersorts, appending each
+    /// **maximal** sort when visited); then Kahn's algorithm over the growing appended sequence
+    /// (`processSubsorts`: walking `index_order[i]`'s declared subsorts in declaration order,
+    /// a sort is appended when its last unresolved supersort is processed). The result is a linear
+    /// extension with supersorts first. The error sort's synthesized edges to the maximal sorts are
+    /// never walked (Maude's loop starts at index 1 and the error edges are inserted after the DFS).
+    fn kind_index_order(
+        up: &[Vec<SortId>],
+        down: &[Vec<SortId>],
+        members: &[SortId],
+        error: SortId,
+    ) -> Vec<SortId> {
+        let mut order: Vec<SortId> = vec![error];
+        let mut registered: BTreeSet<SortId> = BTreeSet::new();
+        let mut unresolved: BTreeMap<SortId, usize> = BTreeMap::new();
+
+        fn register(
+            s: SortId,
+            up: &[Vec<SortId>],
+            down: &[Vec<SortId>],
+            order: &mut Vec<SortId>,
+            registered: &mut BTreeSet<SortId>,
+            unresolved: &mut BTreeMap<SortId, usize>,
+        ) {
+            if !registered.insert(s) {
+                return;
+            }
+            for &sub in &down[s.index()] {
+                register(sub, up, down, order, registered, unresolved);
+            }
+            let sups = &up[s.index()];
+            if sups.is_empty() {
+                order.push(s);
+            } else {
+                unresolved.insert(s, sups.len());
+                for &sup in sups {
+                    register(sup, up, down, order, registered, unresolved);
+                }
+            }
+        }
+        register(members[0], up, down, &mut order, &mut registered, &mut unresolved);
+
+        let mut i = 1;
+        while i < order.len() {
+            let s = order[i];
+            for &sub in &down[s.index()] {
+                let n = unresolved
+                    .get_mut(&sub)
+                    .expect("registered non-maximal sort has an unresolved count");
+                *n -= 1;
+                if *n == 0 {
+                    order.push(sub);
+                }
+            }
+            i += 1;
+        }
+        assert_eq!(
+            order.len(),
+            members.len() + 1,
+            "component could not be linearly ordered (subsort cycle)"
+        );
+        order
+    }
+
     /// Compute kinds (connected components + error sorts) and the subsort closure.
     pub fn close(&mut self) {
         assert!(!self.closed, "already closed");
@@ -172,10 +261,12 @@ impl Sorts {
             let err: SortId = Id::from_raw(self.sorts.len() as u32);
             self.sorts.push(Sort { name: format!("[{repr}]"), is_error: true });
             self.up.push(Vec::new());
+            self.down.push(Vec::new());
             for &m in &members {
                 kind_of[m.index()] = kid;
             }
-            self.kinds.push(Kind { members, error: err });
+            let index_order = Self::kind_index_order(&self.up, &self.down, &members, err);
+            self.kinds.push(Kind { members, error: err, index_order });
         }
 
         // 4. Subsort closure: BFS upward for each user sort, then add its kind's error sort.
@@ -225,9 +316,18 @@ impl Sorts {
             }
         }
 
+        // 7. Per-kind component indices (inverse of each kind's `index_order`).
+        let mut component_index: Vec<u32> = vec![0; n];
+        for k in &self.kinds {
+            for (i, &s) in k.index_order.iter().enumerate() {
+                component_index[s.index()] = i as u32;
+            }
+        }
+
         self.geq = geq;
         self.leqs = leqs;
         self.kind_of = kind_of_full;
+        self.component_index = component_index;
         self.closed = true;
     }
 }
@@ -294,6 +394,84 @@ mod tests {
         assert!(s.leq(a, top), "a <= mid <= top should imply a <= top");
         assert!(s.leq(a, mid));
         assert!(!s.leq(top, a));
+    }
+
+    /// Maude's per-component index order: error sort 0, then maximal sorts in DFS append order,
+    /// then Kahn's algorithm over declaration-ordered subsort lists (supersorts first).
+    #[test]
+    fn component_index_order_diamond() {
+        // Diamond declared bottom-up: A < B, A < C, B < D, C < D.
+        let mut s = Sorts::new();
+        let a = s.add_sort("A");
+        let b = s.add_sort("B");
+        let c = s.add_sort("C");
+        let d = s.add_sort("D");
+        s.add_subsort(a, b);
+        s.add_subsort(a, c);
+        s.add_subsort(b, d);
+        s.add_subsort(c, d);
+        s.close();
+
+        let k = s.kind(s.kind_of(a));
+        let err = k.error;
+        // DFS from A (first declared): A defers (has supersorts), B defers, D is maximal →
+        // appended; Kahn from D releases B then C (declaration order of D's subsort list),
+        // then A when C (its last unresolved supersort) is processed.
+        assert_eq!(k.index_order, vec![err, d, b, c, a]);
+        assert_eq!(s.component_index(err), 0);
+        assert_eq!(s.component_index(d), 1);
+        assert_eq!(s.component_index(b), 2);
+        assert_eq!(s.component_index(c), 3);
+        assert_eq!(s.component_index(a), 4);
+
+        // The order is a linear extension with supersorts first: s <= t ⇒ index(s) >= index(t).
+        for &x in &k.index_order {
+            for &y in &k.index_order {
+                if s.leq(x, y) {
+                    assert!(
+                        s.component_index(x) >= s.component_index(y),
+                        "linear extension violated: {} <= {}",
+                        s.name(x),
+                        s.name(y)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Maximal sorts are appended in the DFS's visit order, which follows the *declaration order*
+    /// of subsort edges — reversing the declarations reverses the maximal sorts' indices.
+    #[test]
+    fn component_index_order_follows_declaration_order() {
+        let build = |flip: bool| {
+            let mut s = Sorts::new();
+            let bot = s.add_sort("Bot");
+            let ta = s.add_sort("TopA");
+            let tb = s.add_sort("TopB");
+            if flip {
+                s.add_subsort(bot, tb);
+                s.add_subsort(bot, ta);
+            } else {
+                s.add_subsort(bot, ta);
+                s.add_subsort(bot, tb);
+            }
+            s.close();
+            let k = s.kind(s.kind_of(bot));
+            k.index_order.iter().map(|&x| s.name(x).to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(build(false), vec!["[TopA,TopB]", "TopA", "TopB", "Bot"]);
+        assert_eq!(build(true), vec!["[TopA,TopB]", "TopB", "TopA", "Bot"]);
+    }
+
+    /// A singleton component: just the error sort above the lone member.
+    #[test]
+    fn component_index_order_singleton() {
+        let mut s = Sorts::new();
+        let solo = s.add_sort("Solo");
+        s.close();
+        let k = s.kind(s.kind_of(solo));
+        assert_eq!(k.index_order, vec![k.error, solo]);
+        assert_eq!(s.component_index(solo), 1);
     }
 
     #[test]

@@ -229,6 +229,10 @@ pub(crate) struct Signature {
     /// least sort is text-dependent (`'X:S` → `Variable`, `'c.S` → `Constant`, `'[K]` → `Kind`, plain `'S`
     /// → `Sort`); empty elsewhere, where every `Qid` is just a `Qid`.
     qid_class: QidClass,
+    /// Per-sort variable symbols for genuine `Var` leaves (Maude's `Module::instantiateVariable`
+    /// cache), created lazily by [`Engine::variable_symbol`] in demand order — the creation order is
+    /// observable through `dag_compare`'s SymbolId ordering, exactly like Maude's symbol indices.
+    var_symbols: HashMap<SortId, SymbolId>,
 }
 
 /// The classification sorts for quoted-identifier constants (Maude's `QuotedIdentifierSymbol` codes
@@ -457,6 +461,7 @@ impl Default for Signature {
             next_mb_id: 0,
             next_rule_id: 0,
             qid_class: QidClass::default(),
+            var_symbols: HashMap::default(),
         }
     }
 }
@@ -1641,7 +1646,9 @@ impl Runtime {
             NodeTerm::S { symbol, count, arg } => {
                 sig.compute_s_sort(*symbol, self.dags.get(*arg).sort, count)
             }
-            NodeTerm::Na { .. } => self.node(id).sort,
+            // A constant leaf's sort never changes; a variable's sort is authoritative as built
+            // (declared sort, or the kind for a mid-solve fresh variable).
+            NodeTerm::Na { .. } | NodeTerm::Var { .. } => self.node(id).sort,
         }
     }
 
@@ -1898,6 +1905,20 @@ impl Runtime {
         self.alloc_node(sort, NodeTerm::Na { symbol, value })
     }
 
+    /// Build a **variable** leaf (Maude's `VariableDagNode`): `symbol` is the per-sort variable
+    /// symbol ([`Engine::variable_symbol`]), whose range is the node's sort; `name` is the interned
+    /// base-name token code; `index` the owning problem's substitution slot.
+    pub(crate) fn make_var(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        name: u32,
+        index: u32,
+    ) -> DagId {
+        let sort = sig.symbol(symbol).decls[0].range;
+        self.alloc_node(sort, NodeTerm::Var { symbol, name, index })
+    }
+
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
     /// operator's theory: a free node directly, or a canonical ACU/AU/CUI/S node. Used by `reduce` when a
     /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
@@ -1945,7 +1966,7 @@ impl Runtime {
             NodeTerm::Free { args, .. } => args.len(),
             NodeTerm::Acu { .. } | NodeTerm::Au { .. } | NodeTerm::Cui { .. } => 2,
             NodeTerm::S { .. } => 1,
-            NodeTerm::Na { .. } => 0,
+            NodeTerm::Na { .. } | NodeTerm::Var { .. } => 0,
         }
     }
 
@@ -2046,6 +2067,11 @@ impl Runtime {
                 crate::dag::rope_cmp(xs, ys)
             }
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
+            // Two variables of the same (per-sort) variable symbol order by name-token code —
+            // `variableDagNode.cc compareArguments` is `id() - id()`. Cross-sort variables never
+            // reach here (distinct symbols; the SymbolId order above mirrors Maude's creation-order
+            // symbol compare). The substitution `index` is bookkeeping, not identity.
+            (NodeTerm::Var { name: xn, .. }, NodeTerm::Var { name: yn, .. }) => xn.cmp(yn),
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
     }
@@ -2919,6 +2945,7 @@ impl Runtime {
                     NodeRepr::Str(s) => s.hash(&mut h),
                     NodeRepr::Qid(q) => q.hash(&mut h),
                     NodeRepr::Float(f) => f.to_bits().hash(&mut h),
+                    NodeRepr::Var { name } => name.hash(&mut h),
                 }
                 for c in node.children() {
                     memo[&c].hash(&mut h);
@@ -3422,6 +3449,31 @@ impl Engine {
             self.rt.var_ranks.insert(sym, rank);
         }
         self.sig.symbols.get_mut(sym).class = class;
+    }
+
+    /// The per-sort variable symbol backing genuine `Var` leaves — Maude's
+    /// `Module::instantiateVariable(sort)`. Created **lazily, in demand order** (command parse →
+    /// mid-solve fresh kinds → unifier extraction) and cached for the module's lifetime: the
+    /// creation order is observable through `dag_compare`'s SymbolId ordering between distinct
+    /// variable symbols, exactly like Maude's symbol indices. Named after its sort (like Maude);
+    /// never entered in any frontend name table, so it cannot collide with user operators.
+    pub fn variable_symbol(&mut self, sort: SortId) -> SymbolId {
+        if let Some(&sym) = self.sig.var_symbols.get(&sort) {
+            return sym;
+        }
+        let name = self.sig.sorts().name(sort).to_string();
+        let sym = self.sig.add_op(name, vec![], sort);
+        self.sig.symbols.get_mut(sym).class = SymbolClass::SortVariable;
+        self.sig.var_symbols.insert(sort, sym);
+        sym
+    }
+
+    /// Build a **variable** leaf (Maude's `VariableDagNode`) of the given sort: `name` is the
+    /// interned base-name token code (frontend-resolved for printing), `index` the owning
+    /// unification problem's substitution slot. Creates the per-sort variable symbol on first use.
+    pub fn make_var(&mut self, sort: SortId, name: u32, index: u32) -> DagId {
+        let sym = self.variable_symbol(sort);
+        self.rt.make_var(&self.sig, sym, name, index)
     }
 
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
@@ -4398,6 +4450,42 @@ mod tests {
             out.sort();
             out
         }
+    }
+
+    /// Genuine variable leaves (`make_var` / `variable_symbol`): per-sort symbol caching in demand
+    /// order, name-code identity (`deep_equal` ignores the slot index), and the canonical order —
+    /// same-sort variables by name code, cross-sort by variable-symbol creation order, and a
+    /// variable (arity 0) before any application inside an ACU multiset.
+    #[test]
+    fn var_leaves_identity_and_order() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        let nznat = e.add_sort("NzNat");
+        e.add_subsort(nznat, nat);
+        e.close_sorts();
+        let plus = e.add_op_ac("+", vec![nat, nat], nat, None);
+
+        // Per-sort variable symbols cache and record creation order.
+        let vs_nat = e.variable_symbol(nat);
+        let vs_nz = e.variable_symbol(nznat);
+        assert_eq!(e.variable_symbol(nat), vs_nat, "same sort → cached symbol");
+        assert_ne!(vs_nat, vs_nz);
+
+        // Identity: name code, not slot index (Maude VariableDagNode::equal is symbol + id).
+        let x0 = e.make_var(nat, 7, 0);
+        let x1 = e.make_var(nat, 7, 1);
+        let y = e.make_var(nat, 8, 2);
+        assert!(e.deep_equal(x0, x1), "same name+sort, different slot: equal");
+        assert!(!e.deep_equal(x0, y), "different name codes differ");
+        assert_eq!(e.sort_of(x0), nat, "a variable's sort is its symbol's range");
+
+        // Order inside an ACU soup: same-sort variables by name code; a variable (arity 0)
+        // precedes an application (arity 2) regardless of creation order.
+        let z = e.make_var(nznat, 9, 3); // NzNat's variable symbol created after Nat's
+        let app = e.make_ac(plus, vec![x0, y]);
+        let soup = e.make_ac(plus, vec![app, z, y, x0]);
+        let order: Vec<DagId> = e.node(soup).children().collect();
+        assert_eq!(order, vec![x0, y, z, app], "name-code order, then creation order, then arity");
     }
 
     /// The public [`Engine::match_solutions`] facade drives the ACU matcher seam end-to-end:
