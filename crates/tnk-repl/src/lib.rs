@@ -630,6 +630,12 @@ impl Repl {
                                 incomplete = uc.problem.is_incomplete();
                             }
                             let _ = incomplete; // the incomplete-warning text is phase-E (stripped)
+                            // `irredundant`: keep only the most-general unifiers (Maude's
+                            // UnifierFilter), in enumeration order, then renumber on display.
+                            if irredundant {
+                                unifiers =
+                                    tnk_core::unify::filter::irredundant(&mut lm.built.engine, unifiers);
+                            }
                             if self.show_timing {
                                 out.push_str("Decision time: 0ms cpu (0ms real)\n");
                             }

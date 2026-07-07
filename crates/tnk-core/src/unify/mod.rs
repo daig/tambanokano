@@ -27,6 +27,7 @@
 
 pub(crate) mod acu;
 pub(crate) mod cui;
+pub mod filter;
 pub mod problem;
 
 use crate::dag::{DagId, NodeTerm};

@@ -3600,6 +3600,18 @@ impl Engine {
         self.rt.normalize_for_unify(&self.sig, dag)
     }
 
+    /// A fresh, distinct ground constant of `sort`. The irredundant filter
+    /// ([`crate::unify::filter`]) freezes a candidate unifier's variables into these, so that "is
+    /// unifier `u` an instance of unifier `r`?" reduces to the satisfiability of `r =? freeze(u)` —
+    /// matching expressed as unification with the subject side frozen. The name is uniquified by the
+    /// live symbol count so repeated calls never alias; it enters no frontend name table (cannot
+    /// collide with a user operator) and never reaches any printed output.
+    pub fn fresh_constant(&mut self, sort: SortId) -> DagId {
+        let name = format!("%frozen-{}", self.sig.symbols_iter().count());
+        let sym = self.sig.add_op(name, vec![], sort);
+        self.make_const(sym)
+    }
+
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         self.sig.set_special(sym, op);
     }
