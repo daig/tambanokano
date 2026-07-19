@@ -22,6 +22,7 @@ fn main() -> rustyline::Result<()> {
     }
 
     // Colorize results only when stdout is a terminal (so piped/redirected output stays plain).
+    let stdin_is_terminal = std::io::stdin().is_terminal();
     let mut repl = Repl::new(std::io::stdout().is_terminal());
     if !no_banner {
         println!("tambanokano REPL — enter modules, `reduce`/`match`, `show`/`select`; `quit` to exit.");
@@ -53,7 +54,13 @@ fn main() -> rustyline::Result<()> {
     let mut rl = DefaultEditor::new()?;
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "tnk> " } else { "   > " };
+        let prompt = if !stdin_is_terminal {
+            ""
+        } else if buffer.is_empty() {
+            "tnk> "
+        } else {
+            "   > "
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 buffer.push_str(&line);
