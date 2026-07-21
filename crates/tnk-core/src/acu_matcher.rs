@@ -24,7 +24,7 @@ use crate::dag::DagId;
 use crate::diophantine::{DiophantineSystem, UNBOUNDED};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
-use crate::symbol::SymbolId;
+use crate::symbol::{IdentityId, SymbolId};
 use crate::term::Subst;
 
 /// One top variable of the pattern (all occurrences of an index merged): its substitution index, its
@@ -49,7 +49,11 @@ enum Mode {
     Trivial { done: bool },
     /// The general Diophantine system. `subject_map[col]` is the element index of column `col`;
     /// `ext_row` is the extension row's original index (`= nr_vars`) when matching with a residue.
-    System { sys: DiophantineSystem, subject_map: Vec<usize>, ext_row: Option<usize> },
+    System {
+        sys: DiophantineSystem,
+        subject_map: Vec<usize>,
+        ext_row: Option<usize>,
+    },
     /// Exhausted / statically infeasible.
     Done,
 }
@@ -59,7 +63,7 @@ enum Mode {
 /// (building fresh binding nodes, hence `&mut Runtime`) and returns `true`, or `false` when exhausted.
 pub(crate) struct AcuMatcher {
     symbol: SymbolId,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     ext_allowed: bool,
     has_grounds: bool,
     subject_is_identity: bool,
@@ -83,7 +87,7 @@ impl AcuMatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         symbol: SymbolId,
-        identity: Option<SymbolId>,
+        identity: Option<IdentityId>,
         elements: Vec<DagId>,
         mult: Vec<u32>,
         vars: Vec<MatcherVar>,
@@ -99,8 +103,12 @@ impl AcuMatcher {
             .filter(|&(_, &m)| m > 0)
             .map(|(&e, &m)| (e, m))
             .collect();
-        let columns: Vec<(usize, u32)> =
-            mult.iter().enumerate().filter(|&(_, &m)| m > 0).map(|(i, &m)| (i, m)).collect();
+        let columns: Vec<(usize, u32)> = mult
+            .iter()
+            .enumerate()
+            .filter(|&(_, &m)| m > 0)
+            .map(|(i, &m)| (i, m))
+            .collect();
 
         // The **lone-variable collector** (Maude's LONE_VARIABLE / `forcedLoneVariableCase`): a single
         // count-1 top variable absorbs the *whole* remainder as one matched-whole solution — a
@@ -139,7 +147,11 @@ impl AcuMatcher {
                 sys.insert_column(m as i32);
             }
             let ext_row = ext_allowed.then_some(nr_vars);
-            Mode::System { sys, subject_map, ext_row }
+            Mode::System {
+                sys,
+                subject_map,
+                ext_row,
+            }
         };
 
         AcuMatcher {
@@ -222,7 +234,9 @@ impl AcuMatcher {
 
     /// The empty-multiset trivial system: bind every variable to the identity, once.
     fn finish_trivial(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
-        let id_sym = self.identity.expect("identity-capable vars require an identity element");
+        let id_sym = self
+            .identity
+            .expect("identity-capable vars require an identity element");
         let id_dag = rt.identity_dag(sig, id_sym);
         let mut binds: Vec<(u32, DagId)> = Vec::with_capacity(self.vars.len());
         for v in &self.vars {
@@ -247,7 +261,11 @@ impl AcuMatcher {
     fn next_system(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         loop {
             let (sys, subject_map, ext_row) = match &mut self.mode {
-                Mode::System { sys, subject_map, ext_row } => (sys, &*subject_map, *ext_row),
+                Mode::System {
+                    sys,
+                    subject_map,
+                    ext_row,
+                } => (sys, &*subject_map, *ext_row),
                 _ => unreachable!("next_system on non-System mode"),
             };
             if !sys.solve() {

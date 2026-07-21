@@ -14,7 +14,7 @@ use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt};
-use crate::lex::{split_mixfix, Frag, Interner, TokKind, Token};
+use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
@@ -46,11 +46,18 @@ impl OpRenamer {
         }
         let mut targets: HashMap<String, Vec<(Option<usize>, Vec<String>)>> = HashMap::new();
         for (from, arity, to) in renames {
-            targets.entry(from.clone()).or_default().push((*arity, literal_frags(to, interner)));
+            targets
+                .entry(from.clone())
+                .or_default()
+                .push((*arity, literal_frags(to, interner)));
         }
         let built = build_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
-        Ok(Some(Self { built, grammar, targets }))
+        Ok(Some(Self {
+            built,
+            grammar,
+            targets,
+        }))
     }
 
     /// Rewrite one term bubble in place-ish (returns a fresh token vector). Replaces every renamed
@@ -65,13 +72,15 @@ impl OpRenamer {
             Ok(t) => t,
             Err(_) => return bubble.to_vec(),
         };
-        let mut edits: Vec<(usize, &str)> = Vec::new();
-        self.collect(&tree, &mut edits);
+        let mut edits: Vec<(usize, String)> = Vec::new();
+        self.collect(&tree, bubble, interner, &mut edits);
         if edits.is_empty() {
             return bubble.to_vec();
         }
-        let new_syms: Vec<(usize, _)> =
-            edits.iter().map(|(pos, text)| (*pos, interner.intern(text))).collect();
+        let new_syms: Vec<(usize, _)> = edits
+            .iter()
+            .map(|(pos, text)| (*pos, interner.intern(text)))
+            .collect();
         let mut out = bubble.to_vec();
         for (pos, sym) in new_syms {
             out[pos].sym = sym;
@@ -83,9 +92,31 @@ impl OpRenamer {
     /// operator. At a `MakeTerm(sym)` node whose symbol is renamed, the literal fragments are the
     /// terminal positions of the production's rhs — found by tiling `[start, end)` with the child spans
     /// (Maude's `extractFirstSubparse` order): a terminal consumes one token, a nonterminal jumps to the
-    /// next child's end.
-    fn collect<'a>(&'a self, t: &PTree, edits: &mut Vec<(usize, &'a str)>) {
+    /// next child's end. A compact `MakeIter(sym)` token is rewritten as a unit (`g^N` → `h^N`), preserving
+    /// its arbitrary-size scalar count.
+    fn collect(
+        &self,
+        t: &PTree,
+        bubble: &[Token],
+        interner: &Interner,
+        edits: &mut Vec<(usize, String)>,
+    ) {
         let prod = &self.grammar.prods[t.prod as usize];
+        if let Action::MakeIter(sym) = prod.action {
+            let name = self.built.engine.symbol(sym).name();
+            let target = self.targets.get(name).and_then(|cands| {
+                cands
+                    .iter()
+                    .find(|(a, _)| *a == Some(1))
+                    .or_else(|| cands.iter().find(|(a, _)| a.is_none()))
+                    .and_then(|(_, frags)| frags.as_slice().first())
+            });
+            if let Some(target) = target
+                && let Some((_, count)) = bubble[t.start].text(interner).rsplit_once('^')
+            {
+                edits.push((t.start, format!("{target}^{count}")));
+            }
+        }
         if let Action::MakeTerm(sym) = prod.action {
             let name = self.built.engine.symbol(sym).name();
             // This node's arity = the number of argument nonterminals in the production. An
@@ -105,7 +136,7 @@ impl OpRenamer {
                     match g {
                         GSym::T(_) => {
                             if let Some(text) = target.get(frag) {
-                                edits.push((cursor, text));
+                                edits.push((cursor, (*text).to_string()));
                             }
                             frag += 1;
                             cursor += 1;
@@ -119,7 +150,7 @@ impl OpRenamer {
             }
         }
         for c in &t.nt_children {
-            self.collect(c, edits);
+            self.collect(c, bubble, interner, edits);
         }
     }
 }
@@ -146,7 +177,10 @@ pub enum ReconTarget {
     /// order (`lt(A, B)` ⇒ `["A", "B"]`); `template` is the target term's tokens (`A < B`). At each
     /// occurrence, every template variable whose base-name is a formal is replaced by the (rewritten,
     /// parenthesized) actual argument at that position.
-    Term { formals: Vec<String>, template: Vec<Token> },
+    Term {
+        formals: Vec<String>,
+        template: Vec<Token>,
+    },
 }
 
 pub struct ViewOpSubst {
@@ -171,7 +205,11 @@ impl ViewOpSubst {
         let built = build_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
         let targets = maps.iter().cloned().collect();
-        Ok(Some(Self { built, grammar, targets }))
+        Ok(Some(Self {
+            built,
+            grammar,
+            targets,
+        }))
     }
 
     /// Rewrite one term bubble. A bubble that does not parse as a single term (e.g. a condition fragment
@@ -192,11 +230,38 @@ impl ViewOpSubst {
     /// child's end).
     fn emit(&self, t: &PTree, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
         let prod = &self.grammar.prods[t.prod as usize];
+        if let Action::MakeIter(sym) = prod.action {
+            let name = self.built.engine.symbol(sym).name();
+            let count = bubble[t.start]
+                .text(interner)
+                .rsplit_once('^')
+                .map(|(_, count)| count.to_string());
+            if let (Some(ReconTarget::Op(target)), Some(count)) =
+                (self.targets.get(name).cloned(), count)
+            {
+                let args: Vec<Vec<Token>> = t
+                    .nt_children
+                    .iter()
+                    .map(|c| self.emit(c, bubble, interner))
+                    .collect();
+                let mut emitted =
+                    emit_application(&format!("{target}^{count}"), &args, bubble, interner);
+                // `emit_application` synthesizes ordinary operator tokens; this one remains an ITER_SYMBOL.
+                // Preserve the parsed source token's semantic class while changing only its rooted symbol.
+                if let Some(head) = emitted.first_mut() {
+                    head.kind = bubble[t.start].kind;
+                }
+                return emitted;
+            }
+        }
         if let Action::MakeTerm(sym) = prod.action {
             let name = self.built.engine.symbol(sym).name();
             if let Some(target) = self.targets.get(name).cloned() {
-                let args: Vec<Vec<Token>> =
-                    t.nt_children.iter().map(|c| self.emit(c, bubble, interner)).collect();
+                let args: Vec<Vec<Token>> = t
+                    .nt_children
+                    .iter()
+                    .map(|c| self.emit(c, bubble, interner))
+                    .collect();
                 return match target {
                     ReconTarget::Op(name) => emit_application(&name, &args, bubble, interner),
                     ReconTarget::Term { formals, template } => {
@@ -237,17 +302,39 @@ fn emit_application(
     interner: &mut Interner,
 ) -> Vec<Token> {
     let frags = split_mixfix(target, interner);
-    let line = args.iter().flatten().next().or_else(|| bubble.first()).map(|t| t.line).unwrap_or(0);
-    let lp = Token { sym: interner.intern("("), line, kind: TokKind::Punct };
-    let rp = Token { sym: interner.intern(")"), line, kind: TokKind::Punct };
-    let comma = Token { sym: interner.intern(","), line, kind: TokKind::Punct };
+    let line = args
+        .iter()
+        .flatten()
+        .next()
+        .or_else(|| bubble.first())
+        .map(|t| t.line)
+        .unwrap_or(0);
+    let lp = Token {
+        sym: interner.intern("("),
+        line,
+        kind: TokKind::Punct,
+    };
+    let rp = Token {
+        sym: interner.intern(")"),
+        line,
+        kind: TokKind::Punct,
+    };
+    let comma = Token {
+        sym: interner.intern(","),
+        line,
+        kind: TokKind::Punct,
+    };
     let mut out = Vec::new();
     if frags.iter().any(|f| matches!(f, Frag::Hole)) {
         out.push(lp);
         let mut ai = 0;
         for f in &frags {
             match f {
-                Frag::Tok(s) => out.push(Token { sym: *s, line, kind: TokKind::Ident }),
+                Frag::Tok(s) => out.push(Token {
+                    sym: *s,
+                    line,
+                    kind: TokKind::Ident,
+                }),
                 Frag::Hole => {
                     out.push(lp);
                     if let Some(a) = args.get(ai) {
@@ -262,7 +349,11 @@ fn emit_application(
     } else {
         for f in &frags {
             if let Frag::Tok(s) = f {
-                out.push(Token { sym: *s, line, kind: TokKind::Ident });
+                out.push(Token {
+                    sym: *s,
+                    line,
+                    kind: TokKind::Ident,
+                });
             }
         }
         if !args.is_empty() {
@@ -288,9 +379,23 @@ fn emit_template(
     bubble: &[Token],
     interner: &mut Interner,
 ) -> Vec<Token> {
-    let line = args.iter().flatten().next().or_else(|| bubble.first()).map(|t| t.line).unwrap_or(0);
-    let lp = Token { sym: interner.intern("("), line, kind: TokKind::Punct };
-    let rp = Token { sym: interner.intern(")"), line, kind: TokKind::Punct };
+    let line = args
+        .iter()
+        .flatten()
+        .next()
+        .or_else(|| bubble.first())
+        .map(|t| t.line)
+        .unwrap_or(0);
+    let lp = Token {
+        sym: interner.intern("("),
+        line,
+        kind: TokKind::Punct,
+    };
+    let rp = Token {
+        sym: interner.intern(")"),
+        line,
+        kind: TokKind::Punct,
+    };
     let mut out = Vec::new();
     for t in template {
         let text = interner.resolve(t.sym);
@@ -328,4 +433,50 @@ fn parse_term(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTr
         return Err("ambiguous".into());
     }
     Ok(parsed.tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::tokenize;
+    use crate::surface::parser::Parser;
+
+    fn iter_module(i: &mut Interner) -> PreModule {
+        let source = tokenize(
+            "fmod ITER-RENAME is sort S . op a : -> S [ctor] . \
+             op g : S -> S [ctor iter] . endfm",
+            i,
+        );
+        Parser::new(&source, i)
+            .parse_source()
+            .expect("parse source")
+            .modules
+            .remove(0)
+    }
+
+    #[test]
+    fn op_renamer_preserves_compact_iter_count() {
+        let mut i = Interner::new();
+        let pm = iter_module(&mut i);
+        let mapper = OpRenamer::new(&pm, &[("g".into(), None, "h".into())], &mut i)
+            .expect("build")
+            .expect("mapper");
+        let bubble = tokenize("g^1000000(a)", &mut i);
+        let rewritten = mapper.rewrite(&bubble, &mut i);
+        let text: String = rewritten.iter().map(|t| i.resolve(t.sym)).collect();
+        assert_eq!(text, "h^1000000(a)");
+    }
+
+    #[test]
+    fn view_substitution_preserves_compact_iter_count() {
+        let mut i = Interner::new();
+        let pm = iter_module(&mut i);
+        let mapper = ViewOpSubst::new(&pm, &[("g".into(), ReconTarget::Op("h".into()))], &mut i)
+            .expect("build")
+            .expect("mapper");
+        let bubble = tokenize("g^1000000(a)", &mut i);
+        let rewritten = mapper.rewrite(&bubble, &mut i);
+        let text: String = rewritten.iter().map(|t| i.resolve(t.sym)).collect();
+        assert_eq!(text, "h^1000000(a)");
+    }
 }

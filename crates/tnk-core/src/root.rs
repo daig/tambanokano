@@ -65,7 +65,10 @@ pub struct RootGuard {
 impl RootGuard {
     pub(crate) fn new(registry: &Roots, id: DagId) -> Self {
         let slot = registry.borrow_mut().register(id);
-        RootGuard { registry: Rc::clone(registry), slot }
+        RootGuard {
+            registry: Rc::clone(registry),
+            slot,
+        }
     }
 
     /// The currently-pinned id.

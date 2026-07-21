@@ -43,7 +43,10 @@ impl Chart {
     /// valid partial parse" — Maude's `badTokenIndex` (`Parser/parser.hh`), reported by `metaParse` as the
     /// `noParse(n)` failure position (fable-audit.md §3.3 B4).
     pub fn furthest(&self) -> usize {
-        (0..self.sets.len()).rev().find(|&j| !self.sets[j].is_empty()).unwrap_or(0)
+        (0..self.sets.len())
+            .rev()
+            .find(|&j| !self.sets[j].is_empty())
+            .unwrap_or(0)
     }
 
     /// The completed top-level items for `start` (origin 0, fully matched) in the final set — the roots of
@@ -103,7 +106,16 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
 
     // Seed: predict every production of the start nonterminal at position 0.
     for &p in g.productions_for(start) {
-        add(&mut sets, &mut seen, 0, Item { prod: p, dot: 0, origin: 0 });
+        add(
+            &mut sets,
+            &mut seen,
+            0,
+            Item {
+                prod: p,
+                dot: 0,
+                origin: 0,
+            },
+        );
     }
 
     for j in 0..=n {
@@ -121,7 +133,16 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
                     GSym::N(nt) => {
                         // Predict: add every production of `nt`, starting here.
                         for &p in g.productions_for(nt) {
-                            add(&mut sets, &mut seen, j, Item { prod: p, dot: 0, origin: j as u32 });
+                            add(
+                                &mut sets,
+                                &mut seen,
+                                j,
+                                Item {
+                                    prod: p,
+                                    dot: 0,
+                                    origin: j as u32,
+                                },
+                            );
                         }
                     }
                     GSym::T(t) => {
@@ -131,7 +152,11 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
                                 &mut sets,
                                 &mut seen,
                                 j + 1,
-                                Item { prod: item.prod, dot: item.dot + 1, origin: item.origin },
+                                Item {
+                                    prod: item.prod,
+                                    dot: item.dot + 1,
+                                    origin: item.origin,
+                                },
                             );
                         }
                     }
@@ -140,7 +165,10 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
         }
     }
 
-    Chart { sets, present: seen }
+    Chart {
+        sets,
+        present: seen,
+    }
 }
 
 /// Completer: a finished production of nonterminal `N` (`item`, spanning `[item.origin, j)`) advances
@@ -164,9 +192,11 @@ fn complete(
             let p2 = &g.prods[it2.prod as usize];
             let d2 = it2.dot as usize;
             match p2.rhs.get(d2) {
-                Some(GSym::N(nt)) if *nt == n && p2.bound[d2].unwrap() >= prec => {
-                    Some(Item { prod: it2.prod, dot: it2.dot + 1, origin: it2.origin })
-                }
+                Some(GSym::N(nt)) if *nt == n && p2.bound[d2].unwrap() >= prec => Some(Item {
+                    prod: it2.prod,
+                    dot: it2.dot + 1,
+                    origin: it2.origin,
+                }),
                 _ => None,
             }
         })
@@ -187,7 +217,7 @@ fn add(sets: &mut [Vec<Item>], seen: &mut [HashSet<Item>], pos: usize, item: Ite
 mod tests {
     use super::*;
     use crate::grammar::build::build_grammar;
-    use crate::lex::{tokenize, Interner};
+    use crate::lex::{Interner, tokenize};
     use crate::sig::build_sig::build_module;
     use crate::surface::parser::Parser;
 

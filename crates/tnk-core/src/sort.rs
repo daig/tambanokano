@@ -67,7 +67,10 @@ impl Sorts {
     pub fn add_sort(&mut self, name: impl Into<String>) -> SortId {
         assert!(!self.closed, "cannot add sorts after close()");
         let id = Id::from_raw(self.sorts.len() as u32);
-        self.sorts.push(Sort { name: name.into(), is_error: false });
+        self.sorts.push(Sort {
+            name: name.into(),
+            is_error: false,
+        });
         self.up.push(Vec::new());
         self.down.push(Vec::new());
         id
@@ -130,7 +133,11 @@ impl Sorts {
     /// `subsort C < Cid`), so a class *constant* / class-sorted variable is recognized structurally.
     /// Requires [`close`](Self::close).
     pub(crate) fn strict_subsorts(&self, s: SortId) -> Vec<SortId> {
-        self.down_set(s).iter().copied().filter(|&y| y != s).collect()
+        self.down_set(s)
+            .iter()
+            .copied()
+            .filter(|&y| y != s)
+            .collect()
     }
 
     /// `true` if `a` and `b` are in the same kind (connected component).
@@ -187,7 +194,14 @@ impl Sorts {
                 }
             }
         }
-        register(members[0], up, down, &mut order, &mut registered, &mut unresolved);
+        register(
+            members[0],
+            up,
+            down,
+            &mut order,
+            &mut registered,
+            &mut unresolved,
+        );
 
         let mut i = 1;
         while i < order.len() {
@@ -252,7 +266,10 @@ impl Sorts {
             // they differ for a multi-top component, and a kind-level term prints its kind as this name
             // (e.g. `metaUnify`'s undefined result `[UnificationPair?,MatchOrUnificationPair,MatchPair?]`).
             let err: SortId = Id::from_raw(self.sorts.len() as u32);
-            self.sorts.push(Sort { name: String::new(), is_error: true }); // name filled once ordered
+            self.sorts.push(Sort {
+                name: String::new(),
+                is_error: true,
+            }); // name filled once ordered
             self.up.push(Vec::new());
             self.down.push(Vec::new());
             for &m in &members {
@@ -267,7 +284,11 @@ impl Sorts {
                 .collect::<Vec<_>>()
                 .join(",");
             self.sorts[err.index()].name = format!("[{repr}]");
-            self.kinds.push(Kind { members, error: err, index_order });
+            self.kinds.push(Kind {
+                members,
+                error: err,
+                index_order,
+            });
         }
 
         // 4. Subsort closure: BFS upward for each user sort, then add its kind's error sort.
@@ -459,7 +480,10 @@ mod tests {
             }
             s.close();
             let k = s.kind(s.kind_of(bot));
-            k.index_order.iter().map(|&x| s.name(x).to_string()).collect::<Vec<_>>()
+            k.index_order
+                .iter()
+                .map(|&x| s.name(x).to_string())
+                .collect::<Vec<_>>()
         };
         assert_eq!(build(false), vec!["[TopA,TopB]", "TopA", "TopB", "Bot"]);
         assert_eq!(build(true), vec!["[TopB,TopA]", "TopB", "TopA", "Bot"]);

@@ -9,7 +9,11 @@ fn repl() -> Repl {
 
 macro_rules! conformance_file {
     ($n:expr) => {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/", $n))
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/",
+            $n
+        ))
     };
 }
 
@@ -40,7 +44,9 @@ fn command_without_current_module() {
 /// The module system end-to-end through the REPL: a diamond import reduces to the binary's value/count.
 #[test]
 fn import_diamond_through_repl() {
-    let out = repl().eval(conformance_file!("import-diamond.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("import-diamond.maude"))
+        .output;
     assert!(out.contains("rewrites: 12"), "count: {out}");
     assert!(out.contains("result N: s(s(s(s(s(0)))))"), "value: {out}");
 }
@@ -48,7 +54,9 @@ fn import_diamond_through_repl() {
 /// Renaming through the REPL: `top(e) = box(e) = e`, sort renamed to `Item`.
 #[test]
 fn import_renaming_through_repl() {
-    let out = repl().eval(conformance_file!("import-renaming.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("import-renaming.maude"))
+        .output;
     assert!(out.contains("result Item: e"), "value: {out}");
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
@@ -60,7 +68,10 @@ fn import_renaming_through_repl() {
 #[test]
 fn prelude_list_m2_through_repl() {
     let out = repl().eval(conformance_file!("prelude-list.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "LIST builds: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "LIST builds: {out}"
+    );
     let lines: Vec<&str> = out
         .lines()
         .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
@@ -69,25 +80,29 @@ fn prelude_list_m2_through_repl() {
     let got: Vec<String> = lines
         .chunks(2)
         .map(|c| {
-            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
+            let n = c[0]
+                .trim_start_matches("rewrites: ")
+                .split(' ')
+                .next()
+                .unwrap_or("?");
             format!("[{n}] {}", c[1].trim_start_matches("result "))
         })
         .collect();
     assert_eq!(
         got,
         vec![
-            "[6] Bool: true",          // occurs(2, 1 2 3)
-            "[9] Bool: true",          // occurs(3, 1 2 3)  — recurses to the singleton
-            "[10] Bool: false",        // occurs(5, 1 2 3)  — recurses past the singleton to nil
-            "[3] Bool: true",          // occurs(7, 7)      — singleton subject
-            "[12] NzNat: 5",           // size(1 2 3 4 5)
-            "[4] NzNat: 1",            // size(7)           — collapse
-            "[2] Zero: 0",             // size(nil)
+            "[6] Bool: true",           // occurs(2, 1 2 3)
+            "[9] Bool: true",           // occurs(3, 1 2 3)  — recurses to the singleton
+            "[10] Bool: false",         // occurs(5, 1 2 3)  — recurses past the singleton to nil
+            "[3] Bool: true",           // occurs(7, 7)      — singleton subject
+            "[12] NzNat: 5",            // size(1 2 3 4 5)
+            "[4] NzNat: 1",             // size(7)           — collapse
+            "[2] Zero: 0",              // size(nil)
             "[6] NeList{Nat}: 4 3 2 1", // reverse(1 2 3 4)
-            "[3] NzNat: 7",            // reverse(7)
-            "[2] List{Nat}: nil",      // reverse(nil)
-            "[1] NzNat: 3",            // last(1 2 3)
-            "[1] NeList{Nat}: 1 2",    // front(1 2 3)
+            "[3] NzNat: 7",             // reverse(7)
+            "[2] List{Nat}: nil",       // reverse(nil)
+            "[1] NzNat: 3",             // last(1 2 3)
+            "[1] NeList{Nat}: 1 2",     // front(1 2 3)
             "[1] NeList{Nat}: 1 2 3 4", // append(1 2, 3 4)
         ],
         "LIST ops: {out}"
@@ -101,7 +116,10 @@ fn prelude_list_m2_through_repl() {
 #[test]
 fn prelude_set_through_repl() {
     let out = repl().eval(conformance_file!("prelude-set.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "SET builds: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "SET builds: {out}"
+    );
     let lines: Vec<&str> = out
         .lines()
         .filter(|l| l.starts_with("result ") || l.starts_with("rewrites:"))
@@ -109,27 +127,31 @@ fn prelude_set_through_repl() {
     let got: Vec<String> = lines
         .chunks(2)
         .map(|c| {
-            let n = c[0].trim_start_matches("rewrites: ").split(' ').next().unwrap_or("?");
+            let n = c[0]
+                .trim_start_matches("rewrites: ")
+                .split(' ')
+                .next()
+                .unwrap_or("?");
             format!("[{n}] {}", c[1].trim_start_matches("result "))
         })
         .collect();
     assert_eq!(
         got,
         vec![
-            "[1] Bool: false",          // true and-then false
-            "[1] Bool: true",           // false or-else true
-            "[1] Bool: true",           // 2 in (1, 2, 3)
-            "[1] Bool: false",          // 5 in (1, 2, 3)   — absent, recurses to singleton (non-linear)
-            "[1] Bool: true",           // 7 in 7           — singleton subject (collapse)
-            "[8] NzNat: 3",             // | (1, 2, 3) |
-            "[4] NzNat: 1",             // | 7 |
-            "[6] Bool: false",          // (1, 5) subset (1, 2, 3)
-            "[7] Bool: true",           // (1, 2) subset (1, 2, 3)
-            "[2] NeSet{Nat}: 1, 3",     // delete(2, (1, 2, 3))
+            "[1] Bool: false",            // true and-then false
+            "[1] Bool: true",             // false or-else true
+            "[1] Bool: true",             // 2 in (1, 2, 3)
+            "[1] Bool: false", // 5 in (1, 2, 3)   — absent, recurses to singleton (non-linear)
+            "[1] Bool: true",  // 7 in 7           — singleton subject (collapse)
+            "[8] NzNat: 3",    // | (1, 2, 3) |
+            "[4] NzNat: 1",    // | 7 |
+            "[6] Bool: false", // (1, 5) subset (1, 2, 3)
+            "[7] Bool: true",  // (1, 2) subset (1, 2, 3)
+            "[2] NeSet{Nat}: 1, 3", // delete(2, (1, 2, 3))
             "[1] NeSet{Nat}: 1, 2, 3, 4", // insert(4, (1, 2, 3))
             "[1] NeSet{Nat}: 1, 2, 3, 4", // union((1, 2), (3, 4))
-            "[11] NeSet{Nat}: 2, 3",    // intersection((1, 2, 3), (2, 3, 4))
-            "[11] NeSet{Nat}: 1, 3",    // (1, 2, 3) \ (2, 4)
+            "[11] NeSet{Nat}: 2, 3", // intersection((1, 2, 3), (2, 3, 4))
+            "[11] NeSet{Nat}: 1, 3", // (1, 2, 3) \ (2, 4)
         ],
         "SET ops: {out}"
     );
@@ -147,7 +169,11 @@ fn strategy_solutions(out: &str) -> Vec<String> {
     for line in out.lines() {
         if line.starts_with("srewrite ") || line.starts_with("dsrewrite ") {
             if active {
-                res.push(if none { "(no solution)".to_string() } else { cur.join(" ; ") });
+                res.push(if none {
+                    "(no solution)".to_string()
+                } else {
+                    cur.join(" ; ")
+                });
             }
             cur = Vec::new();
             active = true;
@@ -161,7 +187,11 @@ fn strategy_solutions(out: &str) -> Vec<String> {
         }
     }
     if active {
-        res.push(if none { "(no solution)".to_string() } else { cur.join(" ; ") });
+        res.push(if none {
+            "(no solution)".to_string()
+        } else {
+            cur.join(" ; ")
+        });
     }
     res
 }
@@ -173,60 +203,63 @@ fn strategy_solutions(out: &str) -> Vec<String> {
 #[test]
 fn strategy_core_through_repl() {
     let out = repl().eval(conformance_file!("strategy.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error:"), "strategy core builds/runs: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error:"),
+        "strategy core builds/runs: {out}"
+    );
     assert_eq!(
         strategy_solutions(&out),
         vec![
-            "b",                 // r1
-            "b ; c",             // r1 | r2
-            "d",                 // r1 ; r3
-            "a ; b",             // r1 * (zero-or-more)
-            "b ; c",             // all
-            "a",                 // idle
-            "(no solution)",     // fail
-            "b",                 // top(r1)
-            "(no solution)",     // match b — a doesn't match b
-            "a",                 // match a — succeeds, returns the subject
-            "(no solution)",     // amatch d — d occurs nowhere in a
-            "d",                 // r1 ? r3 : r2 — r1 succeeds → r3 on b
-            "(no solution)",     // r2 ? r3 : r4 — r2 succeeds → r3 on c fails (no γ)
-            "b ; c",             // (r1 | r2) ! — normalization to the strategy's normal forms
-            "b",                 // r1 +
-            "b",                 // try(r1)
-            "a",                 // not(fail)
-            "d",                 // (r1 ; r3) | (r2 ; r4)
-            "b",                 // one(r1 | r2) — only the first solution
-            "b ; c",             // dsrewrite r1 | r2
-            "d",                 // dsrewrite (r1 | r2) ; r3
+            "b",             // r1
+            "b ; c",         // r1 | r2
+            "d",             // r1 ; r3
+            "a ; b",         // r1 * (zero-or-more)
+            "b ; c",         // all
+            "a",             // idle
+            "(no solution)", // fail
+            "b",             // top(r1)
+            "(no solution)", // match b — a doesn't match b
+            "a",             // match a — succeeds, returns the subject
+            "(no solution)", // amatch d — d occurs nowhere in a
+            "d",             // r1 ? r3 : r2 — r1 succeeds → r3 on b
+            "(no solution)", // r2 ? r3 : r4 — r2 succeeds → r3 on c fails (no γ)
+            "b ; c",         // (r1 | r2) ! — normalization to the strategy's normal forms
+            "b",             // r1 +
+            "b",             // try(r1)
+            "a",             // not(fail)
+            "d",             // (r1 ; r3) | (r2 ; r4)
+            "b",             // one(r1 | r2) — only the first solution
+            "b ; c",         // dsrewrite r1 | r2
+            "d",             // dsrewrite (r1 | r2) ; r3
             // Phase C — strategy definitions (`sd`) + calls. `go := r1 ; r3`, `go2 := go | r2`, and the
             // recursive `reach := idle | ((r1|r2|r3|r4) ; reach)` (cycle-detected). `dsrewrite` for the
             // multi-solution calls (the fair `srewrite` order is the BFS follow-on, fable-audit.md).
-            "d",                 // srewrite go
-            "d ; c",             // dsrewrite go2
-            "a ; b ; d ; c",     // dsrewrite reach — all states reachable from a (recursion terminates)
+            "d",             // srewrite go
+            "d ; c",         // dsrewrite go2
+            "a ; b ; d ; c", // dsrewrite reach — all states reachable from a (recursion terminates)
             // Phase D — matchrew/amatchrew, conditional rules (equality + rewrite-condition substrategies),
             // application substitution `L[x <- t]`, the `xmatch` test, and parameterized strategy calls.
-            "f(b, c)",                              // matchrew by X using r1, Y using r2
-            "f(b, b) ; f(c, b)",                    // matchrew by X using (r1|r2), Y using r1
+            "f(b, c)",                               // matchrew by X using r1, Y using r2
+            "f(b, b) ; f(c, b)",                     // matchrew by X using (r1|r2), Y using r1
             "f(b, b) ; f(c, b) ; f(b, c) ; f(c, c)", // dsrewrite matchrew — full cartesian product
-            "f(b, a)",                              // matchrew by X using r1 — partial by-list (Y kept)
-            "(no solution)",                        // matchrew f(b,a) … X using r1 — r1 fails on b
-            "f(b, a) ; f(a, b)",                    // amatchrew X by X using r1 — anywhere
-            "g(b)",                                 // wrap{r1} — rewrite condition solved by r1
-            "g(c)",                                 // wrap{r2}
-            "g(b) ; g(c)",                          // dsrewrite wrap{r1 | r2}
-            "(no solution)",                        // wrap — bare rewrite-conditional rule cannot apply
-            "d",                                    // eqc — equality condition holds
-            "(no solution)",                        // eqf — equality condition fails
-            "f(b, a)",                              // swap — plain
-            "f(b, a)",                              // swap[X <- a] — consistent constraint
-            "(no solution)",                        // swap[X <- b] — inconsistent with the match
-            "a . a . a",                            // xmatch X . Y — extension test returns the subject
-            "a . a . a",                            // match X . Y — whole-match test returns the subject
-            "b",                                    // s2(a) — parameterized call
-            "b",                                    // go3 := s2(a)
-            "b",                                    // mtest(b) := match b — parameter used in a pattern
-            "(no solution)",                        // mtest(a) := match a — fails on subject b
+            "f(b, a)",           // matchrew by X using r1 — partial by-list (Y kept)
+            "(no solution)",     // matchrew f(b,a) … X using r1 — r1 fails on b
+            "f(b, a) ; f(a, b)", // amatchrew X by X using r1 — anywhere
+            "g(b)",              // wrap{r1} — rewrite condition solved by r1
+            "g(c)",              // wrap{r2}
+            "g(b) ; g(c)",       // dsrewrite wrap{r1 | r2}
+            "(no solution)",     // wrap — bare rewrite-conditional rule cannot apply
+            "d",                 // eqc — equality condition holds
+            "(no solution)",     // eqf — equality condition fails
+            "f(b, a)",           // swap — plain
+            "f(b, a)",           // swap[X <- a] — consistent constraint
+            "(no solution)",     // swap[X <- b] — inconsistent with the match
+            "a . a . a",         // xmatch X . Y — extension test returns the subject
+            "a . a . a",         // match X . Y — whole-match test returns the subject
+            "b",                 // s2(a) — parameterized call
+            "b",                 // go3 := s2(a)
+            "b",                 // mtest(b) := match b — parameter used in a pattern
+            "(no solution)",     // mtest(a) := match a — fails on subject b
         ],
         "strategy solutions: {out}"
     );
@@ -271,20 +304,23 @@ fn strategy_value_counts(out: &str) -> Vec<String> {
 #[test]
 fn strategy_fair_counts_through_repl() {
     let out = repl().eval(conformance_file!("strategy-fair.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error:"), "fair strategy builds/runs: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error:"),
+        "fair strategy builds/runs: {out}"
+    );
     assert_eq!(
         strategy_value_counts(&out),
         vec![
-            "c[2] ; g[4]",        // srew (r1;p;pp) | r2 — fair emits the shorter derivation (c) first
-            "g[3] ; c[4]",        // dsrew — left branch explored fully first
+            "c[2] ; g[4]", // srew (r1;p;pp) | r2 — fair emits the shorter derivation (c) first
+            "g[3] ; c[4]", // dsrew — left branch explored fully first
             "c[1] ; d[5] ; g[6]", // srew r2 | (r1;p) | (r1;p;pp) — n-ary union decompose timing
             "c[1] ; d[3] ; g[6]", // dsrew
-            "d[4] ; e[4]",        // srew (r1;p) | (r2;q) — equal depth, both at the level's final count
+            "d[4] ; e[4]", // srew (r1;p) | (r2;q) — equal depth, both at the level's final count
             "a[0] ; b[2] ; c[2]", // srew (r1|r2)* — reachable set, fair count snapshot
             "a[0] ; b[1] ; c[2]", // dsrew (r1|r2)* — depth-first count snapshot
-            "c[2] ; b[2]",        // srew r2 | r1 — the 2nd branch rewrites before the 1st emits
-            "e[5] ; g[5]",        // srew (r1|r2) ; (p ? pp : q) — interleaved branch sub-tasks
-            "b[1] ; c[2]",        // dsrew (r1|r2)! — normalize, depth-first
+            "c[2] ; b[2]", // srew r2 | r1 — the 2nd branch rewrites before the 1st emits
+            "e[5] ; g[5]", // srew (r1|r2) ; (p ? pp : q) — interleaved branch sub-tasks
+            "b[1] ; c[2]", // dsrew (r1|r2)! — normalize, depth-first
         ],
         "fair srewrite order+count: {out}"
     );
@@ -301,7 +337,10 @@ fn prelude_results(out: &str) -> Vec<String> {
         } else if let Some(value) = lines[i].strip_prefix("result ") {
             let mut block = vec![value.to_string()];
             let mut j = i + 1;
-            while j < lines.len() && !lines[j].starts_with("reduce ") && !lines[j].starts_with("rewrites:") {
+            while j < lines.len()
+                && !lines[j].starts_with("reduce ")
+                && !lines[j].starts_with("rewrites:")
+            {
                 block.push(lines[j].to_string());
                 j += 1;
             }
@@ -336,7 +375,10 @@ fn prelude_results(out: &str) -> Vec<String> {
 #[test]
 fn prelude_meta_through_repl() {
     let out = repl().eval(conformance_file!("prelude-meta.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "META tower builds: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "META tower builds: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         prelude_results(&out),
@@ -363,25 +405,25 @@ fn prelude_meta_through_repl() {
             // Stage 3.5 — value, rewrite count, AND the `format`-attribute layout are now byte-identical to
             // the reference: a substitution's `_<-_` (`format (n++i d d --)`) newline-indents each binding,
             // and `rl_=>_[_].` (`format (… s … s …)`) spaces its `[attrs]`/`.`.
-            "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaRewrite unbounded: a=>b=>c
-            "[2] ResultPair: {'b.Elt, 'Elt}",                          // metaRewrite [1]: one step a=>b
-            "[3] ResultPair: {'c.Elt, 'Elt}",                          // metaFrewrite gas 1: a=>b=>c
-            "[2] Assignment: \n  'N:Nat <- 's_^4['0.Zero]",            // metaMatch: s_(N) <-> s^5(0)
-            "[2] Substitution?: (noMatch).Substitution?",              // metaMatch: _+_ vs s^5 — no match
-            "[2] ResultTriple: {'b.Elt, 'Elt, \n  'X:Elt <- 'b.Elt}",  // metaSearch =>+ sol 0: a=>b
-            "[3] ResultTriple: {'c.Elt, 'Elt, \n  'X:Elt <- 'c.Elt}",  // metaSearch =>+ sol 1: a=>c (ab)
-            "[4] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}",   // metaSearch =>! normal form c: snapshot at nf-confirmation (oracle rewrites: 4; fable-audit.md §3.3 B2b)
+            "[3] ResultPair: {'c.Elt, 'Elt}", // metaRewrite unbounded: a=>b=>c
+            "[2] ResultPair: {'b.Elt, 'Elt}", // metaRewrite [1]: one step a=>b
+            "[3] ResultPair: {'c.Elt, 'Elt}", // metaFrewrite gas 1: a=>b=>c
+            "[2] Assignment: \n  'N:Nat <- 's_^4['0.Zero]", // metaMatch: s_(N) <-> s^5(0)
+            "[2] Substitution?: (noMatch).Substitution?", // metaMatch: _+_ vs s^5 — no match
+            "[2] ResultTriple: {'b.Elt, 'Elt, \n  'X:Elt <- 'b.Elt}", // metaSearch =>+ sol 0: a=>b
+            "[3] ResultTriple: {'c.Elt, 'Elt, \n  'X:Elt <- 'c.Elt}", // metaSearch =>+ sol 1: a=>c (ab)
+            "[4] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}", // metaSearch =>! normal form c: snapshot at nf-confirmation (oracle rewrites: 4; fable-audit.md §3.3 B2b)
             // metaApply: the labelled rule `unwrap` (f(N) => N) at the top, its binding, or failure.
             "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, \n  'N:Nat <- 's_^3['0.Zero]}", // apply at top
-            "[1] ResultTriple?: (failure).ResultTriple?",              // solution 1 — past the last
-            "[1] ResultTriple?: (failure).ResultTriple?",              // no top match (subject is s^3(0))
+            "[1] ResultTriple?: (failure).ResultTriple?", // solution 1 — past the last
+            "[1] ResultTriple?: (failure).ResultTriple?", // no top match (subject is s^3(0))
             // metaXmatch (extension match → {subst, context}) and metaXapply (rule at a position →
             // {term, type, subst, context}). The hole `[]` marks the matched/rewritten position: `[]` at
             // the top, `'f[[]]` at the inner f; the substitution's `_<-_` newline-indents (`format`).
-            "[2] MatchPair: {\n  'N:Nat <- 's_^4['0.Zero], []}",       // metaXmatch s_(N) <-> s^5(0)
-            "[2] MatchPair?: (noMatch).MatchPair?",                    // metaXmatch _+_ vs s^5 — no match
-            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- 'f['0.Zero], []}",   // xapply at top
-            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- '0.Zero, 'f[[]]}",   // xapply at inner f
+            "[2] MatchPair: {\n  'N:Nat <- 's_^4['0.Zero], []}", // metaXmatch s_(N) <-> s^5(0)
+            "[2] MatchPair?: (noMatch).MatchPair?",              // metaXmatch _+_ vs s^5 — no match
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- 'f['0.Zero], []}", // xapply at top
+            "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- '0.Zero, 'f[[]]}", // xapply at inner f
             // metaSearchPath: the path to the first =>* solution is one TraceStep {a, Elt, ab-rule}. Stage
             // 3.5 closes the rule layout — `rl_=>_[_].`'s `format` spaces the `[label(…)]` and trailing `.`,
             // so the up-translated rule prints `'c.Elt [label('ab)] .` byte-identically to the reference.
@@ -393,22 +435,22 @@ fn prelude_meta_through_repl() {
              {'b.Elt, 'Elt, rl 'b.Elt => 'c.Elt [label('r2)] .}",
             // Stage 4 — the up*/query/parse layer. The sort/kind queries read the down-translated
             // module's lattice; value + count are the reference binary's.
-            "[2] Bool: true",                                          // sortLeq(Zero, Nat)
-            "[2] Bool: false",                                         // sameKind(Nat, Bool)
-            "[2] Sort: 'NzNat",                                        // leastSort(2 + 3)
-            "[2] NeSortSet: 'NzNat ; 'Zero",                           // lesserSorts(Nat)
-            "[2] Sort: 'NzNat",                                        // glbSorts(Nat, NzNat)
-            "[2] Sort: 'Nat",                                          // completeName(Nat)
-            "[2] Kind: '`[Nat`]",                                      // getKind(Nat)
-            "[2] NeKindSet: '`[Bool`] ; '`[Nat`]",                     // getKinds
-            "[2] Sort: 'Nat",                                          // maximalSorts([Nat])
-            "[2] NeSortSet: 'NzNat ; 'Zero",                           // minimalSorts([Nat])
-            "[2] NeTypeList: 'Nat 'Nat",                               // maximalAritySet(_+_)
+            "[2] Bool: true",                      // sortLeq(Zero, Nat)
+            "[2] Bool: false",                     // sameKind(Nat, Bool)
+            "[2] Sort: 'NzNat",                    // leastSort(2 + 3)
+            "[2] NeSortSet: 'NzNat ; 'Zero",       // lesserSorts(Nat)
+            "[2] Sort: 'NzNat",                    // glbSorts(Nat, NzNat)
+            "[2] Sort: 'Nat",                      // completeName(Nat)
+            "[2] Kind: '`[Nat`]",                  // getKind(Nat)
+            "[2] NeKindSet: '`[Bool`] ; '`[Nat`]", // getKinds
+            "[2] Sort: 'Nat",                      // maximalSorts([Nat])
+            "[2] NeSortSet: 'NzNat ; 'Zero",       // minimalSorts([Nat])
+            "[2] NeTypeList: 'Nat 'Nat",           // maximalAritySet(_+_)
             // wellFormed: module/term/substitution. The ill-typed term/binding return false.
-            "[2] Bool: true",                                          // wellFormed(2 + 3)
-            "[2] Bool: false",                                         // wellFormed(true + 0) — ill-typed
-            "[2] Bool: true",                                          // wellFormed(X:Nat <- 0)
-            "[2] Bool: false",                                         // wellFormed(X:Nat <- true) — kind clash
+            "[2] Bool: true",  // wellFormed(2 + 3)
+            "[2] Bool: false", // wellFormed(true + 0) — ill-typed
+            "[2] Bool: true",  // wellFormed(X:Nat <- 0)
+            "[2] Bool: false", // wellFormed(X:Nat <- true) — kind clash
             // upModule + the up* projections. Non-flat lists imports + own decls; flat (S4-LIST, no
             // imports) inlines everything with a `nil` import list. Empty sets render `none`. Exercises
             // the iter-chain collapse (`s s 0` → `'s_^2['0.Zero]`), the `id:` attribute, conditional eqs,
@@ -426,23 +468,23 @@ fn prelude_meta_through_repl() {
             "[1] SModule: mod 'S4-SYS is\n  nil\n  sorts 'St .\n  none\n  op 'a : nil -> 'St [ctor] .\n  \
              op 'b : nil -> 'St [ctor] .\n  op 'c : nil -> 'St [ctor] .\n  none\n  none\n  \
              rl 'a.St => 'b.St [label('r1)] .\n  crl 'b.St => 'c.St if 'b.St = 'b.St [label('r2)] .\nendm",
-            "[1] Import: protecting 'NAT .",                           // upImports
-            "[1] NeSortSet: 'Bar ; 'Foo",                             // upSorts (own)
+            "[1] Import: protecting 'NAT .", // upImports
+            "[1] NeSortSet: 'Bar ; 'Foo",    // upSorts (own)
             "[1] OpDeclSet: op 'c : nil -> 'Foo [ctor] .\n\
              op 'f : 'Foo 'Nat -> 'Bar [ctor] .\nop 'g : 'Bar -> 'Bar [none] .", // upOpDecls
             "[1] Equation: ceq 'a.Elt = 'b.Elt if 'a.Elt = 'b.Elt [none] .", // upEqs (conditional)
             "[1] RuleSet: rl 'a.St => 'b.St [label('r1)] .\n\
-             crl 'b.St => 'c.St if 'b.St = 'b.St [label('r2)] .",      // upRls
+             crl 'b.St => 'c.St if 'b.St = 'b.St [label('r2)] .", // upRls
             // upTerm reduces its argument then ups it; downTerm builds (the ambient reduces), returning
             // the default `99` when the meta-term is unresolvable.
-            "[2] GroundTerm: 's_^3['0.Zero]",                          // upTerm(1 + 2)
-            "[1] NzNat: 4",                                            // downTerm(s^4(0), 0)
-            "[1] NzNat: 99",                                           // downTerm(bogus, 99) → default
+            "[2] GroundTerm: 's_^3['0.Zero]", // upTerm(1 + 2)
+            "[1] NzNat: 4",                   // downTerm(s^4(0), 0)
+            "[1] NzNat: 99",                  // downTerm(bogus, 99) → default
             // metaParse parses (no reduce) → {term, sort}; noParse(n) on failure. metaPrettyPrint renders
             // a term to a QidList via the format-aware printer.
             "[2] ResultPair: {'_+_['s_['0.Zero], 's_^2['0.Zero]], 'NzNat}", // metaParse(1 + 2)
-            "[2] ResultPair?: noParse(0)",                             // metaParse(foo bar)
-            "[3] NeTypeList: '2 '+ '3",                                // metaPrettyPrint(2 + 3)
+            "[2] ResultPair?: noParse(0)",                                  // metaParse(foo bar)
+            "[3] NeTypeList: '2 '+ '3", // metaPrettyPrint(2 + 3)
             // upView decomposes a view: header, from/to module exprs, and its sort/op maps.
             "[1] View: view 'S4-V from 'TRIV to 'NAT is\n  sort 'Elt to 'Nat .\n  none\n  none\nendv",
             // Stage 5 — the symbolic/SMT/strategy descent is declared (the tower loads) but stays INERT:
@@ -457,6 +499,102 @@ fn prelude_meta_through_repl() {
     );
 }
 
+/// LEXICAL's two quoted-identifier hooks dispatch through the upper-layer descent seam: `tokenize`
+/// constructs the real AU QidList (including punctuation/backquote canonicalization), and `printTokens`
+/// emits Maude's byte-level spacing/control semantics. Values and one-rewrite counts are the 3.5.1 oracle's.
+#[test]
+fn lexical_token_hooks_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(
+            r#"fmod LEXICAL is
+  protecting QID-LIST .
+  op printTokens : QidList -> String
+    [special (id-hook QuotedIdentifierOpSymbol (printTokens)
+              op-hook stringSymbol (<Strings> : ~> String)
+              op-hook quotedIdentifierSymbol (<Qids> : ~> Qid)
+              op-hook nilQidListSymbol (nil : ~> QidList)
+              op-hook qidListSymbol (__ : QidList QidList ~> QidList))] .
+  op tokenize : String -> QidList
+    [special (id-hook QuotedIdentifierOpSymbol (tokenize)
+              op-hook stringSymbol (<Strings> : ~> String)
+              op-hook quotedIdentifierSymbol (<Qids> : ~> Qid)
+              op-hook nilQidListSymbol (nil : ~> QidList)
+              op-hook qidListSymbol (__ : QidList QidList ~> QidList))] .
+endfm
+red in LEXICAL : tokenize("") .
+red in LEXICAL : tokenize("alpha") .
+red in LEXICAL : tokenize("alpha beta gamma") .
+red in LEXICAL : tokenize("f(a,b) _+_ `[ x`y") .
+red in LEXICAL : tokenize("--- not a comment *** neither") .
+red in LEXICAL : tokenize("ab\
+cd") .
+red in LEXICAL : tokenize("café λ") .
+red in LEXICAL : printTokens(nil) .
+red in LEXICAL : printTokens('alpha) .
+red in LEXICAL : printTokens('f '`( 'a '`, 'b '`) '`[ '`] '`{ '`} '_+_) .
+red in LEXICAL : printTokens('\n '\t '\s '\\) .
+fmod LEXICAL-PARSE is
+  sorts List Elt .
+  subsort Elt < List .
+  op __ : List List -> List [assoc] .
+endfm
+red in META-LEVEL : metaParse(['LEXICAL-PARSE], none, 'A:List 'B:List, anyType) .
+red in META-LEVEL : metaParse(['LEXICAL-PARSE], 'A:List ; 'B:List, 'A 'B, anyType) .
+"#,
+        )
+        .output;
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[1] QidList: nil",
+            "[1] Qid: 'alpha",
+            "[1] NeQidList: 'alpha 'beta 'gamma",
+            "[1] NeQidList: 'f '`( 'a '`, 'b '`) '_+_ '`[ 'x`y",
+            "[1] NeQidList: '--- 'not 'a 'comment '*** 'neither",
+            "[1] Qid: 'abcd",
+            "[1] NeQidList: 'café 'λ",
+            "[1] String: \"\"",
+            "[1] String: \"alpha\"",
+            "[1] String: \"f (a ,b )[]{ }_+_\"",
+            "[1] String: \"\\n\\t \\\\\"",
+            "[2] ResultPair: {'__['A:List, 'B:List], 'List}",
+            "[2] ResultPair: {'__['A:List, 'B:List], 'List}",
+        ],
+        "LEXICAL hooks: {out}"
+    );
+}
+
+/// Modern (Qid-family) free order-sorted `metaUnify` indexes distinct maximal-lower-sort unifiers in
+/// Maude order, then returns the typed exhaustion sentinel. This deliberately excludes AU and variants.
+#[test]
+fn modern_free_meta_unify_indices_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(
+            r#"fmod FREE-MULTI is
+  sorts A B C D Top .
+  subsorts C D < A B < Top .
+endfm
+red in META-LEVEL : metaUnify(['FREE-MULTI], 'X:A =? 'Y:B, '%, 0) .
+red in META-LEVEL : metaUnify(['FREE-MULTI], 'X:A =? 'Y:B, '%, 1) .
+red in META-LEVEL : metaUnify(['FREE-MULTI], 'X:A =? 'Y:B, '%, 2) .
+"#,
+        )
+        .output;
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[2] UnificationPair: {\n  'X:A <- '#1:C ; \n  'Y:B <- '#1:C, '#}",
+            "[2] UnificationPair: {\n  'X:A <- '#1:D ; \n  'Y:B <- '#1:D, '#}",
+            "[2] UnificationPair?: (noUnifier).UnificationPair?",
+        ],
+        "modern free metaUnify indices: {out}"
+    );
+}
+
 /// Container milestone — the real prelude's `MAP{Nat, Nat}` loads and reduces byte-identically. Proves
 /// two-parameter instantiation, the `[Y$Elt]` kind range (via `inst_sort`), and the `id:`-attribute
 /// parse fix (an `_,_ [assoc comm id: empty prec 121]` keeps its prec, so a `_|->_` entry parses as an
@@ -464,7 +602,10 @@ fn prelude_meta_through_repl() {
 #[test]
 fn prelude_map_through_repl() {
     let out = repl().eval(conformance_file!("prelude-map.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "MAP builds: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "MAP builds: {out}"
+    );
     assert_eq!(
         prelude_results(&out),
         vec![
@@ -485,7 +626,10 @@ fn prelude_map_through_repl() {
 #[test]
 fn prelude_array_through_repl() {
     let out = repl().eval(conformance_file!("prelude-array.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "ARRAY builds: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "ARRAY builds: {out}"
+    );
     assert_eq!(
         prelude_results(&out),
         vec![
@@ -505,9 +649,16 @@ fn prelude_array_through_repl() {
 #[test]
 fn var_shadowing_through_repl() {
     let out = repl().eval(conformance_file!("var-shadowing.maude")).output;
-    assert!(!out.contains("no parse"), "the shadowed prefix application must parse: {out}");
+    assert!(
+        !out.contains("no parse"),
+        "the shadowed prefix application must parse: {out}"
+    );
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
-    assert_eq!(results, vec!["result T: e e", "result T: e", "result S: a"], "shadow values: {out}");
+    assert_eq!(
+        results,
+        vec!["result T: e e", "result T: e", "result S: a"],
+        "shadow values: {out}"
+    );
 }
 
 /// B-i: a theory loads through the REPL end-to-end — it becomes current, its `[nonexec]` axiom does NOT
@@ -515,9 +666,14 @@ fn var_shadowing_through_repl() {
 /// Values/counts are the reference binary's.
 #[test]
 fn theory_nonexec_through_repl() {
-    let out = repl().eval(conformance_file!("theory-nonexec.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("theory-nonexec.maude"))
+        .output;
     assert!(out.contains("reduce in ELT-ORD :"), "header: {out}");
-    assert!(out.contains("result Bool: e < e"), "nonexec not applied: {out}");
+    assert!(
+        out.contains("result Bool: e < e"),
+        "nonexec not applied: {out}"
+    );
     assert!(out.contains("result Elt: e"), "exec eq fires: {out}");
     assert!(out.contains("rewrites: 0"), "nonexec count: {out}");
     assert!(out.contains("rewrites: 1"), "exec count: {out}");
@@ -528,8 +684,14 @@ fn theory_nonexec_through_repl() {
 #[test]
 fn theory_entry_is_one_submission_and_current() {
     let mut r = repl();
-    assert!(!r.input_complete("fth TRIV is\n"), "open theory keeps buffering");
-    assert!(!r.input_complete("fth TRIV is\n  sort Elt .\n"), "a `.` inside an open theory is not the end");
+    assert!(
+        !r.input_complete("fth TRIV is\n"),
+        "open theory keeps buffering"
+    );
+    assert!(
+        !r.input_complete("fth TRIV is\n  sort Elt .\n"),
+        "a `.` inside an open theory is not the end"
+    );
     let src = "fth TRIV is\n  sort Elt .\nendfth\n";
     assert!(r.input_complete(src), "`endfth` completes the submission");
     let ev = r.eval(src);
@@ -544,9 +706,15 @@ fn view_through_repl() {
     let mut r = repl();
     let out = r.eval(conformance_file!("view-good.maude")).output;
     assert!(out.contains("result N: z"), "target module reduces: {out}");
-    assert!(r.eval("show views .").output.contains("ToNum"), "show views lists it");
+    assert!(
+        r.eval("show views .").output.contains("ToNum"),
+        "show views lists it"
+    );
     let shown = r.eval("show view ToNum .").output;
-    assert_eq!(shown, "view ToNum from TRIV to NUM is\n  sort Elt to N .\nendv");
+    assert_eq!(
+        shown,
+        "view ToNum from TRIV to NUM is\n  sort Elt to N .\nendv"
+    );
 }
 
 /// B-iii: a parameterized module builds and reduces through the REPL — it echoes as its bare base name
@@ -554,9 +722,18 @@ fn view_through_repl() {
 #[test]
 fn parameterized_module_through_repl() {
     let out = repl().eval(conformance_file!("param-module.maude")).output;
-    assert!(out.contains("reduce in CTR :"), "echoes as the base name: {out}");
-    assert!(out.contains("result Ctr{X}: zero"), "structured result sort: {out}");
-    assert!(out.contains("result NzCtr{X}: inc(inc(zero))"), "least sort over structured sorts: {out}");
+    assert!(
+        out.contains("reduce in CTR :"),
+        "echoes as the base name: {out}"
+    );
+    assert!(
+        out.contains("result Ctr{X}: zero"),
+        "structured result sort: {out}"
+    );
+    assert!(
+        out.contains("result NzCtr{X}: inc(inc(zero))"),
+        "least sort over structured sorts: {out}"
+    );
 }
 
 /// B-iv: parameterized-module instantiation through the REPL end-to-end — a single-parameter `BOX{ToColor}`
@@ -564,9 +741,15 @@ fn parameterized_module_through_repl() {
 #[test]
 fn instantiation_through_repl() {
     let out = repl().eval(conformance_file!("instantiation.maude")).output;
-    assert!(out.contains("result Box{ToColor}: wrap(green)"), "structured instance sort: {out}");
+    assert!(
+        out.contains("result Box{ToColor}: wrap(green)"),
+        "structured instance sort: {out}"
+    );
     assert!(out.contains("result Hue: green"), "view-image sort: {out}");
-    assert!(out.contains("result SA: a"), "multi-parameter instantiation: {out}");
+    assert!(
+        out.contains("result SA: a"),
+        "multi-parameter instantiation: {out}"
+    );
 }
 
 /// Axis-A5: chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (parameter bound to a
@@ -576,7 +759,9 @@ fn instantiation_through_repl() {
 /// Byte-identical to the reference; the prelude's `SORTABLE-LIST{Nat<}` now sorts identically too.
 #[test]
 fn instantiation_chained_through_repl() {
-    let out = repl().eval(conformance_file!("instantiation-chained.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("instantiation-chained.maude"))
+        .output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
         results,
@@ -592,17 +777,27 @@ fn instantiation_chained_through_repl() {
 /// and `op wrap to box` (op→op), so `ARR{ToFL}`'s `d0`/`d1` reduce to the target's terms.
 #[test]
 fn view_opmap_through_repl() {
-    let out = repl().eval(conformance_file!("param-view-opmap.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("param-view-opmap.maude"))
+        .output;
     assert!(out.contains("result F: f0"), "op->term: {out}");
-    assert!(out.contains("result F: box(f0)"), "op->op over op->term: {out}");
+    assert!(
+        out.contains("result F: box(f0)"),
+        "op->op over op->term: {out}"
+    );
 }
 
 /// Axis-A4: a parameter theory that imports a module — the module-declared sort `Bool` is kept (not
 /// renamed to `X$Bool`), so the parameterized module builds and the instance reduces.
 #[test]
 fn theory_module_sorts_through_repl() {
-    let out = repl().eval(conformance_file!("param-theory-module-sorts.maude")).output;
-    assert!(out.contains("result Bool: tt"), "module-declared sort kept: {out}");
+    let out = repl()
+        .eval(conformance_file!("param-theory-module-sorts.maude"))
+        .output;
+    assert!(
+        out.contains("result Bool: tt"),
+        "module-declared sort kept: {out}"
+    );
 }
 
 /// M0 milestone — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL, verbatim)
@@ -613,8 +808,14 @@ fn theory_module_sorts_through_repl() {
 fn prelude_bool_m0_through_repl() {
     let out = repl().eval(conformance_file!("prelude-bool.maude")).output;
     // The poly ops parse and pretty-print — the headers round-trip the mixfix.
-    assert!(out.contains("reduce in BOOL : true == true ."), "== header: {out}");
-    assert!(out.contains("reduce in BOOL : if true then false else true fi ."), "if header: {out}");
+    assert!(
+        out.contains("reduce in BOOL : true == true ."),
+        "== header: {out}"
+    );
+    assert!(
+        out.contains("reduce in BOOL : if true then false else true fi ."),
+        "if header: {out}"
+    );
     // Result value + sort, in order.
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
@@ -629,7 +830,11 @@ fn prelude_bool_m0_through_repl() {
         "values: {out}"
     );
     // Distinctive rewrite counts: four single-rewrite reduces + the 7-rewrite xor expansion.
-    assert_eq!(out.matches("rewrites: 1 ").count(), 4, "1-rewrite reduces: {out}");
+    assert_eq!(
+        out.matches("rewrites: 1 ").count(),
+        4,
+        "1-rewrite reduces: {out}"
+    );
     assert!(out.contains("rewrites: 7 "), "xor-expansion count: {out}");
 }
 
@@ -639,7 +844,9 @@ fn prelude_bool_m0_through_repl() {
 /// binary's (built-in poly `==`/`if`, `red in MK : …`).
 #[test]
 fn poly_multikind_through_repl() {
-    let out = repl().eval(conformance_file!("poly-multikind.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("poly-multikind.maude"))
+        .output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
         results,
@@ -657,7 +864,8 @@ fn poly_multikind_through_repl() {
     // The header echoes with the redundant parens elided — `if c1 == c2 then …` — exactly as the
     // reference binary prints it (==' s prec 51 makes them unnecessary).
     assert!(
-        out.contains("reduce in MK : if c1 == c2 then c0 else c2 fi .") && out.contains("rewrites: 2 "),
+        out.contains("reduce in MK : if c1 == c2 then c0 else c2 fi .")
+            && out.contains("rewrites: 2 "),
         "nested ==/if count: {out}"
     );
 }
@@ -667,12 +875,22 @@ fn poly_multikind_through_repl() {
 /// (b == a = false, 1 rewrite, stays). Values/counts are the reference binary's (`red in T : …`).
 #[test]
 fn bare_condition_through_repl() {
-    let out = repl().eval(conformance_file!("bare-condition.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("bare-condition.maude"))
+        .output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
-    assert_eq!(results, vec!["result Foo: b", "result Foo: f(b)"], "bare-cond values: {out}");
+    assert_eq!(
+        results,
+        vec!["result Foo: b", "result Foo: f(b)"],
+        "bare-cond values: {out}"
+    );
     // f(a): == eval + eq application = 2; f(b): == eval only (condition false) = 1.
     assert_eq!(out.matches("rewrites: 2 ").count(), 1, "fired count: {out}");
-    assert_eq!(out.matches("rewrites: 1 ").count(), 1, "not-fired count: {out}");
+    assert_eq!(
+        out.matches("rewrites: 1 ").count(),
+        1,
+        "not-fired count: {out}"
+    );
 }
 
 /// M1 milestone — the real prelude's NAT (with its BOOL substrate) loads and every built-in reduces
@@ -693,25 +911,25 @@ fn prelude_nat_m1_through_repl() {
             "result NzNat: 1",                    // 7 rem 2
             "result NzNat: 1024",                 // 2 ^ 10
             "result NzNat: 6",                    // gcd(12, 18)
-            "result NzNat: 2",                    // gcd(12, 18, 8)  — prefix N-ary folds to 1 rewrite
-            "result NzNat: 12",                   // lcm(4, 6)
-            "result NzNat: 3",                    // min(3, 5)
-            "result NzNat: 5",                    // max(3, 5)
-            "result NzNat: 5",                    // sd(3, 8)
-            "result NzNat: 5",                    // sd(8, 3)  — commutative
-            "result NzNat: 6",                    // 5 xor 3
-            "result Zero: 0",                     // 5 xor 5   — multiplicity cancels
-            "result NzNat: 8",                    // 12 & 10
-            "result NzNat: 14",                   // 12 | 10
-            "result NzNat: 24",                   // modExp(2, 10, 1000)
-            "result NzNat: 40",                   // 5 << 3
+            "result NzNat: 2",  // gcd(12, 18, 8)  — prefix N-ary folds to 1 rewrite
+            "result NzNat: 12", // lcm(4, 6)
+            "result NzNat: 3",  // min(3, 5)
+            "result NzNat: 5",  // max(3, 5)
+            "result NzNat: 5",  // sd(3, 8)
+            "result NzNat: 5",  // sd(8, 3)  — commutative
+            "result NzNat: 6",  // 5 xor 3
+            "result Zero: 0",   // 5 xor 5   — multiplicity cancels
+            "result NzNat: 8",  // 12 & 10
+            "result NzNat: 14", // 12 | 10
+            "result NzNat: 24", // modExp(2, 10, 1000)
+            "result NzNat: 40", // 5 << 3
             "result NzNat: 18446744073709551616", // 1 << 64  — bignum shift
-            "result NzNat: 5",                    // 40 >> 3
-            "result Bool: true",                  // 3 < 5
-            "result Bool: true",                  // 5 <= 5
-            "result Bool: true",                  // 7 > 2
-            "result Bool: false",                 // 2 >= 7
-            "result Bool: true",                  // 3 divides 12
+            "result NzNat: 5",  // 40 >> 3
+            "result Bool: true", // 3 < 5
+            "result Bool: true", // 5 <= 5
+            "result Bool: true", // 7 > 2
+            "result Bool: false", // 2 >= 7
+            "result Bool: true", // 3 divides 12
         ],
         "NAT values/sorts: {out}"
     );
@@ -793,7 +1011,10 @@ fn prelude_tier2_through_repl() {
     // COUNTER under `rewrite` yields 0, 1, 2 → 0 + 1 + 2 = 3 in 5 rewrites (3 counter steps + 2 ACU
     // folds) — the only multi-rewrite command here (the kind-sorted `[Float]`/`counter` results above
     // already attest the partial-op / inert-counter non-reductions).
-    assert!(out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5 in"), "counter: {out}");
+    assert!(
+        out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5 in"),
+        "counter: {out}"
+    );
 }
 
 /// The view-gap parser fix: a *parameterized* view declaration (`view V{X :: T} from T to M{X}`) and a
@@ -805,7 +1026,9 @@ fn prelude_tier2_through_repl() {
 /// separate Axis-A5 residual in `fable-audit.md`.)
 #[test]
 fn view_parameterized_through_repl() {
-    let out = repl().eval(conformance_file!("view-parameterized.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("view-parameterized.maude"))
+        .output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
         results,
@@ -824,7 +1047,9 @@ fn view_parameterized_through_repl() {
 /// fixed a Tier-2 regression where the `=[`-of-`_=[_]_` heuristic wrongly skipped a separator `= [`.)
 #[test]
 fn eq_bracket_rhs_through_repl() {
-    let out = repl().eval(conformance_file!("eq-bracket-rhs.maude")).output;
+    let out = repl()
+        .eval(conformance_file!("eq-bracket-rhs.maude"))
+        .output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
         results,
@@ -842,12 +1067,23 @@ fn eq_bracket_rhs_through_repl() {
 #[test]
 fn bad_view_reports_error_through_repl() {
     let mut r = repl();
-    assert!(!r.input_complete("view V from TRIV to NUM is\n"), "open view keeps buffering");
-    assert!(r.input_complete("view V from TRIV to NUM is endv\n"), "`endv` completes the submission");
+    assert!(
+        !r.input_complete("view V from TRIV to NUM is\n"),
+        "open view keeps buffering"
+    );
+    assert!(
+        r.input_complete("view V from TRIV to NUM is endv\n"),
+        "`endv` completes the submission"
+    );
     r.eval("fth TRIV is sort Elt . endfth");
     r.eval("fmod NUM is sort N . endfm");
-    let out = r.eval("view Bad from TRIV to NUM is sort Elt to NoSuch . endv").output;
-    assert!(out.contains("failed to find sort NoSuch in NUM"), "got: {out}");
+    let out = r
+        .eval("view Bad from TRIV to NUM is sort Elt to NoSuch . endv")
+        .output;
+    assert!(
+        out.contains("failed to find sort NoSuch in NUM"),
+        "got: {out}"
+    );
     // The session survives — a following module still enters.
     r.eval("fmod OK is sort Z . endfm");
     assert_eq!(r.current(), Some("OK"));
@@ -860,15 +1096,32 @@ fn bad_view_reports_error_through_repl() {
 /// none. (The dedup window is applied in `reduce_command`; forwarding makes the shared node reduce once.)
 #[test]
 fn sharing_through_repl() {
-    let out = repl().eval(conformance_file!("correctness-sharing.maude")).output;
-    assert!(out.contains("result P: < c, c >"), "deep shared chain: {out}");
-    assert!(out.contains("result P: < b, b >"), "free/rhs/triple dup: {out}");
-    assert!(out.contains("result P: < mkA, mkA >"), "mb on shared constant: {out}");
+    let out = repl()
+        .eval(conformance_file!("correctness-sharing.maude"))
+        .output;
+    assert!(
+        out.contains("result P: < c, c >"),
+        "deep shared chain: {out}"
+    );
+    assert!(
+        out.contains("result P: < b, b >"),
+        "free/rhs/triple dup: {out}"
+    );
+    assert!(
+        out.contains("result P: < mkA, mkA >"),
+        "mb on shared constant: {out}"
+    );
     assert!(out.contains("result L: b b b"), "AU triple share: {out}");
     assert!(out.contains("result E: b & b"), "CUI share: {out}");
     assert!(out.contains("result E: b + b"), "ACU share: {out}");
-    assert!(!out.contains("rewrites: 3"), "C7: no pre-fix over-count (f(a) was 3): {out}");
-    assert!(!out.contains("rewrites: 4"), "C7: no pre-fix over-count (chain/triple were 4): {out}");
+    assert!(
+        !out.contains("rewrites: 3"),
+        "C7: no pre-fix over-count (f(a) was 3): {out}"
+    );
+    assert!(
+        !out.contains("rewrites: 4"),
+        "C7: no pre-fix over-count (chain/triple were 4): {out}"
+    );
 }
 
 /// C13: a long result is line-wrapped through `eval` exactly as Maude's stdout wrapper (`auto_wrap`) —
@@ -880,14 +1133,27 @@ fn long_result_is_line_wrapped() {
     let mut r = repl();
     r.eval("fmod W is sort N . op z : -> N [ctor] . op s_ : N -> N [ctor] . endfm");
     let out = r.eval(&format!("red {}z .", "s ".repeat(40))).output;
-    assert!(out.contains("\n    s"), "a wrapped continuation line carries the 4-space indent: {out}");
+    assert!(
+        out.contains("\n    s"),
+        "a wrapped continuation line carries the 4-space indent: {out}"
+    );
     for line in out.lines() {
-        assert!(line.len() <= 79, "every line stays within 79 columns: {} cols in {line:?}", line.len());
+        assert!(
+            line.len() <= 79,
+            "every line stays within 79 columns: {} cols in {line:?}",
+            line.len()
+        );
     }
     // A short reduction is unaffected (no wrapping introduced).
     let short = r.eval("red s s z .").output;
-    assert!(short.contains("result N: s s z"), "short result rendered: {short}");
-    assert!(!short.contains("\n    "), "short result is not wrapped: {short}");
+    assert!(
+        short.contains("result N: s s z"),
+        "short result rendered: {short}"
+    );
+    assert!(
+        !short.contains("\n    "),
+        "short result is not wrapped: {short}"
+    );
 }
 
 /// The `match` command renders solutions (a commutative pattern → two pairings).
@@ -897,7 +1163,10 @@ fn match_command_through_repl() {
     r.eval("fmod M is sort E . ops a b : -> E . op g : E E -> E [comm] . vars X Y : E . endfm");
     let out = r.eval("match g(X, Y) <=? g(a, b) .").output;
     assert!(out.contains("match in M :"), "header: {out}");
-    assert!(out.contains("X --> a") && out.contains("X --> b"), "pairings: {out}");
+    assert!(
+        out.contains("X --> a") && out.contains("X --> b"),
+        "pairings: {out}"
+    );
 }
 
 /// `select` switches the current module; success is silent, an unknown module is reported.
@@ -908,14 +1177,23 @@ fn select_and_show() {
     r.eval("fmod B is sort SB . op b : -> SB [ctor] . endfm");
     assert_eq!(r.current(), Some("B"));
 
-    assert!(r.eval("select A .").output.is_empty(), "select success is silent");
+    assert!(
+        r.eval("select A .").output.is_empty(),
+        "select success is silent"
+    );
     assert_eq!(r.current(), Some("A"));
     assert!(r.eval("select NOPE .").output.contains("no module"));
 
     let mods = r.eval("show modules .").output;
-    assert!(mods.contains('A') && mods.contains('B'), "show modules: {mods}");
+    assert!(
+        mods.contains('A') && mods.contains('B'),
+        "show modules: {mods}"
+    );
     let sm = r.eval("show module .").output; // current = A
-    assert!(sm.contains("fmod A") && sm.contains("SA"), "show module: {sm}");
+    assert!(
+        sm.contains("fmod A") && sm.contains("SA"),
+        "show module: {sm}"
+    );
 }
 
 /// `quit`/`q`/`exit` signal exit.
@@ -931,8 +1209,13 @@ fn quit_exits() {
 /// An undefined import is reported (the REPL doesn't crash).
 #[test]
 fn unknown_import_reported() {
-    let out = repl().eval("fmod M is protecting NOPE . sort S . endfm").output;
-    assert!(out.contains("not defined") || out.contains("error"), "got: {out}");
+    let out = repl()
+        .eval("fmod M is protecting NOPE . sort S . endfm")
+        .output;
+    assert!(
+        out.contains("not defined") || out.contains("error"),
+        "got: {out}"
+    );
 }
 
 /// A Peano module (matches the reference binary's rendering exactly: `s_` mixfix, infix `_+_`).
@@ -949,7 +1232,11 @@ fn trace_shows_rewrite_steps() {
     );
     r.eval("set trace on .");
     let out = r.eval("red add(s(0), s(0)) .").output;
-    assert_eq!(out.matches("*********** equation").count(), 2, "two steps: {out}");
+    assert_eq!(
+        out.matches("*********** equation").count(),
+        2,
+        "two steps: {out}"
+    );
     assert!(out.contains("add(s(0), s(0))\n--->"), "first redex: {out}");
     assert!(out.contains("result N: s(s(0))"), "result: {out}");
 
@@ -995,15 +1282,24 @@ fn trace_substitution_and_whole_flags() {
     r.eval("set trace on .");
     r.eval("set trace substitution off .");
     let no_subst = r.eval("red s 0 + s 0 .").output;
-    assert!(no_subst.contains("*********** equation\neq N + s M = s (N + M) .\ns 0 + s 0\n--->"), "no subst: {no_subst}");
+    assert!(
+        no_subst.contains("*********** equation\neq N + s M = s (N + M) .\ns 0 + s 0\n--->"),
+        "no subst: {no_subst}"
+    );
     // The substitution `Var --> binding` lines are gone (the `--->` arrow is not a substitution line).
-    assert!(!no_subst.contains("N --> ") && !no_subst.contains("M --> "), "substitution lines dropped: {no_subst}");
+    assert!(
+        !no_subst.contains("N --> ") && !no_subst.contains("M --> "),
+        "substitution lines dropped: {no_subst}"
+    );
 
     r.eval("set trace substitution on .");
     r.eval("set trace whole on .");
     let whole = r.eval("red s 0 + s 0 .").output;
     // The second (inner) step rewrites `s 0 + 0`; its whole term is `s (s 0 + 0)` -> `s s 0`.
-    assert!(whole.contains("Old: s (s 0 + 0)\ns 0 + 0\n--->\ns 0\nNew: s s 0\n"), "whole inner step: {whole}");
+    assert!(
+        whole.contains("Old: s (s 0 + 0)\ns 0 + 0\n--->\ns 0\nNew: s s 0\n"),
+        "whole inner step: {whole}"
+    );
 }
 
 /// A conditional equation traces the whole sub-stream: `trial #1`, the `ceq … if …` body + the
@@ -1057,14 +1353,25 @@ fn trace_condition_off_and_backtrack() {
     r.eval("set trace on .");
     // Backtrack: trial #1 (first ceq) fails, trial #2 (second ceq) succeeds.
     let bt = r.eval("red max(s s z, s z) .").output;
-    assert!(bt.contains("*********** failure for condition fragment\nM <= N = tt\n*********** failure #1\n"), "failure: {bt}");
-    assert!(bt.contains("*********** trial #2\nceq max(M, N) = M if M <= N = ff ."), "trial #2: {bt}");
+    assert!(
+        bt.contains(
+            "*********** failure for condition fragment\nM <= N = tt\n*********** failure #1\n"
+        ),
+        "failure: {bt}"
+    );
+    assert!(
+        bt.contains("*********** trial #2\nceq max(M, N) = M if M <= N = ff ."),
+        "trial #2: {bt}"
+    );
 
     // condition off: the nested `_<=_` equation steps inside the condition disappear, scaffolding stays.
     r.eval("set trace condition off .");
     let off = r.eval("red max(s z, s s z) .").output;
     assert!(off.contains("*********** solving condition fragment\nM <= N = tt\n*********** success for condition fragment"), "scaffolding kept: {off}");
-    assert!(!off.contains("z <= s z\n--->"), "nested condition rewrites hidden: {off}");
+    assert!(
+        !off.contains("z <= s z\n--->"),
+        "nested condition rewrites hidden: {off}"
+    );
 }
 
 /// A membership axiom traces as a sort narrowing: `mb lhs : sort .` + substitution + `oldSort: term
@@ -1081,16 +1388,30 @@ fn trace_membership_and_cmb() {
     );
     r.eval("set trace on .");
     let out = r.eval("red g(g(a)) .").output;
-    assert!(out.contains("*********** membership axiom\nmb g(X) : B .\nX --> a\nA: g(a) becomes B\n"), "inner mb: {out}");
-    assert!(out.contains("*********** membership axiom\nmb g(g(X)) : C .\nX --> a\nA: g(g(a)) becomes C\n"), "outer mb: {out}");
+    assert!(
+        out.contains("*********** membership axiom\nmb g(X) : B .\nX --> a\nA: g(a) becomes B\n"),
+        "inner mb: {out}"
+    );
+    assert!(
+        out.contains(
+            "*********** membership axiom\nmb g(g(X)) : C .\nX --> a\nA: g(g(a)) becomes C\n"
+        ),
+        "outer mb: {out}"
+    );
     assert!(out.contains("result C:"), "result sort C: {out}");
 
     // `set trace whole on` adds the `Whole:` line — the full root term (`g(g(a))`) at each membership
     // application, for both the inner (`g(a) becomes B`) and outer (`g(g(a)) becomes C`) steps.
     r.eval("set trace whole on .");
     let whole = r.eval("red g(g(a)) .").output;
-    assert!(whole.contains("X --> a\nWhole: g(g(a))\nA: g(a) becomes B\n"), "inner mb Whole: {whole}");
-    assert!(whole.contains("X --> a\nWhole: g(g(a))\nA: g(g(a)) becomes C\n"), "outer mb Whole: {whole}");
+    assert!(
+        whole.contains("X --> a\nWhole: g(g(a))\nA: g(a) becomes B\n"),
+        "inner mb Whole: {whole}"
+    );
+    assert!(
+        whole.contains("X --> a\nWhole: g(g(a))\nA: g(g(a)) becomes C\n"),
+        "outer mb Whole: {whole}"
+    );
 }
 
 /// The command echo (`reduce in M : … .`) re-spaces the input tokens with Maude's rules — no space
@@ -1104,9 +1425,15 @@ fn command_echo_spacing() {
          op <_,_> : N N -> P [ctor] . var X : N . eq g(X) = X . endfm",
     );
     let nested = r.eval("red g(g(z)) .").output;
-    assert!(nested.contains("reduce in E : g(g(z)) ."), "nested-paren echo: {nested}");
+    assert!(
+        nested.contains("reduce in E : g(g(z)) ."),
+        "nested-paren echo: {nested}"
+    );
     let comma = r.eval("red < z, s z > .").output;
-    assert!(comma.contains("reduce in E : < z, s z > ."), "comma echo: {comma}");
+    assert!(
+        comma.contains("reduce in E : < z, s z > ."),
+        "comma echo: {comma}"
+    );
 }
 
 /// C9 / C10 / C11: the command echo prints the *normalized, pretty-printed* parsed term (Maude's
@@ -1120,7 +1447,10 @@ fn faithful_special_constant_echo() {
     let mut r = repl();
     r.eval(conformance_file!("correctness-float-print.maude")); // enters FLTB (+ runs its reds)
     let e = r.eval("red 100.0 * 100.0 .").output;
-    assert!(e.contains("reduce in FLTB : 1.0e+2 * 1.0e+2 ."), "float echo: {e}");
+    assert!(
+        e.contains("reduce in FLTB : 1.0e+2 * 1.0e+2 ."),
+        "float echo: {e}"
+    );
     assert!(e.contains("result Flt: 1.0e+4"), "float result: {e}");
 
     // C11 — a rational echo is the compact `num/den`; a `0/N` (Zero numerator) is not a rational, so it
@@ -1131,19 +1461,31 @@ fn faithful_special_constant_echo() {
     assert!(q.contains("reduce in RATB : 6/4 ."), "rational echo: {q}");
     assert!(q.contains("result NzRat: 3/2"), "rational result: {q}");
     let z = r.eval("red 0 / 5 .").output;
-    assert!(z.contains("reduce in RATB : 0 / 5 ."), "0/N stays spaced: {z}");
+    assert!(
+        z.contains("reduce in RATB : 0 / 5 ."),
+        "0/N stays spaced: {z}"
+    );
 
     // C10 — a glued `-7` echoes compactly and reduces; a spaced `- 3` also echoes the compact `-3`; and
     // `5 -7` fails to parse, exactly as the reference binary rejects it.
     let mut r = repl();
     r.eval(conformance_file!("correctness-glued-minus.maude")); // enters INTB
     let g = r.eval("red -7 quo 2 .").output;
-    assert!(g.contains("reduce in INTB : -7 quo 2 ."), "glued-minus echo: {g}");
+    assert!(
+        g.contains("reduce in INTB : -7 quo 2 ."),
+        "glued-minus echo: {g}"
+    );
     assert!(g.contains("result NzInt: -3"), "glued-minus result: {g}");
     let s = r.eval("red - 3 .").output;
-    assert!(s.contains("reduce in INTB : -3 ."), "spaced minus echoes compact: {s}");
+    assert!(
+        s.contains("reduce in INTB : -3 ."),
+        "spaced minus echoes compact: {s}"
+    );
     let bad = r.eval("red 5 -7 .").output;
-    assert!(bad.contains("no parse"), "`5 -7` is rejected like the binary: {bad}");
+    assert!(
+        bad.contains("no parse"),
+        "`5 -7` is rejected like the binary: {bad}"
+    );
 }
 
 /// Multi-fragment `:=` backtracking: when the search backtracks *through* a deterministic fragment
@@ -1172,7 +1514,10 @@ fn trace_multi_fragment_backtrack_resolves_deterministic() {
         ),
         "deterministic re-solve on backtrack:\n{out}"
     );
-    assert!(out.contains("result E: c"), "result (a ; b -> X, c -> Y): {out}");
+    assert!(
+        out.contains("result E: c"),
+        "result (a ; b -> X, c -> Y): {out}"
+    );
 }
 
 /// Drive a multi-submission session the way the binary's stdin loop does (main.rs): buffer lines until
@@ -1213,7 +1558,10 @@ fn trace_fixtures_run_through_repl() {
     );
 
     let bi = run_session(conformance_file!("trace-builtin.maude"));
-    assert!(bi.contains("(built-in equation for symbol _+_)\n2 + 3\n--->\n5\n"), "trace-builtin:\n{bi}");
+    assert!(
+        bi.contains("(built-in equation for symbol _+_)\n2 + 3\n--->\n5\n"),
+        "trace-builtin:\n{bi}"
+    );
 
     let mb = run_session(conformance_file!("trace-membership.maude"));
     assert!(
@@ -1222,7 +1570,10 @@ fn trace_fixtures_run_through_repl() {
     );
 
     let cond = run_session(conformance_file!("trace-conditional.maude"));
-    assert!(cond.contains("*********** trial #1\nceq max(M, N) = N if M <= N = tt ."), "trial #1:\n{cond}");
+    assert!(
+        cond.contains("*********** trial #1\nceq max(M, N) = N if M <= N = tt ."),
+        "trial #1:\n{cond}"
+    );
     assert!(
         cond.contains("*********** failure #1") && cond.contains("*********** trial #2"),
         "backtrack #1->#2:\n{cond}"
@@ -1251,9 +1602,18 @@ fn traced_rewrite_renders_rule_blocks() {
          set trace on .\n\
          rewrite a .",
     );
-    assert!(s.contains("*********** rule\nrl a => b .\nempty substitution\na\n--->\nb"), "rule block 1:\n{s}");
-    assert!(s.contains("*********** rule\nrl b => c .\nempty substitution\nb\n--->\nc"), "rule block 2:\n{s}");
-    assert!(s.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "tail:\n{s}");
+    assert!(
+        s.contains("*********** rule\nrl a => b .\nempty substitution\na\n--->\nb"),
+        "rule block 1:\n{s}"
+    );
+    assert!(
+        s.contains("*********** rule\nrl b => c .\nempty substitution\nb\n--->\nc"),
+        "rule block 2:\n{s}"
+    );
+    assert!(
+        s.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"),
+        "tail:\n{s}"
+    );
 }
 
 /// Pillar A-ii: `frewrite` (position-fair) + frozen arguments, byte-matching the reference
@@ -1294,12 +1654,29 @@ fn traced_crl_backtrack() {
          set trace on .\n\
          rewrite f(b) .",
     );
-    assert!(s.contains("*********** trial #1\ncrl f(X) => g(X) if X = a .\nX --> b"), "trial #1:\n{s}");
-    assert!(s.contains("*********** failure for condition fragment\nX = a"), "fragment failure:\n{s}");
+    assert!(
+        s.contains("*********** trial #1\ncrl f(X) => g(X) if X = a .\nX --> b"),
+        "trial #1:\n{s}"
+    );
+    assert!(
+        s.contains("*********** failure for condition fragment\nX = a"),
+        "fragment failure:\n{s}"
+    );
     assert!(s.contains("*********** failure #1"), "trial #1 fails:\n{s}");
-    assert!(s.contains("*********** trial #2\ncrl f(X) => h(Y) if Y := X ."), "trial #2:\n{s}");
-    assert!(s.contains("*********** success #2"), "trial #2 succeeds:\n{s}");
-    assert!(s.contains("*********** rule\ncrl f(X) => h(Y) if Y := X .\nX --> b\nY --> b\nf(b)\n--->\nh(b)"), "rule fires:\n{s}");
+    assert!(
+        s.contains("*********** trial #2\ncrl f(X) => h(Y) if Y := X ."),
+        "trial #2:\n{s}"
+    );
+    assert!(
+        s.contains("*********** success #2"),
+        "trial #2 succeeds:\n{s}"
+    );
+    assert!(
+        s.contains(
+            "*********** rule\ncrl f(X) => h(Y) if Y := X .\nX --> b\nY --> b\nf(b)\n--->\nh(b)"
+        ),
+        "rule fires:\n{s}"
+    );
 }
 
 /// Pillar A-iv: `search` over the state-transition graph, byte-matching the reference
@@ -1336,10 +1713,15 @@ fn search_show_path_and_graph() {
         "show path:\n{s}"
     );
     assert!(
-        s.contains("state 0, St: a\narc 0 ===> state 1 (rl a => b .)\narc 1 ===> state 2 (rl a => c .)"),
+        s.contains(
+            "state 0, St: a\narc 0 ===> state 1 (rl a => b .)\narc 1 ===> state 2 (rl a => c .)"
+        ),
         "show graph state 0:\n{s}"
     );
-    assert!(s.contains("state 3, St: d\narc 0 ===> state 4 (rl d => e .)"), "show graph state 3:\n{s}");
+    assert!(
+        s.contains("state 3, St: d\narc 0 ===> state 4 (rl d => e .)"),
+        "show graph state 3:\n{s}"
+    );
 }
 
 /// Pillar A-v: the rewrite-condition fragment `crl ... if t => p` (a nested =>* reachability search),
@@ -1368,8 +1750,14 @@ fn rewrite_condition_dropped_in_equation() {
     let out = repl()
         .eval("fmod E is sort S . ops a b : -> S . var X : S . ceq a = b if X => b . endfm\nreduce a .")
         .output;
-    assert!(out.contains("result S: a"), "module usable, bad ceq dropped: {out}");
-    assert!(!out.contains("result S: b"), "the dropped ceq must not fire: {out}");
+    assert!(
+        out.contains("result S: a"),
+        "module usable, bad ceq dropped: {out}"
+    );
+    assert!(
+        !out.contains("result S: b"),
+        "the dropped ceq must not fire: {out}"
+    );
 }
 
 /// On-the-fly colon variables `X:Sort` (one token) parse anywhere a term is expected — in an `eq`
@@ -1383,12 +1771,25 @@ fn on_the_fly_colon_variables() {
          op dbl : Nat -> Nat . vars M N : Nat . eq N + z = N . eq N + s M = s (N + M) . \
          eq dbl(N:Nat) = N:Nat + N:Nat . endfm",
     );
-    assert!(r.eval("red dbl(s s z) .").output.contains("result Nat: s s s s z"), "on-the-fly var in an eq");
-    assert!(r.eval("match X:Nat <=? s z .").output.contains("X:Nat --> s z"), "on-the-fly var in match, with sort");
+    assert!(
+        r.eval("red dbl(s s z) .")
+            .output
+            .contains("result Nat: s s s s z"),
+        "on-the-fly var in an eq"
+    );
+    assert!(
+        r.eval("match X:Nat <=? s z .")
+            .output
+            .contains("X:Nat --> s z"),
+        "on-the-fly var in match, with sort"
+    );
     // …and in a system module's search goal.
     r.eval("mod S is sort T . ops p q : -> T . rl p => q . endm");
     let s = r.eval("search p =>1 Y:T .").output;
-    assert!(s.contains("Y:T --> q"), "on-the-fly var in a search goal:\n{s}");
+    assert!(
+        s.contains("Y:T --> q"),
+        "on-the-fly var in a search goal:\n{s}"
+    );
 }
 
 /// A rule in a functional module (`fmod`) is rejected — rules belong only to system modules (`mod`).
@@ -1397,7 +1798,10 @@ fn rule_in_fmod_is_rejected() {
     let out = repl()
         .eval("fmod F is sort S . ops a b : -> S . rl a => b . endfm")
         .output;
-    assert!(out.contains("not allowed in a functional module"), "rejection: {out}");
+    assert!(
+        out.contains("not allowed in a functional module"),
+        "rejection: {out}"
+    );
 }
 
 /// A single `eval` of a file that mixes a module, a `set trace on .` meta-command, and a traced command
@@ -1412,8 +1816,14 @@ fn eval_mixed_file_with_meta_commands() {
              rewrite a .",
         )
         .output;
-    assert!(out.contains("*********** rule\nrl a => b ."), "traced rule from a one-shot file load:\n{out}");
-    assert!(out.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "result:\n{out}");
+    assert!(
+        out.contains("*********** rule\nrl a => b ."),
+        "traced rule from a one-shot file load:\n{out}"
+    );
+    assert!(
+        out.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"),
+        "result:\n{out}"
+    );
 }
 
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
@@ -1422,8 +1832,14 @@ fn eval_mixed_file_with_meta_commands() {
 fn input_complete_boundaries() {
     let mut r = repl();
     assert!(r.input_complete("red x ."), "command terminator");
-    assert!(r.input_complete("fmod M is sort S . endfm"), "closed module");
-    assert!(!r.input_complete("fmod M is sort S ."), "open module body keeps buffering");
+    assert!(
+        r.input_complete("fmod M is sort S . endfm"),
+        "closed module"
+    );
+    assert!(
+        !r.input_complete("fmod M is sort S ."),
+        "open module body keeps buffering"
+    );
     assert!(!r.input_complete("red x"), "no terminator");
     assert!(r.input_complete("quit"), "bare quit");
     assert!(r.input_complete("q"), "bare q");
@@ -1441,7 +1857,10 @@ fn objects_outcomes(out: &str) -> Vec<String> {
     let mut lines = out.lines().peekable();
     let mut keep = Vec::new();
     while let Some(line) = lines.next() {
-        if matches!(line.split(' ').next(), Some("rewrite" | "reduce" | "search" | "erewrite")) {
+        if matches!(
+            line.split(' ').next(),
+            Some("rewrite" | "reduce" | "search" | "erewrite")
+        ) {
             // Skip the echo block: this line plus continuations, through the trailing ` .`.
             let mut l = line;
             while !l.trim_end().ends_with('.') {
@@ -1468,7 +1887,10 @@ fn objects_outcomes(out: &str) -> Vec<String> {
 #[test]
 fn objects_through_repl() {
     let out = repl().eval(conformance_file!("objects.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "objects build: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "objects build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1526,7 +1948,10 @@ fn objects_io_through_repl() {
     let mut r = repl();
     r.set_stdin("one\ntwo\n"); // piped stdin for ECHO's getLine
     let out = r.eval(conformance_file!("objects-io.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "io build: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "io build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1565,7 +1990,10 @@ fn objects_io_through_repl() {
 #[test]
 fn objects_omod_through_repl() {
     let out = repl().eval(conformance_file!("objects-omod.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "omod build: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "omod build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1606,8 +2034,13 @@ fn objects_omod_through_repl() {
 /// Byte-identical to `~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-attrs.maude`.
 #[test]
 fn objects_omod_attrs_through_repl() {
-    let out = repl().eval(conformance_file!("objects-omod-attrs.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "omod-attrs build: {out}");
+    let out = repl()
+        .eval(conformance_file!("objects-omod-attrs.maude"))
+        .output;
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "omod-attrs build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1631,8 +2064,13 @@ fn objects_omod_attrs_through_repl() {
 /// (`~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-multi.maude`).
 #[test]
 fn objects_omod_multi_through_repl() {
-    let out = repl().eval(conformance_file!("objects-omod-multi.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "multi build: {out}");
+    let out = repl()
+        .eval(conformance_file!("objects-omod-multi.maude"))
+        .output;
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "multi build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1656,7 +2094,10 @@ fn objects_omod_multi_through_repl() {
 #[test]
 fn objects_oth_through_repl() {
     let out = repl().eval(conformance_file!("objects-oth.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "oth build: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "oth build: {out}"
+    );
     assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         objects_outcomes(&out),
@@ -1698,10 +2139,19 @@ fn objects_omod_meta_through_repl() {
             "'<_:_|_>['a.Oid, 'Account.Account, 'bal`:_['0.Zero]]], unbounded) .\n",
         ))
         .output;
-    assert!(!out.contains("no parse") && !out.contains("error"), "omod meta: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error"),
+        "omod meta: {out}"
+    );
     // upModule: the message op is `[ctor msg]`, the attribute op is spelled with the backtick-blank.
-    assert!(out.contains("op 'credit : 'Oid 'Nat -> 'Msg [ctor msg] ."), "upModule [ctor msg]: {out}");
-    assert!(out.contains("op 'bal`:_ : 'Nat -> 'Attribute [ctor gather('&)] ."), "attr op name: {out}");
+    assert!(
+        out.contains("op 'credit : 'Oid 'Nat -> 'Msg [ctor msg] ."),
+        "upModule [ctor msg]: {out}"
+    );
+    assert!(
+        out.contains("op 'bal`:_ : 'Nat -> 'Attribute [ctor gather('&)] ."),
+        "attr op name: {out}"
+    );
     // metaRewrite: credit delivered, balance 0 -> 5, attribute op spelled `` 'bal`:_ `` in the result.
     assert!(
         out.contains("'bal`:_['s_^5["),
@@ -1731,14 +2181,23 @@ fn objects_oth_meta_through_repl() {
             "red in META-LEVEL : upModule('OT, false) .\n",
         ))
         .output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "oth meta: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "oth meta: {out}"
+    );
     // The oth up-translates to a `th` (theory), and its rule is completed and shown.
-    assert!(out.contains("th 'OT is"), "oth up-translates to a theory: {out}");
+    assert!(
+        out.contains("th 'OT is"),
+        "oth up-translates to a theory: {out}"
+    );
     // The rule is object-pattern-completed: class constant -> fresh `'V:Acct`, a fresh attribute-set
     // variable `'Atts:AttributeSet`, and the attribute op spelled with the backtick-blank. (The full rule
     // wraps at 80 columns, so assert the individual completion markers.)
     for marker in ["'V:Acct", "'Atts:AttributeSet", "'bal`:_[", "[label('cr)]"] {
-        assert!(out.contains(marker), "oth rule missing completion marker `{marker}`: {out}");
+        assert!(
+            out.contains(marker),
+            "oth rule missing completion marker `{marker}`: {out}"
+        );
     }
 }
 
@@ -1786,17 +2245,31 @@ fn meta_nonexec_up_through_repl() {
             "red in META-LEVEL : upRls('RLX, false) .\n",
         ))
         .output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "nonexec up: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "nonexec up: {out}"
+    );
     // The nonexec eq is retained with `[nonexec label('gx)]`, in declaration order after the exec `[none]`.
     assert!(
-        out.contains("eq 'f['X:Elt] = 'X:Elt [none] .\neq 'g['X:Elt] = 'X:Elt [nonexec label('gx)] ."),
+        out.contains(
+            "eq 'f['X:Elt] = 'X:Elt [none] .\neq 'g['X:Elt] = 'X:Elt [nonexec label('gx)] ."
+        ),
         "nonexec eq retained in declaration order: {out}"
     );
     // An executable equation's own `[label]` is retained.
-    assert!(out.contains("eq 'f['X:S] = 'X:S [label('fx)] ."), "executable eq label: {out}");
+    assert!(
+        out.contains("eq 'f['X:S] = 'X:S [label('fx)] ."),
+        "executable eq label: {out}"
+    );
     // Nonexec memberships (plain + conditional) retained with their labels.
-    assert!(out.contains("mb 'a.S : 'T [nonexec label('mbax)] ."), "nonexec mb: {out}");
-    assert!(out.contains("cmb 'p['X:S] : 'T if 'X:S : 'T [nonexec label('cmbax)] ."), "nonexec cmb: {out}");
+    assert!(
+        out.contains("mb 'a.S : 'T [nonexec label('mbax)] ."),
+        "nonexec mb: {out}"
+    );
+    assert!(
+        out.contains("cmb 'p['X:S] : 'T if 'X:S : 'T [nonexec label('cmbax)] ."),
+        "nonexec cmb: {out}"
+    );
     // Nonexec rule retained (with its label), then the executable rule as `[none]`, in declaration order.
     assert!(
         out.contains("rl 'f['X:S] => 'X:S [nonexec label('rax)] .\nrl 'f['a.S] => 'b.S [none] ."),
@@ -1813,11 +2286,23 @@ fn meta_nonexec_up_through_repl() {
 #[test]
 fn multitoken_op_through_repl() {
     let out = repl().eval(conformance_file!("multitoken-op.maude")).output;
-    assert!(!out.contains("no parse") && !out.contains("error"), "multitoken op: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error"),
+        "multitoken op: {out}"
+    );
     assert!(out.contains("result S: a b"), "2-token constant: {out}");
-    assert!(out.contains("result S: c d a b"), "mixfix over a 2-token arg: {out}");
-    assert!(out.contains("result S: a b e f a b"), "infix with multiple literals: {out}");
-    assert!(out.contains("result S: done[done]"), "escaped-bracket op still works: {out}");
+    assert!(
+        out.contains("result S: c d a b"),
+        "mixfix over a 2-token arg: {out}"
+    );
+    assert!(
+        out.contains("result S: a b e f a b"),
+        "infix with multiple literals: {out}"
+    );
+    assert!(
+        out.contains("result S: done[done]"),
+        "escaped-bracket op still works: {out}"
+    );
     // `g(a b) = done` fires over a multi-token subterm, via BOTH the space and backquote forms.
     assert_eq!(
         out.matches("result S: done\n").count(),
@@ -1847,11 +2332,442 @@ fn multitoken_op_meta_through_repl() {
             "red in META-LEVEL : metaReduce(upModule('MT, false), 'c`d_['a`b.S]) .\n",
         ))
         .output;
-    assert!(!out.contains("no parse") && !out.contains("error in module"), "multitoken meta: {out}");
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "multitoken meta: {out}"
+    );
     // upModule spells the blank as a backquote in each op's name.
-    assert!(out.contains("op 'a`b : nil -> 'S [ctor] ."), "up: 2-token constant name: {out}");
-    assert!(out.contains("op 'c`d_ : 'S -> 'S [none] ."), "up: mixfix name: {out}");
+    assert!(
+        out.contains("op 'a`b : nil -> 'S [ctor] ."),
+        "up: 2-token constant name: {out}"
+    );
+    assert!(
+        out.contains("op 'c`d_ : 'S -> 'S [none] ."),
+        "up: mixfix name: {out}"
+    );
     // metaReduce down-translates the backquote Qid and reduces `c d (a b)` to `z`.
-    assert!(out.contains("result ResultPair: {'z.S, 'S}"), "down: metaReduce over a backquote Qid: {out}");
+    assert!(
+        out.contains("result ResultPair: {'z.S, 'S}"),
+        "down: metaReduce over a backquote Qid: {out}"
+    );
 }
 
+/// A signature-owned compound identity survives the complete metalevel module round-trip. `upModule`
+/// emits the identity as a structural meta-term, and feeding that module directly to `metaReduce`
+/// down-translates the identity against the rebuilt target symbols so construction collapses it. Exact
+/// shapes and rewrite count were transcribed from Maude 3.5.1.
+#[test]
+fn compound_identity_meta_roundtrip_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "fmod ID-META is\n",
+            "  sort S .\n",
+            "  ops a b : -> S [ctor] .\n",
+            "  op pair : S S -> S [ctor] .\n",
+            "  op join : S S -> S [assoc id: pair(a,b)] .\n",
+            "endfm\n",
+            "red in META-LEVEL : upModule('ID-META, false) .\n",
+            "red in META-LEVEL : metaReduce(upModule('ID-META, false), ",
+            "'join['pair['a.S, 'b.S], 'a.S]) .\n",
+        ))
+        .output;
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "compound id meta: {out}"
+    );
+    assert!(
+        out.contains("op 'join : 'S 'S -> 'S [assoc id('pair['a.S, 'b.S])] ."),
+        "upModule structural identity: {out}"
+    );
+    assert!(
+        out.contains("rewrites: 2") && out.contains("result ResultPair: {'a.S, 'S}"),
+        "down-translated identity collapse: {out}"
+    );
+}
+
+/// Down-module identity leaves retain their meta-term sort qualification rather than collapsing to a
+/// constant spelling. The two `a` declarations share one connected component, so `(a).S` is load-bearing
+/// when `upModule` is rebuilt as the target signature.
+#[test]
+fn overloaded_constant_identity_meta_roundtrip_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "fmod ID-META-OVERLOAD is\n",
+            "  sorts S U . subsort U < S .\n",
+            "  op a : -> S [ctor] .\n",
+            "  op a : -> U [ctor] .\n",
+            "  op b : -> S [ctor] .\n",
+            "  op pair : S S -> S [ctor] .\n",
+            "  op join : S S -> S [assoc id: pair((a).S,b)] .\n",
+            "endfm\n",
+            "red in META-LEVEL : metaReduce(upModule('ID-META-OVERLOAD, false), ",
+            "'join['pair['a.S, 'b.S], 'b.S]) .\n",
+        ))
+        .output;
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "qualified id meta: {out}"
+    );
+    assert!(
+        out.contains("rewrites: 2") && out.contains("result ResultPair: {'b.S, 'S}"),
+        "qualified overload identity collapse: {out}"
+    );
+}
+
+/// The same metalevel identity path stays compact for an iterated million-count subterm: neither
+/// `upModule` nor rebuilding its `id(...)` expands the static term into a recursive unary chain.
+#[test]
+fn compact_iter_identity_meta_roundtrip_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "fmod ID-META-ITER is\n",
+            "  sort S .\n",
+            "  op a : -> S [ctor] .\n",
+            "  op g : S -> S [ctor iter] .\n",
+            "  op f : S -> S .\n",
+            "  op join : S S -> S [assoc id: g^1000000(a)] .\n",
+            "  eq f(g^1000000(a)) = a .\n",
+            "endfm\n",
+            "red in META-LEVEL : upModule('ID-META-ITER, false) .\n",
+            "red in META-LEVEL : metaReduce(upModule('ID-META-ITER, false), ",
+            "'join['g^1000000['a.S], 'a.S]) .\n",
+            "red in META-LEVEL : metaReduce(upModule('ID-META-ITER, false), ",
+            "'f['g^1000000['a.S]]) .\n",
+        ))
+        .output;
+    assert!(
+        !out.contains("no parse") && !out.contains("error in module"),
+        "compact id meta: {out}"
+    );
+    assert!(
+        out.contains("id('g^1000000['a.S])"),
+        "upModule preserves the compact compound identity: {out}"
+    );
+    assert!(
+        out.contains("rewrites: 2") && out.contains("result ResultPair: {'a.S, 'S}"),
+        "down-translated compact identity collapse: {out}"
+    );
+    assert!(
+        out.contains("rewrites: 3"),
+        "inline equation's compact static Term::Iter down/up path: {out}"
+    );
+}
+
+fn variant_sequence_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            if let Some(rest) = line.strip_prefix("rewrites: ") {
+                return Some(format!(
+                    "rewrites: {}",
+                    rest.split_whitespace().next().unwrap_or("?")
+                ));
+            }
+            [
+                "get variants",
+                "variant unify",
+                "variant match",
+                "Variant ",
+                "Unifier ",
+                "Matcher ",
+                "S:",
+                "X -->",
+                "Y -->",
+                "Z -->",
+                "No more ",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+            .then(|| line.to_string())
+        })
+        .collect()
+}
+
+fn one_rewrite_count(output: &str) -> u64 {
+    output
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("rewrites: ")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("missing rewrite count in: {output}"))
+}
+
+const META_VARIANT_XOR: &str = r#"
+set show timing off .
+fmod XOR is
+  sort XOR .
+  sort Elem .
+  ops cst1 cst2 cst3 cst4 : -> Elem .
+  subsort Elem < XOR .
+  op _+_ : XOR XOR -> XOR [ctor assoc comm] .
+  op 0 : -> XOR .
+  vars X Y : XOR .
+  eq Y + 0 = Y [variant] .
+  eq X + X = 0 [variant] .
+  eq X + X + Y = Y [variant] .
+endfm
+fmod META-TEST is
+  inc XOR .
+  inc META-LEVEL .
+endfm
+"#;
+
+fn meta_variant_repl() -> Repl {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(
+        !prelude.contains("error in module") && !prelude.contains("no parse"),
+        "meta prelude: {prelude}"
+    );
+    let setup = r.eval(META_VARIANT_XOR).output;
+    assert!(
+        !setup.contains("error in module") && !setup.contains("no parse"),
+        "variant meta setup: {setup}"
+    );
+    r
+}
+
+/// Oracle sequence from Maude 3.5.1: this pins incremental numbering, the `%` family layer,
+/// continuation state, plain variant-unifier order, and complete variant matching end to end.
+#[test]
+fn variant_sequences_and_continuation_match_oracle() {
+    let mut r = repl();
+    r.eval(
+        r#"
+fmod IDEM is
+  sort S .
+  ops a b c : -> S .
+  op _*_ : S S -> S [assoc comm] .
+  vars X Y : S .
+  eq X * X = X [variant] .
+endfm
+"#,
+    );
+    let mut output = r.eval("get variants [1] X * Y .").output;
+    output.push('\n');
+    output.push_str(&r.eval("continue 1 .").output);
+    output.push('\n');
+    output.push_str(&r.eval("continue 1 .").output);
+    output.push('\n');
+    output.push_str(&r.eval("variant unify X * a =? Y * b .").output);
+
+    r.eval(
+        r#"
+fmod FOO is
+  sort Foo .
+  ops f g : Foo Foo -> Foo .
+  op 1f : -> Foo .
+  ops x y z : -> Foo .
+  vars X Y Z : Foo .
+  eq f(X, 1f) = X [variant] .
+  eq f(1f, X) = X [variant] .
+endfm
+"#,
+    );
+    output.push('\n');
+    output.push_str(
+        &r.eval("variant match f(X, g(Y, Z)) <=? f(X, g(Y, Z)) .")
+            .output,
+    );
+
+    assert_eq!(
+        variant_sequence_lines(&output),
+        [
+            "get variants [1] in IDEM : X * Y .",
+            "Variant 1",
+            "rewrites: 0",
+            "S: #1:S * #2:S",
+            "X --> #1:S",
+            "Y --> #2:S",
+            "Variant 2",
+            "rewrites: 1",
+            "S: %1:S",
+            "X --> %1:S",
+            "Y --> %1:S",
+            "No more variants.",
+            "rewrites: 0",
+            "variant unify in IDEM : X * a =? Y * b .",
+            "Unifier 1",
+            "rewrites: 2",
+            "X --> b * %1:S",
+            "Y --> a * %1:S",
+            "Unifier 2",
+            "rewrites: 2",
+            "X --> b",
+            "Y --> a",
+            "No more unifiers.",
+            "rewrites: 4",
+            "variant match in FOO : f(X, g(Y, Z)) <=? f(X, g(Y, Z)) .",
+            "rewrites: 1",
+            "Matcher 1",
+            "X --> X",
+            "Y --> Y",
+            "Z --> Z",
+            "No more matchers.",
+        ]
+        .map(str::to_string)
+    );
+}
+
+/// Oracle-indexed cache sequences from Maude 3.5.1. Besides the returned variants/unifiers/matcher,
+/// the counts distinguish forward resume, equal-index reuse, backward restart, terminal-state deletion,
+/// and exact four-entry MRU eviction; recomputing every request or retaining all historical answers fails.
+#[test]
+fn meta_variant_index_cache_matches_oracle() {
+    let mut get = meta_variant_repl();
+    let get_command =
+        |n| format!("red metaGetVariant(['XOR], upTerm(X:XOR + cst1), empty, '#, {n}) .");
+    let get_outputs: Vec<String> = [0, 1, 1, 0, 1, 2, 3]
+        .into_iter()
+        .map(|n| get.eval(&get_command(n)).output)
+        .collect();
+    assert_eq!(
+        get_outputs
+            .iter()
+            .map(|out| one_rewrite_count(out))
+            .collect::<Vec<_>>(),
+        [3, 6, 3, 3, 6, 3, 3]
+    );
+    assert!(
+        get_outputs[0].contains(
+            "result Variant: {'_+_['cst1.Elem, '%1:XOR], \n  'X:XOR <- '%1:XOR, '%, (none).Parent, false}"
+        ),
+        "initial tuple: {}",
+        get_outputs[0]
+    );
+    assert!(
+        get_outputs[1]
+            .contains("result Variant: {'cst1.Elem, \n  'X:XOR <- '0.XOR, '@, (0).Zero, true}"),
+        "first child tuple: {}",
+        get_outputs[1]
+    );
+    assert!(
+        get_outputs[6].contains(
+            "result Variant: {'@1:XOR, \n  'X:XOR <- '_+_['cst1.Elem, '@1:XOR], '@, (0).Zero, false}"
+        ),
+        "last layer tuple: {}",
+        get_outputs[6]
+    );
+
+    let mut capacity = meta_variant_repl();
+    let capacity_requests = [
+        ("cst1", "#"),
+        ("cst2", "#"),
+        ("cst3", "#"),
+        ("cst4", "#"),
+        ("cst1", "#"),
+        ("cst1", "@"),
+        ("cst2", "#"),
+        ("cst1", "#"),
+    ];
+    let capacity_counts: Vec<_> = capacity_requests
+        .into_iter()
+        .map(|(constant, family)| {
+            let command = format!(
+                "red metaGetVariant(['XOR], upTerm(X:XOR + {constant}), empty, '{family}, 1) ."
+            );
+            one_rewrite_count(&capacity.eval(&command).output)
+        })
+        .collect();
+    assert_eq!(capacity_counts, [6, 6, 6, 6, 3, 6, 6, 3]);
+
+    let mut unify = meta_variant_repl();
+    let unify_command = |n| {
+        format!(
+            "red metaVariantUnify(['XOR], upTerm(X:XOR + cst1) =? \
+             upTerm(Y:XOR + cst2), empty, '#, none, {n}) ."
+        )
+    };
+    let unify_outputs: Vec<String> = [0, 1, 1, 0, 1]
+        .into_iter()
+        .map(|n| unify.eval(&unify_command(n)).output)
+        .collect();
+    assert_eq!(
+        unify_outputs
+            .iter()
+            .map(|out| one_rewrite_count(out))
+            .collect::<Vec<_>>(),
+        [10, 4, 4, 10, 4]
+    );
+    assert!(
+        unify_outputs[0].contains(
+            "'X:XOR <- '_+_['cst2.Elem, '@1:XOR] ; \n  'Y:XOR <- '_+_['cst1.Elem, '@1:XOR], '@}"
+        ),
+        "first meta unifier: {}",
+        unify_outputs[0]
+    );
+    assert!(
+        unify_outputs[1].contains("'X:XOR <- 'cst2.Elem ; \n  'Y:XOR <- 'cst1.Elem, '@}"),
+        "second meta unifier: {}",
+        unify_outputs[1]
+    );
+
+    let match_command = |n| {
+        format!(
+            "red metaVariantMatch(['XOR], upTerm(cst1 + X:XOR) <=? \
+             upTerm(cst2 + Y:XOR), empty, '#, none, {n}) ."
+        )
+    };
+    let match_outputs: Vec<String> = [0, 1, 1, 0, 1]
+        .into_iter()
+        .map(|n| unify.eval(&match_command(n)).output)
+        .collect();
+    assert_eq!(
+        match_outputs
+            .iter()
+            .map(|out| one_rewrite_count(out))
+            .collect::<Vec<_>>(),
+        [7, 4, 7, 7, 4]
+    );
+    assert!(
+        match_outputs[0].contains("'X:XOR <- '_+_['cst1.Elem, 'cst2.Elem, 'Y:XOR]"),
+        "meta matcher: {}",
+        match_outputs[0]
+    );
+    assert!(
+        match_outputs[1].contains("result Substitution?: (noMatch).Substitution?"),
+        "terminal meta match: {}",
+        match_outputs[1]
+    );
+}
+
+/// Maude 3.5.1 returns `noUnifierIncomplete` after the two reported associative unifiers; exhaustion
+/// must preserve the unifier's incompleteness bit rather than silently returning plain `noUnifier`.
+#[test]
+fn meta_variant_incomplete_result_matches_oracle() {
+    let mut r = meta_variant_repl();
+    let output = r
+        .eval(
+            r#"
+fmod A-UNIF is
+  sorts List Elt .
+  subsort Elt < List .
+  op __ : List List -> List [assoc] .
+  ops a b c : -> Elt .
+  vars A B C : List .
+endfm
+fmod META-A-TEST is
+  inc A-UNIF .
+  inc META-LEVEL .
+endfm
+red metaVariantUnify(['A-UNIF], upTerm(A:List B:List) =?
+    upTerm(B:List C:List), empty, '%, none, 2) .
+"#,
+        )
+        .output;
+    assert_eq!(one_rewrite_count(&output), 4, "oracle count: {output}");
+    assert!(
+        output.contains("result UnificationPair?: (noUnifierIncomplete).UnificationPair?"),
+        "associative incompleteness: {output}"
+    );
+}

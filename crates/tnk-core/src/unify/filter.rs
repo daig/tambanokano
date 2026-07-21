@@ -18,9 +18,10 @@ use crate::fresh::VariableFamily;
 use crate::num::Nat;
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
+use crate::term::Term;
 
 use super::problem::{UnifyProblem, VarSpec};
-use super::{is_ground, NameCodes, UnifyEnv};
+use super::{NameCodes, UnifyEnv, is_ground};
 
 /// Apply the irredundant filter to `unifiers` (each the interesting-variable bindings in slot order,
 /// as produced by [`UnifyProblem::find_next`]) and return the most-general subset, in enumeration
@@ -66,24 +67,105 @@ impl NameCodes for ScratchNames {
 /// Whether `retained` subsumes `candidate` on the interesting variables — i.e. `candidate` is an
 /// instance of `retained` modulo the theory. Both slices are the bindings in slot order and of equal
 /// length (one entry per original variable).
-fn subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
+pub(crate) fn subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
+    // Matching is the reference relation and is dramatically cheaper than a throwaway unification
+    // problem. The only implemented matcher gap is a genuinely one-sided identity; keep the frozen
+    // unification fallback solely for vectors containing one.
+    if !retained
+        .iter()
+        .chain(candidate)
+        .copied()
+        .any(|dag| contains_one_sided_identity(e, dag))
+    {
+        let mut variables = Vec::new();
+        let patterns: Vec<Term> = retained
+            .iter()
+            .map(|&dag| dag_to_matching_term(e, dag, &mut variables))
+            .collect();
+        return e.shared_match_exists(patterns, candidate, variables.len() as u32);
+    }
     // Re-slot `retained`'s variables to contiguous indices `0..m`, collecting their specs — these are
     // the only variables of the sub-problem. A fresh variable shared across bindings keeps one slot.
     let mut reslot: Vec<((u32, SortId), u32)> = Vec::new();
     let mut specs: Vec<VarSpec> = Vec::new();
-    let lhs: Vec<DagId> =
-        retained.iter().map(|&d| reindex(e, d, &mut reslot, &mut specs)).collect();
+    let lhs: Vec<DagId> = retained
+        .iter()
+        .map(|&d| reindex(e, d, &mut reslot, &mut specs))
+        .collect();
 
     // Freeze `candidate`'s variables to fresh distinct ground constants (one per distinct variable),
     // leaving no variables on the subject side.
     let mut frozen_map: Vec<((u32, SortId), DagId)> = Vec::new();
-    let rhs: Vec<DagId> = candidate.iter().map(|&d| freeze(e, d, &mut frozen_map)).collect();
+    let rhs: Vec<DagId> = candidate
+        .iter()
+        .map(|&d| freeze(e, d, &mut frozen_map))
+        .collect();
 
     let equations: Vec<(DagId, DagId)> = lhs.into_iter().zip(rhs).collect();
     let mut names = ScratchNames::default();
-    let mut env = UnifyEnv { e, names: &mut names };
+    let mut env = UnifyEnv {
+        e,
+        names: &mut names,
+    };
     let mut prob = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
     prob.find_next(&mut env).is_some()
+}
+
+fn contains_one_sided_identity(e: &Engine, root: DagId) -> bool {
+    let mut work = vec![root];
+    while let Some(dag) = work.pop() {
+        let node = e.node(dag);
+        let symbol = e.symbol(node.symbol());
+        if symbol.identity().is_none()
+            && (symbol.left_identity().is_some() || symbol.right_identity().is_some())
+        {
+            return true;
+        }
+        work.extend(node.children());
+    }
+    false
+}
+
+fn dag_to_matching_term(e: &Engine, dag: DagId, variables: &mut Vec<(u32, SortId)>) -> Term {
+    match &e.node(dag).term {
+        NodeTerm::Var { name, .. } => {
+            let key = (*name, e.sort_of(dag));
+            let slot = match variables.iter().position(|&candidate| candidate == key) {
+                Some(slot) => slot,
+                None => {
+                    variables.push(key);
+                    variables.len() - 1
+                }
+            };
+            Term::var(slot as u32, key.1)
+        }
+        NodeTerm::Free { symbol, args }
+        | NodeTerm::Au { symbol, args }
+        | NodeTerm::Cui { symbol, args } => Term::op(
+            *symbol,
+            args.iter()
+                .map(|&child| dag_to_matching_term(e, child, variables))
+                .collect(),
+        ),
+        NodeTerm::Acu { symbol, args } => Term::op(
+            *symbol,
+            args.iter()
+                .flat_map(|&(child, multiplicity)| {
+                    std::iter::repeat_n(child, multiplicity as usize)
+                })
+                .map(|child| dag_to_matching_term(e, child, variables))
+                .collect(),
+        ),
+        NodeTerm::S { symbol, count, arg } => Term::iter(
+            *symbol,
+            count.clone(),
+            dag_to_matching_term(e, *arg, variables),
+        ),
+        NodeTerm::Na { symbol, value } => Term::Na {
+            symbol: *symbol,
+            value: value.clone(),
+        },
+    }
 }
 
 /// Rebuild `dag`, replacing each variable leaf with `make_var` at a contiguous slot (assigned in
@@ -163,7 +245,10 @@ fn rebuild(
             e.make_free(sym, a)
         }
         Shape::Acu(sym, pairs) => {
-            let p = pairs.into_iter().map(|(c, m)| (rebuild(e, c, leaf), m)).collect();
+            let p = pairs
+                .into_iter()
+                .map(|(c, m)| (rebuild(e, c, leaf), m))
+                .collect();
             e.make_acu(sym, p)
         }
         Shape::Au(sym, els) => {
@@ -177,7 +262,9 @@ fn rebuild(
         }
         Shape::S(sym, count, arg) => {
             let narg = rebuild(e, arg, leaf);
-            let n = count.to_u64().expect("S count of a unifier binding fits u64");
+            let n = count
+                .to_u64()
+                .expect("S count of a unifier binding fits u64");
             e.make_iter(sym, n, narg)
         }
     }
@@ -201,7 +288,10 @@ mod tests {
         let instance = vec![e.make_const(zero)]; //   X --> 0
 
         assert!(subsumes(&mut e, &general, &instance), "#1 subsumes 0");
-        assert!(!subsumes(&mut e, &instance, &general), "0 does not subsume #1");
+        assert!(
+            !subsumes(&mut e, &instance, &general),
+            "0 does not subsume #1"
+        );
     }
 
     /// The filter keeps only the most-general unifier, in enumeration order, whichever order the

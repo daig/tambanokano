@@ -50,19 +50,37 @@ pub struct RewriteStep {
 impl Rewriting {
     /// Construct a rule-fair (`rewrite`) session rooted at `current`.
     pub(crate) fn new_rule_fair(root: RootGuard, current: DagId) -> Self {
-        Rewriting { current, root, cursors: HashMap::new(), done: false, mode: Mode::RuleFair }
+        Rewriting {
+            current,
+            root,
+            cursors: HashMap::new(),
+            done: false,
+            mode: Mode::RuleFair,
+        }
     }
 
     /// Construct a position-fair (`frewrite`) session rooted at `current`, with `gas` rule applications
     /// per position per pass.
     pub(crate) fn new_position_fair(root: RootGuard, current: DagId, gas: u64) -> Self {
-        Rewriting { current, root, cursors: HashMap::new(), done: false, mode: Mode::PositionFair { gas } }
+        Rewriting {
+            current,
+            root,
+            cursors: HashMap::new(),
+            done: false,
+            mode: Mode::PositionFair { gas },
+        }
     }
 
     /// Construct an object-message-fair (`erewrite`) session rooted at `current` (Pillar 2.5-B), with
     /// `gas` for the non-config fallback.
     pub(crate) fn new_object_message_fair(root: RootGuard, current: DagId, gas: u64) -> Self {
-        Rewriting { current, root, cursors: HashMap::new(), done: false, mode: Mode::ObjectMessageFair { gas } }
+        Rewriting {
+            current,
+            root,
+            cursors: HashMap::new(),
+            done: false,
+            mode: Mode::ObjectMessageFair { gas },
+        }
     }
 
     /// The current term.
@@ -80,7 +98,11 @@ impl Rewriting {
     /// reached (`done == true`).
     pub fn run(&mut self, engine: &mut Engine, bound: Option<u64>) -> RewriteStep {
         if self.done {
-            return RewriteStep { term: self.current, done: true, sort_known: true };
+            return RewriteStep {
+                term: self.current,
+                done: true,
+                sort_known: true,
+            };
         }
         match self.mode {
             Mode::RuleFair => self.run_rule_fair(engine, bound),
@@ -98,7 +120,11 @@ impl Rewriting {
             self.current = reduced;
             self.root.set(reduced);
             if bound == Some(steps) {
-                return RewriteStep { term: self.current, done: false, sort_known: true };
+                return RewriteStep {
+                    term: self.current,
+                    done: false,
+                    sort_known: true,
+                };
             }
             match engine.rewrite_step(self.current, &mut self.cursors) {
                 Some(next) => {
@@ -108,7 +134,11 @@ impl Rewriting {
                 }
                 None => {
                     self.done = true;
-                    return RewriteStep { term: self.current, done: true, sort_known: true };
+                    return RewriteStep {
+                        term: self.current,
+                        done: true,
+                        sort_known: true,
+                    };
                 }
             }
         }
@@ -118,21 +148,40 @@ impl Rewriting {
     /// position up to `gas` rule applications, reducing between) until the bound is hit or a pass makes
     /// no progress (a normal form). A bounded stop leaves a non-canonical term — `sort_known = false`, so
     /// the REPL prints `result (sort not calculated): …`, exactly as Maude does.
-    fn run_position_fair(&mut self, engine: &mut Engine, bound: Option<u64>, gas: u64) -> RewriteStep {
+    fn run_position_fair(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+        gas: u64,
+    ) -> RewriteStep {
         let mut remaining = bound;
         self.current = engine.reduce(self.current);
         self.root.set(self.current);
         loop {
             let mut progress = false;
-            let next = engine.frewrite_pass(self.current, gas, &mut remaining, &mut progress, &mut self.cursors);
+            let next = engine.frewrite_pass(
+                self.current,
+                gas,
+                &mut remaining,
+                &mut progress,
+                &mut self.cursors,
+            );
             self.current = next;
             self.root.set(next);
             if remaining == Some(0) {
-                return RewriteStep { term: self.current, done: false, sort_known: false };
+                return RewriteStep {
+                    term: self.current,
+                    done: false,
+                    sort_known: false,
+                };
             }
             if !progress {
                 self.done = true;
-                return RewriteStep { term: self.current, done: true, sort_known: true };
+                return RewriteStep {
+                    term: self.current,
+                    done: true,
+                    sort_known: true,
+                };
             }
         }
     }
@@ -143,13 +192,22 @@ impl Rewriting {
     /// (config-level rule rewrites) — a delivery's equational reductions add to `rewrites:` but not to the
     /// bound — so a bounded stop still leaves a reduced, sort-known configuration (Maude prints
     /// `result Configuration:`, not `(sort not calculated)`). Passes repeat while a delivery is made.
-    fn run_object_message_fair(&mut self, engine: &mut Engine, bound: Option<u64>, gas: u64) -> RewriteStep {
+    fn run_object_message_fair(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+        gas: u64,
+    ) -> RewriteStep {
         let mut remaining = bound;
         self.current = engine.reduce(self.current);
         self.root.set(self.current);
         loop {
             if remaining == Some(0) {
-                return RewriteStep { term: self.current, done: false, sort_known: true };
+                return RewriteStep {
+                    term: self.current,
+                    done: false,
+                    sort_known: true,
+                };
             }
             let mut progress = false;
             if engine.is_config_node(self.current) {
@@ -160,22 +218,40 @@ impl Rewriting {
                 self.root.set(self.current);
                 if !progress {
                     self.done = true;
-                    return RewriteStep { term: self.current, done: true, sort_known: true };
+                    return RewriteStep {
+                        term: self.current,
+                        done: true,
+                        sort_known: true,
+                    };
                 }
                 if let Some(rem) = &mut remaining {
                     *rem -= 1;
                 }
             } else {
                 // Non-config fallback: position-fair, per-rewrite bound (as `frewrite`).
-                let next = engine.frewrite_pass(self.current, gas, &mut remaining, &mut progress, &mut self.cursors);
+                let next = engine.frewrite_pass(
+                    self.current,
+                    gas,
+                    &mut remaining,
+                    &mut progress,
+                    &mut self.cursors,
+                );
                 self.current = engine.reduce(next);
                 self.root.set(self.current);
                 if remaining == Some(0) {
-                    return RewriteStep { term: self.current, done: false, sort_known: true };
+                    return RewriteStep {
+                        term: self.current,
+                        done: false,
+                        sort_known: true,
+                    };
                 }
                 if !progress {
                     self.done = true;
-                    return RewriteStep { term: self.current, done: true, sort_known: true };
+                    return RewriteStep {
+                        term: self.current,
+                        done: true,
+                        sort_known: true,
+                    };
                 }
             }
         }

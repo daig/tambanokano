@@ -19,6 +19,13 @@ decisions doc).
 - **Modules** (`tnk-modules`): import/flatten (`protecting`/`extending`/`including`), summation `+`, renaming.
 - **REPL** (`tnk-repl`): `reduce`/`match`/`xmatch`, `show`/`select`/`set trace`, file load, output line-wrapping.
 
+**Symbolic phases S1 + S2 complete (2026-07-19).** `tnk-core::unify` implements order-sorted unification
+modulo free/S/CUI/AC/ACU/A/AU; `tnk-core::variant` adds layered folding variant narrowing, irredundant
+subsumption, variant unification, matching, blockers, and centralized fresh-variable families. All
+object-level and current/legacy `metaUnify*`/`metaVariant*` surfaces are live, including resumable command
+enumeration and persistent meta caches. Durable gates: S1 is 27/27 fixtures and 676 byte-exact commands;
+S2 is 21/21 and 289. S3 narrowing is READY and next, with 15 frozen fixtures and 168 primary commands.
+
 **Phase 2 in progress.** Pillar A (the *rewriting* layer) is **done**: rules (`rl`/`crl` incl. the rewrite
 `=>` condition), `rewrite`/`frewrite`, `search` (+ state graph, `such that`, `show path`/`graph`),
 `continue` — all conformance-verified, so system modules (`mod`) run. Pillar B (parameterized programming) is
@@ -32,9 +39,9 @@ overloading with `(t).Sort` disambiguation, and structured-sort memberships). Al
 library `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* **the reflection core**: `META-LEVEL` builds, and its descent
 family (`metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/`metaSearchPath`/… + the
 `format`-attribute display) computes byte-identically. The META `up*`/query/parse layer, the strategy
-language, and the object system (`omod`/`erewrite`/STD-STREAM) have since landed too. **The verified
-current state — including every known deviation — is `../../fable-audit.md`** (the 2026-07-01 differential
-audit); the forward plan is `roadmap.md` (correctness-first, rewritten post-audit).
+language, LEXICAL hooks, and the object system (`omod`/`erewrite`/STD-STREAM) have since landed too.
+**The verified current state — including every known deviation — is `../../fable-audit.md`** (status
+refreshed 2026-07-19); the forward plan is `roadmap.md`.
 
 ## Crate layout
 
@@ -67,13 +74,12 @@ these docs are orientation, motivation, gaps, and plan — not a re-explanation 
 
 Every behavioral claim is checked **differentially against the reference binary**, never from memory:
 
-```
-~/Downloads/Maude-3/maude -no-banner <file>.maude < /dev/null   # reference (C++)
-./target/debug/tnk-repl <file>.maude < /dev/null                # ours
+```sh
+MAUDE_LIB=~/code/maude-lang/maude/src/Main ~/.local/bin/maude -no-banner <file.maude < /dev/null
+./target/release/tnk-repl <file.maude < /dev/null
 ```
 
 diffing **result value, result sort, rewrite count, termination**, and (where it matters) byte-for-byte
 output. The `conformance/` directory holds the regression fixtures (`*.maude`), each transcribed from the
 reference; `correctness-*.maude` pin a specific fixed divergence. Reference sources: C++ at
-`~/code/maude-lang/Maude/src`, binary at `~/Downloads/Maude-3/maude`. Sanity anchor: `fib(22) = 186579`
-rewrites.
+`~/code/maude-lang/maude/src`, binary at `~/.local/bin/maude`. Sanity anchor: `fib(22) = 186579` rewrites.

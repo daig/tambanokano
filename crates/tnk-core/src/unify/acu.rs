@@ -11,14 +11,14 @@
 //! `build_solution`. ACU unification is **finitary** — it never flags incompleteness.
 
 use super::{
-    compute_solved_form, last_variable_in_chain, var_index, Marker, PendingStack, SavedSubst,
-    UnifyContext, UnifyEnv,
+    Marker, PendingStack, SavedSubst, UnifyContext, UnifyEnv, compute_solved_form,
+    last_variable_in_chain, var_index,
 };
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::int_system::{IntSystem, UNBOUNDED};
 use crate::sort_bdds::AllSat;
-use crate::symbol::{SymbolId, Theory};
+use crate::symbol::{SymbolClass, SymbolId};
 use biodivine_lib_bdd::{Bdd, BddVariableSet};
 use std::collections::BTreeSet;
 
@@ -61,20 +61,39 @@ pub(crate) struct AcuSubproblem {
     maximal_selections: Option<AllSat>,
 }
 
-/// The `(element, multiplicity)` multiset of an ACU node.
+/// The `(element, multiplicity)` multiset of an ACU node in Maude's pre-index variable order.
+/// Variables sharing a sort share a `VariableSymbol`, so their name codes order them.  Variables
+/// of different sorts are ordered by distinct symbols created before indexing; their assigned slot
+/// order records that comparison even when tnk's per-variable symbol ids do not.
 fn acu_pairs(e: &Engine, id: DagId) -> Vec<(DagId, u32)> {
-    match &e.node(id).term {
+    let mut pairs = match &e.node(id).term {
         NodeTerm::Acu { args, .. } => args.clone(),
         _ => unreachable!("acu_pairs on a non-ACU node"),
-    }
+    };
+    pairs.sort_by(
+        |&(a, _), &(b, _)| match (&e.node(a).term, &e.node(b).term) {
+            (NodeTerm::Var { name: an, .. }, NodeTerm::Var { name: bn, .. }) => {
+                if e.sort_of(a) == e.sort_of(b) {
+                    an.cmp(bn)
+                } else {
+                    var_index(e, a).unwrap().cmp(&var_index(e, b).unwrap())
+                }
+            }
+            _ => e.dag_compare(a, b),
+        },
+    );
+    pairs
 }
 
-/// Maude's `Symbol::isStable` for the classify step: a symbol whose top cannot disappear or reorder
-/// under substitution — a free operator or NA constant that cannot collapse. Theory symbols and
-/// one-sided-id (collapsing) operators are not stable.
-fn is_stable(e: &Engine, sym: SymbolId) -> bool {
-    let s = e.symbol(sym);
-    matches!(s.theory(), Theory::Free) && !s.one_sided_identity()
+/// Maude's virtual `Symbol::isStable`: free, NA, and S symbols are stable; binary-theory symbols
+/// are stable exactly when they have no identity collapse. Genuine variable symbols are unstable.
+pub(super) fn is_stable(e: &Engine, sym: SymbolId) -> bool {
+    let symbol = e.symbol(sym);
+    !matches!(
+        symbol.class,
+        SymbolClass::Variable { .. } | SymbolClass::SortVariable
+    ) && symbol.identity().is_none()
+        && !symbol.one_sided_identity()
 }
 
 impl AcuSubproblem {
@@ -110,15 +129,11 @@ impl AcuSubproblem {
             .collect()
     }
 
-    /// Whether `id` is the operator's two-sided identity constant (a nullary node of the identity
-    /// symbol) — no node allocation needed.
+    /// Whether `id` is the operator's two-sided identity term.
     fn is_identity(&self, e: &Engine, id: DagId) -> bool {
-        match e.symbol(self.top).identity() {
-            Some(id_sym) => {
-                e.node(id).symbol() == id_sym && e.node(id).children().next().is_none()
-            }
-            None => false,
-        }
+        e.symbol(self.top)
+            .identity()
+            .is_some_and(|identity| e.is_identity(identity, id))
     }
 
     // ---- addUnification ------------------------------------------------------------------
@@ -268,7 +283,9 @@ impl AcuSubproblem {
     /// `unsolve`: turn an existing in-theory solved form `X = f(…)` at slot `index` back into an
     /// equation so it is solved simultaneously with the current batch.
     fn unsolve(&mut self, e: &Engine, ctx: &mut UnifyContext, index: usize) {
-        let variable = ctx.variable_node(index).expect("in-theory binding has a tracked variable");
+        let variable = ctx
+            .variable_node(index)
+            .expect("in-theory binding has a tracked variable");
         let value = ctx.value(index).expect("unsolving an unbound slot");
         ctx.bind(index, None);
         self.multiplicities.resize(self.subterms.len(), 0);
@@ -295,15 +312,25 @@ impl AcuSubproblem {
     ) -> (bool, i32, Option<SymbolId>) {
         let has_id = self.has_identity;
         let mut can_take_identity = has_id;
-        let mut upper_bound = if self.marked_subterms.contains(&subterm_index) { 1 } else { UNBOUNDED };
+        let mut upper_bound = if self.marked_subterms.contains(&subterm_index) {
+            1
+        } else {
+            UNBOUNDED
+        };
         let mut subject = self.subterms[subterm_index];
         if var_index(e, subject).is_some() {
             let sort = e.sort_of(subject);
-            let bound = e.signature().acu_sort_bounds(self.top).get(&sort).copied().unwrap_or(UNBOUNDED);
+            let bound = e
+                .signature()
+                .acu_sort_bounds(self.top)
+                .get(&sort)
+                .copied()
+                .unwrap_or(UNBOUNDED);
             if bound < upper_bound {
                 upper_bound = bound;
             }
-            can_take_identity = can_take_identity && e.signature().acu_take_identity(self.top, sort);
+            can_take_identity =
+                can_take_identity && e.signature().acu_take_identity(self.top, sort);
             let rep = last_variable_in_chain(e, ctx, subject);
             match ctx.value(var_index(e, rep).unwrap() as usize) {
                 None => return (can_take_identity, upper_bound, None),
@@ -314,9 +341,21 @@ impl AcuSubproblem {
         if super::is_ground(e, subject) {
             (false, 1, Some(symbol))
         } else if is_stable(e, symbol) {
-            let id_sym = e.symbol(self.top).identity();
-            let can = can_take_identity && id_sym == Some(symbol);
-            (can, 1, Some(symbol))
+            let identity_symbol = e.symbol(self.top).identity().map(|identity| {
+                match e.signature().identity_term(identity) {
+                    crate::term::Term::Var(_) => {
+                        unreachable!("an identity term must be ground")
+                    }
+                    crate::term::Term::Na { symbol, .. }
+                    | crate::term::Term::Op { symbol, .. }
+                    | crate::term::Term::Iter { symbol, .. } => *symbol,
+                }
+            });
+            (
+                can_take_identity && identity_symbol == Some(symbol),
+                1,
+                Some(symbol),
+            )
         } else {
             (can_take_identity, upper_bound, None)
         }
@@ -374,7 +413,11 @@ impl AcuSubproblem {
                     self.accumulator.insert(i);
                 }
             }
-            disc.push(Entry { element: dio_sol, remainder, index });
+            disc.push(Entry {
+                element: dio_sol,
+                remainder,
+                index,
+            });
             index += 1;
         }
         if !self.need_to_cover.is_subset(&self.accumulator) {
@@ -392,7 +435,8 @@ impl AcuSubproblem {
     fn includable(&self, entry: usize) -> bool {
         let e = &self.basis[entry];
         (0..self.subterms.len()).all(|i| {
-            self.upper_bounds[i] == UNBOUNDED || self.totals[i] + e.element[i] <= self.upper_bounds[i]
+            self.upper_bounds[i] == UNBOUNDED
+                || self.totals[i] + e.element[i] <= self.upper_bounds[i]
         })
     }
 
@@ -417,7 +461,10 @@ impl AcuSubproblem {
                             }
                         }
                         self.selection.push(self.current);
-                    } else if !self.uncovered.is_subset(&self.basis[self.current].remainder) {
+                    } else if !self
+                        .uncovered
+                        .is_subset(&self.basis[self.current].remainder)
+                    {
                         backtrack = true;
                         break;
                     }
@@ -440,7 +487,10 @@ impl AcuSubproblem {
                             self.uncovered.insert(j);
                         }
                     }
-                    if self.uncovered.is_subset(&self.basis[self.current].remainder) {
+                    if self
+                        .uncovered
+                        .is_subset(&self.basis[self.current].remainder)
+                    {
                         self.current += 1;
                         self.selection.truncate(i);
                         resumed = true;
@@ -479,8 +529,15 @@ impl AcuSubproblem {
             }
             m
         };
-        let last = if nr == 0 { 0 } else { (nr - 1) as u16 };
-        AllSat::new(maximal, 0, last)
+        // BuDDy's `AllSat(maximal, 0, -1)` treats an empty basis as one empty assignment. The BDD
+        // crate needs a dummy variable to represent the constant formula; exclude it from the
+        // assignment range (`first > last`) or its two values replay the same empty selection.
+        let (first, last) = if nr == 0 {
+            (1, 0)
+        } else {
+            (0, (nr - 1) as u16)
+        };
+        AllSat::new(maximal, first, last)
     }
 
     /// Maude's `computeLegalSelections`: upper-bound (bounded-sum) and need-to-cover constraints
@@ -527,7 +584,10 @@ impl AcuSubproblem {
     /// Maude's `nextSelectionWithIdentity`: the next maximal assignment from `AllSat`, filtered onto
     /// the basis by element index.
     fn next_selection_with_identity(&mut self) -> bool {
-        let all = self.maximal_selections.as_mut().expect("identity selection enumerator");
+        let all = self
+            .maximal_selections
+            .as_mut()
+            .expect("identity selection enumerator");
         if !all.next_assignment() {
             return false;
         }
@@ -549,9 +609,8 @@ impl AcuSubproblem {
         let b = self.selection[selection_index];
         for i in 0..self.subterms.len() {
             if self.basis[b].element[i] == 1 && var_index(e, self.subterms[i]).is_some() {
-                let unique = (0..self.selection.len()).all(|j| {
-                    j == selection_index || self.basis[self.selection[j]].element[i] == 0
-                });
+                let unique = (0..self.selection.len())
+                    .all(|j| j == selection_index || self.basis[self.selection[j]].element[i] == 0);
                 if unique {
                     return Some(i);
                 }
@@ -569,7 +628,10 @@ impl AcuSubproblem {
         // Fresh variables live at the operator's range component (kind level).
         let kind = env.e.sorts().kind_of(range_sort(env.e, self.top));
         let selection_size = self.selection.len();
-        // A fresh variable per selected basis element (reuse where possible).
+        // A fresh variable per selected basis element (reuse where possible), in selection order.
+        // This is ACU_UnificationSubproblem2::buildSolution's direct walk over `selection`; any
+        // identity-path ordering difference belongs in basis/AllSat enumeration, not in a
+        // post-selection permutation of fresh-variable slots.
         let mut fresh_variables: Vec<Option<DagId>> = vec![None; selection_size];
         let mut reused: BTreeSet<usize> = BTreeSet::new();
         for i in 0..selection_size {
@@ -635,11 +697,11 @@ fn range_sort(e: &Engine, sym: SymbolId) -> crate::sort::SortId {
 /// left-identity collapse `f(e, x) = x` can change a sort — i.e. some range-component sort `i` has
 /// `compute_sort(f, [id_sort, i]) != i`. It gates the maximal-selection optimization.
 fn unequal_left_id_collapse(e: &Engine, top: SymbolId) -> bool {
-    let Some(id_sym) = e.symbol(top).identity() else {
+    let Some(identity) = e.symbol(top).identity() else {
         return false;
     };
     let sig = e.signature();
-    let id_sort = sig.symbol(id_sym).decls()[0].range;
+    let id_sort = sig.identity_sort(identity);
     let kind = sig.sorts().kind_of(range_sort(e, top));
     sig.sorts()
         .kind(kind)
@@ -649,8 +711,79 @@ fn unequal_left_id_collapse(e: &Engine, top: SymbolId) -> bool {
         .any(|s| sig.compute_sort(top, &[id_sort, s]) != s)
 }
 
-/// The operator's two-sided identity constant node (`getIdentityDag`).
+/// The operator's two-sided identity DAG (`getIdentityDag`).
 fn identity_dag(e: &mut Engine, top: SymbolId) -> DagId {
-    let id_sym = e.symbol(top).identity().expect("build_solution identity slot needs an identity");
-    e.make_const(id_sym)
+    let identity = e
+        .symbol(top)
+        .identity()
+        .expect("build_solution identity slot needs an identity");
+    e.make_identity(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_identity_basis_has_one_selection() {
+        let mut e = Engine::new();
+        let nat = e.add_sort("Nat");
+        e.close_sorts();
+        let unit = e.add_op("unit", vec![], nat);
+        let product = e.add_op_ac("*", vec![nat, nat], nat, Some(unit));
+        let mut solver = AcuSubproblem::new(&e, product);
+
+        assert!(solver.basis.is_empty());
+        solver.maximal_selections = Some(solver.compute_maximal_selections(&e));
+        assert!(
+            solver.next_selection_with_identity(),
+            "the empty selection is a solution"
+        );
+        assert!(solver.selection.is_empty());
+        assert!(
+            !solver.next_selection_with_identity(),
+            "the dummy BDD variable is not enumerated"
+        );
+    }
+
+    #[test]
+    fn acu_pairs_keep_pre_index_name_order() {
+        let mut e = Engine::new();
+        let set = e.add_sort("Set");
+        e.close_sorts();
+        let f = e.add_op_ac("f", vec![set, set], set, None);
+        // Runtime AC canonicalization sees slot 0 before slot 1.  The unifier must instead recover
+        // VariableTerm normalization, where the shared VariableSymbol compares the name codes.
+        let x = e.make_var(set, 20, 0);
+        let y = e.make_var(set, 10, 1);
+        let term = e.make_ac(f, vec![x, y]);
+
+        let pairs = acu_pairs(&e, term);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|&(id, _)| var_index(&e, id))
+                .collect::<Vec<_>>(),
+            [Some(1), Some(0)]
+        );
+    }
+
+    #[test]
+    fn stable_classifier_accepts_noncollapsing_theory_symbols() {
+        let mut e = Engine::new();
+        let sort = e.add_sort("S");
+        e.close_sorts();
+        let identity = e.add_op("id", vec![], sort);
+        let free = e.add_op("g", vec![sort], sort);
+        let pure_a = e.add_op_au("a", vec![sort, sort], sort, None);
+        let pure_ac = e.add_op_ac("ac", vec![sort, sort], sort, None);
+        let au_with_identity = e.add_op_au("au", vec![sort, sort], sort, Some(identity));
+        let variable = e.make_var(sort, 0, 0);
+
+        assert!(is_stable(&e, free));
+        assert!(is_stable(&e, pure_a));
+        assert!(is_stable(&e, pure_ac));
+        assert!(!is_stable(&e, au_with_identity));
+        assert!(!is_stable(&e, e.node(variable).symbol()));
+    }
 }

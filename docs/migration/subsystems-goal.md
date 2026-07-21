@@ -38,10 +38,10 @@ divergence question to one phase with its own containment machinery.
 ### 1.2 The new instrument
 
 - **`conformance/subsystems/<ID>.maude`** — fixtures for this goal, run by
-  **`tools/subsystems-scoreboard.sh`** (same `diffmaude.sh` harness, same normalization, 60s/fixture,
-  prints `SUBSYSTEMS <n>/<m> PASS`, exit 0 iff n = m). ID prefixes: `U*` unification, `V*` variants,
-  `N*` narrowing, `T*` SMT, `M*` model checker, `I*` meta-interpreters (local mode only — async mode
-  is not oracle-diffable and gates via §1.3).
+  **`tools/subsystems-scoreboard.sh`** (same `diffmaude.sh` harness and normalization; 60s/fixture;
+  `-p PREFIX` selects one frozen sub-phase, e.g. `-p U`; prints `SUBSYSTEMS <n>/<m> PASS`, exit 0 iff
+  n = m). ID prefixes: `U*` unification, `V*` variants, `N*` narrowing, `T*` SMT, `M*` model checker,
+  `I*` meta-interpreters (local mode only — async mode is not oracle-diffable and gates via §1.3).
 - **Per-phase seeding (each phase's step 0, committed before its first feature commit):** enumerate
   the fixture sources — the reference suite (`~/code/maude-lang/maude/tests/`: the directories gated
   on that subsystem per the audit's §3.8 tally), the Maude 3.5.1 manual's worked examples for the
@@ -100,36 +100,38 @@ Definition-of-done per item; frozen fixture lists are appended here by each phas
 - **S3 — narrowing.** `vu-narrow`/`fvu-narrow` (v3 semantics only, per roadmap) with
   reference-identical solutions, order, and counts.
 
-#### Phase-S manifest (frozen 2026-07-05; 60 fixtures in `conformance/subsystems/`, all oracle-verified at authoring, all expected to FAIL until their sub-phase lands)
+#### Phase-S manifest (frozen 2026-07-05; expanded to 63 fixtures on 2026-07-19 when three mixed reference fixtures were split at the S1/S2 boundary)
 
-**U\* — unification (S1), 27 fixtures.**
-Reference-suite lifts (verbatim + header/PRELUDE marker): `U01-unification`, `U02-unification2`,
-`U03-unification3`, `U04-assoc-unification`, `U05-au-unification`, `U06-au-irred-unification`,
-`U07-au-a-edge-cases`, `U08-cu-unification` (from `tests/Misc/`), `U09-meta-unify`,
-`U10-legacy-meta-unify`, `U11-check-unifiers` (from `tests/Meta/`). Manual ch. 13 worked examples
-(each oracle-diffed at authoring; where the printed manual disagrees with the live 3.5.1 oracle the
-oracle is ground truth, deviations noted in-file): `U-ch13-01` … `U-ch13-15`. Fresh probe:
-`U-probe-01-maximal-sorts` (incomparable maximal lower bounds → one unifier per maximal sort, in
-reference order — the SortBdds/AllSat surface). Note: `U-ch13-07-iter-comm` additionally requires
-the `s_^k` *input notation* (recorded §3.4 audit finding) — it lands with S1.
+**U\* — unification (S1), 27 fixtures; 676 substantive commands; 27/27 PASS on 2026-07-19.**
+Reference-suite lifts (verbatim except for the documented base/variant splits): `U01-unification`,
+`U02-unification2`, `U03-unification3`, `U04-assoc-unification`, `U05-au-unification`,
+`U06-au-irred-unification`, `U07-au-a-edge-cases`, `U08-cu-unification` (from `tests/Misc/`),
+`U09-meta-unify`, `U10-legacy-meta-unify`, `U11-check-unifiers` (from `tests/Meta/`). `U05` and
+`U08` now retain only their base `unify` commands; `U11` retains only its `metaUnify` checker. Their
+variant halves are `V13`, `V14`, and `V12` respectively, so S1 has an executable gate without weakening
+S2. Manual ch. 13 worked examples (where the printed manual disagrees with the live 3.5.1 oracle, the
+oracle is ground truth): `U-ch13-01` … `U-ch13-15`. Fresh probe: `U-probe-01-maximal-sorts`
+(incomparable maximal lower bounds → one unifier per maximal sort, in reference order). The
+`U-ch13-07-iter-comm` `s_^k` input notation landed with S1.
 
-**V\* — variants (S2), 18 fixtures.**
+**V\* — variants (S2), 21 fixtures; 289 substantive commands; 21/21 PASS on 2026-07-19.**
 Reference-suite lifts: `V01-variant-unification`, `V02-variant-matching`,
 `V03-filtered-variant-unification`, `V04-meseguer-finite-variant`, `V05-variant-narrowing`
 (despite the name: `get variants`) from `tests/Misc/`; `V06-meta-get-variant`,
 `V07-legacy-meta-get-variant`, `V08-meta-variant-unify`, `V09-meta-variant-unify2`,
-`V10-legacy-meta-variant-unify`, `V11-meta-variant-match` from `tests/Meta/`. Manual ch. 14:
-`V-ch14-01` … `V-ch14-06`. Fresh probe: `V-probe-01-idem-variants`. Note: `V09` runs into the
-tnk-side 60s harness timeout until S2 (the test loops on an inert `metaVariantUnify` by design —
-an honest slow FAIL, self-healing when S2 lands).
+`V10-legacy-meta-variant-unify`, `V11-meta-variant-match` from `tests/Meta/`; split reference halves:
+`V12-check-variant-unifiers`, `V13-au-variant-unification`, `V14-cu-variant-unification`. Manual ch. 14:
+`V-ch14-01` … `V-ch14-06`. Fresh probe: `V-probe-01-idem-variants`. The formerly inert V09
+`metaVariantUnify` loop now terminates with reference-identical cached results.
 
-**N\* — narrowing (S3), 15 fixtures.**
+**N\* — narrowing (S3), 15 fixtures; 168 substantive primary commands; READY 2026-07-19.**
 Reference-suite lifts: `N01-narrow` (`vu-narrow`/`fvu-narrow`), `N02-narrow2` (`{fold}`/`{vfold}`)
 from `tests/Misc/`; `N03-meta-narrow` (`metaNarrowingApply`/`metaNarrowingSearch`/
 `metaNarrowingSearchPath` + legacy `metaNarrow`) from `tests/Meta/`. Manual ch. 15: `N-ch15-01` …
-`N-ch15-11` (`N-ch15-07/08` include the oracle's `set verbose on` state-count lines — verified
-deterministic across runs modulo the normalized timing tails). Fresh probe:
-`N-probe-01-vu-narrow-basic`.
+`N-ch15-11` (`N-ch15-07/08` include the oracle's deterministic `set verbose on` state/folding trace).
+Fresh probe: `N-probe-01-vu-narrow-basic`; its unreachable fourth query is frozen with depth bound 3
+(`No solution.`, 9 rewrites) rather than an expected timeout. Legacy `metaNarrow` stays in the gate via
+an oracle-equivalent v3 adapter or, only if required, the minimal v1-compatible path. No exclusions.
 
 **Enumerated exclusions (phase-S seeding; nothing silent).**
 - `tests/Meta/metaInt*` (17 files) and `tests/Meta/russianDolls*` (non-`Proc` variants) —
@@ -225,9 +227,12 @@ deterministic across runs modulo the normalized timing tails). Fresh probe:
 ## 5. Status ledger (append commit hashes as items complete)
 
 - [x] S0 BDD spike + D6 resolution — ee77559 (GO; report `reports/S0-bdd-spike.md`)
-- [ ] S1 unification —
-- [ ] S2 variants —
-- [ ] S3 narrowing —
+- [x] S1 unification — working tree 2026-07-19 (`tools/subsystems-scoreboard.sh -p U`: 27/27;
+  676 commands; commit hash to append when committed)
+- [x] S2 variants — working tree 2026-07-19 (`tools/subsystems-scoreboard.sh -p V`: 21/21;
+  289 commands; commit hash to append when committed)
+- [ ] S3 narrowing — READY 2026-07-19 (15 fixtures; 168 substantive primary commands;
+  decisions in `remaining-plans/03-narrowing.md` §8)
 - [ ] T SMT —
 - [ ] M model checker —
 - [ ] I0 D12 recorded —
@@ -240,8 +245,8 @@ deterministic across runs modulo the normalized timing tails). Fresh probe:
 
 External file/socket/process IO and OS-process meta-interpreter backends (D5/D12 territory — harness
 era); the fully-featured interactive harness itself and Full Maude or its replacement (dedicated
-later pass, per user decision 2026-07-05); LOOP-MODE/LEXICAL real implementations (harness era);
-the diagnostics/warning surface and the interactive tool surface (`show`/`set print`/debugger —
+later pass, per user decision 2026-07-05); LOOP-MODE interaction (harness era); the diagnostics/warning
+surface and the interactive tool surface (`show`/`set print`/debugger —
 roadmap E/F) except where a shipped subsystem's own output requires a specific line; the
 matchrew/exploration-schedule odometer (recorded accepted divergence, revisit with strategy
 reflection); performance work beyond the stated gates.

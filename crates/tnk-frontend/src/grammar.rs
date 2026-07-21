@@ -35,9 +35,6 @@ pub enum Nt {
     Term,
     /// A per-connected-component (kind), per-type nonterminal (Maude's `nonTerminal(component, type)`).
     Comp(KindId, NtType),
-    /// The per-iter-symbol nonterminal for the `f^n(t)` token form (Maude's `iterSymbols` map). Deferred
-    /// (the milestone uses repeated mixfix `s s 0`, not the `s_^n` token); reserved here.
-    Iter(SymbolId),
 }
 
 /// The kind-relative nonterminal families (Maude's `enum NonTerminalType`, simple/non-complex subset).
@@ -105,18 +102,22 @@ pub enum Action {
     MakeTerm(SymbolId),
     /// Build a variable of this sort from the matched token.
     MakeVariable(SortId),
-    /// Build `s^n(0)` from a decimal numeral, for the successor `symbol` (Maude's `MAKE_NATURAL`).
+    /// Build compact `s^n(0)` from a decimal numeral, for the successor `symbol`
+    /// (Maude's `MAKE_NATURAL`).
     MakeNatural(SymbolId),
     /// Build a negative integer `-(s^n(0))` from a `SMALL_NEG` token, for the minus `symbol` (Maude's
     /// `MAKE_INTEGER` → `MinusSymbol::makeIntTerm`).
     MakeInteger(SymbolId),
-    /// Build `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`): the token carries the count `n`,
-    /// the one nonterminal child the base term `t`; folded via `make_s` (`n` may be a bignum).
+    /// Build compact `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`): the token carries the
+    /// arbitrary-size count `n`, and the one nonterminal child is the base term `t`.
     MakeIter(SymbolId),
     /// Build a glued rational literal `[-]num/den` (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`):
     /// `division / num_or_minus(num) den`, where a non-negative numerator is `s^num(0)` and a negative one
     /// is `minus(s^|num|(0))`. Carries the `DivisionSymbol` and the `MinusSymbol` (for a negative numerator).
-    MakeRational { division: SymbolId, minus: SymbolId },
+    MakeRational {
+        division: SymbolId,
+        minus: SymbolId,
+    },
     MakeFloat(SymbolId),
     MakeString(SymbolId),
     MakeQid(SymbolId),

@@ -6,14 +6,14 @@
 //! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
 
 use crate::lex::{Frag, Interner, Token, is_punct, split_mixfix};
-use crate::sig::syntax::{BuiltModule, SymbolSyntax};
+use crate::sig::syntax::{BuiltModule, IdentitySpec, SymbolSyntax};
 use crate::surface::ast::{Attrs, PreModule, SpecialSpec};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
-    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp, StdStream, StrOp,
-    SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp,
+    StdStream, StrOp, SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -52,9 +52,7 @@ pub fn canonical_name(name: &[Token], i: &Interner) -> String {
 /// opening paren must match the *final* token (depth returns to 0 only at the end), so a name that merely
 /// starts and ends with parens — `(a) b (c)` — is left intact.
 fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
-    if toks.len() < 2
-        || i.resolve(toks[0].sym) != "("
-        || i.resolve(toks[toks.len() - 1].sym) != ")"
+    if toks.len() < 2 || i.resolve(toks[0].sym) != "(" || i.resolve(toks[toks.len() - 1].sym) != ")"
     {
         return toks;
     }
@@ -89,7 +87,10 @@ fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) ->
             .ok_or_else(|| format!("unknown sort `{first}` in kind `[{inner}]`"))?;
         Ok(engine.sorts().error_sort(engine.sorts().kind_of(inner_id)))
     } else {
-        sorts.get(name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
+        sorts
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("unknown sort `{name}`"))
     }
 }
 
@@ -119,7 +120,10 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         sorts.insert(name.clone(), id);
     }
     let sort_id = |sorts: &HashMap<String, SortId>, name: &str| -> R<SortId> {
-        sorts.get(name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
+        sorts
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("unknown sort `{name}`"))
     };
     for chain in &pm.subsorts {
         for w in chain.windows(2) {
@@ -147,9 +151,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // source index, so it is pre-sized and each declaration stores at its own index (the loop below may
     // visit the entries out of source order — constants first, see next).
     let mut op_syms: Vec<Vec<SymbolId>> = vec![Vec::new(); pm.ops.len()];
-    // Operators declared with a one-sided `id:` (`left`/`right`), keyed by symbol → (side, identity
-    // constant); populated as each op is declared, consumed by the [`crate::load`] one-sided post-pass.
-    let mut one_sided_id: HashMap<SymbolId, (crate::surface::ast::IdSide, SymbolId)> = HashMap::new();
+    // Identity bubbles are parsed only after the per-module grammar exists.
+    let mut identity_specs: Vec<IdentitySpec> = Vec::new();
 
     // Pass A: declare every op (theory-dispatched), record name→id + syntax. A `poly` op is expanded
     // here — necessarily after `close_sorts`, which is what creates the kinds/error sorts. Each
@@ -159,12 +162,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // `Universal` is never resolved as a sort: the `poly` list drives the substitution, so it can
     // never reach `sort_id` to become "unknown".
     //
-    // **Constants first** (Maude's "resolve identities after the whole op block"): a nullary op an
-    // `id:` refers to may be declared *later* in the source (`op _o_ : … [id: e] .` then `op e : -> S .`,
-    // fable-audit.md §3.4). Declaring every arity-0 op before any op with arguments makes its symbol
-    // available in `name_to_sym` when `declare_op` resolves an `id:` constant, without a separate fixup
-    // pass. A stable partition preserves source order within each group, so overload resolution is
-    // unchanged; results are stored at the source index (`op_syms[idx]`).
+    // Keep the established constants-first partition: it preserves symbol-index ordering while the
+    // identity post-pass now handles every forward/compound reference.
     let mut decl_order: Vec<usize> = (0..pm.ops.len()).collect();
     decl_order.sort_by_key(|&idx| !pm.ops[idx].domain.is_empty());
     for &idx in &decl_order {
@@ -175,8 +174,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         // The (domain, range) profile(s) this declaration expands to.
         let mut profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
             None => {
-                let domain: Vec<SortId> =
-                    od.domain.iter().map(|s| resolve_sort(&engine, &sorts, s)).collect::<R<_>>()?;
+                let domain: Vec<SortId> = od
+                    .domain
+                    .iter()
+                    .map(|s| resolve_sort(&engine, &sorts, s))
+                    .collect::<R<_>>()?;
                 vec![(domain, resolve_sort(&engine, &sorts, &od.range)?)]
             }
             Some(poly) => {
@@ -191,10 +193,18 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                             .iter()
                             .enumerate()
                             .map(|(i, sn)| {
-                                if poly.contains(&(i as u32 + 1)) { Ok(err) } else { sort_id(&sorts, sn) }
+                                if poly.contains(&(i as u32 + 1)) {
+                                    Ok(err)
+                                } else {
+                                    sort_id(&sorts, sn)
+                                }
                             })
                             .collect::<R<_>>()?;
-                        let range = if poly.contains(&0) { err } else { sort_id(&sorts, &od.range)? };
+                        let range = if poly.contains(&0) {
+                            err
+                        } else {
+                            sort_id(&sorts, &od.range)?
+                        };
                         Ok((domain, range))
                     })
                     .collect::<R<_>>()?
@@ -212,27 +222,15 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
 
         let mut decl_syms: Vec<SymbolId> = Vec::with_capacity(profiles.len());
         for (domain, range) in profiles {
-            let dom_kinds: Vec<KindId> = domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
+            let dom_kinds: Vec<KindId> =
+                domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
             let profile = (cname.clone(), dom_kinds, engine.sorts().kind_of(range));
 
             let sym = if let Some(&existing) = sym_by_profile.get(&profile) {
                 engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
                 existing
             } else {
-                let (sym, one_sided) =
-                    declare_op(&mut engine, &cname, &od.attrs, &domain, range, &name_to_sym, interner)?;
-                if let Some(info) = one_sided {
-                    one_sided_id.insert(sym, info);
-                    // Mirror the side into the kernel for the symbolic engine (unification's CUI
-                    // collapse alternatives + the assoc-with-one-sided-id unimplemented screen);
-                    // construction collapse stays frontend-side, so reduction is untouched.
-                    let side = match info.0 {
-                        crate::surface::ast::IdSide::Left => tnk_core::symbol::IdentitySide::Left,
-                        crate::surface::ast::IdSide::Right => tnk_core::symbol::IdentitySide::Right,
-                        crate::surface::ast::IdSide::Both => unreachable!("two-sided id is not one-sided"),
-                    };
-                    engine.set_one_sided_identity(sym, side, info.1);
-                }
+                let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range);
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
                 name_to_sym.entry(cname.clone()).or_insert(sym);
@@ -266,6 +264,33 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 );
                 sym
             };
+            if let Some(tokens) = &od.attrs.id
+                && !identity_specs.iter().any(|spec| spec.symbol == sym)
+            {
+                match od.attrs.id_side {
+                    crate::surface::ast::IdSide::Both => engine.reserve_identity(sym, range),
+                    crate::surface::ast::IdSide::Left => {
+                        engine.reserve_one_sided_identity(
+                            sym,
+                            tnk_core::symbol::IdentitySide::Left,
+                            range,
+                        );
+                    }
+                    crate::surface::ast::IdSide::Right => {
+                        engine.reserve_one_sided_identity(
+                            sym,
+                            tnk_core::symbol::IdentitySide::Right,
+                            range,
+                        );
+                    }
+                }
+                identity_specs.push(IdentitySpec {
+                    symbol: sym,
+                    sort: range,
+                    side: od.attrs.id_side,
+                    tokens: tokens.clone(),
+                });
+            }
             decl_syms.push(sym);
         }
         op_syms[idx] = decl_syms;
@@ -283,14 +308,19 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut false_sym = None;
     let mut succ_zero: HashMap<SymbolId, SymbolId> = HashMap::new();
     for (idx, od) in pm.ops.iter().enumerate() {
-        let Some(spec) = &od.attrs.special else { continue };
-        let Some((class, _)) = &spec.id_hook else { continue };
+        let Some(spec) = &od.attrs.special else {
+            continue;
+        };
+        let Some((class, _)) = &spec.id_hook else {
+            continue;
+        };
         let sym = op_syms[idx][0]; // anchors are concrete (non-poly) ⇒ exactly one instance
         match class.as_str() {
             "SuccSymbol" => {
                 nat_succ = Some(sym);
-                let zero = term_hook_sym(spec, "zeroTerm", &name_to_sym, interner)
+                let proposed = term_hook_sym(spec, "zeroTerm", &name_to_sym, interner)
                     .ok_or("SuccSymbol missing its zeroTerm")?;
+                let zero = engine.register_succ_zero(sym, proposed);
                 nat_zero = Some(zero);
                 succ_zero.insert(sym, zero);
             }
@@ -318,7 +348,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // The canonical META-LEVEL hook set: `metaReduce` carries the full `op-hook` list; every other descent
     // op declares only `op-hook shareWith (metaReduce …)`. Resolve `metaReduce`'s once (order-independent —
     // by spec shape, not declaration position) so all sharers can clone it (see the `MetaLevelOpSymbol` arm).
-    let canonical_meta = find_canonical_meta_hooks(pm, &sym_by_profile, &sorts, engine.sorts(), interner);
+    let canonical_meta =
+        find_canonical_meta_hooks(pm, &sym_by_profile, &sorts, engine.sorts(), interner);
     for (idx, od) in pm.ops.iter().enumerate() {
         if od.attrs.ditto {
             continue; // attributes inherited from the prior declaration (shared symbol)
@@ -386,7 +417,13 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             // `SymbolType` CONFIG/OBJECT/MESSAGE/PORTAL bits onto the kernel symbol. Inert for the
             // existing rewriting modes; the `erewrite` scheduler (Phase 2.5-B) keys on them.
             if od.attrs.config || od.attrs.object || od.attrs.message || od.attrs.portal {
-                engine.set_oo_flags(sym, od.attrs.config, od.attrs.object, od.attrs.message, od.attrs.portal);
+                engine.set_oo_flags(
+                    sym,
+                    od.attrs.config,
+                    od.attrs.object,
+                    od.attrs.message,
+                    od.attrs.portal,
+                );
             }
             if let Some(op) = &special {
                 engine.set_special(sym, op.clone());
@@ -431,7 +468,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         false_sym,
         overload,
         strat_defs: pm.strat_defs.clone(),
-        one_sided_id,
+        identity_specs,
     })
 }
 
@@ -450,7 +487,11 @@ fn compute_overload_flags(
     type Profile = (SymbolId, Vec<KindId>, KindId);
     let mut by_name: HashMap<(&str, usize), Vec<Profile>> = HashMap::new();
     for (&sym, syn) in syntax {
-        let dom: Vec<KindId> = syn.domain.iter().map(|&s| engine.sorts().kind_of(s)).collect();
+        let dom: Vec<KindId> = syn
+            .domain
+            .iter()
+            .map(|&s| engine.sorts().kind_of(s))
+            .collect();
         let range = engine.sorts().kind_of(syn.range);
         by_name
             .entry((engine.symbol(sym).name(), dom.len()))
@@ -481,52 +522,33 @@ fn compute_overload_flags(
     flags
 }
 
-/// Declare one operator via the kernel constructor for its theory (from the attribute flags). Returns the
-/// symbol and, for a **one-sided** `id:` (`left`/`right`), the `(side, identity-constant)` to record — such
-/// an op is registered *without* a kernel identity (whose collapse is two-sided); the declared-side
-/// collapse is applied at command construction ([`crate::load`]'s one-sided post-pass, fable-audit.md §3.4).
+/// Declare one operator via the kernel constructor for its theory. Identity slots are attached by the
+/// caller after every declaration exists; constructors therefore receive no provisional constant.
 fn declare_op(
     engine: &mut Engine,
     name: &str,
     attrs: &Attrs,
     domain: &[SortId],
     range: SortId,
-    name_to_sym: &HashMap<String, SymbolId>,
-    i: &Interner,
-) -> R<(SymbolId, Option<(crate::surface::ast::IdSide, SymbolId)>)> {
-    use crate::surface::ast::IdSide;
-    // `id: <const>` — resolve the (already-declared) identity **constant** by name. Only a single-token
-    // (constant) identity is representable as a `SymbolId`; a compound identity term like `id: g(a)`
-    // (Maude allows it) is not yet supported, so it is dropped here — the operator becomes pure-AC/AU
-    // for construction and unification (no crash; a general identity-term dag is a later
-    // generalization). The audit notes this limitation; U03's `id: g(a)` modules exercise it.
-    let identity = match &attrs.id {
-        Some(toks) if toks.len() == 1 => {
-            Some(*name_to_sym.get(i.resolve(toks[0].sym)).ok_or("unknown id: constant")?)
-        }
-        _ => None,
-    };
-    // A one-sided identity is withheld from the kernel (its collapse is two-sided); record it for the
-    // frontend collapse. A plain (two-sided) `id:` goes to the kernel as before.
-    let one_sided = match (attrs.id_side, identity) {
-        (IdSide::Both, _) | (_, None) => None,
-        (side, Some(c)) => Some((side, c)),
-    };
-    let kernel_id = if one_sided.is_some() { None } else { identity };
-    let sym = if attrs.iter {
+) -> SymbolId {
+    if attrs.iter {
         engine.add_op_iter(name.to_string(), domain.to_vec(), range)
     } else if attrs.assoc && attrs.comm {
-        engine.add_op_ac(name.to_string(), domain.to_vec(), range, kernel_id)
+        engine.add_op_ac(name.to_string(), domain.to_vec(), range, None)
     } else if attrs.assoc {
-        engine.add_op_au(name.to_string(), domain.to_vec(), range, kernel_id)
-    } else if attrs.comm || attrs.idem || kernel_id.is_some() || one_sided.is_some() {
-        // Any non-assoc subset of {comm, id:, idem} is CUI (Maude's CUI_Theory) — an `id:`-only or
-        // `idem`-only op still collapses at construction (§3.2 A3c); non-comm stays positional.
-        engine.add_op_cui(name.to_string(), domain.to_vec(), range, attrs.comm, attrs.idem, kernel_id)
+        engine.add_op_au(name.to_string(), domain.to_vec(), range, None)
+    } else if attrs.comm || attrs.idem || attrs.id.is_some() {
+        engine.add_op_cui(
+            name.to_string(),
+            domain.to_vec(),
+            range,
+            attrs.comm,
+            attrs.idem,
+            None,
+        )
     } else {
         engine.add_op(name.to_string(), domain.to_vec(), range)
-    };
-    Ok((sym, one_sided))
+    }
 }
 
 // ---- hook resolution ----
@@ -541,8 +563,11 @@ fn op_hook_sym(
     // The operator name is the run of tokens before the `:` of `(name : domain ~> range)`. A *mixfix*
     // name can be several tokens — `<_,_,_>` lexes as `<_ , _ , _>` — so join them (canonical form), not
     // just the first (which sufficed for the single-token names `_and_`/`_/_`/`<Strings>`).
-    let name: String =
-        sig.iter().take_while(|t| i.resolve(t.sym) != ":").map(|t| i.resolve(t.sym)).collect();
+    let name: String = sig
+        .iter()
+        .take_while(|t| i.resolve(t.sym) != ":")
+        .map(|t| i.resolve(t.sym))
+        .collect();
     name_to_sym.get(&name).copied()
 }
 
@@ -562,8 +587,12 @@ fn nat_hooks(
     succ_zero: &HashMap<SymbolId, SymbolId>,
     i: &Interner,
 ) -> R<NatHooks> {
-    let succ = op_hook_sym(spec, "succSymbol", name_to_sym, i).ok_or("missing op-hook succSymbol")?;
-    let zero = succ_zero.get(&succ).copied().ok_or("succSymbol has no recorded zeroTerm")?;
+    let succ =
+        op_hook_sym(spec, "succSymbol", name_to_sym, i).ok_or("missing op-hook succSymbol")?;
+    let zero = succ_zero
+        .get(&succ)
+        .copied()
+        .ok_or("succSymbol has no recorded zeroTerm")?;
     let minus = op_hook_sym(spec, "minusSymbol", name_to_sym, i);
     Ok(NatHooks { succ, zero, minus })
 }
@@ -593,7 +622,9 @@ fn special_op(
     canonical_meta: &Option<std::rc::Rc<MetaHooks>>,
     i: &Interner,
 ) -> R<Option<SpecialOp>> {
-    let Some((class, data)) = &spec.id_hook else { return Ok(None) };
+    let Some((class, data)) = &spec.id_hook else {
+        return Ok(None);
+    };
     let code = data.first().map(String::as_str);
     let op = match class.as_str() {
         // Markers (no reduction rule): the constant/successor literals, and the `true`/`false`
@@ -601,7 +632,11 @@ fn special_op(
         // carries no behaviour; `true`/`false` stand for themselves. They are *recorded* (Pass A2) so
         // later passes — bare boolean conditions (`if pred` ⇒ `pred = true`), sort-test predicates —
         // can reference the canonical truth constants.
-        "SuccSymbol" | "StringSymbol" | "FloatSymbol" | "QuotedIdentifierSymbol" | "SystemTrue"
+        "SuccSymbol"
+        | "StringSymbol"
+        | "FloatSymbol"
+        | "QuotedIdentifierSymbol"
+        | "SystemTrue"
         | "SystemFalse" => return Ok(None),
         // `<_:_|_>` (CONFIGURATION's `ObjectConstructorSymbol`, Pillar 2.5). A marker: the object
         // constructor is an ordinary free symbol for reduction/rewriting (its third argument is the
@@ -609,8 +644,12 @@ fn special_op(
         // matching optimizations (via the `attributeSetSymbol` op-hook) that the `erewrite` scheduler
         // will exploit (Phase 2.5-B); for plain rewrite/search nothing special is needed.
         "ObjectConstructorSymbol" => return Ok(None),
-        "MinusSymbol" => SpecialOp::Minus { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
-        "DivisionSymbol" => SpecialOp::Division { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
+        "MinusSymbol" => SpecialOp::Minus {
+            nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
+        },
+        "DivisionSymbol" => SpecialOp::Division {
+            nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
+        },
         // `_==_`/`_=/=_`: structural equality of the two reduced arguments (ground or not — Maude
         // decides `X == Y` as `false` for distinct variables too).
         "EqualitySymbol" => SpecialOp::Equality {
@@ -662,17 +701,46 @@ fn special_op(
                 not_found: term_hook_sym(spec, "notFoundTerm", name_to_sym, i),
             },
         },
-        "RandomOpSymbol" => SpecialOp::Random { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
-        "CounterSymbol" => SpecialOp::Counter { nat: nat_hooks(spec, name_to_sym, succ_zero, i)? },
-        "QuotedIdentifierOpSymbol" => SpecialOp::QidOp {
-            op: match qid_op(code.ok_or("QuotedIdentifierOpSymbol code")?) {
-                Ok(op) => op,
-                Err(_) => return Ok(None), // unimplemented quoted-id op (printTokens/tokenize): inert
+        "RandomOpSymbol" => SpecialOp::Random {
+            nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
+        },
+        "CounterSymbol" => SpecialOp::Counter {
+            nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
+        },
+        "QuotedIdentifierOpSymbol" => match code.ok_or("QuotedIdentifierOpSymbol code")? {
+            // LEXICAL needs the frontend's byte-aware token scanner, so these two quoted-identifier
+            // operations use the same upper-layer descent seam as META-LEVEL rather than becoming inert
+            // or teaching the kernel about source tokens.
+            "tokenize" => SpecialOp::Meta {
+                op: MetaOp::Tokenize,
+                hooks: std::rc::Rc::new(resolve_meta_hooks(
+                    spec,
+                    sym_by_profile,
+                    sorts,
+                    sort_table,
+                    i,
+                )),
             },
-            qid_sym: op_hook_sym(spec, "quotedIdentifierSymbol", name_to_sym, i)
-                .ok_or("QuotedIdentifierOpSymbol quotedIdentifierSymbol")?,
-            str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
-                .ok_or("QuotedIdentifierOpSymbol stringSymbol")?,
+            "printTokens" => SpecialOp::Meta {
+                op: MetaOp::PrintTokens,
+                hooks: std::rc::Rc::new(resolve_meta_hooks(
+                    spec,
+                    sym_by_profile,
+                    sorts,
+                    sort_table,
+                    i,
+                )),
+            },
+            code => SpecialOp::QidOp {
+                op: match qid_op(code) {
+                    Ok(op) => op,
+                    Err(_) => return Ok(None),
+                },
+                qid_sym: op_hook_sym(spec, "quotedIdentifierSymbol", name_to_sym, i)
+                    .ok_or("QuotedIdentifierOpSymbol quotedIdentifierSymbol")?,
+                str_sym: op_hook_sym(spec, "stringSymbol", name_to_sym, i)
+                    .ok_or("QuotedIdentifierOpSymbol stringSymbol")?,
+            },
         },
         "FloatOpSymbol" => match conv_op("FloatOpSymbol", code.unwrap_or(""), arity) {
             Some(op) => conversion(op, spec, name_to_sym, succ_zero, i),
@@ -693,7 +761,13 @@ fn special_op(
             hooks: match canonical_meta {
                 Some(h) => h.clone(),
                 // No `shareWith` source in this module (a descent op standing alone) — resolve its own.
-                None => std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)),
+                None => std::rc::Rc::new(resolve_meta_hooks(
+                    spec,
+                    sym_by_profile,
+                    sorts,
+                    sort_table,
+                    i,
+                )),
             },
         },
         // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
@@ -722,9 +796,9 @@ fn special_op(
     Ok(Some(op))
 }
 
-/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. The reflection-core
-/// functions have dedicated variants; symbolic/variant/narrowing, SMT, and strategy descent map to
-/// [`MetaOp::Deferred`] (declared, inert — Phase 3.2/3.3).
+/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. Reflection and symbolic
+/// variant functions have dedicated variants; narrowing, SMT, and strategy descent map to
+/// [`MetaOp::Deferred`] (declared, inert — Phase 3.3+).
 fn meta_op(code: &str) -> MetaOp {
     match code {
         "metaReduce" => MetaOp::Reduce,
@@ -769,15 +843,71 @@ fn meta_op(code: &str) -> MetaOp {
         "metaDownTerm" => MetaOp::DownTerm,
         // Order-sorted unification descent (S1f). Current signature (variable-family `Qid` 3rd arg) and
         // legacy signature (fresh-variable-count `Nat` 3rd arg) carry distinct id-hook codes.
-        "metaUnify" => MetaOp::Unify { disjoint: false, irredundant: false, legacy: false },
-        "metaDisjointUnify" => MetaOp::Unify { disjoint: true, irredundant: false, legacy: false },
-        "metaIrredundantUnify" => MetaOp::Unify { disjoint: false, irredundant: true, legacy: false },
-        "metaIrredundantDisjointUnify" => {
-            MetaOp::Unify { disjoint: true, irredundant: true, legacy: false }
-        }
-        "legacyMetaUnify" => MetaOp::Unify { disjoint: false, irredundant: false, legacy: true },
-        "legacyMetaDisjointUnify" => MetaOp::Unify { disjoint: true, irredundant: false, legacy: true },
-        // Symbolic (variant/narrowing), SMT, strategy, and legacy descent — Phase 3.2/3.3.
+        "metaUnify" => MetaOp::Unify {
+            disjoint: false,
+            irredundant: false,
+            legacy: false,
+        },
+        "metaDisjointUnify" => MetaOp::Unify {
+            disjoint: true,
+            irredundant: false,
+            legacy: false,
+        },
+        "metaIrredundantUnify" => MetaOp::Unify {
+            disjoint: false,
+            irredundant: true,
+            legacy: false,
+        },
+        "metaIrredundantDisjointUnify" => MetaOp::Unify {
+            disjoint: true,
+            irredundant: true,
+            legacy: false,
+        },
+        "legacyMetaUnify" => MetaOp::Unify {
+            disjoint: false,
+            irredundant: false,
+            legacy: true,
+        },
+        "legacyMetaDisjointUnify" => MetaOp::Unify {
+            disjoint: true,
+            irredundant: false,
+            legacy: true,
+        },
+        // Folding variant descent (S2), current Qid-family and legacy Nat-family signatures.
+        "metaGetVariant" => MetaOp::GetVariant {
+            irredundant: false,
+            legacy: false,
+        },
+        "metaGetIrredundantVariant" => MetaOp::GetVariant {
+            irredundant: true,
+            legacy: false,
+        },
+        "legacyMetaGetVariant" => MetaOp::GetVariant {
+            irredundant: false,
+            legacy: true,
+        },
+        "legacyMetaGetIrredundantVariant" => MetaOp::GetVariant {
+            irredundant: true,
+            legacy: true,
+        },
+        "metaVariantUnify" => MetaOp::VariantUnify {
+            disjoint: false,
+            legacy: false,
+        },
+        "metaVariantDisjointUnify" => MetaOp::VariantUnify {
+            disjoint: true,
+            legacy: false,
+        },
+        "legacyMetaVariantUnify" => MetaOp::VariantUnify {
+            disjoint: false,
+            legacy: true,
+        },
+        "legacyMetaVariantDisjointUnify" => MetaOp::VariantUnify {
+            disjoint: true,
+            legacy: true,
+        },
+        "metaVariantMatch" => MetaOp::VariantMatch,
+        // Remaining symbolic (narrowing), SMT, strategy, and legacy descent — Phase 3.3+.
         _ => MetaOp::Deferred,
     }
 }
@@ -798,7 +928,13 @@ fn find_canonical_meta_hooks(
         let spec = od.attrs.special.as_ref()?;
         let (class, _) = spec.id_hook.as_ref()?;
         if class == "MetaLevelOpSymbol" && !spec.op_hooks.iter().any(|(p, _)| p == "shareWith") {
-            Some(std::rc::Rc::new(resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i)))
+            Some(std::rc::Rc::new(resolve_meta_hooks(
+                spec,
+                sym_by_profile,
+                sorts,
+                sort_table,
+                i,
+            )))
         } else {
             None
         }
@@ -824,7 +960,10 @@ fn resolve_meta_hooks(
         }
     }
     // The descent functions carry op-hooks only (no term-hooks), so `terms` stays empty.
-    MetaHooks { ops, terms: HashMap::new() }
+    MetaHooks {
+        ops,
+        terms: HashMap::new(),
+    }
 }
 
 /// Resolve one `op-hook` signature `name : dom… ~> range` to the symbol with that profile (name + the
@@ -842,8 +981,10 @@ fn resolve_op_hook_sig(
     let arrow = texts.iter().position(|&t| t == "~>" || t == "->")?;
     let name: String = texts[..colon].concat();
     let kind_of_sort = |s: &str| sorts.get(s).map(|&sid| sort_table.kind_of(sid));
-    let dom_kinds: Vec<KindId> =
-        texts[colon + 1..arrow].iter().map(|s| kind_of_sort(s)).collect::<Option<_>>()?;
+    let dom_kinds: Vec<KindId> = texts[colon + 1..arrow]
+        .iter()
+        .map(|s| kind_of_sort(s))
+        .collect::<Option<_>>()?;
     let range = texts.get(arrow + 1)?;
     let range_kind = kind_of_sort(range)?;
     sym_by_profile.get(&(name, dom_kinds, range_kind)).copied()
@@ -988,7 +1129,6 @@ fn flt_op(code: &str, arity: usize) -> R<FltOp> {
         (other, _) => return Err(format!("unsupported float op `{other}`")),
     })
 }
-
 
 #[cfg(test)]
 mod tests {

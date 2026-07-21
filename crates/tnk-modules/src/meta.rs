@@ -6,8 +6,8 @@
 //! flatten+build pipeline), down-translate the subject meta-term into that module, run the engine
 //! operation, and **up**-translate the result back into the meta-level engine (via `ctx`).
 //!
-//! Scope (Stages 1–5 — the whole META-LEVEL surface; the symbolic/SMT/strategy descent is declared and
-//! reduces inert until its backends land, Stage 5):
+//! Scope (Stages 1–5 — the whole META-LEVEL surface): base unification and folding-variant descent are
+//! implemented; narrowing, SMT, and strategy descent remain deferred until their backends land.
 //!
 //! * **The rewriting/matching/search family** (Stage 3) computes over a down-translated object module —
 //!   `metaReduce`/`metaNormalize` (→ `ResultPair`), `metaRewrite`/`metaFrewrite` (rule-/position-fair),
@@ -31,11 +31,12 @@
 //!   and `metaWellFormed{Module,Term,Substitution}` (structural checks → `Bool`).
 //!
 //! Every implemented descent function conforms on **value, sort, rewrite count, *and* layout** (Stage 3.5
-//! taught `print_pretty` the `format` attribute). The **symbolic** (unify/variant/narrow, Phase 3.2),
-//! **SMT** (Phase 3.3), and **strategy-meta** (Phase 2.4 E) descent — `MetaOp::Deferred` plus the strategy-up
-//! maps `UpStratDecls`/`UpSds` — are declared and parse (the tower is complete) but reduce to the kind level
-//! via the [`descend`](MetaDescent::descend) match's single exhaustive inert arm (Stage 5: a new descent op now
-//! forces a dispatch choice at compile time). The strategy *language* itself (`srewrite`/`dsrewrite`, the full
+//! taught `print_pretty` the `format` attribute). Base unification and the current/legacy variant families
+//! have dedicated `MetaOp` variants; narrowing, **SMT**, and **strategy-meta** descent remain in
+//! `MetaOp::Deferred`. Those deferred operations parse and load but reduce to the kind level; exhaustive
+//! dispatch still forces an explicit choice whenever a new descent operation is added. The strategy
+//! *language* itself
+//! (`srewrite`/`dsrewrite`, the full
 //! combinator + matchrew + conditional-rule surface) is **complete and conformant** in `tnk-frontend::strategy`
 //! (Phase 2.4 A–D); only the strategy *meta-reflection* (`upStratDecls`/`upSds`/`metaParseStrategy`/
 //! `metaPrettyPrintStrategy` — the Stage-5 strategy tail) stays inert here, pending sort-aware constructor
@@ -59,29 +60,370 @@ use tnk_core::sort::SortId;
 use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 use tnk_frontend::build_term::VarIndex;
-use tnk_frontend::lex::{tokenize, Interner, Sym};
+use tnk_frontend::lex::{Interner, Sym, tokenize};
 use tnk_frontend::load::{
-    build_command_dag, build_loaded_module, command_parse_furthest, parse_statement_trace, InternerNames,
-    LoadedModule, StmtTrace,
+    InternerNames, LoadedModule, StmtTrace, build_command_dag, build_loaded_module,
+    build_logic_command_dag, command_parse_furthest, executable_variant_equations,
+    maude_variable_name_rank, parse_statement_trace,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use tnk_frontend::surface::ast::{
-    Attrs, GatherElem, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap, Parameter, PreModule,
-    Statement,
+    Attrs, GatherElem, IdSide, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap,
+    Parameter, PreModule, Statement,
 };
 
 use crate::db::ModuleDb;
 use crate::flatten::{flatten, flatten_pre};
 use crate::view::ViewDb;
 
-/// The descent handler: the module database/views (to resolve a meta-module's imports) and the interner
-/// (to build the object module). Constructed per reduce command and threaded into `reduce_with`.
+const META_VARIANT_CACHE_CAPACITY: usize = 4;
+
+#[derive(Default)]
+pub struct MetaState {
+    variant_caches: Vec<MetaVariantCache>,
+}
+
+impl MetaState {
+    /// Drop cached descent states before the REPL replaces the outer module engine that owns their
+    /// structurally keyed meta-term DAGs.
+    pub fn clear(&mut self) {
+        self.variant_caches.clear();
+    }
+
+    fn take_get_variant(
+        &mut self,
+        key: &MetaGetVariantCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaGetVariantCache> {
+        let index = self.variant_caches.iter().position(
+            |entry| matches!(entry, MetaVariantCache::Get(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaVariantCache::Get(cache) = self.variant_caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+    }
+
+    fn take_variant_unify(
+        &mut self,
+        key: &MetaVariantUnifyCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaVariantUnifyCache> {
+        let index = self.variant_caches.iter().position(
+            |entry| matches!(entry, MetaVariantCache::Unify(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaVariantCache::Unify(cache) = self.variant_caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+    }
+
+    fn insert(&mut self, cache: MetaVariantCache) {
+        if self.variant_caches.len() == META_VARIANT_CACHE_CAPACITY {
+            self.variant_caches.remove(0);
+        }
+        self.variant_caches.push(cache);
+    }
+}
+
+enum MetaVariantCache {
+    Get(MetaGetVariantCache),
+    Unify(MetaVariantUnifyCache),
+}
+
+/// The descent handler: the module database/views (to resolve a meta-module's imports), the interner
+/// (to build the object module), and the REPL-owned state for Maude's cross-command variant cache.
 pub struct MetaDescent<'a> {
     pub interner: &'a mut Interner,
     pub db: &'a ModuleDb,
     pub views: &'a ViewDb,
+    unify_cache: Option<MetaUnifyCache>,
+    state: &'a mut MetaState,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MetaUnifyCacheKey {
+    module: DagId,
+    roots: Vec<DagId>,
+    family_root: &'static str,
+    base: String,
+    disjoint: bool,
+}
+
+struct MetaUnifyCache {
+    key: MetaUnifyCacheKey,
+    limit: usize,
+    loaded: LoadedModule,
+    specs_raw: Vec<(String, SortId)>,
+    n_lhs: usize,
+    original_order: Vec<usize>,
+    unifiers: Vec<Vec<DagId>>,
+    exhausted: bool,
+    incomplete: bool,
+}
+
+#[derive(Clone)]
+struct MetaGetVariantCacheKey {
+    module: DagId,
+    roots: Vec<DagId>,
+    family: Option<tnk_core::fresh::VariableFamily>,
+    base: String,
+    irredundant: bool,
+    legacy: bool,
+}
+
+impl MetaGetVariantCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.family == other.family
+            && self.base == other.base
+            && self.irredundant == other.irredundant
+            && self.legacy == other.legacy
+            && ctx.deep_equal(self.module, other.module)
+            && self.roots.len() == other.roots.len()
+            && self
+                .roots
+                .iter()
+                .zip(&other.roots)
+                .all(|(&lhs, &rhs)| ctx.deep_equal(lhs, rhs))
+    }
+}
+
+struct MetaGetVariantCache {
+    key: MetaGetVariantCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::variant::VariantSearch,
+    variable_names: Vec<String>,
+    variants: Vec<tnk_core::variant::VariantResult>,
+    exhausted: bool,
+    last_solution: Option<usize>,
+    rewrite_checkpoint: u64,
+    rewrite_charge: u64,
+}
+
+#[derive(Clone)]
+struct MetaVariantUnifyCacheKey {
+    module: DagId,
+    roots: Vec<DagId>,
+    family: Option<tnk_core::fresh::VariableFamily>,
+    base: String,
+    disjoint: bool,
+    legacy: bool,
+    matching: bool,
+    filtered: bool,
+    delayed: bool,
+}
+
+impl MetaVariantUnifyCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.family == other.family
+            && (self.matching || self.base == other.base)
+            && self.disjoint == other.disjoint
+            && self.legacy == other.legacy
+            && self.filtered == other.filtered
+            && self.delayed == other.delayed
+            && self.matching == other.matching
+            && ctx.deep_equal(self.module, other.module)
+            && self.roots.len() == other.roots.len()
+            && self
+                .roots
+                .iter()
+                .zip(&other.roots)
+                .all(|(&lhs, &rhs)| ctx.deep_equal(lhs, rhs))
+    }
+}
+
+
+struct MetaVariantUnifyCache {
+    key: MetaVariantUnifyCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::variant::VariantSearch,
+    pair_count: usize,
+    specs_raw: Vec<(String, SortId)>,
+    canonical_order: Vec<usize>,
+    n_lhs: usize,
+    upfront: bool,
+    prepared: bool,
+    exhausted: bool,
+    rewrite_checkpoint: u64,
+    rewrite_charge: u64,
+    stream: tnk_core::variant::FilteredVariantUnifierStream,
+    answers: Vec<usize>,
+    deferred_variant: Option<tnk_core::variant::VariantResult>,
+    restorations: Vec<(DagId, DagId)>,
+    last_solution: Option<usize>,
+}
+
+impl MetaVariantUnifyCache {
+
+    fn advance(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
+        if self.exhausted {
+            return;
+        }
+        let pending_before = self.stream.pending_len();
+        if self.key.matching {
+            self.advance_matching(env);
+        } else if let Some(variant) = self.search.find_next(env) {
+            debug_assert!(variant.unifier);
+            let mut bindings = variant.substitution;
+            if !self.restorations.is_empty() {
+                for binding in &mut bindings {
+                    *binding = tnk_core::variant::restore_subject_variables(
+                        env.e,
+                        *binding,
+                        &self.restorations,
+                    );
+                }
+            }
+            let equations = self.search.variant_equations();
+            let rewrites = env.e.rewrites();
+            self.stream
+                .insert(env, bindings, variant.family, rewrites, &equations);
+        } else {
+            self.exhausted = true;
+        }
+        if !self.upfront {
+            let rewrites = env.e.rewrites();
+            if self.stream.pending_len() > pending_before {
+                // Maude transfers a variant search's subcontext count only when findNextUnifier()
+                // returns a solution. Work accumulated while skipping rejected candidates belongs
+                // to the next solution; work in the terminal failed call is deliberately dropped.
+                self.rewrite_charge += rewrites.saturating_sub(self.rewrite_checkpoint);
+                self.rewrite_checkpoint = rewrites;
+            } else if self.exhausted {
+                self.rewrite_checkpoint = rewrites;
+            }
+        }
+    }
+
+    fn advance_matching(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
+        let Some(mut variant) = self
+            .deferred_variant
+            .take()
+            .or_else(|| self.search.find_next(env))
+        else {
+            self.exhausted = true;
+            return;
+        };
+        let root_identity = variant.index == 0
+            && env
+                .e
+                .node(variant.term)
+                .children()
+                .collect::<Vec<_>>()
+                .chunks_exact(2)
+                .all(|pair| env.e.deep_equal(pair[0], pair[1]));
+        let family = self
+            .key
+            .family
+            .expect("metalevel variant matching has a family");
+        let mut completed = Vec::new();
+        loop {
+            completed.extend(tnk_core::variant::complete_variant_unifier(
+                env,
+                &variant,
+                self.pair_count,
+                family,
+                &self.key.base,
+            ));
+            if root_identity {
+                break;
+            }
+            if variant.more_in_layer {
+                variant = self.search.find_next(env).expect("same variant layer");
+            } else {
+                self.deferred_variant = self.search.find_next(env);
+                break;
+            }
+        }
+        if !self.restorations.is_empty() {
+            for bindings in &mut completed {
+                for binding in bindings {
+                    *binding = tnk_core::variant::restore_subject_variables(
+                        env.e,
+                        *binding,
+                        &self.restorations,
+                    );
+                }
+            }
+        }
+        completed.retain(|bindings| self.search.accepts_completed_unifier(env.e, bindings));
+        let completed = if self.stream.is_filtered() {
+            completed
+        } else {
+            let mut survivors: Vec<Vec<DagId>> = Vec::new();
+            'candidate: for bindings in completed {
+                if survivors
+                    .iter()
+                    .any(|retained| tnk_core::variant::unifier_subsumes(env.e, retained, &bindings))
+                {
+                    continue 'candidate;
+                }
+                survivors.retain(|retained| {
+                    !tnk_core::variant::unifier_subsumes(env.e, &bindings, retained)
+                });
+                survivors.push(bindings);
+            }
+            survivors
+        };
+        for bindings in completed {
+            let equations = self.search.variant_equations();
+            let rewrites = env.e.rewrites();
+            self.stream
+                .insert(env, bindings, family, rewrites, &equations);
+        }
+        if root_identity || self.deferred_variant.is_none() {
+            self.exhausted = true;
+        }
+    }
+
+    fn prepare(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
+        if self.prepared {
+            return;
+        }
+        while !self.exhausted {
+            self.advance(env);
+        }
+        self.stream.finish();
+        self.prepared = true;
+
+        let rewrites = env.e.rewrites();
+        if !self.stream.pending_is_empty() {
+            // DELAY constructs and exhausts the filtered search before its first result. The first
+            // successful extraction transfers the whole completed subcontext count.
+            self.rewrite_charge += rewrites.saturating_sub(self.rewrite_checkpoint);
+        }
+        self.rewrite_checkpoint = rewrites;
+    }
+
+    fn take_rewrite_charge(&mut self) -> u64 {
+        std::mem::take(&mut self.rewrite_charge)
+    }
+    fn pop_pending(&mut self) -> Option<usize> {
+        self.stream.pop_pending()
+    }
+}
+
+impl<'a> MetaDescent<'a> {
+    pub fn new(
+        interner: &'a mut Interner,
+        db: &'a ModuleDb,
+        views: &'a ViewDb,
+        state: &'a mut MetaState,
+    ) -> Self {
+        Self {
+            interner,
+            db,
+            views,
+            unify_cache: None,
+            state,
+        }
+    }
 }
 
 impl DescentOps for MetaDescent<'_> {
@@ -147,12 +489,15 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Parse => self.meta_parse(ctx, hooks, redex),
             MetaOp::PrettyPrint => self.meta_pretty_print(ctx, hooks, redex, false),
             MetaOp::PrintToString => self.meta_pretty_print(ctx, hooks, redex, true),
-            // Stage 5 — declared but **inert**: the symbolic (unify/variant/narrow, Phase 3.2, D6 BDD),
-            // SMT (Phase 3.3, D7 Z3), and strategy (Phase 2.4) descent. These ops parse and load (the tower
-            // is complete) but reduce to the kind level — they never misfire — until their backends land.
-            // `MetaOp::Deferred` is the symbolic/SMT/legacy set (`metaUnify`/`metaVariant*`/`metaNarrow*`/
-            // `metaSmtSearch`/`metaCheck`/`metaSrewrite`/`metaParseStrategy`/…); `UpStratDecls`/`UpSds` are
-            // the strategy-declaration up maps. The match is exhaustive so a new descent op forces a choice.
+            // LEXICAL's quoted-identifier hooks also descend: their scanner owns the shared frontend
+            // interner, while their inputs/results remain ordinary String/Qid NA nodes in this engine.
+            MetaOp::Tokenize => self.lexical_tokenize(ctx, hooks, redex),
+            MetaOp::PrintTokens => self.lexical_print_tokens(ctx, hooks, redex),
+            // Stage 5 — declared but **inert**: narrowing, SMT, and strategy descent. Base unification
+            // and S2 variants have explicit arms below; `MetaOp::Deferred` now contains only the
+            // remaining `metaNarrow*`, `metaSmtSearch`/`metaCheck`, and strategy-meta operations.
+            // These surfaces parse and load but reduce to the kind level until their backends land.
+            // The exhaustive match forces a dispatch choice when a new descent op is added.
             // Strategy-meta up maps are structurally deferred (G1, §3.9.8) — but the EMPTY sets
             // need none of G1's prerequisites: a module with no strat declarations/definitions
             // up-translates to the empty-set constant ((none).StratDeclSet, 1 rewrite), as Maude
@@ -173,9 +518,21 @@ impl DescentOps for MetaDescent<'_> {
                 Some(ctx.app(sym, Vec::new()))
             }
             // Order-sorted unification descent (S1f).
-            MetaOp::Unify { disjoint, irredundant, legacy } => {
-                self.meta_unify(ctx, hooks, redex, disjoint, irredundant, legacy)
+            MetaOp::Unify {
+                disjoint,
+                irredundant,
+                legacy,
+            } => self.meta_unify(ctx, hooks, redex, disjoint, irredundant, legacy),
+            // S2 variant operations have distinct dispatch identities so they cannot silently fall through
+            // to an unrelated descent function. Their concrete handlers are wired with the variant engine.
+            MetaOp::GetVariant {
+                irredundant,
+                legacy,
+            } => self.meta_get_variant(ctx, hooks, redex, irredundant, legacy),
+            MetaOp::VariantUnify { disjoint, legacy } => {
+                self.meta_variant_unify(ctx, hooks, redex, disjoint, legacy)
             }
+            MetaOp::VariantMatch => self.meta_variant_match(ctx, hooks, redex),
             MetaOp::Deferred => None,
         }
     }
@@ -190,11 +547,11 @@ impl MetaDescent<'_> {
             return None;
         }
         let mut loaded = self.down_module(ctx, hooks, kids[0])?;
-        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner)?;
         loaded.built.engine.reset_rewrites();
         let result = loaded.built.engine.reduce(subj);
         ctx.add_rewrites(loaded.built.engine.rewrites());
-        let ut = up_term(ctx, hooks, &loaded.built, result);
+        let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, result);
         let us = up_sort(ctx, hooks, &loaded.built, result);
         let rp = *hooks.ops.get("resultPairSymbol")?;
         Some(ctx.app(rp, vec![ut, us]))
@@ -202,20 +559,25 @@ impl MetaDescent<'_> {
 
     /// `metaNormalize(M, T)` → `{up(t'), up(leastSort(t'))}` where `t'` is `down(T)` normalized modulo the
     /// module's **structural axioms only** — AC/ACU ordering, `id:`/`idem` collapse, `iter` fold — with **no
-    /// user equations applied** (Maude's `Term::normalize(true)`, which `down_term`'s construction already
-    /// performs). The inverse temptation is `meta_reduce`, which additionally runs the equations to normal
-    /// form; `metaNormalize` must leave `g(a)` as `g(a)` even when `eq g(a) = b` exists. No object rewrites
-    /// are counted (Maude does not `addInCount` here).
-    fn meta_normalize(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    /// user equations applied**. `down_term` constructs the dynamic DAG; `normalize_for_unify` performs
+    /// Maude's eager `Term::normalize(true)` pass, including flattening nested associative applications
+    /// whose children are not reduction-stamped. The inverse temptation is `meta_reduce`, which additionally
+    /// runs user equations. No object rewrites are counted (Maude does not `addInCount` here).
+    fn meta_normalize(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         if kids.len() != 2 {
             return None;
         }
         let mut loaded = self.down_module(ctx, hooks, kids[0])?;
-        // `down_term` builds the canonical DAG (construction canonicalizes AC order / collapses id/idem /
-        // folds iter) — that *is* the axiom-normal form; no `reduce` call, so no equation ever fires.
-        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built)?;
-        let ut = up_term(ctx, hooks, &loaded.built, subj);
+        // Eager theory normalization only; unlike `reduce`, this never applies user equations.
+        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner)?;
+        let subj = loaded.built.engine.normalize_for_unify(subj);
+        let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, subj);
         let us = up_sort(ctx, hooks, &loaded.built, subj);
         let rp = *hooks.ops.get("resultPairSymbol")?;
         Some(ctx.app(rp, vec![ut, us]))
@@ -233,7 +595,7 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let bound = down_bound(ctx, hooks, *kids.get(2)?);
         loaded.built.engine.reset_rewrites();
         let result = if position_fair {
@@ -246,7 +608,7 @@ impl MetaDescent<'_> {
             rw.run(&mut loaded.built.engine, bound).term
         };
         ctx.add_rewrites(loaded.built.engine.rewrites());
-        let ut = up_term(ctx, hooks, &loaded.built, result);
+        let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, result);
         let us = up_sort(ctx, hooks, &loaded.built, result);
         let rp = *hooks.ops.get("resultPairSymbol")?;
         Some(ctx.app(rp, vec![ut, us]))
@@ -260,7 +622,7 @@ impl MetaDescent<'_> {
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
-        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
         // The condition (such-that) is handled only when empty for now.
         if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
             return None;
@@ -273,7 +635,14 @@ impl MetaDescent<'_> {
         // Capture the (n+1)-th solution's bindings while the matcher stream borrows the engine.
         let bindings = nth_match(&mut loaded.built.engine, pattern, nr, subj, false, sol_nr);
         let result = match bindings {
-            Some(b) => up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &b),
+            Some(b) => up_substitution(
+                ctx,
+                hooks,
+                &loaded.built,
+                self.interner,
+                &var_names(&vars),
+                &b,
+            ),
             None => ctx.app(*hooks.ops.get("noMatchSubstSymbol")?, vec![]),
         };
         Some(result)
@@ -293,14 +662,17 @@ impl MetaDescent<'_> {
         redex: DagId,
         disjoint: bool,
         irredundant: bool,
-        legacy: bool,
+        _declared_legacy: bool,
     ) -> Option<DagId> {
         use tnk_core::fresh::VariableFamily;
-        use tnk_core::unify::problem::{UnifyProblem, VarSpec};
         use tnk_core::unify::UnifyEnv;
+        use tnk_core::unify::problem::{UnifyProblem, VarSpec};
 
         let kids = ctx.children(redex);
-        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
+        // The current and legacy prelude declarations have the same name and arity, so this port's
+        // name/arity symbol table folds them onto one symbol and the later attachment is last-wins.
+        // Select the overload from the observable 3rd argument instead: Qid is current, Nat is legacy.
+        let legacy = !matches!(ctx.repr(*kids.get(2)?), NodeRepr::Qid(_));
 
         // 3rd argument. Current signature: a variable-family Qid whose result family is Maude's
         // `variableFamilyToUse` ('#' unless the hint IS '#', then '%'), and the `ok` family for the
@@ -326,35 +698,80 @@ impl MetaDescent<'_> {
             VariableFamily::Narrow => "@",
         };
         let sol_nr = down_nat64(ctx, *kids.get(3)?)? as usize;
+        // A `check`-style meta program asks for indices 0,1,2,… by repeatedly rebuilding the same
+        // redex. Cache an exponentially grown current-API prefix for this outer reduce command: each
+        // growth still enumerates from scratch, but the total work is O(n), not O(n²). Legacy counters
+        // and irredundant filtering retain their existing one-shot paths.
+        let cache_key = if !legacy && !irredundant {
+            Some(MetaUnifyCacheKey {
+                module: *kids.first()?,
+                roots: meta_unification_roots(ctx, hooks, *kids.get(1)?)?,
+                family_root,
+                base: base.clone(),
+                disjoint,
+            })
+        } else {
+            None
+        };
+        if let Some(key) = &cache_key
+            && let Some(cache) = self.unify_cache.as_ref().filter(|cache| &cache.key == key)
+            && (sol_nr < cache.unifiers.len() || cache.exhausted)
+        {
+            return render_cached_meta_unifier(ctx, hooks, cache, self.interner, sol_nr);
+        }
+        let enumeration_limit = cache_key.as_ref().map_or(sol_nr + 1, |key| {
+            self.unify_cache
+                .as_ref()
+                .filter(|cache| &cache.key == key)
+                .map_or(sol_nr + 1, |cache| {
+                    cache.limit.saturating_mul(2).max(sol_nr + 1)
+                })
+        });
+        let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
 
         // Down-translate the problem into (lhs, rhs) Term pairs + the original variables' (name, sort) in
         // slot order; `n_lhs` is the disjoint split point (lhs-side variables occupy slots `0..n_lhs`).
         let mut specs_raw: Vec<(String, SortId)> = Vec::new();
-        let (pairs, n_lhs) =
-            down_unification_problem(ctx, hooks, *kids.get(1)?, &loaded.built, &mut specs_raw, disjoint)?;
+        let (pairs, n_lhs) = down_unification_problem(
+            ctx,
+            hooks,
+            *kids.get(1)?,
+            &loaded.built,
+            &mut specs_raw,
+            disjoint,
+        )?;
         let n_vars = specs_raw.len();
 
-        // Internal name codes per slot. A disjoint problem's rhs variables (slots `n_lhs..`) must be
-        // distinct from the lhs even when they share a source name — the kernel compares variables by
-        // name code (deep_equal), so a shared code would collapse `X+Y =? X'+Y'` to the trivial
-        // `X+Y =? X+Y`. We give them a per-slot internal name (Maude's `Token::flaggedCode`); the result's
-        // substitution keys still render from the original names (`specs_raw`), and solution *order* is by
-        // slot index, so lhs (`0..n_lhs`) precedes rhs — matching the reference.
+        // Maude's meta down-conversion splits a variable qid (`L:Bag`) and gives the kernel the bare
+        // name's existing token code (`L`), not the compound qid's code. This preserves the session-wide
+        // variable order used by term canonicalization. For disjoint unification, rhs names are made
+        // distinct with `Token::flaggedCode`'s reserved bit while retaining that order.
+        const FLAGGED_CODE_BIT: u32 = 0x4000_0000;
         let codes: Vec<u32> = (0..n_vars)
             .map(|k| {
-                let internal = if disjoint && k >= n_lhs {
-                    format!("{}\u{1}{k}", specs_raw[k].0)
+                let bare = specs_raw[k]
+                    .0
+                    .split_once(':')
+                    .map_or(specs_raw[k].0.as_str(), |(name, _)| name);
+                let code = self.interner.intern(bare).index();
+                if disjoint && k >= n_lhs {
+                    code | FLAGGED_CODE_BIT
                 } else {
-                    specs_raw[k].0.clone()
-                };
-                self.interner.intern(&internal).index()
+                    code
+                }
             })
             .collect();
 
         // Genuine Var-leaf dags per slot; instantiate each side and theory-normalize (the `unify`
         // command's pipeline; one-sided-id collapse is a no-op for every metaUnify operator).
-        let bindings: Vec<DagId> =
-            (0..n_vars).map(|k| loaded.built.engine.make_var(specs_raw[k].1, codes[k], k as u32)).collect();
+        let bindings: Vec<DagId> = (0..n_vars)
+            .map(|k| {
+                loaded
+                    .built
+                    .engine
+                    .make_var(specs_raw[k].1, codes[k], k as u32)
+            })
+            .collect();
         let mut equations: Vec<(DagId, DagId)> = Vec::new();
         for (l, r) in &pairs {
             let ld = loaded.built.engine.instantiate_bindings(l, &bindings);
@@ -363,8 +780,12 @@ impl MetaDescent<'_> {
             let rd = loaded.built.engine.normalize_for_unify(rd);
             equations.push((ld, rd));
         }
-        let specs: Vec<VarSpec> =
-            (0..n_vars).map(|k| VarSpec { sort: specs_raw[k].1, name: codes[k] }).collect();
+        let specs: Vec<VarSpec> = (0..n_vars)
+            .map(|k| VarSpec {
+                sort: specs_raw[k].1,
+                name: codes[k],
+            })
+            .collect();
 
         // Safe-name check (Maude's `variableNameConflict`): a problem variable named like the fresh
         // family (`#1` when the used family is `#`) is unsafe → no reduction (advisory only).
@@ -379,14 +800,21 @@ impl MetaDescent<'_> {
             }
         }
 
-        // Enumerate. Irredundant: collect all, filter, then index. Otherwise: the (n+1)-th directly.
+        // Enumerate. Irredundant: collect all, filter, then index. Current non-irredundant calls grow
+        // an outer-command cache exponentially; other calls enumerate exactly through the requested index.
         let mut collected: Vec<Vec<DagId>> = Vec::new();
+        let mut exhausted = false;
         let incomplete;
         let last_var_index; // legacy result's `Nat` = base + nrFreeVariables of the chosen unifier
+        let original_order;
         {
             let mut names = InternerNames(self.interner);
-            let mut env = UnifyEnv { e: &mut loaded.built.engine, names: &mut names };
+            let mut env = UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
             let mut prob = UnifyProblem::new(&mut env, equations, specs, used_family, &base);
+            original_order = prob.original_variable_order().to_vec();
             if !prob.problem_okay() {
                 return None; // unimplemented-theory screen — no reduction
             }
@@ -394,11 +822,15 @@ impl MetaDescent<'_> {
                 while let Some(u) = prob.find_next(&mut env) {
                     collected.push(u);
                 }
+                exhausted = true;
             } else {
-                for _ in 0..=sol_nr {
+                for _ in 0..enumeration_limit {
                     match prob.find_next(&mut env) {
                         Some(b) => collected.push(b),
-                        None => break,
+                        None => {
+                            exhausted = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -410,6 +842,21 @@ impl MetaDescent<'_> {
         } else {
             collected
         };
+        if let Some(key) = cache_key {
+            self.unify_cache = Some(MetaUnifyCache {
+                key,
+                limit: enumeration_limit,
+                loaded,
+                specs_raw,
+                n_lhs,
+                original_order,
+                unifiers,
+                exhausted,
+                incomplete,
+            });
+            let cache = self.unify_cache.as_ref()?;
+            return render_cached_meta_unifier(ctx, hooks, cache, self.interner, sol_nr);
+        }
 
         // The result's third component: a family `Qid` (current) or the next free-variable index `Nat`
         // (legacy `base + nrFreeVariables`).
@@ -424,6 +871,14 @@ impl MetaDescent<'_> {
                 ctx.app(*hooks.ops.get(hook)?, vec![])
             }
             Some(bindings) => {
+                // The kernel returns bindings in its post-normalization slot order. Restore the
+                // down-translator's original order before pairing names and, for disjoint
+                // unification, before splitting the contiguous lhs/rhs slot ranges.
+                let mut bindings_original = bindings.clone();
+                for (new_slot, &old_slot) in original_order.iter().enumerate() {
+                    bindings_original[old_slot] = bindings[new_slot];
+                }
+                let bindings = &bindings_original;
                 let third = if legacy {
                     up_nat_big(ctx, &last_var_index)?
                 } else {
@@ -435,22 +890,936 @@ impl MetaDescent<'_> {
                         specs_raw[..n_lhs].iter().map(|(n, _)| n.as_str()).collect();
                     let rhs_names: Vec<&str> =
                         specs_raw[n_lhs..].iter().map(|(n, _)| n.as_str()).collect();
-                    let sl = up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &lhs_names, lhs_b);
-                    let sr = up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &rhs_names, rhs_b);
-                    let hook = if legacy { "legacyUnificationTripleSymbol" } else { "unificationTripleSymbol" };
+                    let sl = up_unifier_substitution(
+                        ctx,
+                        hooks,
+                        &loaded.built,
+                        self.interner,
+                        &lhs_names,
+                        lhs_b,
+                    );
+                    let sr = up_unifier_substitution(
+                        ctx,
+                        hooks,
+                        &loaded.built,
+                        self.interner,
+                        &rhs_names,
+                        rhs_b,
+                    );
+                    let hook = if legacy {
+                        "legacyUnificationTripleSymbol"
+                    } else {
+                        "unificationTripleSymbol"
+                    };
                     ctx.app(*hooks.ops.get(hook)?, vec![sl, sr, third])
                 } else {
                     let names: Vec<&str> = specs_raw.iter().map(|(n, _)| n.as_str()).collect();
-                    let sub =
-                        up_unifier_substitution(ctx, hooks, &loaded.built, self.interner, &names, bindings);
+                    let sub = up_unifier_substitution(
+                        ctx,
+                        hooks,
+                        &loaded.built,
+                        self.interner,
+                        &names,
+                        bindings,
+                    );
                     // The current `{_,_}:Substitution Qid` UnificationPair coincides with `matchPairSymbol`
                     // at the kind level (metaUp.cc); the legacy `{_,_}:Substitution Nat` is its own symbol.
-                    let hook = if legacy { "legacyUnificationPairSymbol" } else { "matchPairSymbol" };
+                    let hook = if legacy {
+                        "legacyUnificationPairSymbol"
+                    } else {
+                        "matchPairSymbol"
+                    };
                     ctx.app(*hooks.ops.get(hook)?, vec![sub, third])
                 }
             }
         };
         Some(result)
+    }
+
+    /// `metaGetVariant(M, T, TL, F, n)` returns the `n`th folding variant of `T`. Maude retains the
+    /// live search in its four-entry structural meta-operation cache: equal indices reuse the current
+    /// result, forward indices resume it, and a backward request discards it and starts over.
+    fn meta_get_variant(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        irredundant: bool,
+        legacy: bool,
+    ) -> Option<DagId> {
+        use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
+        use tnk_core::unify::problem::VarSpec;
+        use tnk_core::variant::{VariantMode, VariantSearch};
+
+        let kids = ctx.children(redex);
+        if kids.len() != 5 {
+            return None;
+        }
+        let (incoming_family, base) = if legacy {
+            (None, down_nat_decimal(ctx, kids[3])?)
+        } else {
+            (
+                Some(VariableFamily::of_root(&qid_text(ctx, kids[3])?)?),
+                "0".to_string(),
+            )
+        };
+        let blocker_roots = down_term_list_roots(ctx, hooks, kids[2])?;
+        let mut roots = Vec::with_capacity(blocker_roots.len() + 1);
+        roots.push(kids[1]);
+        roots.extend(blocker_roots.iter().copied());
+        let key = MetaGetVariantCacheKey {
+            module: kids[0],
+            roots,
+            family: incoming_family,
+            base: base.clone(),
+            irredundant,
+            legacy,
+        };
+        let sol_nr = down_nat64(ctx, kids[4])? as usize;
+
+        let mut cache = if let Some(cache) = self.state.take_get_variant(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let mut vars = VarIndex::new();
+            let target_term = down_term_to_term(ctx, hooks, kids[1], &loaded.built, &mut vars)?;
+            let target_variables = vars.count() as usize;
+            let blocker_terms: Vec<Term> = blocker_roots
+                .iter()
+                .map(|&root| down_term_to_term(ctx, hooks, root, &loaded.built, &mut vars))
+                .collect::<Option<_>>()?;
+
+            let variable_names: Vec<String> = (0..target_variables)
+                .map(|slot| vars.name(slot as u32).to_string())
+                .collect();
+            let namegen = FreshVariableGenerator::new();
+            if variable_names.iter().any(|name| {
+                let bare = name.split_once(':').map_or(name.as_str(), |(bare, _)| bare);
+                namegen.variable_name_conflict(bare, incoming_family)
+            }) {
+                return Some(ctx.app(*hooks.ops.get("noVariantSymbol")?, vec![]));
+            }
+
+            let codes: Vec<u32> = (0..vars.count())
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let bindings: Vec<DagId> = (0..vars.count())
+                .map(|slot| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(vars.sort(slot), codes[slot as usize], slot)
+                })
+                .collect();
+            let target = loaded
+                .built
+                .engine
+                .instantiate_bindings(&target_term, &bindings);
+            let blockers = blocker_terms
+                .iter()
+                .map(|term| loaded.built.engine.instantiate_bindings(term, &bindings))
+                .collect();
+            let specs: Vec<VarSpec> = (0..target_variables)
+                .map(|slot| {
+                    let source = vars.name(slot as u32);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    VarSpec {
+                        sort: vars.sort(slot as u32),
+                        name: maude_variable_name_rank(bare, codes[slot]),
+                    }
+                })
+                .collect();
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            loaded.built.engine.reset_rewrites();
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let mode = if irredundant {
+                VariantMode::Irredundant
+            } else {
+                VariantMode::Incremental
+            };
+            let search = VariantSearch::new(
+                &mut env,
+                target,
+                specs,
+                blockers,
+                equations,
+                mode,
+                incoming_family,
+                &base,
+            )
+            .ok()?;
+            let variable_names = search
+                .original_variable_order()
+                .iter()
+                .map(|&old| variable_names[old].clone())
+                .collect();
+            let key_roots = std::iter::once(key.module)
+                .chain(key.roots.iter().copied())
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaGetVariantCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                variable_names,
+                variants: Vec::new(),
+                exhausted: false,
+                last_solution: None,
+                rewrite_checkpoint: 0,
+                rewrite_charge: 0,
+            }
+        };
+
+        while cache.variants.len() <= sol_nr && !cache.exhausted {
+            let next = {
+                let mut names = InternerNames(self.interner);
+                let mut env = tnk_core::unify::UnifyEnv {
+                    e: &mut cache.loaded.built.engine,
+                    names: &mut names,
+                };
+                cache.search.find_next(&mut env)
+            };
+            let rewrites = cache.loaded.built.engine.rewrites();
+            if let Some(variant) = next {
+                cache.rewrite_charge += rewrites.saturating_sub(cache.rewrite_checkpoint);
+                cache.rewrite_checkpoint = rewrites;
+                cache.variants.push(variant);
+            } else {
+                // The terminal failed call is not transferred and the reference deletes the state.
+                cache.rewrite_checkpoint = rewrites;
+                cache.exhausted = true;
+            }
+        }
+        ctx.add_rewrites(std::mem::take(&mut cache.rewrite_charge));
+
+        if cache.variants.get(sol_nr).is_none() {
+            let hook = if cache.search.is_incomplete() {
+                "noVariantIncompleteSymbol"
+            } else {
+                "noVariantSymbol"
+            };
+            return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+        }
+        let result = {
+            let variant = &cache.variants[sol_nr];
+            let term = up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, variant.term);
+            let names: Vec<&str> = cache.variable_names.iter().map(String::as_str).collect();
+            let subst = up_unifier_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &names,
+                &variant.substitution,
+            );
+            let family = if legacy {
+                legacy_variant_next_index(
+                    ctx,
+                    &cache.loaded.built.engine,
+                    self.interner,
+                    variant,
+                    &base,
+                )?
+            } else {
+                let root = variant_family_root(variant.family);
+                ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(root.into()))
+            };
+            let parent = match variant.parent {
+                Some(parent) => up_nat_exact(ctx, parent as u64)?,
+                None => ctx.app(*hooks.ops.get("noParentSymbol")?, vec![]),
+            };
+            let more = up_bool(ctx, variant.more_in_layer)?;
+            let hook = if legacy {
+                "legacyVariantSymbol"
+            } else {
+                "variantSymbol"
+            };
+            ctx.app(
+                *hooks.ops.get(hook)?,
+                vec![term, subst, family, parent, more],
+            )
+        };
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaVariantCache::Get(cache));
+        Some(result)
+    }
+
+    fn meta_variant_unify(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        disjoint: bool,
+        legacy: bool,
+    ) -> Option<DagId> {
+        use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
+        use tnk_core::unify::problem::VarSpec;
+        use tnk_core::variant::{VariantMode, VariantSearch};
+
+        let kids = ctx.children(redex);
+        let (incoming_family, base, filtered, delayed, sol_nr) = if legacy {
+            if kids.len() != 5 {
+                return None;
+            }
+            (
+                None,
+                down_nat_decimal(ctx, kids[3])?,
+                false,
+                false,
+                down_nat64(ctx, kids[4])? as usize,
+            )
+        } else {
+            if kids.len() != 6 {
+                return None;
+            }
+            let family = VariableFamily::of_root(&qid_text(ctx, kids[3])?)?;
+            let (filtered, delayed) = down_variant_options(ctx, kids[4]);
+            (
+                Some(family),
+                "0".to_string(),
+                filtered,
+                delayed,
+                down_nat64(ctx, kids[5])? as usize,
+            )
+        };
+        let blocker_roots = down_term_list_roots(ctx, hooks, kids[2])?;
+        let mut roots = Vec::with_capacity(blocker_roots.len() + 1);
+        roots.push(kids[1]);
+        roots.extend(blocker_roots.iter().copied());
+        let key = MetaVariantUnifyCacheKey {
+            module: kids[0],
+            roots,
+            family: incoming_family,
+            base: base.clone(),
+            disjoint,
+            legacy,
+            matching: false,
+            filtered,
+            delayed,
+        };
+
+        let mut cache = if let Some(cache) = self.state.take_variant_unify(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let mut specs_raw: Vec<(String, SortId)> = Vec::new();
+            let (pairs, n_lhs) = down_unification_problem(
+                ctx,
+                hooks,
+                kids[1],
+                &loaded.built,
+                &mut specs_raw,
+                disjoint,
+            )?;
+            if pairs.is_empty() {
+                return None;
+            }
+            let pair_count = pairs.len();
+            let range = specs_raw.first().map(|(_, sort)| *sort)?;
+            let target_term = if pair_count == 1 {
+                let pair_sym =
+                    loaded
+                        .built
+                        .engine
+                        .add_op("$metaVariantUnifyPair", vec![range; 2], range);
+                let (lhs, rhs) = pairs.into_iter().next().unwrap();
+                Term::Op {
+                    symbol: pair_sym,
+                    args: vec![lhs, rhs],
+                }
+            } else {
+                let lhs_sym = loaded.built.engine.add_op(
+                    "$metaVariantUnifyLhs",
+                    vec![range; pair_count],
+                    range,
+                );
+                let rhs_sym = loaded.built.engine.add_op(
+                    "$metaVariantUnifyRhs",
+                    vec![range; pair_count],
+                    range,
+                );
+                let pair_sym =
+                    loaded
+                        .built
+                        .engine
+                        .add_op("$metaVariantUnifyPair", vec![range; 2], range);
+                let mut lhs = Vec::with_capacity(pair_count);
+                let mut rhs = Vec::with_capacity(pair_count);
+                for (left, right) in pairs {
+                    lhs.push(left);
+                    rhs.push(right);
+                }
+                Term::Op {
+                    symbol: pair_sym,
+                    args: vec![
+                        Term::Op {
+                            symbol: lhs_sym,
+                            args: lhs,
+                        },
+                        Term::Op {
+                            symbol: rhs_sym,
+                            args: rhs,
+                        },
+                    ],
+                }
+            };
+            let mut blocker_vars = VarIndex::new();
+            let blocker_shared = if disjoint {
+                &specs_raw[..n_lhs]
+            } else {
+                specs_raw.as_slice()
+            };
+            for (name, sort) in blocker_shared {
+                blocker_vars.index_of(name, *sort);
+            }
+            let blocker_terms: Vec<Term> = blocker_roots
+                .iter()
+                .map(|&root| down_term_to_term(ctx, hooks, root, &loaded.built, &mut blocker_vars))
+                .collect::<Option<_>>()?;
+            if blocker_vars.count() as usize != blocker_shared.len() {
+                return None;
+            }
+            let namegen = FreshVariableGenerator::new();
+            if specs_raw.iter().any(|(name, _)| {
+                let bare = name.split_once(':').map_or(name.as_str(), |(bare, _)| bare);
+                namegen.variable_name_conflict(bare, incoming_family)
+            }) {
+                let hook = if disjoint {
+                    "noUnifierTripleSymbol"
+                } else {
+                    "noUnifierPairSymbol"
+                };
+                return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+            }
+            const FLAGGED_CODE_BIT: u32 = 0x4000_0000;
+            let codes: Vec<u32> = specs_raw
+                .iter()
+                .enumerate()
+                .map(|(slot, (name, _))| {
+                    let bare = name.split_once(':').map_or(name.as_str(), |(bare, _)| bare);
+                    let code = self.interner.intern(bare).index();
+                    if disjoint && slot >= n_lhs {
+                        code | FLAGGED_CODE_BIT
+                    } else {
+                        code
+                    }
+                })
+                .collect();
+            let bindings: Vec<DagId> = specs_raw
+                .iter()
+                .enumerate()
+                .map(|(slot, (_, sort))| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(*sort, codes[slot], slot as u32)
+                })
+                .collect();
+            let target = loaded
+                .built
+                .engine
+                .instantiate_bindings(&target_term, &bindings);
+            let target = loaded.built.engine.normalize_for_unify(target);
+            let blockers = blocker_terms
+                .iter()
+                .map(|term| loaded.built.engine.instantiate_bindings(term, &bindings))
+                .collect();
+            let specs: Vec<VarSpec> = specs_raw
+                .iter()
+                .enumerate()
+                .map(|(slot, (source, sort))| {
+                    let bare = source
+                        .split_once(':')
+                        .map_or(source.as_str(), |(bare, _)| bare);
+                    VarSpec {
+                        sort: *sort,
+                        name: maude_variable_name_rank(bare, codes[slot]),
+                    }
+                })
+                .collect();
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            loaded.built.engine.reset_rewrites();
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let mut search = VariantSearch::new(
+                &mut env,
+                target,
+                specs,
+                blockers,
+                equations,
+                VariantMode::Incremental,
+                incoming_family,
+                &base,
+            )
+            .ok()?;
+            search.enable_unification(env.e, pair_count);
+            let canonical_order = search.original_variable_order().to_vec();
+            let key_roots = std::iter::once(key.module)
+                .chain(key.roots.iter().copied())
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaVariantUnifyCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                pair_count,
+                specs_raw,
+                canonical_order,
+                n_lhs,
+                stream: tnk_core::variant::FilteredVariantUnifierStream::new(filtered),
+                upfront: delayed,
+                prepared: false,
+                exhausted: false,
+                rewrite_checkpoint: 0,
+                rewrite_charge: 0,
+                answers: Vec::new(),
+                deferred_variant: None,
+                restorations: Vec::new(),
+                last_solution: None,
+            }
+        };
+
+        let mut engine = std::mem::take(&mut cache.loaded.built.engine);
+        {
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut engine,
+                names: &mut names,
+            };
+            if cache.upfront {
+                cache.prepare(&mut env);
+            }
+            while cache.answers.len() <= sol_nr {
+                if let Some(index) = cache.pop_pending() {
+                    cache.answers.push(index);
+                    continue;
+                }
+                if cache.exhausted {
+                    break;
+                }
+                cache.advance(&mut env);
+            }
+        }
+        ctx.add_rewrites(cache.take_rewrite_charge());
+        cache.loaded.built.engine = engine;
+
+        let Some(&answer) = cache.answers.get(sol_nr) else {
+            let incomplete = cache.search.is_incomplete();
+            let hook = match (disjoint, incomplete) {
+                (true, false) => "noUnifierTripleSymbol",
+                (true, true) => "noUnifierIncompleteTripleSymbol",
+                (false, false) => "noUnifierPairSymbol",
+                (false, true) => "noUnifierIncompletePairSymbol",
+            };
+            return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+        };
+        let result_dag = {
+            let result_bindings = cache.stream.bindings(answer);
+            let mut bindings_original = result_bindings.to_vec();
+            for (new_slot, &old_slot) in cache.canonical_order.iter().enumerate() {
+                bindings_original[old_slot] = result_bindings[new_slot];
+            }
+            let third = if legacy {
+                legacy_unifier_next_index(
+                    ctx,
+                    &cache.loaded.built.engine,
+                    self.interner,
+                    &bindings_original,
+                    &base,
+                )?
+            } else {
+                ctx.make_na(
+                    hooks.ops["qidSymbol"],
+                    NaValue::Qid(variant_family_root(cache.stream.family(answer)).into()),
+                )
+            };
+            if disjoint {
+                let (lhs_b, rhs_b) = bindings_original.split_at(cache.n_lhs);
+                let lhs_names: Vec<&str> = cache.specs_raw[..cache.n_lhs]
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let rhs_names: Vec<&str> = cache.specs_raw[cache.n_lhs..]
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let lhs = up_unifier_substitution(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    &lhs_names,
+                    lhs_b,
+                );
+                let rhs = up_unifier_substitution(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    &rhs_names,
+                    rhs_b,
+                );
+                let hook = if legacy {
+                    "legacyUnificationTripleSymbol"
+                } else {
+                    "unificationTripleSymbol"
+                };
+                ctx.app(*hooks.ops.get(hook)?, vec![lhs, rhs, third])
+            } else {
+                let names: Vec<&str> = cache
+                    .specs_raw
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let subst = up_unifier_substitution(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    &names,
+                    &bindings_original,
+                );
+                let hook = if legacy {
+                    "legacyUnificationPairSymbol"
+                } else {
+                    "matchPairSymbol"
+                };
+                ctx.app(*hooks.ops.get(hook)?, vec![subst, third])
+            }
+        };
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaVariantCache::Unify(cache));
+        Some(result_dag)
+    }
+
+    fn meta_variant_match(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
+        use tnk_core::unify::problem::VarSpec;
+        use tnk_core::variant::{VariantMode, VariantSearch};
+
+        let kids = ctx.children(redex);
+        if kids.len() != 6 {
+            return None;
+        }
+        let incoming_family = VariableFamily::of_root(&qid_text(ctx, kids[3])?)?;
+        let (filtered, delayed) = down_variant_options(ctx, kids[4]);
+        let sol_nr = down_nat64(ctx, kids[5])? as usize;
+        let blocker_roots = down_term_list_roots(ctx, hooks, kids[2])?;
+        let mut roots = Vec::with_capacity(blocker_roots.len() + 1);
+        roots.push(kids[1]);
+        roots.extend(blocker_roots.iter().copied());
+        let key = MetaVariantUnifyCacheKey {
+            module: kids[0],
+            roots,
+            family: Some(incoming_family),
+            base: "0".to_string(),
+            disjoint: false,
+            legacy: false,
+            matching: true,
+            filtered,
+            delayed,
+        };
+        let mut cache = if let Some(cache) = self.state.take_variant_unify(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let conjunction = hooks.ops.get("matchingConjunctionSymbol").copied();
+            let pair_symbol = *hooks.ops.get("patternSubjectPairSymbol")?;
+            let pair_dags = if Some(ctx.top(kids[1])) == conjunction {
+                ctx.children(kids[1])
+            } else {
+                vec![kids[1]]
+            };
+            if pair_dags.is_empty() {
+                return None;
+            }
+            let pair_count = pair_dags.len();
+            let mut pattern_vars = VarIndex::new();
+            let mut subject_vars = VarIndex::new();
+            let mut pattern_terms = Vec::with_capacity(pair_count);
+            let mut subject_terms = Vec::with_capacity(pair_count);
+            for pair in pair_dags {
+                if ctx.top(pair) != pair_symbol {
+                    return None;
+                }
+                let pair_kids = ctx.children(pair);
+                pattern_terms.push(down_term_to_term(
+                    ctx,
+                    hooks,
+                    *pair_kids.first()?,
+                    &loaded.built,
+                    &mut pattern_vars,
+                )?);
+                subject_terms.push(down_term_to_term(
+                    ctx,
+                    hooks,
+                    *pair_kids.get(1)?,
+                    &loaded.built,
+                    &mut subject_vars,
+                )?);
+            }
+            let target_variables = pattern_vars.count() as usize;
+            let specs_raw: Vec<(String, SortId)> = (0..pattern_vars.count())
+                .map(|slot| (pattern_vars.name(slot).to_string(), pattern_vars.sort(slot)))
+                .collect();
+            let namegen = FreshVariableGenerator::new();
+            if specs_raw.iter().any(|(name, _)| {
+                let bare = name.split_once(':').map_or(name.as_str(), |(bare, _)| bare);
+                namegen.variable_name_conflict(bare, Some(incoming_family))
+            }) {
+                return Some(ctx.app(*hooks.ops.get("noMatchSubstSymbol")?, vec![]));
+            }
+            let pattern_codes: Vec<u32> = specs_raw
+                .iter()
+                .map(|(name, _)| {
+                    let bare = name.split_once(':').map_or(name.as_str(), |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let pattern_bindings: Vec<DagId> = specs_raw
+                .iter()
+                .enumerate()
+                .map(|(slot, (_, sort))| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(*sort, pattern_codes[slot], slot as u32)
+                })
+                .collect();
+            let pattern_dags: Vec<DagId> = pattern_terms
+                .iter()
+                .map(|term| {
+                    loaded
+                        .built
+                        .engine
+                        .instantiate_bindings(term, &pattern_bindings)
+                })
+                .collect();
+
+            let subject_codes: Vec<u32> = (0..subject_vars.count())
+                .map(|slot| {
+                    let source = subject_vars.name(slot);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let subject_bindings: Vec<DagId> = (0..subject_vars.count())
+                .map(|slot| {
+                    loaded.built.engine.make_var(
+                        subject_vars.sort(slot),
+                        subject_codes[slot as usize],
+                        slot,
+                    )
+                })
+                .collect();
+            let subject_dags: Vec<DagId> = subject_terms
+                .iter()
+                .map(|term| {
+                    loaded
+                        .built
+                        .engine
+                        .instantiate_bindings(term, &subject_bindings)
+                })
+                .collect();
+            let subject_domains: Vec<SortId> = subject_dags
+                .iter()
+                .map(|&dag| {
+                    let sort = loaded.built.engine.sort_of(dag);
+                    let kind = loaded.built.engine.sorts().kind_of(sort);
+                    loaded.built.engine.sorts().error_sort(kind)
+                })
+                .collect();
+            let subject_pack = loaded.built.engine.add_op(
+                "$metaVariantMatchSubjects",
+                subject_domains.clone(),
+                subject_domains[0],
+            );
+            let packed = loaded.built.engine.make_free(subject_pack, subject_dags);
+            let (packed, restorations) =
+                tnk_core::variant::ground_subject_variables(&mut loaded.built.engine, packed);
+            let grounded_subjects: Vec<DagId> =
+                loaded.built.engine.node(packed).children().collect();
+
+            let mut blocker_vars = VarIndex::new();
+            for (name, sort) in &specs_raw {
+                blocker_vars.index_of(name, *sort);
+            }
+            let blocker_terms: Vec<Term> = blocker_roots
+                .iter()
+                .map(|&root| down_term_to_term(ctx, hooks, root, &loaded.built, &mut blocker_vars))
+                .collect::<Option<_>>()?;
+            if blocker_vars.count() as usize != target_variables {
+                return None;
+            }
+            let blockers: Vec<DagId> = blocker_terms
+                .iter()
+                .map(|term| {
+                    loaded
+                        .built
+                        .engine
+                        .instantiate_bindings(term, &pattern_bindings)
+                })
+                .collect();
+
+            let mut target_args = Vec::with_capacity(pair_count * 2);
+            for (pattern, subject) in pattern_dags.into_iter().zip(grounded_subjects) {
+                target_args.push(pattern);
+                target_args.push(subject);
+            }
+            let domains: Vec<SortId> = target_args
+                .iter()
+                .map(|&dag| {
+                    let sort = loaded.built.engine.sort_of(dag);
+                    let kind = loaded.built.engine.sorts().kind_of(sort);
+                    loaded.built.engine.sorts().error_sort(kind)
+                })
+                .collect();
+            let target_symbol =
+                loaded
+                    .built
+                    .engine
+                    .add_op("$metaVariantMatchingPair", domains.clone(), domains[0]);
+            let target = loaded.built.engine.make_free(target_symbol, target_args);
+            let specs: Vec<VarSpec> = specs_raw
+                .iter()
+                .enumerate()
+                .map(|(slot, (source, sort))| {
+                    let bare = source
+                        .split_once(':')
+                        .map_or(source.as_str(), |(bare, _)| bare);
+                    VarSpec {
+                        sort: *sort,
+                        name: maude_variable_name_rank(bare, pattern_codes[slot]),
+                    }
+                })
+                .collect();
+            let base = (0..subject_vars.count())
+                .filter_map(|slot| {
+                    subject_vars
+                        .name(slot)
+                        .split_once(':')
+                        .map_or(subject_vars.name(slot), |(bare, _)| bare)
+                        .strip_prefix('#')
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                .to_string();
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            loaded.built.engine.reset_rewrites();
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let mut search = VariantSearch::new(
+                &mut env,
+                target,
+                specs,
+                blockers,
+                equations,
+                VariantMode::Irredundant,
+                Some(incoming_family),
+                &base,
+            )
+            .ok()?;
+            search.skip_root_position();
+            let canonical_order = search.original_variable_order().to_vec();
+            let mut stored_key = key.clone();
+            stored_key.base = base;
+            let key_roots = std::iter::once(key.module)
+                .chain(key.roots.iter().copied())
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaVariantUnifyCache {
+                key: stored_key,
+                _key_roots: key_roots,
+                loaded,
+                search,
+                pair_count,
+                specs_raw,
+                canonical_order,
+                n_lhs: 0,
+                stream: tnk_core::variant::FilteredVariantUnifierStream::new(filtered),
+                upfront: true,
+                prepared: false,
+                exhausted: false,
+                rewrite_checkpoint: 0,
+                rewrite_charge: 0,
+                answers: Vec::new(),
+                deferred_variant: None,
+                restorations,
+                last_solution: None,
+            }
+        };
+
+        let mut engine = std::mem::take(&mut cache.loaded.built.engine);
+        {
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut engine,
+                names: &mut names,
+            };
+            cache.prepare(&mut env);
+            while cache.answers.len() <= sol_nr {
+                let Some(index) = cache.pop_pending() else {
+                    break;
+                };
+                cache.answers.push(index);
+            }
+        }
+        ctx.add_rewrites(cache.take_rewrite_charge());
+        cache.loaded.built.engine = engine;
+
+        let Some(&answer) = cache.answers.get(sol_nr) else {
+            let hook = if cache.search.is_incomplete() {
+                "noMatchIncompleteSubstSymbol"
+            } else {
+                "noMatchSubstSymbol"
+            };
+            return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+        };
+        let result_dag = {
+            let result_bindings = cache.stream.bindings(answer);
+            let mut bindings_original = result_bindings.to_vec();
+            for (new_slot, &old_slot) in cache.canonical_order.iter().enumerate() {
+                bindings_original[old_slot] = result_bindings[new_slot];
+            }
+            let names: Vec<&str> = cache
+                .specs_raw
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            up_unifier_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &names,
+                &bindings_original,
+            )
+        };
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaVariantCache::Unify(cache));
+        Some(result_dag)
     }
 
     /// `metaSearch(M, S, P, C, kind, B, n)` → the `(n+1)`-th solution `{up(state), up(type), subst}` of
@@ -460,17 +1829,27 @@ impl MetaDescent<'_> {
     fn meta_search(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
         let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
-        let cond = down_condition(ctx, hooks, *kids.get(3)?, &loaded.built, &mut vars, &mut bound_set)?;
+        let cond = down_condition(
+            ctx,
+            hooks,
+            *kids.get(3)?,
+            &loaded.built,
+            &mut vars,
+            &mut bound_set,
+        )?;
         let arrow = down_arrow(ctx, *kids.get(4)?)?;
         let max_depth = down_bound(ctx, hooks, *kids.get(5)?).map(|d| d as u32);
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let mut search = loaded.built.engine.search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut search = loaded
+            .built
+            .engine
+            .search(subj, pattern, nr, cond, arrow, max_depth);
         let mut sol = None;
         for _ in 0..=sol_nr {
             sol = search.next_solution(&mut loaded.built.engine);
@@ -484,9 +1863,16 @@ impl MetaDescent<'_> {
                 // exploration (BFS may have visited siblings first).
                 ctx.add_rewrites(s.rewrites);
                 let state = search.state_term(s.state)?;
-                let ut = up_term(ctx, hooks, &loaded.built, state);
+                let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, state);
                 let us = up_sort(ctx, hooks, &loaded.built, state);
-                let subst = up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &s.bindings);
+                let subst = up_substitution(
+                    ctx,
+                    hooks,
+                    &loaded.built,
+                    self.interner,
+                    &var_names(&vars),
+                    &s.bindings,
+                );
                 ctx.app(*hooks.ops.get("resultTripleSymbol")?, vec![ut, us, subst])
             }
             None => {
@@ -506,7 +1892,7 @@ impl MetaDescent<'_> {
     fn meta_apply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let label = match ctx.repr(*kids.get(2)?) {
             NodeRepr::Qid(s) => s.to_string(),
             _ => return None,
@@ -522,11 +1908,21 @@ impl MetaDescent<'_> {
             .rl_traces
             .iter()
             .filter(|t| t.label.as_deref() == Some(label.as_str()))
-            .map(|t| (t.lhs.clone(), t.rhs.clone(), t.var_names.clone(), t.var_names.len() as u32))
+            .map(|t| {
+                (
+                    t.lhs.clone(),
+                    t.rhs.clone(),
+                    t.var_names.clone(),
+                    t.var_names.len() as u32,
+                )
+            })
             .collect();
-        if loaded.built.rl_traces.iter().any(|t| {
-            t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty()
-        }) {
+        if loaded
+            .built
+            .rl_traces
+            .iter()
+            .any(|t| t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty())
+        {
             return None;
         }
         loaded.built.engine.reset_rewrites();
@@ -534,10 +1930,14 @@ impl MetaDescent<'_> {
         // Enumerate top matches across the labelled rules (in declaration order), pick the (n+1)-th.
         let mut all: Vec<(usize, Vec<DagId>)> = Vec::new();
         for (ri, (lhs, _, _, nr)) in rules.iter().enumerate() {
-            let mut sols = loaded.built.engine.match_solutions(lhs.clone(), *nr, subj, false);
+            let mut sols = loaded
+                .built
+                .engine
+                .match_solutions(lhs.clone(), *nr, subj, false);
             while sols.advance() {
-                let b: Vec<DagId> =
-                    (0..*nr).map(|k| sols.binding(k).expect("matcher binds every var")).collect();
+                let b: Vec<DagId> = (0..*nr)
+                    .map(|k| sols.binding(k).expect("matcher binds every var"))
+                    .collect();
                 all.push((ri, b));
             }
         }
@@ -548,9 +1948,10 @@ impl MetaDescent<'_> {
                 let res = loaded.built.engine.reduce(res);
                 // subject reduce + result reduce + the rule application (1).
                 ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
-                let ut = up_term(ctx, hooks, &loaded.built, res);
+                let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, res);
                 let us = up_sort(ctx, hooks, &loaded.built, res);
-                let subst = up_substitution(ctx, hooks, &loaded.built, names, bindings);
+                let subst =
+                    up_substitution(ctx, hooks, &loaded.built, self.interner, names, bindings);
                 ctx.app(*hooks.ops.get("resultTripleSymbol")?, vec![ut, us, subst])
             }
             None => {
@@ -571,7 +1972,7 @@ impl MetaDescent<'_> {
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
-        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
         if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
             return None;
         }
@@ -585,7 +1986,14 @@ impl MetaDescent<'_> {
                 if !whole {
                     return None; // partial AC match — residue context is a follow-on
                 }
-                let subst = up_substitution(ctx, hooks, &loaded.built, &var_names(&vars), &bindings);
+                let subst = up_substitution(
+                    ctx,
+                    hooks,
+                    &loaded.built,
+                    self.interner,
+                    &var_names(&vars),
+                    &bindings,
+                );
                 let context = ctx.app(*hooks.ops.get("holeSymbol")?, vec![]);
                 Some(ctx.app(*hooks.ops.get("matchPairSymbol")?, vec![subst, context]))
             }
@@ -602,7 +2010,7 @@ impl MetaDescent<'_> {
     fn meta_xapply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj0 = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let subj0 = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let label = match ctx.repr(*kids.get(2)?) {
             NodeRepr::Qid(s) => s.to_string(),
             _ => return None,
@@ -618,26 +2026,49 @@ impl MetaDescent<'_> {
             .rl_traces
             .iter()
             .filter(|t| t.label.as_deref() == Some(label.as_str()))
-            .map(|t| (t.lhs.clone(), t.rhs.clone(), t.var_names.clone(), t.var_names.len() as u32))
+            .map(|t| {
+                (
+                    t.lhs.clone(),
+                    t.rhs.clone(),
+                    t.var_names.clone(),
+                    t.var_names.len() as u32,
+                )
+            })
             .collect();
-        if loaded.built.rl_traces.iter().any(|t| {
-            t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty()
-        }) {
+        if loaded
+            .built
+            .rl_traces
+            .iter()
+            .any(|t| t.label.as_deref() == Some(label.as_str()) && !t.condition.is_empty())
+        {
             return None;
         }
         loaded.built.engine.reset_rewrites();
         let subj = loaded.built.engine.reduce(subj0);
         // Positions within the depth band, outermost-first; at each, every labelled rule's top matches.
         let mut positions = Vec::new();
-        collect_positions(&loaded.built.engine, subj, 0, &mut Vec::new(), min_d, max_d, &mut positions);
+        collect_positions(
+            &loaded.built.engine,
+            subj,
+            0,
+            &mut Vec::new(),
+            min_d,
+            max_d,
+            &mut positions,
+        );
         let mut all: Vec<(Vec<usize>, usize, Vec<DagId>)> = Vec::new();
         for path in &positions {
             let subterm = subterm_at(&loaded.built.engine, subj, path);
             for (ri, (lhs, _, _, nr)) in rules.iter().enumerate() {
-                let mut sols = loaded.built.engine.match_solutions(lhs.clone(), *nr, subterm, false);
+                let mut sols =
+                    loaded
+                        .built
+                        .engine
+                        .match_solutions(lhs.clone(), *nr, subterm, false);
                 while sols.advance() {
-                    let b: Vec<DagId> =
-                        (0..*nr).map(|k| sols.binding(k).expect("matcher binds every var")).collect();
+                    let b: Vec<DagId> = (0..*nr)
+                        .map(|k| sols.binding(k).expect("matcher binds every var"))
+                        .collect();
                     all.push((path.clone(), ri, b));
                 }
             }
@@ -649,11 +2080,15 @@ impl MetaDescent<'_> {
                 let whole = replace_at(&mut loaded.built.engine, subj, path, new_sub);
                 let whole = loaded.built.engine.reduce(whole);
                 ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
-                let ut = up_term(ctx, hooks, &loaded.built, whole);
+                let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, whole);
                 let us = up_sort(ctx, hooks, &loaded.built, whole);
-                let subst = up_substitution(ctx, hooks, &loaded.built, names, bindings);
-                let context = up_context(ctx, hooks, &loaded.built, subj, path);
-                ctx.app(*hooks.ops.get("result4TupleSymbol")?, vec![ut, us, subst, context])
+                let subst =
+                    up_substitution(ctx, hooks, &loaded.built, self.interner, names, bindings);
+                let context = up_context(ctx, hooks, &loaded.built, self.interner, subj, path);
+                ctx.app(
+                    *hooks.ops.get("result4TupleSymbol")?,
+                    vec![ut, us, subst, context],
+                )
             }
             None => {
                 ctx.add_rewrites(loaded.built.engine.rewrites());
@@ -668,20 +2103,35 @@ impl MetaDescent<'_> {
     /// that leaves it), joined by `__`, or `nil` for a zero-length path; `failure` (`Trace?`) when there is
     /// no such solution. Reuses the same search as [`meta_search`](Self::meta_search); the rules are
     /// up-translated by [`up_rule`] (unconditional here — see its note).
-    fn meta_search_path(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_search_path(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
         let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
-        let cond = down_condition(ctx, hooks, *kids.get(3)?, &loaded.built, &mut vars, &mut bound_set)?;
+        let cond = down_condition(
+            ctx,
+            hooks,
+            *kids.get(3)?,
+            &loaded.built,
+            &mut vars,
+            &mut bound_set,
+        )?;
         let arrow = down_arrow(ctx, *kids.get(4)?)?;
         let max_depth = down_bound(ctx, hooks, *kids.get(5)?).map(|d| d as u32);
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let mut search = loaded.built.engine.search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut search = loaded
+            .built
+            .engine
+            .search(subj, pattern, nr, cond, arrow, max_depth);
         let mut sol = None;
         for _ in 0..=sol_nr {
             sol = search.next_solution(&mut loaded.built.engine);
@@ -699,7 +2149,7 @@ impl MetaDescent<'_> {
         let mut trace_steps = Vec::new();
         for i in 0..steps.len().saturating_sub(1) {
             let rule_id = steps[i + 1].via? as usize;
-            let ut = up_term(ctx, hooks, &loaded.built, steps[i].term);
+            let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, steps[i].term);
             let us = up_sort(ctx, hooks, &loaded.built, steps[i].term);
             let rule = up_rule(ctx, hooks, &loaded.built, &loaded.built.rl_traces[rule_id])?;
             trace_steps.push(ctx.app(*hooks.ops.get("traceStepSymbol")?, vec![ut, us, rule]));
@@ -715,7 +2165,12 @@ impl MetaDescent<'_> {
 
     /// `sortLeq(M, T1, T2)` → `Bool` — `T1 <= T2` (same kind *and* subsort, mirroring Maude's
     /// `s1->component() == s2->component() && leq(s1, s2)`).
-    fn meta_sort_leq(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_sort_leq(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s1 = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -726,7 +2181,12 @@ impl MetaDescent<'_> {
     }
 
     /// `sameKind(M, T1, T2)` → `Bool` — whether the two types share a connected component.
-    fn meta_same_kind(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_same_kind(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s1 = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -737,29 +2197,49 @@ impl MetaDescent<'_> {
 
     /// `leastSort(M, T)` → the `Type` of the least sort of the down-translated term (no reduction —
     /// our `down_term` computes the sort at construction, Maude's `computeTrueSort`).
-    fn meta_least_sort(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_least_sort(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let t = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built)?;
+        let t = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
         let s = loaded.built.engine.sort_of(t);
         Some(up_type(ctx, hooks, &loaded.built, s))
     }
 
     /// `lesserSorts(M, T)` → the `SortSet` of sorts strictly below `T` in its component.
-    fn meta_lesser_sorts(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_lesser_sorts(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s = down_type(ctx, &loaded.built, *kids.get(1)?)?;
         let sorts = loaded.built.engine.sorts();
         let kid = sorts.kind_of(s);
-        let lesser: Vec<SortId> =
-            sorts.kind(kid).members.iter().copied().filter(|&x| x != s && sorts.leq(x, s)).collect();
+        let lesser: Vec<SortId> = sorts
+            .kind(kid)
+            .members
+            .iter()
+            .copied()
+            .filter(|&x| x != s && sorts.leq(x, s))
+            .collect();
         Some(up_sort_set(ctx, hooks, &loaded.built, &lesser))
     }
 
     /// `glbSorts(M, T1, T2)` → the `TypeSet` of maximal common lower bounds (greatest lower bounds);
     /// empty when the two types are in different components.
-    fn meta_glb_sorts(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_glb_sorts(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s1 = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -775,7 +2255,11 @@ impl MetaDescent<'_> {
                 .filter(|&x| sorts.leq(x, s1) && sorts.leq(x, s2))
                 .collect();
             // Keep the maximal elements of the lower set (the greatest lower bounds).
-            lowers.iter().copied().filter(|&x| !lowers.iter().any(|&y| y != x && sorts.leq(x, y))).collect()
+            lowers
+                .iter()
+                .copied()
+                .filter(|&x| !lowers.iter().any(|&y| y != x && sorts.leq(x, y)))
+                .collect()
         } else {
             Vec::new()
         };
@@ -784,7 +2268,12 @@ impl MetaDescent<'_> {
 
     /// `completeName(M, T)` → the resolved `Type` (a valid sort/kind name maps to itself; Maude's
     /// `downType`→`upType`). `None` if `T` is not a type of `M`.
-    fn meta_complete_name(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_complete_name(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -792,7 +2281,12 @@ impl MetaDescent<'_> {
     }
 
     /// `getKind(M, T)` → the `Kind` (error/top sort) of `T`'s connected component.
-    fn meta_get_kind(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_get_kind(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let s = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -802,7 +2296,12 @@ impl MetaDescent<'_> {
     }
 
     /// `getKinds(M)` → the `KindSet` of every connected component's `Kind` (error sort).
-    fn meta_get_kinds(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_get_kinds(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let sorts = loaded.built.engine.sorts();
@@ -812,7 +2311,12 @@ impl MetaDescent<'_> {
 
     /// `maximalSorts(M, K)` → the `SortSet` of `K`'s maximal sorts (those with no proper supersort).
     /// `None` unless `K` is a kind (Maude requires `k->index() == Sort::KIND`).
-    fn meta_maximal_sorts(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_maximal_sorts(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let k = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -830,7 +2334,12 @@ impl MetaDescent<'_> {
     }
 
     /// `minimalSorts(M, K)` → the `SortSet` of `K`'s minimal sorts (those with no proper subsort).
-    fn meta_minimal_sorts(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_minimal_sorts(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let k = down_type(ctx, &loaded.built, *kids.get(1)?)?;
@@ -866,8 +2375,10 @@ impl MetaDescent<'_> {
             hooks.ops.get("nilQidListSymbol").copied(),
             hooks.ops.get("qidListSymbol").copied(),
         );
-        let dom_sorts: Vec<SortId> =
-            dom_dags.iter().map(|&d| down_type(ctx, &loaded.built, d)).collect::<Option<_>>()?;
+        let dom_sorts: Vec<SortId> = dom_dags
+            .iter()
+            .map(|&d| down_type(ctx, &loaded.built, d))
+            .collect::<Option<_>>()?;
         let target = down_type(ctx, &loaded.built, *kids.get(3)?)?;
         let sym = *loaded.built.ops.get(&(op_name, dom_sorts.len()))?;
         let sorts = loaded.built.engine.sorts();
@@ -880,7 +2391,10 @@ impl MetaDescent<'_> {
             .filter(|(dom, range)| {
                 sorts.leq(*range, target)
                     && dom.len() == dom_sorts.len()
-                    && dom.iter().zip(&dom_sorts).all(|(&d, &q)| sorts.same_kind(d, q))
+                    && dom
+                        .iter()
+                        .zip(&dom_sorts)
+                        .all(|(&d, &q)| sorts.same_kind(d, q))
             })
             .map(|(dom, _)| dom)
             .collect();
@@ -893,8 +2407,10 @@ impl MetaDescent<'_> {
             .filter(|d| !candidates.iter().any(|o| dominates(o, d)))
             .cloned()
             .collect();
-        let type_lists: Vec<DagId> =
-            maximal.iter().map(|dom| up_type_list(ctx, hooks, &loaded.built, dom)).collect();
+        let type_lists: Vec<DagId> = maximal
+            .iter()
+            .map(|dom| up_type_list(ctx, hooks, &loaded.built, dom))
+            .collect();
         // A `TypeListSet` joins type-lists with `_;_`; a single list stays itself (always >= 1 here).
         Some(match type_lists.len() {
             1 => type_lists.into_iter().next().unwrap(),
@@ -925,7 +2441,7 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let ok = match down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built) {
+        let ok = match down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner) {
             Some(t) => term_well_formed(&loaded.built, t),
             None => false,
         };
@@ -943,7 +2459,7 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let ok = subst_well_formed(ctx, hooks, &mut loaded.built, *kids.get(1)?);
+        let ok = subst_well_formed(ctx, hooks, &mut loaded.built, *kids.get(1)?, self.interner);
         up_bool(ctx, ok)
     }
 
@@ -953,7 +2469,12 @@ impl MetaDescent<'_> {
     /// import closure (a `nil` import list); `flat = false` lists the imports and emits only the module's
     /// own declarations (Maude's `getNrImported*` suffix). The argument order mirrors the module
     /// constructor `fmod_is_sorts_.____endfm` / `mod_is_sorts_._____endm`.
-    fn meta_up_module(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_up_module(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let name = qid_text(ctx, *kids.first()?)?;
         let flat = down_bool(ctx, *kids.get(1)?)?;
@@ -985,7 +2506,12 @@ impl MetaDescent<'_> {
     }
 
     /// `upImports(Q)` → the `ImportList` of the module named `Q` (always the module's own imports).
-    fn meta_up_imports(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_up_imports(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let name = qid_text(ctx, *kids.first()?)?;
         let pm = self.db.get(&name)?;
@@ -996,7 +2522,12 @@ impl MetaDescent<'_> {
     /// `upView(Q)` → the `View` meta-rep of the view named `Q`: `view Q from <from> to <to> is <sort maps>
     /// <op maps> <strat maps> endv`. Sort maps and op→op maps are emitted; an op→term map and a structured
     /// (non-`Named`) `from`/`to` are follow-ons (`None`). Strategy maps are not modelled (empty).
-    fn meta_up_view(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+    fn meta_up_view(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let name = qid_text(ctx, *kids.first()?)?;
         let v = self.views.get(&name)?.clone();
@@ -1004,9 +2535,10 @@ impl MetaDescent<'_> {
         let mut op_names = Vec::with_capacity(v.op_maps.len());
         for m in &v.op_maps {
             match m {
-                OpMap::Op { from, to } => {
-                    op_names.push((canonical_name(from, self.interner), canonical_name(to, self.interner)))
-                }
+                OpMap::Op { from, to } => op_names.push((
+                    canonical_name(from, self.interner),
+                    canonical_name(to, self.interner),
+                )),
                 OpMap::Term { .. } => return None,
             }
         }
@@ -1020,18 +2552,29 @@ impl MetaDescent<'_> {
             let bq = ctx.make_na(qid, NaValue::Qid(b.as_str().into()));
             sm.push(ctx.app(hooks.ops["sortMappingSymbol"], vec![aq, bq]));
         }
-        let sort_maps =
-            up_set(ctx, sm, hooks.ops["emptySortMappingSetSymbol"], hooks.ops["sortMappingSetSymbol"]);
+        let sort_maps = up_set(
+            ctx,
+            sm,
+            hooks.ops["emptySortMappingSetSymbol"],
+            hooks.ops["sortMappingSetSymbol"],
+        );
         let mut om = Vec::with_capacity(op_names.len());
         for (a, b) in &op_names {
             let aq = ctx.make_na(qid, NaValue::Qid(a.as_str().into()));
             let bq = ctx.make_na(qid, NaValue::Qid(b.as_str().into()));
             om.push(ctx.app(hooks.ops["opMappingSymbol"], vec![aq, bq]));
         }
-        let op_maps =
-            up_set(ctx, om, hooks.ops["emptyOpMappingSetSymbol"], hooks.ops["opMappingSetSymbol"]);
+        let op_maps = up_set(
+            ctx,
+            om,
+            hooks.ops["emptyOpMappingSetSymbol"],
+            hooks.ops["opMappingSetSymbol"],
+        );
         let strat_maps = ctx.app(hooks.ops["emptyStratMappingSetSymbol"], vec![]);
-        Some(ctx.app(hooks.ops["viewSymbol"], vec![header, from, to, sort_maps, op_maps, strat_maps]))
+        Some(ctx.app(
+            hooks.ops["viewSymbol"],
+            vec![header, from, to, sort_maps, op_maps, strat_maps],
+        ))
     }
 
     /// The individual declaration-set projections `upSorts`/`upSubsortDecls`/`upOpDecls`/`upMbs`/`upEqs`/
@@ -1059,16 +2602,28 @@ impl MetaDescent<'_> {
 
     /// `metaParse(M, VS, QL, T?)` → `{up(parsed term), up(least sort)}` (`ResultPair`) of parsing the
     /// token list `QL` in `M`'s grammar, or `noParse(n)` at the first unparseable token. The parse does not
-    /// reduce. The variable set `VS` (on-the-fly variables) and a restricting `Type` are handled when
-    /// empty/`anyType`; a non-empty variable set is a follow-on.
+    /// reduce. `VS` supplies typed variables whose names may be abbreviated in `QL` (`'A:List` lets token
+    /// `'A` parse as that variable); an explicit type on a token remains authoritative.
     fn meta_parse(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let texts = qidlist_texts(ctx, hooks, *kids.get(2)?)?;
+        let variables = qidset_texts(ctx, hooks, *kids.get(1)?)?;
+        let mut texts = qidlist_texts(ctx, hooks, *kids.get(2)?)?;
+        for text in &mut texts {
+            if text.contains(':') {
+                continue;
+            }
+            if let Some(typed) = variables
+                .iter()
+                .find(|typed| typed.split_once(':').is_some_and(|(name, _)| name == text))
+            {
+                text.clone_from(typed);
+            }
+        }
         let tokens = tokenize(&texts.join(" "), self.interner);
-        let result = match build_command_dag(&mut loaded, self.interner, &tokens) {
+        let result = match build_logic_command_dag(&mut loaded, self.interner, &tokens) {
             Ok(dag) => {
-                let ut = up_term(ctx, hooks, &loaded.built, dag);
+                let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, dag);
                 let us = up_sort(ctx, hooks, &loaded.built, dag);
                 ctx.app(*hooks.ops.get("resultPairSymbol")?, vec![ut, us])
             }
@@ -1101,18 +2656,75 @@ impl MetaDescent<'_> {
             return None; // non-mixfix (prefix) print options are a separate renderer — stay inert
         }
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let term = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built)?;
+        let term = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
         let printed = print_pretty(&loaded.built, self.interner, term, false);
         if to_string {
             // A string value is raw bytes; the printed ASCII text becomes those bytes.
-            return Some(ctx.make_na(hooks.ops["stringSymbol"], NaValue::Str(printed.into_bytes().into())));
+            return Some(ctx.make_na(
+                hooks.ops["stringSymbol"],
+                NaValue::Str(printed.into_bytes().into()),
+            ));
         }
         let tokens = tokenize(&printed, self.interner);
-        let texts: Vec<String> = tokens.iter().map(|t| self.interner.resolve(t.sym).to_string()).collect();
+        let texts: Vec<String> = tokens
+            .iter()
+            .map(|t| self.interner.resolve(t.sym).to_string())
+            .collect();
         let qid = hooks.ops["qidSymbol"];
-        let qids: Vec<DagId> =
-            texts.iter().map(|w| ctx.make_na(qid, NaValue::Qid(w.as_str().into()))).collect();
-        Some(up_set(ctx, qids, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"]))
+        let qids: Vec<DagId> = texts
+            .iter()
+            .map(|w| ctx.make_na(qid, NaValue::Qid(w.as_str().into())))
+            .collect();
+        Some(up_set(
+            ctx,
+            qids,
+            hooks.ops["nilQidListSymbol"],
+            hooks.ops["qidListSymbol"],
+        ))
+    }
+
+    /// `tokenize(S)` scans a raw byte string with LEXICAL's deliberately small lexer (not the source
+    /// lexer): whitespace, controls, and otherwise-invalid bytes are skipped; punctuation is returned as
+    /// backquoted Qids. Invalid UTF-8 inside an identifier cannot inhabit the existing `Qid(Rc<str>)`
+    /// representation, so the partial hook safely stays unreduced rather than replacing bytes lossily.
+    fn lexical_tokenize(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        let arg = *ctx.children(redex).first()?;
+        let NodeRepr::Str(input) = ctx.repr(arg) else {
+            return None;
+        };
+        let words = lexical_tokens(input)?;
+        let qid_sym = *hooks.ops.get("quotedIdentifierSymbol")?;
+        let mut qids = Vec::with_capacity(words.len());
+        for word in words {
+            let sym = self.interner.intern(&word);
+            qids.push(ctx.make_na(qid_sym, NaValue::Qid(self.interner.resolve(sym).into())));
+        }
+        Some(up_set(
+            ctx,
+            qids,
+            *hooks.ops.get("nilQidListSymbol")?,
+            *hooks.ops.get("qidListSymbol")?,
+        ))
+    }
+
+    /// `printTokens(QL)` is the inverse-oriented token-list formatter from
+    /// `QuotedIdentifierOpSymbol::printQidList`: its spacing state and the `\n`/`\t`/`\s`/`\\` control
+    /// Qids are observable String bytes and intentionally differ from the ordinary term pretty-printer.
+    fn lexical_print_tokens(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        let arg = *ctx.children(redex).first()?;
+        let words = qidlist_texts(ctx, hooks, arg)?;
+        let output = print_lexical_tokens(&words);
+        Some(ctx.make_na(*hooks.ops.get("stringSymbol")?, NaValue::Str(output.into())))
     }
 
     /// Build the decomposition pieces of module `name`: the (flat or own) surface sorts/subsorts/ops + the
@@ -1123,22 +2735,34 @@ impl MetaDescent<'_> {
     fn module_pieces(&mut self, name: &str, flat: bool) -> Option<ModulePieces> {
         let pm = self.db.get(name)?.clone();
         let flat_pm = flatten(name, self.db, self.views, self.interner).ok()?;
-        let loaded = build_loaded_module(&flat_pm, self.interner).ok()?;
+        let mut loaded = build_loaded_module(&flat_pm, self.interner).ok()?;
         let (sorts, subsorts, raw_ops, imports) = if flat {
-            (flat_pm.sorts.clone(), flat_pm.subsorts.clone(), flat_pm.ops.clone(), Vec::new())
+            (
+                flat_pm.sorts.clone(),
+                flat_pm.subsorts.clone(),
+                flat_pm.ops.clone(),
+                Vec::new(),
+            )
         } else {
-            (pm.sorts.clone(), pm.subsorts.clone(), pm.ops.clone(), pm.imports.clone())
+            (
+                pm.sorts.clone(),
+                pm.subsorts.clone(),
+                pm.ops.clone(),
+                pm.imports.clone(),
+            )
         };
-        // Pre-resolve each op's canonical name + identity-element name (both need the interner) so the
-        // up-builders are interner-free.
-        let ops: Vec<UpOp> = raw_ops
-            .iter()
-            .map(|od| UpOp {
+        let mut ops: Vec<UpOp> = Vec::with_capacity(raw_ops.len());
+        for od in &raw_ops {
+            let identity = match &od.attrs.id {
+                Some(tokens) => Some(build_command_dag(&mut loaded, self.interner, tokens).ok()?),
+                None => None,
+            };
+            ops.push(UpOp {
                 name: canonical_name(&od.name, self.interner),
-                id_name: od.attrs.id.as_ref().map(|toks| canonical_name(toks, self.interner)),
+                identity,
                 decl: od.clone(),
-            })
-            .collect();
+            });
+        }
         let (mbs, eqs, rls) = if flat {
             // The whole import closure: walk the flattened statement list, interleaving `[nonexec]` axioms
             // with the flat build's trace vectors (which cover every executable statement, from index 0).
@@ -1169,12 +2793,7 @@ impl MetaDescent<'_> {
     /// install its inline memberships/equations/rules by down-translating their meta-terms directly into
     /// the built engine. Handles both the **import-expression** form (`[Q]` — sorts/ops/equations all
     /// `none`) and a module with **inline declarations** (what `upModule` emits, or a hand-written one).
-    fn down_module(
-        &mut self,
-        ctx: &MetaCtx,
-        hooks: &MetaHooks,
-        m: DagId,
-    ) -> Option<LoadedModule> {
+    fn down_module(&mut self, ctx: &MetaCtx, hooks: &MetaHooks, m: DagId) -> Option<LoadedModule> {
         let ctor = ctx.name(ctx.top(m)).to_string();
         let (kind, is_theory) = module_kind(&ctor)?;
         let kids = ctx.children(m);
@@ -1210,12 +2829,36 @@ impl MetaDescent<'_> {
         };
         let flat = flatten_pre(&pm, self.db, self.views, self.interner).ok()?;
         let mut loaded = build_loaded_module(&flat, self.interner).ok()?;
+        // A named module's declared variables materialize its per-sort VariableSymbols in declaration
+        // order. Reproduce that module-lifetime order on every meta down-translation; otherwise two
+        // independent `metaNormalize` calls can AC-sort the same `Set`/`Elt` variables differently.
+        for var in &flat.vars {
+            let sort = if let Some(inner) = var
+                .sort
+                .strip_prefix('[')
+                .and_then(|name| name.strip_suffix(']'))
+            {
+                let first = inner.split(',').next()?.trim();
+                let member = *loaded.built.sorts.get(first)?;
+                let kind = loaded.built.engine.sorts().kind_of(member);
+                loaded.built.engine.sorts().error_sort(kind)
+            } else {
+                *loaded.built.sorts.get(&var.sort)?
+            };
+            loaded.built.engine.variable_symbol(sort);
+        }
         // Install this module's own inline declarations (the imports' statements came through `flatten`,
         // parsed by `build_loaded_module`; these are reconstructed straight from their meta-terms).
         install_membs(ctx, hooks, *kids.get(5)?, &mut loaded.built)?;
         install_eqs(ctx, hooks, *kids.get(6)?, &mut loaded.built)?;
         if kind == ModuleKind::System {
-            install_rules(ctx, hooks, *kids.get(7)?, &mut loaded.built)?;
+            install_rules(
+                ctx,
+                hooks,
+                *kids.get(7)?,
+                &mut loaded.built,
+                self.interner,
+            )?;
         }
         Some(loaded)
     }
@@ -1249,10 +2892,25 @@ fn qid_text(ctx: &MetaCtx, d: DagId) -> Option<String> {
 /// Flatten a meta declaration set joined by a binary constructor `join` (`__`/`_;_`) into its element
 /// DAGs in left-to-right order, dropping the `empty` constant (`none`/`nil`). A single element, the empty
 /// constant, or a (AU/ACU-canonicalized) tree of `join` all collapse to a flat element list.
-fn flatten_set(ctx: &MetaCtx, d: DagId, empty: Option<SymbolId>, join: Option<SymbolId>) -> Vec<DagId> {
-    fn go(ctx: &MetaCtx, d: DagId, empty: Option<SymbolId>, join: Option<SymbolId>, out: &mut Vec<DagId>) {
+fn flatten_set(
+    ctx: &MetaCtx,
+    d: DagId,
+    empty: Option<SymbolId>,
+    join: Option<SymbolId>,
+) -> Vec<DagId> {
+    fn go(
+        ctx: &MetaCtx,
+        d: DagId,
+        empty: Option<SymbolId>,
+        join: Option<SymbolId>,
+        out: &mut Vec<DagId>,
+    ) {
         let sym = Some(ctx.top(d));
-        if sym == empty {
+        if sym == empty
+            || (ctx.name(ctx.top(d)) == "none"
+                && ctx.children(d).is_empty()
+                && !matches!(ctx.repr(d), NodeRepr::Qid(_)))
+        {
             return;
         }
         if sym == join {
@@ -1273,14 +2931,193 @@ fn flatten_set(ctx: &MetaCtx, d: DagId, empty: Option<SymbolId>, join: Option<Sy
 fn qidlist_texts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Vec<String>> {
     let empty = hooks.ops.get("nilQidListSymbol").copied();
     let join = hooks.ops.get("qidListSymbol").copied();
-    flatten_set(ctx, d, empty, join).iter().map(|&x| qid_text(ctx, x)).collect()
+    flatten_set(ctx, d, empty, join)
+        .iter()
+        .map(|&x| qid_text(ctx, x))
+        .collect()
+}
+
+/// A meta `QidSet` (`none` | `_;_`-joined `Qid`s, or a single `Qid`) → its texts. `VariableSet` is a
+/// subsort of `QidSet`, so META-LEVEL's shared hooks are the canonical flattening symbols.
+fn qidset_texts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Vec<String>> {
+    let empty = hooks.ops.get("emptyQidSetSymbol").copied();
+    let join = hooks.ops.get("qidSetSymbol").copied();
+    flatten_set(ctx, d, empty, join)
+        .iter()
+        .map(|&x| qid_text(ctx, x))
+        .collect()
+}
+
+/// The scanner used only by LEXICAL's `tokenize`. This mirrors `Mixfix/tokenizer.ll`, whose grammar is
+/// intentionally not the source lexer: comments and dots have no special meaning, bad/control bytes are
+/// skipped, and `( ) [ ] { } ,` split unless backquoted. The returned spellings use this port's existing
+/// Qid payload convention: syntactic backquotes before punctuation are removed (the Qid renderer restores
+/// them), while backquotes joining ordinary characters remain semantic name separators.
+fn lexical_tokens(input: &[u8]) -> Option<Vec<String>> {
+    fn control(b: u8) -> bool {
+        b < b' ' || b == 0x7f
+    }
+    fn punct(b: u8) -> bool {
+        matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',')
+    }
+    fn normal_atom(input: &[u8], at: usize) -> Option<usize> {
+        let b = *input.get(at)?;
+        if b == b'"' {
+            let mut i = at + 1;
+            while let Some(&c) = input.get(i) {
+                match c {
+                    b'"' => return Some(i + 1),
+                    b'\\' => {
+                        let &next = input.get(i + 1)?;
+                        if control(next) && next != b'\n' {
+                            return None;
+                        }
+                        i += 2;
+                    }
+                    _ if control(c) => return None,
+                    _ => i += 1,
+                }
+            }
+            return None;
+        }
+        (!control(b)
+            && !matches!(
+                b,
+                b' ' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' | b'`' | b'_' | b'"'
+            ))
+        .then_some(at + 1)
+    }
+
+    let mut result = Vec::new();
+    let mut at = 0;
+    while at < input.len() {
+        if punct(input[at]) {
+            result.push(String::from_utf8(vec![input[at]]).expect("ASCII punctuation"));
+            at += 1;
+            continue;
+        }
+
+        let start = at;
+        let mut token = Vec::new();
+        loop {
+            if input.get(at) == Some(&b'_') {
+                token.push(b'_');
+                at += 1;
+                continue;
+            }
+            if input.get(at) == Some(&b'`') && input.get(at + 1).is_some_and(|&b| punct(b)) {
+                token.push(input[at + 1]);
+                at += 2;
+                continue;
+            }
+            let Some(end) = normal_atom(input, at) else {
+                break;
+            };
+            token.extend_from_slice(&input[at..end]);
+            at = end;
+            // A backquote joins two `normal` atoms inside one normalSeq. It remains part of the token's
+            // canonical spelling (unlike source-level operator-name blank handling).
+            while input.get(at) == Some(&b'`') {
+                let Some(end) = normal_atom(input, at + 1) else {
+                    break;
+                };
+                token.push(b'`');
+                token.extend_from_slice(&input[at + 1..end]);
+                at = end;
+            }
+        }
+        if at == start {
+            at += 1; // tokenizer.ll's catch-all rule discards one otherwise-unrecognized byte
+            continue;
+        }
+        // Token::fixUp removes backslash-newline continuations after the flex match.
+        let mut fixed = Vec::with_capacity(token.len());
+        let mut i = 0;
+        while i < token.len() {
+            if token.get(i) == Some(&b'\\') && token.get(i + 1) == Some(&b'\n') {
+                i += 2;
+            } else {
+                fixed.push(token[i]);
+                i += 1;
+            }
+        }
+        result.push(String::from_utf8(fixed).ok()?);
+    }
+    Some(result)
+}
+
+/// Maude 3.5.1's byte-valued `QuotedIdentifierOpSymbol::printQidList`.
+fn print_lexical_tokens(words: &[String]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut need_space = false;
+    for word in words {
+        let bytes = word.as_bytes();
+        if let [c] = bytes
+            && matches!(c, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',')
+        {
+            // The live oracle follows its C++ predicate literally: every punctuation except `{` takes
+            // this branch. Thus `a (b )c`, `a ,b`, but `a{ b }c`.
+            if *c != b'{' {
+                if need_space {
+                    output.push(b' ');
+                }
+                need_space = false;
+            } else {
+                need_space = true;
+            }
+            output.push(*c);
+            continue;
+        }
+        if let [b'\\', c] = bytes {
+            match c {
+                b'n' => {
+                    output.push(b'\n');
+                    need_space = false;
+                    continue;
+                }
+                b't' => {
+                    output.push(b'\t');
+                    need_space = false;
+                    continue;
+                }
+                b's' => {
+                    output.push(b' ');
+                    need_space = false;
+                    continue;
+                }
+                b'\\' => {
+                    if need_space {
+                        output.push(b' ');
+                    }
+                    output.push(b'\\');
+                    need_space = true;
+                    continue;
+                }
+                // ANSI Qids and reset append `Tty::ctrlSequence()`. In the non-TTY evaluation mode used
+                // by both command runners that sequence is empty, and spacing state is unchanged.
+                b'!' | b'?' | b'u' | b'f' | b'x' | b'h' | b'p' | b'r' | b'g' | b'y' | b'b'
+                | b'm' | b'c' | b'w' | b'P' | b'R' | b'G' | b'Y' | b'B' | b'M' | b'C' | b'W'
+                | b'o' => continue,
+                _ => {}
+            }
+        }
+        if need_space {
+            output.push(b' ');
+        }
+        output.extend_from_slice(bytes);
+        need_space = true;
+    }
+    output
 }
 
 /// A meta `SortSet` (`none` | `_;_`-joined sort `Qid`s) → the sort name strings.
 fn down_sorts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<String> {
     let empty = hooks.ops.get("emptySortSetSymbol").copied();
     let join = hooks.ops.get("sortSetSymbol").copied();
-    flatten_set(ctx, d, empty, join).iter().filter_map(|&x| qid_text(ctx, x)).collect()
+    flatten_set(ctx, d, empty, join)
+        .iter()
+        .filter_map(|&x| qid_text(ctx, x))
+        .collect()
 }
 
 /// A meta `SubsortDeclSet` (`none` | `__`-joined `subsort A < B .`) → the surface chain form (each decl a
@@ -1295,9 +3132,10 @@ fn down_subsorts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<Vec<Vec<Stri
             continue;
         }
         let kids = ctx.children(decl);
-        if let (Some(a), Some(b)) =
-            (kids.first().and_then(|&x| qid_text(ctx, x)), kids.get(1).and_then(|&x| qid_text(ctx, x)))
-        {
+        if let (Some(a), Some(b)) = (
+            kids.first().and_then(|&x| qid_text(ctx, x)),
+            kids.get(1).and_then(|&x| qid_text(ctx, x)),
+        ) {
             out.push(vec![vec![a], vec![b]]);
         }
     }
@@ -1320,7 +3158,13 @@ fn down_ops(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> Opt
         let domain = down_typelist(ctx, hooks, *kids.get(1)?);
         let range = qid_text(ctx, *kids.get(2)?)?;
         let attrs = down_attrs(ctx, hooks, *kids.get(3)?, i)?;
-        out.push(OpDecl { name: tokenize(&name_str, i), domain, range, partial: false, attrs });
+        out.push(OpDecl {
+            name: tokenize(&name_str, i),
+            domain,
+            range,
+            partial: false,
+            attrs,
+        });
     }
     Some(out)
 }
@@ -1329,7 +3173,10 @@ fn down_ops(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> Opt
 fn down_typelist(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Vec<String> {
     let empty = hooks.ops.get("nilQidListSymbol").copied();
     let join = hooks.ops.get("qidListSymbol").copied();
-    flatten_set(ctx, d, empty, join).iter().filter_map(|&x| qid_text(ctx, x)).collect()
+    flatten_set(ctx, d, empty, join)
+        .iter()
+        .filter_map(|&x| qid_text(ctx, x))
+        .collect()
 }
 
 /// A meta `AttrSet` → surface [`Attrs`]. Reconstructs the structural attributes (`ctor`/`assoc`/`comm`/
@@ -1363,8 +3210,14 @@ fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> O
         } else if is("portalSymbol") {
             a.portal = true;
         } else if is("idSymbol") || is("leftIdSymbol") || is("rightIdSymbol") {
-            // `id:`/`left-id:`/`right-id:` <term> — a single identity constant in practice; carry its name.
-            a.id = Some(id_bubble(ctx, *ctx.children(attr).first()?, i)?);
+            a.id = Some(id_bubble(ctx, hooks, *ctx.children(attr).first()?, i)?);
+            a.id_side = if is("leftIdSymbol") {
+                IdSide::Left
+            } else if is("rightIdSymbol") {
+                IdSide::Right
+            } else {
+                IdSide::Both
+            };
         } else if is("precSymbol") {
             a.prec = down_nat(ctx, *ctx.children(attr).first()?);
         } else if is("stratSymbol") {
@@ -1388,12 +3241,37 @@ fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> O
     Some(a)
 }
 
-/// The `id:`-attribute bubble for an identity constant `'name.Sort`: its name as a single token (what
-/// `declare_op` resolves against `name_to_sym`).
-fn id_bubble(ctx: &MetaCtx, t: DagId, i: &mut Interner) -> Option<Vec<tnk_frontend::lex::Token>> {
-    let text = qid_text(ctx, t)?;
-    let name = text.rsplit_once('.').map(|(n, _)| n).unwrap_or(&text);
-    Some(tokenize(name, i))
+/// Reconstruct a ground identity meta-term as a prefix-form object term bubble.
+fn id_bubble(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    term: DagId,
+    interner: &mut Interner,
+) -> Option<Vec<tnk_frontend::lex::Token>> {
+    fn text(ctx: &MetaCtx, hooks: &MetaHooks, term: DagId) -> Option<String> {
+        if ctx.top(term) == hooks.ops["metaTermSymbol"] {
+            let children = ctx.children(term);
+            let head = strip_op_blanks(&qid_text(ctx, *children.first()?)?);
+            let arglist = *children.get(1)?;
+            let args: Vec<DagId> = if ctx.top(arglist) == hooks.ops["metaArgSymbol"] {
+                ctx.children(arglist).to_vec()
+            } else {
+                vec![arglist]
+            };
+            let rendered: Option<Vec<String>> =
+                args.into_iter().map(|arg| text(ctx, hooks, arg)).collect();
+            return Some(format!("{head}({})", rendered?.join(",")));
+        }
+        let atom = qid_text(ctx, term)?;
+        match atom.rsplit_once('.') {
+            // Keep the meta-term's resolved sort qualification. A bare constant name is not an identity:
+            // two copied/imported overloads may share that spelling, while `(c).S` selects the exact target
+            // symbol/kind when the down-translated signature parses and owns the rebuilt ground term.
+            Some((name, sort)) => Some(format!("({}).{sort}", strip_op_blanks(name))),
+            None => Some(strip_op_blanks(&atom)),
+        }
+    }
+    Some(tokenize(&text(ctx, hooks, term)?, interner))
 }
 
 /// A meta `NatList` (a single `Nat`, or `__`/`natListSymbol`-joined `Nat`s) → the `u32` position list —
@@ -1419,7 +3297,10 @@ fn attrset_has(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, hook: &str) -> bool {
     let empty = hooks.ops.get("emptyAttrSetSymbol").copied();
     let join = hooks.ops.get("attrSetSymbol").copied();
     let target = hooks.ops.get(hook).copied();
-    target.is_some() && flatten_set(ctx, d, empty, join).iter().any(|&x| Some(ctx.top(x)) == target)
+    target.is_some()
+        && flatten_set(ctx, d, empty, join)
+            .iter()
+            .any(|&x| Some(ctx.top(x)) == target)
 }
 
 /// The `label(Q)` of a rule's meta `AttrSet`, if present.
@@ -1477,11 +3358,20 @@ fn install_membs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule
             nonexec: false,
         };
         let id = if condition.is_empty() {
-            m.engine.add_membership(Membership { lhs, sort: sort_id, nr_vars: nr })
+            m.engine.add_membership(Membership {
+                lhs,
+                sort: sort_id,
+                nr_vars: nr,
+            })
         } else {
-            m.engine.add_conditional_membership(lhs, sort_id, nr, condition)
+            m.engine
+                .add_conditional_membership(lhs, sort_id, nr, condition)
         };
-        assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
+        assert_eq!(
+            id as usize,
+            m.mb_traces.len(),
+            "membership id is the dense mb_traces index"
+        );
         m.mb_traces.push(trace);
     }
     Some(())
@@ -1515,6 +3405,7 @@ fn install_eqs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) 
             continue;
         }
         let owise = attrset_has(ctx, hooks, attrs, "owiseSymbol");
+        let variant = attrset_has(ctx, hooks, attrs, "variantAttrSymbol");
         let nr = vars.count();
         let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
         let trace = EqTrace {
@@ -1523,24 +3414,42 @@ fn install_eqs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) 
             condition: condition.clone(),
             var_names,
             owise,
+            variant,
             label: attrset_label(ctx, hooks, attrs), // executable (nonexec skipped above); retain the label
             nonexec: false,
         };
-        let id = if owise {
+        let id = if variant {
+            m.engine
+                .add_variant_equation(lhs, rhs, nr, condition, owise)
+        } else if owise {
             m.engine.add_owise_equation(lhs, rhs, nr, condition)
         } else if condition.is_empty() {
-            m.engine.add_equation(Equation { lhs, rhs, nr_vars: nr })
+            m.engine.add_equation(Equation {
+                lhs,
+                rhs,
+                nr_vars: nr,
+            })
         } else {
             m.engine.add_conditional_equation(lhs, rhs, nr, condition)
         };
-        assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
+        assert_eq!(
+            id as usize,
+            m.eq_traces.len(),
+            "equation id is the dense eq_traces index"
+        );
         m.eq_traces.push(trace);
     }
     Some(())
 }
 
 /// Install a meta `RuleSet`'s rules into the built engine (down-translating each `rl`/`crl`).
-fn install_rules(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule) -> Option<()> {
+fn install_rules(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    d: DagId,
+    m: &mut BuiltModule,
+    interner: &mut Interner,
+) -> Option<()> {
     let empty = hooks.ops.get("emptyRuleSetSymbol").copied();
     let join = hooks.ops.get("ruleSetSymbol").copied();
     let rl = hooks.ops.get("rlSymbol").copied();
@@ -1562,12 +3471,38 @@ fn install_rules(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule
         } else {
             return None;
         };
-        if attrset_has(ctx, hooks, attrs, "nonexecSymbol") {
+        let nonexec = attrset_has(ctx, hooks, attrs, "nonexecSymbol");
+        let narrowing = attrset_has(ctx, hooks, attrs, "narrowingSymbol");
+        if narrowing && !condition.is_empty() {
             continue;
         }
         let label = attrset_label(ctx, hooks, attrs);
         let nr = vars.count();
-        let var_names = (0..nr).map(|k| vars.name(k).to_string()).collect();
+        let var_names: Vec<String> = (0..nr).map(|k| vars.name(k).to_string()).collect();
+        let variable_specs = (0..nr)
+            .map(|slot| {
+                let source = vars.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                tnk_core::unify::problem::VarSpec {
+                    sort: vars.sort(slot),
+                    name: maude_variable_name_rank(base, interner.intern(base).index()),
+                }
+            })
+            .collect();
+        if narrowing {
+            m.engine.add_narrowing_rule(
+                lhs.clone(),
+                rhs.clone(),
+                variable_specs,
+                var_names.clone(),
+                condition.clone(),
+                label.clone(),
+                nonexec,
+            );
+        }
+        if nonexec || lhs.top_symbol().is_none() {
+            continue;
+        }
         let trace = RlTrace {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -1575,13 +3510,18 @@ fn install_rules(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, m: &mut BuiltModule
             var_names,
             label,
             nonexec: false,
+            narrowing,
         };
         let id = if condition.is_empty() {
             m.engine.add_rule(lhs, rhs, nr)
         } else {
             m.engine.add_conditional_rule(lhs, rhs, nr, condition)
         };
-        assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
+        assert_eq!(
+            id as usize,
+            m.rl_traces.len(),
+            "rule id is the dense rl_traces index"
+        );
         m.rl_traces.push(trace);
     }
     Some(())
@@ -1622,12 +3562,20 @@ fn down_condition(
             let pattern = down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?;
             let subject = down_term_to_term(ctx, hooks, *kids.get(1)?, m, vars)?;
             let fresh = fresh_vars(&pattern, bound);
-            ConditionFragment::Matching { pattern, subject, fresh_vars: fresh }
+            ConditionFragment::Matching {
+                pattern,
+                subject,
+                fresh_vars: fresh,
+            }
         } else if sym == rw_c {
             let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, vars)?;
             let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, m, vars)?;
             let fresh = fresh_vars(&pattern, bound);
-            ConditionFragment::Rewrite { lhs, pattern, fresh_vars: fresh }
+            ConditionFragment::Rewrite {
+                lhs,
+                pattern,
+                fresh_vars: fresh,
+            }
         } else {
             return None;
         };
@@ -1655,6 +3603,7 @@ fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
             }
         }
         Term::Na { .. } => {}
+        Term::Iter { arg, .. } => term_var_indices(arg, out),
         Term::Op { args, .. } => {
             for a in args {
                 term_var_indices(a, out);
@@ -1666,8 +3615,8 @@ fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
 /// Down-translate a meta-term into a kernel [`Term`] (a pattern / statement side) over `target`. Like
 /// [`down_term`] but yields a static `Term`: a meta variable `'X:Sort` becomes an indexed `Term::Var`
 /// (tracked in `vars`, keyed by the full meta name so `'X:Nat` and `'X:Int` stay distinct), a constant
-/// `'c.S` an arity-0 `Term::Op`, an application `'f[args]` a `Term::Op`, and the iterated `'s_^n[t]` an
-/// `n`-deep successor chain (the kernel folds it to a compact `s^n` node downstream).
+/// `'c.S` an arity-0 `Term::Op`, an application `'f[args]` a `Term::Op`, and the iterated `'s_^n[t]` a
+/// compact [`Term::Iter`] carrying the arbitrary-size count as scalar data.
 fn down_term_to_term(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
@@ -1692,7 +3641,7 @@ fn down_term_to_term(
 fn down_leaf_to_term(text: &str, target: &BuiltModule, vars: &mut VarIndex) -> Option<Term> {
     if let Some(colon) = text.find(':') {
         // Variable: a name can hold no `:` and a sort no `:`, so the first `:` splits name from sort.
-        let sort = *target.sorts.get(&text[colon + 1..])?;
+        let sort = resolve_meta_sort_name(target, &text[colon + 1..])?;
         Some(Term::var(vars.index_of(text, sort), sort))
     } else if let Some(dot) = text.rfind('.') {
         // Constant `name.Sort`: look up the arity-0 operator (literal NA constants are a follow-up).
@@ -1700,6 +3649,21 @@ fn down_leaf_to_term(text: &str, target: &BuiltModule, vars: &mut VarIndex) -> O
         Some(Term::constant(sym))
     } else {
         None
+    }
+}
+
+fn resolve_meta_sort_name(target: &BuiltModule, name: &str) -> Option<SortId> {
+    let name = strip_op_blanks(name);
+    if let Some(inner) = name
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+    {
+        let first = inner.split(',').next()?.trim();
+        let member = *target.sorts.get(first)?;
+        let kind = target.engine.sorts().kind_of(member);
+        Some(target.engine.sorts().error_sort(kind))
+    } else {
+        target.sorts.get(&name).copied()
     }
 }
 
@@ -1714,7 +3678,10 @@ fn down_arglist_to_term(
 ) -> Option<Vec<Term>> {
     let arg_sym = hooks.ops.get("metaArgSymbol").copied();
     if Some(ctx.top(list)) == arg_sym {
-        ctx.children(list).into_iter().map(|c| down_term_to_term(ctx, hooks, c, target, vars)).collect()
+        ctx.children(list)
+            .into_iter()
+            .map(|c| down_term_to_term(ctx, hooks, c, target, vars))
+            .collect()
     } else {
         Some(vec![down_term_to_term(ctx, hooks, list, target, vars)?])
     }
@@ -1738,18 +3705,15 @@ fn resolve_flat_assoc(name: &str, arity: usize, target: &BuiltModule) -> Option<
 }
 
 /// Build a kernel [`Term`] application from a meta op-name + down-translated args: an iterated name
-/// `base^n` wraps the argument in `n` nested successor `Term::Op`s; otherwise the operator is `(name, arity)`.
+/// `base^n` becomes one compact [`Term::Iter`]; otherwise the operator is `(name, arity)`.
 fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<Term> {
     let head = strip_op_blanks(head); // normalize a meta Qid's backtick-blanks to the canonical op name
-    if let Some((base, count)) = head.rsplit_once('^')
-        && let Ok(n) = count.parse::<u64>()
-    {
+    if let Some((base, count)) = head.rsplit_once('^') {
         let sym = *target.ops.get(&(base.to_string(), 1))?;
-        let mut t = args.into_iter().next()?;
-        for _ in 0..n {
-            t = Term::op(sym, vec![t]);
+        if args.len() != 1 {
+            return None;
         }
-        return Some(t);
+        return Term::iter_decimal(sym, count, args.into_iter().next()?);
     }
     let sym = resolve_flat_assoc(&head, args.len(), target)?;
     Some(Term::op(sym, args))
@@ -1793,7 +3757,10 @@ fn down_import(ctx: &MetaCtx, hooks: &MetaHooks, imp: DagId) -> Option<Import> {
         return None;
     };
     let expr = *ctx.children(imp).first()?;
-    Some(Import { mode, expr: down_module_expr(ctx, expr)? })
+    Some(Import {
+        mode,
+        expr: down_module_expr(ctx, expr)?,
+    })
 }
 
 /// Down-translate a module expression. Only a named module (a `Qid` leaf) is handled here.
@@ -1808,17 +3775,35 @@ fn down_module_expr(ctx: &MetaCtx, e: DagId) -> Option<ModuleExpr> {
 
 /// Down-translate a meta-term into a DAG in `target` (the object module). Handles a constant `'c.S`
 /// (a `Qid` leaf), an application `'f[args]` (a `metaTermSymbol` node), and the iterated form `'s_^n[t]`.
-fn down_term(ctx: &MetaCtx, hooks: &MetaHooks, t: DagId, target: &mut BuiltModule) -> Option<DagId> {
+fn down_term(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    t: DagId,
+    target: &mut BuiltModule,
+    interner: &mut Interner,
+) -> Option<DagId> {
+    let mut vars = VarIndex::new();
+    down_term_inner(ctx, hooks, t, target, &mut vars, interner)
+}
+
+fn down_term_inner(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    t: DagId,
+    target: &mut BuiltModule,
+    vars: &mut VarIndex,
+    interner: &mut Interner,
+) -> Option<DagId> {
     let meta_term = hooks.ops.get("metaTermSymbol").copied();
     match ctx.repr(t) {
-        NodeRepr::Qid(text) => down_constant(text, target),
+        NodeRepr::Qid(text) => down_leaf_to_dag(text, target, vars, interner),
         NodeRepr::App if Some(ctx.top(t)) == meta_term => {
             let kids = ctx.children(t);
             let head = match ctx.repr(*kids.first()?) {
                 NodeRepr::Qid(s) => s.to_string(),
                 _ => return None,
             };
-            let args = down_arglist(ctx, hooks, *kids.get(1)?, target)?;
+            let args = down_arglist(ctx, hooks, *kids.get(1)?, target, vars, interner)?;
             build_app(&head, args, target)
         }
         _ => None,
@@ -1832,15 +3817,38 @@ fn down_arglist(
     hooks: &MetaHooks,
     list: DagId,
     target: &mut BuiltModule,
+    vars: &mut VarIndex,
+    interner: &mut Interner,
 ) -> Option<Vec<DagId>> {
     let arg_sym = hooks.ops.get("metaArgSymbol").copied();
     if Some(ctx.top(list)) == arg_sym {
-        ctx.children(list).into_iter().map(|c| down_term(ctx, hooks, c, target)).collect()
+        ctx.children(list)
+            .into_iter()
+            .map(|c| down_term_inner(ctx, hooks, c, target, vars, interner))
+            .collect()
     } else {
-        Some(vec![down_term(ctx, hooks, list, target)?])
+        Some(vec![down_term_inner(
+            ctx, hooks, list, target, vars, interner,
+        )?])
     }
 }
 
+/// Build a variable or constant meta-term leaf into a dynamic kernel DAG.
+fn down_leaf_to_dag(
+    text: &str,
+    target: &mut BuiltModule,
+    vars: &mut VarIndex,
+    interner: &mut Interner,
+) -> Option<DagId> {
+    if let Some(colon) = text.find(':') {
+        let sort = resolve_meta_sort_name(target, &text[colon + 1..])?;
+        let index = vars.index_of(text, sort);
+        let name = interner.intern(&text[..colon]).index();
+        Some(target.engine.make_var(sort, name, index))
+    } else {
+        down_constant(text, target)
+    }
+}
 /// Build a constant from a meta `'name.sort` (a `Qid` leaf): look up the arity-0 operator `name`.
 fn down_constant(text: &str, target: &mut BuiltModule) -> Option<DagId> {
     let (name, _sort) = text.rsplit_once('.')?;
@@ -1928,6 +3936,28 @@ fn strip_op_blanks(name: &str) -> String {
 
 /// Up-translate an object DAG `t` (in `source`) into a meta-term built in `ctx`.
 fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId) -> DagId {
+    up_term_inner(ctx, hooks, source, None, t)
+}
+
+/// Up-translate a `metaParse` result, preserving the symbolic DAG's variable leaves as typed variable
+/// Qids. The session interner resolves the name token stored on each kernel variable.
+fn up_parsed_term(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: &Interner,
+    t: DagId,
+) -> DagId {
+    up_term_inner(ctx, hooks, source, Some(interner), t)
+}
+
+fn up_term_inner(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: Option<&Interner>,
+    t: DagId,
+) -> DagId {
     let qid = hooks.ops["qidSymbol"];
     match source.engine.node(t).repr() {
         NodeRepr::App => {
@@ -1936,10 +3966,17 @@ fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
             let kids: Vec<DagId> = source.engine.node(t).children().collect();
             if kids.is_empty() {
                 // a constant → `'name.sort`
-                let sort = source.engine.sorts().name(source.engine.sort_of(t)).to_string();
+                let sort = source
+                    .engine
+                    .sorts()
+                    .name(source.engine.sort_of(t))
+                    .to_string();
                 ctx.make_na(qid, NaValue::Qid(format!("{name}.{sort}").into()))
             } else {
-                let up_args: Vec<DagId> = kids.iter().map(|&k| up_term(ctx, hooks, source, k)).collect();
+                let up_args: Vec<DagId> = kids
+                    .iter()
+                    .map(|&k| up_term_inner(ctx, hooks, source, interner, k))
+                    .collect();
                 let arglist = up_arglist(ctx, hooks, up_args);
                 let opqid = ctx.make_na(qid, NaValue::Qid(name.into()));
                 ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
@@ -1948,22 +3985,34 @@ fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId)
         NodeRepr::Iter { count, arg } => {
             // `'base^count[up(arg)]` — `^count` only when count > 1 (`s^1` is `'s_[…]`).
             let base = meta_op_name(source.engine.symbol(source.engine.node(t).symbol()).name());
-            let head = if count == "1" { base } else { format!("{base}^{count}") };
-            let up_arg = up_term(ctx, hooks, source, arg);
+            let head = if count == "1" {
+                base
+            } else {
+                format!("{base}^{count}")
+            };
+            let up_arg = up_term_inner(ctx, hooks, source, interner, arg);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_arg])
         }
         // String/float constants up to `'"s".String` / `'f.Float`; bare qids to `''q.Sort` — these need
         // the value-dependent classification and are not reached by NAT/BOOL reduction (a follow-on).
         NodeRepr::Str(_) | NodeRepr::Qid(_) | NodeRepr::Float(_) => {
-            let sort = source.engine.sorts().name(source.engine.sort_of(t)).to_string();
+            let sort = source
+                .engine
+                .sorts()
+                .name(source.engine.sort_of(t))
+                .to_string();
             ctx.make_na(qid, NaValue::Qid(format!("?.{sort}").into()))
         }
-        // A genuine variable leaf exists only in symbolic-engine DAGs; the metaUnify result path
-        // (S1f) up-translates its substitutions itself (`upVariable`, name resolved through the
-        // session interner) — no other meta surface can receive one.
-        NodeRepr::Var { .. } => {
-            unreachable!("Var leaf reached up_term outside the metaUnify result path")
+        NodeRepr::Var { name } => {
+            let interner = interner.expect("symbolic DAG reached ordinary up_term");
+            let text = interner.resolve(Sym::from_raw(name));
+            let sort = source.engine.sorts().name(source.engine.sort_of(t));
+            let typed = match text.rsplit_once(':') {
+                Some((base, declared)) if !base.is_empty() && declared == sort => text.to_string(),
+                _ => format!("{text}:{sort}"),
+            };
+            ctx.make_na(qid, NaValue::Qid(typed.into()))
         }
     }
 }
@@ -1983,9 +4032,9 @@ fn up_arglist(ctx: &mut MetaCtx, hooks: &MetaHooks, args: Vec<DagId>) -> DagId {
 /// The snapshot of an object DAG node needed to up-translate it, taken with immutable `MetaCtx` reads
 /// before the (mutable) result build — so `up_term_ctx` can recurse without a borrow conflict.
 enum NodeShape {
-    Leaf(String),               // a constant `'name.sort` or NA literal `'"s".String` / `''q.Qid` / `'f.Float`
-    App(String, Vec<DagId>),    // an application `'name[args]`
-    Iter(String, Vec<DagId>),   // the iter head `name`/`name^count` + the single argument
+    Leaf(String), // a constant `'name.sort` or NA literal `'"s".String` / `''q.Qid` / `'f.Float`
+    App(String, Vec<DagId>), // an application `'name[args]`
+    Iter(String, Vec<DagId>), // the iter head `name`/`name^count` + the single argument
 }
 
 /// `upTerm`: up-translate an object DAG `t` of the **current** module into its meta-`Term`. Unlike
@@ -1997,17 +4046,52 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
     let sort = ctx.sort_name(ctx.sort_of(t)).to_string();
     let shape = match ctx.repr(t) {
         NodeRepr::App => {
-            let name = meta_op_name(ctx.name(ctx.top(t)));
+            let raw = ctx.name(ctx.top(t));
             let kids = ctx.children(t);
-            if kids.is_empty() {
-                NodeShape::Leaf(format!("{name}.{sort}"))
+            let variable_base = raw
+                .rsplit_once(':')
+                .filter(|(base, declared)| {
+                    !base.is_empty() && !base.contains('`') && strip_op_blanks(declared) == sort
+                })
+                .map(|(base, _)| base)
+                .or_else(|| {
+                    sort.starts_with('[')
+                        .then(|| raw.rsplit_once('.'))
+                        .flatten()
+                        .filter(|(base, declared)| {
+                            !base.is_empty() && strip_op_blanks(declared) == sort
+                        })
+                        .map(|(base, _)| base)
+                })
+                .or_else(|| {
+                    (sort.starts_with('[')
+                        && raw.as_bytes().first().is_some_and(|byte| {
+                            byte.is_ascii_uppercase() || matches!(*byte, b'#' | b'%' | b'@')
+                        }))
+                    .then_some(raw)
+                });
+            if kids.is_empty()
+                && let Some(base) = variable_base
+            {
+                // Kind variables are represented by the command parser as `X.[Kind]`; ordinary
+                // variables use `X:Sort`. Both up-translate to the meta Qid `X:Type`.
+                NodeShape::Leaf(format!("{}:{sort}", strip_op_blanks(base)))
             } else {
-                NodeShape::App(name, kids)
+                let name = meta_op_name(raw);
+                if kids.is_empty() {
+                    NodeShape::Leaf(format!("{name}.{sort}"))
+                } else {
+                    NodeShape::App(name, kids)
+                }
             }
         }
         NodeRepr::Iter { count, arg } => {
             let base = meta_op_name(ctx.name(ctx.top(t)));
-            let head = if count == "1" { base } else { format!("{base}^{count}") };
+            let head = if count == "1" {
+                base
+            } else {
+                format!("{base}^{count}")
+            };
             NodeShape::Iter(head, vec![arg])
         }
         NodeRepr::Str(s) => NodeShape::Leaf(format!("{:?}.{sort}", String::from_utf8_lossy(s))),
@@ -2053,7 +4137,10 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
             let NodeRepr::Qid(head) = ctx.repr(*kids.first()?) else {
                 return None;
             };
-            DShape::App(head.to_string(), down_arg_dags_ctx(ctx, hooks, *kids.get(1)?))
+            DShape::App(
+                head.to_string(),
+                down_arg_dags_ctx(ctx, hooks, *kids.get(1)?),
+            )
         }
         _ => return None,
     };
@@ -2064,8 +4151,10 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
             Some(ctx.app(sym, vec![]))
         }
         DShape::App(head, arg_dags) => {
-            let args: Vec<DagId> =
-                arg_dags.iter().map(|&a| down_term_ctx(ctx, hooks, a)).collect::<Option<_>>()?;
+            let args: Vec<DagId> = arg_dags
+                .iter()
+                .map(|&a| down_term_ctx(ctx, hooks, a))
+                .collect::<Option<_>>()?;
             if let Some((base, count)) = head.rsplit_once('^')
                 && let Ok(n) = count.parse::<u64>()
             {
@@ -2099,7 +4188,11 @@ fn down_arg_dags_ctx(ctx: &MetaCtx, hooks: &MetaHooks, list: DagId) -> Vec<DagId
 /// Up-translate the least sort of `t` (in `source`) to its meta `Type` — a `Qid` of the sort name.
 fn up_sort(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId) -> DagId {
     let qid = hooks.ops["qidSymbol"];
-    let sort = source.engine.sorts().name(source.engine.sort_of(t)).to_string();
+    let sort = source
+        .engine
+        .sorts()
+        .name(source.engine.sort_of(t))
+        .to_string();
     ctx.make_na(qid, NaValue::Qid(sort.into()))
 }
 
@@ -2135,7 +4228,12 @@ fn up_type_list(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, sorts: &[
         .iter()
         .map(|&s| ctx.make_na(qid, NaValue::Qid(m.engine.sorts().name(s).into())))
         .collect();
-    up_set(ctx, elems, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"])
+    up_set(
+        ctx,
+        elems,
+        hooks.ops["nilQidListSymbol"],
+        hooks.ops["qidListSymbol"],
+    )
 }
 
 /// Build a META-LEVEL `Bool` result (`true`/`false`), resolved by name in the current module. `None` if
@@ -2149,10 +4247,15 @@ fn up_bool(ctx: &mut MetaCtx, b: bool) -> Option<DagId> {
 /// `_;_` ACU constructor; an empty set is `none`. The sort names are sorted so the (commutative) result is
 /// deterministic; the kernel's ACU canonicalization then fixes the printed order.
 fn up_sort_set(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, sorts: &[SortId]) -> DagId {
-    let mut names: Vec<String> = sorts.iter().map(|&s| m.engine.sorts().name(s).to_string()).collect();
+    let mut names: Vec<String> = sorts
+        .iter()
+        .map(|&s| m.engine.sorts().name(s).to_string())
+        .collect();
     names.sort();
-    let qids: Vec<DagId> =
-        names.iter().map(|n| ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(n.as_str().into()))).collect();
+    let qids: Vec<DagId> = names
+        .iter()
+        .map(|n| ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(n.as_str().into())))
+        .collect();
     match qids.len() {
         0 => ctx.app(hooks.ops["emptySortSetSymbol"], vec![]),
         1 => qids.into_iter().next().unwrap(),
@@ -2181,7 +4284,13 @@ fn term_well_formed(m: &BuiltModule, t: DagId) -> bool {
 
 /// Whether meta `Substitution` `d` is well-formed in `m`: every assignment `'X:Sort <- value` has a value
 /// that down-translates to a well-formed term whose kind matches the variable's sort. `wellFormed(M, S)`.
-fn subst_well_formed(ctx: &MetaCtx, hooks: &MetaHooks, m: &mut BuiltModule, d: DagId) -> bool {
+fn subst_well_formed(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    m: &mut BuiltModule,
+    d: DagId,
+    interner: &mut Interner,
+) -> bool {
     let empty = hooks.ops.get("emptySubstitutionSymbol").copied();
     let join = hooks.ops.get("substitutionSymbol").copied();
     let assign = hooks.ops.get("assignmentSymbol").copied();
@@ -2191,7 +4300,8 @@ fn subst_well_formed(ctx: &MetaCtx, hooks: &MetaHooks, m: &mut BuiltModule, d: D
         }
         let kids = ctx.children(a);
         let Some((_, sort_name)) = kids.first().and_then(|&k| qid_text(ctx, k)).and_then(|t| {
-            t.split_once(':').map(|(n, s)| (n.to_string(), s.to_string()))
+            t.split_once(':')
+                .map(|(n, s)| (n.to_string(), s.to_string()))
         }) else {
             return false;
         };
@@ -2201,10 +4311,13 @@ fn subst_well_formed(ctx: &MetaCtx, hooks: &MetaHooks, m: &mut BuiltModule, d: D
         let Some(&val) = kids.get(1) else {
             return false;
         };
-        match down_term(ctx, hooks, val, m) {
+        match down_term(ctx, hooks, val, m, interner) {
             Some(value) => {
                 if !term_well_formed(m, value)
-                    || !m.engine.sorts().same_kind(m.engine.sort_of(value), var_sort)
+                    || !m
+                        .engine
+                        .sorts()
+                        .same_kind(m.engine.sort_of(value), var_sort)
                 {
                     return false;
                 }
@@ -2271,7 +4384,8 @@ fn merge_statement_traces(
         match stmt {
             Statement::Mb { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Mb(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                    if let Ok(StmtTrace::Mb(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    {
                         mbs.push(t);
                     }
                 } else {
@@ -2281,7 +4395,8 @@ fn merge_statement_traces(
             }
             Statement::Eq { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Eq(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                    if let Ok(StmtTrace::Eq(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    {
                         eqs.push(t);
                     }
                 } else {
@@ -2291,7 +4406,8 @@ fn merge_statement_traces(
             }
             Statement::Rule { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Rl(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i) {
+                    if let Ok(StmtTrace::Rl(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    {
                         rls.push(t);
                     }
                 } else {
@@ -2304,11 +4420,10 @@ fn merge_statement_traces(
     (mbs, eqs, rls)
 }
 
-/// One operator to up-translate: its canonical name + the (pre-joined) identity-element name + the surface
-/// declaration carrying its types and attributes.
+/// One operator to up-translate: canonical name, normalized identity DAG, and surface declaration.
 struct UpOp {
     name: String,
-    id_name: Option<String>,
+    identity: Option<DagId>,
     decl: OpDecl,
 }
 
@@ -2381,7 +4496,12 @@ fn up_imports(ctx: &mut MetaCtx, hooks: &MetaHooks, imports: &[Import]) -> Optio
         };
         elems.push(ctx.app(*hooks.ops.get(ctor)?, vec![name_qid]));
     }
-    Some(up_set(ctx, elems, hooks.ops["nilImportListSymbol"], hooks.ops["importListSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["nilImportListSymbol"],
+        hooks.ops["importListSymbol"],
+    ))
 }
 
 /// Up-translate a module expression to a meta `ModuleExpression`. A named module is its `Qid`; a structured
@@ -2389,7 +4509,9 @@ fn up_imports(ctx: &mut MetaCtx, hooks: &MetaHooks, imports: &[Import]) -> Optio
 /// structured `from`/`to`/import stays inert rather than emit a wrong shape.
 fn up_module_expr(ctx: &mut MetaCtx, hooks: &MetaHooks, e: &ModuleExpr) -> Option<DagId> {
     match e {
-        ModuleExpr::Named(name) => Some(ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.as_str().into()))),
+        ModuleExpr::Named(name) => {
+            Some(ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.as_str().into())))
+        }
         _ => None,
     }
 }
@@ -2399,8 +4521,16 @@ fn up_sorts_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, sorts: &[String]) -> DagId
     let qid = hooks.ops["qidSymbol"];
     let mut names: Vec<&str> = sorts.iter().map(|s| s.as_str()).collect();
     names.sort_unstable();
-    let elems: Vec<DagId> = names.iter().map(|n| ctx.make_na(qid, NaValue::Qid((*n).into()))).collect();
-    up_set(ctx, elems, hooks.ops["emptySortSetSymbol"], hooks.ops["sortSetSymbol"])
+    let elems: Vec<DagId> = names
+        .iter()
+        .map(|n| ctx.make_na(qid, NaValue::Qid((*n).into())))
+        .collect();
+    up_set(
+        ctx,
+        elems,
+        hooks.ops["emptySortSetSymbol"],
+        hooks.ops["sortSetSymbol"],
+    )
 }
 
 /// Up-translate the subsort chains to a `SubsortDeclSet` — one `subsort A < B .` per consecutive pair of a
@@ -2420,13 +4550,23 @@ fn up_subsorts_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, chains: &[Vec<Vec<Strin
             }
         }
     }
-    up_set(ctx, elems, hooks.ops["emptySubsortDeclSetSymbol"], hooks.ops["subsortDeclSetSymbol"])
+    up_set(
+        ctx,
+        elems,
+        hooks.ops["emptySubsortDeclSetSymbol"],
+        hooks.ops["subsortDeclSetSymbol"],
+    )
 }
 
 /// Up-translate operator declarations to an `OpDeclSet` (`__`-joined `op N : D -> R [A] .`, sorted by
 /// canonical name as Maude orders its symbol table). `None` if any op carries an attribute the up-map does
 /// not yet reconstruct (`special`/`poly` — the builtin-hook surface, the inverse of `down_attrs`' boundary).
-fn up_ops_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, ops: &[UpOp]) -> Option<DagId> {
+fn up_ops_dag(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    m: &BuiltModule,
+    ops: &[UpOp],
+) -> Option<DagId> {
     let mut sorted: Vec<&UpOp> = ops.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut elems = Vec::with_capacity(sorted.len());
@@ -2435,13 +4575,20 @@ fn up_ops_dag(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, ops: &[UpOp
         // the same-name non-`ditto` op. Maude's `upModule` emits the *expanded* attributes on every subsort
         // overload (`[assoc ctor id(…) prec(25)]`), not the bare `[ctor ditto]` the source carries.
         let attr_op = if op.decl.attrs.ditto {
-            ops.iter().find(|o| o.name == op.name && !o.decl.attrs.ditto).unwrap_or(op)
+            ops.iter()
+                .find(|o| o.name == op.name && !o.decl.attrs.ditto)
+                .unwrap_or(op)
         } else {
             op
         };
         elems.push(up_op_decl(ctx, hooks, m, op, attr_op)?);
     }
-    Some(up_set(ctx, elems, hooks.ops["emptyOpDeclSetSymbol"], hooks.ops["opDeclSetSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyOpDeclSetSymbol"],
+        hooks.ops["opDeclSetSymbol"],
+    ))
 }
 
 /// Up-translate one operator declaration `op N : D -> R [A] .` (`opDeclSymbol`): the name `Qid`, the
@@ -2457,13 +4604,26 @@ fn up_op_decl(
 ) -> Option<DagId> {
     let qid = hooks.ops["qidSymbol"];
     let name = ctx.make_na(qid, NaValue::Qid(meta_op_name(&op.name).into()));
-    let dom_elems: Vec<DagId> =
-        op.decl.domain.iter().map(|s| ctx.make_na(qid, NaValue::Qid(s.as_str().into()))).collect();
-    let domain = up_set(ctx, dom_elems, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"]);
+    let dom_elems: Vec<DagId> = op
+        .decl
+        .domain
+        .iter()
+        .map(|s| ctx.make_na(qid, NaValue::Qid(s.as_str().into())))
+        .collect();
+    let domain = up_set(
+        ctx,
+        dom_elems,
+        hooks.ops["nilQidListSymbol"],
+        hooks.ops["qidListSymbol"],
+    );
     // A partial op (`~>`) ranges over its kind; render the kind name (`[Range]`) the engine assigned it.
     let range_name = if op.decl.partial {
         match m.sorts.get(&op.decl.range) {
-            Some(&s) => m.engine.sorts().name(m.engine.sorts().error_sort(m.engine.sorts().kind_of(s))).to_string(),
+            Some(&s) => m
+                .engine
+                .sorts()
+                .name(m.engine.sorts().error_sort(m.engine.sorts().kind_of(s)))
+                .to_string(),
             None => op.decl.range.clone(),
         }
     } else {
@@ -2510,28 +4670,46 @@ fn up_attrs(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, op: &UpOp) ->
     }
     if let Some(format) = &a.format {
         let qid = hooks.ops["qidSymbol"];
-        let words: Vec<DagId> =
-            format.iter().map(|w| ctx.make_na(qid, NaValue::Qid(w.as_str().into()))).collect();
-        let list = up_set(ctx, words, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"]);
+        let words: Vec<DagId> = format
+            .iter()
+            .map(|w| ctx.make_na(qid, NaValue::Qid(w.as_str().into())))
+            .collect();
+        let list = up_set(
+            ctx,
+            words,
+            hooks.ops["nilQidListSymbol"],
+            hooks.ops["qidListSymbol"],
+        );
         elems.push(ctx.app(hooks.ops["formatSymbol"], vec![list]));
     }
-    if let Some(name) = &op.id_name {
-        // `id(c)` — the identity constant `'c.Sort` (resolved from the constant's range sort in `m`).
-        let sort = m.ops.get(&(name.clone(), 0)).map(|&s| sort_name_of(m, s)).unwrap_or_default();
-        let c = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(format!("{name}.{sort}").into()));
-        elems.push(ctx.app(hooks.ops["idSymbol"], vec![c]));
+    if let Some(identity) = op.identity {
+        let term = up_term(ctx, hooks, m, identity);
+        let hook = match a.id_side {
+            IdSide::Both => "idSymbol",
+            IdSide::Left => "leftIdSymbol",
+            IdSide::Right => "rightIdSymbol",
+        };
+        elems.push(ctx.app(hooks.ops[hook], vec![term]));
     }
     if let Some(strat) = &a.strat {
         let n = up_nat_list(ctx, hooks, strat)?;
         elems.push(ctx.app(hooks.ops["stratSymbol"], vec![n]));
     }
     if let Some(frozen) = &a.frozen {
-        let positions: Vec<u32> =
-            if frozen.is_empty() { (1..=op.decl.domain.len() as u32).collect() } else { frozen.clone() };
+        let positions: Vec<u32> = if frozen.is_empty() {
+            (1..=op.decl.domain.len() as u32).collect()
+        } else {
+            frozen.clone()
+        };
         let n = up_nat_list(ctx, hooks, &positions)?;
         elems.push(ctx.app(hooks.ops["frozenSymbol"], vec![n]));
     }
-    Some(up_set(ctx, elems, hooks.ops["emptyAttrSetSymbol"], hooks.ops["attrSetSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyAttrSetSymbol"],
+        hooks.ops["attrSetSymbol"],
+    ))
 }
 
 /// Up-translate a `gather (…)` pattern (`gatherSymbol` of a `QidList` of `'e`/`'E`/`'&`).
@@ -2548,7 +4726,12 @@ fn up_gather(ctx: &mut MetaCtx, hooks: &MetaHooks, gather: &[GatherElem]) -> Dag
             ctx.make_na(qid, NaValue::Qid(s.into()))
         })
         .collect();
-    let list = up_set(ctx, words, hooks.ops["nilQidListSymbol"], hooks.ops["qidListSymbol"]);
+    let list = up_set(
+        ctx,
+        words,
+        hooks.ops["nilQidListSymbol"],
+        hooks.ops["qidListSymbol"],
+    );
     ctx.app(hooks.ops["gatherSymbol"], vec![list])
 }
 
@@ -2576,7 +4759,10 @@ fn up_nat_big(ctx: &mut MetaCtx, count: &str) -> Option<DagId> {
 
 /// Up-translate a 1-based position list to a meta `NatList` (`__`-joined `Nat`s; a singleton stays a `Nat`).
 fn up_nat_list(ctx: &mut MetaCtx, hooks: &MetaHooks, positions: &[u32]) -> Option<DagId> {
-    let nats: Vec<DagId> = positions.iter().map(|&p| up_nat(ctx, p as u64)).collect::<Option<_>>()?;
+    let nats: Vec<DagId> = positions
+        .iter()
+        .map(|&p| up_nat(ctx, p as u64))
+        .collect::<Option<_>>()?;
     Some(match nats.len() {
         1 => nats.into_iter().next().unwrap(),
         _ => ctx.app(hooks.ops["natListSymbol"], nats),
@@ -2591,6 +4777,8 @@ fn stmt_attr_set(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     owise: bool,
+    variant: bool,
+    narrowing: bool,
     nonexec: bool,
     label: Option<&str>,
 ) -> DagId {
@@ -2601,11 +4789,22 @@ fn stmt_attr_set(
     if nonexec && let Some(&s) = hooks.ops.get("nonexecSymbol") {
         elems.push(ctx.app(s, vec![]));
     }
+    if variant && let Some(&s) = hooks.ops.get("variantAttrSymbol") {
+        elems.push(ctx.app(s, vec![]));
+    }
+    if narrowing && let Some(&s) = hooks.ops.get("narrowingSymbol") {
+        elems.push(ctx.app(s, vec![]));
+    }
     if let Some(l) = label {
         let lqid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(l.into()));
         elems.push(ctx.app(hooks.ops["labelSymbol"], vec![lqid]));
     }
-    up_set(ctx, elems, hooks.ops["emptyAttrSetSymbol"], hooks.ops["attrSetSymbol"])
+    up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyAttrSetSymbol"],
+        hooks.ops["attrSetSymbol"],
+    )
 }
 
 fn up_membs_dag(
@@ -2618,7 +4817,15 @@ fn up_membs_dag(
     for t in traces {
         let lhs = up_pattern(ctx, hooks, m, &t.lhs, &t.var_names);
         let sort = up_type(ctx, hooks, m, t.sort);
-        let attrs = stmt_attr_set(ctx, hooks, false, t.nonexec, t.label.as_deref());
+        let attrs = stmt_attr_set(
+            ctx,
+            hooks,
+            false,
+            false,
+            false,
+            t.nonexec,
+            t.label.as_deref(),
+        );
         let mb = if t.condition.is_empty() {
             ctx.app(hooks.ops["mbSymbol"], vec![lhs, sort, attrs])
         } else {
@@ -2627,7 +4834,12 @@ fn up_membs_dag(
         };
         elems.push(mb);
     }
-    Some(up_set(ctx, elems, hooks.ops["emptyMembAxSetSymbol"], hooks.ops["membAxSetSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyMembAxSetSymbol"],
+        hooks.ops["membAxSetSymbol"],
+    ))
 }
 
 /// Up-translate the equation traces to an `EquationSet` (`eq`/`ceq` joined by `__`), each carrying its
@@ -2642,7 +4854,15 @@ fn up_eqs_dag(
     for t in traces {
         let lhs = up_pattern(ctx, hooks, m, &t.lhs, &t.var_names);
         let rhs = up_pattern(ctx, hooks, m, &t.rhs, &t.var_names);
-        let attrs = stmt_attr_set(ctx, hooks, t.owise, t.nonexec, t.label.as_deref());
+        let attrs = stmt_attr_set(
+            ctx,
+            hooks,
+            t.owise,
+            t.variant,
+            false,
+            t.nonexec,
+            t.label.as_deref(),
+        );
         let eq = if t.condition.is_empty() {
             ctx.app(hooks.ops["eqSymbol"], vec![lhs, rhs, attrs])
         } else {
@@ -2651,7 +4871,12 @@ fn up_eqs_dag(
         };
         elems.push(eq);
     }
-    Some(up_set(ctx, elems, hooks.ops["emptyEquationSetSymbol"], hooks.ops["equationSetSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyEquationSetSymbol"],
+        hooks.ops["equationSetSymbol"],
+    ))
 }
 
 /// Up-translate the rule traces in `range` to a `RuleSet` (`rl`/`crl` joined by `__`); a labelled rule
@@ -2666,7 +4891,12 @@ fn up_rls_dag(
     for t in traces {
         elems.push(up_rule(ctx, hooks, m, t)?);
     }
-    Some(up_set(ctx, elems, hooks.ops["emptyRuleSetSymbol"], hooks.ops["ruleSetSymbol"]))
+    Some(up_set(
+        ctx,
+        elems,
+        hooks.ops["emptyRuleSetSymbol"],
+        hooks.ops["ruleSetSymbol"],
+    ))
 }
 
 /// Up-translate a condition (the inverse of [`down_condition`]): one fragment stays itself, several are
@@ -2678,7 +4908,10 @@ fn up_condition(
     frags: &[ConditionFragment],
     names: &[String],
 ) -> DagId {
-    let ups: Vec<DagId> = frags.iter().map(|f| up_condition_fragment(ctx, hooks, m, f, names)).collect();
+    let ups: Vec<DagId> = frags
+        .iter()
+        .map(|f| up_condition_fragment(ctx, hooks, m, f, names))
+        .collect();
     match ups.len() {
         1 => ups.into_iter().next().unwrap(),
         _ => ctx.app(hooks.ops["conjunctionSymbol"], ups),
@@ -2704,7 +4937,9 @@ fn up_condition_fragment(
             let s = up_type(ctx, hooks, m, *sort);
             ctx.app(hooks.ops["sortTestConditionSymbol"], vec![t, s])
         }
-        ConditionFragment::Matching { pattern, subject, .. } => {
+        ConditionFragment::Matching {
+            pattern, subject, ..
+        } => {
             let p = up_pattern(ctx, hooks, m, pattern, names);
             let s = up_pattern(ctx, hooks, m, subject, names);
             ctx.app(hooks.ops["matchConditionSymbol"], vec![p, s])
@@ -2725,6 +4960,7 @@ fn up_substitution(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     source: &BuiltModule,
+    interner: &Interner,
     names: &[String],
     bindings: &[DagId],
 ) -> DagId {
@@ -2732,9 +4968,11 @@ fn up_substitution(
     let assign = hooks.ops["assignmentSymbol"];
     let mut assigns = Vec::new();
     for (k, name) in names.iter().enumerate() {
-        let Some(&val) = bindings.get(k) else { continue };
+        let Some(&val) = bindings.get(k) else {
+            continue;
+        };
         let var_qid = ctx.make_na(qid, NaValue::Qid(name.as_str().into()));
-        let up_val = up_term(ctx, hooks, source, val);
+        let up_val = up_parsed_term(ctx, hooks, source, interner, val);
         assigns.push(ctx.app(assign, vec![var_qid, up_val]));
     }
     match assigns.len() {
@@ -2746,7 +4984,9 @@ fn up_substitution(
 
 /// The `VarIndex`'s variable names as the `&[String]` [`up_substitution`] expects.
 fn var_names(vars: &VarIndex) -> Vec<String> {
-    (0..vars.count()).map(|k| vars.name(k).to_string()).collect()
+    (0..vars.count())
+        .map(|k| vars.name(k).to_string())
+        .collect()
 }
 
 /// Down-translate a meta `UnificationProblem` (`_=?_` unificand pairs, optionally joined by the `_/\_`
@@ -2755,6 +4995,87 @@ fn var_names(vars: &VarIndex) -> Vec<String> {
 /// slots `0..n_lhs`, rhs-side at `n_lhs..`). A non-disjoint problem shares variables by name across the
 /// two sides; a disjoint one gives the rhs its own slots (renamed apart) — its Terms' variable indices
 /// shifted up by `n_lhs`.
+fn meta_unification_roots(ctx: &MetaCtx, hooks: &MetaHooks, problem: DagId) -> Option<Vec<DagId>> {
+    let conj = hooks.ops.get("unificationConjunctionSymbol").copied();
+    let pair_sym = hooks.ops.get("unificandPairSymbol").copied();
+    let pairs = if Some(ctx.top(problem)) == conj {
+        ctx.children(problem)
+    } else {
+        vec![problem]
+    };
+    let mut roots = Vec::with_capacity(pairs.len() * 2);
+    for pair in pairs {
+        if Some(ctx.top(pair)) != pair_sym {
+            return None;
+        }
+        let kids = ctx.children(pair);
+        roots.push(*kids.first()?);
+        roots.push(*kids.get(1)?);
+    }
+    Some(roots)
+}
+
+fn render_cached_meta_unifier(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    cache: &MetaUnifyCache,
+    interner: &Interner,
+    sol_nr: usize,
+) -> Option<DagId> {
+    let Some(bindings) = cache.unifiers.get(sol_nr) else {
+        if !cache.exhausted {
+            return None;
+        }
+        let hook = match (cache.key.disjoint, cache.incomplete) {
+            (true, false) => "noUnifierTripleSymbol",
+            (true, true) => "noUnifierIncompleteTripleSymbol",
+            (false, false) => "noUnifierPairSymbol",
+            (false, true) => "noUnifierIncompletePairSymbol",
+        };
+        return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+    };
+
+    let mut bindings_original = bindings.clone();
+    for (new_slot, &old_slot) in cache.original_order.iter().enumerate() {
+        bindings_original[old_slot] = bindings[new_slot];
+    }
+    let third = ctx.make_na(
+        hooks.ops["qidSymbol"],
+        NaValue::Qid(cache.key.family_root.into()),
+    );
+    if cache.key.disjoint {
+        let (lhs_b, rhs_b) = bindings_original.split_at(cache.n_lhs);
+        let lhs_names: Vec<&str> = cache.specs_raw[..cache.n_lhs]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let rhs_names: Vec<&str> = cache.specs_raw[cache.n_lhs..]
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let lhs =
+            up_unifier_substitution(ctx, hooks, &cache.loaded.built, interner, &lhs_names, lhs_b);
+        let rhs =
+            up_unifier_substitution(ctx, hooks, &cache.loaded.built, interner, &rhs_names, rhs_b);
+        Some(ctx.app(hooks.ops["unificationTripleSymbol"], vec![lhs, rhs, third]))
+    } else {
+        let names: Vec<&str> = cache
+            .specs_raw
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let subst = up_unifier_substitution(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            interner,
+            &names,
+            &bindings_original,
+        );
+        Some(ctx.app(hooks.ops["matchPairSymbol"], vec![subst, third]))
+    }
+}
+
 fn down_unification_problem(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
@@ -2765,8 +5086,11 @@ fn down_unification_problem(
 ) -> Option<(Vec<(Term, Term)>, usize)> {
     let conj = hooks.ops.get("unificationConjunctionSymbol").copied();
     let pair_sym = hooks.ops.get("unificandPairSymbol").copied();
-    let pair_dags: Vec<DagId> =
-        if Some(ctx.top(problem)) == conj { ctx.children(problem) } else { vec![problem] };
+    let pair_dags: Vec<DagId> = if Some(ctx.top(problem)) == conj {
+        ctx.children(problem)
+    } else {
+        vec![problem]
+    };
 
     let mut vars_l = VarIndex::new();
     let mut vars_r = VarIndex::new(); // disjoint only
@@ -2791,7 +5115,11 @@ fn down_unification_problem(
         for k in 0..vars_r.count() {
             specs.push((vars_r.name(k).to_string(), vars_r.sort(k)));
         }
-        lhs_terms.into_iter().zip(rhs_terms).map(|(l, r)| (l, shift_term_vars(&r, n_lhs as u32))).collect()
+        lhs_terms
+            .into_iter()
+            .zip(rhs_terms)
+            .map(|(l, r)| (l, shift_term_vars(&r, n_lhs as u32)))
+            .collect()
     } else {
         lhs_terms.into_iter().zip(rhs_terms).collect()
     };
@@ -2803,9 +5131,16 @@ fn down_unification_problem(
 fn shift_term_vars(t: &Term, offset: u32) -> Term {
     match t {
         Term::Var(v) => Term::var(v.index + offset, v.sort),
-        Term::Na { symbol, value } => Term::Na { symbol: *symbol, value: value.clone() },
-        Term::Op { symbol, args } => {
-            Term::op(*symbol, args.iter().map(|a| shift_term_vars(a, offset)).collect())
+        Term::Na { symbol, value } => Term::Na {
+            symbol: *symbol,
+            value: value.clone(),
+        },
+        Term::Op { symbol, args } => Term::op(
+            *symbol,
+            args.iter().map(|a| shift_term_vars(a, offset)).collect(),
+        ),
+        Term::Iter { symbol, count, arg } => {
+            Term::iter(*symbol, count.clone(), shift_term_vars(arg, offset))
         }
     }
 }
@@ -2825,7 +5160,9 @@ fn up_unifier_substitution(
     let assign = hooks.ops["assignmentSymbol"];
     let mut assigns = Vec::new();
     for (k, name) in names.iter().enumerate() {
-        let Some(&val) = bindings.get(k) else { continue };
+        let Some(&val) = bindings.get(k) else {
+            continue;
+        };
         let var_qid = ctx.make_na(qid, NaValue::Qid((*name).into()));
         let up_val = up_meta_term_sym(ctx, hooks, source, interner, val);
         assigns.push(ctx.app(assign, vec![var_qid, up_val]));
@@ -2849,7 +5186,9 @@ fn up_meta_term_sym(
     let qid = hooks.ops["qidSymbol"];
     match source.engine.node(t).repr() {
         NodeRepr::Var { name } => {
-            let bare = interner.resolve(Sym::from_raw(name)).to_string();
+            let bare = interner
+                .resolve(Sym::from_raw(name & !0x4000_0000))
+                .to_string();
             let sort = source.engine.sorts().name(source.engine.sort_of(t));
             ctx.make_na(qid, NaValue::Qid(format!("{bare}:{sort}").into()))
         }
@@ -2861,8 +5200,10 @@ fn up_meta_term_sym(
                 let sort = source.engine.sorts().name(source.engine.sort_of(t));
                 ctx.make_na(qid, NaValue::Qid(format!("{opname}.{sort}").into()))
             } else {
-                let up_args: Vec<DagId> =
-                    kids.iter().map(|&c| up_meta_term_sym(ctx, hooks, source, interner, c)).collect();
+                let up_args: Vec<DagId> = kids
+                    .iter()
+                    .map(|&c| up_meta_term_sym(ctx, hooks, source, interner, c))
+                    .collect();
                 let arglist = up_arglist(ctx, hooks, up_args);
                 let opqid = ctx.make_na(qid, NaValue::Qid(opname.into()));
                 ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
@@ -2870,7 +5211,11 @@ fn up_meta_term_sym(
         }
         NodeRepr::Iter { count, arg } => {
             let base = meta_op_name(source.engine.symbol(source.engine.node(t).symbol()).name());
-            let head = if count == "1" { base } else { format!("{base}^{count}") };
+            let head = if count == "1" {
+                base
+            } else {
+                format!("{base}^{count}")
+            };
             let up_arg = up_meta_term_sym(ctx, hooks, source, interner, arg);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_arg])
@@ -2889,6 +5234,7 @@ fn up_context(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     source: &BuiltModule,
+    interner: &Interner,
     node: DagId,
     path: &[usize],
 ) -> DagId {
@@ -2906,7 +5252,7 @@ fn up_context(
             .iter()
             .enumerate()
             .filter(|&(i, _)| i != head)
-            .map(|(_, &c)| up_term(ctx, hooks, source, c))
+            .map(|(_, &c)| up_parsed_term(ctx, hooks, source, interner, c))
             .collect();
         args.push(ctx.app(hooks.ops["holeSymbol"], vec![]));
         args
@@ -2918,9 +5264,9 @@ fn up_context(
             .enumerate()
             .map(|(i, &c)| {
                 if i == head {
-                    up_context(ctx, hooks, source, c, rest)
+                    up_context(ctx, hooks, source, interner, c, rest)
                 } else {
-                    up_term(ctx, hooks, source, c)
+                    up_parsed_term(ctx, hooks, source, interner, c)
                 }
             })
             .collect()
@@ -2945,7 +5291,9 @@ fn up_pattern(
     let qid = hooks.ops["qidSymbol"];
     match term {
         Term::Var(v) => {
-            let base = names.get(v.index as usize).map_or("V", |s| s.split(':').next().unwrap_or(s));
+            let base = names
+                .get(v.index as usize)
+                .map_or("V", |s| s.split(':').next().unwrap_or(s));
             let sort = source.engine.sorts().name(v.sort);
             ctx.make_na(qid, NaValue::Qid(format!("{base}:{sort}").into()))
         }
@@ -2955,21 +5303,41 @@ fn up_pattern(
                 NaValue::Qid(q) => format!("'{q}"),
                 NaValue::Float(b) => format!("{}", f64::from_bits(*b)),
             };
-            ctx.make_na(qid, NaValue::Qid(format!("{rendered}.{}", sort_name_of(source, *symbol)).into()))
+            ctx.make_na(
+                qid,
+                NaValue::Qid(format!("{rendered}.{}", sort_name_of(source, *symbol)).into()),
+            )
+        }
+        Term::Iter { symbol, count, arg } => {
+            let base = meta_op_name(source.engine.symbol(*symbol).name());
+            let decimal = count.to_decimal();
+            let head = if decimal == "1" {
+                base
+            } else {
+                format!("{base}^{decimal}")
+            };
+            let up_inner = up_pattern(ctx, hooks, source, arg, names);
+            let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
+            ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_inner])
         }
         Term::Op { symbol, args } if args.is_empty() => {
             let name = meta_op_name(source.engine.symbol(*symbol).name());
-            ctx.make_na(qid, NaValue::Qid(format!("{name}.{}", sort_name_of(source, *symbol)).into()))
+            ctx.make_na(
+                qid,
+                NaValue::Qid(format!("{name}.{}", sort_name_of(source, *symbol)).into()),
+            )
         }
         // Iter-chain collapse: a successor chain `s(s(…x))` (nested unary `iter` ops, as a rule side stores
         // it) prints as `'s_^n[up(x)]` — the compact `S`-symbol form, matching how `up_term` ups a DAG's
         // iter node and what the reference emits.
-        Term::Op { symbol, args }
-            if Some(*symbol) == source.nat_succ && args.len() == 1 =>
-        {
+        Term::Op { symbol, args } if Some(*symbol) == source.nat_succ && args.len() == 1 => {
             let mut count = 1u64;
             let mut inner = &args[0];
-            while let Term::Op { symbol: s2, args: a2 } = inner {
+            while let Term::Op {
+                symbol: s2,
+                args: a2,
+            } = inner
+            {
                 if Some(*s2) == source.nat_succ && a2.len() == 1 {
                     count += 1;
                     inner = &a2[0];
@@ -2978,7 +5346,11 @@ fn up_pattern(
                 }
             }
             let base = meta_op_name(source.engine.symbol(*symbol).name());
-            let head = if count == 1 { base } else { format!("{base}^{count}") };
+            let head = if count == 1 {
+                base
+            } else {
+                format!("{base}^{count}")
+            };
             let up_inner = up_pattern(ctx, hooks, source, inner, names);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_inner])
@@ -2998,8 +5370,10 @@ fn up_pattern(
             } else {
                 flat.extend(args.iter());
             }
-            let up_args: Vec<DagId> =
-                flat.iter().map(|a| up_pattern(ctx, hooks, source, a, names)).collect();
+            let up_args: Vec<DagId> = flat
+                .iter()
+                .map(|a| up_pattern(ctx, hooks, source, a, names))
+                .collect();
             let arglist = up_arglist(ctx, hooks, up_args);
             let opqid = ctx.make_na(qid, NaValue::Qid(name.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, arglist])
@@ -3012,24 +5386,43 @@ fn up_pattern(
 fn flatten_assoc_args<'t>(symbol: SymbolId, args: &'t [Term], out: &mut Vec<&'t Term>) {
     for a in args {
         match a {
-            Term::Op { symbol: s2, args: a2 } if *s2 == symbol => flatten_assoc_args(symbol, a2, out),
+            Term::Op {
+                symbol: s2,
+                args: a2,
+            } if *s2 == symbol => flatten_assoc_args(symbol, a2, out),
             _ => out.push(a),
         }
     }
 }
 
-
 /// The declared range-sort name of operator `symbol` (its `SymbolSyntax`), for a constant's `'c.Sort`.
 fn sort_name_of(source: &BuiltModule, symbol: SymbolId) -> String {
-    source.syntax.get(&symbol).map(|s| source.engine.sorts().name(s.range).to_string()).unwrap_or_default()
+    source
+        .syntax
+        .get(&symbol)
+        .map(|s| source.engine.sorts().name(s.range).to_string())
+        .unwrap_or_default()
 }
 
 /// Up-translate a rule (from its trace) to a meta `Rule` — `rl lhs => rhs [label] .`, or `crl lhs => rhs if
 /// cond [label] .` for a conditional rule (the condition up-mapped by [`up_condition`]).
-fn up_rule(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, trace: &RlTrace) -> Option<DagId> {
+fn up_rule(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    trace: &RlTrace,
+) -> Option<DagId> {
     let up_lhs = up_pattern(ctx, hooks, source, &trace.lhs, &trace.var_names);
     let up_rhs = up_pattern(ctx, hooks, source, &trace.rhs, &trace.var_names);
-    let attrs = stmt_attr_set(ctx, hooks, false, trace.nonexec, trace.label.as_deref());
+    let attrs = stmt_attr_set(
+        ctx,
+        hooks,
+        false,
+        false,
+        trace.narrowing,
+        trace.nonexec,
+        trace.label.as_deref(),
+    );
     Some(if trace.condition.is_empty() {
         ctx.app(hooks.ops["rlSymbol"], vec![up_lhs, up_rhs, attrs])
     } else {
@@ -3067,7 +5460,11 @@ fn collect_positions(
 fn subterm_at(engine: &Engine, root: DagId, path: &[usize]) -> DagId {
     let mut node = root;
     for &i in path {
-        node = engine.node(node).children().nth(i).expect("valid position path");
+        node = engine
+            .node(node)
+            .children()
+            .nth(i)
+            .expect("valid position path");
     }
     node
 }
@@ -3149,7 +5546,12 @@ fn nth_match(
     while sols.advance() {
         if count == n {
             return Some(
-                (0..nr).map(|k| sols.binding(k).expect("the matcher binds every pattern variable")).collect(),
+                (0..nr)
+                    .map(|k| {
+                        sols.binding(k)
+                            .expect("the matcher binds every pattern variable")
+                    })
+                    .collect(),
             );
         }
         count += 1;
@@ -3173,8 +5575,9 @@ fn nth_xmatch(
         let mut count = 0;
         while sols.advance() {
             if count == n {
-                let bindings: Vec<DagId> =
-                    (0..nr).map(|k| sols.binding(k).expect("the matcher binds every variable")).collect();
+                let bindings: Vec<DagId> = (0..nr)
+                    .map(|k| sols.binding(k).expect("the matcher binds every variable"))
+                    .collect();
                 found = Some((bindings, sols.matched_portion()));
                 break;
             }
@@ -3182,4 +5585,131 @@ fn nth_xmatch(
         }
     }
     found.map(|(b, portion)| (b, engine.deep_equal(portion, subj)))
+}
+
+fn variant_family_root(family: tnk_core::fresh::VariableFamily) -> &'static str {
+    match family {
+        tnk_core::fresh::VariableFamily::Unify => "#",
+        tnk_core::fresh::VariableFamily::Variant => "%",
+        tnk_core::fresh::VariableFamily::Narrow => "@",
+    }
+}
+
+fn down_variant_options(ctx: &MetaCtx, options: DagId) -> (bool, bool) {
+    let mut filtered = false;
+    let mut delayed = false;
+    let mut work = vec![options];
+    while let Some(option) = work.pop() {
+        match ctx.name(ctx.top(option)) {
+            "filter" => filtered = true,
+            "delay" => delayed = true,
+            _ => work.extend(ctx.children(option)),
+        }
+    }
+    (filtered, delayed)
+}
+
+/// Flatten a META-LEVEL `TermList`. Its associative constructor is already flattened in the DAG;
+/// a bare `Term` is the singleton-list representation used by Maude.
+fn down_term_list_roots(ctx: &MetaCtx, hooks: &MetaHooks, list: DagId) -> Option<Vec<DagId>> {
+    let top = ctx.top(list);
+    let children = ctx.children(list);
+    if (Some(top) == hooks.ops.get("emptyTermListSymbol").copied()
+        || (ctx.name(top) == "empty" && children.is_empty()))
+        && !matches!(ctx.repr(list), NodeRepr::Qid(_))
+    {
+        Some(Vec::new())
+    } else if Some(top) == hooks.ops.get("termListSymbol").copied()
+        || Some(top) == hooks.ops.get("metaArgSymbol").copied()
+        || ctx.name(top) == "_,_"
+    {
+        Some(children)
+    } else {
+        Some(vec![list])
+    }
+}
+
+fn up_nat_exact(ctx: &mut MetaCtx, count: u64) -> Option<DagId> {
+    let succ = ctx.resolve_iter("s_")?;
+    let zero = ctx.iter_zero(succ)?;
+    if count == 0 {
+        Some(zero)
+    } else {
+        Some(ctx.make_iter(succ, count, zero))
+    }
+}
+
+fn up_nat_big_exact(ctx: &mut MetaCtx, count: &str) -> Option<DagId> {
+    let succ = ctx.resolve_iter("s_")?;
+    let zero = ctx.iter_zero(succ)?;
+    if count == "0" {
+        Some(zero)
+    } else {
+        ctx.make_iter_decimal(succ, count, zero)
+    }
+}
+
+/// Legacy variant results carry the greatest fresh-variable index rather than a family Qid.
+fn legacy_variant_next_index(
+    ctx: &mut MetaCtx,
+    engine: &Engine,
+    interner: &Interner,
+    variant: &tnk_core::variant::VariantResult,
+    base: &str,
+) -> Option<DagId> {
+    let mut greatest = base.trim_start_matches('0').to_string();
+    if greatest.is_empty() {
+        greatest.push('0');
+    }
+    let mut work = Vec::with_capacity(variant.substitution.len() + 1);
+    work.push(variant.term);
+    work.extend(variant.substitution.iter().copied());
+    while let Some(dag) = work.pop() {
+        let node = engine.node(dag);
+        if let NodeRepr::Var { name } = node.repr() {
+            let text = interner.resolve_index(name);
+            if matches!(text.as_bytes().first(), Some(b'#' | b'%' | b'@')) {
+                let digits = text[1..].trim_start_matches('0');
+                let digits = if digits.is_empty() { "0" } else { digits };
+                if digits.len() > greatest.len()
+                    || (digits.len() == greatest.len() && digits > greatest.as_str())
+                {
+                    greatest = digits.to_string();
+                }
+            }
+        }
+        work.extend(node.children());
+    }
+    up_nat_big_exact(ctx, &greatest)
+}
+
+fn legacy_unifier_next_index(
+    ctx: &mut MetaCtx,
+    engine: &Engine,
+    interner: &Interner,
+    bindings: &[DagId],
+    base: &str,
+) -> Option<DagId> {
+    let mut greatest = base.trim_start_matches('0').to_string();
+    if greatest.is_empty() {
+        greatest.push('0');
+    }
+    let mut work = bindings.to_vec();
+    while let Some(dag) = work.pop() {
+        let node = engine.node(dag);
+        if let NodeRepr::Var { name } = node.repr() {
+            let text = interner.resolve_index(name);
+            if matches!(text.as_bytes().first(), Some(b'#' | b'%' | b'@')) {
+                let digits = text[1..].trim_start_matches('0');
+                let digits = if digits.is_empty() { "0" } else { digits };
+                if digits.len() > greatest.len()
+                    || (digits.len() == greatest.len() && digits > greatest.as_str())
+                {
+                    greatest = digits.to_string();
+                }
+            }
+        }
+        work.extend(node.children());
+    }
+    up_nat_big_exact(ctx, &greatest)
 }

@@ -102,24 +102,23 @@ fd→manager map + timer heap); `erewrite` interleaves rewriting quanta with `re
 via `signal-hook`→`AtomicBool` at safe points; managers implement an `ExternalObject` trait; no `tokio`.
 **Revisit:** when embedding is taken up (design the Model-B API then) — see `objects-io-plan.md` §4-C…E.
 
-## D6 — BDD: `biodivine-lib-bdd` behind a facade, feature-gated
-**Decision.** Use pure-Rust **`biodivine-lib-bdd`** behind a `bdd` facade trait (var/and/or/not/restrict/
-exists-forall/compose/AllSat), under a `symbolic` feature. Used only by order-sorted unification (`SortBdds`),
-ACU Diophantine selection, and LTL→Büchi labels — all Phase 3. BuDDy-FFI kept as a per-op fallback.
+## D6 — BDD: `biodivine-lib-bdd`, pure Rust and engine-local
+**Decision.** Use pure-Rust **`biodivine-lib-bdd`** for order-sorted unification (`SortBdds`/AllSat).
+The backend is a normal `tnk-core` dependency rather than a feature: S1's `unify` contract requires it in
+every build. Backend-specific operations are contained in `sort_bdds.rs`; BuDDy FFI remains only a recorded
+fallback.
 
-**Why.** BDDs don't touch core rewriting (deferrable); pure Rust keeps the build clean; manager-less BDDs
-avoid BuDDy's global-state clash with the multi-engine model (D1).
-**Impact.** Facade isolates the choice across three consumers. **Revisit:** **Phase 3** — prototype the
-`SortBdds` sort-function + AllSat path first to confirm perf.
+**Why.** Pure Rust keeps builds portable and avoids BuDDy's global-state clash with the multi-engine model
+(D1). Per-problem `BddVariableSet` values preserve engine isolation.
 
 **Resolution (2026-07-05, S0 gate — binding).** Spike ran (`spikes/bdd-spike/`, report
 `docs/migration/reports/S0-bdd-spike.md`): full `SortBdds` + sort functions + maximality + AllSat slice on
 `biodivine-lib-bdd` 0.5.27, validated against pointwise semantics and brute-force maximal sets. **GO.**
 Per-problem sort-solving ~100–350µs at realistic scale (656µs at a 128-sort stress case); AllSat ~2–5ns per
-solution; enumeration-order fidelity by ROBDD canonicity + a verbatim port of the reference walk. Facade
-deltas recorded in the report §6: op list gains fused apply-quantify, order-preserving block shift (the one
-`unsafe`, precondition-documented), and substitute (the veccompose seam; native veccompose is the recorded
-escape hatch if S1 fixtures surface large bound terms). BuDDy-FFI fallback stays recorded but unmotivated.
+solution; enumeration-order fidelity by ROBDD canonicity + a verbatim port of the reference walk. The
+production implementation uses fused apply-quantify, order-preserving block shift (one
+precondition-documented `unsafe`), and substitute, and is wired through `unify/problem.rs`. The 27/27 S1
+gate resolved the fallback question: BuDDy FFI is unmotivated.
 
 ## D7 — SMT: `z3` crate default, behind a trait
 **Decision.** Default to the **`z3` crate** behind `trait SmtEngine` (assert/check/push/pop/fresh-var),

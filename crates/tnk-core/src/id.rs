@@ -51,7 +51,10 @@ impl<T> Id<T> {
         Self {
             raw,
             #[cfg(debug_assertions)]
-            meta: IdMeta { generation: 0, arena: 0 },
+            meta: IdMeta {
+                generation: 0,
+                arena: 0,
+            },
             _t: PhantomData,
         }
     }

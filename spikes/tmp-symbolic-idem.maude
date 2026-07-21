@@ -1,0 +1,15 @@
+set show timing off .
+fmod EXCLUSIVE-OR-SYMBOLIC is
+  sorts Elem ElemXor .
+  subsort Elem < ElemXor .
+  ops a b c : -> Elem .
+  op mt : -> ElemXor .
+  op _*_ : ElemXor ElemXor -> ElemXor [assoc comm] .
+  vars X Y Z : [ElemXor] .
+  eq [idem] : X * X = mt [variant] .
+  eq [idem-Coh] : X * X * Z = Z [variant] .
+  eq [id] : X * mt = X [variant] .
+  op f1 : [ElemXor] -> [ElemXor] .
+endfm
+reduce f1(X) * f1(X) .
+reduce f1(X) * f1(X) * Y .

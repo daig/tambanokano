@@ -48,9 +48,11 @@ fn expr_base_name(e: &ModuleExpr) -> Result<&str, String> {
     match e {
         ModuleExpr::Named(n) => Ok(n),
         ModuleExpr::Instantiation(base, _) => expr_base_name(base),
-        _ => Err("a view's `from`/`to` must be a named module/theory or an instantiation \
+        _ => Err(
+            "a view's `from`/`to` must be a named module/theory or an instantiation \
                   (sums/renamings are a later increment)"
-            .into()),
+                .into(),
+        ),
     }
 }
 
@@ -66,14 +68,24 @@ pub fn validate_view(
     let from_name = expr_base_name(&v.from)?;
     let to_name = expr_base_name(&v.to)?;
 
-    let from_pm = db
-        .get(from_name)
-        .ok_or_else(|| format!("view `{}`: source theory `{from_name}` is not defined", v.name))?;
+    let from_pm = db.get(from_name).ok_or_else(|| {
+        format!(
+            "view `{}`: source theory `{from_name}` is not defined",
+            v.name
+        )
+    })?;
     if !from_pm.is_theory {
-        return Err(format!("view `{}`: source `{from_name}` is not a theory", v.name));
+        return Err(format!(
+            "view `{}`: source `{from_name}` is not a theory",
+            v.name
+        ));
     }
-    db.get(to_name)
-        .ok_or_else(|| format!("view `{}`: target module `{to_name}` is not defined", v.name))?;
+    db.get(to_name).ok_or_else(|| {
+        format!(
+            "view `{}`: target module `{to_name}` is not defined",
+            v.name
+        )
+    })?;
 
     // Flatten the source theory / target module with the REAL view table: a target may itself be
     // built from instantiations (`INT-VECTOR = VECTOR{Int0} * (…)`, stock linear.maude), so an
@@ -85,7 +97,10 @@ pub fn validate_view(
     let mut mapped: HashSet<&str> = HashSet::new();
     for (a, _b) in &v.sort_maps {
         if !from_sorts.contains(a.as_str()) {
-            return Err(format!("view `{}`: sort `{a}` is not a sort of `{from_name}`", v.name));
+            return Err(format!(
+                "view `{}`: sort `{a}` is not a sort of `{from_name}`",
+                v.name
+            ));
         }
         mapped.insert(a.as_str());
     }
@@ -156,7 +171,10 @@ mod tests {
              view Bad from TRIV to NUM is sort Elt to NoSuch . endv\n",
         );
         let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
-        assert!(err.contains("failed to find sort NoSuch in NUM"), "got: {err}");
+        assert!(
+            err.contains("failed to find sort NoSuch in NUM"),
+            "got: {err}"
+        );
     }
 
     /// A view whose source is not a theory is rejected.

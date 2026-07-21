@@ -20,13 +20,124 @@ use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
 use crate::sort::{KindId, SortId, Sorts};
 use crate::symbol::{
-    Axioms, IdentitySide, OoFlags, OpDeclaration, SpecialOp, StdStream, Symbol, SymbolClass,
-    SymbolId, Theory,
+    Axioms, Identity, IdentityId, IdentitySide, OoFlags, OpDeclaration, SpecialOp, StdStream,
+    Symbol, SymbolClass, SymbolId, Theory,
 };
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, Subproblem};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Conservative static register pressure for constructing `term` into a substitution slot.
+///
+/// Maude's `computeIndexRemapping` colors temporary RHS construction indices by overlapping
+/// lifetimes. The kernel does not retain its frontend builder graph, so this computes the analogous
+/// tree pressure: non-variable children are built largest-first, their results stay live until the
+/// parent is built, and the parent can reuse one child's slot. Ignoring LHS-term reuse can only
+/// overestimate the module minimum.
+fn term_construction_slots(term: &Term) -> usize {
+    let children: Vec<&Term> = match term {
+        Term::Var(_) => return 0,
+        Term::Na { .. } => return 1,
+        Term::Iter { arg, .. } => vec![arg],
+        Term::Op { args, .. } => args.iter().collect(),
+    };
+    let mut pressures: Vec<usize> = children
+        .into_iter()
+        .map(term_construction_slots)
+        .filter(|&p| p != 0)
+        .collect();
+    pressures.sort_unstable_by(|a, b| b.cmp(a));
+    let mut peak = 0;
+    for (live, pressure) in pressures.into_iter().enumerate() {
+        peak = peak.max(live + pressure);
+    }
+    peak.max(1)
+}
+
+/// Construction pressure of one condition fragment. Both sides of an equality must coexist;
+/// matching/rewrite patterns are match automata rather than constructed terms.
+fn fragment_construction_slots(fragment: &ConditionFragment) -> usize {
+    match fragment {
+        ConditionFragment::Equality { lhs, rhs } => {
+            let lhs = term_construction_slots(lhs);
+            let rhs = term_construction_slots(rhs);
+            lhs.max((lhs != 0) as usize + rhs)
+        }
+        ConditionFragment::SortTest { term, .. } => term_construction_slots(term),
+        ConditionFragment::Matching { subject, .. } => term_construction_slots(subject),
+        ConditionFragment::Rewrite { lhs, .. } => term_construction_slots(lhs),
+    }
+}
+
+fn term_variable_indices(term: &Term) -> HashSet<u32> {
+    let mut variables = HashSet::new();
+    let mut work = vec![term];
+    while let Some(term) = work.pop() {
+        match term {
+            Term::Var(variable) => {
+                variables.insert(variable.index);
+            }
+            Term::Op { args, .. } => work.extend(args),
+            Term::Iter { arg, .. } => work.push(arg),
+            Term::Na { .. } => {}
+        }
+    }
+    variables
+}
+
+/// Structural equation-pattern matching for static terms. Pattern variables are wildcards, with
+/// repeated occurrences required to denote the same subject subtree.
+fn term_matches_pattern(pattern: &Term, subject: &Term) -> bool {
+    fn matches(pattern: &Term, subject: &Term, bindings: &mut HashMap<u32, Term>) -> bool {
+        match (pattern, subject) {
+            (Term::Var(variable), subject) => match bindings.get(&variable.index) {
+                Some(bound) => bound == subject,
+                None => {
+                    bindings.insert(variable.index, subject.clone());
+                    true
+                }
+            },
+            (
+                Term::Op {
+                    symbol: pattern_symbol,
+                    args: pattern_args,
+                },
+                Term::Op {
+                    symbol: subject_symbol,
+                    args: subject_args,
+                },
+            ) => {
+                pattern_symbol == subject_symbol
+                    && pattern_args.len() == subject_args.len()
+                    && pattern_args
+                        .iter()
+                        .zip(subject_args)
+                        .all(|(pattern, subject)| matches(pattern, subject, bindings))
+            }
+            (
+                Term::Iter {
+                    symbol: pattern_symbol,
+                    count: pattern_count,
+                    arg: pattern_arg,
+                },
+                Term::Iter {
+                    symbol: subject_symbol,
+                    count: subject_count,
+                    arg: subject_arg,
+                },
+            ) => {
+                pattern_symbol == subject_symbol
+                    && pattern_count == subject_count
+                    && matches(pattern_arg, subject_arg, bindings)
+            }
+            (Term::Na { .. }, Term::Na { .. }) => pattern == subject,
+            _ => false,
+        }
+    }
+
+    matches(pattern, subject, &mut HashMap::new())
+}
 
 /// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
 /// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
@@ -112,12 +223,26 @@ struct CompiledRule {
 /// match attempt so backtracking re-binds cleanly.
 #[derive(Clone)]
 pub(crate) enum CompiledFragment {
-    Equality { lhs: Term, rhs: Term },
-    SortTest { term: Term, sort: SortId },
-    Matching { pattern: LhsAutomaton, subject: Term, fresh_vars: Vec<u32> },
+    Equality {
+        lhs: Term,
+        rhs: Term,
+    },
+    SortTest {
+        term: Term,
+        sort: SortId,
+    },
+    Matching {
+        pattern: LhsAutomaton,
+        subject: Term,
+        fresh_vars: Vec<u32>,
+    },
     /// `lhs => pattern` — a rewrite condition (rule-only, Pillar A-v): a nested `=>*` reachability search
     /// from `lhs`'s instance, matching `pattern` against each reachable state.
-    Rewrite { lhs: Term, pattern: LhsAutomaton, fresh_vars: Vec<u32> },
+    Rewrite {
+        lhs: Term,
+        pattern: LhsAutomaton,
+        fresh_vars: Vec<u32>,
+    },
 }
 
 /// Which statement a condition belongs to — gates the `=>` (rewrite) fragment, which is legal **only** in
@@ -197,12 +322,36 @@ struct ReduceFrame {
     cursor: usize,
 }
 
+/// One symbolic alien that may need a protected abstraction slot while matching a statement LHS.
+struct LayoutAlien {
+    parent: SymbolId,
+    term: Term,
+}
+
+/// An equation-derived collapse shape. `target = None` means the pattern can collapse to any term;
+/// otherwise it can collapse to a term rooted by that symbol.
+struct CollapsePattern {
+    pattern: Term,
+    target: Option<SymbolId>,
+}
+
+/// Static ingredients needed to revise a statement's substitution lower bound when later equations
+/// reveal additional collapse shapes.
+struct SubstitutionLayoutEstimate {
+    /// Real variables plus colored RHS/condition construction slots.
+    base: usize,
+    abstraction_candidates: Vec<LayoutAlien>,
+}
+
 /// The immutable-during-reduction half of the engine: the sort poset, the symbol table, and the
 /// compiled equation set. Matching, instantiation, and reduction take this by shared reference, so
 /// the [`Runtime`] can mutate the DAG arena while the equation table stays borrowed.
 pub(crate) struct Signature {
     sorts: Sorts,
     symbols: Arena<Symbol>,
+    /// Ground identity terms referenced by symbols. Unlike DAG nodes these are signature-lifetime data;
+    /// the runtime materializes each as one normalized, rooted DAG.
+    identities: Arena<Identity>,
     /// Unconditional equations (LHS compiled to a theory automaton), indexed by lhs top symbol.
     equations: HashMap<SymbolId, Vec<CompiledEquation>>,
     /// Membership axioms (`mb`), indexed by lhs top symbol; applied to lower a node's least sort at
@@ -213,6 +362,9 @@ pub(crate) struct Signature {
     /// (Pillar A) — never by [`reduce`](Engine::reduce), so equational normal forms never apply a rule.
     /// Adding a rule does not bump `eq_epoch` (rules don't change any equational normal form).
     rules: HashMap<SymbolId, Vec<CompiledRule>>,
+    /// Source-form `[narrowing]` rules in flattened module order. This includes nonexec rules that are
+    /// deliberately absent from `rules`; symbolic unification needs their lhs/rhs and variable layout.
+    narrowing_rules: Vec<crate::narrow::NarrowingRule>,
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
     /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
     /// reduced" sentinel stored on nodes, so this starts at `1`.
@@ -234,6 +386,15 @@ pub(crate) struct Signature {
     /// cache), created lazily by [`Engine::variable_symbol`] in demand order — the creation order is
     /// observable through `dag_compare`'s SymbolId ordering, exactly like Maude's symbol indices.
     var_symbols: HashMap<SortId, SymbolId>,
+    /// The `zeroTerm` attached to each `iter` successor (`SuccSymbol`).
+    succ_zeros: HashMap<SymbolId, SymbolId>,
+    /// Module-wide lower bound for substitution arrays. Real statement variables occupy the prefix;
+    /// the remainder approximates Maude's colored construction/protected-variable footprint.
+    minimum_substitution_size: usize,
+    /// Equation-derived symbolic collapse shapes used to approximate protected LHS abstraction
+    /// variables. Retained so imported/replayed statement metadata remains module-global.
+    collapse_patterns: Vec<CollapsePattern>,
+    substitution_layout_estimates: Vec<SubstitutionLayoutEstimate>,
 }
 
 /// The classification sorts for quoted-identifier constants (Maude's `QuotedIdentifierSymbol` codes
@@ -286,13 +447,28 @@ pub enum TraceEvent {
     },
     /// Begin trying a conditional equation/membership against one matcher solution (a *trial*).
     /// `bindings` is the substitution so far (the lhs match; fresh `:=` variables are still `None`).
-    TrialStart { kind: StmtKind, stmt_id: u32, depth: u32, bindings: Vec<Option<DagId>> },
+    TrialStart {
+        kind: StmtKind,
+        stmt_id: u32,
+        depth: u32,
+        bindings: Vec<Option<DagId>>,
+    },
     /// End a trial: `success` iff the whole condition held. `kind`/`depth` mirror the matching
     /// [`TrialStart`](TraceEvent::TrialStart) so the renderer gates (and so pairs) them identically.
-    TrialEnd { kind: StmtKind, depth: u32, success: bool },
+    TrialEnd {
+        kind: StmtKind,
+        depth: u32,
+        success: bool,
+    },
     /// Begin solving condition fragment `index` of `stmt_id`'s condition (`first_attempt = false` on a
     /// backtracking re-solve → Maude's `re-solving`).
-    FragmentStart { kind: StmtKind, stmt_id: u32, index: u32, depth: u32, first_attempt: bool },
+    FragmentStart {
+        kind: StmtKind,
+        stmt_id: u32,
+        index: u32,
+        depth: u32,
+        first_attempt: bool,
+    },
     /// End solving a condition fragment. On `success`, `bindings` is the substitution after the fragment
     /// (it may have bound fresh `:=` variables).
     FragmentEnd {
@@ -321,15 +497,32 @@ impl TraceEvent {
 
     /// Every DAG node id this event references (for GC rooting under in-reduction GC).
     fn for_each_id(&self, mut f: impl FnMut(DagId)) {
-        let binds = |bs: &[Option<DagId>], f: &mut dyn FnMut(DagId)| bs.iter().flatten().for_each(|&d| f(d));
+        let binds = |bs: &[Option<DagId>], f: &mut dyn FnMut(DagId)| {
+            bs.iter().flatten().for_each(|&d| f(d))
+        };
         match self {
-            TraceEvent::Rewrite { redex, result, bindings, whole_before, whole_after, .. } => {
+            TraceEvent::Rewrite {
+                redex,
+                result,
+                bindings,
+                whole_before,
+                whole_after,
+                ..
+            } => {
                 f(*redex);
                 f(*result);
                 binds(bindings, &mut f);
-                whole_before.iter().chain(whole_after.iter()).for_each(|&d| f(d));
+                whole_before
+                    .iter()
+                    .chain(whole_after.iter())
+                    .for_each(|&d| f(d));
             }
-            TraceEvent::Membership { subject, bindings, whole, .. } => {
+            TraceEvent::Membership {
+                subject,
+                bindings,
+                whole,
+                ..
+            } => {
                 f(*subject);
                 binds(bindings, &mut f);
                 whole.iter().for_each(|&d| f(d));
@@ -377,15 +570,25 @@ pub(crate) struct Runtime {
     /// (variableDagNode.cc), and [`dag_compare`](Self::dag_compare) mirrors that here. Empty unless a
     /// non-ground subject was built, so the ground hot path pays one `is_empty` check.
     var_ranks: HashMap<SymbolId, u32>,
-    /// Per-identity-constant cached DAG node (Maude's `BinarySymbol::getIdentityDag`, born REDUCED):
-    /// the node a collapse match binds an identity-absorbed variable to. Being already stamped
-    /// reduced is what makes the collapse rewrite one-shot (`red e` = exactly 1 rewrite) while fresh
-    /// RHS constructions still loop (`eq a = a` parity, §3.9.1/.4). Keyed by the identity constant's
-    /// symbol; values are GC roots.
-    identity_dags: HashMap<SymbolId, DagId>,
+    /// Relative creation ranks of Maude's per-sort `VariableSymbol`s. Original command variables
+    /// are parsed before their final theory-normalized slots are known, so the unification driver
+    /// records the parser-equivalent first-demand order explicitly. Unranked mid-solve symbols keep
+    /// the ordinary `SymbolId` fallback.
+    sort_var_ranks: HashMap<SymbolId, u32>,
+    /// Kind/error metadata for per-sort variable symbols. Within one kind, Maude's real-sort
+    /// VariableSymbols precede the synthesized kind-error VariableSymbol even when a previous
+    /// command forced the error symbol first during unsorted solving.
+    sort_var_meta: HashMap<SymbolId, (KindId, bool)>,
+    /// Per-identity cached normalized DAG (Maude's `BinarySymbol::getIdentityDag`). Values are
+    /// engine-lifetime GC roots and are stamped reduced when handed to a collapse binding.
+    identity_dags: HashMap<IdentityId, DagId>,
+    /// Guards identity materialization against recursively identity-bearing terms.
+    identity_building: HashSet<IdentityId>,
     /// Count of equational rewrites applied (Maude's `rewrites` statistic). `pub(crate)` so the rewrite-
     /// path `counter` special ([`Runtime::try_counter`]) can count its step like a rule application.
     pub(crate) rewrite_count: u64,
+    variant_narrowing_count: u64,
+    narrowing_count: u64,
     /// Next value for the `counter` built-in (Maude's `CounterSymbol`): each `rewrite`/`frewrite` step
     /// that fires a `counter` redex yields this and increments it. Reset to 0 at the start of each
     /// top-level rewriting command (not on `continue`). Inert under equational `reduce`.
@@ -454,15 +657,21 @@ impl Default for Signature {
         Signature {
             sorts: Sorts::default(),
             symbols: Arena::default(),
+            identities: Arena::default(),
             equations: HashMap::default(),
             memberships: HashMap::default(),
             rules: HashMap::default(),
+            narrowing_rules: Vec::default(),
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
             next_eq_id: 0,
             next_mb_id: 0,
             next_rule_id: 0,
             qid_class: QidClass::default(),
             var_symbols: HashMap::default(),
+            succ_zeros: HashMap::default(),
+            minimum_substitution_size: 1,
+            collapse_patterns: Vec::default(),
+            substitution_layout_estimates: Vec::default(),
         }
     }
 }
@@ -477,11 +686,20 @@ fn term_has_repeated_subterm(t: &Term) -> bool {
     let mut seen: HashSet<&Term> = HashSet::new();
     let mut stack = vec![t];
     while let Some(cur) = stack.pop() {
-        if let Term::Op { args, .. } = cur {
-            if !seen.insert(cur) {
-                return true; // this compound subterm was already seen elsewhere — a real duplicate
+        match cur {
+            Term::Op { args, .. } => {
+                if !seen.insert(cur) {
+                    return true; // this compound subterm was already seen elsewhere — a real duplicate
+                }
+                stack.extend(args.iter());
             }
-            stack.extend(args.iter());
+            Term::Iter { arg, .. } => {
+                if !seen.insert(cur) {
+                    return true;
+                }
+                stack.push(arg);
+            }
+            Term::Var(_) | Term::Na { .. } => {}
         }
     }
     false
@@ -509,6 +727,158 @@ impl Signature {
     pub(crate) fn symbols_iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> + '_ {
         self.symbols.iter()
     }
+    pub(crate) fn succ_zero(&self, succ: SymbolId) -> Option<SymbolId> {
+        self.succ_zeros.get(&succ).copied()
+    }
+
+    fn note_substitution_layout(
+        &mut self,
+        lhs: &Term,
+        nr_vars: u32,
+        built_term: Option<&Term>,
+        condition: &[ConditionFragment],
+    ) {
+        let construction = built_term.map_or(0, term_construction_slots).max(
+            condition
+                .iter()
+                .map(fragment_construction_slots)
+                .max()
+                .unwrap_or(0),
+        );
+        let mut abstraction_candidates = Vec::new();
+        self.collect_abstraction_candidates(lhs, &mut abstraction_candidates);
+        self.substitution_layout_estimates
+            .push(SubstitutionLayoutEstimate {
+                base: nr_vars as usize + construction,
+                abstraction_candidates,
+            });
+        self.recompute_minimum_substitution_size();
+    }
+
+    /// Approximate `insertAbstractionVariables`: recursively retain each immediate non-variable alien
+    /// beneath a non-free theory node. Whether it needs protection is decided against the module's
+    /// equation-derived collapse patterns in [`recompute_minimum_substitution_size`](Self::recompute_minimum_substitution_size).
+    fn collect_abstraction_candidates(&self, term: &Term, out: &mut Vec<LayoutAlien>) {
+        match term {
+            Term::Op { symbol, args } => {
+                if self.symbol(*symbol).theory() != Theory::Free {
+                    for arg in args {
+                        if !matches!(arg, Term::Var(_))
+                            && arg.top_symbol().is_some_and(|alien| alien != *symbol)
+                        {
+                            out.push(LayoutAlien {
+                                parent: *symbol,
+                                term: arg.clone(),
+                            });
+                        }
+                    }
+                }
+                for arg in args {
+                    self.collect_abstraction_candidates(arg, out);
+                }
+            }
+            Term::Iter { symbol, arg, .. } => {
+                if !matches!(arg.as_ref(), Term::Var(_))
+                    && arg.top_symbol().is_some_and(|alien| alien != *symbol)
+                {
+                    out.push(LayoutAlien {
+                        parent: *symbol,
+                        term: arg.as_ref().clone(),
+                    });
+                }
+                self.collect_abstraction_candidates(arg, out);
+            }
+            Term::Var(_) | Term::Na { .. } => {}
+        }
+    }
+
+    /// Record a collapse relation in the orientation used by symbolic alien matching. A bare-variable
+    /// RHS means the original LHS can collapse to any root. Otherwise, when both sides contain the
+    /// same variables, the RHS is a reversible equation pattern that can expose the LHS top symbol.
+    fn note_collapse_pattern(&mut self, lhs: &Term, rhs: &Term) {
+        let lhs_top = lhs
+            .top_symbol()
+            .expect("equation lhs must be an application");
+        if matches!(rhs, Term::Var(_)) {
+            self.collapse_patterns.push(CollapsePattern {
+                pattern: lhs.clone(),
+                target: None,
+            });
+        } else if term_variable_indices(lhs) == term_variable_indices(rhs) {
+            self.collapse_patterns.push(CollapsePattern {
+                pattern: rhs.clone(),
+                target: Some(lhs_top),
+            });
+        }
+    }
+
+    fn recompute_minimum_substitution_size(&mut self) {
+        let estimated = self
+            .substitution_layout_estimates
+            .iter()
+            .map(|estimate| {
+                let protected = estimate
+                    .abstraction_candidates
+                    .iter()
+                    .filter(|alien| {
+                        self.collapse_patterns.iter().any(|collapse| {
+                            collapse.target.is_none_or(|target| target == alien.parent)
+                                && term_matches_pattern(&collapse.pattern, &alien.term)
+                        })
+                    })
+                    .count();
+                estimate.base + protected
+            })
+            .max()
+            .unwrap_or(1);
+        self.minimum_substitution_size = estimated.max(1);
+    }
+
+    fn constant_identity(&mut self, symbol: SymbolId) -> IdentityId {
+        let sort = self.symbols.get(symbol).decls()[0].range;
+        self.identities.alloc(Identity {
+            term: Some(Term::constant(symbol)),
+            sort,
+        })
+    }
+
+    fn reserve_identity(&mut self, sort: SortId) -> IdentityId {
+        self.identities.alloc(Identity { term: None, sort })
+    }
+
+    pub(crate) fn identity_term(&self, id: IdentityId) -> &Term {
+        self.identities
+            .get(id)
+            .term
+            .as_ref()
+            .expect("identity term not installed")
+    }
+
+    pub(crate) fn identity_sort(&self, id: IdentityId) -> SortId {
+        self.identities.get(id).sort
+    }
+
+    pub(crate) fn identity_constant(&self, id: IdentityId) -> Option<SymbolId> {
+        match self.identity_term(id) {
+            Term::Op { symbol, args } if args.is_empty() => Some(*symbol),
+            _ => None,
+        }
+    }
+
+    fn term_sort(&self, term: &Term) -> SortId {
+        match term {
+            Term::Var(v) => v.sort,
+            Term::Na { symbol, .. } => self.symbol(*symbol).decls()[0].range,
+            Term::Iter { symbol, count, arg } => {
+                self.compute_s_sort(*symbol, self.term_sort(arg), count)
+            }
+            Term::Op { symbol, args } if args.is_empty() => self.symbol(*symbol).decls()[0].range,
+            Term::Op { symbol, args } => {
+                let arg_sorts: Vec<SortId> = args.iter().map(|arg| self.term_sort(arg)).collect();
+                self.compute_sort(*symbol, &arg_sorts)
+            }
+        }
+    }
 
     pub(crate) fn add_op(
         &mut self,
@@ -518,7 +888,11 @@ impl Signature {
     ) -> SymbolId {
         self.symbols.alloc(Symbol {
             name: name.into(),
-            decls: vec![OpDeclaration { domain, range, ctor: false }],
+            decls: vec![OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            }],
             axioms: Axioms::default(),
             identity: None,
             one_sided_id: None,
@@ -542,10 +916,20 @@ impl Signature {
         identity: Option<SymbolId>,
     ) -> SymbolId {
         assert_eq!(domain.len(), 2, "an `assoc comm` operator must be binary");
+        let identity = identity.map(|s| self.constant_identity(s));
         let id = self.symbols.alloc(Symbol {
             name: name.into(),
-            decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: true, comm: true, idem: false, iter: false },
+            decls: vec![OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            }],
+            axioms: Axioms {
+                assoc: true,
+                comm: true,
+                idem: false,
+                iter: false,
+            },
             identity,
             one_sided_id: None,
             strategy: None,
@@ -554,7 +938,7 @@ impl Signature {
             oo: OoFlags::default(),
             class: SymbolClass::default(),
         });
-        self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
+        self.commutative_sort_completion(id);
         id
     }
 
@@ -569,10 +953,20 @@ impl Signature {
         identity: Option<SymbolId>,
     ) -> SymbolId {
         assert_eq!(domain.len(), 2, "an `assoc` operator must be binary");
+        let identity = identity.map(|s| self.constant_identity(s));
         self.symbols.alloc(Symbol {
             name: name.into(),
-            decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: true, comm: false, idem: false, iter: false },
+            decls: vec![OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            }],
+            axioms: Axioms {
+                assoc: true,
+                comm: false,
+                idem: false,
+                iter: false,
+            },
             identity,
             one_sided_id: None,
             strategy: None,
@@ -596,10 +990,20 @@ impl Signature {
         identity: Option<SymbolId>,
     ) -> SymbolId {
         assert_eq!(domain.len(), 2, "a CUI operator must be binary");
+        let identity = identity.map(|s| self.constant_identity(s));
         let id = self.symbols.alloc(Symbol {
             name: name.into(),
-            decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { assoc: false, comm, idem, iter: false },
+            decls: vec![OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            }],
+            axioms: Axioms {
+                assoc: false,
+                comm,
+                idem,
+                iter: false,
+            },
             identity,
             one_sided_id: None,
             strategy: None,
@@ -608,7 +1012,7 @@ impl Signature {
             oo: OoFlags::default(),
             class: SymbolClass::default(),
         });
-        self.commutative_sort_completion(id); // an asymmetric initial decl needs its swap
+        self.commutative_sort_completion(id);
         id
     }
 
@@ -624,8 +1028,15 @@ impl Signature {
         assert_eq!(domain.len(), 1, "an `iter` operator must be unary");
         self.symbols.alloc(Symbol {
             name: name.into(),
-            decls: vec![OpDeclaration { domain, range, ctor: false }],
-            axioms: Axioms { iter: true, ..Default::default() },
+            decls: vec![OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            }],
+            axioms: Axioms {
+                iter: true,
+                ..Default::default()
+            },
             identity: None,
             one_sided_id: None,
             strategy: None,
@@ -675,7 +1086,11 @@ impl Signature {
                 "overloaded declarations of `{}` must agree on arity",
                 s.name()
             );
-            s.decls.push(OpDeclaration { domain, range, ctor: false });
+            s.decls.push(OpDeclaration {
+                domain,
+                range,
+                ctor: false,
+            });
         }
         // Keep a commutative operator's declaration set complete under argument swap (no-op for free
         // and AU operators, whose declarations stay positional).
@@ -702,7 +1117,7 @@ impl Signature {
         let s = self.symbols.get(sym);
         if !matches!(s.theory(), Theory::Acu | Theory::Cui) || !s.axioms.comm {
             return; // only genuinely commutative ops complete; AU / free / non-comm CUI
-                    // (id:/idem-only) stay positional
+            // (id:/idem-only) stay positional
         }
         // Snapshot the current declarations so the shared borrow ends before the mutable push below
         // (the sort ids are `Copy`, so this clone is cheap and small).
@@ -718,7 +1133,11 @@ impl Signature {
                 .chain(to_add.iter())
                 .any(|e| e.domain == swapped && e.range == d.range && e.ctor == d.ctor);
             if !present {
-                to_add.push(OpDeclaration { domain: swapped, range: d.range, ctor: d.ctor });
+                to_add.push(OpDeclaration {
+                    domain: swapped,
+                    range: d.range,
+                    ctor: d.ctor,
+                });
             }
         }
         self.symbols.get_mut(sym).decls.extend(to_add);
@@ -784,7 +1203,10 @@ impl Signature {
             // from a parameter theory's `protecting BOOL` and a regular `BOOL` import) is a no-op: the
             // seam already installed `strat (1 0)`. The "no user strat" check therefore guards only the
             // *first* attach — a genuine user `strat` on `if_then_else_fi` still trips it.
-            if matches!(self.symbols.get(sym).special, Some(SpecialOp::Branch { .. })) {
+            if matches!(
+                self.symbols.get(sym).special,
+                Some(SpecialOp::Branch { .. })
+            ) {
                 return;
             }
             assert!(
@@ -801,7 +1223,12 @@ impl Signature {
     /// The argument position to reduce at strategy step `cursor` for `symbol` (B2.4), or `None` once the
     /// strategy is exhausted (→ attempt the top rewrite). The standard strategy reduces every argument
     /// left-to-right; a custom strategy reduces only its listed positions, in order.
-    pub(crate) fn strat_position(&self, symbol: SymbolId, cursor: usize, arity: usize) -> Option<usize> {
+    pub(crate) fn strat_position(
+        &self,
+        symbol: SymbolId,
+        cursor: usize,
+        arity: usize,
+    ) -> Option<usize> {
         match &self.symbols.get(symbol).strategy {
             None => (cursor < arity).then_some(cursor),
             Some(positions) => positions.get(cursor).map(|&p| p as usize),
@@ -849,11 +1276,7 @@ impl Signature {
             NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
             NaValue::Qid(_) => true,
         };
-        if special {
-            min
-        } else {
-            max
-        }
+        if special { min } else { max }
     }
 
     /// Classify a quoted-identifier's text into its META-TERM sort, or `None` if this module has no
@@ -888,7 +1311,11 @@ impl Signature {
     /// is unique (the running down-set intersection equals the chosen range's down-set — Maude's
     /// `unique` flag). Maude *warns* when this is false; we compute it but defer the user-facing
     /// warning (no diagnostics sink yet) — the tie-break itself is exercised by conformance.
-    pub(crate) fn compute_sort_uniq(&self, symbol: SymbolId, arg_sorts: &[SortId]) -> (SortId, bool) {
+    pub(crate) fn compute_sort_uniq(
+        &self,
+        symbol: SymbolId,
+        arg_sorts: &[SortId],
+    ) -> (SortId, bool) {
         let decls = self.symbols.get(symbol).decls();
         assert_eq!(
             arg_sorts.len(),
@@ -900,8 +1327,10 @@ impl Signature {
         // range is the unique least sort when applicable, else the kind's error sort. Avoids the
         // per-node down-set clone the general path does, keeping the reduce hot path allocation-free.
         if let [only] = decls {
-            let applicable =
-                arg_sorts.iter().zip(&only.domain).all(|(&a, &dom)| self.sorts.leq(a, dom));
+            let applicable = arg_sorts
+                .iter()
+                .zip(&only.domain)
+                .all(|(&a, &dom)| self.sorts.leq(a, dom));
             return if applicable {
                 (only.range, true)
             } else {
@@ -909,7 +1338,9 @@ impl Signature {
             };
         }
         debug_assert!(
-            decls.iter().all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
+            decls
+                .iter()
+                .all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
             "cross-kind ad-hoc overloading of `{}` is not yet supported (a B2 follow-up): the args, \
              not the range, would select the declaration group",
             self.symbols.get(symbol).name()
@@ -919,7 +1350,11 @@ impl Signature {
         let mut min_range: Option<SortId> = None;
         let mut running: Option<std::collections::BTreeSet<SortId>> = None;
         for d in decls {
-            if !arg_sorts.iter().zip(&d.domain).all(|(&a, &dom)| self.sorts.leq(a, dom)) {
+            if !arg_sorts
+                .iter()
+                .zip(&d.domain)
+                .all(|(&a, &dom)| self.sorts.leq(a, dom))
+            {
                 continue; // declaration not applicable to these argument sorts
             }
             let down = self.sorts.down_set(d.range);
@@ -939,7 +1374,10 @@ impl Signature {
         match min_range {
             // unique iff the GLB's down-set (`running`) equals the chosen min's down-set ⇒ min is the GLB.
             Some(r) => (r, running.as_ref() == Some(self.sorts.down_set(r))),
-            None => (self.sorts.error_sort(self.sorts.kind_of(decls[0].range)), true),
+            None => (
+                self.sorts.error_sort(self.sorts.kind_of(decls[0].range)),
+                true,
+            ),
         }
     }
 
@@ -957,19 +1395,11 @@ impl Signature {
         acc
     }
 
-    /// Whether a variable of sort `sort` under associative operator `op` can be bound to the
-    /// operator's identity element (Maude's `BinarySymbol::takeIdentity`): `true` iff `op` has an
-    /// identity and the identity constant's sort is `<= sort`. This is the variable's Diophantine
-    /// **lower bound** discriminator — an identity-capable variable has lower bound 0 (may bind the
-    /// empty multiset), else 1.
+    /// Whether a variable of `sort` may take `op`'s identity.
     pub(crate) fn acu_take_identity(&self, op: SymbolId, sort: SortId) -> bool {
-        match self.symbol(op).identity() {
-            Some(id_sym) => {
-                let id_sort = self.symbols.get(id_sym).decls()[0].range;
-                self.sorts.leq(id_sort, sort)
-            }
-            None => false,
-        }
+        self.symbol(op)
+            .identity()
+            .is_some_and(|id| self.sorts.leq(self.identity_sort(id), sort))
     }
 
     /// The per-sort **bound** for associative operator `op` (Maude's `AssociativeSymbol::sortBound` via
@@ -993,7 +1423,11 @@ impl Signature {
             members.iter().map(|&s| (s, UNBOUNDED)).collect();
         // Sorts `>= s` within the component (Maude's `insertGreaterOrEqualSorts`).
         let ge = |s: SortId| -> Vec<SortId> {
-            members.iter().copied().filter(|&m| self.sorts.leq(s, m)).collect()
+            members
+                .iter()
+                .copied()
+                .filter(|&m| self.sorts.leq(s, m))
+                .collect()
         };
         let mut largest_bound = 1;
         let mut i = 1;
@@ -1042,8 +1476,9 @@ impl Signature {
         }
         // Past the lead: index into the cycle (Maude's `computeSortIndex` tail arithmetic).
         let cycle = path_len - lead;
-        let steps =
-            count.checked_sub(&Nat::from_u64((lead + 1) as u64)).expect("count > path_len >= lead+1");
+        let steps = count
+            .checked_sub(&Nat::from_u64((lead + 1) as u64))
+            .expect("count > path_len >= lead+1");
         seq[lead + steps.rem_usize(cycle)]
     }
 
@@ -1093,6 +1528,18 @@ impl Signature {
         self.push_equation(lhs, rhs, nr_vars, condition, true)
     }
 
+    /// Register an executable equation carrying Maude's `[variant]` attribute.
+    pub(crate) fn add_variant_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+        owise: bool,
+    ) -> u32 {
+        self.push_equation(lhs, rhs, nr_vars, condition, owise)
+    }
+
     /// Compile and register an equation, returning its dense per-module **id** (the index the frontend
     /// keys its trace metadata by).
     fn push_equation(
@@ -1103,7 +1550,11 @@ impl Signature {
         condition: Vec<ConditionFragment>,
         owise: bool,
     ) -> u32 {
-        let top = lhs.top_symbol().expect("equation lhs must be an application");
+        let top = lhs
+            .top_symbol()
+            .expect("equation lhs must be an application");
+        self.note_collapse_pattern(&lhs, &rhs);
+        self.note_substitution_layout(&lhs, nr_vars, Some(&rhs), &condition);
         let id = self.next_eq_id;
         self.next_eq_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
@@ -1154,13 +1605,14 @@ impl Signature {
             _ => return Vec::new(),
         };
         let mut targets: Vec<SymbolId> = Vec::new();
-        let mut push = |t: SymbolId, targets: &mut Vec<SymbolId>| {
+        let push = |t: SymbolId, targets: &mut Vec<SymbolId>| {
             if t != top && !targets.contains(&t) {
                 targets.push(t);
             }
         };
         if has_id {
-            let id_sym = sym.identity.expect("has_id");
+            let identity = sym.identity.expect("has_id");
+            let identity_top = self.identity_term(identity).top_symbol();
             let nonvars: Vec<&Term> = args.iter().filter(|a| !matches!(a, Term::Var(_))).collect();
             match nonvars.len() {
                 0 => {
@@ -1184,7 +1636,9 @@ impl Signature {
                             push(s, &mut targets);
                         }
                     } else {
-                        push(id_sym, &mut targets);
+                        if let Some(id_top) = identity_top {
+                            push(id_top, &mut targets);
+                        }
                     }
                 }
                 1 => {
@@ -1225,20 +1679,32 @@ impl Signature {
     /// [`LhsAutomaton`] through the same A3 seam (and F-A guard) as an equation lhs. `owner` gates the
     /// **rewrite** (`=>`) fragment, which is legal only in a rule condition — the frontend rejects it in
     /// an `ceq`/`cmb` (this is the defensive kernel backstop, A-v).
-    fn compile_condition(&self, condition: Vec<ConditionFragment>, owner: CondOwner) -> Vec<CompiledFragment> {
+    fn compile_condition(
+        &self,
+        condition: Vec<ConditionFragment>,
+        owner: CondOwner,
+    ) -> Vec<CompiledFragment> {
         condition
             .into_iter()
             .map(|frag| match frag {
                 ConditionFragment::Equality { lhs, rhs } => CompiledFragment::Equality { lhs, rhs },
-                ConditionFragment::SortTest { term, sort } => CompiledFragment::SortTest { term, sort },
-                ConditionFragment::Matching { pattern, subject, fresh_vars } => {
-                    CompiledFragment::Matching {
-                        pattern: LhsAutomaton::compile(pattern, self),
-                        subject,
-                        fresh_vars,
-                    }
+                ConditionFragment::SortTest { term, sort } => {
+                    CompiledFragment::SortTest { term, sort }
                 }
-                ConditionFragment::Rewrite { lhs, pattern, fresh_vars } => {
+                ConditionFragment::Matching {
+                    pattern,
+                    subject,
+                    fresh_vars,
+                } => CompiledFragment::Matching {
+                    pattern: LhsAutomaton::compile(pattern, self),
+                    subject,
+                    fresh_vars,
+                },
+                ConditionFragment::Rewrite {
+                    lhs,
+                    pattern,
+                    fresh_vars,
+                } => {
                     assert!(
                         owner == CondOwner::Rule,
                         "a rewrite (`=>`) condition fragment is legal only in a rule (`crl`)"
@@ -1278,7 +1744,14 @@ impl Signature {
     /// its `rl_traces` metadata by). Mirrors [`push_equation`](Self::push_equation) minus the `owise`
     /// phase and — crucially — **without** bumping `eq_epoch`: a rule cannot change any equational normal
     /// form, so invalidating the reduced-cache would be a pure regression.
-    fn push_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32, condition: Vec<ConditionFragment>) -> u32 {
+    fn push_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) -> u32 {
+        self.note_substitution_layout(&lhs, nr_vars, Some(&rhs), &condition);
         let top = lhs.top_symbol().expect("rule lhs must be an application");
         let id = self.next_rule_id;
         self.next_rule_id += 1;
@@ -1302,7 +1775,9 @@ impl Signature {
     /// and one **message** constructor, both stable (an application, not a top variable) and sharing the
     /// same first argument (the object/target *name*). Everything else config-rooted is `LeftOver`.
     fn classify_oo_rule(&self, lhs: &Term) -> OoRuleKind {
-        let Term::Op { symbol, args } = lhs else { return OoRuleKind::NotConfig };
+        let Term::Op { symbol, args } = lhs else {
+            return OoRuleKind::NotConfig;
+        };
         if !self.symbol(*symbol).oo.config {
             return OoRuleKind::NotConfig;
         }
@@ -1313,8 +1788,16 @@ impl Signature {
             (false, None, None);
         for arg in args {
             // Must be stable — an application whose first argument is the name (a top variable disqualifies).
-            let Term::Op { symbol: asym, args: aargs } = arg else { return OoRuleKind::LeftOver };
-            let Some(arg0) = aargs.first() else { return OoRuleKind::LeftOver };
+            let Term::Op {
+                symbol: asym,
+                args: aargs,
+            } = arg
+            else {
+                return OoRuleKind::LeftOver;
+            };
+            let Some(arg0) = aargs.first() else {
+                return OoRuleKind::LeftOver;
+            };
             let oo = self.symbol(*asym).oo;
             if oo.object {
                 if object {
@@ -1366,8 +1849,17 @@ impl Signature {
     /// Compile and register a membership axiom, returning its dense per-module **id**. (The membership
     /// table is re-sorted smallest-target-first for application, but `id` stays declaration order — the
     /// frontend keys `mb_traces` by it.)
-    fn push_membership(&mut self, lhs: Term, sort: SortId, nr_vars: u32, condition: Vec<ConditionFragment>) -> u32 {
-        let top = lhs.top_symbol().expect("membership lhs must be an application");
+    fn push_membership(
+        &mut self,
+        lhs: Term,
+        sort: SortId,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+    ) -> u32 {
+        self.note_substitution_layout(&lhs, nr_vars, None, &condition);
+        let top = lhs
+            .top_symbol()
+            .expect("membership lhs must be an application");
         let id = self.next_mb_id;
         self.next_mb_id += 1;
         let compiled = SortConstraint {
@@ -1441,7 +1933,12 @@ impl Runtime {
         if self.gc_interval.is_some() {
             self.allocs_since_gc += 1;
         }
-        self.dags.alloc(DagNode { sort, reduced_epoch: 0, nf: None, term })
+        self.dags.alloc(DagNode {
+            sort,
+            reduced_epoch: 0,
+            nf: None,
+            term,
+        })
     }
 
     /// Open a construction-time structural-dedup window (C7 Half 1): until [`end_dedup`](Self::end_dedup),
@@ -1470,7 +1967,13 @@ impl Runtime {
     /// term an equation reduces away is never constrained (no over-count; a `cmb` whose condition loops
     /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
     /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
-    fn constrain_to_smaller_sort(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
+    fn constrain_to_smaller_sort(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        whole: Option<DagId>,
+        frames: &[ReduceFrame],
+    ) {
         // B3: AC memberships fire **through extension** — on sub-multisets of an AC subject.
         // Maude's mechanism is simply bottom-up reduction of the UNFLATTENED right-associated
         // parse: each intermediate node reaches its own reduce normal-form point and is
@@ -1490,9 +1993,17 @@ impl Runtime {
     /// (Maude counts membership applications); smallest-first means a node drops straight to its smallest
     /// applicable sort in one application. [`constrain_to_smaller_sort`] wraps this with the AC prefix
     /// fold so the extension case is covered too.
-    fn constrain_node_whole(&mut self, sig: &Signature, id: DagId, whole: Option<DagId>, frames: &[ReduceFrame]) {
+    fn constrain_node_whole(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        whole: Option<DagId>,
+        frames: &[ReduceFrame],
+    ) {
         let symbol = self.node(id).symbol();
-        let Some(constraints) = sig.memberships.get(&symbol) else { return };
+        let Some(constraints) = sig.memberships.get(&symbol) else {
+            return;
+        };
         loop {
             let current = self.node(id).sort;
             let mut lowered = false;
@@ -1547,7 +2058,11 @@ impl Runtime {
         let mut sp = sc.lhs.match_(self, sig, id, &mut subst, false, false)?;
         while sp.next(self, sig, &mut subst) {
             if sc.condition.is_empty() {
-                return Some(if self.tracing() { Self::snapshot_subst(&subst) } else { Vec::new() });
+                return Some(if self.tracing() {
+                    Self::snapshot_subst(&subst)
+                } else {
+                    Vec::new()
+                });
             }
             let depth = self.condition_depth;
             if self.tracing() {
@@ -1576,7 +2091,11 @@ impl Runtime {
                 });
             }
             if holds {
-                return Some(if self.tracing() { Self::snapshot_subst(&subst) } else { Vec::new() });
+                return Some(if self.tracing() {
+                    Self::snapshot_subst(&subst)
+                } else {
+                    Vec::new()
+                });
             }
         }
         None
@@ -1651,9 +2170,10 @@ impl Runtime {
                 let arg_sorts: Vec<SortId> = args.iter().map(|&e| self.dags.get(e).sort).collect();
                 sig.compute_sort_fold(*symbol, &arg_sorts)
             }
-            NodeTerm::Cui { symbol, args } => {
-                sig.compute_sort(*symbol, &[self.dags.get(args[0]).sort, self.dags.get(args[1]).sort])
-            }
+            NodeTerm::Cui { symbol, args } => sig.compute_sort(
+                *symbol,
+                &[self.dags.get(args[0]).sort, self.dags.get(args[1]).sort],
+            ),
             NodeTerm::S { symbol, count, arg } => {
                 sig.compute_s_sort(*symbol, self.dags.get(*arg).sort, count)
             }
@@ -1679,7 +2199,13 @@ impl Runtime {
     /// across two separate strat frames* in one reduction would be refined once per frame — a narrow edge
     /// needing `strat` + `mb` + a repeated strat-skipped compound. C7's construction dedup can now produce
     /// such sharing, but no observed case hits it; see `fable-audit.md`.)
-    fn compute_true_sort(&mut self, sig: &Signature, id: DagId, seen: &mut HashSet<DagId>, frames: &[ReduceFrame]) {
+    fn compute_true_sort(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        seen: &mut HashSet<DagId>,
+        frames: &[ReduceFrame],
+    ) {
         if self.node(id).reduced_epoch == sig.eq_epoch() || !seen.insert(id) {
             return; // already at its true sort, or already refined in this pass
         }
@@ -1699,23 +2225,89 @@ impl Runtime {
         self.make_free(sig, symbol, Vec::new())
     }
 
-    /// The cached identity DAG node for identity-constant symbol `id_sym` (Maude's `getIdentityDag`):
-    /// built once, and stamped **already reduced in the current equation epoch** on every fetch. A
-    /// collapse match binds an identity-absorbed variable to this node — never to a fresh
-    /// `make_const` — so a bare-variable RHS hands the reduce loop an already-normal node and the
-    /// collapse rewrite fires exactly once (`red e` = 1). Fresh RHS constructions never carry the
-    /// stamp, so `eq a = a` still diverges exactly like Maude (§3.9.1/.4).
-    pub(crate) fn identity_dag(&mut self, sig: &Signature, id_sym: SymbolId) -> DagId {
-        let d = match self.identity_dags.get(&id_sym) {
-            Some(&d) => d,
+    /// Build an overloaded constant using a specific declaration range. Ordinary construction infers
+    /// the least declaration from children; a nullary symbol has no children to disambiguate overloads.
+    pub(crate) fn make_const_at_sort(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        sort: SortId,
+    ) -> DagId {
+        debug_assert!(
+            sig.symbol(symbol)
+                .decls()
+                .iter()
+                .any(|decl| { decl.domain.is_empty() && decl.range == sort })
+        );
+        self.alloc_node(
+            sort,
+            NodeTerm::Free {
+                symbol,
+                args: Vec::new(),
+            },
+        )
+    }
+
+    /// Materialize a signature-owned identity term once as a normalized, engine-lifetime DAG.
+    ///
+    /// The raw instance is entered in the permanent cache before reduction: safe-point GC may run
+    /// during that reduction, and collapse normalization may consult an identity while reducing one.
+    /// A cached identity is reduced again only after the equation epoch changes; this preserves the
+    /// canonical node on ordinary fetches without blessing a stale normal form after module extension.
+    pub(crate) fn identity_dag(&mut self, sig: &Signature, identity: IdentityId) -> DagId {
+        let d = match self.identity_dags.get(&identity) {
+            Some(&d) => {
+                // Reduction of an identity can match an identity-bearing equation, whose matcher
+                // asks for this same identity to build an empty variable run. Handing that cached
+                // DAG to the collapse binding must stamp it reduced: if the equation rewrites the
+                // identity to itself, the enclosing reducer then counts the one application and
+                // stops instead of applying it forever. Clear an older epoch's forwarding target
+                // before blessing the value for the current one.
+                if self.identity_building.contains(&identity) {
+                    let n = self.dags.get_mut(d);
+                    n.nf = None;
+                    n.reduced_epoch = sig.eq_epoch();
+                    return d;
+                }
+                d
+            }
             None => {
-                let d = self.make_const(sig, id_sym);
-                self.identity_dags.insert(id_sym, d);
+                assert!(
+                    self.identity_building.insert(identity),
+                    "recursive identity-term materialization"
+                );
+                let term = sig.identity_term(identity);
+                let d = self.instantiate(sig, term, &Subst::new());
+                self.identity_dags.insert(identity, d);
+                self.identity_building.remove(&identity);
                 d
             }
         };
-        self.dags.get_mut(d).reduced_epoch = sig.eq_epoch();
-        d
+        assert!(
+            self.identity_building.insert(identity),
+            "recursive identity normalization was not intercepted by the cache"
+        );
+        // Identity canonicalization is module/runtime maintenance, not a user rewrite command:
+        // preserve observable rewrite statistics and discard any internal trace events. Keeping
+        // the existing trace buffer installed during reduction still roots its DAGs across GC.
+        let rewrite_count = self.rewrite_count;
+        let trace_len = self.trace.as_ref().map(Vec::len);
+        let normalized = self.reduce(sig, d, &mut NullDescent);
+        self.rewrite_count = rewrite_count;
+        if let (Some(trace), Some(len)) = (&mut self.trace, trace_len) {
+            trace.truncate(len);
+        }
+        self.identity_building.remove(&identity);
+        self.identity_dags.insert(identity, normalized);
+        normalized
+    }
+
+    pub(crate) fn is_identity(&self, sig: &Signature, identity: IdentityId, dag: DagId) -> bool {
+        if let Some(&id_dag) = self.identity_dags.get(&identity) {
+            return id_dag == dag || self.deep_equal(id_dag, dag);
+        }
+        sig.identity_constant(identity)
+            .is_some_and(|id_sym| self.is_constant(dag, id_sym))
     }
 
     /// Build a canonical **ACU** node for `symbol` from `raw_args` (`(element, multiplicity)` pairs).
@@ -1732,7 +2324,11 @@ impl Runtime {
         symbol: SymbolId,
         raw_args: Vec<(DagId, u32)>,
     ) -> DagId {
-        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Acu, "make_acu on a non-ACU symbol");
+        debug_assert_eq!(
+            sig.symbol(symbol).theory(),
+            Theory::Acu,
+            "make_acu on a non-ACU symbol"
+        );
         let identity = sig.symbol(symbol).identity();
 
         // (1) flatten nested same-symbol nodes + (2) drop identity elements.
@@ -1749,13 +2345,14 @@ impl Runtime {
             if mult == 0 {
                 continue;
             }
-            if identity.is_some_and(|id_sym| self.is_constant(arg, id_sym)) {
+            if identity.is_some_and(|id| self.is_identity(sig, id, arg)) {
                 continue; // an identity argument vanishes
             }
             match &self.dags.get(arg).term {
-                NodeTerm::Acu { symbol: inner, args }
-                    if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch =>
-                {
+                NodeTerm::Acu {
+                    symbol: inner,
+                    args,
+                } if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch => {
                     for &(e, m) in args {
                         flat.push((e, m * mult));
                     }
@@ -1792,8 +2389,9 @@ impl Runtime {
         let total: u64 = args.iter().map(|&(_, m)| u64::from(m)).sum();
         match total {
             0 => {
-                let id_sym = identity.expect("an empty ACU multiset requires an identity element");
-                self.make_const(sig, id_sym)
+                let identity =
+                    identity.expect("an empty ACU multiset requires an identity element");
+                self.identity_dag(sig, identity)
             }
             1 => args[0].0, // exactly one element, multiplicity 1 — never wrap a lone argument
             _ => {
@@ -1809,6 +2407,42 @@ impl Runtime {
         }
     }
 
+    /// Rebuild an ACU node after changing only variable indices while retaining the existing
+    /// argument order. Maude indexes retained variant variables in place, so routing this through
+    /// `make_acu` would incorrectly reorder arguments by their new slots. Reindexing can make two
+    /// formerly distinct variables structurally equal, however, so restore the canonical multiset
+    /// invariant by merging such elements without moving their first occurrence.
+    pub(crate) fn make_acu_preserving_order(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        args: Vec<(DagId, u32)>,
+    ) -> DagId {
+        let mut merged: Vec<(DagId, u32)> = Vec::with_capacity(args.len());
+        for (element, multiplicity) in args {
+            if let Some((_, retained_multiplicity)) = merged
+                .iter_mut()
+                .find(|(retained, _)| self.deep_equal(*retained, element))
+            {
+                *retained_multiplicity += multiplicity;
+            } else {
+                merged.push((element, multiplicity));
+            }
+        }
+        let elem_sorts: Vec<SortId> = merged
+            .iter()
+            .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
+            .collect();
+        let sort = sig.compute_sort_fold(symbol, &elem_sorts);
+        self.alloc_node(
+            sort,
+            NodeTerm::Acu {
+                symbol,
+                args: merged,
+            },
+        )
+    }
+
     /// Eagerly put `dag` into **theory normal form** for the symbolic engine (unification/variants):
     /// flatten nested same-symbol ACU/AU nodes and merge equal ACU elements **unconditionally**,
     /// unlike [`make_acu`](Self::make_acu)'s lazy, rewrite-count-preserving splice (which only
@@ -1816,18 +2450,45 @@ impl Runtime {
     /// unification; without it a parse-nested `X + X + Y` (from a `prec`/`gather` binary parse) would
     /// reach the ACU solver as `{(X+X): 1, Y: 1}` instead of `{X: 2, Y: 1}`. Bottom-up; leaves and
     /// free/S/CUI nodes are rebuilt from normalized children.
+    /// Preserve Maude's in-place "already reduced" flag across an alpha/theory-normalizing rebuild.
+    /// A forwarding redex (`nf = Some`) is deliberately excluded: only a node that is its own normal
+    /// form may bless an equivalent rebuilt node, and a theory collapse to a different top symbol is
+    /// left to the reducer.
+    fn inherit_reduced_status(&mut self, sig: &Signature, source: DagId, rebuilt: DagId) {
+        if source == rebuilt {
+            return;
+        }
+        let source_is_normal = {
+            let node = self.dags.get(source);
+            node.reduced_epoch == sig.eq_epoch()
+                && node.nf.is_none()
+                && node.symbol() == self.dags.get(rebuilt).symbol()
+        };
+        if source_is_normal {
+            let node = self.dags.get_mut(rebuilt);
+            node.reduced_epoch = sig.eq_epoch();
+            node.nf = None;
+        }
+    }
+
     pub(crate) fn normalize_for_unify(&mut self, sig: &Signature, dag: DagId) -> DagId {
-        match self.dags.get(dag).term.clone() {
+        let normalized = match self.dags.get(dag).term.clone() {
             NodeTerm::Var { .. } | NodeTerm::Na { .. } => dag,
             NodeTerm::Free { symbol, args } => {
-                let nargs: Vec<DagId> =
-                    args.iter().map(|&a| self.normalize_for_unify(sig, a)).collect();
-                if nargs == args { dag } else { self.make_free(sig, symbol, nargs) }
+                let nargs: Vec<DagId> = args
+                    .iter()
+                    .map(|&a| self.normalize_for_unify(sig, a))
+                    .collect();
+                if nargs == args {
+                    dag
+                } else {
+                    self.make_free(sig, symbol, nargs)
+                }
             }
             NodeTerm::Cui { symbol, args } => {
                 let x = self.normalize_for_unify(sig, args[0]);
                 let y = self.normalize_for_unify(sig, args[1]);
-                self.make_cui(sig, symbol, x, y)
+                self.make_cui_for_unify(sig, symbol, x, y)
             }
             NodeTerm::S { symbol, count, arg } => {
                 let na = self.normalize_for_unify(sig, arg);
@@ -1838,7 +2499,10 @@ impl Runtime {
                 for (e, m) in args {
                     let ne = self.normalize_for_unify(sig, e);
                     match &self.dags.get(ne).term {
-                        NodeTerm::Acu { symbol: inner, args: inner_args } if *inner == symbol => {
+                        NodeTerm::Acu {
+                            symbol: inner,
+                            args: inner_args,
+                        } if *inner == symbol => {
                             for &(ie, im) in inner_args {
                                 flat.push((ie, im * m));
                             }
@@ -1853,7 +2517,10 @@ impl Runtime {
                 for a in args {
                     let na = self.normalize_for_unify(sig, a);
                     match &self.dags.get(na).term {
-                        NodeTerm::Au { symbol: inner, args: inner_args } if *inner == symbol => {
+                        NodeTerm::Au {
+                            symbol: inner,
+                            args: inner_args,
+                        } if *inner == symbol => {
                             flat.extend(inner_args.iter().copied());
                         }
                         _ => flat.push(na),
@@ -1861,22 +2528,33 @@ impl Runtime {
                 }
                 self.make_au(sig, symbol, flat) // flat already spliced; make_au drops identities/collapses
             }
-        }
+        };
+        self.inherit_reduced_status(sig, dag, normalized);
+        normalized
     }
 
     /// The eager ACU canonicalizer used by [`normalize_for_unify`]: sort + **unconditionally** merge
     /// equal elements (summing multiplicities) + collapse, over an already-flattened element list.
-    fn build_acu_eager(&mut self, sig: &Signature, symbol: SymbolId, flat: Vec<(DagId, u32)>) -> DagId {
+    fn build_acu_eager(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        flat: Vec<(DagId, u32)>,
+    ) -> DagId {
         let identity = sig.symbol(symbol).identity();
         let mut flat: Vec<(DagId, u32)> = flat
             .into_iter()
-            .filter(|&(arg, m)| m != 0 && !identity.is_some_and(|id| self.is_constant(arg, id)))
+            .filter(|&(arg, m)| {
+                m != 0 && !identity.is_some_and(|id| self.is_identity(sig, id, arg))
+            })
             .collect();
-        flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
+        flat.sort_by(|&(x, _), &(y, _)| self.dag_compare_for_unify(x, y));
         let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
         for (e, m) in flat {
             match args.last_mut() {
-                Some(last) if last.0 == e || self.dag_compare(last.0, e) == Ordering::Equal => {
+                Some(last)
+                    if last.0 == e || self.dag_compare_for_unify(last.0, e) == Ordering::Equal =>
+                {
                     last.1 += m
                 }
                 _ => args.push((e, m)),
@@ -1885,8 +2563,9 @@ impl Runtime {
         let total: u64 = args.iter().map(|&(_, m)| u64::from(m)).sum();
         match total {
             0 => {
-                let id_sym = identity.expect("an empty ACU multiset requires an identity element");
-                self.make_const(sig, id_sym)
+                let identity =
+                    identity.expect("an empty ACU multiset requires an identity element");
+                self.identity_dag(sig, identity)
             }
             1 => args[0].0,
             _ => {
@@ -1900,36 +2579,60 @@ impl Runtime {
         }
     }
 
-    /// Build a canonical **AU** node for `symbol` from `raw_args` (an ordered argument list). Mirrors
-    /// [`make_acu`](Self::make_acu) for the associative-only theory: flatten arguments that are
-    /// themselves `symbol`-rooted AU nodes (preserving order), drop identity elements, then collapse —
-    /// empty → the identity, a single argument → that argument, else an [`NodeTerm::Au`] node. Order is
-    /// significant, so there is **no** sorting or multiplicity merging.
-    pub(crate) fn make_au(&mut self, sig: &Signature, symbol: SymbolId, raw_args: Vec<DagId>) -> DagId {
-        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Au, "make_au on a non-AU symbol");
-        let identity = sig.symbol(symbol).identity();
-        // Lazy splice, as in make_acu: an UNREDUCED nested same-symbol argument keeps the parse
-        // shape (metaParse returns the nested surface parse; bottom-up reduction sees each level),
-        // and the reduce loop's normal-form rebuild — whose children are then reduced — flattens.
+    /// Build a canonical **AU** node. Two-sided identities vanish anywhere; a one-sided identity
+    /// vanishes only at its legal edge after associative flattening.
+    pub(crate) fn make_au(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        raw_args: Vec<DagId>,
+    ) -> DagId {
+        debug_assert_eq!(
+            sig.symbol(symbol).theory(),
+            Theory::Au,
+            "make_au on a non-AU symbol"
+        );
+        let sym = sig.symbol(symbol);
+        let identity = sym.identity();
+        let left_identity = sym.left_identity();
+        let right_identity = sym.right_identity();
         let epoch = sig.eq_epoch();
         let mut args: Vec<DagId> = Vec::with_capacity(raw_args.len());
         for arg in raw_args {
-            if identity.is_some_and(|id_sym| self.is_constant(arg, id_sym)) {
-                continue; // an identity argument vanishes
+            if identity.is_some_and(|id| self.is_identity(sig, id, arg)) {
+                continue;
             }
             match &self.dags.get(arg).term {
-                NodeTerm::Au { symbol: inner, args: inner_args }
-                    if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch =>
-                {
+                NodeTerm::Au {
+                    symbol: inner,
+                    args: inner_args,
+                } if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch => {
                     args.extend_from_slice(inner_args);
                 }
                 _ => args.push(arg),
             }
         }
+        if identity.is_none() {
+            while args
+                .first()
+                .is_some_and(|&arg| left_identity.is_some_and(|id| self.is_identity(sig, id, arg)))
+            {
+                args.remove(0);
+            }
+            while args
+                .last()
+                .is_some_and(|&arg| right_identity.is_some_and(|id| self.is_identity(sig, id, arg)))
+            {
+                args.pop();
+            }
+        }
         match args.len() {
             0 => {
-                let id_sym = identity.expect("an empty AU sequence requires an identity element");
-                self.make_const(sig, id_sym)
+                let id = identity
+                    .or(left_identity)
+                    .or(right_identity)
+                    .expect("an empty AU sequence requires an identity");
+                self.identity_dag(sig, id)
             }
             1 => args[0],
             _ => {
@@ -1949,44 +2652,91 @@ impl Runtime {
         &mut self,
         sig: &Signature,
         symbol: SymbolId,
+        x: DagId,
+        y: DagId,
+    ) -> DagId {
+        self.make_cui_ordered(sig, symbol, x, y, false)
+    }
+
+    /// The `Term::normalize(true)` path compares variable arguments by name id before slots exist.
+    fn make_cui_for_unify(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        x: DagId,
+        y: DagId,
+    ) -> DagId {
+        self.make_cui_ordered(sig, symbol, x, y, true)
+    }
+
+    fn make_cui_ordered(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
         mut x: DagId,
         mut y: DagId,
+        variables_by_name: bool,
     ) -> DagId {
-        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::Cui, "make_cui on a non-CUI symbol");
-        let identity = sig.symbol(symbol).identity;
-        let idem = sig.symbol(symbol).axioms.idem;
-        if let Some(id_sym) = identity {
-            if self.is_constant(x, id_sym) {
-                return y;
-            }
-            if self.is_constant(y, id_sym) {
-                return x;
-            }
+        debug_assert_eq!(
+            sig.symbol(symbol).theory(),
+            Theory::Cui,
+            "make_cui on a non-CUI symbol"
+        );
+        let sym = sig.symbol(symbol);
+        let idem = sym.axioms.idem;
+        if sym
+            .left_identity()
+            .is_some_and(|id| self.is_identity(sig, id, x))
+        {
+            return y;
         }
-        if idem && self.dag_compare(x, y) == Ordering::Equal {
+        if sym
+            .right_identity()
+            .is_some_and(|id| self.is_identity(sig, id, y))
+        {
             return x;
         }
-        if sig.symbol(symbol).axioms.comm && self.dag_compare(x, y) == Ordering::Greater {
-            std::mem::swap(&mut x, &mut y); // canonical order for commutativity (non-comm CUI:
-                                            // id:/idem-only ops keep positional order)
+        if idem && self.dag_compare_inner(x, y, variables_by_name) == Ordering::Equal {
+            return x;
+        }
+        if sym.axioms.comm && self.dag_compare_inner(x, y, variables_by_name) == Ordering::Greater {
+            std::mem::swap(&mut x, &mut y);
         }
         let sort = sig.compute_sort(symbol, &[self.dags.get(x).sort, self.dags.get(y).sort]);
-        self.alloc_node(sort, NodeTerm::Cui { symbol, args: vec![x, y] })
+        self.alloc_node(
+            sort,
+            NodeTerm::Cui {
+                symbol,
+                args: vec![x, y],
+            },
+        )
     }
 
     /// Build a canonical **S** (`iter`) node `s^count(arg)` (Maude's `S_DagNode::normalizeAtTop`):
     /// `count == 0` collapses to `arg` (`s^0(x) = x`); a nested same-symbol successor flattens
     /// (`s^j(s^k(x)) = s^(j+k)(x)` — one level suffices, the inner node is already normalized); otherwise
     /// an [`NodeTerm::S`] with the periodic least sort ([`compute_s_sort`](Signature::compute_s_sort)).
-    pub(crate) fn make_s(&mut self, sig: &Signature, symbol: SymbolId, count: Nat, arg: DagId) -> DagId {
-        debug_assert_eq!(sig.symbol(symbol).theory(), Theory::S, "make_s on a non-S symbol");
+    pub(crate) fn make_s(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        count: Nat,
+        arg: DagId,
+    ) -> DagId {
+        debug_assert_eq!(
+            sig.symbol(symbol).theory(),
+            Theory::S,
+            "make_s on a non-S symbol"
+        );
         if count.is_zero() {
             return arg;
         }
         let (count, arg) = match &self.dags.get(arg).term {
-            NodeTerm::S { symbol: inner, count: k, arg: inner_arg } if *inner == symbol => {
-                (count.add(k), *inner_arg)
-            }
+            NodeTerm::S {
+                symbol: inner,
+                count: k,
+                arg: inner_arg,
+            } if *inner == symbol => (count.add(k), *inner_arg),
             _ => (count, arg),
         };
         let arg_sort = self.dags.get(arg).sort;
@@ -2018,17 +2768,31 @@ impl Runtime {
         index: u32,
     ) -> DagId {
         let sort = sig.symbol(symbol).decls[0].range;
-        self.alloc_node(sort, NodeTerm::Var { symbol, name, index })
+        self.alloc_node(
+            sort,
+            NodeTerm::Var {
+                symbol,
+                name,
+                index,
+            },
+        )
     }
 
     /// Rebuild a node for `symbol` from `children` (the flattened child sequence), dispatching on the
     /// operator's theory: a free node directly, or a canonical ACU/AU/CUI/S node. Used by `reduce` when a
     /// child changed and by `instantiate`, so neither hard-codes the free constructor (which rejects
     /// theory symbols).
-    pub(crate) fn rebuild(&mut self, sig: &Signature, symbol: SymbolId, children: Vec<DagId>) -> DagId {
+    pub(crate) fn rebuild(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        children: Vec<DagId>,
+    ) -> DagId {
         match sig.symbol(symbol).theory() {
             Theory::Free => self.make_free(sig, symbol, children),
-            Theory::Acu => self.make_acu(sig, symbol, children.into_iter().map(|d| (d, 1)).collect()),
+            Theory::Acu => {
+                self.make_acu(sig, symbol, children.into_iter().map(|d| (d, 1)).collect())
+            }
             Theory::Au => self.make_au(sig, symbol, children),
             Theory::Cui => {
                 debug_assert_eq!(children.len(), 2, "a CUI node is binary");
@@ -2073,6 +2837,16 @@ impl Runtime {
     }
 
     pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
+        self.dag_compare_inner(a, b, false)
+    }
+
+    /// The comparison used while emulating `Term::normalize(true)`, before Maude's
+    /// `indexVariables` pass assigns substitution slots.
+    fn dag_compare_for_unify(&self, a: DagId, b: DagId) -> Ordering {
+        self.dag_compare_inner(a, b, true)
+    }
+
+    fn dag_compare_inner(&self, a: DagId, b: DagId, variables_by_name: bool) -> Ordering {
         if a == b {
             return Ordering::Equal; // same node id — identical, prune
         }
@@ -2096,10 +2870,36 @@ impl Runtime {
         if na.symbol() != nb.symbol()
             && !self.var_ranks.is_empty()
             && na.sort == nb.sort
-            && let (Some(&ra), Some(&rb)) =
-                (self.var_ranks.get(&na.symbol()), self.var_ranks.get(&nb.symbol()))
+            && let (Some(&ra), Some(&rb)) = (
+                self.var_ranks.get(&na.symbol()),
+                self.var_ranks.get(&nb.symbol()),
+            )
         {
             return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
+        }
+        // Genuine variables of different sorts have different per-sort VariableSymbols in Maude.
+        // Within one kind, proper-sort variables precede the synthesized kind-error variable;
+        // among proper sorts, the command driver records the parser-equivalent first-demand order.
+        // These keys keep canonical AC/ACU order stable across a sequence of commands that may have
+        // materialized a kind-error fresh variable before a later proper-sort variable.
+        if na.symbol() != nb.symbol()
+            && matches!(na.term, NodeTerm::Var { .. })
+            && matches!(nb.term, NodeTerm::Var { .. })
+        {
+            if let (Some(&(ka, ea)), Some(&(kb, eb))) = (
+                self.sort_var_meta.get(&na.symbol()),
+                self.sort_var_meta.get(&nb.symbol()),
+            ) && ka == kb
+                && ea != eb
+            {
+                return ea.cmp(&eb).then_with(|| na.symbol().cmp(&nb.symbol()));
+            }
+            if let (Some(&ra), Some(&rb)) = (
+                self.sort_var_ranks.get(&na.symbol()),
+                self.sort_var_ranks.get(&nb.symbol()),
+            ) {
+                return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
+            }
         }
         match na.symbol().cmp(&nb.symbol()) {
             Ordering::Equal => {}
@@ -2109,7 +2909,7 @@ impl Runtime {
         match (&na.term, &nb.term) {
             (NodeTerm::Free { args: xa, .. }, NodeTerm::Free { args: ya, .. }) => {
                 for (&x, &y) in xa.iter().zip(ya.iter()) {
-                    match self.dag_compare(x, y) {
+                    match self.dag_compare_inner(x, y, variables_by_name) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
@@ -2130,7 +2930,7 @@ impl Runtime {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
-                    match self.dag_compare(xe, ye) {
+                    match self.dag_compare_inner(xe, ye, variables_by_name) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
@@ -2146,7 +2946,7 @@ impl Runtime {
                     ord => return ord,
                 }
                 for (&x, &y) in xa.iter().zip(ya.iter()) {
-                    match self.dag_compare(x, y) {
+                    match self.dag_compare_inner(x, y, variables_by_name) {
                         Ordering::Equal => {}
                         ord => return ord,
                     }
@@ -2156,31 +2956,52 @@ impl Runtime {
             // S successor: the scalar `count` is part of identity (not a child), so compare it first,
             // then the argument (Maude's `S_DagNode::compareArguments`). This keeps the order consistent
             // with the `deep_equal` S-arm, so `s^2(0)` and `s^3(0)` order correctly inside an ACU subject.
-            (NodeTerm::S { count: xc, arg: xa, .. }, NodeTerm::S { count: yc, arg: ya, .. }) => {
-                match xc.cmp(yc) {
-                    Ordering::Equal => self.dag_compare(*xa, *ya),
-                    ord => ord,
-                }
-            }
+            (
+                NodeTerm::S {
+                    count: xc, arg: xa, ..
+                },
+                NodeTerm::S {
+                    count: yc, arg: ya, ..
+                },
+            ) => match xc.cmp(yc) {
+                Ordering::Equal => self.dag_compare_inner(*xa, *ya, variables_by_name),
+                ord => ord,
+            },
             // An NA constant orders by its scalar value (consistent with the `deep_equal` Na arm). A string
             // value compares as Maude's `Rope` does — signed bytes (`StringDagNode::compareArguments`), not
             // the derived unsigned byte order — so a high byte orders before an ASCII one.
-            (NodeTerm::Na { value: NaValue::Str(xs), .. }, NodeTerm::Na { value: NaValue::Str(ys), .. }) => {
-                crate::dag::rope_cmp(xs, ys)
-            }
+            (
+                NodeTerm::Na {
+                    value: NaValue::Str(xs),
+                    ..
+                },
+                NodeTerm::Na {
+                    value: NaValue::Str(ys),
+                    ..
+                },
+            ) => crate::dag::rope_cmp(xs, ys),
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
-            // Two variables of the same (per-sort) variable symbol order by their substitution
-            // `index` = the problem's variable slot (first-encounter/creation order): the original
-            // command variables in `lhs, rhs` encounter order, then mid-solve fresh variables in
-            // creation order. This is the order-sorted engine's stable canonical order for ACU/CUI
-            // argument sorting. It deliberately does NOT use the interned name code: over the
-            // standing prelude a command variable's name may be pre-interned at an arbitrary code,
-            // which would scramble the AC subterm order relative to the fresh variables (whose names
-            // are always freshly interned) and permute the enumerated unifiers. Index↔name is a
-            // bijection within a problem (each variable has one slot), so this stays consistent with
-            // `deep_equal` (same index ⟺ same name). Cross-sort variables never reach here (distinct
-            // per-sort symbols, ordered by the SymbolId compare above).
-            (NodeTerm::Var { index: xi, .. }, NodeTerm::Var { index: yi, .. }) => xi.cmp(yi),
+            // `VariableTerm`/`VariableDagNode::compareArguments` uses the interned name id. During
+            // ordinary DAG solving, slot order remains the established canonical approximation;
+            // only pre-index term normalization selects the reference's name-id ordering.
+            (
+                NodeTerm::Var {
+                    name: xn,
+                    index: xi,
+                    ..
+                },
+                NodeTerm::Var {
+                    name: yn,
+                    index: yi,
+                    ..
+                },
+            ) => {
+                if variables_by_name {
+                    xn.cmp(yn)
+                } else {
+                    xi.cmp(yi)
+                }
+            }
             _ => unreachable!("equal top symbols must share a NodeTerm arm"),
         }
     }
@@ -2207,11 +3028,12 @@ impl Runtime {
         RootGuard::new(&self.roots, id)
     }
 
-    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`
-    /// (see [`Engine::gc`]); returns the number reclaimed.
+    /// Collect every DAG node not reachable from a live [`RootGuard`], an engine-lifetime identity
+    /// cache entry, or from `extra_roots` (see [`Engine::gc`]); returns the number reclaimed.
     pub(crate) fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
         self.dags.clear_marks();
         self.mark_registered_roots();
+        self.mark_identity_roots();
         for root in extra_roots {
             self.mark_reachable(root);
         }
@@ -2224,6 +3046,14 @@ impl Runtime {
         let pinned: Vec<DagId> = self.roots.borrow().live_roots().collect();
         for r in pinned {
             self.mark_reachable(r);
+        }
+    }
+
+    /// Mark the normalized identity DAG cache, whose entries are permanent runtime roots.
+    fn mark_identity_roots(&mut self) {
+        let identity_roots: Vec<DagId> = self.identity_dags.values().copied().collect();
+        for d in identity_roots {
+            self.mark_reachable(d);
         }
     }
 
@@ -2242,12 +3072,9 @@ impl Runtime {
     fn safe_point_gc(&mut self, frames: &[ReduceFrame], child_result: Option<DagId>) {
         self.dags.clear_marks();
         self.mark_registered_roots();
-        // The cached identity dags are engine-lifetime roots: collapse matches bind variables to them
+        // Cached identity DAGs are engine-lifetime roots: collapse matches bind variables to them
         // (and their reduced stamps are load-bearing), so they must survive every collection.
-        let identity_roots: Vec<DagId> = self.identity_dags.values().copied().collect();
-        for d in identity_roots {
-            self.mark_reachable(d);
-        }
+        self.mark_identity_roots();
         for frame in frames {
             self.mark_reachable(frame.original);
             // `start` is the node this frame will memoize at completion (C7 forwarding). Once the frame
@@ -2327,6 +3154,8 @@ impl Runtime {
     }
     pub(crate) fn reset_rewrites(&mut self) {
         self.rewrite_count = 0;
+        self.variant_narrowing_count = 0;
+        self.narrowing_count = 0;
     }
     /// Add `n` to the rewrite counter (a META-LEVEL descent function folding the object-level
     /// reduction's rewrites into the current command's total).
@@ -2374,7 +3203,9 @@ impl Runtime {
 
             // Deliver a completed child into its strategy position and advance the strategy cursor.
             if let Some(r) = child_result.take() {
-                let f = stack.last_mut().expect("child result with empty reduce stack");
+                let f = stack
+                    .last_mut()
+                    .expect("child result with empty reduce stack");
                 let pos = sig
                     .strat_position(f.symbol, f.cursor, f.orig.len())
                     .expect("delivering a child means a strategy step was in progress");
@@ -2410,7 +3241,10 @@ impl Runtime {
             // every arg (each refined at its own normal-form point), and a membership-free module never
             // changes a sort, so both keep the unchanged hot path. Already-reduced args no-op (guarded).
             if !sig.memberships.is_empty()
-                && sig.symbol(stack.last().expect("empty reduce stack").symbol).strategy.is_some()
+                && sig
+                    .symbol(stack.last().expect("empty reduce stack").symbol)
+                    .strategy
+                    .is_some()
             {
                 let args = stack.last().expect("empty reduce stack").args.clone();
                 let mut seen = HashSet::new();
@@ -2435,7 +3269,11 @@ impl Runtime {
                 }
                 // `mem::take` moves the args out (no clone) — the frame is about to be reused or popped,
                 // so its `args` is no longer needed.
-                let args = if changed { std::mem::take(&mut f.args) } else { Vec::new() };
+                let args = if changed {
+                    std::mem::take(&mut f.args)
+                } else {
+                    Vec::new()
+                };
                 (f.symbol, f.original, args, changed)
             };
             let rebuilt = if !changed {
@@ -2589,8 +3427,11 @@ impl Runtime {
     /// Attach reconstructed whole-before/after terms to the most-recently recorded `Rewrite` event (the
     /// top rewrite `try_equations`/`try_special` just recorded).
     fn patch_whole(&mut self, before: DagId, after: DagId) {
-        if let Some(TraceEvent::Rewrite { whole_before, whole_after, .. }) =
-            self.trace.as_mut().and_then(|b| b.last_mut())
+        if let Some(TraceEvent::Rewrite {
+            whole_before,
+            whole_after,
+            ..
+        }) = self.trace.as_mut().and_then(|b| b.last_mut())
         {
             *whole_before = Some(before);
             *whole_after = Some(after);
@@ -2661,8 +3502,10 @@ impl Runtime {
         // sub-multiset (ACU), a contiguous sub-sequence (AU), a successor prefix `s^k` of an `s^n`
         // subject (S), or — for a CUI op with identity — a single argument via pattern collapse,
         // leaving a residue to splice back. The free theory matches the whole node.
-        let ext_allowed =
-            matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S | Theory::Cui);
+        let ext_allowed = matches!(
+            sig.symbol(symbol).theory(),
+            Theory::Acu | Theory::Au | Theory::S | Theory::Cui
+        );
         let eqs = sig.equations.get(&symbol)?;
         // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
         // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
@@ -2708,7 +3551,12 @@ impl Runtime {
                 eq.rhs_shares,
                 ext_allowed,
                 &mut subst,
-                StmtCtx { kind: StmtKind::Equation, stmt_id: eq.id, frames, redex: id },
+                StmtCtx {
+                    kind: StmtKind::Equation,
+                    stmt_id: eq.id,
+                    frames,
+                    redex: id,
+                },
                 &mut |_, _| Flow::Stop,
             );
             if r.is_some() {
@@ -2770,10 +3618,21 @@ impl Runtime {
                         bindings,
                     });
                 }
-                let holds =
-                    self.condition_holds(sig, condition, subst, ctx.kind, ctx.stmt_id, ctx.frames, ctx.redex);
+                let holds = self.condition_holds(
+                    sig,
+                    condition,
+                    subst,
+                    ctx.kind,
+                    ctx.stmt_id,
+                    ctx.frames,
+                    ctx.redex,
+                );
                 if self.tracing() {
-                    self.record(TraceEvent::TrialEnd { kind: ctx.kind, depth, success: holds });
+                    self.record(TraceEvent::TrialEnd {
+                        kind: ctx.kind,
+                        depth,
+                        success: holds,
+                    });
                 }
                 if !holds {
                     continue;
@@ -2847,7 +3706,10 @@ impl Runtime {
         }
         // Rules of ACU/AU/S symbols match *modulo* the axioms with extension (a sub-multiset / contiguous
         // sub-sequence / successor prefix), exactly as equations do (try_rewrite_top).
-        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
+        let ext_allowed = matches!(
+            sig.symbol(symbol).theory(),
+            Theory::Acu | Theory::Au | Theory::S
+        );
         let start = (*cursors.get(&symbol).unwrap_or(&0) as usize) % n;
         let mut subst = Subst::new();
         for k in 0..n {
@@ -2855,8 +3717,10 @@ impl Runtime {
             let rule = &rules[idx];
             // Skip rules outside the requested `erewrite` class (object-message vs leftOver).
             match filter {
-                Some(RuleFilter::ObjectMessage) if !matches!(rule.oo, OoRuleKind::ObjectMessage(_)) => {
-                    continue
+                Some(RuleFilter::ObjectMessage)
+                    if !matches!(rule.oo, OoRuleKind::ObjectMessage(_)) =>
+                {
+                    continue;
                 }
                 Some(RuleFilter::LeftOver) if rule.oo != OoRuleKind::LeftOver => continue,
                 _ => {}
@@ -2874,7 +3738,12 @@ impl Runtime {
                 rule.rhs_shares,
                 ext_allowed,
                 &mut subst,
-                StmtCtx { kind: StmtKind::Rule, stmt_id: rule.id, frames: &[], redex: node },
+                StmtCtx {
+                    kind: StmtKind::Rule,
+                    stmt_id: rule.id,
+                    frames: &[],
+                    redex: node,
+                },
                 &mut |_, _| Flow::Stop,
             );
             if let Some(result) = r {
@@ -2898,7 +3767,11 @@ impl Runtime {
         root: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
     ) -> Option<DagId> {
-        let mut stack = vec![RedexPos { node: root, parent: usize::MAX, arg_index: 0 }];
+        let mut stack = vec![RedexPos {
+            node: root,
+            parent: usize::MAX,
+            arg_index: 0,
+        }];
         let mut next_to_explore = 0usize;
         let mut i = 0usize;
         loop {
@@ -2917,9 +3790,13 @@ impl Runtime {
                     for (ai, c) in children.into_iter().enumerate() {
                         if sig.symbol(sym).is_frozen_arg(ai) {
                             continue; // frozen blocks rule application below (same check as frewrite;
-                                      // equational reduction is untouched — §3.9.2)
+                            // equational reduction is untouched — §3.9.2)
                         }
-                        stack.push(RedexPos { node: c, parent: parent_idx, arg_index: ai });
+                        stack.push(RedexPos {
+                            node: c,
+                            parent: parent_idx,
+                            arg_index: ai,
+                        });
                     }
                     next_to_explore += 1;
                     if stack.len() > before {
@@ -2942,7 +3819,13 @@ impl Runtime {
     /// Rebuild the path from a rewritten position up to the root: starting at stack position `leaf_idx`
     /// with `new_node` in place, reconstruct each ancestor with the one argument leading to the redex
     /// replaced (Maude's chained `copyWithReplacement`). Ancestors' other children stay shared.
-    fn rebuild_path(&mut self, sig: &Signature, stack: &[RedexPos], leaf_idx: usize, new_node: DagId) -> DagId {
+    fn rebuild_path(
+        &mut self,
+        sig: &Signature,
+        stack: &[RedexPos],
+        leaf_idx: usize,
+        new_node: DagId,
+    ) -> DagId {
         let mut node = new_node;
         let mut idx = leaf_idx;
         while stack[idx].parent != usize::MAX {
@@ -2964,7 +3847,11 @@ impl Runtime {
     /// (first applicable), this enumerates all rules × all matcher solutions at all positions.
     fn state_successors(&mut self, sig: &Signature, root: DagId, out: &mut Vec<(u32, DagId)>) {
         // Enumerate all non-frozen positions (a flattened parent/arg-index list for the path rebuild).
-        let mut positions = vec![RedexPos { node: root, parent: usize::MAX, arg_index: 0 }];
+        let mut positions = vec![RedexPos {
+            node: root,
+            parent: usize::MAX,
+            arg_index: 0,
+        }];
         let mut i = 0;
         while i < positions.len() {
             let node = positions[i].node;
@@ -2972,7 +3859,11 @@ impl Runtime {
             let children: Vec<DagId> = self.node(node).children().collect();
             for (ai, c) in children.into_iter().enumerate() {
                 if !sig.symbol(symbol).is_frozen_arg(ai) {
-                    positions.push(RedexPos { node: c, parent: i, arg_index: ai });
+                    positions.push(RedexPos {
+                        node: c,
+                        parent: i,
+                        arg_index: ai,
+                    });
                 }
             }
             i += 1;
@@ -2997,7 +3888,10 @@ impl Runtime {
         let Some(rules) = sig.rules.get(&symbol) else {
             return;
         };
-        let ext_allowed = matches!(sig.symbol(symbol).theory(), Theory::Acu | Theory::Au | Theory::S);
+        let ext_allowed = matches!(
+            sig.symbol(symbol).theory(),
+            Theory::Acu | Theory::Au | Theory::S
+        );
         let mut subst = Subst::new();
         for rule in rules {
             let rid = rule.id;
@@ -3011,7 +3905,12 @@ impl Runtime {
                 rule.rhs_shares,
                 ext_allowed,
                 &mut subst,
-                StmtCtx { kind: StmtKind::Rule, stmt_id: rule.id, frames: &[], redex: node },
+                StmtCtx {
+                    kind: StmtKind::Rule,
+                    stmt_id: rule.id,
+                    frames: &[],
+                    redex: node,
+                },
                 &mut |_rt, result| {
                     // The rewrite is counted (and the state reduced) by `reduce_successor` when the
                     // search commits this successor — so the per-state count snapshot stays interleaved.
@@ -3089,7 +3988,9 @@ impl Runtime {
                 // (the `rem`/`=/=` etc.): Maude bills those to the solution the condition admits, so the
                 // per-solution `rewrites:` count includes the condition evaluation (fable-audit.md §3.3
                 // B2a). An empty condition is 0-cost, so this equals the discovery count.
-                let bindings = (0..nr_vars).map(|k| subst.get(k).expect("goal variable bound")).collect();
+                let bindings = (0..nr_vars)
+                    .map(|k| subst.get(k).expect("goal variable bound"))
+                    .collect();
                 solutions.push((bindings, self.rewrites()));
             }
         }
@@ -3168,9 +4069,21 @@ impl Runtime {
 
     /// Record the end of solving condition fragment `index` (Maude's `traceEndFragment`): the fragment
     /// text again, plus — on success — the substitution after it (`Var --> binding` lines).
-    fn end_fragment(&mut self, kind: StmtKind, stmt_id: u32, index: usize, depth: u32, success: bool, subst: &Subst) {
+    fn end_fragment(
+        &mut self,
+        kind: StmtKind,
+        stmt_id: u32,
+        index: usize,
+        depth: u32,
+        success: bool,
+        subst: &Subst,
+    ) {
         if self.tracing() {
-            let bindings = if success { Self::snapshot_subst(subst) } else { Vec::new() };
+            let bindings = if success {
+                Self::snapshot_subst(subst)
+            } else {
+                Vec::new()
+            };
             self.record(TraceEvent::FragmentEnd {
                 kind,
                 stmt_id,
@@ -3188,9 +4101,28 @@ impl Runtime {
     /// unwinds through it instead, so we reproduce just the trace events here — a `re-solving` +
     /// `failure for condition fragment` pair. **Trace-only**: it never affects the search, the rewrite
     /// count, or the bindings (a deterministic re-solve does no reduction). No-op when not tracing.
-    fn trace_deterministic_backtrack(&mut self, kind: StmtKind, stmt_id: u32, i: usize, depth: u32) {
-        self.record(TraceEvent::FragmentStart { kind, stmt_id, index: i as u32, depth, first_attempt: false });
-        self.record(TraceEvent::FragmentEnd { kind, stmt_id, index: i as u32, depth, success: false, bindings: Vec::new() });
+    fn trace_deterministic_backtrack(
+        &mut self,
+        kind: StmtKind,
+        stmt_id: u32,
+        i: usize,
+        depth: u32,
+    ) {
+        self.record(TraceEvent::FragmentStart {
+            kind,
+            stmt_id,
+            index: i as u32,
+            depth,
+            first_attempt: false,
+        });
+        self.record(TraceEvent::FragmentEnd {
+            kind,
+            stmt_id,
+            index: i as u32,
+            depth,
+            success: false,
+            bindings: Vec::new(),
+        });
     }
 
     /// Satisfy `condition[i..]` under `subst`, backtracking (Maude's `solveCondition`): an **equality**
@@ -3270,7 +4202,11 @@ impl Runtime {
                 self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
                 false
             }
-            CompiledFragment::Matching { pattern, subject, fresh_vars } => {
+            CompiledFragment::Matching {
+                pattern,
+                subject,
+                fresh_vars,
+            } => {
                 let subj = self.instantiate(sig, subject, subst);
                 self.condition_depth += 1;
                 let subj = self.reduce(sig, subj, &mut NullDescent);
@@ -3324,14 +4260,20 @@ impl Runtime {
                 }
                 satisfied
             }
-            CompiledFragment::Rewrite { lhs, pattern, fresh_vars } => {
+            CompiledFragment::Rewrite {
+                lhs,
+                pattern,
+                fresh_vars,
+            } => {
                 // Instantiate + reduce the search origin, then explore its `=>*` reachable states for a
                 // matching `pattern` that lets the rest of the condition succeed (Pillar A-v).
                 let start = self.instantiate(sig, lhs, subst);
                 self.condition_depth += 1;
                 let start = self.reduce(sig, start, &mut NullDescent);
                 self.condition_depth -= 1;
-                self.solve_rewrite_condition(sig, start, pattern, fresh_vars, subst, condition, i, kind, stmt_id, depth)
+                self.solve_rewrite_condition(
+                    sig, start, pattern, fresh_vars, subst, condition, i, kind, stmt_id, depth,
+                )
             }
         }
     }
@@ -3449,15 +4391,30 @@ impl Engine {
             .symbols
             .iter()
             .find(|(_, s)| s.theory() == Theory::Acu && s.decls[0].range == attr_set_sort)?;
-        let none_sym = assym.identity();
+        let none_sym = assym
+            .identity()
+            .and_then(|identity| self.sig.identity_constant(identity));
         let class_sorts = self.sig.sorts.strict_subsorts(cid_sort);
-        Some(OoInfo { object_ctor, attr_set_sym, attr_set_sort, none_sym, cid_sort, class_sorts })
+        Some(OoInfo {
+            object_ctor,
+            attr_set_sym,
+            attr_set_sort,
+            none_sym,
+            cid_sort,
+            class_sorts,
+        })
     }
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Module-wide lower bound for substitution layouts. Narrowing places state variables at or
+    /// above this index so statement construction/protected slots remain reserved.
+    pub fn minimum_substitution_size(&self) -> usize {
+        self.sig.minimum_substitution_size
     }
 
     /// Shared access to the immutable signature half (sorts/symbols/equations). Used by the matcher
@@ -3539,11 +4496,30 @@ impl Engine {
         self.sig.set_frozen(sym, raw);
     }
 
+    pub(crate) fn is_frozen_arg(&self, sym: SymbolId, arg: usize) -> bool {
+        self.sig.symbol(sym).is_frozen_arg(arg)
+    }
+
     /// Record the object-system role of `sym` (`config`/`obj`/`msg`/`portal` attributes, Pillar 2.5).
     /// Inert for `reduce`/`rewrite`/`frewrite`/`search` (the `config` `__` stays an ordinary ACU soup);
     /// the flags drive the `erewrite` object-message scheduler's soup partition (Phase 2.5-B).
-    pub fn set_oo_flags(&mut self, sym: SymbolId, config: bool, object: bool, message: bool, portal: bool) {
-        self.sig.set_oo_flags(sym, OoFlags { config, object, message, portal });
+    pub fn set_oo_flags(
+        &mut self,
+        sym: SymbolId,
+        config: bool,
+        object: bool,
+        message: bool,
+        portal: bool,
+    ) {
+        self.sig.set_oo_flags(
+            sym,
+            OoFlags {
+                config,
+                object,
+                message,
+                portal,
+            },
+        );
     }
 
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user
@@ -3560,13 +4536,95 @@ impl Engine {
         self.sig.symbols.get_mut(sym).class = class;
     }
 
-    /// Record a **one-sided** identity (`left id:` / `right id:`) on `sym` for the symbolic
-    /// engine. Deliberately does NOT touch [`Symbol`]'s two-sided `identity`: construction-time
-    /// collapse of one-sided identities stays in the frontend (fable-audit §3.4), so
-    /// reduction/matching behavior is unchanged — only unification consults this (the CUI collapse
-    /// alternatives; the associative-with-one-sided-id unimplemented-theory screen).
-    pub fn set_one_sided_identity(&mut self, sym: SymbolId, side: IdentitySide, id_const: SymbolId) {
-        self.sig.symbols.get_mut(sym).one_sided_id = Some((side, id_const));
+    /// Reserve a two-sided identity slot before the ground term is parsed. This supports mutually
+    /// referring operator declarations without degrading identity terms to name lookups.
+    pub fn reserve_identity(&mut self, sym: SymbolId, sort: SortId) {
+        let identity = self.sig.reserve_identity(sort);
+        self.sig.symbols.get_mut(sym).identity = Some(identity);
+    }
+
+    /// Reserve a one-sided identity slot before its ground term is parsed.
+    pub fn reserve_one_sided_identity(&mut self, sym: SymbolId, side: IdentitySide, sort: SortId) {
+        let identity = self.sig.reserve_identity(sort);
+        self.sig.symbols.get_mut(sym).one_sided_id = Some((side, identity));
+    }
+
+    /// Install the parsed ground term into a previously reserved identity slot.
+    pub fn set_identity_term(&mut self, sym: SymbolId, term: Term) {
+        let identity = self
+            .sig
+            .symbol(sym)
+            .identity()
+            .expect("identity slot not reserved");
+        assert!(term.is_ground(), "identity term must be ground");
+        let sort = self.sig.term_sort(&term);
+        *self.sig.identities.get_mut(identity) = Identity {
+            term: Some(term),
+            sort,
+        };
+    }
+
+    /// Install the parsed ground term into a previously reserved one-sided identity slot.
+    pub fn set_one_sided_identity_term(&mut self, sym: SymbolId, term: Term) {
+        let identity = self
+            .sig
+            .symbol(sym)
+            .one_sided_id
+            .expect("one-sided identity slot not reserved")
+            .1;
+        assert!(term.is_ground(), "identity term must be ground");
+        let sort = self.sig.term_sort(&term);
+        *self.sig.identities.get_mut(identity) = Identity {
+            term: Some(term),
+            sort,
+        };
+    }
+
+    /// Materialize every installed identity as a normalized permanent DAG after module construction.
+    pub fn prepare_identities(&mut self) {
+        let identities: HashSet<IdentityId> = self
+            .sig
+            .symbols_iter()
+            .flat_map(|(_, sym)| {
+                sym.identity
+                    .into_iter()
+                    .chain(sym.one_sided_id.map(|(_, identity)| identity))
+            })
+            .collect();
+        let (sig, rt) = (&self.sig, &mut self.rt);
+        for identity in identities {
+            rt.identity_dag(sig, identity);
+        }
+    }
+    /// Retain a `SuccSymbol`'s `zeroTerm`. A raw term-hook lookup is name/arity-only; select the
+    /// same-name zero declaration whose range belongs to the successor's domain kind.
+    pub fn register_succ_zero(&mut self, succ: SymbolId, proposed: SymbolId) -> SymbolId {
+        let domain = self.sig.symbol(succ).decls()[0].domain[0];
+        let name = self.sig.symbol(proposed).name().to_string();
+        let zero = self
+            .sig
+            .symbols_iter()
+            .find_map(|(id, symbol)| {
+                (symbol.name() == name
+                    && symbol.decls().iter().any(|decl| {
+                        decl.domain.is_empty() && self.sig.sorts.leq(decl.range, domain)
+                    }))
+                .then_some(id)
+            })
+            .unwrap_or(proposed);
+        self.sig.succ_zeros.insert(succ, zero);
+        zero
+    }
+
+    /// Constant-only compatibility API used by hand-built kernel tests.
+    pub fn set_one_sided_identity(
+        &mut self,
+        sym: SymbolId,
+        side: IdentitySide,
+        id_const: SymbolId,
+    ) {
+        let identity = self.sig.constant_identity(id_const);
+        self.sig.symbols.get_mut(sym).one_sided_id = Some((side, identity));
     }
 
     /// The per-sort variable symbol backing genuine `Var` leaves — Maude's
@@ -3575,14 +4633,68 @@ impl Engine {
     /// creation order is observable through `dag_compare`'s SymbolId ordering between distinct
     /// variable symbols, exactly like Maude's symbol indices. Named after its sort (like Maude);
     /// never entered in any frontend name table, so it cannot collide with user operators.
+    /// Record the first-demand order of per-sort variable symbols recovered by command
+    /// normalization. Existing ranks are permanent, as in Maude's module-level symbol cache;
+    /// newly encountered sorts append in the supplied order. The slice is then restored to that
+    /// module-lifetime order: its input traversal came from an already-canonical command DAG whose
+    /// child order can itself reflect symbols materialized by earlier commands.
+    fn rank_term_variable_sorts(&mut self, terms: &[&Term]) {
+        fn collect(term: &Term, sorts: &mut Vec<SortId>) {
+            match term {
+                Term::Var(v) => {
+                    if !sorts.contains(&v.sort) {
+                        sorts.push(v.sort);
+                    }
+                }
+                Term::Op { args, .. } => {
+                    for arg in args {
+                        collect(arg, sorts);
+                    }
+                }
+                Term::Iter { arg, .. } => collect(arg, sorts),
+                Term::Na { .. } => {}
+            }
+        }
+
+        let mut sorts = Vec::new();
+        for term in terms {
+            collect(term, &mut sorts);
+        }
+        self.rank_variable_sorts(&mut sorts);
+    }
+
+    pub(crate) fn rank_variable_sorts(&mut self, sorts: &mut [SortId]) {
+        let mut next = self
+            .rt
+            .sort_var_ranks
+            .values()
+            .copied()
+            .max()
+            .map_or(0, |r| r + 1);
+        for &sort in sorts.iter() {
+            let sym = self.variable_symbol(sort);
+            if !self.rt.sort_var_ranks.contains_key(&sym) {
+                self.rt.sort_var_ranks.insert(sym, next);
+                next += 1;
+            }
+        }
+        sorts.sort_by_key(|sort| {
+            let sym = self.sig.var_symbols[sort];
+            self.rt.sort_var_ranks[&sym]
+        });
+    }
     pub fn variable_symbol(&mut self, sort: SortId) -> SymbolId {
+        let kind = self.sig.sorts().kind_of(sort);
+        let is_error = self.sig.sorts().sort(sort).is_error;
         if let Some(&sym) = self.sig.var_symbols.get(&sort) {
+            self.rt.sort_var_meta.entry(sym).or_insert((kind, is_error));
             return sym;
         }
         let name = self.sig.sorts().name(sort).to_string();
         let sym = self.sig.add_op(name, vec![], sort);
         self.sig.symbols.get_mut(sym).class = SymbolClass::SortVariable;
         self.sig.var_symbols.insert(sort, sym);
+        self.rt.sort_var_meta.insert(sym, (kind, is_error));
         sym
     }
 
@@ -3598,6 +4710,114 @@ impl Engine {
     /// `Term::normalize(true)` the `unify` command applies to each unificand before solving.
     pub fn normalize_for_unify(&mut self, dag: DagId) -> DagId {
         self.rt.normalize_for_unify(&self.sig, dag)
+    }
+
+    /// Carry the current-epoch self-normal stamp across a semantics-preserving alpha rebuild.
+    pub(crate) fn inherit_reduced_status(&mut self, source: DagId, rebuilt: DagId) {
+        self.rt
+            .inherit_reduced_status(&self.sig, source, rebuilt);
+    }
+
+    pub(crate) fn reduction_cache_state(&self, dag: DagId) -> (bool, bool) {
+        let node = self.rt.dags.get(dag);
+        (
+            node.reduced_epoch == self.sig.eq_epoch(),
+            node.nf.is_some(),
+        )
+    }
+
+    /// Rebuild a symbolic DAG with each original variable slot replaced by `new_slots[old_slot]`.
+    /// Unification calls this after theory normalization: Maude normalizes each static `Term` before
+    /// `indexVariables`, so commutative canonical order—not parser encounter order—defines the visible
+    /// substitution slots. The iterative postorder walk preserves sharing and compact `S` counts.
+    pub(crate) fn remap_variable_slots(&mut self, root: DagId, new_slots: &[u32]) -> DagId {
+        #[derive(Clone)]
+        enum Shape {
+            Free(SymbolId, Vec<DagId>),
+            Acu(SymbolId, Vec<(DagId, u32)>),
+            Au(SymbolId, Vec<DagId>),
+            Cui(SymbolId, DagId, DagId),
+            S(SymbolId, Nat, DagId),
+            Na,
+            Var(SymbolId, u32, u32),
+        }
+
+        let mut rebuilt: HashMap<DagId, DagId> = HashMap::new();
+        let mut work = vec![(root, false)];
+        while let Some((id, expanded)) = work.pop() {
+            if rebuilt.contains_key(&id) {
+                continue;
+            }
+            let shape = match &self.rt.dags.get(id).term {
+                NodeTerm::Free { symbol, args } => Shape::Free(*symbol, args.clone()),
+                NodeTerm::Acu { symbol, args } => Shape::Acu(*symbol, args.clone()),
+                NodeTerm::Au { symbol, args } => Shape::Au(*symbol, args.clone()),
+                NodeTerm::Cui { symbol, args } => Shape::Cui(*symbol, args[0], args[1]),
+                NodeTerm::S { symbol, count, arg } => Shape::S(*symbol, count.clone(), *arg),
+                NodeTerm::Na { .. } => Shape::Na,
+                NodeTerm::Var {
+                    symbol,
+                    name,
+                    index,
+                } => Shape::Var(*symbol, *name, *index),
+            };
+            if !expanded {
+                work.push((id, true));
+                match &shape {
+                    Shape::Free(_, args) | Shape::Au(_, args) => {
+                        work.extend(args.iter().rev().map(|&child| (child, false)));
+                    }
+                    Shape::Acu(_, args) => {
+                        work.extend(args.iter().rev().map(|&(child, _)| (child, false)));
+                    }
+                    Shape::Cui(_, x, y) => {
+                        work.push((*y, false));
+                        work.push((*x, false));
+                    }
+                    Shape::S(_, _, arg) => work.push((*arg, false)),
+                    Shape::Na | Shape::Var(_, _, _) => {}
+                }
+                continue;
+            }
+            let map_child = |child: DagId| {
+                *rebuilt
+                    .get(&child)
+                    .expect("postorder child must be rebuilt")
+            };
+            let new = match shape {
+                Shape::Free(symbol, args) => {
+                    let args = args.into_iter().map(map_child).collect();
+                    self.rt.make_free(&self.sig, symbol, args)
+                }
+                Shape::Acu(symbol, args) => {
+                    let args = args
+                        .into_iter()
+                        .map(|(child, mult)| (map_child(child), mult))
+                        .collect();
+                    self.rt.make_acu(&self.sig, symbol, args)
+                }
+                Shape::Au(symbol, args) => {
+                    let args = args.into_iter().map(map_child).collect();
+                    self.rt.make_au(&self.sig, symbol, args)
+                }
+                Shape::Cui(symbol, x, y) => {
+                    self.rt
+                        .make_cui(&self.sig, symbol, map_child(x), map_child(y))
+                }
+                Shape::S(symbol, count, arg) => {
+                    self.rt.make_s(&self.sig, symbol, count, map_child(arg))
+                }
+                Shape::Na => id,
+                Shape::Var(symbol, name, old_slot) => {
+                    self.rt
+                        .make_var(&self.sig, symbol, name, new_slots[old_slot as usize])
+                }
+            };
+            self.rt
+                .inherit_reduced_status(&self.sig, id, new);
+            rebuilt.insert(id, new);
+        }
+        rebuilt[&root]
     }
 
     /// A fresh, distinct ground constant of `sort`. The irredundant filter
@@ -3654,12 +4874,18 @@ impl Engine {
         idem: bool,
         identity: Option<SymbolId>,
     ) -> SymbolId {
-        self.sig.add_op_cui(name, domain, range, comm, idem, identity)
+        self.sig
+            .add_op_cui(name, domain, range, comm, idem, identity)
     }
 
     /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Must be
     /// unary; its nodes (built via [`make_iter`](Self::make_iter)) store `s^count(arg)` compactly.
-    pub fn add_op_iter(&mut self, name: impl Into<String>, domain: Vec<SortId>, range: SortId) -> SymbolId {
+    pub fn add_op_iter(
+        &mut self,
+        name: impl Into<String>,
+        domain: Vec<SortId>,
+        range: SortId,
+    ) -> SymbolId {
         self.sig.add_op_iter(name, domain, range)
     }
     pub fn symbol(&self, id: SymbolId) -> &Symbol {
@@ -3669,7 +4895,12 @@ impl Engine {
     /// The `(domain, range)` of each of `sym`'s operator declarations (one per ad-hoc/subsort overload).
     /// The META-LEVEL `maximalAritySet` descent reads these to find an operator's maximal argument sorts.
     pub fn symbol_declarations(&self, id: SymbolId) -> Vec<(Vec<SortId>, SortId)> {
-        self.sig.symbol(id).decls().iter().map(|d| (d.domain.clone(), d.range)).collect()
+        self.sig
+            .symbol(id)
+            .decls()
+            .iter()
+            .map(|d| (d.domain.clone(), d.range))
+            .collect()
     }
 
     /// The kind (connected component) of `sym`'s result — its first declaration's range kind. Used by the
@@ -3705,6 +4936,14 @@ impl Engine {
         self.rt.make_const(&self.sig, symbol)
     }
 
+    pub(crate) fn make_identity(&mut self, identity: IdentityId) -> DagId {
+        self.rt.identity_dag(&self.sig, identity)
+    }
+
+    pub(crate) fn is_identity(&self, identity: IdentityId, dag: DagId) -> bool {
+        self.rt.is_identity(&self.sig, identity, dag)
+    }
+
     /// Build a canonical **ACU** node for an `assoc comm [id:]` operator from `(element, multiplicity)`
     /// pairs (see [`Runtime::make_acu`]). The result is in AC(+U) normal form — flattened, identity
     /// dropped, equal elements merged, canonically ordered — and may collapse to a single element or
@@ -3712,10 +4951,22 @@ impl Engine {
     pub fn make_acu(&mut self, symbol: SymbolId, args: Vec<(DagId, u32)>) -> DagId {
         self.rt.make_acu(&self.sig, symbol, args)
     }
+
+    pub(crate) fn make_acu_preserving_order(
+        &mut self,
+        symbol: SymbolId,
+        args: Vec<(DagId, u32)>,
+    ) -> DagId {
+        self.rt.make_acu_preserving_order(&self.sig, symbol, args)
+    }
     /// Convenience for [`make_acu`](Self::make_acu) from a flat list of elements (each multiplicity 1):
     /// `make_ac(plus, vec![a, b, c])` builds the canonical `a + b + c`.
     pub fn make_ac(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
-        self.rt.make_acu(&self.sig, symbol, elements.into_iter().map(|e| (e, 1)).collect())
+        self.rt.make_acu(
+            &self.sig,
+            symbol,
+            elements.into_iter().map(|e| (e, 1)).collect(),
+        )
     }
 
     /// Build a canonical **AU** node for an `assoc [id:]` operator from an ordered element list (see
@@ -3741,7 +4992,12 @@ impl Engine {
     /// As [`make_iter`](Self::make_iter) with an arbitrary-precision decimal count — the frontend's
     /// bignum numeral / `s_^k` literal bridge (`1267650600228229401496703205376` builds directly;
     /// the kernel count is a bignum [`Nat`] natively). `None` if `count` is not a decimal numeral.
-    pub fn make_iter_decimal(&mut self, symbol: SymbolId, count: &str, arg: DagId) -> Option<DagId> {
+    pub fn make_iter_decimal(
+        &mut self,
+        symbol: SymbolId,
+        count: &str,
+        arg: DagId,
+    ) -> Option<DagId> {
         let n = crate::num::Int::from_string_base(10, count)?;
         if n.is_negative() {
             return None;
@@ -3752,15 +5008,18 @@ impl Engine {
     /// Build a string-literal NA node (the `<Strings>` `StringSymbol`, B3.6); `symbol` is an arity-0
     /// string-constant operator. The value is a raw byte sequence (Maude strings are bytes, not UTF-8).
     pub fn make_string(&mut self, symbol: SymbolId, value: &[u8]) -> DagId {
-        self.rt.make_na(&self.sig, symbol, NaValue::Str(value.into()))
+        self.rt
+            .make_na(&self.sig, symbol, NaValue::Str(value.into()))
     }
     /// Build a quoted-identifier NA node (the `<Qids>` `QuotedIdentifierSymbol`, B3.6).
     pub fn make_qid(&mut self, symbol: SymbolId, value: &str) -> DagId {
-        self.rt.make_na(&self.sig, symbol, NaValue::Qid(value.into()))
+        self.rt
+            .make_na(&self.sig, symbol, NaValue::Qid(value.into()))
     }
     /// Build a float NA node (the `<Floats>` `FloatSymbol`, B3.7).
     pub fn make_float(&mut self, symbol: SymbolId, value: f64) -> DagId {
-        self.rt.make_na(&self.sig, symbol, NaValue::Float(value.to_bits()))
+        self.rt
+            .make_na(&self.sig, symbol, NaValue::Float(value.to_bits()))
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -3798,10 +5057,11 @@ impl Engine {
         self.rt.root(id)
     }
 
-    /// Collect every DAG node not reachable from a live [`RootGuard`] or from `extra_roots`; returns
-    /// the number reclaimed. Roots pinned by guards are *always* included, so callers normally pass
-    /// `[]`; `extra_roots` is the advanced entry point for roots not (yet) held by a guard — e.g. the
-    /// `examples/peano` benchmark, which roots a term inline.
+    /// Collect every DAG node not reachable from a live [`RootGuard`], a cached identity DAG, or from
+    /// `extra_roots`; returns the number reclaimed. Roots pinned by guards and permanent identity cache
+    /// entries are *always* included, so callers normally pass `[]`; `extra_roots` is the advanced entry
+    /// point for roots not (yet) held by a guard — e.g. the `examples/peano` benchmark, which roots a
+    /// term inline.
     pub fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
         self.rt.gc(extra_roots)
     }
@@ -3826,6 +5086,7 @@ impl Engine {
     /// the old equation set may now be reducible, so this advances the equation epoch, invalidating
     /// every node's cached "reduced" stamp (review R2 H2).
     pub fn add_equation(&mut self, eq: Equation) -> u32 {
+        self.rank_term_variable_sorts(&[&eq.lhs, &eq.rhs]);
         self.sig.add_equation(eq)
     }
 
@@ -3839,7 +5100,9 @@ impl Engine {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) -> u32 {
-        self.sig.add_conditional_equation(lhs, rhs, nr_vars, condition)
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        self.sig
+            .add_conditional_equation(lhs, rhs, nr_vars, condition)
     }
 
     /// Register an `[owise]` equation (optionally conditional): applied only when no non-owise equation
@@ -3851,13 +5114,91 @@ impl Engine {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
         self.sig.add_owise_equation(lhs, rhs, nr_vars, condition)
+    }
+
+    /// Register an executable equation carrying Maude's `[variant]` attribute.
+    pub fn add_variant_equation(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+        owise: bool,
+    ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        self.sig
+            .add_variant_equation(lhs, rhs, nr_vars, condition, owise)
+    }
+
+    /// Whether `pattern` has at least one equation-style match against `subject`, optionally with a
+    /// theory extension. Unlike [`match_solutions`](Self::match_solutions), this keeps the matcher in
+    /// rewrite mode (`command = false`), which is the contract used by variant-equation reducibility.
+    pub(crate) fn has_equation_match(
+        &mut self,
+        pattern: &Term,
+        nr_vars: u32,
+        subject: DagId,
+        extension: bool,
+    ) -> bool {
+        let automaton = LhsAutomaton::compile(pattern.clone(), &self.sig);
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        let Some(mut subproblem) =
+            automaton.match_(&self.rt, &self.sig, subject, &mut subst, extension, false)
+        else {
+            return false;
+        };
+        subproblem.next(&mut self.rt, &self.sig, &mut subst)
+    }
+
+    /// Whether several retained-pattern DAGs match candidate DAGs under one shared substitution.
+    /// Variant folding uses this instead of unification: in particular, AU matching is complete even
+    /// though Maude's AU unifier intentionally is not.
+    pub(crate) fn shared_match_exists(
+        &mut self,
+        patterns: Vec<Term>,
+        subjects: &[DagId],
+        nr_vars: u32,
+    ) -> bool {
+        fn exists(
+            index: usize,
+            pairs: &[(Term, DagId)],
+            rt: &mut Runtime,
+            sig: &Signature,
+            subst: &mut Subst,
+        ) -> bool {
+            if index == pairs.len() {
+                return true;
+            }
+            let (pattern, subject) = &pairs[index];
+            let automaton = LhsAutomaton::compile(pattern.clone(), sig);
+            let checkpoint = subst.clone();
+            if let Some(mut subproblem) = automaton.match_(rt, sig, *subject, subst, false, false) {
+                while subproblem.next(rt, sig, subst) {
+                    if exists(index + 1, pairs, rt, sig, subst) {
+                        return true;
+                    }
+                }
+            }
+            *subst = checkpoint;
+            false
+        }
+        if patterns.len() != subjects.len() {
+            return false;
+        }
+        let pairs: Vec<_> = patterns.into_iter().zip(subjects.iter().copied()).collect();
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        exists(0, &pairs, &mut self.rt, &self.sig, &mut subst)
     }
 
     /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
     /// matcher seam). Memberships lower a node's least sort at construction, so declare them before
     /// building any node of the lhs's symbol (cf. the overload add-declarations-first contract).
     pub fn add_membership(&mut self, mb: Membership) -> u32 {
+        self.rank_term_variable_sorts(&[&mb.lhs]);
         self.sig.add_membership(mb)
     }
 
@@ -3871,13 +5212,16 @@ impl Engine {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) -> u32 {
-        self.sig.add_conditional_membership(lhs, sort, nr_vars, condition)
+        self.rank_term_variable_sorts(&[&lhs]);
+        self.sig
+            .add_conditional_membership(lhs, sort, nr_vars, condition)
     }
 
     /// Register an unconditional rule `rl lhs => rhs` (Pillar A), returning its dense per-module id (the
     /// index the frontend keys its `rl_traces` metadata by). Rules are applied only by `rewrite`/
     /// `frewrite`/`search`, never by [`reduce`](Self::reduce).
     pub fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
         self.sig.add_rule(lhs, rhs, nr_vars)
     }
 
@@ -3891,7 +5235,42 @@ impl Engine {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
         self.sig.add_conditional_rule(lhs, rhs, nr_vars, condition)
+    }
+
+    /// Retain an unconditional `[narrowing]` rule for symbolic search. Registration is independent of
+    /// ordinary rule compilation, so `[nonexec narrowing]` and bare-variable lhs rules remain usable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_narrowing_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        variables: Vec<crate::unify::problem::VarSpec>,
+        variable_names: Vec<String>,
+        condition: Vec<ConditionFragment>,
+        label: Option<String>,
+        nonexec: bool,
+    ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        let id = self.sig.narrowing_rules.len() as u32;
+        let rule = crate::narrow::compile_narrowing_rule(
+            self,
+            id,
+            lhs,
+            rhs,
+            variables,
+            variable_names,
+            condition,
+            label,
+            nonexec,
+        );
+        self.sig.narrowing_rules.push(rule);
+        id
+    }
+
+    pub fn narrowing_rules(&self) -> &[crate::narrow::NarrowingRule] {
+        &self.sig.narrowing_rules
     }
 
     /// Begin a `rewrite` session over `initial` (Pillar A): rule-fair, reduce-to-canonical then apply the
@@ -3906,7 +5285,11 @@ impl Engine {
     /// One rule-fair step (used by [`Rewriting::run`]): apply the first rule at the top-down-first redex
     /// of `current`, returning the rebuilt root, or `None` at a normal form. `cursors` carries the
     /// per-symbol round-robin rule cursor across steps.
-    pub(crate) fn rewrite_step(&mut self, current: DagId, cursors: &mut HashMap<SymbolId, u32>) -> Option<DagId> {
+    pub(crate) fn rewrite_step(
+        &mut self,
+        current: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> Option<DagId> {
         self.rt.rewrite_step(&self.sig, current, cursors)
     }
 
@@ -3914,8 +5297,14 @@ impl Engine {
     /// node or `None`. Used by the position-fair `frewrite` traversal (Pillar A-ii) and `search` (A-iv),
     /// which drive the per-position rule application themselves rather than through the top-down
     /// [`rewrite_step`](Self::rewrite_step).
-    pub(crate) fn rewrite_at(&mut self, node: DagId, cursors: &mut HashMap<SymbolId, u32>) -> Option<DagId> {
-        self.rt.apply_first_rule_at(&self.sig, node, cursors).map(|(_, r)| r)
+    pub(crate) fn rewrite_at(
+        &mut self,
+        node: DagId,
+        cursors: &mut HashMap<SymbolId, u32>,
+    ) -> Option<DagId> {
+        self.rt
+            .apply_first_rule_at(&self.sig, node, cursors)
+            .map(|(_, r)| r)
     }
 
     /// Apply the first applicable rule of the given `erewrite` class (object-message vs `leftOver`) at
@@ -3927,13 +5316,18 @@ impl Engine {
         cursors: &mut HashMap<SymbolId, u32>,
         filter: RuleFilter,
     ) -> Option<DagId> {
-        self.rt.apply_first_rule_filtered(&self.sig, node, cursors, Some(filter)).map(|(_, r)| r)
+        self.rt
+            .apply_first_rule_filtered(&self.sig, node, cursors, Some(filter))
+            .map(|(_, r)| r)
     }
 
     /// Whether the config operator `sym` has any `leftOver` (non-object-message) rule — the gate for the
     /// generic `leftOverRewrite` path (a delivering system like bank/ping-pong has none).
     fn has_leftover_rules(&self, sym: SymbolId) -> bool {
-        self.sig.rules.get(&sym).is_some_and(|rs| rs.iter().any(|r| r.oo == OoRuleKind::LeftOver))
+        self.sig
+            .rules
+            .get(&sym)
+            .is_some_and(|rs| rs.iter().any(|r| r.oo == OoRuleKind::LeftOver))
     }
 
     /// Reconstruct a node of `symbol` from `children` (the theory-aware constructor — Free/ACU/AU/CUI/S).
@@ -4000,7 +5394,8 @@ impl Engine {
         such_that: &[CompiledFragment],
         state: DagId,
     ) -> Vec<(Vec<DagId>, u64)> {
-        self.rt.eval_goal(&self.sig, goal, nr_vars, such_that, state)
+        self.rt
+            .eval_goal(&self.sig, goal, nr_vars, such_that, state)
     }
 
     /// Begin a `frewrite` session over `initial` (Pillar A-ii): position-fair, `gas` rule applications
@@ -4047,7 +5442,11 @@ impl Engine {
                 new_children.push(nc);
             }
         }
-        let mut node = if changed { self.rebuild_node(symbol, new_children) } else { node };
+        let mut node = if changed {
+            self.rebuild_node(symbol, new_children)
+        } else {
+            node
+        };
         // 2. A rewritten child can enable an equation here (Maude's `ascend` reduce of a stale parent);
         //    reduce the rebuilt node to canonical form before trying rules at it. (`frozen` blocks rules,
         //    not equations, so reducing a frozen child's value is correct.)
@@ -4088,7 +5487,8 @@ impl Engine {
     /// for the [`erewrite_pass`](Self::erewrite_pass) scheduler. Mirrors Maude dispatching the
     /// object-message machinery on `ConfigSymbol` (an ACU op carrying the `config` attribute).
     pub(crate) fn is_config_node(&self, id: DagId) -> bool {
-        matches!(self.node(id).term, NodeTerm::Acu { .. }) && self.symbol(self.node(id).symbol()).oo.config
+        matches!(self.node(id).term, NodeTerm::Acu { .. })
+            && self.symbol(self.node(id).symbol()).oo.config
     }
 
     /// One object-message-fair delivery pass over a `config` ACU soup — Maude's `ConfigSymbol::ruleRewrite`
@@ -4136,8 +5536,15 @@ impl Engine {
                 portal_seen = true;
             }
             if oo.object {
-                let name = self.node(elem).children().next().expect("object constructor has a name arg");
-                match map.iter_mut().find(|(n, _, _)| self.rt.dag_compare(*n, name) == Ordering::Equal) {
+                let name = self
+                    .node(elem)
+                    .children()
+                    .next()
+                    .expect("object constructor has a name arg");
+                match map
+                    .iter_mut()
+                    .find(|(n, _, _)| self.rt.dag_compare(*n, name) == Ordering::Equal)
+                {
                     Some(entry) if entry.1.is_none() => entry.1 = Some(elem),
                     Some(_) => remainder.push((elem, mult)), // duplicate-named object — leave it in the soup
                     None => map.push((name, Some(elem), Vec::new())),
@@ -4147,8 +5554,15 @@ impl Engine {
                     remainder.push((elem, 1));
                 }
             } else if oo.message {
-                let target = self.node(elem).children().next().expect("message has a target arg");
-                match map.iter_mut().find(|(n, _, _)| self.rt.dag_compare(*n, target) == Ordering::Equal) {
+                let target = self
+                    .node(elem)
+                    .children()
+                    .next()
+                    .expect("message has a target arg");
+                match map
+                    .iter_mut()
+                    .find(|(n, _, _)| self.rt.dag_compare(*n, target) == Ordering::Equal)
+                {
                     Some(entry) => {
                         for _ in 0..mult {
                             entry.2.push(elem);
@@ -4171,7 +5585,10 @@ impl Engine {
             if portal_seen {
                 let pending = std::mem::take(&mut self.rt.incoming);
                 let (mine, rest): (Vec<DagId>, Vec<DagId>) = pending.into_iter().partition(|&r| {
-                    self.node(r).children().next().is_some_and(|a| self.rt.dag_compare(a, name) == Ordering::Equal)
+                    self.node(r)
+                        .children()
+                        .next()
+                        .is_some_and(|a| self.rt.dag_compare(a, name) == Ordering::Equal)
                 });
                 messages.extend(mine);
                 self.rt.incoming = rest;
@@ -4235,7 +5652,9 @@ impl Engine {
     /// consumed the object (none with `name` survives), the object is `None` and everything is "others".
     fn retrieve_object(&self, r: DagId, name: DagId) -> (Option<DagId>, Vec<DagId>) {
         let elems: Vec<(DagId, u32)> = match &self.node(r).term {
-            NodeTerm::Acu { args, .. } if self.symbol(self.node(r).symbol()).oo.config => args.clone(),
+            NodeTerm::Acu { args, .. } if self.symbol(self.node(r).symbol()).oo.config => {
+                args.clone()
+            }
             _ => vec![(r, 1)],
         };
         let mut obj = None;
@@ -4269,6 +5688,40 @@ impl Engine {
     pub fn reset_rewrites(&mut self) {
         self.rt.reset_rewrites();
     }
+
+    /// Count one successful symbolic variant-narrowing step. Maude includes this counter in the
+    /// command's aggregate `rewrites:` value even though no ordinary equation was matched directly.
+    pub(crate) fn count_variant_narrowing_step(&mut self) {
+        self.rt.add_rewrites(1);
+        self.rt.variant_narrowing_count += 1;
+    }
+
+    pub(crate) fn count_narrowing_step(&mut self) {
+        self.rt.add_rewrites(1);
+        self.rt.narrowing_count += 1;
+    }
+
+    pub fn narrowing_breakdown(&self) -> (u64, u64) {
+        (self.rt.variant_narrowing_count, self.rt.narrowing_count)
+    }
+
+    /// Snapshot and restore command-visible rewrite accounting around work performed by an
+    /// intentionally isolated Maude subcontext. Narrowing `vfold` keeps its variant subsumption
+    /// searches for reuse but never transfers their counts into the parent narrowing context.
+    pub(crate) fn rewrite_checkpoint(&self) -> (u64, u64, u64) {
+        (
+            self.rt.rewrite_count,
+            self.rt.variant_narrowing_count,
+            self.rt.narrowing_count,
+        )
+    }
+
+    pub(crate) fn restore_rewrite_checkpoint(&mut self, checkpoint: (u64, u64, u64)) {
+        self.rt.rewrite_count = checkpoint.0;
+        self.rt.variant_narrowing_count = checkpoint.1;
+        self.rt.narrowing_count = checkpoint.2;
+    }
+
     /// Reset the `counter` built-in (Maude's `CounterSymbol`) to 0 — call at the start of each top-level
     /// `rewrite`/`frewrite` command so successive commands restart the count (`continue` does not reset).
     pub fn reset_counter(&mut self) {
@@ -4327,7 +5780,9 @@ impl Engine {
                 return false;
             }
             let (me, target, payload) = (args[1], args[0], args[2]);
-            let Some(text) = self.rt.as_str(payload) else { return false };
+            let Some(text) = self.rt.as_str(payload) else {
+                return false;
+            };
             // The buffers are `String`; strings are bytes — decode lossily at this I/O boundary (the
             // pinned STD-STREAM traffic is ASCII, so this is exact for it).
             let text = String::from_utf8_lossy(&text);
@@ -4355,8 +5810,11 @@ impl Engine {
             }
             let line = self.rt.read_line();
             if let (Some(got), Some(str_sym)) = (got_line_msg, string_sym) {
-                let line_dag =
-                    self.rt.make_na(&self.sig, str_sym, crate::dag::NaValue::Str(line.into_bytes().into()));
+                let line_dag = self.rt.make_na(
+                    &self.sig,
+                    str_sym,
+                    crate::dag::NaValue::Str(line.into_bytes().into()),
+                );
                 let reply = self.make_free(got, vec![me, target, line_dag]); // gotLine(me, self, line)
                 self.rt.incoming.push(reply);
             }
@@ -4387,7 +5845,11 @@ impl Engine {
 
     /// Take the recorded trace events, clearing the buffer (tracing stays enabled). Empty when off.
     pub fn take_trace(&mut self) -> Vec<TraceEvent> {
-        self.rt.trace.as_mut().map(std::mem::take).unwrap_or_default()
+        self.rt
+            .trace
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Open a construction-time structural-dedup window (C7): until [`end_dedup`](Self::end_dedup), DAG
@@ -4489,7 +5951,12 @@ impl Engine {
             // engine does not need — the AU `bigEnough` floor / partition order, bare-variable extension).
             automaton.match_(rt, sig, subject, &mut subst, extension, true)
         };
-        Solutions { engine: self, pattern, subproblem, subst }
+        Solutions {
+            engine: self,
+            pattern,
+            subproblem,
+            subst,
+        }
     }
 }
 
@@ -4518,7 +5985,9 @@ impl Solutions<'_> {
     /// the accessors, not yielded, so it is not an [`Iterator`].)
     #[must_use]
     pub fn advance(&mut self) -> bool {
-        let Some(sp) = self.subproblem.as_mut() else { return false };
+        let Some(sp) = self.subproblem.as_mut() else {
+            return false;
+        };
         let (sig, rt) = self.engine.parts_mut();
         sp.next(rt, sig, &mut self.subst)
     }
@@ -4546,7 +6015,9 @@ impl Solutions<'_> {
     pub fn matched_portion_display(&mut self) -> Option<MatchedPortion> {
         match self.subproblem.as_ref()?.matched_status()? {
             true => Some(MatchedPortion::Whole),
-            false => Some(MatchedPortion::Portion(self.engine.instantiate(&self.pattern, &self.subst))),
+            false => Some(MatchedPortion::Portion(
+                self.engine.instantiate(&self.pattern, &self.subst),
+            )),
         }
     }
 }
@@ -4594,9 +6065,8 @@ mod tests {
     }
 
     /// Genuine variable leaves (`make_var` / `variable_symbol`): per-sort symbol caching in demand
-    /// order, name-code identity (`deep_equal` ignores the slot index), and the canonical order —
-    /// same-sort variables by name code, cross-sort by variable-symbol creation order, and a
-    /// variable (arity 0) before any application inside an ACU multiset.
+    /// order and name-code identity (`deep_equal` ignores the slot index). Ordinary symbolic DAGs
+    /// keep their established slot order; the pre-index unification normalizer uses name-code order.
     #[test]
     fn var_leaves_identity_and_order() {
         let mut e = Engine::new();
@@ -4616,17 +6086,54 @@ mod tests {
         let x0 = e.make_var(nat, 7, 0);
         let x1 = e.make_var(nat, 7, 1);
         let y = e.make_var(nat, 8, 2);
-        assert!(e.deep_equal(x0, x1), "same name+sort, different slot: equal");
+        assert!(
+            e.deep_equal(x0, x1),
+            "same name+sort, different slot: equal"
+        );
         assert!(!e.deep_equal(x0, y), "different name codes differ");
-        assert_eq!(e.sort_of(x0), nat, "a variable's sort is its symbol's range");
+        assert_eq!(
+            e.sort_of(x0),
+            nat,
+            "a variable's sort is its symbol's range"
+        );
 
-        // Order inside an ACU soup: same-sort variables by name code; a variable (arity 0)
+        // Order inside an ordinary ACU DAG: same-sort variables by slot; a variable (arity 0)
         // precedes an application (arity 2) regardless of creation order.
         let z = e.make_var(nznat, 9, 3); // NzNat's variable symbol created after Nat's
         let app = e.make_ac(plus, vec![x0, y]);
         let soup = e.make_ac(plus, vec![app, z, y, x0]);
         let order: Vec<DagId> = e.node(soup).children().collect();
-        assert_eq!(order, vec![x0, y, z, app], "name-code order, then creation order, then arity");
+        assert_eq!(
+            order,
+            vec![x0, y, z, app],
+            "name-code order, then creation order, then arity"
+        );
+    }
+
+    /// `UnificationProblem` mirrors Maude's `Term::normalize(true)` before `indexVariables`: the
+    /// temporary source slots must not determine the canonical order of same-sort variables.
+    #[test]
+    fn unify_normalization_orders_variables_by_name_before_reindex() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let plus = e.add_op_ac("+", vec![s, s], s, None);
+
+        let later_name = e.make_var(s, 20, 0);
+        let earlier_name = e.make_var(s, 10, 1);
+        let parsed = e.make_ac(plus, vec![later_name, earlier_name]);
+        assert_eq!(
+            e.node(parsed).children().collect::<Vec<_>>(),
+            vec![later_name, earlier_name],
+            "ordinary DAG construction follows the established slot order"
+        );
+
+        let normalized = e.normalize_for_unify(parsed);
+        assert_eq!(
+            e.node(normalized).children().collect::<Vec<_>>(),
+            vec![earlier_name, later_name],
+            "pre-index term normalization follows the variable name ids"
+        );
     }
 
     /// The public [`Engine::match_solutions`] facade drives the ACU matcher seam end-to-end:
@@ -4655,8 +6162,10 @@ mod tests {
                 ids.push((sols.binding(0).unwrap(), sols.binding(1).unwrap()));
             }
         }
-        let mut got: Vec<(Vec<String>, Vec<String>)> =
-            ids.iter().map(|&(x, y)| (leaf_names(&e, x), leaf_names(&e, y))).collect();
+        let mut got: Vec<(Vec<String>, Vec<String>)> = ids
+            .iter()
+            .map(|&(x, y)| (leaf_names(&e, x), leaf_names(&e, y)))
+            .collect();
         got.sort();
         let mut want = vec![
             (vec!["a".into()], vec!["b".into(), "c".into()]),
@@ -4676,11 +6185,17 @@ mod tests {
             assert!(sols.advance(), "one extension solution");
             let p = sols.matched_portion();
             // The display view reports a partial portion (not `(whole)`) for `a + b <=? a + b + c`.
-            assert!(matches!(sols.matched_portion_display(), Some(MatchedPortion::Portion(_))));
+            assert!(matches!(
+                sols.matched_portion_display(),
+                Some(MatchedPortion::Portion(_))
+            ));
             assert!(!sols.advance(), "exactly one");
             p
         };
-        assert_eq!(leaf_names(&e, portion), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            leaf_names(&e, portion),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     /// Three constants threaded by rules `a => b => c => d`. `rewrite` drives them to the normal form
@@ -4707,7 +6222,11 @@ mod tests {
         // reduce never applies a rule: `a` is its own equational normal form.
         let a0 = e.make_const(a);
         let red = e.reduce(a0);
-        assert_eq!(e.symbol(e.node(red).symbol()).name(), "a", "reduce must not apply rules");
+        assert_eq!(
+            e.symbol(e.node(red).symbol()).name(),
+            "a",
+            "reduce must not apply rules"
+        );
 
         // rewrite drives the rules to the normal form `d` in 3 steps.
         e.reset_rewrites();
@@ -4807,9 +6326,17 @@ mod tests {
         assert_eq!(e.sort_of(s0), nznat, "s 0 : NzNat");
         // s0 / n0 are reused as shared children below (a genuine DAG share).
         let s0_plus_s0 = e.make_free(plus, vec![s0, s0]);
-        assert_eq!(e.sort_of(s0_plus_s0), nznat, "s 0 + s 0 : NzNat (both args NzNat)");
+        assert_eq!(
+            e.sort_of(s0_plus_s0),
+            nznat,
+            "s 0 + s 0 : NzNat (both args NzNat)"
+        );
         let zero_plus_s0 = e.make_free(plus, vec![n0, s0]);
-        assert_eq!(e.sort_of(zero_plus_s0), nat, "0 + s 0 : Nat (Zero is not <= NzNat)");
+        assert_eq!(
+            e.sort_of(zero_plus_s0),
+            nat,
+            "0 + s 0 : Nat (Zero is not <= NzNat)"
+        );
         let zero_plus_zero = e.make_free(plus, vec![n0, n0]);
         assert_eq!(e.sort_of(zero_plus_zero), nat, "0 + 0 : Nat");
     }
@@ -4836,8 +6363,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
 
@@ -4877,13 +6410,20 @@ mod tests {
 
         let (z1, z2) = (e.make_const(z), e.make_const(z));
         let zz = e.make_free(plus, vec![z1, z2]); // 0 + 0 : no decl applies
-        assert!(e.sorts().sort(e.sort_of(zz)).is_error, "0 + 0 lands in the error sort");
+        assert!(
+            e.sorts().sort(e.sort_of(zz)).is_error,
+            "0 + 0 lands in the error sort"
+        );
 
         let z0 = e.make_const(z);
         let s0a = e.make_free(s, vec![z0]);
         let s0b = e.make_free(s, vec![z0]);
         let ss = e.make_free(plus, vec![s0a, s0b]); // s 0 + s 0 : NzNat
-        assert_eq!(e.sort_of(ss), nznat, "s 0 + s 0 : NzNat (the one declaration applies)");
+        assert_eq!(
+            e.sort_of(ss),
+            nznat,
+            "s 0 + s 0 : NzNat (the one declaration applies)"
+        );
     }
 
     /// B2.1 (== reference binary, OVERLOAD-PREREG): a non-preregular operator (`f : A -> A` and
@@ -4904,7 +6444,11 @@ mod tests {
 
         let c0 = e.make_const(c);
         let fc = e.make_free(f, vec![c0]);
-        assert_eq!(e.sort_of(fc), a, "f(c) : A — the earliest of the two incomparable declarations");
+        assert_eq!(
+            e.sort_of(fc),
+            a,
+            "f(c) : A — the earliest of the two incomparable declarations"
+        );
     }
 
     /// B2.1 / audit-F-B regression (== reference binary, `conformance/acu-overload.maude` ACU-OVERLOAD):
@@ -4932,7 +6476,11 @@ mod tests {
             let s = e.make_ac(plus, vec![x, y]);
             e.sorts().name(e.sort_of(s)).to_string()
         };
-        assert_eq!(sum(&mut e, z, nz), "NzNat", "z + nz : NzNat (order-independent)");
+        assert_eq!(
+            sum(&mut e, z, nz),
+            "NzNat",
+            "z + nz : NzNat (order-independent)"
+        );
         assert_eq!(sum(&mut e, nz, z), "NzNat", "nz + z : NzNat");
         assert_eq!(sum(&mut e, z, z), "Nat", "z + z : Nat");
         assert_eq!(sum(&mut e, nz, nz), "NzNat", "nz + nz : NzNat");
@@ -4941,7 +6489,11 @@ mod tests {
             let (x, y, w) = (e.make_const(z), e.make_const(nz), e.make_const(z));
             e.make_ac(plus, vec![x, y, w])
         };
-        assert_eq!(e.sorts().name(e.sort_of(tern)), "NzNat", "z + z + nz : NzNat");
+        assert_eq!(
+            e.sorts().name(e.sort_of(tern)),
+            "NzNat",
+            "z + z + nz : NzNat"
+        );
     }
 
     /// B1/B2.1 / audit-F-B regression (== reference binary, CUI-OVERLOAD): the same order-independence
@@ -4966,7 +6518,11 @@ mod tests {
             let s = e.make_cui(g, x, y);
             e.sorts().name(e.sort_of(s)).to_string()
         };
-        assert_eq!(gg(&mut e, z, nz), "NzNat", "g(z, nz) : NzNat (order-independent)");
+        assert_eq!(
+            gg(&mut e, z, nz),
+            "NzNat",
+            "g(z, nz) : NzNat (order-independent)"
+        );
         assert_eq!(gg(&mut e, nz, z), "NzNat", "g(nz, z) : NzNat");
         assert_eq!(gg(&mut e, z, z), "Nat", "g(z, z) : Nat");
     }
@@ -5004,7 +6560,11 @@ mod tests {
         e.reset_rewrites();
         let (z0, z1) = (e.make_const(z), e.make_const(z));
         let zz = e.make_free(pairop, vec![z0, z1]);
-        assert_eq!(e.sort_of(zz), pair, "base sort Pair at construction (membership applies lazily)");
+        assert_eq!(
+            e.sort_of(zz),
+            pair,
+            "base sort Pair at construction (membership applies lazily)"
+        );
         let r = e.reduce(zz);
         assert_eq!(e.rewrites(), 1, "one membership application");
         assert_eq!(e.sort_of(r), sympair, "< z, z > : SymPair after reduce");
@@ -5041,7 +6601,11 @@ mod tests {
         let fzsz = e.make_free(f, vec![zsz2]);
         let r3 = e.reduce(fzsz);
         assert_eq!(e.rewrites(), 0, "no membership, no equation");
-        assert_eq!(e.node(r3).symbol(), f, "f(< z, s z >) is its own normal form");
+        assert_eq!(
+            e.node(r3).symbol(),
+            f,
+            "f(< z, s z >) is its own normal form"
+        );
     }
 
     /// B3 (== reference binary, conformance/audit/B3-mb-extension.maude): an AC membership fires
@@ -5081,8 +6645,16 @@ mod tests {
         let inner = e.make_ac(bar, vec![b1, b2]);
         let aaa = e.make_ac(bar, vec![b0, inner]);
         let r3 = e.reduce(aaa);
-        assert_eq!(e.rewrites(), 1, "a | a | a: one membership application (extension), not 0");
-        assert_eq!(e.sort_of(r3), et, "a | a | a : E (whole match fails; prefix refinement discarded)");
+        assert_eq!(
+            e.rewrites(),
+            1,
+            "a | a | a: one membership application (extension), not 0"
+        );
+        assert_eq!(
+            e.sort_of(r3),
+            et,
+            "a | a | a : E (whole match fails; prefix refinement discarded)"
+        );
     }
 
     /// B3, conditional variant (CMB-EXT): `cmb (a | a) : Special if a = a` fires through extension too,
@@ -5108,7 +6680,10 @@ mod tests {
             Term::op(bar, vec![Term::constant(a), Term::constant(a)]), // a | a
             special,
             0,
-            vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
+            vec![ConditionFragment::Equality {
+                lhs: Term::constant(a),
+                rhs: Term::constant(a),
+            }],
         );
 
         // red a | a | h(h(a)) — 2 (h reductions) + 1 (cmb on the inner node) = 3. Right-nested
@@ -5157,11 +6732,19 @@ mod tests {
             Term::op(bar, vec![Term::constant(a), Term::constant(a)]),
             special,
             0,
-            vec![ConditionFragment::Equality { lhs: Term::constant(a), rhs: Term::constant(a) }],
+            vec![ConditionFragment::Equality {
+                lhs: Term::constant(a),
+                rhs: Term::constant(a),
+            }],
         );
         e.set_gc_interval(Some(1)); // collect at every allocation — stress nested-reduction rooting
         e.reset_rewrites();
-        let (a0, a1, a2, a3) = (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
+        let (a0, a1, a2, a3) = (
+            e.make_const(a),
+            e.make_const(a),
+            e.make_const(a),
+            e.make_const(a),
+        );
         // a | (a | (a | (a | h(h(a))))) — the right-nested parse shape; the innermost node's cmb
         // condition re-enters reduce under per-allocation GC.
         let hha = {
@@ -5174,7 +6757,11 @@ mod tests {
         let l3 = e.make_ac(bar, vec![a1, l2]);
         let subject = e.make_ac(bar, vec![a0, l3]);
         let r = e.reduce(subject); // must not crash / read freed nodes
-        assert_eq!(e.rewrites(), 3, "2 h-reductions + 1 cmb (prefix a | a) under aggressive GC");
+        assert_eq!(
+            e.rewrites(),
+            3,
+            "2 h-reductions + 1 cmb (prefix a | a) under aggressive GC"
+        );
         let five = {
             let cs: Vec<DagId> = (0..5).map(|_| e.make_const(a)).collect();
             e.make_ac(bar, cs)
@@ -5196,7 +6783,11 @@ mod tests {
         e.close_sorts();
         let a = e.add_op("a", vec![], sa);
         let g = e.add_op("g", vec![sa], sa);
-        e.add_membership(Membership { lhs: Term::op(g, vec![Term::var(0, sa)]), sort: sb, nr_vars: 1 }); // g(X) : B
+        e.add_membership(Membership {
+            lhs: Term::op(g, vec![Term::var(0, sa)]),
+            sort: sb,
+            nr_vars: 1,
+        }); // g(X) : B
         e.add_membership(Membership {
             lhs: Term::op(g, vec![Term::op(g, vec![Term::var(0, sa)])]), // g(g(X)) : C
             sort: sc,
@@ -5224,7 +6815,11 @@ mod tests {
         let gga = e.make_free(g, vec![ga2]);
         assert_eq!(e.sort_of(gga), sa, "g(g(a)) base sort A at construction");
         let rgga = e.reduce(gga);
-        assert_eq!(e.rewrites(), 2, "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3");
+        assert_eq!(
+            e.rewrites(),
+            2,
+            "inner g(a):B then outer g(g(a)):C — smallest-first, 2 not 3"
+        );
         assert_eq!(e.sort_of(rgga), sc, "g(g(a)) : C after reduce");
     }
 
@@ -5243,8 +6838,11 @@ mod tests {
         let v = |i| Term::var(i, nat);
         let s_of = |t| Term::op(s, vec![t]);
         // eq add(0, Y) = Y .   eq add(s(X), Y) = s(add(X, Y)) .   (ids 0 and 1)
-        let id_add0 =
-            e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
+        let id_add0 = e.add_equation(Equation {
+            lhs: Term::op(add, vec![Term::constant(z), v(0)]),
+            rhs: v(0),
+            nr_vars: 1,
+        });
         let id_adds = e.add_equation(Equation {
             lhs: Term::op(add, vec![s_of(v(0)), v(1)]),
             rhs: s_of(Term::op(add, vec![v(0), v(1)])),
@@ -5264,7 +6862,15 @@ mod tests {
         assert_eq!(steps.len(), 2, "two equation rewrites");
         // Step 0: add(s(X),Y) fires on the whole subject, binding X and Y (2 vars).
         match &steps[0] {
-            TraceEvent::Rewrite { kind, eq_id, depth, redex, bindings, whole_before, .. } => {
+            TraceEvent::Rewrite {
+                kind,
+                eq_id,
+                depth,
+                redex,
+                bindings,
+                whole_before,
+                ..
+            } => {
                 assert_eq!(*kind, RewriteKind::Equation);
                 assert_eq!(*eq_id, Some(id_adds));
                 assert_eq!(*depth, 0);
@@ -5277,7 +6883,12 @@ mod tests {
         }
         // Step 1: add(0,Y) fires on the inner redex, binding Y (1 var).
         match &steps[1] {
-            TraceEvent::Rewrite { kind, eq_id, bindings, .. } => {
+            TraceEvent::Rewrite {
+                kind,
+                eq_id,
+                bindings,
+                ..
+            } => {
                 assert_eq!(*kind, RewriteKind::Equation);
                 assert_eq!(*eq_id, Some(id_add0));
                 assert_eq!(bindings.len(), 1, "Y bound");
@@ -5306,7 +6917,11 @@ mod tests {
         let add = e.add_op("add", vec![nat, nat], nat);
         let v = |i| Term::var(i, nat);
         let s_of = |t| Term::op(s, vec![t]);
-        e.add_equation(Equation { lhs: Term::op(add, vec![Term::constant(z), v(0)]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(add, vec![Term::constant(z), v(0)]),
+            rhs: v(0),
+            nr_vars: 1,
+        });
         e.add_equation(Equation {
             lhs: Term::op(add, vec![s_of(v(0)), v(1)]),
             rhs: s_of(Term::op(add, vec![v(0), v(1)])),
@@ -5334,11 +6949,23 @@ mod tests {
         let one_again = mk(&mut e, 1); // s 0
         // Step 1 is the inner rewrite add(0, s 0) -> s 0; its WHOLE after is s s 0 (not s 0).
         match &steps[1] {
-            TraceEvent::Rewrite { redex, result: res, whole_before, whole_after, .. } => {
+            TraceEvent::Rewrite {
+                redex,
+                result: res,
+                whole_before,
+                whole_after,
+                ..
+            } => {
                 assert!(e.deep_equal(*res, one_again), "inner result is s 0");
-                assert!(e.deep_equal(whole_after.unwrap(), two), "whole after is s s 0");
+                assert!(
+                    e.deep_equal(whole_after.unwrap(), two),
+                    "whole after is s s 0"
+                );
                 // whole_before is s (add(0, s 0)) — strictly larger than the redex add(0, s 0).
-                assert!(!e.deep_equal(whole_before.unwrap(), *redex), "whole_before is the full term");
+                assert!(
+                    !e.deep_equal(whole_before.unwrap(), *redex),
+                    "whole_before is the full term"
+                );
             }
             ev => panic!("expected Rewrite, got {ev:?}"),
         }
@@ -5384,13 +7011,19 @@ mod tests {
             Term::op(max, vec![v(0), v(1)]),
             v(1),
             2,
-            vec![ConditionFragment::Equality { lhs: le_mn(), rhs: Term::constant(tt) }],
+            vec![ConditionFragment::Equality {
+                lhs: le_mn(),
+                rhs: Term::constant(tt),
+            }],
         );
         e.add_conditional_equation(
             Term::op(max, vec![v(0), v(1)]),
             v(0),
             2,
-            vec![ConditionFragment::Equality { lhs: le_mn(), rhs: Term::constant(ff) }],
+            vec![ConditionFragment::Equality {
+                lhs: le_mn(),
+                rhs: Term::constant(ff),
+            }],
         );
 
         // max(1, 2) = 2 in 3 rewrites: condition `1<=2` reduces to tt (2), then max→N (1).
@@ -5407,8 +7040,16 @@ mod tests {
         let (n2b, n1b) = (numeral(&mut e, z, s, 2), numeral(&mut e, z, s, 1));
         let m2 = e.make_free(max, vec![n2b, n1b]);
         let r2 = e.reduce(m2);
-        assert_eq!(e.rewrites(), 5, "max(2,1): cond fails (2) + cond re-reduced (2) + max (1)");
-        assert_eq!(decode(&e, r2, z, s), 2, "max(2,1) = 2 (backtracked to the second equation)");
+        assert_eq!(
+            e.rewrites(),
+            5,
+            "max(2,1): cond fails (2) + cond re-reduced (2) + max (1)"
+        );
+        assert_eq!(
+            decode(&e, r2, z, s),
+            2,
+            "max(2,1) = 2 (backtracked to the second equation)"
+        );
 
         // max(0, 0) = 0 in 2 rewrites.
         e.reset_rewrites();
@@ -5435,7 +7076,10 @@ mod tests {
             Term::op(nzq, vec![Term::var(0, nat)]),
             Term::op(s, vec![Term::constant(z)]), // = s z
             1,
-            vec![ConditionFragment::SortTest { term: Term::var(0, nat), sort: nznat }],
+            vec![ConditionFragment::SortTest {
+                term: Term::var(0, nat),
+                sort: nznat,
+            }],
         );
 
         // nz?(s z) : the argument is NzNat → condition holds → s z, 1 rewrite.
@@ -5502,8 +7146,14 @@ mod tests {
         }
         let off = run(None);
         let on = run(Some(4)); // aggressive collection around (not during) the condition reduce
-        assert_eq!(off.1, 22, "f(20) → z in 22 rewrites (21 condition + 1 equation)");
-        assert_eq!(on, off, "conditional reduce identical with safe-point GC on — F-2 mitigation holds");
+        assert_eq!(
+            off.1, 22,
+            "f(20) → z in 22 rewrites (21 condition + 1 equation)"
+        );
+        assert_eq!(
+            on, off,
+            "conditional reduce identical with safe-point GC on — F-2 mitigation holds"
+        );
     }
 
     /// B2.3b `owise` equations (== reference binary, `conformance/owise.maude` OWISE-EQ): an `[owise]`
@@ -5525,7 +7175,12 @@ mod tests {
             rhs: Term::constant(tt),
             nr_vars: 0,
         });
-        e.add_owise_equation(Term::op(iszero, vec![Term::var(0, nat)]), Term::constant(ff), 1, Vec::new());
+        e.add_owise_equation(
+            Term::op(iszero, vec![Term::var(0, nat)]),
+            Term::constant(ff),
+            1,
+            Vec::new(),
+        );
 
         // iszero(z): the specific non-owise equation matches.
         e.reset_rewrites();
@@ -5589,7 +7244,12 @@ mod tests {
                 rhs: Term::constant(tt),
             }],
         );
-        e.add_owise_equation(Term::op(clamp, vec![v(0)]), s_of(Term::constant(z)), 1, Vec::new());
+        e.add_owise_equation(
+            Term::op(clamp, vec![v(0)]),
+            s_of(Term::constant(z)),
+            1,
+            Vec::new(),
+        );
 
         for (input, expected, rewrites) in [(0u32, 0u32, 2u64), (1, 0, 3), (2, 1, 3)] {
             e.reset_rewrites();
@@ -5659,10 +7319,26 @@ mod tests {
             let p = e.reduce(p);
             (e.sort_of(p), e.rewrites())
         };
-        assert_eq!(build(&mut e, 0, 1), (goodpair, 2), "< z, s z > : GoodPair, 2 rewrites");
-        assert_eq!(build(&mut e, 1, 0), (pair, 1), "< s z, z > : Pair (condition fails), 1 rewrite");
-        assert_eq!(build(&mut e, 0, 0), (goodpair, 2), "< z, z > : GoodPair, 2 rewrites");
-        assert_eq!(build(&mut e, 1, 1), (goodpair, 3), "< s z, s z > : GoodPair, 3 rewrites");
+        assert_eq!(
+            build(&mut e, 0, 1),
+            (goodpair, 2),
+            "< z, s z > : GoodPair, 2 rewrites"
+        );
+        assert_eq!(
+            build(&mut e, 1, 0),
+            (pair, 1),
+            "< s z, z > : Pair (condition fails), 1 rewrite"
+        );
+        assert_eq!(
+            build(&mut e, 0, 0),
+            (goodpair, 2),
+            "< z, z > : GoodPair, 2 rewrites"
+        );
+        assert_eq!(
+            build(&mut e, 1, 1),
+            (goodpair, 3),
+            "< s z, s z > : GoodPair, 3 rewrites"
+        );
     }
 
     /// B2.3d matching condition `:=` (== reference binary, `conformance/match-cond.maude` MATCH-COND):
@@ -5694,7 +7370,11 @@ mod tests {
             let n = numeral(&mut e, z, s, input);
             let q = e.make_free(pred, vec![n]);
             let r = e.reduce(q);
-            assert_eq!(e.rewrites(), 1, "pred({input}): one rewrite (the := match is not counted)");
+            assert_eq!(
+                e.rewrites(),
+                1,
+                "pred({input}): one rewrite (the := match is not counted)"
+            );
             assert_eq!(decode(&e, r, z, s), expected, "pred({input}) = {expected}");
         }
 
@@ -5759,15 +7439,24 @@ mod tests {
         e.set_ctor(s);
         assert!(e.is_constructor(z), "z is a constructor");
         assert!(e.is_constructor(s), "s is a constructor");
-        assert!(!e.is_constructor(plus), "+ is a defined function, not a constructor");
+        assert!(
+            !e.is_constructor(plus),
+            "+ is a defined function, not a constructor"
+        );
         e.add_equation(Equation {
             lhs: Term::op(plus, vec![Term::var(0, nat), Term::constant(z)]),
             rhs: Term::var(0, nat),
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
         let (a, b) = (numeral(&mut e, z, s, 1), numeral(&mut e, z, s, 2));
@@ -5820,19 +7509,39 @@ mod tests {
 
         // Each case: build if(cond, then, else) and reduce. (cond_is_tt, then_big, expected, rewrites)
         let cases = [
-            (true, false, 0u32, 1u64),  // if tt then z   else big -> z      (else not reduced)
-            (false, true, 0, 1),        // if ff then big else z   -> z      (then not reduced)
-            (true, true, 2, 2),         // if tt then big else z   -> s s z  (chosen big IS reduced)
+            (true, false, 0u32, 1u64), // if tt then z   else big -> z      (else not reduced)
+            (false, true, 0, 1),       // if ff then big else z   -> z      (then not reduced)
+            (true, true, 2, 2),        // if tt then big else z   -> s s z  (chosen big IS reduced)
         ];
         for (cond_tt, then_big, expected, rewrites) in cases {
             e.reset_rewrites();
-            let cond = if cond_tt { e.make_const(tt) } else { e.make_const(ff) };
-            let then_arg = if then_big { e.make_const(big) } else { e.make_const(z) };
-            let else_arg = if then_big { e.make_const(z) } else { e.make_const(big) };
+            let cond = if cond_tt {
+                e.make_const(tt)
+            } else {
+                e.make_const(ff)
+            };
+            let then_arg = if then_big {
+                e.make_const(big)
+            } else {
+                e.make_const(z)
+            };
+            let else_arg = if then_big {
+                e.make_const(z)
+            } else {
+                e.make_const(big)
+            };
             let q = e.make_free(ite, vec![cond, then_arg, else_arg]);
             let r = e.reduce(q);
-            assert_eq!(e.rewrites(), rewrites, "rewrite count for case {cond_tt}/{then_big}");
-            assert_eq!(decode(&e, r, z, s), expected, "result for case {cond_tt}/{then_big}");
+            assert_eq!(
+                e.rewrites(),
+                rewrites,
+                "rewrite count for case {cond_tt}/{then_big}"
+            );
+            assert_eq!(
+                decode(&e, r, z, s),
+                expected,
+                "result for case {cond_tt}/{then_big}"
+            );
         }
     }
 
@@ -5860,7 +7569,7 @@ mod tests {
 
         let u = e.symbol(union);
         assert_eq!(u.theory(), Theory::Acu);
-        assert_eq!(u.identity(), Some(empty));
+        assert_eq!(e.sig.identity_constant(u.identity().unwrap()), Some(empty));
         assert_eq!(e.symbol(plus).theory(), Theory::Free, "a plain op is free");
         assert_eq!(e.symbol(empty).theory(), Theory::Free, "a constant is free");
     }
@@ -5931,7 +7640,11 @@ mod tests {
         let abc_flat = e.reduce(abc_flat);
         assert!(e.deep_equal(abc_left, abc_right), "(a+b)+c == a+(b+c)");
         assert!(e.deep_equal(abc_left, abc_flat), "(a+b)+c == a+b+c");
-        assert_eq!(e.node(abc_flat).children().count(), 3, "flattened to 3 children");
+        assert_eq!(
+            e.node(abc_flat).children().count(),
+            3,
+            "flattened to 3 children"
+        );
     }
 
     /// B1.2: identity (`id:`) elements vanish and the multiset collapses — `a+e == a`, `e+e == e`,
@@ -5962,7 +7675,11 @@ mod tests {
             let (x, u, y) = (e.make_const(a), e.make_const(unit), e.make_const(b));
             e.make_ac(plus, vec![x, u, y])
         };
-        assert_eq!(e.node(aeb).children().count(), 2, "a + e + b == a + b (2 children)");
+        assert_eq!(
+            e.node(aeb).children().count(),
+            2,
+            "a + e + b == a + b (2 children)"
+        );
     }
 
     /// B1.2: equal elements merge into a multiplicity (`a+a` keeps two children via one `(a,2)` pair),
@@ -5974,7 +7691,11 @@ mod tests {
             let (x, y) = (e.make_const(a), e.make_const(a)); // distinct ids, structurally equal
             e.make_ac(plus, vec![x, y])
         };
-        assert_eq!(e.node(aa).children().count(), 2, "a + a has two children (multiplicity 2)");
+        assert_eq!(
+            e.node(aa).children().count(),
+            2,
+            "a + a has two children (multiplicity 2)"
+        );
         assert_eq!(e.node(aa).symbol(), plus, "a + a is an ACU node");
 
         let lone = e.make_const(a);
@@ -5996,7 +7717,11 @@ mod tests {
             e.make_ac(plus, vec![x, y]) // structurally equal to ab but distinct ids
         };
         assert!(e.deep_equal(ab, _garbage), "b+a == a+b across distinct ids");
-        assert_eq!(e.gc([ab]), 3, "the unreachable b+a subgraph (3 nodes) is reclaimed");
+        assert_eq!(
+            e.gc([ab]),
+            3,
+            "the unreachable b+a subgraph (3 nodes) is reclaimed"
+        );
         assert_eq!(e.node(ab).children().count(), 2, "ab survives intact");
     }
 
@@ -6029,15 +7754,21 @@ mod tests {
             rhs: Term::var(0, nat),
             nr_vars: 1,
         });
-        let (s0a, s0b, s0c) =
-            (s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s), s_of_zero(&mut e, zero, s));
+        let (s0a, s0b, s0c) = (
+            s_of_zero(&mut e, zero, s),
+            s_of_zero(&mut e, zero, s),
+            s_of_zero(&mut e, zero, s),
+        );
         let z = e.make_const(zero);
         let subject = e.make_ac(plus, vec![s0a, z, s0b, s0c]); // s0 + 0 + s0 + s0
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 1, "one rewrite removes the 0");
         let kids: Vec<_> = e.node(r).children().collect();
         assert_eq!(kids.len(), 3, "result is s0 + s0 + s0");
-        assert!(kids.iter().all(|&k| e.node(k).symbol() == s), "all three are successors");
+        assert!(
+            kids.iter().all(|&k| e.node(k).symbol() == s),
+            "all three are successors"
+        );
     }
 
     /// B1.5 reduce lock: ground AC pattern needing a residue splice — `eq a + a = a` on `a + a + b`
@@ -6085,7 +7816,11 @@ mod tests {
         let subject = e.make_ac(set, vec![z0, s0a, z1, s0b]); // 0 ; s0 ; 0 ; s0
         e.end_dedup();
         let r = e.reduce(subject);
-        assert_eq!(e.rewrites(), 2, "two duplicate-removals (== reference binary)");
+        assert_eq!(
+            e.rewrites(),
+            2,
+            "two duplicate-removals (== reference binary)"
+        );
         assert_eq!(e.node(r).children().count(), 2, "result is 0 ; s0");
     }
 
@@ -6102,12 +7837,20 @@ mod tests {
         // Construction-dedup window, as every real command subject is built (C7): the four `a`
         // occurrences share one node, so the multiset merges by identity as in the real pipeline.
         e.begin_dedup();
-        let (a0, a1, a2, a3) =
-            (e.make_const(a), e.make_const(a), e.make_const(a), e.make_const(a));
+        let (a0, a1, a2, a3) = (
+            e.make_const(a),
+            e.make_const(a),
+            e.make_const(a),
+            e.make_const(a),
+        );
         let subject = e.make_ac(plus, vec![a0, a1, a2, a3]); // a + a + a + a
         e.end_dedup();
         let r = e.reduce(subject);
-        assert_eq!(e.rewrites(), 3, "X binds a single `a` each step (== reference binary)");
+        assert_eq!(
+            e.rewrites(),
+            3,
+            "X binds a single `a` each step (== reference binary)"
+        );
         assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
     }
 
@@ -6127,7 +7870,11 @@ mod tests {
         let subject = e.make_ac(plus, vec![a0, c0, c1]); // a + c + c
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 1, "a + X = b fires once");
-        assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c + c), not b + c");
+        assert_eq!(
+            e.node(r).symbol(),
+            b,
+            "result is b (X absorbed c + c), not b + c"
+        );
     }
 
     /// C8: a theory-rooted (AC) subterm under a *free* operator is matched via the cross-theory
@@ -6141,7 +7888,10 @@ mod tests {
         let f = e.add_op("f", vec![s], s); // free, unary
         // eq f(a + b) = cc   — `a + b` is an AC subterm under the free `f`.
         e.add_equation(Equation {
-            lhs: Term::op(f, vec![Term::op(plus, vec![Term::constant(a), Term::constant(b)])]),
+            lhs: Term::op(
+                f,
+                vec![Term::op(plus, vec![Term::constant(a), Term::constant(b)])],
+            ),
             rhs: Term::constant(c),
             nr_vars: 0,
         });
@@ -6205,7 +7955,15 @@ mod tests {
     }
 
     /// Engine with constants `a`,`b`,`c`,`d` and an `assoc` (not comm) `__` over sort `E`.
-    fn au_ctx() -> (Engine, SortId, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+    fn au_ctx() -> (
+        Engine,
+        SortId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+    ) {
         let mut e = Engine::new();
         let s = e.add_sort("E");
         e.close_sorts();
@@ -6228,8 +7986,12 @@ mod tests {
             rhs: Term::constant(a),
             nr_vars: 0,
         });
-        let (d0, b0, c0, d1) =
-            (e.make_const(d), e.make_const(b), e.make_const(c), e.make_const(d));
+        let (d0, b0, c0, d1) = (
+            e.make_const(d),
+            e.make_const(b),
+            e.make_const(c),
+            e.make_const(d),
+        );
         let subject = e.make_au(cat, vec![d0, b0, c0, d1]); // d b c d
         let r = e.reduce(subject);
         assert_eq!(e.rewrites(), 1, "b c = a fires once");
@@ -6379,7 +8141,11 @@ mod tests {
         let s3 = e.make_iter(s, 3, z0);
         let s2_s3 = e.make_iter(s, 2, s3); // s^2(s^3(0))
         assert!(e.deep_equal(s2_s3, s5), "s^2(s^3(0)) flattens to s^5(0)");
-        assert_eq!(e.node(s2_s3).children().count(), 1, "an S node has one child (the base)");
+        assert_eq!(
+            e.node(s2_s3).children().count(),
+            1,
+            "an S node has one child (the base)"
+        );
     }
 
     /// B3.2 THE soundness gate (the audit's #1 B3 trap): the S `count` is scalar payload, not a child,
@@ -6389,10 +8155,24 @@ mod tests {
     fn iter_equality_and_order_use_the_count() {
         let (mut e, _zero, _nznat, _nat, z, s) = iter_ctx();
         let z0 = e.make_const(z);
-        let (s2a, s2b, s3) = (e.make_iter(s, 2, z0), e.make_iter(s, 2, z0), e.make_iter(s, 3, z0));
-        assert!(e.deep_equal(s2a, s2b), "s^2(0) == s^2(0) (distinct ids, equal count)");
-        assert!(!e.deep_equal(s2a, s3), "s^2(0) != s^3(0) — count distinguishes them");
-        assert_eq!(e.runtime().dag_compare(s2a, s3), Ordering::Less, "s^2 < s^3 by count");
+        let (s2a, s2b, s3) = (
+            e.make_iter(s, 2, z0),
+            e.make_iter(s, 2, z0),
+            e.make_iter(s, 3, z0),
+        );
+        assert!(
+            e.deep_equal(s2a, s2b),
+            "s^2(0) == s^2(0) (distinct ids, equal count)"
+        );
+        assert!(
+            !e.deep_equal(s2a, s3),
+            "s^2(0) != s^3(0) — count distinguishes them"
+        );
+        assert_eq!(
+            e.runtime().dag_compare(s2a, s3),
+            Ordering::Less,
+            "s^2 < s^3 by count"
+        );
         assert_eq!(e.runtime().dag_compare(s3, s2a), Ordering::Greater);
         assert_eq!(e.runtime().dag_compare(s2a, s2b), Ordering::Equal);
     }
@@ -6469,7 +8249,12 @@ mod tests {
         let eq = e.add_op("~", vec![nat, nat], truth);
         e.set_special(eq, SpecialOp::Equality { eq: tt, neq: ff });
         let myif = e.add_op("myif", vec![truth, nat, nat], nat);
-        e.set_special(myif, SpecialOp::Branch { tests: vec![tt, ff] });
+        e.set_special(
+            myif,
+            SpecialOp::Branch {
+                tests: vec![tt, ff],
+            },
+        );
 
         // _~_ over (reduced) Nat numerals: structural equality → tt/ff, 1 rewrite each.
         let mut eqtest = |a: u64, b: u64| -> (SymbolId, u64) {
@@ -6485,7 +8270,11 @@ mod tests {
 
         // myif(tt, 0, big) -> 0, 1 rewrite (dead `big` never reduced).
         e.reset_rewrites();
-        let (c, t0, ebig) = (e.make_const(tt), iter_num(&mut e, z, s, 0), e.make_const(big));
+        let (c, t0, ebig) = (
+            e.make_const(tt),
+            iter_num(&mut e, z, s, 0),
+            e.make_const(big),
+        );
         let q = e.make_free(myif, vec![c, t0, ebig]);
         let r = e.reduce(q);
         assert_eq!(e.node(r).symbol(), z, "myif(tt, 0, big) = 0");
@@ -6493,7 +8282,11 @@ mod tests {
 
         // myif(tt, big, 0) -> s s 0, 2 rewrites (selection + big reduces).
         e.reset_rewrites();
-        let (c, tbig, e0) = (e.make_const(tt), e.make_const(big), iter_num(&mut e, z, s, 0));
+        let (c, tbig, e0) = (
+            e.make_const(tt),
+            e.make_const(big),
+            iter_num(&mut e, z, s, 0),
+        );
         let q = e.make_free(myif, vec![c, tbig, e0]);
         let r = e.reduce(q);
         assert_eq!(e.rewrites(), 2, "selection + big = s s 0");
@@ -6502,7 +8295,11 @@ mod tests {
 
         // myif(ff, big, 0) -> 0, 1 rewrite (else branch; big unreduced).
         e.reset_rewrites();
-        let (c, tbig, e0) = (e.make_const(ff), e.make_const(big), iter_num(&mut e, z, s, 0));
+        let (c, tbig, e0) = (
+            e.make_const(ff),
+            e.make_const(big),
+            iter_num(&mut e, z, s, 0),
+        );
         let q = e.make_free(myif, vec![c, tbig, e0]);
         let r = e.reduce(q);
         assert_eq!(e.node(r).symbol(), z, "myif(ff, big, 0) = 0");
@@ -6528,8 +8325,15 @@ mod tests {
         let ff = e.add_op("ff", vec![], truth);
         let z = e.add_op("0", vec![], zero);
         let s = e.add_op_iter("s", vec![nat], nznat);
-        let nh = NatHooks { succ: s, zero: z, minus: None }; // NAT: no negatives
-        let bh = BoolHooks { true_: tt, false_: ff };
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: None,
+        }; // NAT: no negatives
+        let bh = BoolHooks {
+            true_: tt,
+            false_: ff,
+        };
         // ACU ops: NzNat Nat -> NzNat overloaded Nat Nat -> Nat (the prelude shape; F-B-completed).
         let acu_op = |e: &mut Engine, name: &'static str, op: NumOp| -> SymbolId {
             let o = e.add_op_ac(name, vec![nznat, nat], nznat, None);
@@ -6541,12 +8345,20 @@ mod tests {
         let times = acu_op(&mut e, "*", NumOp::Mul);
         let gcd = acu_op(&mut e, "gcd", NumOp::Gcd);
         // free arithmetic → Nat, and relational → Truth.
-        let num_op = |e: &mut Engine, name: &'static str, op: NumOp, b: Option<BoolHooks>| -> SymbolId {
-            let rng = if b.is_some() { truth } else { nat };
-            let o = e.add_op(name, vec![nat, nat], rng);
-            e.set_special(o, SpecialOp::NumberOp { op, nat: nh, bool_: b });
-            o
-        };
+        let num_op =
+            |e: &mut Engine, name: &'static str, op: NumOp, b: Option<BoolHooks>| -> SymbolId {
+                let rng = if b.is_some() { truth } else { nat };
+                let o = e.add_op(name, vec![nat, nat], rng);
+                e.set_special(
+                    o,
+                    SpecialOp::NumberOp {
+                        op,
+                        nat: nh,
+                        bool_: b,
+                    },
+                );
+                o
+            };
         let quo = num_op(&mut e, "quo", NumOp::Quo, None);
         let rem = num_op(&mut e, "rem", NumOp::Rem, None);
         let pow = num_op(&mut e, "^", NumOp::Pow, None);
@@ -6563,7 +8375,11 @@ mod tests {
             (decode_nat(e, r), e.sort_of(r), e.rewrites())
         };
         assert_eq!(acu(&mut e, plus, 2, 3), (5, nznat, 1), "2 + 3 = 5");
-        assert_eq!(acu(&mut e, plus, 2, 2), (4, nznat, 1), "2 + 2 = 4 (multiplicity fold)");
+        assert_eq!(
+            acu(&mut e, plus, 2, 2),
+            (4, nznat, 1),
+            "2 + 2 = 4 (multiplicity fold)"
+        );
         assert_eq!(acu(&mut e, plus, 0, 5), (5, nznat, 1), "0 + 5 = 5");
         assert_eq!(acu(&mut e, times, 3, 4), (12, nznat, 1), "3 * 4 = 12");
         assert_eq!(acu(&mut e, times, 2, 2), (4, nznat, 1), "2 * 2 = 4");
@@ -6595,11 +8411,19 @@ mod tests {
 
         // Residue: x + 2 + 3 = x + 5 (the non-numeric x survives), NzNat, 1 rewrite.
         e.reset_rewrites();
-        let (xn, n2, n3) = (e.make_const(x), iter_num(&mut e, z, s, 2), iter_num(&mut e, z, s, 3));
+        let (xn, n2, n3) = (
+            e.make_const(x),
+            iter_num(&mut e, z, s, 2),
+            iter_num(&mut e, z, s, 3),
+        );
         let q = e.make_ac(plus, vec![xn, n2, n3]);
         let r = e.reduce(q);
         assert_eq!(e.rewrites(), 1, "x + 2 + 3 = x + 5 in 1 rewrite");
-        assert_eq!(e.sort_of(r), nznat, "x + 5 : NzNat (asymmetric overload, F-B)");
+        assert_eq!(
+            e.sort_of(r),
+            nznat,
+            "x + 5 : NzNat (asymmetric overload, F-B)"
+        );
         assert_eq!(e.node(r).symbol(), plus, "result is still a + node");
         let kids: Vec<DagId> = e.node(r).children().collect();
         assert_eq!(kids.len(), 2, "x + 5 has two operands");
@@ -6641,21 +8465,68 @@ mod tests {
         let s = e.add_op_iter("s", vec![nat], nznat);
         let minus = e.add_op("-", vec![nznat], nzint); // -_ : NzNat -> NzInt
         e.add_op_decl(minus, vec![int], int); //          -_ : Int -> Int
-        let nh = NatHooks { succ: s, zero: z, minus: Some(minus) };
-        let bh = BoolHooks { true_: tt, false_: ff };
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: Some(minus),
+        };
+        let bh = BoolHooks {
+            true_: tt,
+            false_: ff,
+        };
         e.set_special(minus, SpecialOp::Minus { nat: nh });
         let plus = e.add_op_ac("+", vec![int, int], int, None);
-        e.set_special(plus, SpecialOp::AcuNumberOp { op: NumOp::Add, nat: nh });
+        e.set_special(
+            plus,
+            SpecialOp::AcuNumberOp {
+                op: NumOp::Add,
+                nat: nh,
+            },
+        );
         let times = e.add_op_ac("*", vec![int, int], int, None);
-        e.set_special(times, SpecialOp::AcuNumberOp { op: NumOp::Mul, nat: nh });
+        e.set_special(
+            times,
+            SpecialOp::AcuNumberOp {
+                op: NumOp::Mul,
+                nat: nh,
+            },
+        );
         let sub = e.add_op("-bin", vec![int, int], int);
-        e.set_special(sub, SpecialOp::NumberOp { op: NumOp::Sub, nat: nh, bool_: None });
+        e.set_special(
+            sub,
+            SpecialOp::NumberOp {
+                op: NumOp::Sub,
+                nat: nh,
+                bool_: None,
+            },
+        );
         let quo = e.add_op("quo", vec![int, nzint], int);
-        e.set_special(quo, SpecialOp::NumberOp { op: NumOp::Quo, nat: nh, bool_: None });
+        e.set_special(
+            quo,
+            SpecialOp::NumberOp {
+                op: NumOp::Quo,
+                nat: nh,
+                bool_: None,
+            },
+        );
         let rem = e.add_op("rem", vec![int, nzint], int);
-        e.set_special(rem, SpecialOp::NumberOp { op: NumOp::Rem, nat: nh, bool_: None });
+        e.set_special(
+            rem,
+            SpecialOp::NumberOp {
+                op: NumOp::Rem,
+                nat: nh,
+                bool_: None,
+            },
+        );
         let lt = e.add_op("<", vec![int, int], truth);
-        e.set_special(lt, SpecialOp::NumberOp { op: NumOp::Lt, nat: nh, bool_: Some(bh) });
+        e.set_special(
+            lt,
+            SpecialOp::NumberOp {
+                op: NumOp::Lt,
+                nat: nh,
+                bool_: Some(bh),
+            },
+        );
 
         // Build a signed numeral `v` (`s^v(0)`, or `-(s^|v|(0))`).
         let mk = |e: &mut Engine, v: i64| -> DagId {
@@ -6717,8 +8588,16 @@ mod tests {
         };
         assert_eq!(bin(&mut e, sub, 2, 5), (-3, 1), "2 - 5 = -3");
         assert_eq!(bin(&mut e, sub, 5, 2), (3, 1), "5 - 2 = 3");
-        assert_eq!(bin(&mut e, quo, 7, -2), (-3, 1), "7 quo -2 = -3 (toward zero)");
-        assert_eq!(bin(&mut e, rem, -7, 2), (-1, 1), "-7 rem 2 = -1 (dividend's sign)");
+        assert_eq!(
+            bin(&mut e, quo, 7, -2),
+            (-3, 1),
+            "7 quo -2 = -3 (toward zero)"
+        );
+        assert_eq!(
+            bin(&mut e, rem, -7, 2),
+            (-1, 1),
+            "-7 rem 2 = -1 (dividend's sign)"
+        );
 
         // Comparison → Truth.
         let cmp = |e: &mut Engine, a: i64, b: i64| -> SymbolId {
@@ -6756,16 +8635,59 @@ mod tests {
         let s = e.add_op_iter("s", vec![nat], nznat);
         let strsym = e.add_op("<Strings>", vec![], str_s);
         let qidsym = e.add_op("<Qids>", vec![], qid_s);
-        let nh = NatHooks { succ: s, zero: z, minus: None };
-        let bh = BoolHooks { true_: tt, false_: ff };
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: None,
+        };
+        let bh = BoolHooks {
+            true_: tt,
+            false_: ff,
+        };
         let concat = e.add_op(".", vec![str_s, str_s], str_s);
-        e.set_special(concat, SpecialOp::StringOp { op: StrOp::Concat, str_sym: strsym, nat: None, bool_: None, not_found: None });
+        e.set_special(
+            concat,
+            SpecialOp::StringOp {
+                op: StrOp::Concat,
+                str_sym: strsym,
+                nat: None,
+                bool_: None,
+                not_found: None,
+            },
+        );
         let len = e.add_op("len", vec![str_s], nat);
-        e.set_special(len, SpecialOp::StringOp { op: StrOp::Length, str_sym: strsym, nat: Some(nh), bool_: None, not_found: None });
+        e.set_special(
+            len,
+            SpecialOp::StringOp {
+                op: StrOp::Length,
+                str_sym: strsym,
+                nat: Some(nh),
+                bool_: None,
+                not_found: None,
+            },
+        );
         let sub = e.add_op("sub", vec![str_s, nat, nat], str_s);
-        e.set_special(sub, SpecialOp::StringOp { op: StrOp::Substr, str_sym: strsym, nat: Some(nh), bool_: None, not_found: None });
+        e.set_special(
+            sub,
+            SpecialOp::StringOp {
+                op: StrOp::Substr,
+                str_sym: strsym,
+                nat: Some(nh),
+                bool_: None,
+                not_found: None,
+            },
+        );
         let lt = e.add_op("lt", vec![str_s, str_s], truth);
-        e.set_special(lt, SpecialOp::StringOp { op: StrOp::Lt, str_sym: strsym, nat: None, bool_: Some(bh), not_found: None });
+        e.set_special(
+            lt,
+            SpecialOp::StringOp {
+                op: StrOp::Lt,
+                str_sym: strsym,
+                nat: None,
+                bool_: Some(bh),
+                not_found: None,
+            },
+        );
         let se = e.add_op("se", vec![str_s, str_s], truth);
         e.set_special(se, SpecialOp::Equality { eq: tt, neq: ff });
         let qe = e.add_op("qe", vec![qid_s, qid_s], truth);
@@ -6773,7 +8695,10 @@ mod tests {
 
         let dstr = |e: &Engine, id: DagId| -> String {
             match &e.node(id).term {
-                NodeTerm::Na { value: NaValue::Str(v), .. } => String::from_utf8_lossy(v).into_owned(),
+                NodeTerm::Na {
+                    value: NaValue::Str(v),
+                    ..
+                } => String::from_utf8_lossy(v).into_owned(),
                 _ => panic!("not a string node"),
             }
         };
@@ -6783,14 +8708,22 @@ mod tests {
         let (a, b) = (e.make_string(strsym, b"ab"), e.make_string(strsym, b"cd"));
         let q = e.make_free(concat, vec![a, b]);
         let r = e.reduce(q);
-        assert_eq!((dstr(&e, r), e.rewrites()), ("abcd".into(), 1), "\"ab\" . \"cd\" = \"abcd\"");
+        assert_eq!(
+            (dstr(&e, r), e.rewrites()),
+            ("abcd".into(), 1),
+            "\"ab\" . \"cd\" = \"abcd\""
+        );
 
         // length → Nat (sort follows the value)
         e.reset_rewrites();
         let h = e.make_string(strsym, b"hello");
         let q = e.make_free(len, vec![h]);
         let r = e.reduce(q);
-        assert_eq!((decode_nat(&e, r), e.rewrites()), (5, 1), "len(\"hello\") = 5");
+        assert_eq!(
+            (decode_nat(&e, r), e.rewrites()),
+            (5, 1),
+            "len(\"hello\") = 5"
+        );
         assert_eq!(e.sorts().name(e.sort_of(r)), "NzNat");
         let empty = e.make_string(strsym, b"");
         let q = e.make_free(len, vec![empty]);
@@ -6800,15 +8733,26 @@ mod tests {
 
         // substr(s, start, len)
         e.reset_rewrites();
-        let (hh, n1, n3) = (e.make_string(strsym, b"hello"), iter_num(&mut e, z, s, 1), iter_num(&mut e, z, s, 3));
+        let (hh, n1, n3) = (
+            e.make_string(strsym, b"hello"),
+            iter_num(&mut e, z, s, 1),
+            iter_num(&mut e, z, s, 3),
+        );
         let q = e.make_free(sub, vec![hh, n1, n3]);
         let r = e.reduce(q);
-        assert_eq!((dstr(&e, r), e.rewrites()), ("ell".into(), 1), "sub(\"hello\", 1, 3) = \"ell\"");
+        assert_eq!(
+            (dstr(&e, r), e.rewrites()),
+            ("ell".into(), 1),
+            "sub(\"hello\", 1, 3) = \"ell\""
+        );
 
         // string comparison + NA equality (string + qid)
         let cmp = |e: &mut Engine, op: SymbolId, x: &str, y: &str| -> SymbolId {
             e.reset_rewrites();
-            let (a, b) = (e.make_string(strsym, x.as_bytes()), e.make_string(strsym, y.as_bytes()));
+            let (a, b) = (
+                e.make_string(strsym, x.as_bytes()),
+                e.make_string(strsym, y.as_bytes()),
+            );
             let q = e.make_free(op, vec![a, b]);
             let r = e.reduce(q);
             assert_eq!(e.rewrites(), 1);
@@ -6817,7 +8761,11 @@ mod tests {
         assert_eq!(cmp(&mut e, lt, "abc", "abd"), tt, "\"abc\" < \"abd\"");
         assert_eq!(cmp(&mut e, lt, "b", "abc"), ff, "\"b\" < \"abc\" is false");
         assert_eq!(cmp(&mut e, se, "abc", "abc"), tt, "\"abc\" == \"abc\"");
-        assert_eq!(cmp(&mut e, se, "abc", "abd"), ff, "\"abc\" == \"abd\" is false");
+        assert_eq!(
+            cmp(&mut e, se, "abc", "abd"),
+            ff,
+            "\"abc\" == \"abd\" is false"
+        );
 
         // quoted-id NA equality (matches only itself)
         let qcmp = |e: &mut Engine, x: &str, y: &str| -> SymbolId {
@@ -6845,18 +8793,39 @@ mod tests {
         let tt = e.add_op("tt", vec![], truth);
         let ff = e.add_op("ff", vec![], truth);
         let fsym = e.add_op("<Floats>", vec![], flt);
-        let bh = BoolHooks { true_: tt, false_: ff };
+        let bh = BoolHooks {
+            true_: tt,
+            false_: ff,
+        };
         let unary = |e: &mut Engine, op: FltOp| -> SymbolId {
             let o = e.add_op("uf", vec![flt], flt);
-            e.set_special(o, SpecialOp::FloatOp { op, float_sym: fsym, bool_: None });
+            e.set_special(
+                o,
+                SpecialOp::FloatOp {
+                    op,
+                    float_sym: fsym,
+                    bool_: None,
+                },
+            );
             o
         };
         let binary = |e: &mut Engine, op: FltOp| -> SymbolId {
             let o = e.add_op("bf", vec![flt, flt], flt);
-            e.set_special(o, SpecialOp::FloatOp { op, float_sym: fsym, bool_: None });
+            e.set_special(
+                o,
+                SpecialOp::FloatOp {
+                    op,
+                    float_sym: fsym,
+                    bool_: None,
+                },
+            );
             o
         };
-        let (neg, abs, sqrt) = (unary(&mut e, FltOp::Neg), unary(&mut e, FltOp::Abs), unary(&mut e, FltOp::Sqrt));
+        let (neg, abs, sqrt) = (
+            unary(&mut e, FltOp::Neg),
+            unary(&mut e, FltOp::Abs),
+            unary(&mut e, FltOp::Sqrt),
+        );
         let (add, sub, mul, div) = (
             binary(&mut e, FltOp::Add),
             binary(&mut e, FltOp::Sub),
@@ -6864,11 +8833,21 @@ mod tests {
             binary(&mut e, FltOp::Div),
         );
         let lt = e.add_op("lt", vec![flt, flt], truth);
-        e.set_special(lt, SpecialOp::FloatOp { op: FltOp::Lt, float_sym: fsym, bool_: Some(bh) });
+        e.set_special(
+            lt,
+            SpecialOp::FloatOp {
+                op: FltOp::Lt,
+                float_sym: fsym,
+                bool_: Some(bh),
+            },
+        );
 
         let df = |e: &Engine, id: DagId| -> f64 {
             match &e.node(id).term {
-                NodeTerm::Na { value: NaValue::Float(b), .. } => f64::from_bits(*b),
+                NodeTerm::Na {
+                    value: NaValue::Float(b),
+                    ..
+                } => f64::from_bits(*b),
                 _ => panic!("not a float node"),
             }
         };
@@ -6900,7 +8879,11 @@ mod tests {
         let negn3 = e.make_free(neg, vec![n3]);
         let absq = e.make_free(abs, vec![negn3]);
         let r = e.reduce(absq);
-        assert_eq!((df(&e, r), e.rewrites()), (3.0, 2), "abs(neg(3.0)) = 3.0 in 2 rewrites");
+        assert_eq!(
+            (df(&e, r), e.rewrites()),
+            (3.0, 2),
+            "abs(neg(3.0)) = 3.0 in 2 rewrites"
+        );
         // Comparison → Truth.
         let cf = |e: &mut Engine, a: f64, b: f64| -> SymbolId {
             e.reset_rewrites();
@@ -6942,7 +8925,11 @@ mod tests {
         let s = e.add_op_iter("s", vec![nat], nznat);
         let minus = e.add_op("-", vec![nznat], nzint);
         e.add_op_decl(minus, vec![int], int);
-        let nh = NatHooks { succ: s, zero: z, minus: Some(minus) };
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: Some(minus),
+        };
         e.set_special(minus, SpecialOp::Minus { nat: nh });
         let div = e.add_op("/", vec![nzint, nznat], nzrat);
         e.add_op_decl(div, vec![int, nznat], rat);
@@ -6967,8 +8954,16 @@ mod tests {
         assert_eq!(frac(&mut e, 6, 4), ("3/2".into(), 1), "6/4 = 3/2");
         assert_eq!(frac(&mut e, -6, 4), ("-3/2".into(), 1), "-6/4 = -3/2");
         assert_eq!(frac(&mut e, 5, 1), ("5".into(), 1), "5/1 = 5");
-        assert_eq!(frac(&mut e, 3, 4), ("3/4".into(), 0), "3/4 already canonical (0 rewrites)");
-        assert_eq!(frac(&mut e, 0, 5), ("0/5".into(), 0), "0/5 left to the user eq (0 rewrites)");
+        assert_eq!(
+            frac(&mut e, 3, 4),
+            ("3/4".into(), 0),
+            "3/4 already canonical (0 rewrites)"
+        );
+        assert_eq!(
+            frac(&mut e, 0, 5),
+            ("0/5".into(), 0),
+            "0/5 left to the user eq (0 rewrites)"
+        );
     }
 
     #[test]
@@ -6987,8 +8982,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
 
@@ -7007,7 +9008,10 @@ mod tests {
 
         let result = e.reduce(sum);
         let four = peano(&mut e, zero, s, 4);
-        assert!(e.deep_equal(result, four), "2 + 2 should reduce to s s s s 0");
+        assert!(
+            e.deep_equal(result, four),
+            "2 + 2 should reduce to s s s s 0"
+        );
         assert_eq!(e.rewrites(), 3, "rewrite count matches reference Maude");
     }
 
@@ -7024,14 +9028,22 @@ mod tests {
         let v = |i| Term::var(i, nat);
         let s_of = |t| Term::op(s, vec![t]);
         // N + 0 = N ; N + s M = s (N + M)
-        e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), Term::constant(zero)]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![v(0), Term::constant(zero)]),
+            rhs: v(0),
+            nr_vars: 1,
+        });
         e.add_equation(Equation {
             lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
             rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
             nr_vars: 2,
         });
         // N * 0 = 0 ; N * s M = (N * M) + N
-        e.add_equation(Equation { lhs: Term::op(times, vec![v(0), Term::constant(zero)]), rhs: Term::constant(zero), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(times, vec![v(0), Term::constant(zero)]),
+            rhs: Term::constant(zero),
+            nr_vars: 1,
+        });
         e.add_equation(Equation {
             lhs: Term::op(times, vec![v(0), s_of(v(1))]),
             rhs: Term::op(plus, vec![Term::op(times, vec![v(0), v(1)]), v(0)]),
@@ -7051,7 +9063,10 @@ mod tests {
         let prod = e.make_free(times, vec![three, four]); // 3 * 4
         let result = e.reduce(prod);
         let twelve = peano(&mut e, zero, s, 12);
-        assert!(e.deep_equal(result, twelve), "3 * 4 should reduce to s^12 0");
+        assert!(
+            e.deep_equal(result, twelve),
+            "3 * 4 should reduce to s^12 0"
+        );
         assert_eq!(e.rewrites(), 21, "rewrite count matches reference Maude");
     }
 
@@ -7067,11 +9082,23 @@ mod tests {
 
         let a0 = e.make_const(a);
         let r1 = e.reduce(a0);
-        assert_eq!(e.node(r1).symbol(), a, "no equations yet: a is its own normal form");
+        assert_eq!(
+            e.node(r1).symbol(),
+            a,
+            "no equations yet: a is its own normal form"
+        );
 
-        e.add_equation(Equation { lhs: Term::constant(a), rhs: Term::constant(b), nr_vars: 0 });
+        e.add_equation(Equation {
+            lhs: Term::constant(a),
+            rhs: Term::constant(b),
+            nr_vars: 0,
+        });
         let r2 = e.reduce(a0); // same id; must re-reduce despite the earlier REDUCED stamp
-        assert_eq!(e.node(r2).symbol(), b, "after adding a = b, reducing a yields b");
+        assert_eq!(
+            e.node(r2).symbol(),
+            b,
+            "after adding a = b, reducing a yields b"
+        );
     }
 
     #[test]
@@ -7094,9 +9121,16 @@ mod tests {
 
         let tb = e.make_const(t);
         let ft = e.make_free(f, vec![tb]); // f(t): Bool arg not <= Nat
-        assert!(e.sorts().sort(e.sort_of(ft)).is_error, "ill-sorted f(t) is in the error sort");
+        assert!(
+            e.sorts().sort(e.sort_of(ft)).is_error,
+            "ill-sorted f(t) is in the error sort"
+        );
         let r = e.reduce(ft);
-        assert_eq!(e.node(r).symbol(), f, "f(t) does not rewrite: N:Nat cannot match a Bool");
+        assert_eq!(
+            e.node(r).symbol(),
+            f,
+            "f(t) does not rewrite: N:Nat cannot match a Bool"
+        );
     }
 
     /// Build the unary numeral `s^n 0`.
@@ -7118,7 +9152,11 @@ mod tests {
                 return k;
             }
             assert_eq!(sym, s, "not a Peano numeral");
-            id = e.node(id).children().next().expect("successor has one child");
+            id = e
+                .node(id)
+                .children()
+                .next()
+                .expect("successor has one child");
             k += 1;
         }
     }
@@ -7141,8 +9179,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
 
@@ -7166,7 +9210,10 @@ mod tests {
         let s = e.add_op("s", vec![nat], nat);
         let chain = numeral(&mut e, zero, s, 200_000);
         let r = e.reduce(chain);
-        assert_eq!(r, chain, "no equations: a deep chain is its own normal form (shared id kept)");
+        assert_eq!(
+            r, chain,
+            "no equations: a deep chain is its own normal form (shared id kept)"
+        );
     }
 
     /// Conformance lock against the reference C++ Maude binary (`conformance/fib.maude`): the
@@ -7185,13 +9232,21 @@ mod tests {
         let v = |i| Term::var(i, nat);
         let s_of = |t| Term::op(s, vec![t]);
         let zero_t = || Term::constant(zero);
-        e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), zero_t()]), rhs: v(0), nr_vars: 1 });
+        e.add_equation(Equation {
+            lhs: Term::op(plus, vec![v(0), zero_t()]),
+            rhs: v(0),
+            nr_vars: 1,
+        });
         e.add_equation(Equation {
             lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
             rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
             nr_vars: 2,
         });
-        e.add_equation(Equation { lhs: Term::op(fib, vec![zero_t()]), rhs: zero_t(), nr_vars: 0 });
+        e.add_equation(Equation {
+            lhs: Term::op(fib, vec![zero_t()]),
+            rhs: zero_t(),
+            nr_vars: 0,
+        });
         e.add_equation(Equation {
             lhs: Term::op(fib, vec![s_of(zero_t())]),
             rhs: s_of(zero_t()),
@@ -7199,7 +9254,10 @@ mod tests {
         });
         e.add_equation(Equation {
             lhs: Term::op(fib, vec![s_of(s_of(v(0)))]),
-            rhs: Term::op(plus, vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])]),
+            rhs: Term::op(
+                plus,
+                vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])],
+            ),
             nr_vars: 1,
         });
 
@@ -7207,7 +9265,11 @@ mod tests {
         let q = e.make_free(fib, vec![n]);
         let r = e.reduce(q);
         assert_eq!(decode(&e, r, zero, s), 17711, "fib(22) = 17711");
-        assert_eq!(e.rewrites(), 186579, "exact rewrite count matches reference Maude");
+        assert_eq!(
+            e.rewrites(),
+            186579,
+            "exact rewrite count matches reference Maude"
+        );
     }
 
     /// C7 forwarding, re-baselined: a *shared, still-reducible* redex is reduced — and counted — **once
@@ -7241,7 +9303,11 @@ mod tests {
 
         // f(s 0, s 0): the shared C fired `N + 0 = N` once; the second reference forwarded to the result.
         assert_eq!(e.node(r).symbol(), f);
-        assert_eq!(e.rewrites(), 1, "shared reducible redex reduced once total (C7 forwarding)");
+        assert_eq!(
+            e.rewrites(),
+            1,
+            "shared reducible redex reduced once total (C7 forwarding)"
+        );
     }
 
     /// A [`RootGuard`] pins its node across `gc`; dropping it releases the root (D2 amendment).
@@ -7254,10 +9320,18 @@ mod tests {
         let node = e.make_const(a);
         {
             let _g = e.root(node);
-            assert_eq!(e.gc(Vec::new()), 0, "a guarded node survives gc with no extra roots");
+            assert_eq!(
+                e.gc(Vec::new()),
+                0,
+                "a guarded node survives gc with no extra roots"
+            );
             assert_eq!(e.live_nodes(), 1);
         } // guard dropped here
-        assert_eq!(e.gc(Vec::new()), 1, "after the guard drops, the node is collected");
+        assert_eq!(
+            e.gc(Vec::new()),
+            1,
+            "after the guard drops, the node is collected"
+        );
         assert_eq!(e.live_nodes(), 0);
     }
 
@@ -7273,7 +9347,11 @@ mod tests {
         let nb = e.make_const(b);
         let g = e.root(na);
         g.set(nb); // now protecting nb instead of na
-        assert_eq!(e.gc(Vec::new()), 1, "na is no longer rooted and is collected");
+        assert_eq!(
+            e.gc(Vec::new()),
+            1,
+            "na is no longer rooted and is collected"
+        );
         assert_eq!(e.live_nodes(), 1);
         assert_eq!(e.node(g.get()).symbol(), b, "the guard now protects nb");
     }
@@ -7295,17 +9373,32 @@ mod tests {
             let v = |i| Term::var(i, nat);
             let s_of = |t| Term::op(s, vec![t]);
             let zero_t = || Term::constant(zero);
-            e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), zero_t()]), rhs: v(0), nr_vars: 1 });
+            e.add_equation(Equation {
+                lhs: Term::op(plus, vec![v(0), zero_t()]),
+                rhs: v(0),
+                nr_vars: 1,
+            });
             e.add_equation(Equation {
                 lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
                 rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
                 nr_vars: 2,
             });
-            e.add_equation(Equation { lhs: Term::op(fib, vec![zero_t()]), rhs: zero_t(), nr_vars: 0 });
-            e.add_equation(Equation { lhs: Term::op(fib, vec![s_of(zero_t())]), rhs: s_of(zero_t()), nr_vars: 0 });
+            e.add_equation(Equation {
+                lhs: Term::op(fib, vec![zero_t()]),
+                rhs: zero_t(),
+                nr_vars: 0,
+            });
+            e.add_equation(Equation {
+                lhs: Term::op(fib, vec![s_of(zero_t())]),
+                rhs: s_of(zero_t()),
+                nr_vars: 0,
+            });
             e.add_equation(Equation {
                 lhs: Term::op(fib, vec![s_of(s_of(v(0)))]),
-                rhs: Term::op(plus, vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])]),
+                rhs: Term::op(
+                    plus,
+                    vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])],
+                ),
                 nr_vars: 1,
             });
             e.set_gc_interval(interval);
@@ -7319,7 +9412,10 @@ mod tests {
         let (val_on, rw_on, cap_on) = run(Some(20_000));
         assert_eq!(val_off, 6765, "fib(20) = 6765");
         assert_eq!(val_on, 6765, "safe-point GC does not change the result");
-        assert_eq!(rw_on, rw_off, "safe-point GC does not change the rewrite count");
+        assert_eq!(
+            rw_on, rw_off,
+            "safe-point GC does not change the rewrite count"
+        );
         assert!(
             cap_on < cap_off,
             "safe-point GC bounds the arena high-water: {cap_on} (on) vs {cap_off} (off)"
@@ -7345,8 +9441,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
         e.set_gc_interval(Some(100)); // collect several times during a reduction
@@ -7363,7 +9465,11 @@ mod tests {
         let big_sum = e.make_free(plus, vec![big_a, big_b]);
         let _ = e.reduce(big_sum);
 
-        assert_eq!(decode(&e, g.get(), zero, s), 4, "the rooted result survives intact");
+        assert_eq!(
+            decode(&e, g.get(), zero, s),
+            4,
+            "the rooted result survives intact"
+        );
     }
 
     /// F-2 (engine-global condition-reduce root set): with in-reduction GC on, a re-entrant condition
@@ -7389,8 +9495,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
         let pair = e.add_op("pair", vec![nat, nat], nat); // a free ctor, no equations
@@ -7419,8 +9531,16 @@ mod tests {
 
         let children: Vec<DagId> = e.node(r).children().collect();
         assert_eq!(children.len(), 2, "pair keeps its two arguments");
-        assert_eq!(decode(&e, children[0], zero, s), 100, "outer-frame sibling survived the condition GC");
-        assert_eq!(decode(&e, children[1], zero, s), 120, "cond(b) reduced to b");
+        assert_eq!(
+            decode(&e, children[0], zero, s),
+            100,
+            "outer-frame sibling survived the condition GC"
+        );
+        assert_eq!(
+            decode(&e, children[1], zero, s),
+            120,
+            "cond(b) reduced to b"
+        );
     }
 
     /// F-2, matching (`:=`) condition variant: locks the `solve_condition` *matching* arm's rooting of the
@@ -7442,8 +9562,14 @@ mod tests {
             nr_vars: 1,
         });
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::var(0, nat), Term::op(s, vec![Term::var(1, nat)])],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
         let pair = e.add_op("pair", vec![nat, nat], nat);
@@ -7469,8 +9595,16 @@ mod tests {
 
         let children: Vec<DagId> = e.node(r).children().collect();
         assert_eq!(children.len(), 2, "pair keeps its two arguments");
-        assert_eq!(decode(&e, children[0], zero, s), 100, "outer-frame sibling survived the condition GC");
-        assert_eq!(decode(&e, children[1], zero, s), 120, "pickm(b) = b + b = 120 (matched subject survived)");
+        assert_eq!(
+            decode(&e, children[0], zero, s),
+            100,
+            "outer-frame sibling survived the condition GC"
+        );
+        assert_eq!(
+            decode(&e, children[1], zero, s),
+            120,
+            "pickm(b) = b + b = 120 (matched subject survived)"
+        );
     }
 
     /// C7 normal-form forwarding (Half 2), in isolation — no construction dedup needed: a *manually*
@@ -7500,9 +9634,147 @@ mod tests {
         e.reset_rewrites();
         let r = e.reduce(subj);
 
-        assert_eq!(e.rewrites(), 1, "a shared redex reduces once (forwarding), not once per reference");
+        assert_eq!(
+            e.rewrites(),
+            1,
+            "a shared redex reduces once (forwarding), not once per reference"
+        );
         let children: Vec<DagId> = e.node(r).children().collect();
         let bsym = |id| e.node(id).symbol() == b;
-        assert!(bsym(children[0]) && bsym(children[1]), "both arguments forwarded to b: < b, b >");
+        assert!(
+            bsym(children[0]) && bsym(children[1]),
+            "both arguments forwarded to b: < b, b >"
+        );
+    }
+
+    #[test]
+    fn compound_identity_materializes_as_reduced_canonical_dag() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let g = e.add_op("g", vec![s], s);
+        let f = e.add_op_ac("f", vec![s, s], s, None);
+        e.add_equation(Equation {
+            lhs: Term::op(g, vec![Term::constant(a)]),
+            rhs: Term::constant(b),
+            nr_vars: 0,
+        });
+        e.reserve_identity(f, s);
+        e.set_identity_term(f, Term::op(g, vec![Term::constant(a)]));
+
+        e.reset_rewrites();
+        e.prepare_identities();
+        let identity = e.sig.symbol(f).identity().expect("reserved identity");
+        let first = e.make_identity(identity);
+        let second = e.make_identity(identity);
+
+        assert_eq!(
+            first, second,
+            "repeated fetches reuse the canonical identity DAG"
+        );
+        assert_eq!(
+            e.node(first).symbol(),
+            b,
+            "g(a) is reduced before the identity is cached"
+        );
+        assert_eq!(
+            e.rewrites(),
+            0,
+            "identity-cache maintenance does not enter user rewrite statistics"
+        );
+        let a0 = e.make_const(a);
+        let ga = e.make_free(g, vec![a0]);
+        let ga = e.reduce(ga);
+        let other = e.make_const(a);
+        assert_eq!(
+            e.make_ac(f, vec![ga, other]),
+            other,
+            "a value-equal reduced DAG is recognized as identity"
+        );
+    }
+
+    #[test]
+    fn compound_identity_cache_is_a_permanent_explicit_gc_root() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let b = e.add_op("b", vec![], s);
+        let g = e.add_op("g", vec![s], s);
+        let f = e.add_op_ac("f", vec![s, s], s, None);
+        e.reserve_identity(f, s);
+        e.set_identity_term(f, Term::op(g, vec![Term::constant(a)]));
+        e.prepare_identities();
+        let identity = e.sig.symbol(f).identity().expect("reserved identity");
+        let cached = e.make_identity(identity);
+
+        for _ in 0..32 {
+            let garbage_a = e.make_const(a);
+            let _ = e.make_free(g, vec![garbage_a]);
+        }
+        assert!(e.gc([]) > 0, "forced collection reclaims unrelated DAGs");
+
+        let fetched = e.make_identity(identity);
+        assert_eq!(
+            fetched, cached,
+            "the permanent cache entry survives explicit collection"
+        );
+        let child = e
+            .node(fetched)
+            .children()
+            .next()
+            .expect("compound identity child");
+        assert_eq!(
+            e.node(child).symbol(),
+            a,
+            "collection keeps the full cached identity graph live"
+        );
+        let b0 = e.make_const(b);
+        assert_eq!(
+            e.make_ac(f, vec![fetched, b0]),
+            b0,
+            "the surviving cache still drives identity collapse"
+        );
+    }
+
+    #[test]
+    fn compact_million_count_iter_identity_materializes_without_expansion() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], s);
+        let g = e.add_op_iter("g", vec![s], s);
+        let f = e.add_op_ac("f", vec![s, s], s, None);
+        e.reserve_identity(f, s);
+        e.set_identity_term(
+            f,
+            Term::iter(g, Nat::from_u64(1_000_000), Term::constant(a)),
+        );
+
+        e.prepare_identities();
+        let identity = e.sig.symbol(f).identity().expect("reserved identity");
+        let cached = e.make_identity(identity);
+        match &e.node(cached).term {
+            NodeTerm::S { symbol, count, arg } => {
+                assert_eq!(*symbol, g);
+                assert_eq!(count, &Nat::from_u64(1_000_000));
+                assert_eq!(e.node(*arg).symbol(), a);
+            }
+            other => {
+                panic!("million-count identity expanded instead of using one S node: {other:?}")
+            }
+        }
+        assert_eq!(
+            e.live_nodes(),
+            2,
+            "identity uses only its base and one compact iter DAG node"
+        );
+        assert_eq!(
+            e.make_identity(identity),
+            cached,
+            "compact identity remains canonical on repeat fetch"
+        );
     }
 }

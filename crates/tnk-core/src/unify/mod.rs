@@ -12,30 +12,32 @@
 //!   incompleteness flag.
 //! * [`compute_solved_form`] — `DagNode::computeSolvedForm` dispatch plus the per-theory
 //!   `computeSolvedForm2` arms that resolve deterministically (variables, free, S/iter, and the
-//!   ground backstop); multi-solution theories (C/CUI in [`cui`], AC/ACU and A/AU when their
-//!   solvers land) push onto the pending stack instead.
+//!   ground backstop); multi-solution theories (C/CUI in [`cui`], AC/ACU in [`acu`], and A/AU in
+//!   [`au`]) push onto the pending stack instead.
 //!
 //! Everything takes `&mut Engine` — solving builds nodes and creates per-sort variable symbols in
 //! Maude's demand order (observable through `dag_compare`). Fresh-variable *names* come from the
 //! central [`FreshVariableGenerator`]; their interned codes come from the session's [`NameCodes`]
 //! source, so name-code order matches the reference's token-encounter order.
 
-// A few solved-form helpers (`flag_as_incomplete`, `UnifyContext::family`) have no caller until the
-// AC/ACU and A/AU solvers land (S1c) and the `metaUnify` descent (S1f). Scoped dead-code allowance
-// until then (subsystems-goal §5 S1); the object-level `unify` command already drives the rest.
+// Some solved-form accessors are consumed only by the later variant/narrowing drivers; keep the
+// dead-code allowance scoped to this module.
 #![allow(dead_code)]
 
 pub(crate) mod acu;
+pub(crate) mod au;
 pub(crate) mod cui;
 pub mod filter;
 pub mod problem;
+pub(crate) mod word;
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
 use crate::num::Nat;
 use crate::sort::{KindId, SortId};
-use crate::symbol::{SymbolId, Theory};
+use crate::symbol::{IdentityId, SymbolId, Theory};
+use crate::term::Term;
 use std::collections::BTreeSet;
 
 /// Session name-code source: interns a fresh-variable name (`#1`, `%2`, …) and returns its code —
@@ -59,9 +61,9 @@ pub(crate) type SavedSubst = Vec<Option<DagId>>;
 // UnifyContext — unificationContext.{hh,cc}
 // ======================================================================================
 
-/// The unification substitution: slots `0..n_original` are the problem's original variables,
-/// higher slots are fresh variables created mid-solve (always at the **kind** level). `None` =
-/// unbound. Mirrors `UnificationContext`.
+/// The unification substitution: slots `0..n_original` are the problem's original layout (including
+/// inactive narrowing gaps), and higher slots are fresh variables created mid-solve (always at the
+/// **kind** level). `None` = unbound or inactive. Mirrors `UnificationContext`.
 pub(crate) struct UnifyContext {
     values: Vec<Option<DagId>>,
     n_original: usize,
@@ -131,7 +133,9 @@ impl UnifyContext {
         self.values.push(None);
         let fresh_nr = index - self.n_original;
         self.fresh_sorts.push(sort);
-        let code = env.names.code(self.generator.fresh_name(fresh_nr, self.family));
+        let code = env
+            .names
+            .code(self.generator.fresh_name(fresh_nr, self.family));
         env.e.make_var(sort, code, index as u32)
     }
 
@@ -248,7 +252,7 @@ pub(crate) fn insert_variables(e: &Engine, id: DagId, occurs: &mut BTreeSet<usiz
 /// Instantiate `id` under the context (`DagNode::instantiate` with invariants maintained):
 /// `None` = unchanged. Rebuilding goes through the canonical `make_*` builders, so collapse,
 /// flattening, ordering, and base sorts are maintained exactly as at construction.
-pub(crate) fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Option<DagId> {
+pub fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Option<DagId> {
     enum Rep {
         Free(SymbolId, Vec<DagId>),
         Acu(SymbolId, Vec<(DagId, u32)>),
@@ -365,15 +369,14 @@ pub(crate) fn unify_theory(e: &Engine, symbol: SymbolId) -> UnifyTheory {
     }
 }
 
-/// Whether `symbol`'s unification theory is unimplemented (the `computeBaseSortForGroundSubterms`
-/// backstop set): CUI with `idem`; associative with a one-sided identity. AC/ACU and A/AU are
-/// TEMPORARILY in this set until their solvers land (S1c) — an honest refusal (warn, no unifiers)
-/// rather than a misfiring partial answer.
+/// Whether `symbol`'s unification theory is unimplemented (the
+/// `computeBaseSortForGroundSubterms` backstop set): CUI with `idem`, or associative with a
+/// one-sided identity.
 fn unimplemented_theory(e: &Engine, symbol: SymbolId) -> bool {
     let sym = e.symbol(symbol);
     match sym.theory() {
         Theory::Cui => sym.axioms.idem,
-        Theory::Au => sym.one_sided_identity() || true, // TEMPORARY: A/AU solver lands next in S1c
+        Theory::Au => sym.one_sided_identity(),
         _ => false,
     }
 }
@@ -503,7 +506,10 @@ enum VarStatus {
 impl PendingStack {
     pub(crate) fn new() -> Self {
         PendingStack {
-            theory_table: vec![TheoryEntry { controlling: None, first_problem: None }],
+            theory_table: vec![TheoryEntry {
+                controlling: None,
+                first_problem: None,
+            }],
             stack: Vec::new(),
             subproblems: Vec::new(),
             incomplete: BTreeSet::new(),
@@ -536,8 +542,17 @@ impl PendingStack {
             }
         }
         let i = self.theory_table.len();
-        self.theory_table.push(TheoryEntry { controlling, first_problem: Some(e) });
-        self.stack.push(PendingProblem { theory: i, next_in_theory: None, lhs, rhs, marked });
+        self.theory_table.push(TheoryEntry {
+            controlling,
+            first_problem: Some(e),
+        });
+        self.stack.push(PendingProblem {
+            theory: i,
+            next_in_theory: None,
+            lhs,
+            rhs,
+            marked,
+        });
     }
 
     /// `resolveTheoryClash`: neither side's theory owns `lhs =? rhs`. If only one side can
@@ -600,8 +615,11 @@ impl PendingStack {
         ctx: &mut UnifyContext,
     ) -> bool {
         let mut find_first = find_first;
-        if if find_first { self.make_new_subproblem(env, ctx) } else { !self.subproblems.is_empty() }
-        {
+        if if find_first {
+            self.make_new_subproblem(env, ctx)
+        } else {
+            !self.subproblems.is_empty()
+        } {
             loop {
                 // Temporarily move the top subproblem out so it can mutate `self` while solving.
                 let top = self.subproblems.len() - 1;
@@ -705,7 +723,9 @@ impl PendingStack {
                 self.subproblems.push(ActiveSubproblem {
                     theory: ActiveTheory::CompoundCycle,
                     saved_first: None,
-                    sp: Some(UnifySubproblem::CompoundCycle(CompoundCycleSubproblem::new(cycle))),
+                    sp: Some(UnifySubproblem::CompoundCycle(
+                        CompoundCycleSubproblem::new(cycle),
+                    )),
                 });
                 true
             }
@@ -714,7 +734,10 @@ impl PendingStack {
 
     /// `killTopSubproblem`: pop and relink its problems back as unsolved.
     fn kill_top_subproblem(&mut self) {
-        let a = self.subproblems.pop().expect("kill on empty subproblem stack");
+        let a = self
+            .subproblems
+            .pop()
+            .expect("kill on empty subproblem stack");
         if let ActiveTheory::Table(i) = a.theory {
             debug_assert!(
                 self.theory_table[i].first_problem.is_none(),
@@ -766,18 +789,15 @@ impl PendingStack {
 
     /// GC-root surface: every dag held by pending problems.
     pub(crate) fn gc_roots(&self) -> impl Iterator<Item = DagId> + '_ {
-        self.stack
-            .iter()
-            .flat_map(|p| [p.lhs, p.rhs])
-            .chain(self.subproblems.iter().flat_map(|a| {
-                a.sp.as_ref().map(|sp| sp.gc_roots()).unwrap_or_default()
-            }))
+        self.stack.iter().flat_map(|p| [p.lhs, p.rhs]).chain(
+            self.subproblems
+                .iter()
+                .flat_map(|a| a.sp.as_ref().map(|sp| sp.gc_roots()).unwrap_or_default()),
+        )
     }
 }
 
-/// `Symbol::makeUnificationSubproblem` — one subproblem per controlling theory. AC/ACU and A/AU
-/// arrive with S1c; until then their tops are screened as unimplemented, so no problem can be
-/// pushed under them.
+/// `Symbol::makeUnificationSubproblem` — one subproblem per controlling theory.
 fn make_unification_subproblem(e: &Engine, symbol: SymbolId) -> UnifySubproblem {
     match unify_theory(e, symbol) {
         UnifyTheory::Cui => {
@@ -789,9 +809,7 @@ fn make_unification_subproblem(e: &Engine, symbol: SymbolId) -> UnifySubproblem 
             }
         }
         UnifyTheory::Acu => UnifySubproblem::Acu(acu::AcuSubproblem::new(e, symbol)),
-        UnifyTheory::Au => {
-            unreachable!("A/AU tops are screened until their solver lands (S1c)")
-        }
+        UnifyTheory::Au => UnifySubproblem::Au(au::AuSubproblem::new(symbol)),
         UnifyTheory::Free | UnifyTheory::S => {
             unreachable!("free and S theories never push subproblems")
         }
@@ -808,6 +826,7 @@ pub(crate) enum UnifySubproblem {
     C(cui::CSubproblem),
     CuiWithId(cui::CuiIdSubproblem),
     Acu(acu::AcuSubproblem),
+    Au(au::AuSubproblem),
 }
 
 impl UnifySubproblem {
@@ -828,6 +847,7 @@ impl UnifySubproblem {
             UnifySubproblem::C(c) => c.add_unification(lhs, rhs, marked),
             UnifySubproblem::CuiWithId(c) => c.add_unification(env, ctx, pending, lhs, rhs, marked),
             UnifySubproblem::Acu(c) => c.add_unification(env.e, ctx, lhs, rhs, marked),
+            UnifySubproblem::Au(a) => a.add_unification(env.e, ctx, lhs, rhs, marked),
         }
     }
 
@@ -844,6 +864,7 @@ impl UnifySubproblem {
             UnifySubproblem::C(c) => c.solve(env, find_first, ctx, pending),
             UnifySubproblem::CuiWithId(c) => c.solve(env, find_first, ctx, pending),
             UnifySubproblem::Acu(c) => c.solve(env, find_first, ctx, pending),
+            UnifySubproblem::Au(a) => a.solve(env, find_first, ctx, pending),
         }
     }
 
@@ -858,6 +879,7 @@ impl UnifySubproblem {
             UnifySubproblem::C(c) => c.gc_roots(),
             UnifySubproblem::CuiWithId(c) => c.gc_roots(),
             UnifySubproblem::Acu(c) => c.gc_roots(),
+            UnifySubproblem::Au(a) => a.gc_roots(),
         }
     }
 }
@@ -932,11 +954,59 @@ impl DisjunctionSubproblem {
 // CompoundCycleSubproblem — compoundCycleSubproblem.cc
 // --------------------------------------------------------------------------------------
 
-/// Break a cross-theory dependency cycle by collapsing one of its non-variable edges (an
-/// assignment whose top can resolve to a subterm via identity). The reference's second phase —
-/// unifying an edge against a *cyclic identity* — is unreachable in tnk: identities are constant
-/// symbols (`Symbol::identity` docs), and a constant identity can never contain another
-/// identity-bearing operator, so `BinarySymbol::hasCyclicIdentity` is identically false.
+/// Break a cross-theory dependency cycle. Phase 1 collapses a non-variable edge through an
+/// identity-bearing top symbol; phase 2 solves a cyclic identity against the next cycle variable.
+/// The latter is required when identities are compound terms that recursively contain the operator.
+fn binary_identity(e: &Engine, symbol: SymbolId) -> Option<IdentityId> {
+    let sym = e.symbol(symbol);
+    (sym.decls().first()?.domain.len() == 2)
+        .then(|| {
+            sym.identity()
+                .or_else(|| sym.left_identity())
+                .or_else(|| sym.right_identity())
+        })
+        .flatten()
+}
+
+fn identity_term_reaches_symbol(
+    e: &Engine,
+    target: SymbolId,
+    term: &Term,
+    examined: &mut BTreeSet<SymbolId>,
+) -> bool {
+    let symbol = match term {
+        Term::Var(_) => return false,
+        Term::Na { symbol, .. } | Term::Op { symbol, .. } | Term::Iter { symbol, .. } => *symbol,
+    };
+    if symbol == target {
+        return true;
+    }
+    if examined.insert(symbol)
+        && let Some(identity) = binary_identity(e, symbol)
+        && identity_term_reaches_symbol(e, target, e.signature().identity_term(identity), examined)
+    {
+        return true;
+    }
+    match term {
+        Term::Op { args, .. } => args
+            .iter()
+            .any(|arg| identity_term_reaches_symbol(e, target, arg, examined)),
+        Term::Iter { arg, .. } => identity_term_reaches_symbol(e, target, arg, examined),
+        Term::Var(_) | Term::Na { .. } => false,
+    }
+}
+
+fn has_cyclic_identity(e: &Engine, symbol: SymbolId) -> bool {
+    let Some(identity) = binary_identity(e, symbol) else {
+        return false;
+    };
+    identity_term_reaches_symbol(
+        e,
+        symbol,
+        e.signature().identity_term(identity),
+        &mut BTreeSet::new(),
+    )
+}
 pub(crate) struct CompoundCycleSubproblem {
     cycle: Vec<usize>,
     pre_break_substitution: SavedSubst,
@@ -972,8 +1042,9 @@ impl CompoundCycleSubproblem {
         let n = self.cycle.len();
         while self.current_edge_index < n {
             let variable_index = self.cycle[self.current_edge_index];
-            let variable =
-                ctx.variable_node(variable_index).expect("cycle variable has a tracked dag");
+            let variable = ctx
+                .variable_node(variable_index)
+                .expect("cycle variable has a tracked dag");
             let assignment = ctx.value(variable_index).expect("cycle variable is bound");
             self.current_edge_index += 1;
             let controlling = env.e.node(assignment).symbol();
@@ -982,6 +1053,24 @@ impl CompoundCycleSubproblem {
                 // The binding is back on the stack as a problem; drop it from the solution.
                 ctx.bind(variable_index, None);
                 return true;
+            }
+        }
+        while self.current_edge_index < 2 * n {
+            let variable_index = self.cycle[self.current_edge_index % n];
+            let assignment = ctx.value(variable_index).expect("cycle variable is bound");
+            self.current_edge_index += 1;
+            let next_index = self.cycle[self.current_edge_index % n];
+            let next_variable = ctx
+                .variable_node(next_index)
+                .expect("cycle variable has a tracked dag");
+            let controlling = env.e.node(assignment).symbol();
+            if has_cyclic_identity(env.e, controlling) {
+                let identity =
+                    binary_identity(env.e, controlling).expect("cyclic identity must exist");
+                let identity_dag = env.e.make_identity(identity);
+                if compute_solved_form(env, identity_dag, next_variable, ctx, pending) {
+                    return true;
+                }
             }
         }
         false
@@ -1088,7 +1177,10 @@ fn backstop_solved_form2(
     ctx: &mut UnifyContext,
     pending: &mut PendingStack,
 ) -> bool {
-    debug_assert!(is_ground(env.e, lhs), "backstop with a non-ground lhs escaped screening");
+    debug_assert!(
+        is_ground(env.e, lhs),
+        "backstop with a non-ground lhs escaped screening"
+    );
     let _ = pending;
     match as_variable_rep(env.e, ctx, rhs) {
         Some(VarRep::Bound(value)) => compute_solved_form(env, lhs, value, ctx, pending),
@@ -1197,7 +1289,10 @@ fn free_solved_form2(
     if s == env.e.node(rhs).symbol() {
         let largs = free_args(env.e, lhs);
         let rargs = free_args(env.e, rhs);
-        debug_assert!(!largs.is_empty(), "constants are ground and never reach here");
+        debug_assert!(
+            !largs.is_empty(),
+            "constants are ground and never reach here"
+        );
         for (l, r) in largs.into_iter().zip(rargs) {
             if !compute_solved_form(env, l, r, ctx, pending) {
                 return false;
@@ -1465,7 +1560,10 @@ mod tests {
         let b = e.add_op("b", vec![], nat);
         let f = e.add_op("f", vec![nat, nat], nat);
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", nat, 0);
         let y = mkvar(&mut env, "Y", nat, 1);
@@ -1487,7 +1585,10 @@ mod tests {
         e.close_sorts();
         let f = e.add_op("f", vec![nat], nat);
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", nat, 0);
         let fx = env.e.make_free(f, vec![x]);
@@ -1502,7 +1603,10 @@ mod tests {
         let nat = e.add_sort("Nat");
         e.close_sorts();
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", nat, 0);
         let y = mkvar(&mut env, "Y", nat, 1);
@@ -1527,7 +1631,10 @@ mod tests {
         let zero = e.add_op("0", vec![], nat);
         let s = e.add_op_iter("s", vec![nat], nat);
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", nat, 0);
         let z = env.e.make_const(zero);
@@ -1540,7 +1647,10 @@ mod tests {
             let z2 = env.e.make_const(zero);
             env.e.make_iter(s, 2, z2)
         };
-        assert!(env.e.deep_equal(forms[0][0].unwrap(), expected), "X --> s^2(0)");
+        assert!(
+            env.e.deep_equal(forms[0][0].unwrap(), expected),
+            "X --> s^2(0)"
+        );
     }
 
     #[test]
@@ -1551,7 +1661,10 @@ mod tests {
         let zero = e.add_op("0", vec![], nat);
         let s = e.add_op_iter("s", vec![nat], nat);
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", nat, 0);
         let z1 = env.e.make_const(zero);
@@ -1587,7 +1700,10 @@ mod tests {
         let _ = SymbolClass::Standard;
 
         let mut names = TestNames::default();
-        let mut env = UnifyEnv { e: &mut e, names: &mut names };
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
 
         let x = mkvar(&mut env, "X", magma, 0);
         let y = mkvar(&mut env, "Y", magma, 1);
@@ -1600,6 +1716,206 @@ mod tests {
         let rhs = env.e.make_free(junc, vec![ya, a_r2]);
 
         let forms = all_solved_forms(&mut env, 2, &[(lhs, rhs)]);
-        assert_eq!(forms.len(), 2, "left-id CUI gives two unsorted solved forms");
+        assert_eq!(
+            forms.len(),
+            2,
+            "left-id CUI gives two unsorted solved forms"
+        );
+    }
+    fn assert_binary_theory_clash_uses_identity(
+        env: &mut UnifyEnv,
+        top: SymbolId,
+        identity: DagId,
+        alien: SymbolId,
+        make_lhs: impl FnOnce(&mut Engine, DagId, DagId) -> DagId,
+    ) {
+        let x = mkvar(env, "X", env.e.sort_of(identity), 0);
+        let y = mkvar(env, "Y", env.e.sort_of(identity), 1);
+        let z = mkvar(env, "Z", env.e.sort_of(identity), 2);
+        let lhs = make_lhs(env.e, x, y);
+        assert_eq!(env.e.node(lhs).symbol(), top);
+        let rhs = env.e.make_free(alien, vec![z]);
+
+        let forms = all_solved_forms(env, 3, &[(lhs, rhs)]);
+        assert_eq!(
+            forms.len(),
+            2,
+            "either theory argument may take the identity"
+        );
+        for form in forms {
+            let bx = form[0].expect("X is bound");
+            let by = form[1].expect("Y is bound");
+            let identity_count = usize::from(env.e.deep_equal(bx, identity))
+                + usize::from(env.e.deep_equal(by, identity));
+            assert_eq!(
+                identity_count, 1,
+                "exactly one argument collapses to the identity"
+            );
+            let other = if env.e.deep_equal(bx, identity) {
+                by
+            } else {
+                bx
+            };
+            let expected = env.e.make_free(alien, vec![z]);
+            assert!(
+                env.e.deep_equal(other, expected),
+                "the other argument absorbs the alien"
+            );
+        }
+    }
+
+    #[test]
+    fn acu_theory_clash_collapses_through_constant_identity() {
+        let mut e = Engine::new();
+        let foo = e.add_sort("Foo");
+        e.close_sorts();
+        let unit = e.add_op("unit", vec![], foo);
+        let alien = e.add_op("h", vec![foo], foo);
+        let f = e.add_op_ac("f", vec![foo, foo], foo, Some(unit));
+        let identity = e.make_const(unit);
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
+
+        assert_binary_theory_clash_uses_identity(&mut env, f, identity, alien, |e, x, y| {
+            e.make_acu(f, vec![(x, 1), (y, 1)])
+        });
+    }
+
+    #[test]
+    fn acu_theory_clash_collapses_through_compound_identity() {
+        let mut e = Engine::new();
+        let foo = e.add_sort("Foo");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], foo);
+        let g = e.add_op("g", vec![foo], foo);
+        let alien = e.add_op("h", vec![foo], foo);
+        let f = e.add_op_ac("f", vec![foo, foo], foo, None);
+        e.reserve_identity(f, foo);
+        e.set_identity_term(f, Term::op(g, vec![Term::constant(a)]));
+        e.prepare_identities();
+        let identity_id = e.symbol(f).identity().expect("identity installed");
+        let identity = e.make_identity(identity_id);
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
+
+        assert_binary_theory_clash_uses_identity(&mut env, f, identity, alien, |e, x, y| {
+            e.make_acu(f, vec![(x, 1), (y, 1)])
+        });
+    }
+
+    #[test]
+    fn cui_theory_clash_collapses_through_compound_identity() {
+        let mut e = Engine::new();
+        let foo = e.add_sort("Foo");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], foo);
+        let g = e.add_op("g", vec![foo], foo);
+        let alien = e.add_op("h", vec![foo], foo);
+        let f = e.add_op_cui("f", vec![foo, foo], foo, true, false, None);
+        e.reserve_identity(f, foo);
+        e.set_identity_term(f, Term::op(g, vec![Term::constant(a)]));
+        e.prepare_identities();
+        let identity_id = e.symbol(f).identity().expect("identity installed");
+        let identity = e.make_identity(identity_id);
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
+
+        assert_binary_theory_clash_uses_identity(&mut env, f, identity, alien, |e, x, y| {
+            e.make_cui(f, x, y)
+        });
+    }
+
+    #[test]
+    fn compact_iter_identity_cycle_traversal_is_stack_safe() {
+        let mut e = Engine::new();
+        let foo = e.add_sort("Foo");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], foo);
+        let b = e.add_op("b", vec![], foo);
+        let g = e.add_op_iter("g", vec![foo], foo);
+        let f = e.add_op_ac("f", vec![foo, foo], foo, None);
+        e.reserve_identity(f, foo);
+        e.set_identity_term(
+            f,
+            Term::Iter {
+                symbol: g,
+                count: crate::num::Nat::from_u64(1_000_000),
+                arg: Box::new(Term::op(f, vec![Term::constant(a), Term::constant(b)])),
+            },
+        );
+
+        assert!(has_cyclic_identity(&e, f));
+        assert!(!has_cyclic_identity(&e, g));
+    }
+
+    #[test]
+    fn compound_identity_cycle_is_detected_through_free_context() {
+        let mut e = Engine::new();
+        let foo = e.add_sort("Foo");
+        e.close_sorts();
+        let a = e.add_op("a", vec![], foo);
+        let b = e.add_op("b", vec![], foo);
+        let h = e.add_op("h", vec![foo], foo);
+        let f = e.add_op_ac("f", vec![foo, foo], foo, None);
+        e.reserve_identity(f, foo);
+        e.set_identity_term(
+            f,
+            Term::op(
+                h,
+                vec![Term::op(f, vec![Term::constant(a), Term::constant(b)])],
+            ),
+        );
+        assert!(has_cyclic_identity(&e, f));
+        assert!(!has_cyclic_identity(&e, h));
+
+        e.prepare_identities();
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut e,
+            names: &mut names,
+        };
+        let x = mkvar(&mut env, "X", foo, 0);
+        let y = mkvar(&mut env, "Y", foo, 1);
+        let ac = env.e.make_const(a);
+        let bc = env.e.make_const(b);
+        let fyab = env.e.make_node(f, vec![y, ac, bc]);
+        let hx = env.e.make_free(h, vec![x]);
+        let mut ctx = UnifyContext::new(2, VariableFamily::Unify);
+        let mut pending = PendingStack::new();
+        assert!(
+            compute_solved_form(&mut env, x, fyab, &mut ctx, &mut pending),
+            "first equation"
+        );
+        assert!(
+            compute_solved_form(&mut env, y, hx, &mut ctx, &mut pending),
+            "second equation"
+        );
+        assert!(
+            pending.solve(&mut env, true, &mut ctx),
+            "compound cycle has a solution"
+        );
+        let expected_x = {
+            let a = env.e.make_const(a);
+            let b = env.e.make_const(b);
+            env.e.make_node(f, vec![a, b])
+        };
+        let expected_y = env.e.make_free(h, vec![expected_x]);
+        assert!(
+            env.e.deep_equal(ctx.value(0).unwrap(), expected_x),
+            "X --> f(a, b)"
+        );
+        assert!(
+            env.e.deep_equal(ctx.value(1).unwrap(), expected_y),
+            "Y --> h(f(a, b))"
+        );
     }
 }

@@ -78,7 +78,10 @@ impl FreshVariableGenerator {
     /// machinery so the numbering contract has exactly one home.
     #[allow(dead_code)]
     pub(crate) fn with_base(base_number: Nat) -> Self {
-        FreshVariableGenerator { base_number, ..Self::default() }
+        FreshVariableGenerator {
+            base_number,
+            ..Self::default()
+        }
     }
 
     /// The name of fresh variable `index` in `family`: `<prefix><index + base_number + 1>`.
@@ -194,10 +197,22 @@ mod tests {
 
     #[test]
     fn family_classification_and_parse() {
-        assert!(FreshVariableGenerator::belongs_to_family("#12", VariableFamily::Unify));
-        assert!(FreshVariableGenerator::belongs_to_family("#01", VariableFamily::Unify));
-        assert!(!FreshVariableGenerator::belongs_to_family("%12", VariableFamily::Unify));
-        assert!(!FreshVariableGenerator::belongs_to_family("#", VariableFamily::Unify));
+        assert!(FreshVariableGenerator::belongs_to_family(
+            "#12",
+            VariableFamily::Unify
+        ));
+        assert!(FreshVariableGenerator::belongs_to_family(
+            "#01",
+            VariableFamily::Unify
+        ));
+        assert!(!FreshVariableGenerator::belongs_to_family(
+            "%12",
+            VariableFamily::Unify
+        ));
+        assert!(!FreshVariableGenerator::belongs_to_family(
+            "#",
+            VariableFamily::Unify
+        ));
 
         assert_eq!(
             FreshVariableGenerator::parse_fresh_name("#1"),

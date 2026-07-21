@@ -8,15 +8,15 @@
 //! command drives the kernel's public multi-solution stream (`Engine::match_solutions`). Still open in
 //! B4.5: `__` juxtaposition (B4.5e, blocks `au`) and the whole-prelude differential test.
 
-use crate::build_term::{build_dag, build_term, VarIndex};
+use crate::build_term::{VarIndex, build_dag, build_logic_dag, build_term};
 use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
-use crate::grammar::{Action, Nt, NtType};
-use crate::lex::{tokenize, Interner, Token};
+use crate::grammar::{Action, GSym, Nt, NtType, Terminal};
+use crate::lex::{Frag, Interner, Token, tokenize};
 use crate::oo_complete;
-use crate::pretty::{print_pretty, print_term};
+use crate::pretty::{print_pretty, print_pretty_with_variables, print_term};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
@@ -29,6 +29,9 @@ use tnk_core::search::{Arrow, Search};
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
+use tnk_core::variant::{
+    VariantEquation, VariantMode, VariantSearch, compile_variant_equation, term_from_dag_slots,
+};
 
 /// A fully loaded module: its kernel state (signature + statements) and its mixfix grammar (for parsing
 /// command/REPL terms).
@@ -49,9 +52,13 @@ pub struct Loaded {
 /// ([`build_grammar`]) + its statements ([`load_statements`]). The module system (`tnk-modules`) calls
 /// this on a *flattened* `PreModule` (the import closure merged into one), so imports need no kernel
 /// change — flattening is a pure `PreModule → PreModule` transform upstream of here.
-pub fn build_loaded_module(pm: &PreModule, interner: &mut Interner) -> Result<LoadedModule, String> {
+pub fn build_loaded_module(
+    pm: &PreModule,
+    interner: &mut Interner,
+) -> Result<LoadedModule, String> {
     let mut built = build_module(pm, interner)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+    install_identities(&mut built, &grammar, interner)?;
     load_statements(pm, &mut built, &grammar, interner)?;
     Ok(LoadedModule { built, grammar })
 }
@@ -70,8 +77,41 @@ pub fn build_loaded_module_homed<'m>(
 ) -> Result<LoadedModule, String> {
     let mut built = build_module(pm, interner)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+    install_identities(&mut built, &grammar, interner)?;
     load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
     Ok(LoadedModule { built, grammar })
+}
+
+fn install_identities(
+    built: &mut BuiltModule,
+    grammar: &CompiledGrammar,
+    interner: &Interner,
+) -> Result<(), String> {
+    let specs = std::mem::take(&mut built.identity_specs);
+    for spec in specs {
+        let mut vars = VarIndex::new();
+        let kind = built.engine.sorts().kind_of(spec.sort);
+        let tree = parse_forest_at(
+            &spec.tokens,
+            grammar,
+            interner,
+            Nt::Comp(kind, NtType::Term),
+        )
+        .map_err(|e| format!("bad identity term: {e}"))?;
+        let term = build_term(&tree, grammar, built, &spec.tokens, interner, &mut vars)
+            .map_err(|e| format!("bad identity term: {e}"))?;
+        if vars.count() != 0 {
+            return Err("identity term must be ground".to_string());
+        }
+        match spec.side {
+            crate::surface::ast::IdSide::Both => built.engine.set_identity_term(spec.symbol, term),
+            crate::surface::ast::IdSide::Left | crate::surface::ast::IdSide::Right => {
+                built.engine.set_one_sided_identity_term(spec.symbol, term);
+            }
+        }
+    }
+    built.engine.prepare_identities();
+    Ok(())
 }
 
 /// Produce a copy of `home`'s compiled grammar whose semantic **actions** resolve symbols and sorts in
@@ -95,7 +135,9 @@ pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<Com
     let mut kind_map: HashMap<KindId, KindId> = HashMap::new();
     for (name, &hsort) in &home.built.sorts {
         if let Some(&fsort) = flat.sorts.get(name) {
-            kind_map.entry(hsorts.kind_of(hsort)).or_insert_with(|| fsorts.kind_of(fsort));
+            kind_map
+                .entry(hsorts.kind_of(hsort))
+                .or_insert_with(|| fsorts.kind_of(fsort));
         }
     }
     // flat operator table keyed by intrinsic identity (name, domain kinds, range kind).
@@ -116,8 +158,11 @@ pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<Com
     let map_sym = |hsym: SymbolId| -> Option<SymbolId> {
         let syn = home.built.syntax.get(&hsym)?;
         let name = home.built.engine.symbol(hsym).name();
-        let dom: Vec<KindId> =
-            syn.domain.iter().map(|&s| kind_map.get(&hsorts.kind_of(s)).copied()).collect::<Option<_>>()?;
+        let dom: Vec<KindId> = syn
+            .domain
+            .iter()
+            .map(|&s| kind_map.get(&hsorts.kind_of(s)).copied())
+            .collect::<Option<_>>()?;
         let rng = *kind_map.get(&hsorts.kind_of(syn.range))?;
         flat_by_profile.get(&(name, dom, rng)).copied()
     };
@@ -131,9 +176,10 @@ pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<Com
             Action::MakeString(s) => Action::MakeString(map_sym(s)?),
             Action::MakeQid(s) => Action::MakeQid(map_sym(s)?),
             Action::MakeFloat(s) => Action::MakeFloat(map_sym(s)?),
-            Action::MakeRational { division, minus } => {
-                Action::MakeRational { division: map_sym(division)?, minus: map_sym(minus)? }
-            }
+            Action::MakeRational { division, minus } => Action::MakeRational {
+                division: map_sym(division)?,
+                minus: map_sym(minus)?,
+            },
             keep @ (Action::PassThru | Action::AssocList | Action::Nop) => keep,
         })
     };
@@ -152,7 +198,11 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
     let toks = tokenize(src, &mut interner);
     // The frontend loader is import-free and view-free (the module system, `tnk-modules`, handles both);
     // any `view` in the source is ignored here.
-    let Source { modules: pre, commands, .. } = Parser::new(&toks, &interner).parse_source()?;
+    let Source {
+        modules: pre,
+        commands,
+        ..
+    } = Parser::new(&toks, &interner).parse_source()?;
 
     let mut modules = Vec::with_capacity(pre.len());
     for pm in &pre {
@@ -164,7 +214,11 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
         }
         modules.push(build_loaded_module(pm, &mut interner)?);
     }
-    Ok(Loaded { interner, modules, commands })
+    Ok(Loaded {
+        interner,
+        modules,
+        commands,
+    })
 }
 
 /// Parse + build + add each of the module's statement bubbles to the engine, all against the flattened
@@ -179,13 +233,13 @@ fn load_statements(
     load_statements_homed(pm, m, g, &[], &|_| None, i)
 }
 
-/// Parse + build + add each statement, with the **D1a import-reparse point-fix**: a statement that fails
-/// to parse in the flattened grammar `g` (typically because an importer's operator/constant made an
-/// imported bubble ambiguous) is retried against its **home** module's own grammar — re-pointed at this
-/// flattened module's symbol table by [`remap_home_grammar`]. `homes[k]` is the home-module name of
-/// `pm.statements[k]` (from `flatten_with_homes`), `None` or the flattened module's own name meaning "use
-/// the flattened grammar"; `home_mod` resolves a home name to its already-built [`LoadedModule`] (the
-/// REPL's / loader's module cache). When `homes` is empty this is exactly the pre-fix loader.
+/// Parse + build + add each statement in its defining module's grammar. Imported statements are parsed
+/// against their **home** grammar first, remapped onto the flattened module's symbol table by
+/// [`remap_home_grammar`]. This preserves the sorts of home variables when an importer declares
+/// same-named variables (a flattened parse can succeed while silently selecting the importer's
+/// declaration). The flattened grammar remains the fallback when the home is unavailable or its remapped
+/// grammar cannot parse the statement. `homes[k]` is the home-module name of `pm.statements[k]` (from
+/// `flatten_with_homes`); `None` or the flattened module's own name selects the flattened grammar directly.
 pub fn load_statements_homed<'m>(
     pm: &PreModule,
     m: &mut BuiltModule,
@@ -198,28 +252,19 @@ pub fn load_statements_homed<'m>(
     // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
     // module, or one with no object constructor in scope — completion then never runs.
     let oo = pm.is_object.then(|| m.engine.oo_info()).flatten();
-    // Cache of home-module grammars remapped onto this flattened module's symbols (built lazily, only when
-    // a statement actually fails the flattened parse — so the common path pays nothing). `None` = the home
-    // is not resolvable / could not be remapped, so no retry.
+    // Cache home-module grammars remapped onto this flattened module's symbols. Imported statements use
+    // these first; `None` means the home is unavailable or cannot be remapped, so the flat grammar is used.
     let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
 
     for (idx, stmt) in pm.statements.iter().enumerate() {
-        // Skip `nonexec` axioms — proof obligations never applied during reduction/rewriting (every
-        // theory axiom is `[nonexec]`; a module statement may be too). They still carry through parsing
-        // and flattening (for later view-obligation checking) but are not registered in the engine.
-        if stmt_is_nonexec(stmt) {
+        // Ordinary nonexec axioms are proof obligations. `[nonexec narrowing]` rules are different:
+        // symbolic narrowing consumes their source terms even though rewriting must not compile them.
+        if stmt_is_nonexec(stmt) && !stmt_is_narrowing_rule(stmt) {
             continue;
         }
-        // A statement whose bubbles fail to parse/build is DROPPED (Maude warns per statement and keeps
-        // the module — fable-audit.md §3.4), so a later command still sees a whole module rather than a
-        // "no current module". `load_one_stmt` registers nothing before its fallible parse completes, so a
-        // failed attempt leaves the engine (and the dense trace indices) consistent and can be retried.
-        let flat_err = match load_one_stmt(stmt, m, g, false, &oo, i) {
-            Ok(()) => continue,
-            Err(e) => e,
-        };
-        // Failed against the flattened grammar. If this statement was donated by a distinct home module,
-        // retry against that home's own grammar (re-pointed at this module's symbols) — the D1a point-fix.
+        // Imported statements belong to their defining grammar. Trying the flattened grammar first is
+        // unsafe even when it parses: importer declarations can shadow a home variable name and change
+        // its sort without producing an error.
         if let Some(home) = homes.get(idx).and_then(|h| h.as_deref())
             && home != m.name
         {
@@ -233,6 +278,13 @@ pub fn load_statements_homed<'m>(
                 continue;
             }
         }
+        // Home parsing was not applicable or failed. A statement whose flattened parse/build fails is
+        // dropped (Maude warns per statement and keeps the module). `load_one_stmt` registers nothing
+        // before its fallible parsing finishes, so either attempt leaves the dense trace indices intact.
+        let flat_err = match load_one_stmt(stmt, m, g, false, &oo, i) {
+            Ok(()) => continue,
+            Err(e) => e,
+        };
         if std::env::var("TNK_DEBUG_DROP").is_ok() {
             eprintln!("DROP[{}]: {flat_err}", m.name);
         }
@@ -241,11 +293,211 @@ pub fn load_statements_homed<'m>(
     Ok(())
 }
 
+/// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover the
+/// original variable slots for source-form rendering. Maude prints `[narrowing]` rules from normalized
+/// `Term`s in `show path`, so AC/ACU arguments there follow canonical order rather than parser order.
+fn normalize_trace_term(
+    m: &mut BuiltModule,
+    i: &Interner,
+    vars: &VarIndex,
+    term: &Term,
+) -> Term {
+    let bindings: Vec<_> = (0..vars.count())
+        .map(|slot| {
+            let source = vars.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            let name = i
+                .get(base)
+                .expect("statement variable name was interned by the lexer")
+                .index();
+            m.engine.make_var(vars.sort(slot), name, slot as u32)
+        })
+        .collect();
+    let dag = m.engine.instantiate_bindings(term, &bindings);
+    let dag = m.engine.normalize_for_unify(dag);
+    term_from_dag_slots(&m.engine, dag)
+}
+/// Static AC normalization preserves the source positions of direct variables relative to nonvariables
+/// until a genuine adjacent inversion forces a sort. The runtime DAG canonicalizer always sorts the
+/// whole soup. Restore that observable partition while retaining the kernel's canonical order within
+/// the variable and nonvariable groups (notably `M:Marking a c` versus `N' + M + K`).
+fn restore_echo_variable_positions(
+    m: &BuiltModule,
+    source: &Term,
+    normalized: Term,
+) -> Term {
+    fn source_soup<'a>(symbol: SymbolId, term: &'a Term, out: &mut Vec<&'a Term>) {
+        if let Term::Op {
+            symbol: child_symbol,
+            args,
+        } = term
+            && *child_symbol == symbol
+        {
+            for arg in args {
+                source_soup(symbol, arg, out);
+            }
+        } else {
+            out.push(term);
+        }
+    }
+
+    fn normalized_soup(symbol: SymbolId, term: Term, out: &mut Vec<Term>) {
+        match term {
+            Term::Op {
+                symbol: child_symbol,
+                args,
+            } if child_symbol == symbol => {
+                for arg in args {
+                    normalized_soup(symbol, arg, out);
+                }
+            }
+            term => out.push(term),
+        }
+    }
+    fn source_shape(
+        symbol: SymbolId,
+        source: &Term,
+        leaves: &mut std::vec::IntoIter<Term>,
+    ) -> Term {
+        if let Term::Op {
+            symbol: child_symbol,
+            args,
+        } = source
+            && *child_symbol == symbol
+        {
+            Term::op(
+                symbol,
+                args.iter()
+                    .map(|arg| source_shape(symbol, arg, leaves))
+                    .collect(),
+            )
+        } else {
+            leaves.next().expect("associative source shape changed")
+        }
+    }
+
+
+    match (source, normalized) {
+        (
+            Term::Op {
+                symbol: source_symbol,
+                args: direct_source_args,
+            },
+            Term::Op {
+                symbol,
+                args: direct_args,
+            },
+        ) if *source_symbol == symbol => {
+            let mut flattened_source = Vec::new();
+            let mut flattened = Vec::new();
+            let blank_juxtaposition = m.syntax.get(&symbol).is_some_and(
+                |syntax| matches!(syntax.frags.as_slice(), [Frag::Hole, Frag::Hole]),
+            );
+            let (source_args, args, restore_shape, left_fold_candidate) =
+                if direct_source_args.len() == direct_args.len() {
+                    (
+                        direct_source_args.iter().collect::<Vec<_>>(),
+                        direct_args,
+                        false,
+                        direct_source_args.len() > 2 && blank_juxtaposition,
+                    )
+                } else {
+                    for arg in direct_source_args {
+                        source_soup(symbol, arg, &mut flattened_source);
+                    }
+                    for arg in direct_args {
+                        normalized_soup(symbol, arg, &mut flattened);
+                    }
+                    (
+                        flattened_source,
+                        flattened,
+                        true,
+                        blank_juxtaposition,
+                    )
+                };
+            if source_args.len() != args.len() {
+                return Term::op(symbol, args);
+            }
+            let left_fold = left_fold_candidate
+                && source_args.len() > 2
+                && source_args.iter().any(|arg| {
+                    arg.top_symbol()
+                        .and_then(|symbol| m.syntax.get(&symbol))
+                        .is_some_and(|syntax| {
+                            matches!(syntax.frags.first(), Some(Frag::Hole))
+                                || matches!(syntax.frags.last(), Some(Frag::Hole))
+                        })
+                });
+            let restore_shape = restore_shape && !left_fold;
+
+            let mask: Vec<_> = source_args
+                .iter()
+                .map(|arg| matches!(arg, Term::Var(_)))
+                .collect();
+            let has_variables = mask.iter().any(|&is_variable| is_variable);
+            let has_nonvariables = mask.iter().any(|&is_variable| !is_variable);
+            let ordered = if has_variables && has_nonvariables {
+                let (variables, nonvariables): (Vec<_>, Vec<_>) =
+                    args.into_iter().partition(|arg| matches!(arg, Term::Var(_)));
+                let mut variables = variables.into_iter();
+                let mut nonvariables = nonvariables.into_iter();
+                mask.into_iter()
+                    .map(|is_variable| {
+                        if is_variable {
+                            variables.next().expect("variable partition length changed")
+                        } else {
+                            nonvariables
+                                .next()
+                                .expect("nonvariable partition length changed")
+                        }
+                    })
+                    .collect()
+            } else {
+                args
+            };
+            let restored: Vec<_> = source_args
+                .into_iter()
+                .zip(ordered)
+                .map(|(source, normalized)| {
+                    restore_echo_variable_positions(m, source, normalized)
+                })
+                .collect();
+            if restore_shape {
+                source_shape(symbol, source, &mut restored.into_iter())
+            } else if left_fold {
+                let mut restored = restored.into_iter();
+                let mut term = restored.next().expect("associative term has no arguments");
+                for arg in restored {
+                    term = Term::op(symbol, vec![term, arg]);
+                }
+                term
+            } else {
+                Term::op(symbol, restored)
+            }
+        }
+        (
+            Term::Iter {
+                symbol: source_symbol,
+                count: source_count,
+                arg: source_arg,
+            },
+            Term::Iter { symbol, count, arg },
+        ) if *source_symbol == symbol && *source_count == count => Term::iter(
+            symbol,
+            count,
+            restore_echo_variable_positions(m, source_arg, *arg),
+        ),
+        (_, normalized) => normalized,
+    }
+}
+
+
 /// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
 /// the D1a home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
 /// unambiguous home grammar, so the flattened-grammar kind-homogeneity trick is neither needed nor valid —
 /// its `Nt::Comp(kind, …)` start would name a *flattened* kind absent from the home grammar). Registers
 /// nothing before the last fallible parse, so a returned `Err` leaves `m` unchanged (safe to retry).
+
 fn load_one_stmt(
     stmt: &Statement,
     m: &mut BuiltModule,
@@ -264,7 +516,15 @@ fn load_one_stmt(
         }
     };
     match stmt {
-        Statement::Eq { lhs, rhs, cond, owise, label, .. } => {
+        Statement::Eq {
+            lhs,
+            rhs,
+            cond,
+            owise,
+            variant,
+            label,
+            ..
+        } => {
             // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
             // one variable index. Then add via the matching kernel facade.
             let mut vars = VarIndex::new();
@@ -277,7 +537,12 @@ fn load_one_stmt(
             let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
             if let Some(info) = oo {
                 oo_complete::complete_statement(
-                    info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    Some(&mut rhs_t),
+                    &mut condition,
                 );
             }
             let nr = vars.count();
@@ -293,20 +558,39 @@ fn load_one_stmt(
                 condition: condition.clone(),
                 var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
                 owise: *owise,
+                variant: *variant,
                 label: label.clone(),
                 nonexec: false, // engine-registered ⇒ executable
             };
-            let id = if *owise {
+            let id = if *variant {
+                m.engine
+                    .add_variant_equation(lhs_t, rhs_t, nr, condition, *owise)
+            } else if *owise {
                 m.engine.add_owise_equation(lhs_t, rhs_t, nr, condition)
             } else if condition.is_empty() {
-                m.engine.add_equation(Equation { lhs: lhs_t, rhs: rhs_t, nr_vars: nr })
+                m.engine.add_equation(Equation {
+                    lhs: lhs_t,
+                    rhs: rhs_t,
+                    nr_vars: nr,
+                })
             } else {
-                m.engine.add_conditional_equation(lhs_t, rhs_t, nr, condition)
+                m.engine
+                    .add_conditional_equation(lhs_t, rhs_t, nr, condition)
             };
-            assert_eq!(id as usize, m.eq_traces.len(), "equation id is the dense eq_traces index");
+            assert_eq!(
+                id as usize,
+                m.eq_traces.len(),
+                "equation id is the dense eq_traces index"
+            );
             m.eq_traces.push(trace);
         }
-        Statement::Mb { lhs, sort, cond, label, .. } => {
+        Statement::Mb {
+            lhs,
+            sort,
+            cond,
+            label,
+            ..
+        } => {
             let mut vars = VarIndex::new();
             let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -316,7 +600,14 @@ fn load_one_stmt(
                 None => Vec::new(),
             };
             if let Some(info) = oo {
-                oo_complete::complete_statement(info, m, &mut vars, &mut lhs_t, None, &mut condition);
+                oo_complete::complete_statement(
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    None,
+                    &mut condition,
+                );
             }
             let nr = vars.count();
             reject_rewrite_fragment(&condition, "membership")?;
@@ -332,14 +623,30 @@ fn load_one_stmt(
                 nonexec: false, // engine-registered ⇒ executable
             };
             let id = if condition.is_empty() {
-                m.engine.add_membership(Membership { lhs: lhs_t, sort: sort_id, nr_vars: nr })
+                m.engine.add_membership(Membership {
+                    lhs: lhs_t,
+                    sort: sort_id,
+                    nr_vars: nr,
+                })
             } else {
-                m.engine.add_conditional_membership(lhs_t, sort_id, nr, condition)
+                m.engine
+                    .add_conditional_membership(lhs_t, sort_id, nr, condition)
             };
-            assert_eq!(id as usize, m.mb_traces.len(), "membership id is the dense mb_traces index");
+            assert_eq!(
+                id as usize,
+                m.mb_traces.len(),
+                "membership id is the dense mb_traces index"
+            );
             m.mb_traces.push(trace);
         }
-        Statement::Rule { label, lhs, rhs, cond, .. } => {
+        Statement::Rule {
+            label,
+            lhs,
+            rhs,
+            cond,
+            nonexec,
+            narrowing,
+        } => {
             // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
             // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
             let mut vars = VarIndex::new();
@@ -352,27 +659,83 @@ fn load_one_stmt(
             let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
             if let Some(info) = oo {
                 oo_complete::complete_statement(
-                    info, m, &mut vars, &mut lhs_t, Some(&mut rhs_t), &mut condition,
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    Some(&mut rhs_t),
+                    &mut condition,
                 );
             }
             let nr = vars.count();
-            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
+            let variable_names: Vec<String> =
+                (0..nr).map(|k| vars.name(k).to_string()).collect();
+            let variable_specs = (0..nr)
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let base = source.split_once(':').map_or(source, |(base, _)| base);
+                    let code = i
+                        .get(base)
+                        .expect("statement variable base was interned by the lexer")
+                        .index();
+                    tnk_core::unify::problem::VarSpec {
+                        sort: vars.sort(slot),
+                        name: maude_variable_name_rank(base, code),
+                    }
+                })
+                .collect();
+            // Maude rejects conditions on `[narrowing]` rules; the statement remains loadable but has
+            // no symbolic or executable rule instance.
+            if *narrowing && !condition.is_empty() {
+                return Ok(());
+            }
+            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t))
+                && !(*narrowing && *nonexec)
+            {
                 return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
             }
+            if *narrowing {
+                m.engine.add_narrowing_rule(
+                    lhs_t.clone(),
+                    rhs_t.clone(),
+                    variable_specs,
+                    variable_names.clone(),
+                    condition.clone(),
+                    label.clone(),
+                    *nonexec,
+                );
+            }
+            // A nonexec or bare-lhs narrowing rule exists only in the symbolic descriptor table.
+            if *nonexec || lhs_t.top_symbol().is_none() {
+                return Ok(());
+            }
+            let (trace_lhs, trace_rhs) = if *narrowing {
+                (
+                    normalize_trace_term(m, i, &vars, &lhs_t),
+                    normalize_trace_term(m, i, &vars, &rhs_t),
+                )
+            } else {
+                (lhs_t.clone(), rhs_t.clone())
+            };
             let trace = RlTrace {
-                lhs: lhs_t.clone(),
-                rhs: rhs_t.clone(),
+                lhs: trace_lhs,
+                rhs: trace_rhs,
                 condition: condition.clone(),
-                var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
+                var_names: variable_names,
                 label: label.clone(),
                 nonexec: false, // engine-registered ⇒ executable
+                narrowing: *narrowing,
             };
             let id = if condition.is_empty() {
                 m.engine.add_rule(lhs_t, rhs_t, nr)
             } else {
                 m.engine.add_conditional_rule(lhs_t, rhs_t, nr, condition)
             };
-            assert_eq!(id as usize, m.rl_traces.len(), "rule id is the dense rl_traces index");
+            assert_eq!(
+                id as usize,
+                m.rl_traces.len(),
+                "rule id is the dense rl_traces index"
+            );
             m.rl_traces.push(trace);
         }
     }
@@ -401,7 +764,15 @@ pub fn parse_statement_trace(
     i: &Interner,
 ) -> Result<StmtTrace, String> {
     match stmt {
-        Statement::Eq { lhs, rhs, cond, owise, nonexec, label } => {
+        Statement::Eq {
+            lhs,
+            rhs,
+            cond,
+            owise,
+            variant,
+            nonexec,
+            label,
+        } => {
             let mut vars = VarIndex::new();
             let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -418,11 +789,18 @@ pub fn parse_statement_trace(
                 condition,
                 var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
                 owise: *owise,
+                variant: *variant,
                 label: label.clone(),
                 nonexec: *nonexec,
             }))
         }
-        Statement::Mb { lhs, sort, cond, nonexec, label } => {
+        Statement::Mb {
+            lhs,
+            sort,
+            cond,
+            nonexec,
+            label,
+        } => {
             let mut vars = VarIndex::new();
             let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -442,7 +820,14 @@ pub fn parse_statement_trace(
                 nonexec: *nonexec,
             }))
         }
-        Statement::Rule { label, lhs, rhs, cond, nonexec } => {
+        Statement::Rule {
+            label,
+            lhs,
+            rhs,
+            cond,
+            nonexec,
+            narrowing,
+        } => {
             let mut vars = VarIndex::new();
             let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -460,6 +845,7 @@ pub fn parse_statement_trace(
                 var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
                 label: label.clone(),
                 nonexec: *nonexec,
+                narrowing: *narrowing,
             }))
         }
     }
@@ -499,7 +885,10 @@ pub(crate) fn parse_condition(
             let true_sym = m
                 .true_sym
                 .ok_or("bare boolean condition, but no `true` is in scope (import BOOL)")?;
-            frags.push(ConditionFragment::Equality { lhs, rhs: Term::constant(true_sym) });
+            frags.push(ConditionFragment::Equality {
+                lhs,
+                rhs: Term::constant(true_sym),
+            });
             continue;
         };
         let frag = match conn {
@@ -508,9 +897,17 @@ pub(crate) fn parse_condition(
                 let subject = parse_build(right, g, m, i, vars)?;
                 let mut pat_vars = Vec::new();
                 term_var_indices(&pattern, &mut pat_vars);
-                let fresh: Vec<u32> = pat_vars.iter().copied().filter(|v| !bound.contains(v)).collect();
+                let fresh: Vec<u32> = pat_vars
+                    .iter()
+                    .copied()
+                    .filter(|v| !bound.contains(v))
+                    .collect();
                 bound.extend(pat_vars);
-                ConditionFragment::Matching { pattern, subject, fresh_vars: fresh }
+                ConditionFragment::Matching {
+                    pattern,
+                    subject,
+                    fresh_vars: fresh,
+                }
             }
             Connective::Eq => ConditionFragment::Equality {
                 lhs: parse_build(left, g, m, i, vars)?,
@@ -523,9 +920,17 @@ pub(crate) fn parse_condition(
                 let pattern = parse_build(right, g, m, i, vars)?;
                 let mut pat_vars = Vec::new();
                 term_var_indices(&pattern, &mut pat_vars);
-                let fresh: Vec<u32> = pat_vars.iter().copied().filter(|v| !bound.contains(v)).collect();
+                let fresh: Vec<u32> = pat_vars
+                    .iter()
+                    .copied()
+                    .filter(|v| !bound.contains(v))
+                    .collect();
                 bound.extend(pat_vars);
-                ConditionFragment::Rewrite { lhs, pattern, fresh_vars: fresh }
+                ConditionFragment::Rewrite {
+                    lhs,
+                    pattern,
+                    fresh_vars: fresh,
+                }
             }
             Connective::Sort => ConditionFragment::SortTest {
                 term: parse_build(left, g, m, i, vars)?,
@@ -597,12 +1002,27 @@ fn stmt_is_nonexec(s: &Statement) -> bool {
     }
 }
 
+fn stmt_is_narrowing_rule(s: &Statement) -> bool {
+    matches!(
+        s,
+        Statement::Rule {
+            narrowing: true,
+            ..
+        }
+    )
+}
+
 /// Reject a rewrite (`=>`) fragment in a non-rule condition — `=>` conditions are legal only in rules
 /// (`crl`), never in an `ceq`/`cmb` (Pillar A-v). The clean user-facing guard ahead of the kernel's
 /// defensive `compile_condition` assert.
 fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Result<(), String> {
-    if condition.iter().any(|f| matches!(f, ConditionFragment::Rewrite { .. })) {
-        return Err(format!("a rewrite condition (`=>`) is only allowed in a rule (`crl`), not an {owner}"));
+    if condition
+        .iter()
+        .any(|f| matches!(f, ConditionFragment::Rewrite { .. }))
+    {
+        return Err(format!(
+            "a rewrite condition (`=>`) is only allowed in a rule (`crl`), not an {owner}"
+        ));
     }
     Ok(())
 }
@@ -625,12 +1045,18 @@ fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option
         let frag_ok = match frag {
             ConditionFragment::Equality { lhs, rhs } => ok(lhs, &bound) && ok(rhs, &bound),
             ConditionFragment::SortTest { term, .. } => ok(term, &bound),
-            ConditionFragment::Matching { subject, fresh_vars, .. } => {
+            ConditionFragment::Matching {
+                subject,
+                fresh_vars,
+                ..
+            } => {
                 let r = ok(subject, &bound);
                 bound.extend_from_slice(fresh_vars);
                 r
             }
-            ConditionFragment::Rewrite { lhs, fresh_vars, .. } => {
+            ConditionFragment::Rewrite {
+                lhs, fresh_vars, ..
+            } => {
                 let r = ok(lhs, &bound);
                 bound.extend_from_slice(fresh_vars);
                 r
@@ -656,6 +1082,7 @@ pub(crate) fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
                 term_var_indices(a, out);
             }
         }
+        Term::Iter { arg, .. } => term_var_indices(arg, out),
     }
 }
 
@@ -663,7 +1090,11 @@ pub(crate) fn term_var_indices(t: &Term, out: &mut Vec<u32>) {
 fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
     let parsed = parse_forest_any(tokens, g, i)?;
     if parsed.ambiguous {
-        let rendered = tokens.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ");
+        let rendered = tokens
+            .iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(format!("ambiguous parse: `{rendered}`"));
     }
     Ok(parsed.tree)
@@ -687,7 +1118,13 @@ fn parse_forest_any(
     if tokens.is_empty() {
         return Err("empty term".into());
     }
-    let rendered = || tokens.iter().map(|t| i.resolve(t.sym)).collect::<Vec<_>>().join(" ");
+    let rendered = || {
+        tokens
+            .iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let chart = earley::parse(g, tokens, Nt::Term, i);
     forest::extract(g, &chart, tokens.len(), Nt::Term).map_err(|e| format!("{e}: `{}`", rendered()))
 }
@@ -733,7 +1170,12 @@ fn parse_build_rhs(
 
 /// Like [`parse_forest`] but starting at an arbitrary nonterminal (a per-kind term nonterminal), to parse
 /// a bubble constrained to one kind.
-fn parse_forest_at(tokens: &[Token], g: &CompiledGrammar, i: &Interner, start: Nt) -> Result<PTree, String> {
+fn parse_forest_at(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    i: &Interner,
+    start: Nt,
+) -> Result<PTree, String> {
     if tokens.is_empty() {
         return Err("empty term".into());
     }
@@ -750,7 +1192,10 @@ fn parse_forest_at(tokens: &[Token], g: &CompiledGrammar, i: &Interner, start: N
 /// canonical sort name the signature stored.
 fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortId, String> {
     let name: String = tokens.iter().map(|t| t.text(i)).collect();
-    m.sorts.get(&name).copied().ok_or_else(|| format!("unknown sort `{name}`"))
+    m.sorts
+        .get(&name)
+        .copied()
+        .ok_or_else(|| format!("unknown sort `{name}`"))
 }
 
 /// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`. Builds the term
@@ -769,8 +1214,22 @@ pub fn command_echo(
 ) -> Result<String, String> {
     let tree = parse_forest_pick(term, &lm.grammar, i)?;
     let dag = build_subject_dag(lm, &tree, term, i)?;
-    let dag = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag);
-    Ok(print_pretty(&lm.built, i, dag, color))
+    let mut echo = print_pretty(&lm.built, i, dag, color);
+    // Nullary overloads share one runtime symbol and therefore cannot carry the parent's expected
+    // declaration into pretty-printing. The variant metalevel APIs uniquely require their `empty`
+    // argument at `GroundTermList`; restore that statically known domain in the command echo.
+    let head = term.first().map(|token| token.text(i)).unwrap_or("");
+    if matches!(
+        head,
+        "metaGetVariant"
+            | "metaGetIrredundantVariant"
+            | "metaVariantUnify"
+            | "metaVariantDisjointUnify"
+            | "metaVariantMatch"
+    ) {
+        echo = echo.replace("(empty).EmptyCommaList", "(empty).GroundTermList");
+    }
+    Ok(echo)
 }
 
 pub fn reduce_command(
@@ -791,7 +1250,6 @@ pub fn reduce_command(
     let dag = build_subject_dag(lm, &tree, term, i);
     lm.built.engine.end_dedup();
     let dag = dag?;
-    let dag = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag);
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
@@ -800,14 +1258,43 @@ pub fn reduce_command(
 /// window exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders and the
 /// REPL's `reduce` (which then drives [`Engine::reduce_with`](tnk_core::engine::Engine::reduce_with) for
 /// META-LEVEL descent).
-pub fn build_command_dag(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<DagId, String> {
+pub fn build_command_dag(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+) -> Result<DagId, String> {
     let tree = parse_forest_pick(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
     let dag = build_subject_dag(lm, &tree, term, i);
     lm.built.engine.end_dedup();
-    let dag = dag?;
-    Ok(collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, dag))
+    dag
+}
+
+/// Parse a command-shaped term into a genuine symbolic DAG. Unlike [`build_command_dag`], variables stay
+/// [`NodeRepr::Var`](tnk_core::dag::NodeRepr::Var) leaves rather than being lowered to inert constants.
+/// META-LEVEL's `metaParse` needs this distinction because its result reifies variables as `Qid` terms.
+pub fn build_logic_command_dag(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+) -> Result<DagId, String> {
+    let tree = parse_forest_pick(term, &lm.grammar, i)?;
+    lm.built.engine.reset_rewrites();
+    lm.built.engine.begin_dedup();
+    let mut vars = VarIndex::new();
+    let dag = build_logic_dag(
+        &tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        term,
+        i,
+        &mut vars,
+    );
+    lm.built.engine.end_dedup();
+    dag
 }
 
 /// Build a command's subject DAG from its parse tree, handling BOTH ground terms (the [`build_dag`] fast
@@ -826,20 +1313,31 @@ fn build_subject_dag(
 ) -> Result<DagId, String> {
     if !tree_has_var(tree, &lm.grammar) {
         return build_dag(
-            tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, term, i,
+            tree,
+            &lm.grammar,
+            &mut lm.built.engine,
+            lm.built.nat_zero,
+            lm.built.nat_succ,
+            term,
+            i,
         );
     }
     let mut vars = VarIndex::new();
     let t = build_term(tree, &lm.grammar, &lm.built, term, i, &mut vars)?;
     let bindings: Vec<DagId> = (0..vars.count())
         .map(|idx| {
-            let sym = lm.built.engine.add_op(vars.name(idx).to_string(), vec![], vars.sort(idx));
+            let sym = lm
+                .built
+                .engine
+                .add_op(vars.name(idx).to_string(), vec![], vars.sort(idx));
             // Class the atom as a variable: `.=.`'s stability/groundness analysis must see Maude's
             // VariableSymbol (never stable, never ground), and comm/AC canonical ordering must
             // compare same-sort variables by name-token code (the variable's source token is
             // guaranteed interned — it was lexed), not by symbol creation order.
             let rank = i.get(vars.name(idx)).map(|s| s.index()).unwrap_or(u32::MAX);
-            lm.built.engine.set_symbol_class(sym, tnk_core::symbol::SymbolClass::Variable { rank });
+            lm.built
+                .engine
+                .set_symbol_class(sym, tnk_core::symbol::SymbolClass::Variable { rank });
             lm.built.engine.make_const(sym)
         })
         .collect();
@@ -853,69 +1351,6 @@ fn tree_has_var(tree: &PTree, g: &CompiledGrammar) -> bool {
         || tree.nt_children.iter().any(|c| tree_has_var(c, g))
 }
 
-/// Apply the declared-side collapse for one-sided-`id:` operators (`assoc left id: e` / `right id: e`) to a
-/// freshly built command DAG. The kernel registered these ops **without** an identity — its collapse is
-/// two-sided (fable-audit.md §3.4) — so `make_au`/`make_cui` left the identity arguments in place; here the
-/// leading (left) / trailing (right) identity elements are dropped and the node rebuilt. Recurses so nested
-/// occurrences are handled. A no-op (returns `dag`) when the module declares no one-sided op (`map` empty),
-/// so ordinary reduction pays nothing. (Construction-time only — a faithful one-sided identity in matching
-/// and equation-rhs construction needs the kernel `make_au`, which is out of scope here.)
-fn collapse_one_sided(
-    engine: &mut tnk_core::engine::Engine,
-    map: &std::collections::HashMap<tnk_core::symbol::SymbolId, (crate::surface::ast::IdSide, tnk_core::symbol::SymbolId)>,
-    dag: DagId,
-) -> DagId {
-    use crate::surface::ast::IdSide;
-    if map.is_empty() {
-        return dag;
-    }
-    let sym = engine.node(dag).symbol();
-    let children: Vec<DagId> = engine.node(dag).children().collect();
-    if children.is_empty() {
-        return dag; // a leaf (constant / built-in literal) has no arguments to collapse
-    }
-    let new_children: Vec<DagId> =
-        children.iter().map(|&c| collapse_one_sided(engine, map, c)).collect();
-    let child_changed = new_children != children;
-    if let Some(&(side, idc)) = map.get(&sym) {
-        // An element is the identity constant iff it is `idc` applied to no arguments.
-        let mut kids = new_children;
-        match side {
-            IdSide::Left => {
-                while let Some(&c) = kids.first() {
-                    let n = engine.node(c);
-                    if n.symbol() == idc && n.children().next().is_none() {
-                        kids.remove(0);
-                    } else {
-                        break;
-                    }
-                }
-            }
-            IdSide::Right => {
-                while let Some(&c) = kids.last() {
-                    let n = engine.node(c);
-                    if n.symbol() == idc && n.children().next().is_none() {
-                        kids.pop();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            IdSide::Both => {}
-        }
-        return match kids.len() {
-            0 => engine.make_const(idc),            // every element was the identity → the identity itself
-            1 => kids.into_iter().next().unwrap(),  // a lone survivor is the term (also avoids CUI's binary assert)
-            _ => engine.make_node(sym, kids),
-        };
-    }
-    if child_changed {
-        engine.make_node(sym, new_children)
-    } else {
-        dag
-    }
-}
-
 /// The token index where a failed command/term parse got stuck — the furthest token a valid partial
 /// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (fable-audit.md
 /// §3.3 B4); parsed at the universal `Term` start, matching [`build_command_dag`].
@@ -925,21 +1360,35 @@ pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -
 
 /// Begin a `rewrite` (rule-fair) session over `term` (Pillar A). The caller drives the returned
 /// [`Rewriting`] with [`Rewriting::run`] and stores it for `continue`.
-pub fn rewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token]) -> Result<Rewriting, String> {
+pub fn rewrite_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.rewrite(dag))
 }
 
 /// Begin a `frewrite` (position-fair) session over `term` (Pillar A-ii); `gas` rule applications per
 /// position per pass.
-pub fn frewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas: u64) -> Result<Rewriting, String> {
+pub fn frewrite_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+    gas: u64,
+) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.frewrite(dag, gas))
 }
 
 /// Begin an `erewrite` (object-message-fair) session over `term` (Pillar 2.5-B); `gas` is the
 /// per-position gas for the non-config fallback (default 1).
-pub fn erewrite_command(lm: &mut LoadedModule, i: &Interner, term: &[Token], gas: u64) -> Result<Rewriting, String> {
+pub fn erewrite_command(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    term: &[Token],
+    gas: u64,
+) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.erewrite(dag, gas))
 }
@@ -971,7 +1420,15 @@ pub fn search_command(
     lm.built.engine.reset_rewrites();
     let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
     lm.built.engine.begin_dedup();
-    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
+    let subj = build_dag(
+        &subj_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        subject,
+        i,
+    );
     lm.built.engine.end_dedup();
     let subj = subj?;
     let arrow = match arrow {
@@ -980,8 +1437,449 @@ pub fn search_command(
         SearchArrow::Star => Arrow::Star,
         SearchArrow::Bang => Arrow::Bang,
     };
-    let search = lm.built.engine.search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32));
+    let search = lm
+        .built
+        .engine
+        .search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32));
     Ok((search, vars))
+}
+
+pub struct NarrowCommand {
+    pub search: tnk_core::narrow::NarrowSearch,
+    pub variables: VarIndex,
+    pub initial_variable_count: usize,
+    /// Per-root source variables for a disjunction; `None` for the ordinary shared subject/goal scope.
+    pub initial_variables: Option<Vec<VarIndex>>,
+    pub initial_echoes: Vec<String>,
+    pub subject_echo: String,
+    pub goal_echo: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn narrow_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    subject: &[Token],
+    arrow: SearchArrow,
+    goal: &[Token],
+    max_depth: Option<u64>,
+    fold: bool,
+    vfold: bool,
+    path: bool,
+    filter: bool,
+    delay: bool,
+) -> Result<NarrowCommand, String> {
+    use tnk_core::fresh::VariableFamily;
+    use tnk_core::narrow::{NarrowFold, NarrowGoal, NarrowOptions, NarrowSearchType};
+    use tnk_core::unify::problem::VarSpec;
+
+    let initial_parts = split_on_text(subject, "\\/", i);
+    if initial_parts.len() > 1 {
+        return narrow_disjunction_command(
+            lm,
+            i,
+            &initial_parts,
+            arrow,
+            goal,
+            max_depth,
+            fold,
+            vfold,
+            path,
+            filter,
+            delay,
+        );
+    }
+
+    let subject_tree = parse_forest_pick(subject, &lm.grammar, i)?;
+    let goal_tree = parse_forest_pick(goal, &lm.grammar, i)?;
+    let mut variables = VarIndex::new();
+    let _ = build_term(
+        &subject_tree,
+        &lm.grammar,
+        &lm.built,
+        subject,
+        i,
+        &mut variables,
+    )?;
+    let initial_variable_count = variables.count() as usize;
+    let goal_term = build_term(
+        &goal_tree,
+        &lm.grammar,
+        &lm.built,
+        goal,
+        i,
+        &mut variables,
+    )?;
+    let goal_variable_names: Vec<_> = (0..variables.count())
+        .map(|slot| {
+            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+        })
+        .collect();
+    for slot in 0..variables.count() {
+        let base = variables
+            .name(slot)
+            .split_once(':')
+            .map_or(variables.name(slot), |(base, _)| base);
+        i.intern(base);
+    }
+    let mut specs: Vec<_> = (0..variables.count())
+        .map(|slot| {
+            let source = variables.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            let code = i.intern(base).index();
+            VarSpec {
+                sort: variables.sort(slot),
+                name: maude_variable_name_rank(base, code),
+            }
+        })
+        .collect();
+
+    lm.built.engine.reset_rewrites();
+    lm.built.engine.begin_dedup();
+    let subject_dag = build_logic_dag(
+        &subject_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        subject,
+        i,
+        &mut variables,
+    );
+    let goal_dag = build_logic_dag(
+        &goal_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        goal,
+        i,
+        &mut variables,
+    );
+    lm.built.engine.end_dedup();
+    let mut subject_dag = subject_dag?;
+    let mut goal_dag = goal_dag?;
+    // Maude indexes command variables by walking each canonical DAG, not by source-token order.
+    // This is visible in substitutions whenever an AC(U) operator reorders the input.
+    let mut variable_order = tnk_core::variant::variables_in_dag(&lm.built.engine, subject_dag);
+    for slot in tnk_core::variant::variables_in_dag(&lm.built.engine, goal_dag) {
+        if !variable_order.contains(&slot) {
+            variable_order.push(slot);
+        }
+    }
+    if variable_order.len() != specs.len() {
+        return Err("narrowing variable table does not match the command terms".into());
+    }
+    let mut new_slot = vec![0u32; specs.len()];
+    for (new, &old) in variable_order.iter().enumerate() {
+        new_slot[old] = new as u32;
+    }
+    let remapping: Vec<_> = specs
+        .iter()
+        .enumerate()
+        .map(|(old, spec)| {
+            Some(
+                lm.built
+                    .engine
+                    .make_var(spec.sort, spec.name, new_slot[old]),
+            )
+        })
+        .collect();
+    subject_dag =
+        tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, subject_dag)
+            .unwrap_or(subject_dag);
+    goal_dag = tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, goal_dag)
+        .unwrap_or(goal_dag);
+    specs = variable_order
+        .iter()
+        .map(|&old| specs[old].clone())
+        .collect();
+    variables.reorder(&variable_order);
+    let echo_variables: Vec<_> = (0..variables.count())
+        .map(|slot| {
+            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+        })
+        .collect();
+    let subject_echo =
+        print_pretty_with_variables(&lm.built, i, subject_dag, &echo_variables, false);
+    let goal_echo = print_term(&lm.built, i, &goal_term, &goal_variable_names, false);
+
+    let equations = executable_variant_equations(&mut lm.built, i);
+    let rules = lm.built.engine.narrowing_rules().to_vec();
+    let search_type = match arrow {
+        SearchArrow::One => NarrowSearchType::One,
+        SearchArrow::Plus => NarrowSearchType::AtLeastOne,
+        SearchArrow::Star => NarrowSearchType::Any,
+        SearchArrow::Bang => NarrowSearchType::NormalForm,
+    };
+    let options = NarrowOptions {
+        search_type,
+        max_depth: max_depth.map(|depth| depth as usize),
+        filter,
+        delay,
+        fold: if vfold {
+            NarrowFold::Variant
+        } else if fold {
+            NarrowFold::Match
+        } else {
+            NarrowFold::None
+        },
+        keep_history: false,
+        keep_paths: path,
+        respect_frozen: true,
+    };
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
+    let mut search = tnk_core::narrow::NarrowSearch::new(
+        &mut env,
+        subject_dag,
+        specs[..initial_variable_count].to_vec(),
+        &rules,
+        equations,
+        "0",
+        options,
+    )?;
+    let goal = NarrowGoal::new(
+        env.e,
+        goal_dag,
+        specs,
+        initial_variable_count,
+    );
+    search.set_goal(goal);
+    let _ = VariableFamily::Unify;
+    Ok(NarrowCommand {
+        search,
+        variables,
+        initial_variable_count,
+        initial_variables: None,
+        initial_echoes: vec![subject_echo.clone()],
+        subject_echo,
+        goal_echo,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn narrow_disjunction_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    initial_parts: &[&[Token]],
+    arrow: SearchArrow,
+    goal: &[Token],
+    max_depth: Option<u64>,
+    fold: bool,
+    vfold: bool,
+    path: bool,
+    filter: bool,
+    delay: bool,
+) -> Result<NarrowCommand, String> {
+    use tnk_core::narrow::{NarrowFold, NarrowGoal, NarrowOptions, NarrowSearchType};
+    use tnk_core::unify::problem::VarSpec;
+
+    let mut initials = Vec::with_capacity(initial_parts.len());
+    let mut initial_variables = Vec::with_capacity(initial_parts.len());
+    let mut initial_echoes = Vec::with_capacity(initial_parts.len());
+    let mut seen_initial_variables: Vec<(String, tnk_core::sort::SortId, usize)> = Vec::new();
+
+    lm.built.engine.reset_rewrites();
+    for (root, &tokens) in initial_parts.iter().enumerate() {
+        if tokens.is_empty() {
+            return Err("empty initial state in narrowing disjunction".into());
+        }
+        let tree = parse_forest_pick(tokens, &lm.grammar, i)?;
+        let mut variables = VarIndex::new();
+        let source_term = build_term(&tree, &lm.grammar, &lm.built, tokens, i, &mut variables)?;
+        for slot in 0..variables.count() {
+            let source = variables.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            if let Some((_, _, prior)) = seen_initial_variables
+                .iter()
+                .find(|(name, sort, _)| name == base && *sort == variables.sort(slot))
+            {
+                return Err(format!(
+                    "variable {source} appears in both initial state {} and initial state {root}",
+                    prior
+                ));
+            }
+            seen_initial_variables.push((base.to_string(), variables.sort(slot), root));
+            i.intern(base);
+        }
+        let specs: Vec<VarSpec> = (0..variables.count())
+            .map(|slot| {
+                let source = variables.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                VarSpec {
+                    sort: variables.sort(slot),
+                    name: maude_variable_name_rank(base, i.intern(base).index()),
+                }
+            })
+            .collect();
+        let echo_variables: Vec<_> = (0..variables.count())
+            .map(|slot| {
+                command_variable_display_name(
+                    &lm.grammar,
+                    i,
+                    variables.name(slot),
+                    variables.sort(slot),
+                )
+            })
+            .collect();
+        let echo_term = normalize_trace_term(&mut lm.built, i, &variables, &source_term);
+        let echo_term = restore_echo_variable_positions(&lm.built, &source_term, echo_term);
+        let initial_echo = print_term(&lm.built, i, &echo_term, &echo_variables, false);
+        lm.built.engine.begin_dedup();
+        let dag = build_logic_dag(
+            &tree,
+            &lm.grammar,
+            &mut lm.built.engine,
+            lm.built.nat_zero,
+            lm.built.nat_succ,
+            tokens,
+            i,
+            &mut variables,
+        );
+        lm.built.engine.end_dedup();
+        let (dag, specs) =
+            canonicalize_narrow_command_dag(&mut lm.built.engine, dag?, specs, &mut variables)?;
+        initial_echoes.push(initial_echo);
+        initial_variables.push(variables);
+        initials.push((dag, specs));
+    }
+
+    let goal_tree = parse_forest_pick(goal, &lm.grammar, i)?;
+    let mut variables = VarIndex::new();
+    let goal_term = build_term(
+        &goal_tree,
+        &lm.grammar,
+        &lm.built,
+        goal,
+        i,
+        &mut variables,
+    )?;
+    let goal_variable_names: Vec<_> = (0..variables.count())
+        .map(|slot| {
+            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+        })
+        .collect();
+    for slot in 0..variables.count() {
+        let source = variables.name(slot);
+        let base = source.split_once(':').map_or(source, |(base, _)| base);
+        if let Some((_, _, root)) = seen_initial_variables
+            .iter()
+            .find(|(name, sort, _)| name == base && *sort == variables.sort(slot))
+        {
+            return Err(format!(
+                "sharing variable {source} between initial state {root} and the goal is not allowed"
+            ));
+        }
+        i.intern(base);
+    }
+    let goal_specs: Vec<VarSpec> = (0..variables.count())
+        .map(|slot| {
+            let source = variables.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            VarSpec {
+                sort: variables.sort(slot),
+                name: maude_variable_name_rank(base, i.intern(base).index()),
+            }
+        })
+        .collect();
+    lm.built.engine.begin_dedup();
+    let goal_dag = build_logic_dag(
+        &goal_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        goal,
+        i,
+        &mut variables,
+    );
+    lm.built.engine.end_dedup();
+    let (goal_dag, goal_specs) =
+        canonicalize_narrow_command_dag(&mut lm.built.engine, goal_dag?, goal_specs, &mut variables)?;
+    let goal_echo = print_term(&lm.built, i, &goal_term, &goal_variable_names, false);
+
+    let equations = executable_variant_equations(&mut lm.built, i);
+    let rules = lm.built.engine.narrowing_rules().to_vec();
+    let search_type = match arrow {
+        SearchArrow::One => NarrowSearchType::One,
+        SearchArrow::Plus => NarrowSearchType::AtLeastOne,
+        SearchArrow::Star => NarrowSearchType::Any,
+        SearchArrow::Bang => NarrowSearchType::NormalForm,
+    };
+    let options = NarrowOptions {
+        search_type,
+        max_depth: max_depth.map(|depth| depth as usize),
+        filter,
+        delay,
+        fold: if vfold {
+            NarrowFold::Variant
+        } else if fold {
+            NarrowFold::Match
+        } else {
+            NarrowFold::None
+        },
+        keep_history: false,
+        keep_paths: path,
+        respect_frozen: true,
+    };
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
+    let mut search = tnk_core::narrow::NarrowSearch::new_many(
+        &mut env, initials, &rules, equations, "0", options,
+    )?;
+    search.set_goal(NarrowGoal::new(env.e, goal_dag, goal_specs, 0));
+    let subject_echo = initial_echoes.join(" \\/ ");
+    Ok(NarrowCommand {
+        search,
+        variables,
+        initial_variable_count: 0,
+        initial_variables: Some(initial_variables),
+        initial_echoes,
+        subject_echo,
+        goal_echo,
+    })
+}
+
+fn canonicalize_narrow_command_dag(
+    engine: &mut tnk_core::engine::Engine,
+    dag: DagId,
+    specs: Vec<tnk_core::unify::problem::VarSpec>,
+    variables: &mut VarIndex,
+) -> Result<(DagId, Vec<tnk_core::unify::problem::VarSpec>), String> {
+    let ranked_names: Vec<_> = specs
+        .iter()
+        .enumerate()
+        .map(|(slot, spec)| Some(engine.make_var(spec.sort, spec.name, slot as u32)))
+        .collect();
+    let dag = tnk_core::unify::instantiate(engine, &ranked_names, dag).unwrap_or(dag);
+    let dag = engine.normalize_for_unify(dag);
+    let variable_order = tnk_core::variant::variables_in_dag(engine, dag);
+    if variable_order.len() != specs.len() {
+        return Err("narrowing variable table does not match the command term".into());
+    }
+    let mut new_slot = vec![0u32; specs.len()];
+    for (new, &old) in variable_order.iter().enumerate() {
+        new_slot[old] = new as u32;
+    }
+    let remapping: Vec<_> = specs
+        .iter()
+        .enumerate()
+        .map(|(old, spec)| Some(engine.make_var(spec.sort, spec.name, new_slot[old])))
+        .collect();
+    let dag = tnk_core::unify::instantiate(engine, &remapping, dag).unwrap_or(dag);
+    let specs = variable_order
+        .iter()
+        .map(|&old| specs[old].clone())
+        .collect();
+    variables.reorder(&variable_order);
+    Ok((dag, specs))
 }
 
 /// The matched-portion id (for `xmatch`) and binding ids of one match solution, captured while the
@@ -1021,7 +1919,15 @@ pub fn match_command(
     let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
     // C7: dedup the subject's repeated subterms into shared nodes before reducing (see `reduce_command`).
     lm.built.engine.begin_dedup();
-    let subj = build_dag(&subj_tree, &lm.grammar, &mut lm.built.engine, lm.built.nat_zero, lm.built.nat_succ, subject, i);
+    let subj = build_dag(
+        &subj_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        subject,
+        i,
+    );
     lm.built.engine.end_dedup();
     let subj = subj?;
     let subj = lm.built.engine.reduce(subj);
@@ -1032,14 +1938,24 @@ pub fn match_command(
         let mut sols = lm.built.engine.match_solutions(pat, nr, subj, xmatch);
         while sols.advance() {
             let bindings = (0..nr)
-                .map(|k| sols.binding(k).expect("the matcher binds every pattern variable"))
+                .map(|k| {
+                    sols.binding(k)
+                        .expect("the matcher binds every pattern variable")
+                })
                 .collect();
-            let portion = if xmatch { sols.matched_portion_display() } else { None };
+            let portion = if xmatch {
+                sols.matched_portion_display()
+            } else {
+                None
+            };
             raws.push(RawSolution { bindings, portion });
         }
     }
 
-    Ok(raws.iter().map(|r| render_solution(&lm.built, i, r, &vars)).collect())
+    Ok(raws
+        .iter()
+        .map(|r| render_solution(&lm.built, i, r, &vars))
+        .collect())
 }
 
 /// Render one solution's body: the `Matched portion = …` line (for `xmatch`) followed by the
@@ -1050,7 +1966,10 @@ fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarI
     match sol.portion {
         Some(MatchedPortion::Whole) => lines.push("Matched portion = (whole)".to_string()),
         Some(MatchedPortion::Portion(p)) => {
-            lines.push(format!("Matched portion = {}", print_pretty(m, i, p, false)));
+            lines.push(format!(
+                "Matched portion = {}",
+                print_pretty(m, i, p, false)
+            ));
         }
         None => {}
     }
@@ -1058,7 +1977,11 @@ fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarI
         lines.push("empty substitution".to_string());
     } else {
         for (k, &b) in sol.bindings.iter().enumerate() {
-            lines.push(format!("{} --> {}", vars.name(k as u32), print_pretty(m, i, b, false)));
+            lines.push(format!(
+                "{} --> {}",
+                vars.name(k as u32),
+                print_pretty(m, i, b, false)
+            ));
         }
     }
     lines.join("\n")
@@ -1090,6 +2013,45 @@ impl tnk_core::unify::NameCodes for InternerNames<'_> {
     }
 }
 
+/// Relative token-name ranks established by Maude 3.5.1's standing prelude before a user module is
+/// parsed. VariableTerm comparison uses these global token codes, so a self-contained module still
+/// normalizes conventional one-letter variables in this order (direct oracle: an AC sum of A..Z).
+/// Names outside the standing set retain this session's interner order after the reserved prefix.
+pub fn maude_variable_name_rank(name: &str, fallback: u32) -> u32 {
+    const STANDING: &[&str] = &[
+        "E", "A", "B", "C", "I", "J", "N", "M", "K", "Z", "Q", "R", "X", "Y", "L", "S", "P", "D",
+        "V", "U", "H", "T", "O", "F", "G", "W",
+    ];
+    STANDING
+        .iter()
+        .position(|&candidate| candidate == name)
+        .map_or(0x100u32.saturating_add(fallback), |rank| rank as u32)
+}
+/// Maude resolves `X:Sort` to the existing declared variable `X` when both name and sort agree, and
+/// consequently drops the on-the-fly sort suffix in command echoes and substitution keys.
+pub fn command_variable_display_name(
+    grammar: &CompiledGrammar,
+    i: &Interner,
+    source: &str,
+    sort: SortId,
+) -> String {
+    let Some((base, _)) = source.split_once(':') else {
+        return source.to_string();
+    };
+    let declared = grammar.prods.iter().any(|prod| {
+        matches!(prod.action, Action::MakeVariable(s) if s == sort)
+            && matches!(
+                prod.rhs.as_slice(),
+                [GSym::T(Terminal::Tok(sym))] if i.resolve(*sym) == base
+            )
+    });
+    if declared {
+        base.to_string()
+    } else {
+        source.to_string()
+    }
+}
+
 /// The built pieces of a `unify` command: the pretty-printed echo body (`T1 =? T2 /\ …`, without
 /// the `unify in M :` frame or trailing ` .`), the original variables' print names (slot order),
 /// and the resumable [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
@@ -1101,12 +2063,25 @@ pub struct UnifyCommand {
     /// "unsafe variable name" warning, like a screening failure.
     pub names_ok: bool,
     pub problem: tnk_core::unify::problem::UnifyProblem,
+    pub(crate) source_var_names: Vec<String>,
+    pub(crate) equations: Vec<(DagId, DagId)>,
+    pub(crate) specs: Vec<tnk_core::unify::problem::VarSpec>,
+    pub(crate) vars: VarIndex,
 }
 
-/// Build a `unify` command: split the body into `=?`-separated pairs (over `/\`), parse both sides
-/// of every pair sharing one [`VarIndex`] (so variable slots are assigned in first-encounter order
-/// — the observable order), build the echo and the genuine-`Var`-leaf dags, and construct the
-/// order-sorted [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
+fn build_unify_echo_term(
+    tree: &PTree,
+    lm: &LoadedModule,
+    tokens: &[Token],
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<Term, String> {
+    build_term(tree, &lm.grammar, &lm.built, tokens, i, vars)
+}
+
+/// Build a `unify` command: parse each pair with temporary source-order slots, theory-normalize every
+/// side, then use Maude's post-normalization variable order for the resumable order-sorted problem and
+/// displayed substitution keys.
 pub fn unify_command(
     lm: &mut LoadedModule,
     i: &mut Interner,
@@ -1115,71 +2090,113 @@ pub fn unify_command(
     use tnk_core::fresh::VariableFamily;
     use tnk_core::unify::problem::{UnifyProblem, VarSpec};
 
-    // Split on `/\` into conjuncts, each on `=?` into (lhs, rhs); parse both sides sharing `vars`.
-    let mut vars = VarIndex::new();
-    let mut pairs: Vec<(Term, Term)> = Vec::new();
-    for conj in split_on_text(body, "/\\", i) {
-        let sides = split_on_text(conj, "=?", i);
-        if sides.len() != 2 {
-            return Err("unify: each conjunct must be `T1 =? T2`".to_string());
-        }
-        let lhs = parse_build(sides[0], &lm.grammar, &lm.built, i, &mut vars)?;
-        let rhs = parse_build(sides[1], &lm.grammar, &lm.built, i, &mut vars)?;
-        pairs.push((lhs, rhs));
+    let conjs = split_on_text(body, "/\\", i);
+    let sides: Vec<_> = conjs.iter().map(|c| split_on_text(c, "=?", i)).collect();
+    if sides.iter().any(|s| s.len() != 2) {
+        return Err("unify: each conjunct must be `T1 =? T2`".to_string());
     }
 
-    // Echo: each side pretty-printed via the Term printer (variables by their source names), joined
-    // with ` =? ` and ` /\ `. Line-wrapping is the REPL's global post-process.
-    let var_names: Vec<String> = (0..vars.count()).map(|k| vars.name(k).to_string()).collect();
+    let mut vars = VarIndex::new();
+    let mut equations = Vec::with_capacity(sides.len());
+    let mut echo_pairs = Vec::with_capacity(sides.len());
+    for side in &sides {
+        let lhs_tree = parse_forest_pick(side[0], &lm.grammar, i)?;
+        // Establish source-order variable slots before the DAG constructor canonicalizes commutative args.
+        let lhs_echo = build_unify_echo_term(&lhs_tree, lm, side[0], i, &mut vars)?;
+        // `Token::split` interns the base when Maude turns an on-the-fly `X:Sort` token into a
+        // VariableTerm. Do that before the DAG builder records the variable's name id.
+        for idx in 0..vars.count() {
+            let name = vars.name(idx);
+            let base = name.split_once(':').map_or(name, |(base, _)| base);
+            i.intern(base);
+        }
+        let lhs = build_logic_dag(
+            &lhs_tree,
+            &lm.grammar,
+            &mut lm.built.engine,
+            lm.built.nat_zero,
+            lm.built.nat_succ,
+            side[0],
+            i,
+            &mut vars,
+        )?;
+        let rhs_tree = parse_forest_pick(side[1], &lm.grammar, i)?;
+        let rhs_echo = build_unify_echo_term(&rhs_tree, lm, side[1], i, &mut vars)?;
+        for idx in 0..vars.count() {
+            let name = vars.name(idx);
+            let base = name.split_once(':').map_or(name, |(base, _)| base);
+            i.intern(base);
+        }
+        let rhs = build_logic_dag(
+            &rhs_tree,
+            &lm.grammar,
+            &mut lm.built.engine,
+            lm.built.nat_zero,
+            lm.built.nat_succ,
+            side[1],
+            i,
+            &mut vars,
+        )?;
+        echo_pairs.push((lhs_echo, rhs_echo));
+        equations.push((lhs, rhs));
+    }
 
-    // Safe-name check (Maude's `variableNameConflict`): a unificand variable named like a fresh
-    // variable (`#1`, `%2`, `@3`) would clash. The bare id is the text before the on-the-fly `:Sort`.
-    let namegen = tnk_core::fresh::FreshVariableGenerator::new();
-    let names_ok = var_names.iter().all(|n| {
-        let bare = n.split(':').next().unwrap_or(n);
-        !namegen.variable_name_conflict(bare, None)
-    });
-    let echo = pairs
+    let source_var_names: Vec<String> = (0..vars.count())
+        .map(|idx| command_variable_display_name(&lm.grammar, i, vars.name(idx), vars.sort(idx)))
+        .collect();
+    let echo = echo_pairs
         .iter()
-        .map(|(l, r)| {
+        .map(|(lhs, rhs)| {
             format!(
                 "{} =? {}",
-                print_term(&lm.built, i, l, &var_names, false),
-                print_term(&lm.built, i, r, &var_names, false)
+                print_term(&lm.built, i, lhs, &source_var_names, false),
+                print_term(&lm.built, i, rhs, &source_var_names, false)
             )
         })
         .collect::<Vec<_>>()
         .join(" /\\ ");
-
-    // Genuine `Var`-leaf dags: instantiate each side's Term over per-slot `Var` bindings. `Var`
-    // leaves carry the interned base-name code; the one-sided-id collapse matches Maude's normalize.
-    let bindings: Vec<DagId> = (0..vars.count())
-        .map(|k| {
-            let name = i.intern(vars.name(k)).index();
-            lm.built.engine.make_var(vars.sort(k), name, k)
+    let specs: Vec<VarSpec> = (0..vars.count())
+        .map(|idx| {
+            let source_name = vars.name(idx);
+            let base = source_name
+                .split_once(':')
+                .map_or(source_name, |(base, _)| base);
+            let code = i.intern(base).index();
+            VarSpec {
+                sort: vars.sort(idx),
+                name: maude_variable_name_rank(base, code),
+            }
         })
         .collect();
-    let mut equations: Vec<(DagId, DagId)> = Vec::new();
-    for (l, r) in &pairs {
-        let ld = lm.built.engine.instantiate_bindings(l, &bindings);
-        let ld = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, ld);
-        let ld = lm.built.engine.normalize_for_unify(ld);
-        let rd = lm.built.engine.instantiate_bindings(r, &bindings);
-        let rd = collapse_one_sided(&mut lm.built.engine, &lm.built.one_sided_id, rd);
-        let rd = lm.built.engine.normalize_for_unify(rd);
-        equations.push((ld, rd));
-    }
 
-    let specs: Vec<VarSpec> = (0..vars.count())
-        .map(|k| VarSpec { sort: vars.sort(k), name: i.intern(vars.name(k)).index() })
-        .collect();
-
-    // The object-level command uses the `#` family starting at 0 (metaUnify supplies its own base).
+    let namegen = tnk_core::fresh::FreshVariableGenerator::new();
+    let names_ok = source_var_names.iter().all(|name| {
+        let bare = name.split(':').next().unwrap_or(name);
+        !namegen.variable_name_conflict(bare, None)
+    });
+    let source_equations = equations.clone();
+    let source_specs = specs.clone();
     let mut names = InternerNames(i);
-    let mut env = tnk_core::unify::UnifyEnv { e: &mut lm.built.engine, names: &mut names };
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
     let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
-
-    Ok(UnifyCommand { echo, var_names, names_ok, problem })
+    let var_names = problem
+        .original_variable_order()
+        .iter()
+        .map(|&old| source_var_names[old].clone())
+        .collect();
+    Ok(UnifyCommand {
+        echo,
+        var_names,
+        names_ok,
+        problem,
+        source_var_names,
+        equations: source_equations,
+        specs: source_specs,
+        vars,
+    })
 }
 
 /// Render one unifier's substitution (`name --> value` lines, or `empty substitution`), matching
@@ -1201,6 +2218,554 @@ pub fn render_unifier(
         .join("\n")
 }
 
+/// Parsed state for a resumable `get variants` command.
+pub struct VariantCommand {
+    pub echo: String,
+    pub var_names: Vec<String>,
+    pub names_ok: bool,
+    pub search: VariantSearch,
+}
+
+/// Parsed state for a plain or filtered variant-unification command.
+pub struct VariantUnifyCommand {
+    pub echo: String,
+    pub var_names: Vec<String>,
+    pub names_ok: bool,
+    pub pair_count: usize,
+    pub search: VariantSearch,
+}
+
+/// Parsed state for variant matching: an irredundant pattern-variant search plus the grounded
+/// subject matched against each surviving variant.
+pub struct VariantMatchCommand {
+    pub echo: String,
+    pub var_names: Vec<String>,
+    pub names_ok: bool,
+    pub search: VariantSearch,
+    pub subject: DagId,
+    pub restorations: Vec<(DagId, DagId)>,
+    pub fresh_base: String,
+}
+
+fn collect_term_variable_sorts(term: &Term, sorts: &mut Vec<Option<SortId>>) {
+    match term {
+        Term::Var(v) => {
+            let slot = v.index as usize;
+            if sorts.len() <= slot {
+                sorts.resize(slot + 1, None);
+            }
+            sorts[slot] = Some(v.sort);
+        }
+        Term::Op { args, .. } => {
+            for arg in args {
+                collect_term_variable_sorts(arg, sorts);
+            }
+        }
+        Term::Iter { arg, .. } => collect_term_variable_sorts(arg, sorts),
+        Term::Na { .. } => {}
+    }
+}
+
+pub fn executable_variant_equations(m: &mut BuiltModule, i: &mut Interner) -> Vec<VariantEquation> {
+    use tnk_core::unify::problem::VarSpec;
+
+    let traces = &m.eq_traces;
+    let engine = &mut m.engine;
+    traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| trace.variant && !trace.nonexec)
+        .map(|(id, trace)| {
+            let mut sorts = Vec::new();
+            collect_term_variable_sorts(&trace.lhs, &mut sorts);
+            collect_term_variable_sorts(&trace.rhs, &mut sorts);
+            let variables: Vec<_> = sorts
+                .into_iter()
+                .enumerate()
+                .map(|(slot, sort)| {
+                    let source = trace.var_names.get(slot).map(String::as_str).unwrap_or("X");
+                    let base = source.split_once(':').map_or(source, |(base, _)| base);
+                    let code = i.intern(base).index();
+                    VarSpec {
+                        sort: sort.expect("each statement variable occurs in its lhs or rhs"),
+                        name: maude_variable_name_rank(base, code),
+                    }
+                })
+                .collect();
+            compile_variant_equation(engine, id as u32, &trace.lhs, &trace.rhs, variables)
+        })
+        .collect()
+}
+
+/// Build the target, irreducibility blockers, and executable `[variant]` equation set for `get
+/// variants`. The target's source slots are reordered only after theory canonicalization, matching
+/// Maude's `VariantSearch` constructor.
+pub fn variant_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    term: &[Token],
+    irreducible: Option<&[Token]>,
+    irredundant: bool,
+) -> Result<VariantCommand, String> {
+    use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
+    use tnk_core::unify::problem::VarSpec;
+
+    let mut vars = VarIndex::new();
+    let tree = parse_forest_pick(term, &lm.grammar, i)?;
+    let _source_term = build_term(&tree, &lm.grammar, &lm.built, term, i, &mut vars)?;
+    for slot in 0..vars.count() {
+        let source = vars.name(slot);
+        let base = source.split_once(':').map_or(source, |(base, _)| base);
+        i.intern(base);
+    }
+    let target = build_logic_dag(
+        &tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        term,
+        i,
+        &mut vars,
+    )?;
+    let echo_term = tnk_core::variant::term_from_dag_slots(&lm.built.engine, target);
+    let target_variables = vars.count();
+
+    let mut blocker_terms = Vec::new();
+    let mut blockers = Vec::new();
+    if let Some(body) = irreducible {
+        for part in split_on_text(body, ",", i) {
+            let tree = parse_forest_pick(part, &lm.grammar, i)?;
+            let source_term = build_term(&tree, &lm.grammar, &lm.built, part, i, &mut vars)?;
+            for slot in 0..vars.count() {
+                let source = vars.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                i.intern(base);
+            }
+            let blocker = build_logic_dag(
+                &tree,
+                &lm.grammar,
+                &mut lm.built.engine,
+                lm.built.nat_zero,
+                lm.built.nat_succ,
+                part,
+                i,
+                &mut vars,
+            )?;
+            blocker_terms.push(source_term);
+            blockers.push(blocker);
+        }
+    }
+
+    let source_var_names: Vec<String> = (0..vars.count())
+        .map(|slot| command_variable_display_name(&lm.grammar, i, vars.name(slot), vars.sort(slot)))
+        .collect();
+    let mut echo = print_term(&lm.built, i, &echo_term, &source_var_names, false);
+    if !blocker_terms.is_empty() {
+        let blockers = blocker_terms
+            .iter()
+            .map(|term| print_term(&lm.built, i, term, &source_var_names, false))
+            .collect::<Vec<_>>()
+            .join(", ");
+        echo.push_str(" such that ");
+        echo.push_str(&blockers);
+        echo.push_str(" irreducible");
+    }
+    let specs: Vec<VarSpec> = (0..target_variables)
+        .map(|slot| {
+            let source = vars.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            let code = i.intern(base).index();
+            VarSpec {
+                sort: vars.sort(slot),
+                name: maude_variable_name_rank(base, code),
+            }
+        })
+        .collect();
+    let namegen = FreshVariableGenerator::new();
+    let names_ok = source_var_names.iter().all(|name| {
+        let bare = name.split(':').next().unwrap_or(name);
+        !namegen.variable_name_conflict(bare, None)
+    });
+    let equations = executable_variant_equations(&mut lm.built, i);
+    lm.built.engine.reset_rewrites();
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
+    let mode = if irredundant {
+        VariantMode::Irredundant
+    } else {
+        VariantMode::Incremental
+    };
+    let search = VariantSearch::new(
+        &mut env,
+        target,
+        specs,
+        blockers,
+        equations,
+        mode,
+        None::<VariableFamily>,
+        "0",
+    )?;
+    let var_names = search
+        .original_variable_order()
+        .iter()
+        .map(|&old| source_var_names[old].clone())
+        .collect();
+    Ok(VariantCommand {
+        echo,
+        var_names,
+        names_ok,
+        search,
+    })
+}
+
+pub fn variant_unify_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    body: &[Token],
+    irreducible: Option<&[Token]>,
+    _filtered: bool,
+) -> Result<VariantUnifyCommand, String> {
+    use tnk_core::fresh::VariableFamily;
+
+    let UnifyCommand {
+        mut echo,
+        names_ok,
+        problem,
+        source_var_names,
+        equations,
+        specs,
+        mut vars,
+        ..
+    } = unify_command(lm, i, body)?;
+    drop(problem);
+    let pair_count = equations.len();
+    if pair_count == 0 {
+        return Err("variant unify: expected at least one unification pair".to_string());
+    }
+
+    let mut blockers = Vec::new();
+    let mut blocker_echoes = Vec::new();
+    if let Some(tokens) = irreducible {
+        for part in split_on_text(tokens, ",", i) {
+            let tree = parse_forest_pick(part, &lm.grammar, i)?;
+            let echo_term = build_term(&tree, &lm.grammar, &lm.built, part, i, &mut vars)?;
+            for slot in 0..vars.count() {
+                let source = vars.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                i.intern(base);
+            }
+            let dag = build_logic_dag(
+                &tree,
+                &lm.grammar,
+                &mut lm.built.engine,
+                lm.built.nat_zero,
+                lm.built.nat_succ,
+                part,
+                i,
+                &mut vars,
+            )?;
+            blocker_echoes.push(print_term(
+                &lm.built,
+                i,
+                &echo_term,
+                &source_var_names,
+                false,
+            ));
+            blockers.push(dag);
+        }
+    }
+    if !blocker_echoes.is_empty() {
+        echo.push_str(" such that ");
+        echo.push_str(&blocker_echoes.join(", "));
+        echo.push_str(" irreducible");
+    }
+
+    let target = if pair_count == 1 {
+        let (lhs, rhs) = equations[0];
+        let domains = [lhs, rhs]
+            .map(|dag| {
+                let sort = lm.built.engine.sort_of(dag);
+                let kind = lm.built.engine.sorts().kind_of(sort);
+                lm.built.engine.sorts().error_sort(kind)
+            })
+            .to_vec();
+        let result_sort = domains[0];
+        let pair_symbol = lm
+            .built
+            .engine
+            .add_op("$variant-unification-pair", domains, result_sort);
+        lm.built.engine.make_free(pair_symbol, vec![lhs, rhs])
+    } else {
+        let lhs: Vec<_> = equations.iter().map(|&(lhs, _)| lhs).collect();
+        let rhs: Vec<_> = equations.iter().map(|&(_, rhs)| rhs).collect();
+        let tuple_sort = {
+            let kind = lm
+                .built
+                .engine
+                .sorts()
+                .kind_of(lm.built.engine.sort_of(lhs[0]));
+            lm.built.engine.sorts().error_sort(kind)
+        };
+        let lhs_domains = lhs
+            .iter()
+            .map(|&dag| {
+                let kind = lm
+                    .built
+                    .engine
+                    .sorts()
+                    .kind_of(lm.built.engine.sort_of(dag));
+                lm.built.engine.sorts().error_sort(kind)
+            })
+            .collect();
+        let rhs_domains = rhs
+            .iter()
+            .map(|&dag| {
+                let kind = lm
+                    .built
+                    .engine
+                    .sorts()
+                    .kind_of(lm.built.engine.sort_of(dag));
+                lm.built.engine.sorts().error_sort(kind)
+            })
+            .collect();
+        let lhs_symbol =
+            lm.built
+                .engine
+                .add_op("$variant-unification-lhs", lhs_domains, tuple_sort);
+        let rhs_symbol =
+            lm.built
+                .engine
+                .add_op("$variant-unification-rhs", rhs_domains, tuple_sort);
+        let lhs = lm.built.engine.make_free(lhs_symbol, lhs);
+        let rhs = lm.built.engine.make_free(rhs_symbol, rhs);
+        let pair_symbol = lm.built.engine.add_op(
+            "$variant-unification-pair",
+            vec![tuple_sort, tuple_sort],
+            tuple_sort,
+        );
+        lm.built.engine.make_free(pair_symbol, vec![lhs, rhs])
+    };
+    let target = lm.built.engine.normalize_for_unify(target);
+    let equations = executable_variant_equations(&mut lm.built, i);
+    lm.built.engine.reset_rewrites();
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
+    let mode = VariantMode::Incremental;
+    let mut search = VariantSearch::new(
+        &mut env,
+        target,
+        specs,
+        blockers,
+        equations,
+        mode,
+        None::<VariableFamily>,
+        "0",
+    )?;
+    search.enable_unification(env.e, pair_count);
+    let var_names = search
+        .original_variable_order()
+        .iter()
+        .map(|&old| source_var_names[old].clone())
+        .collect();
+    Ok(VariantUnifyCommand {
+        echo,
+        var_names,
+        names_ok,
+        pair_count,
+        search,
+    })
+}
+
+pub fn variant_match_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    pattern: &[Token],
+    subject: &[Token],
+    irreducible: Option<&[Token]>,
+) -> Result<VariantMatchCommand, String> {
+    use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
+    use tnk_core::unify::problem::VarSpec;
+
+    let mut pattern_vars = VarIndex::new();
+    let pattern_tree = parse_forest_pick(pattern, &lm.grammar, i)?;
+    let pattern_term = build_term(
+        &pattern_tree,
+        &lm.grammar,
+        &lm.built,
+        pattern,
+        i,
+        &mut pattern_vars,
+    )?;
+    for slot in 0..pattern_vars.count() {
+        let source = pattern_vars.name(slot);
+        i.intern(source.split_once(':').map_or(source, |(base, _)| base));
+    }
+    let pattern_dag = build_logic_dag(
+        &pattern_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        pattern,
+        i,
+        &mut pattern_vars,
+    )?;
+    let target_variables = pattern_vars.count();
+    let source_var_names: Vec<_> = (0..target_variables)
+        .map(|slot| {
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                pattern_vars.name(slot),
+                pattern_vars.sort(slot),
+            )
+        })
+        .collect();
+
+    let mut subject_vars = VarIndex::new();
+    let subject_tree = parse_forest_pick(subject, &lm.grammar, i)?;
+    let subject_term = build_term(
+        &subject_tree,
+        &lm.grammar,
+        &lm.built,
+        subject,
+        i,
+        &mut subject_vars,
+    )?;
+    for slot in 0..subject_vars.count() {
+        let source = subject_vars.name(slot);
+        i.intern(source.split_once(':').map_or(source, |(base, _)| base));
+    }
+    let subject_dag = build_logic_dag(
+        &subject_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        subject,
+        i,
+        &mut subject_vars,
+    )?;
+    let subject_var_names: Vec<_> = (0..subject_vars.count())
+        .map(|slot| {
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                subject_vars.name(slot),
+                subject_vars.sort(slot),
+            )
+        })
+        .collect();
+    let fresh_base = subject_var_names
+        .iter()
+        .filter_map(|name| {
+            name.split(':')
+                .next()
+                .and_then(|bare| bare.strip_prefix('#'))
+                .and_then(|digits| digits.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0)
+        .to_string();
+    let (subject_dag, mut restorations) =
+        tnk_core::variant::ground_subject_variables(&mut lm.built.engine, subject_dag);
+    for (index, (_, variable)) in restorations.iter_mut().enumerate() {
+        let sort = lm.built.engine.sort_of(*variable);
+        let display = subject_var_names
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or("X");
+        *variable = lm
+            .built
+            .engine
+            .make_var(sort, i.intern(display).index(), index as u32);
+    }
+
+    let mut blockers = Vec::new();
+    let mut blocker_echoes = Vec::new();
+    if let Some(tokens) = irreducible {
+        for part in split_on_text(tokens, ",", i) {
+            let tree = parse_forest_pick(part, &lm.grammar, i)?;
+            let term = build_term(&tree, &lm.grammar, &lm.built, part, i, &mut pattern_vars)?;
+            let dag = build_logic_dag(
+                &tree,
+                &lm.grammar,
+                &mut lm.built.engine,
+                lm.built.nat_zero,
+                lm.built.nat_succ,
+                part,
+                i,
+                &mut pattern_vars,
+            )?;
+            blocker_echoes.push(print_term(&lm.built, i, &term, &source_var_names, false));
+            blockers.push(dag);
+        }
+    }
+
+    let mut echo = format!(
+        "{} <=? {}",
+        print_term(&lm.built, i, &pattern_term, &source_var_names, false),
+        print_term(&lm.built, i, &subject_term, &subject_var_names, false)
+    );
+    if !blocker_echoes.is_empty() {
+        echo.push_str(" such that ");
+        echo.push_str(&blocker_echoes.join(", "));
+        echo.push_str(" irreducible");
+    }
+    let specs: Vec<VarSpec> = (0..target_variables)
+        .map(|slot| {
+            let source = pattern_vars.name(slot);
+            let base = source.split_once(':').map_or(source, |(base, _)| base);
+            VarSpec {
+                sort: pattern_vars.sort(slot),
+                name: maude_variable_name_rank(base, i.intern(base).index()),
+            }
+        })
+        .collect();
+    let namegen = FreshVariableGenerator::new();
+    let names_ok = source_var_names.iter().all(|name| {
+        let bare = name.split(':').next().unwrap_or(name);
+        !namegen.variable_name_conflict(bare, None)
+    });
+    let equations = executable_variant_equations(&mut lm.built, i);
+    lm.built.engine.reset_rewrites();
+    let mut names = InternerNames(i);
+    let mut env = tnk_core::unify::UnifyEnv {
+        e: &mut lm.built.engine,
+        names: &mut names,
+    };
+    let search = VariantSearch::new(
+        &mut env,
+        pattern_dag,
+        specs,
+        blockers,
+        equations,
+        VariantMode::Irredundant,
+        None::<VariableFamily>,
+        &fresh_base,
+    )?;
+    let var_names = search
+        .original_variable_order()
+        .iter()
+        .map(|&old| source_var_names[old].clone())
+        .collect();
+    Ok(VariantMatchCommand {
+        echo,
+        var_names,
+        names_ok,
+        search,
+        subject: subject_dag,
+        restorations,
+        fresh_base,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,7 +2776,11 @@ mod tests {
         /// A `reduce`: `(result-sort, an expected-term in surface syntax, rewrite-count)`. The expected
         /// term is reduced through the same pipeline and compared by `deep_equal`, so its surface form
         /// just has to denote the same value (e.g. `- 3` for the binary's `-3`, `s s 0` for `s_^2(0)`).
-        Reduce { sort: &'static str, term: &'static str, rewrites: u64 },
+        Reduce {
+            sort: &'static str,
+            term: &'static str,
+            rewrites: u64,
+        },
         /// A `match`/`xmatch`: the expected solution blocks (each the `Var --> value` lines, or for
         /// `xmatch` the `Matched portion = …` line + substitution), rendered by [`render_solution`].
         /// Compared **as a set** (both sides sorted): the binary's exact ACU/AU solution *order* is
@@ -1221,7 +2790,11 @@ mod tests {
     }
 
     const fn e(sort: &'static str, term: &'static str, rewrites: u64) -> Expect {
-        Expect::Reduce { sort, term, rewrites }
+        Expect::Reduce {
+            sort,
+            term,
+            rewrites,
+        }
     }
 
     const fn mat(blocks: &'static [&'static str]) -> Expect {
@@ -1231,7 +2804,11 @@ mod tests {
     /// A command's tokens, owned so the loop can `&mut`-borrow `loaded.modules` while iterating.
     enum Cmd {
         Reduce(Vec<Token>),
-        Match { pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
+        Match {
+            pattern: Vec<Token>,
+            subject: Vec<Token>,
+            xmatch: bool,
+        },
     }
 
     /// Load `src` and assert each command matches the reference binary: a `reduce`'s result sort, rewrite
@@ -1245,7 +2822,12 @@ mod tests {
             .map(|(m, c)| {
                 let cmd = match c {
                     Command::Reduce { term, .. } => Cmd::Reduce(term.clone()),
-                    Command::Match { pattern, subject, xmatch, .. } => Cmd::Match {
+                    Command::Match {
+                        pattern,
+                        subject,
+                        xmatch,
+                        ..
+                    } => Cmd::Match {
                         pattern: pattern.clone(),
                         subject: subject.clone(),
                         xmatch: *xmatch,
@@ -1259,25 +2841,54 @@ mod tests {
 
         for (idx, ((m, cmd), exp)) in cmds.iter().zip(expected).enumerate() {
             match (cmd, exp) {
-                (Cmd::Reduce(term), Expect::Reduce { sort, term: eterm, rewrites }) => {
+                (
+                    Cmd::Reduce(term),
+                    Expect::Reduce {
+                        sort,
+                        term: eterm,
+                        rewrites,
+                    },
+                ) => {
                     let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
                         .unwrap_or_else(|err| panic!("command {idx}: {err}"));
                     {
                         let eng = &loaded.modules[*m].built.engine;
-                        assert_eq!(eng.sorts().name(eng.sort_of(got)), *sort, "command {idx} sort");
+                        assert_eq!(
+                            eng.sorts().name(eng.sort_of(got)),
+                            *sort,
+                            "command {idx} sort"
+                        );
                     }
                     assert_eq!(rw, *rewrites, "command {idx} rewrite count");
 
                     let exp_toks = tokenize(eterm, &mut loaded.interner);
-                    let (want, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &exp_toks)
-                        .unwrap_or_else(|err| panic!("command {idx} expected `{eterm}`: {err}"));
+                    let (want, _) =
+                        reduce_command(&mut loaded.modules[*m], &loaded.interner, &exp_toks)
+                            .unwrap_or_else(|err| {
+                                panic!("command {idx} expected `{eterm}`: {err}")
+                            });
                     let eng = &loaded.modules[*m].built.engine;
-                    assert!(eng.deep_equal(got, want), "command {idx} value: expected `{eterm}`");
+                    assert!(
+                        eng.deep_equal(got, want),
+                        "command {idx} value: expected `{eterm}`"
+                    );
                 }
-                (Cmd::Match { pattern, subject, xmatch }, Expect::Match(blocks)) => {
-                    let mut got =
-                        match_command(&mut loaded.modules[*m], &loaded.interner, pattern, subject, *xmatch)
-                            .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+                (
+                    Cmd::Match {
+                        pattern,
+                        subject,
+                        xmatch,
+                    },
+                    Expect::Match(blocks),
+                ) => {
+                    let mut got = match_command(
+                        &mut loaded.modules[*m],
+                        &loaded.interner,
+                        pattern,
+                        subject,
+                        *xmatch,
+                    )
+                    .unwrap_or_else(|err| panic!("command {idx}: {err}"));
                     got.sort();
                     let mut want: Vec<String> = blocks.iter().map(|s| (*s).to_string()).collect();
                     want.sort();
@@ -1290,7 +2901,11 @@ mod tests {
 
     macro_rules! conformance_file {
         ($name:expr) => {
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/", $name))
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../conformance/",
+                $name
+            ))
         };
     }
 
@@ -1306,6 +2921,178 @@ mod tests {
                 e("NzNat", "s 0", 1),
             ],
         );
+    }
+
+    #[test]
+    fn compact_prefix_iteration_command_stays_one_iter_node() {
+        let mut loaded = load_source(
+            "fmod PREFIX-ITER is
+               sort Nat .
+               op 0 : -> Nat [ctor] .
+               op s : Nat -> Nat [ctor iter] .
+             endfm",
+        )
+        .expect("load prefix iter module");
+        let term = tokenize("s^1000000(0)", &mut loaded.interner);
+        let lm = &mut loaded.modules[0];
+
+        assert_eq!(
+            command_echo(lm, &loaded.interner, &term, false).expect("command echo"),
+            "s^1000000(0)"
+        );
+        let (result, rewrites) =
+            reduce_command(lm, &loaded.interner, &term).expect("reduce compact prefix iteration");
+        assert_eq!(rewrites, 0);
+        assert_eq!(
+            lm.built
+                .engine
+                .sorts()
+                .name(lm.built.engine.sort_of(result)),
+            "Nat"
+        );
+        assert_eq!(
+            crate::pretty::print_raw(&lm.built, &loaded.interner, result),
+            "s^1000000(0)",
+            "round-trip printer must not expand the million-count iter node"
+        );
+        match lm.built.engine.node(result).repr() {
+            tnk_core::dag::NodeRepr::Iter { count, arg } => {
+                assert_eq!(count, "1000000");
+                assert!(matches!(
+                    lm.built.engine.node(arg).repr(),
+                    tnk_core::dag::NodeRepr::App
+                ));
+            }
+            other => panic!("expected one compact iter node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_and_mixfix_iter_notation_follow_overloaded_ditto_syntax() {
+        let mut loaded = load_source(
+            "fmod ITER-SYNTAX is
+               sorts Small Big .
+               subsort Small < Big .
+               op a : -> Small [ctor] .
+               op g : Big -> Big [ctor iter] .
+               op g : Small -> Small [ditto] .
+               op s_ : Big -> Big [ctor iter] .
+               op s_ : Small -> Small [ditto] .
+             endfm",
+        )
+        .expect("load overloaded iter module");
+
+        for (input, echo) in [
+            ("g^1(a)", "g(a)"),
+            ("g^2(a)", "g^2(a)"),
+            ("s_^1(a)", "s a"),
+            ("s_^3(a)", "s_^3(a)"),
+        ] {
+            let term = tokenize(input, &mut loaded.interner);
+            let lm = &mut loaded.modules[0];
+            assert_eq!(
+                command_echo(lm, &loaded.interner, &term, false).expect("iter command echo"),
+                echo,
+                "oracle print for `{input}`"
+            );
+            let (result, rewrites) =
+                reduce_command(lm, &loaded.interner, &term).expect("reduce overloaded iter");
+            assert_eq!(rewrites, 0);
+            assert_eq!(
+                lm.built
+                    .engine
+                    .sorts()
+                    .name(lm.built.engine.sort_of(result)),
+                "Small",
+                "ditto declaration selects the Small sort for `{input}`"
+            );
+        }
+    }
+
+    #[test]
+    fn u03_million_iter_identities_load_and_commands_five_six_match() {
+        let mut loaded =
+            load_source(conformance_file!("subsystems/U03-unification3.maude")).expect("load U03");
+        let targets: Vec<_> = loaded
+            .commands
+            .iter()
+            .skip(4)
+            .take(2)
+            .map(|(module, command)| {
+                let Command::Unify { body, .. } = command else {
+                    panic!("U03 commands 5/6 must be unify commands")
+                };
+                (*module, body.clone())
+            })
+            .collect();
+        assert_eq!(targets.len(), 2);
+
+        let expected = [
+            vec!["X:Small --> #1:Small\nZ:Small --> #1:Small\nY:Big --> g^999999(a)"],
+            vec![
+                "X:Small --> #1:Small\nZ:Small --> #1:Small\nY:Big --> g^999999(a)",
+                "X:Small --> f(#1:Small, g(#2:Small))\nZ:Small --> #1:Small\nY:Big --> #2:Small",
+            ],
+        ];
+
+        for ((module, body), want) in targets.into_iter().zip(expected) {
+            let mut command =
+                unify_command(&mut loaded.modules[module], &mut loaded.interner, &body)
+                    .expect("build U03 unify");
+            assert_eq!(command.echo, "X:Small =? f(g(Y:Big), Z:Small)");
+            assert!(command.names_ok && command.problem.problem_okay());
+
+            let mut solutions = Vec::new();
+            {
+                let mut names = InternerNames(&mut loaded.interner);
+                let mut env = tnk_core::unify::UnifyEnv {
+                    e: &mut loaded.modules[module].built.engine,
+                    names: &mut names,
+                };
+                while let Some(binding) = command.problem.find_next(&mut env) {
+                    solutions.push(binding);
+                }
+            }
+            let got: Vec<_> = solutions
+                .iter()
+                .map(|binding| {
+                    render_unifier(
+                        &loaded.modules[module].built,
+                        &loaded.interner,
+                        &command.var_names,
+                        binding,
+                    )
+                })
+                .collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn iter_comm_normalization_uses_standing_maude_name_order() {
+        let mut loaded = load_source(conformance_file!("subsystems/U-ch13-07-iter-comm.maude"))
+            .expect("load iter-comm fixture");
+        let commands: Vec<_> = loaded
+            .commands
+            .iter()
+            .map(|(module, command)| {
+                let Command::Unify { body, .. } = command else {
+                    panic!("iter-comm fixture contains only unify commands")
+                };
+                (*module, body.clone())
+            })
+            .collect();
+        let expected = [
+            vec!["X:OddNat", "Y:Int"],
+            vec!["X:OddNat", "W:Int", "Z:Int", "Y:Int"],
+            vec!["X:OddNat", "W:Int", "Z:Int", "Y:Int"],
+        ];
+
+        for ((module, body), expected_names) in commands.into_iter().zip(expected) {
+            let command = unify_command(&mut loaded.modules[module], &mut loaded.interner, &body)
+                .expect("build iter-comm unify");
+            assert_eq!(command.var_names, expected_names);
+        }
     }
 
     #[test]
@@ -1373,7 +3160,10 @@ mod tests {
     fn peano_conforms() {
         conform(
             conformance_file!("peano.maude"),
-            &[e("Nat", "s s s s 0", 3), e("Nat", "s s s s s s s s s s s s 0", 21)],
+            &[
+                e("Nat", "s s s s 0", 3),
+                e("Nat", "s s s s s s s s s s s s 0", 21),
+            ],
         );
     }
 
@@ -1381,7 +3171,12 @@ mod tests {
     fn strat_conforms() {
         conform(
             conformance_file!("strat.maude"),
-            &[e("Nat", "s s z", 1), e("Nat", "z", 1), e("Nat", "z", 1), e("Nat", "s s z", 2)],
+            &[
+                e("Nat", "s s z", 1),
+                e("Nat", "z", 1),
+                e("Nat", "z", 1),
+                e("Nat", "s s z", 2),
+            ],
         );
     }
 
@@ -1399,8 +3194,8 @@ mod tests {
                 e("Nat", "s s s z", 3),
                 e("Nat", "s s s z", 4),
                 e("Nat", "s s s s s s s z", 4),
-                e("Nat", "s s s s s s z", 8),         // 2 * 3
-                e("Nat", "s s s s s s s s s z", 13),  // 3 * 3
+                e("Nat", "s s s s s s z", 8),        // 2 * 3
+                e("Nat", "s s s s s s s s s z", 13), // 3 * 3
             ],
         );
     }
@@ -1414,11 +3209,11 @@ mod tests {
         conform(
             conformance_file!("correctness-au-alien.maude"),
             &[
-                e("E", "a b c", 2), // (s s a) b c — peel two successors off the head
-                e("E", "a b c", 1), // a (s b) c   — interior successor untouched
-                e("E", "a b c", 2), // (s a)(s b) c
-                e("E", "a", 1),     // a a         — non-linear collapse
-                e("E", "a", 2),     // a a a
+                e("E", "a b c", 2),     // (s s a) b c — peel two successors off the head
+                e("E", "a b c", 1),     // a (s b) c   — interior successor untouched
+                e("E", "a b c", 2),     // (s a)(s b) c
+                e("E", "a", 1),         // a a         — non-linear collapse
+                e("E", "a", 2),         // a a a
                 e("E", "s (a b) c", 1), // (s a)(s b) c — two aliens, leading pair + residue c
             ],
         );
@@ -1432,11 +3227,11 @@ mod tests {
         conform(
             conformance_file!("correctness-free-alien.maude"),
             &[
-                e("E", "b c", 1),       // f(a b c) — AU alien under free f
-                e("E", "f(b c)", 0),    // f(b c)   — no match (head is not a)
-                e("E", "b ; c", 1),     // g(a ; b ; c) — AC alien under free g
-                e("E", "g(b ; c)", 0),  // g(b ; c)
-                e("E", "c a", 1),       // h(a c, b a) — two aliens, one per argument
+                e("E", "b c", 1),      // f(a b c) — AU alien under free f
+                e("E", "f(b c)", 0),   // f(b c)   — no match (head is not a)
+                e("E", "b ; c", 1),    // g(a ; b ; c) — AC alien under free g
+                e("E", "g(b ; c)", 0), // g(b ; c)
+                e("E", "c a", 1),      // h(a c, b a) — two aliens, one per argument
             ],
         );
     }
@@ -1471,16 +3266,16 @@ mod tests {
                 // AC-MB
                 e("Sym", "a + a", 1),
                 e("E", "a + b", 0),
-                e("Pair", "s a + b", 1),   // alien membership lhs `s M + N` matches modulo AC
+                e("Pair", "s a + b", 1), // alien membership lhs `s M + N` matches modulo AC
                 e("Pair", "s a + s a", 1), // both apply; the tie-break picks Pair
                 // AU-MB
                 e("Lst", "a b c", 1),
                 e("E", "b c", 0),
-                e("Spec", "s a b c", 1),   // alien head `(s M) L` matches modulo AU
+                e("Spec", "s a b c", 1), // alien head `(s M) L` matches modulo AU
                 // S-MB
                 e("Zero", "0", 0),
-                e("NzNat", "s s 0", 0),    // too few successors
-                e("Big", "s s s 0", 1),    // iter/S membership lhs `s s s X`
+                e("NzNat", "s s 0", 0), // too few successors
+                e("Big", "s s s 0", 1), // iter/S membership lhs `s s s X`
                 e("Big", "s s s s 0", 1),
             ],
         );
@@ -1497,7 +3292,7 @@ mod tests {
             conformance_file!("correctness-strat-mb.maude"),
             &[
                 e("WrS", "wrap(mk(e))", 1), // skipped arg refined → overloaded range WrS
-                e("Sml", "mkA", 4),         // both branches refined before selection; discarded one counts
+                e("Sml", "mkA", 4), // both branches refined before selection; discarded one counts
             ],
         );
     }
@@ -1559,9 +3354,9 @@ mod tests {
         conform(
             conformance_file!("correctness-mb-reducible.maude"),
             &[
-                e("Big", "big", 1),  // MB-REDUCIBLE: eq g(a)=big fires; mb g(X):Small never reached
-                e("S", "g(b)", 2),   // MB-REWRITE-CHAIN: g(a)→g(b) [1] then g(b)'s mb [2]
-                e("Big", "big", 1),  // CMB-DIVERGENT: halts at big; the looping cmb condition is unreached
+                e("Big", "big", 1), // MB-REDUCIBLE: eq g(a)=big fires; mb g(X):Small never reached
+                e("S", "g(b)", 2),  // MB-REWRITE-CHAIN: g(a)→g(b) [1] then g(b)'s mb [2]
+                e("Big", "big", 1), // CMB-DIVERGENT: halts at big; the looping cmb condition is unreached
             ],
         );
     }
@@ -1575,15 +3370,15 @@ mod tests {
         conform(
             conformance_file!("correctness-sharing.maude"),
             &[
-                e("P", "< b, b >", 1),       // FREE subject dup: two g(a) -> one node, reduced once
-                e("P", "< c, c >", 2),       // deep shared chain g(g(a))->g(b)->c, once
-                e("P", "< b, b >", 2),       // rhs dup: f(a) [1] + shared g(a) in rhs [2]
-                e("P", "< b, b >", 2),       // triple subject dup: g(a) once [1] + h [2]
-                e("P", "< mkA, mkA >", 1),   // mb on a shared constant: fires once
-                e("L", "b b", 1),            // AU: two equal elements share, reduced once
-                e("L", "b b b", 1),          // AU: three equal elements
-                e("E", "b & b", 1),          // CUI: two equal elements share
-                e("E", "b + b", 1),          // ACU: already merges to multiplicity 2 (unchanged by C7)
+                e("P", "< b, b >", 1), // FREE subject dup: two g(a) -> one node, reduced once
+                e("P", "< c, c >", 2), // deep shared chain g(g(a))->g(b)->c, once
+                e("P", "< b, b >", 2), // rhs dup: f(a) [1] + shared g(a) in rhs [2]
+                e("P", "< b, b >", 2), // triple subject dup: g(a) once [1] + h [2]
+                e("P", "< mkA, mkA >", 1), // mb on a shared constant: fires once
+                e("L", "b b", 1),      // AU: two equal elements share, reduced once
+                e("L", "b b b", 1),    // AU: three equal elements
+                e("E", "b & b", 1),    // CUI: two equal elements share
+                e("E", "b + b", 1),    // ACU: already merges to multiplicity 2 (unchanged by C7)
             ],
         );
     }
@@ -1629,13 +3424,22 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
         for (idx, ((m, term), exp)) in cmds.iter().zip(expected).enumerate() {
-            let Expect::Reduce { sort: esort, term: eterm, rewrites } = exp else {
+            let Expect::Reduce {
+                sort: esort,
+                term: eterm,
+                rewrites,
+            } = exp
+            else {
                 panic!("conform_render handles only reduce expectations");
             };
             let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
                 .unwrap_or_else(|err| panic!("command {idx}: {err}"));
             let built = &loaded.modules[*m].built;
-            let sort = built.engine.sorts().name(built.engine.sort_of(got)).to_string();
+            let sort = built
+                .engine
+                .sorts()
+                .name(built.engine.sort_of(got))
+                .to_string();
             assert_eq!(sort, *esort, "command {idx} sort");
             assert_eq!(rw, *rewrites, "command {idx} rewrites");
             let printed = crate::pretty::print_pretty(built, &loaded.interner, got, false);
@@ -1860,7 +3664,10 @@ mod tests {
     fn format_matchers_layout() {
         assert_eq!(format_matchers(&[]), "No match.");
         assert_eq!(
-            format_matchers(&["X --> a\nY --> b".to_string(), "X --> b\nY --> a".to_string()]),
+            format_matchers(&[
+                "X --> a\nY --> b".to_string(),
+                "X --> b\nY --> a".to_string()
+            ]),
             "Matcher 1\nX --> a\nY --> b\n\nMatcher 2\nX --> b\nY --> a"
         );
     }
@@ -1877,6 +3684,39 @@ mod tests {
                 e("E", "c", 1), // red f(b, a)  — matching modulo comm
                 e("E", "a", 0), // red g(a, a)  — idempotence collapses at construction
                 e("E", "a", 0), // red h(a, e)  — identity collapses at construction
+            ],
+        );
+    }
+
+    /// General ground identities normalize identically in ACU, AU, CUI, and one-sided AU theories.
+    #[test]
+    fn compound_identities_conform_across_theories() {
+        conform(
+            "fmod ID-THEORIES is
+               sort S .
+               ops a b : -> S [ctor] .
+               op g : S -> S [ctor] .
+               op _*_ : S S -> S [assoc comm id: g(a)] .
+               op cat : S S -> S [assoc id: g(a)] .
+               op pair : S S -> S [comm id: g(a)] .
+               op lefty : S S -> S [assoc left id: g(a)] .
+               op righty : S S -> S [assoc right id: g(a)] .
+             endfm
+             red g(a) * b .
+             red cat(g(a), b) .
+             red pair(g(a), b) .
+             red lefty(g(a), b) .
+             red lefty(b, g(a)) .
+             red righty(b, g(a)) .
+             red righty(g(a), b) .",
+            &[
+                e("S", "b", 0),
+                e("S", "b", 0),
+                e("S", "b", 0),
+                e("S", "b", 0),
+                e("S", "lefty(b, g(a))", 0),
+                e("S", "b", 0),
+                e("S", "righty(g(a), b)", 0),
             ],
         );
     }
@@ -1904,6 +3744,58 @@ mod tests {
         );
     }
 
+    /// Declared command variables keep their base names while the solver reorders their slots by
+    /// canonical DAG traversal. The colon-token ids occur in source order here, deliberately opposite
+    /// the declared base-name order.
+    #[test]
+    fn unify_normalization_uses_declared_variable_base_names() {
+        let src = r#"
+fmod BASE-NAME-ORDER is
+  sort S .
+  op f : S S -> S [assoc comm] .
+  vars Z X Y : S .
+endfm
+unify f(X:S, X:S, Y:S, Y:S, Z:S) =? f(X:S, Y:S, Z:S) .
+"#;
+        let mut loaded = load_source(src).expect("load source");
+        let (module, command) = loaded.commands.pop().expect("unify command");
+        let body = match command {
+            Command::Unify { body, .. } => body,
+            _ => panic!("expected unify command"),
+        };
+        let command = unify_command(&mut loaded.modules[module], &mut loaded.interner, &body)
+            .expect("build unify");
+        assert_eq!(command.var_names, ["Z", "X", "Y"]);
+    }
+
+    #[test]
+    fn retains_nonexec_and_bare_lhs_narrowing_rules() {
+        let loaded = load_source(
+            r#"
+mod NARROW-METADATA is
+  sort S .
+  op s : S -> S .
+  vars X Y : S .
+  rl [step] : s(X) => X [narrowing] .
+  rl [extra] : X => Y [nonexec narrowing] .
+  crl [bad] : s(X) => X if X = X [narrowing] .
+endm
+"#,
+        )
+        .expect("load narrowing metadata");
+        let module = &loaded.modules[0].built;
+        let rules = module.engine.narrowing_rules();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].label.as_deref(), Some("step"));
+        assert!(!rules[0].nonexec);
+        assert_eq!(rules[1].label.as_deref(), Some("extra"));
+        assert!(rules[1].nonexec);
+        assert!(matches!(rules[1].lhs, Term::Var(_)));
+        assert_eq!(rules[1].variable_names, ["X", "Y"]);
+        assert_eq!(module.rl_traces.len(), 1);
+        assert!(module.rl_traces[0].narrowing);
+    }
+
     /// The whole-conformance-suite differential gate (B4.5e, the last B4 deliverable). EVERY conformance
     /// module loads, EVERY command runs, and every reduced result **round-trips** (`parse∘print_raw =
     /// id`). The per-module `*_conforms` tests pin exact sorts / counts / values against the reference
@@ -1918,7 +3810,11 @@ mod tests {
         // `peano` round-trips the same Peano-Fibonacci theory at a small numeral.
         let modules: &[(&str, &str, bool)] = &[
             ("acu-match", conformance_file!("acu-match.maude"), true),
-            ("acu-overload", conformance_file!("acu-overload.maude"), true),
+            (
+                "acu-overload",
+                conformance_file!("acu-overload.maude"),
+                true,
+            ),
             ("acu-reduce", conformance_file!("acu-reduce.maude"), true),
             ("au", conformance_file!("au.maude"), true),
             ("bool", conformance_file!("bool.maude"), true),
@@ -1947,7 +3843,12 @@ mod tests {
                 .map(|(m, c)| {
                     let cmd = match c {
                         Command::Reduce { term, .. } => Cmd::Reduce(term.clone()),
-                        Command::Match { pattern, subject, xmatch, .. } => Cmd::Match {
+                        Command::Match {
+                            pattern,
+                            subject,
+                            xmatch,
+                            ..
+                        } => Cmd::Match {
                             pattern: pattern.clone(),
                             subject: subject.clone(),
                             xmatch: *xmatch,
@@ -1961,14 +3862,18 @@ mod tests {
             for (idx, (m, cmd)) in cmds.iter().enumerate() {
                 match cmd {
                     Cmd::Reduce(term) => {
-                        let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
-                            .unwrap_or_else(|e| panic!("{name} cmd {idx}: reduce: {e}"));
+                        let (result, _) =
+                            reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                                .unwrap_or_else(|e| panic!("{name} cmd {idx}: reduce: {e}"));
                         if round_trip {
-                            let printed = print_raw(&loaded.modules[*m].built, &loaded.interner, result);
+                            let printed =
+                                print_raw(&loaded.modules[*m].built, &loaded.interner, result);
                             let toks = tokenize(&printed, &mut loaded.interner);
                             let (reparsed, _) =
                                 reduce_command(&mut loaded.modules[*m], &loaded.interner, &toks)
-                                    .unwrap_or_else(|e| panic!("{name} cmd {idx} reparse `{printed}`: {e}"));
+                                    .unwrap_or_else(|e| {
+                                        panic!("{name} cmd {idx} reparse `{printed}`: {e}")
+                                    });
                             let eng = &loaded.modules[*m].built.engine;
                             assert!(
                                 eng.deep_equal(result, reparsed),
@@ -1976,9 +3881,19 @@ mod tests {
                             );
                         }
                     }
-                    Cmd::Match { pattern, subject, xmatch } => {
-                        match_command(&mut loaded.modules[*m], &loaded.interner, pattern, subject, *xmatch)
-                            .unwrap_or_else(|e| panic!("{name} cmd {idx}: match: {e}"));
+                    Cmd::Match {
+                        pattern,
+                        subject,
+                        xmatch,
+                    } => {
+                        match_command(
+                            &mut loaded.modules[*m],
+                            &loaded.interner,
+                            pattern,
+                            subject,
+                            *xmatch,
+                        )
+                        .unwrap_or_else(|e| panic!("{name} cmd {idx}: match: {e}"));
                     }
                 }
             }

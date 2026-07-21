@@ -13,13 +13,10 @@ fmod FOO is
 endfm
 
 unify f(X, Y) =? f(U, V) .
-variant unify f(X, Y) =? f(U, V) .
 
 unify f(X, Y) =? X .
-variant unify f(X, Y) =? X .
 
 unify f(X, Y) =? Y .
-variant unify f(X, Y) =? Y .
 
 *** Ur theory
 
@@ -32,13 +29,10 @@ fmod FOO2 is
 endfm
 
 unify f(X, Y) =? f(U, V) .
-variant unify f(X, Y) =? f(U, V) .
 
 unify f(X, Y) =? X .
-variant unify f(X, Y) =? X .
 
 unify f(X, Y) =? Y .
-variant unify f(X, Y) =? Y .
 
 *** U theory
 
@@ -51,13 +45,10 @@ fmod FOO3 is
 endfm
 
 unify f(X, Y) =? f(U, V) .
-variant unify f(X, Y) =? f(U, V) .
 
 unify f(X, Y) =? X .
-variant unify f(X, Y) =? X .
 
 unify f(X, Y) =? Y .
-variant unify f(X, Y) =? Y .
 
 *** CU theory
 
@@ -70,10 +61,7 @@ fmod FOO4 is
 endfm
 
 unify f(X, Y) =? f(U, V) .
-variant unify f(X, Y) =? f(U, V) .
 
 unify f(X, Y) =? X .
-variant unify f(X, Y) =? X .
 
 unify f(X, Y) =? Y .
-variant unify f(X, Y) =? Y .

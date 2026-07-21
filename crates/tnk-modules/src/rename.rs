@@ -11,8 +11,8 @@
 //! attributes (the prelude's `op _,_ to _;_ [prec 43]`).
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::{split_mixfix, tokenize, Frag, Interner, Token};
-use tnk_frontend::rename_terms::OpRenamer;
+use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
+use tnk_frontend::rename_terms::{OpRenamer, ReconTarget, ViewOpSubst};
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement};
 
 use crate::flatten::FlatDecls;
@@ -44,7 +44,12 @@ pub fn apply_renaming(
             RenameItem::Sort { from, to } => {
                 sort_map.insert(from.clone(), to.clone());
             }
-            RenameItem::Op { from, to, dom_range, attrs } => {
+            RenameItem::Op {
+                from,
+                to,
+                dom_range,
+                attrs,
+            } => {
                 op_renames.push(OpRenameSpec {
                     from: from.clone(),
                     to: to.clone(),
@@ -58,14 +63,25 @@ pub fn apply_renaming(
         }
     }
 
-    // Single-token, non-disambiguated op renames (constants/prefix ops) substitute textually everywhere; a
-    // mixfix rename, or any arity-disambiguated rename (one overload of a shared name), needs grammar-aware
-    // term rewriting — only the parser can tell an operator fragment from an argument separator, and only
-    // the parse arity can pick the right overload. Build that renamer over the **pre-rename** declarations.
+    // Every non-disambiguated operator map is reconstructed structurally from the source parse. This is
+    // necessary when fixity changes (`pair` → `_+_`): swapping the prefix token in `pair(a,b)` would yield
+    // the invalid `+(a,b)`. Signature-disambiguated maps retain the arity-aware surgical renamer.
+    let structural_maps: Vec<(String, ReconTarget)> = op_renames
+        .iter()
+        .filter(|s| s.dom_range.is_none())
+        .map(|s| (s.from.clone(), ReconTarget::Op(s.to.clone())))
+        .collect();
+    let structural = ViewOpSubst::new(&premodule_of(&d), &structural_maps, interner)?;
     let grammar_renames: Vec<(String, Option<usize>, String)> = op_renames
         .iter()
-        .filter(|s| s.dom_range.is_some() || !is_single_token(&s.from, interner))
-        .map(|s| (s.from.clone(), s.dom_range.as_ref().map(|(d, _)| d.len()), s.to.clone()))
+        .filter(|s| s.dom_range.is_some())
+        .map(|s| {
+            (
+                s.from.clone(),
+                s.dom_range.as_ref().map(|(d, _)| d.len()),
+                s.to.clone(),
+            )
+        })
         .collect();
     let renamer = OpRenamer::new(&premodule_of(&d), &grammar_renames, interner)?;
 
@@ -97,7 +113,9 @@ pub fn apply_renaming(
         // signature equals the spec's; a plain spec matches every overload of the name.
         if let Some(spec) = op_renames.iter().find(|s| {
             s.from == canon
-                && s.dom_range.as_ref().is_none_or(|(d, r)| *d == orig_domain && *r == orig_range)
+                && s.dom_range
+                    .as_ref()
+                    .is_none_or(|(d, r)| *d == orig_domain && *r == orig_range)
         }) {
             // Replace the op's name wholesale with the target's token vector. `tokenize` reproduces the
             // canonical spelling — one token for a hole-bearing name with no lexer-punctuation (`_plus_`,
@@ -106,10 +124,17 @@ pub fn apply_renaming(
             op.name = tokenize(&spec.to, interner);
             apply_attr_override(&mut op.attrs, &spec.attrs);
         }
-        // The `id:` identity element is a constant — rename it like any other (single-token op / sort).
+        // Identity attributes are arbitrary ground terms: rewrite their operator occurrences through
+        // the same grammar-aware path as statements, then apply textual single-op/sort renames.
         if let Some(idb) = &mut op.attrs.id {
+            if let Some(r) = structural.as_ref() {
+                *idb = r.rewrite(idb, interner);
+            }
+            if let Some(r) = renamer.as_ref() {
+                *idb = r.rewrite(idb, interner);
+            }
             subst_tokens(idb, &single_op_map, interner);
-            subst_tokens(idb, &sort_map, interner);
+            subst_sort_tokens(idb, &sort_map, interner);
         }
         // `special (op-hook …)` signatures reference OTHER ops by name (build_sig resolves hooks by
         // name), so a renamed referenced op must be tracked — INT * (op s_ : Nat -> NzNat to $succ)
@@ -121,12 +146,17 @@ pub fn apply_renaming(
                 let Some(colon) = toks.iter().position(|t| interner.resolve(t.sym) == ":") else {
                     continue;
                 };
-                let name_canon: String =
-                    toks[..colon].iter().map(|t| interner.resolve(t.sym)).collect();
+                let name_canon: String = toks[..colon]
+                    .iter()
+                    .map(|t| interner.resolve(t.sym))
+                    .collect();
                 let arrow = toks.iter().position(|t| interner.resolve(t.sym) == "~>");
                 let (dom, rng): (Vec<String>, Option<String>) = match arrow {
                     Some(a) => (
-                        toks[colon + 1..a].iter().map(|t| interner.resolve(t.sym).to_string()).collect(),
+                        toks[colon + 1..a]
+                            .iter()
+                            .map(|t| interner.resolve(t.sym).to_string())
+                            .collect(),
                         toks.get(a + 1).map(|t| interner.resolve(t.sym).to_string()),
                     ),
                     None => (Vec::new(), None),
@@ -141,11 +171,11 @@ pub fn apply_renaming(
                     new_toks.extend_from_slice(&toks[colon..]);
                     *toks = new_toks;
                 }
-                subst_tokens(toks, &sort_map, interner);
+                subst_sort_tokens(toks, &sort_map, interner);
             }
             for (_purpose, toks) in &mut sp.term_hooks {
                 subst_tokens(toks, &single_op_map, interner);
-                subst_tokens(toks, &sort_map, interner);
+                subst_sort_tokens(toks, &sort_map, interner);
             }
         }
     }
@@ -176,28 +206,80 @@ pub fn apply_renaming(
         })
         .collect();
     let lparen = tokenize("(", interner);
+    for op in &mut d.ops {
+        if let Some(idb) = &mut op.attrs.id {
+            *idb = qualify_constants(idb, &const_qual, &lparen, interner);
+        }
+    }
 
     // Statement bubbles: op renames (mixfix grammar-aware, then textual sorts/single ops), then constant
     // qualification.
     for st in &mut d.statements {
         match st {
             Statement::Eq { lhs, rhs, cond, .. } => {
-                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
-                rewrite_term(rhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
+                rewrite_term(
+                    lhs,
+                    structural.as_ref(),
+                    renamer.as_ref(),
+                    &sort_map,
+                    &single_op_map,
+                    &const_qual,
+                    &lparen,
+                    interner,
+                );
+                rewrite_term(
+                    rhs,
+                    structural.as_ref(),
+                    renamer.as_ref(),
+                    &sort_map,
+                    &single_op_map,
+                    &const_qual,
+                    &lparen,
+                    interner,
+                );
                 if let Some(c) = cond {
                     rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
             }
-            Statement::Mb { lhs, sort, cond, .. } => {
-                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
-                subst_tokens(sort, &sort_map, interner);
+            Statement::Mb {
+                lhs, sort, cond, ..
+            } => {
+                rewrite_term(
+                    lhs,
+                    structural.as_ref(),
+                    renamer.as_ref(),
+                    &sort_map,
+                    &single_op_map,
+                    &const_qual,
+                    &lparen,
+                    interner,
+                );
+                subst_sort_tokens(sort, &sort_map, interner);
                 if let Some(c) = cond {
                     rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
             }
             Statement::Rule { lhs, rhs, cond, .. } => {
-                rewrite_term(lhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
-                rewrite_term(rhs, renamer.as_ref(), &sort_map, &single_op_map, &const_qual, &lparen, interner);
+                rewrite_term(
+                    lhs,
+                    structural.as_ref(),
+                    renamer.as_ref(),
+                    &sort_map,
+                    &single_op_map,
+                    &const_qual,
+                    &lparen,
+                    interner,
+                );
+                rewrite_term(
+                    rhs,
+                    structural.as_ref(),
+                    renamer.as_ref(),
+                    &sort_map,
+                    &single_op_map,
+                    &const_qual,
+                    &lparen,
+                    interner,
+                );
                 if let Some(c) = cond {
                     rewrite_cond(c, &sort_map, &single_op_map, &const_qual, &lparen, interner);
                 }
@@ -234,8 +316,13 @@ fn qualify_constants(
         return b.to_vec();
     }
     let mut out = Vec::with_capacity(b.len());
-    for t in b {
-        if let Some(suffix) = const_qual.get(interner.resolve(t.sym)) {
+    for (index, t) in b.iter().enumerate() {
+        let already_qualified = index > 0
+            && index + 2 < b.len()
+            && interner.resolve(b[index - 1].sym) == "("
+            && interner.resolve(b[index + 1].sym) == ")"
+            && interner.resolve(b[index + 2].sym).starts_with('.');
+        if !already_qualified && let Some(suffix) = const_qual.get(interner.resolve(t.sym)) {
             out.extend_from_slice(lparen);
             out.push(*t);
             out.extend_from_slice(suffix);
@@ -251,6 +338,7 @@ fn qualify_constants(
 #[allow(clippy::too_many_arguments)]
 fn rewrite_term(
     b: &mut Vec<Token>,
+    structural: Option<&ViewOpSubst>,
     renamer: Option<&OpRenamer>,
     sort_map: &HashMap<String, String>,
     single_op_map: &HashMap<String, String>,
@@ -258,10 +346,13 @@ fn rewrite_term(
     lparen: &[Token],
     interner: &mut Interner,
 ) {
+    if let Some(r) = structural {
+        *b = r.rewrite(b, interner);
+    }
     if let Some(r) = renamer {
         *b = r.rewrite(b, interner);
     }
-    subst_tokens(b, sort_map, interner);
+    subst_sort_tokens(b, sort_map, interner);
     subst_tokens(b, single_op_map, interner);
     *b = qualify_constants(b, const_qual, lparen, interner);
 }
@@ -276,7 +367,7 @@ fn rewrite_cond(
     lparen: &[Token],
     interner: &mut Interner,
 ) {
-    subst_tokens(b, sort_map, interner);
+    subst_sort_tokens(b, sort_map, interner);
     subst_tokens(b, single_op_map, interner);
     *b = qualify_constants(b, const_qual, lparen, interner);
 }
@@ -339,6 +430,17 @@ fn subst_tokens(bubble: &mut [Token], map: &HashMap<String, String>, interner: &
         let text = interner.resolve(t.sym).to_string();
         if let Some(to) = map.get(&text) {
             t.sym = interner.intern(to);
+        } else if let Some((base, count)) = text.rsplit_once('^')
+            && !base.is_empty()
+            && !count.is_empty()
+            && count.bytes().all(|b| b.is_ascii_digit())
+            && let Some(to) = map.get(base)
+        {
+            // An iter application is one lexical token (`g^1000000`), but the renamed symbol is its
+            // `g` prefix. Preserve the scalar count while re-rooting the identity/statement at the target
+            // operator; treating the whole token as a stale source name makes copied compact identities
+            // fail to parse after `op g to h`.
+            t.sym = interner.intern(&format!("{to}^{count}"));
         } else if let Some((name, sort)) = text.rsplit_once(':')
             && !name.is_empty()
             && let Some(to) = map.get(sort)
@@ -351,21 +453,124 @@ fn subst_tokens(bubble: &mut [Token], map: &HashMap<String, String>, interner: &
     }
 }
 
+/// Replace sort names in a token bubble, including structured spellings split by the lexer
+/// (`Vector{Int0}` -> `Vector`, `{`, `Int0`, `}`), dotted sort qualifiers, and colon variables.
+fn subst_sort_tokens(
+    bubble: &mut Vec<Token>,
+    map: &HashMap<String, String>,
+    interner: &mut Interner,
+) {
+    struct Mapping {
+        source: Vec<Sym>,
+        target: Vec<Token>,
+        source_name: String,
+        target_name: String,
+    }
+
+    let mut mappings = Vec::with_capacity(map.len() * 2);
+    for (from, to) in map {
+        for dotted in [false, true] {
+            let source_text = if dotted {
+                format!(".{from}")
+            } else {
+                from.clone()
+            };
+            let target_text = if dotted { format!(".{to}") } else { to.clone() };
+            mappings.push(Mapping {
+                source: tokenize(&source_text, interner)
+                    .into_iter()
+                    .map(|token| token.sym)
+                    .collect(),
+                target: tokenize(&target_text, interner),
+                source_name: from.clone(),
+                target_name: to.clone(),
+            });
+        }
+    }
+    mappings.sort_by(|left, right| {
+        right
+            .source
+            .len()
+            .cmp(&left.source.len())
+            .then_with(|| left.source_name.cmp(&right.source_name))
+    });
+
+    let mut index = 0;
+    while index < bubble.len() {
+        let exact = mappings.iter().find(|mapping| {
+            index + mapping.source.len() <= bubble.len()
+                && bubble[index..index + mapping.source.len()]
+                    .iter()
+                    .map(|token| token.sym)
+                    .eq(mapping.source.iter().copied())
+        });
+        let colon = if exact.is_none() {
+            let text = interner.resolve(bubble[index].sym);
+            text.split_once(':').and_then(|(name, first)| {
+                mappings.iter().find_map(|mapping| {
+                    let source_first = mapping.source.first().map(|&sym| interner.resolve(sym))?;
+                    let rest = &mapping.source[1..];
+                    (name.len() + first.len() + 1 == text.len()
+                        && first == source_first
+                        && index + 1 + rest.len() <= bubble.len()
+                        && bubble[index + 1..index + 1 + rest.len()]
+                            .iter()
+                            .map(|token| token.sym)
+                            .eq(rest.iter().copied()))
+                    .then(|| (name.to_string(), mapping))
+                })
+            })
+        } else {
+            None
+        };
+
+        let (consumed, mut replacement) = if let Some(mapping) = exact {
+            (mapping.source.len(), mapping.target.clone())
+        } else if let Some((name, mapping)) = colon {
+            (
+                mapping.source.len(),
+                tokenize(&format!("{name}:{}", mapping.target_name), interner),
+            )
+        } else {
+            index += 1;
+            continue;
+        };
+        let line = bubble[index].line;
+        for token in &mut replacement {
+            token.line = line;
+        }
+        let replacement_len = replacement.len();
+        bubble.splice(index..index + consumed, replacement);
+        index += replacement_len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::flatten::FlatDecls;
+    use tnk_frontend::surface::parser::Parser;
 
     fn empty() -> FlatDecls {
-        FlatDecls { sorts: vec![], subsorts: vec![], ops: vec![], vars: vec![], statements: vec![] }
+        FlatDecls {
+            sorts: vec![],
+            subsorts: vec![],
+            ops: vec![],
+            vars: vec![],
+            statements: vec![],
+        }
     }
 
     /// A single-token op rename (a constant / prefix op) needs no grammar and applies textually.
     #[test]
     fn single_token_op_rename_ok() {
         let mut i = Interner::new();
-        let single =
-            [RenameItem::Op { from: "f".into(), to: "g".into(), dom_range: None, attrs: Attrs::default() }];
+        let single = [RenameItem::Op {
+            from: "f".into(),
+            to: "g".into(),
+            dom_range: None,
+            attrs: Attrs::default(),
+        }];
         assert!(apply_renaming(empty(), &single, &mut i).is_ok());
     }
 
@@ -375,9 +580,70 @@ mod tests {
         let mut i = Interner::new();
         let mut d = empty();
         d.sorts = vec!["Elt".into()];
-        let renamed =
-            apply_renaming(d, &[RenameItem::Sort { from: "Elt".into(), to: "Item".into() }], &mut i)
-                .expect("rename");
+        let renamed = apply_renaming(
+            d,
+            &[RenameItem::Sort {
+                from: "Elt".into(),
+                to: "Item".into(),
+            }],
+            &mut i,
+        )
+        .expect("rename");
         assert_eq!(renamed.sorts, ["Item"]);
+    }
+
+    #[test]
+    fn compound_identity_reconstructs_across_fixity_and_iter_renames() {
+        let mut i = Interner::new();
+        let tokens = tokenize(
+            "fmod R is sort S . ops a b : -> S [ctor] . op g : S -> S [ctor iter] . \
+             op pair : S S -> S [ctor] . \
+             op join : S S -> S [assoc id: pair(g^1000000(a),b)] . endfm",
+            &mut i,
+        );
+        let pm = Parser::new(&tokens, &i)
+            .parse_source()
+            .expect("parse")
+            .modules
+            .remove(0);
+        let d = FlatDecls {
+            sorts: pm.sorts,
+            subsorts: pm.subsorts,
+            ops: pm.ops,
+            vars: pm.vars,
+            statements: pm.statements,
+        };
+        let op = |from: &str, to: &str| RenameItem::Op {
+            from: from.into(),
+            to: to.into(),
+            dom_range: None,
+            attrs: Attrs::default(),
+        };
+        let renamed = apply_renaming(
+            d,
+            &[
+                RenameItem::Sort {
+                    from: "S".into(),
+                    to: "T".into(),
+                },
+                op("a", "x"),
+                op("b", "y"),
+                op("g", "h"),
+                op("pair", "duo"),
+                op("join", "merge"),
+            ],
+            &mut i,
+        )
+        .expect("rename");
+        let join = renamed
+            .ops
+            .iter()
+            .find(|op| op.name.iter().map(|t| i.resolve(t.sym)).collect::<String>() == "merge")
+            .expect("join");
+        let identity = join.attrs.id.as_ref().expect("identity");
+        let text: String = identity.iter().map(|t| i.resolve(t.sym)).collect();
+        assert_eq!(text, "duo(h^1000000((x).T),(y).T)");
+        tnk_frontend::load::build_loaded_module(&premodule_of(&renamed), &mut i)
+            .expect("renamed compound identity builds");
     }
 }

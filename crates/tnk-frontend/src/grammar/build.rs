@@ -6,12 +6,12 @@
 //! productions** (per operator: constants, prefix/assoc-prefix forms, mixfix forms, the successor
 //! numeral). Order is observable (it decides the first parse on ambiguity), so it is preserved.
 //!
-//! Scope (B4.3, the B4.4 milestone): the productions the `{iter,bool,nat,int}` modules need. Deferred to
-//! B4.5 (documented at each site): the redundant prefix form for *mixfix* operators (`_+_(a,b)`); the
-//! `f^n(t)` iter-token form; `SMALL_NEG`/`RATIONAL` literal forms; sort disambiguation (`(t).Sort`),
-//! colon variables (`X:Sort`), and on-the-fly (undeclared) variables; structured/parameterized sorts.
+//! Iter-symbol productions cover both genuine prefix names (`g^n(t)`) and canonical mixfix names
+//! (`s_^n(t)`), alongside built-in literal, sort-disambiguation, colon-variable, and structured-sort
+//! productions. The redundant ordinary prefix form for a mixfix operator (`_+_(a,b)`) remains outside
+//! this builder's current surface.
 
-use super::{Action, GSym, Grammar, Nt, NtType, Production, Terminal, ANY, PREFIX_GATHER};
+use super::{ANY, Action, GSym, Grammar, Nt, NtType, PREFIX_GATHER, Production, Terminal};
 use crate::lex::{Frag, Interner};
 use crate::sig::syntax::BuiltModule;
 use tnk_core::sort::{KindId, SortId, Sorts};
@@ -77,7 +77,14 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
         }
 
         // `TERM ::= <FooTerm>` — lift any kind's term to the universal start symbol.
-        push(&mut g, Nt::Term, vec![GSym::N(term_nt)], 0, vec![ANY], Action::PassThru);
+        push(
+            &mut g,
+            Nt::Term,
+            vec![GSym::N(term_nt)],
+            0,
+            vec![ANY],
+            Action::PassThru,
+        );
 
         // Parentheses: `<FooTerm> ::= ( <FooTerm> )`.
         push(
@@ -124,7 +131,14 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
     for (name, sort) in &m.vars {
         let nt = Nt::Comp(sorts.kind_of(*sort), NtType::Term);
         let tok = Terminal::Tok(interner.intern(name));
-        push(&mut g, nt, vec![GSym::T(tok)], 0, vec![], Action::MakeVariable(*sort));
+        push(
+            &mut g,
+            nt,
+            vec![GSym::T(tok)],
+            0,
+            vec![],
+            Action::MakeVariable(*sort),
+        );
     }
 
     // On-the-fly variable productions: `<FooTerm> ::= name:Foo` for every sort (Maude's colon-variable
@@ -135,14 +149,28 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
     for (sort_name, sort_id) in sort_names {
         let nt = Nt::Comp(sorts.kind_of(sort_id), NtType::Term);
         let name_sym = interner.intern(sort_name);
-        push(&mut g, nt, vec![GSym::T(Terminal::ColonVar(name_sym))], 0, vec![], Action::MakeVariable(sort_id));
+        push(
+            &mut g,
+            nt,
+            vec![GSym::T(Terminal::ColonVar(name_sym))],
+            0,
+            vec![],
+            Action::MakeVariable(sort_id),
+        );
         // The **kind** colon-variable `name:[S]` — an error-sort (kind-level) on-the-fly variable
         // (`var B : [Bool]` flattens to `B:[Bool]`; also a user-typed `X:[Foo]`). `[S]` resolves to S's
         // component's error sort, into that component's term NT. Any sort of a multi-sort kind spells the
         // same kind (`[Zero]` = `[Nat]`); the distinct tokens each get a production to the one error sort.
         let err = sorts.error_sort(sorts.kind_of(sort_id));
         let kind_sym = interner.intern(&format!("[{sort_name}]"));
-        push(&mut g, nt, vec![GSym::T(Terminal::ColonVar(kind_sym))], 0, vec![], Action::MakeVariable(err));
+        push(
+            &mut g,
+            nt,
+            vec![GSym::T(Terminal::ColonVar(kind_sym))],
+            0,
+            vec![],
+            Action::MakeVariable(err),
+        );
     }
 
     // ---- symbol productions (per operator, in declaration order) ----
@@ -209,13 +237,27 @@ fn symbol_productions(
 
         // A successor symbol additionally accepts a decimal numeral: `<rangeTerm> ::= SMALL_NAT`.
         if m.nat_succ == Some(sym) {
-            push(g, range_nt, vec![GSym::T(Terminal::SmallNat)], 0, vec![], Action::MakeNatural(sym));
+            push(
+                g,
+                range_nt,
+                vec![GSym::T(Terminal::SmallNat)],
+                0,
+                vec![],
+                Action::MakeNatural(sym),
+            );
         }
         // A minus symbol additionally accepts a negative numeral: `<rangeTerm> ::= SMALL_NEG` (Maude's
         // `MAKE_INTEGER`). `-7` is one `SMALL_NEG` token; `- 7` and `5 - 7` keep `-` as the `-_`/`_-_`
         // operator token, so prefix negation and binary subtraction are unaffected.
         if m.minus_sym == Some(sym) {
-            push(g, range_nt, vec![GSym::T(Terminal::SmallNeg)], 0, vec![], Action::MakeInteger(sym));
+            push(
+                g,
+                range_nt,
+                vec![GSym::T(Terminal::SmallNeg)],
+                0,
+                vec![],
+                Action::MakeInteger(sym),
+            );
         }
         // A division symbol additionally accepts a glued rational literal: `<rangeTerm> ::= RATIONAL`
         // (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`). A negative numerator needs the
@@ -228,7 +270,10 @@ fn symbol_productions(
                     vec![GSym::T(Terminal::Rational)],
                     0,
                     vec![],
-                    Action::MakeRational { division: sym, minus },
+                    Action::MakeRational {
+                        division: sym,
+                        minus,
+                    },
                 );
             }
         }
@@ -240,7 +285,12 @@ fn symbol_productions(
             push(
                 g,
                 range_nt,
-                vec![GSym::T(Terminal::IterSymbol(name)), GSym::T(lp), arg_nt(0), GSym::T(rp)],
+                vec![
+                    GSym::T(Terminal::IterSymbol(name)),
+                    GSym::T(lp),
+                    arg_nt(0),
+                    GSym::T(rp),
+                ],
                 0,
                 vec![PREFIX_GATHER],
                 Action::MakeIter(sym),
@@ -263,7 +313,10 @@ fn symbol_productions(
         .collect();
     if nr_args == 0 {
         // A single-token constant may be a built-in literal terminal (the string/qid/float pseudo-ctor).
-        if let Some((term, action)) = (name_toks.len() == 1).then(|| literal_terminal_for(m, sym)).flatten() {
+        if let Some((term, action)) = (name_toks.len() == 1)
+            .then(|| literal_terminal_for(m, sym))
+            .flatten()
+        {
             push(g, range_nt, vec![GSym::T(term)], 0, vec![], action);
         } else {
             push(g, range_nt, name_toks, 0, vec![], Action::MakeTerm(sym));
@@ -276,7 +329,14 @@ fn symbol_productions(
         let assoc_nt = Nt::Comp(sorts.kind_of(syn.domain[0]), NtType::AssocList);
         let mut rhs = name_toks;
         rhs.extend([GSym::T(lp), GSym::N(assoc_nt), GSym::T(rp)]);
-        push(g, range_nt, rhs, 0, vec![PREFIX_GATHER], Action::MakeTerm(sym));
+        push(
+            g,
+            range_nt,
+            rhs,
+            0,
+            vec![PREFIX_GATHER],
+            Action::MakeTerm(sym),
+        );
     } else {
         let mut rhs = name_toks;
         rhs.push(GSym::T(lp));
@@ -287,6 +347,26 @@ fn symbol_productions(
             rhs.push(GSym::T(if j + 1 == nr_args { rp } else { comma }));
         }
         push(g, range_nt, rhs, 0, gather, Action::MakeTerm(sym));
+    }
+    // A genuine prefix `iter` operator additionally accepts its compact token form:
+    // `<rangeTerm> ::= f^count ( <argTerm> )`.  Mixfix iter operators get the same production in the
+    // branch above; keeping this beside the ordinary `f(arg)` production preserves that spelling.
+    if syn.iter && nr_args == 1 {
+        let name_str = glued_name(&syn.frags, interner);
+        let name = interner.intern(&name_str);
+        push(
+            g,
+            range_nt,
+            vec![
+                GSym::T(Terminal::IterSymbol(name)),
+                GSym::T(lp),
+                arg_nt(0),
+                GSym::T(rp),
+            ],
+            0,
+            vec![PREFIX_GATHER],
+            Action::MakeIter(sym),
+        );
     }
 }
 
@@ -311,7 +391,13 @@ fn push(g: &mut Grammar, lhs: Nt, rhs: Vec<GSym>, prec: u32, gather: Vec<u32>, a
         rhs.iter().filter(|s| s.is_nonterminal()).count(),
         "gather must have one bound per nonterminal: lhs={lhs:?} rhs={rhs:?}"
     );
-    g.productions.push(Production { lhs, rhs, prec, gather, action });
+    g.productions.push(Production {
+        lhs,
+        rhs,
+        prec,
+        gather,
+        action,
+    });
 }
 
 #[cfg(test)]
@@ -365,7 +451,10 @@ endfm
         let plus = m.ops[&("_+_".to_string(), 2)];
         let ps = prods_for(&g, plus);
         // Exactly the mixfix form (assoc-prefix and `_+_(a,b)` are deferred): prec 41, gather [40,41].
-        let mix = ps.iter().find(|p| p.prec == 41).expect("mixfix _+_ production");
+        let mix = ps
+            .iter()
+            .find(|p| p.prec == 41)
+            .expect("mixfix _+_ production");
         assert_eq!(mix.gather, vec![40, 41], "right-associating gather (e E)");
         assert_eq!(mix.rhs.len(), 3, "<term> + <term>");
         assert!(mix.rhs[0].is_nonterminal() && mix.rhs[2].is_nonterminal());
@@ -378,7 +467,11 @@ endfm
         let p = prods_for(&g, lt);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].prec, 41);
-        assert_eq!(p[0].gather, vec![41, 41], "non-assoc infix: both holes at prec");
+        assert_eq!(
+            p[0].gather,
+            vec![41, 41],
+            "non-assoc infix: both holes at prec"
+        );
     }
 
     #[test]
@@ -386,11 +479,19 @@ endfm
         let (m, _i, g) = build(NATB);
         let succ = m.nat_succ.unwrap();
         let ps = prods_for(&g, succ);
-        let mixfix = ps.iter().find(|p| matches!(p.action, Action::MakeTerm(_))).expect("s _ mixfix");
+        let mixfix = ps
+            .iter()
+            .find(|p| matches!(p.action, Action::MakeTerm(_)))
+            .expect("s _ mixfix");
         assert_eq!(mixfix.prec, 15, "UNARY_PREC");
         assert_eq!(mixfix.gather, vec![15]);
-        let numeral = ps.iter().find(|p| matches!(p.action, Action::MakeNatural(_)));
-        assert!(numeral.is_some(), "successor symbol accepts a decimal numeral via SMALL_NAT");
+        let numeral = ps
+            .iter()
+            .find(|p| matches!(p.action, Action::MakeNatural(_)));
+        assert!(
+            numeral.is_some(),
+            "successor symbol accepts a decimal numeral via SMALL_NAT"
+        );
         assert_eq!(numeral.unwrap().rhs, vec![GSym::T(Terminal::SmallNat)]);
     }
 
@@ -402,7 +503,11 @@ endfm
         assert_eq!(p.len(), 1, "the flattened assoc-list prefix form");
         // rhs = gcd ( <assocList> )
         assert_eq!(p[0].gather, vec![PREFIX_GATHER]);
-        assert!(p[0].rhs.iter().any(|s| matches!(s, GSym::N(Nt::Comp(_, NtType::AssocList)))));
+        assert!(
+            p[0].rhs
+                .iter()
+                .any(|s| matches!(s, GSym::N(Nt::Comp(_, NtType::AssocList))))
+        );
     }
 
     #[test]
@@ -420,8 +525,11 @@ endfm
         let (_m, _i, g) = build(NATB);
         // Two kinds (Truth; Nat-family). Each gets a `TERM ::= <kind>Term`, a parens production, and
         // two assoc-list productions.
-        let term_injections =
-            g.productions.iter().filter(|p| p.lhs == Nt::Term && p.action == Action::PassThru).count();
+        let term_injections = g
+            .productions
+            .iter()
+            .filter(|p| p.lhs == Nt::Term && p.action == Action::PassThru)
+            .count();
         assert_eq!(term_injections, 2, "one TERM injection per kind");
         let assoc_lists = g
             .productions
@@ -441,6 +549,9 @@ endfm
             .expect("a variable production for X");
         // X : Nat → produces into the Nat kind's term nonterminal.
         let nat = m.sorts["Nat"];
-        assert_eq!(x_prod.lhs, Nt::Comp(m.engine.sorts().kind_of(nat), NtType::Term));
+        assert_eq!(
+            x_prod.lhs,
+            Nt::Comp(m.engine.sorts().kind_of(nat), NtType::Term)
+        );
     }
 }

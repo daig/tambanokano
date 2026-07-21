@@ -15,8 +15,8 @@
 //! procedure reads them as `l0 <= l1`, `r0 <= r1`.
 
 use super::{
-    compute_solved_form, last_variable_in_chain, var_index, Marker, PendingStack, SavedSubst,
-    UnifyContext, UnifyEnv,
+    Marker, PendingStack, SavedSubst, UnifyContext, UnifyEnv, compute_solved_form,
+    last_variable_in_chain, var_index,
 };
 use crate::dag::DagId;
 use crate::engine::Engine;
@@ -33,7 +33,10 @@ fn cui_args(e: &Engine, id: DagId) -> (DagId, DagId) {
     let mut kids = e.node(id).children();
     let a0 = kids.next().expect("CUI-unification node is binary");
     let a1 = kids.next().expect("CUI-unification node is binary");
-    debug_assert!(kids.next().is_none(), "CUI-unification node has exactly two arguments");
+    debug_assert!(
+        kids.next().is_none(),
+        "CUI-unification node has exactly two arguments"
+    );
     (a0, a1)
 }
 
@@ -45,15 +48,16 @@ fn rebuild_binary(env: &mut UnifyEnv, symbol: SymbolId, a0: DagId, a1: DagId) ->
     rt.rebuild(sig, symbol, vec![a0, a1])
 }
 
-/// Build the identity constant node of a CUI-with-id operator (`getIdentityDag`): the two-sided
-/// `id:` constant, or whichever one-sided identity is declared.
+/// Build the identity DAG of a CUI-with-id operator (`getIdentityDag`): the two-sided identity,
+/// or whichever one-sided identity is declared.
 fn identity_dag(env: &mut UnifyEnv, symbol: SymbolId) -> DagId {
-    let sym = env.e.symbol(symbol);
-    let id_const = sym
+    let identity = env
+        .e
+        .symbol(symbol)
         .left_identity()
-        .or_else(|| sym.right_identity())
-        .expect("a CUI-with-id operator has an identity constant");
-    env.e.make_const(id_const)
+        .or_else(|| env.e.symbol(symbol).right_identity())
+        .expect("a CUI-with-id operator has an identity");
+    env.e.make_identity(identity)
 }
 
 /// `DagNode::compare` on two nodes, via the runtime's canonical total order.
@@ -220,12 +224,7 @@ fn make_purified_version(
 /// `CUI_DagNode::indirectOccursCheck` — can `rep_var` be reached by chasing `var |-> var` and
 /// `var |-> our-symbol` bindings from `this`'s arguments? `rep_var` is a representative (unbound
 /// or bound-to-non-variable).
-fn indirect_occurs_check(
-    env: &UnifyEnv,
-    this: DagId,
-    rep_var: DagId,
-    ctx: &UnifyContext,
-) -> bool {
+fn indirect_occurs_check(env: &UnifyEnv, this: DagId, rep_var: DagId, ctx: &UnifyContext) -> bool {
     let s = env.e.node(this).symbol();
     let (a0, a1) = cui_args(env.e, this);
     indirect_occurs_arg(env, a0, s, rep_var, ctx) || indirect_occurs_arg(env, a1, s, rep_var, ctx)
@@ -279,7 +278,10 @@ pub(crate) struct CSubproblem {
 
 impl CSubproblem {
     pub(crate) fn add_unification(&mut self, lhs: DagId, rhs: DagId, marked: bool) {
-        debug_assert!(!marked, "pure-C subproblems never receive collapse (marked) problems");
+        debug_assert!(
+            !marked,
+            "pure-C subproblems never receive collapse (marked) problems"
+        );
         self.problems.push(CProblem {
             lhs,
             rhs,
@@ -425,7 +427,13 @@ impl CuiIdSubproblem {
         let mut roots: Vec<DagId> = self
             .problems
             .iter()
-            .flat_map(|p| p.saved_subst.iter().copied().flatten().chain([p.lhs, p.rhs]))
+            .flat_map(|p| {
+                p.saved_subst
+                    .iter()
+                    .copied()
+                    .flatten()
+                    .chain([p.lhs, p.rhs])
+            })
             .collect();
         roots.extend(self.identity);
         roots
@@ -576,7 +584,8 @@ impl CuiIdSubproblem {
     fn resolve(&self, env: &UnifyEnv, d: DagId, ctx: &UnifyContext) -> DagId {
         if var_index(env.e, d).is_some() {
             let rep = last_variable_in_chain(env.e, ctx, d);
-            ctx.value(var_index(env.e, rep).unwrap() as usize).unwrap_or(rep)
+            ctx.value(var_index(env.e, rep).unwrap() as usize)
+                .unwrap_or(rep)
         } else {
             d
         }
@@ -697,8 +706,11 @@ impl CuiIdSubproblem {
         ctx: &mut UnifyContext,
         pending: &mut PendingStack,
     ) -> bool {
-        let (lhs, rhs, a) =
-            (self.problems[idx].lhs, self.problems[idx].rhs, self.problems[idx].alternative);
+        let (lhs, rhs, a) = (
+            self.problems[idx].lhs,
+            self.problems[idx].rhs,
+            self.problems[idx].alternative,
+        );
         let id = self.identity.unwrap();
         let (l0, l1) = cui_args(env.e, lhs);
         match a {

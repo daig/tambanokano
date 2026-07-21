@@ -119,7 +119,15 @@ pub(crate) fn render_trace(
     flags: TraceFlags,
     color: bool,
 ) -> String {
-    let mut r = Renderer { m, i, flags, color, out: String::new(), trial_counter: 0, trial_stack: Vec::new() };
+    let mut r = Renderer {
+        m,
+        i,
+        flags,
+        color,
+        out: String::new(),
+        trial_counter: 0,
+        trial_stack: Vec::new(),
+    };
     for ev in events {
         r.event(ev);
     }
@@ -166,7 +174,16 @@ impl Renderer<'_> {
             return;
         }
         match ev {
-            TraceEvent::Rewrite { kind, eq_id, redex, result, bindings, whole_before, whole_after, .. } => {
+            TraceEvent::Rewrite {
+                kind,
+                eq_id,
+                redex,
+                result,
+                bindings,
+                whole_before,
+                whole_after,
+                ..
+            } => {
                 let text = match kind {
                     RewriteKind::Equation if self.flags.eq => self.rewrite_eq(
                         eq_id.expect("equation rewrite has an id"),
@@ -191,13 +208,27 @@ impl Renderer<'_> {
                 };
                 self.out.push_str(&text);
             }
-            TraceEvent::Membership { mb_id, subject, old_sort, new_sort, bindings, whole, .. } => {
+            TraceEvent::Membership {
+                mb_id,
+                subject,
+                old_sort,
+                new_sort,
+                bindings,
+                whole,
+                ..
+            } => {
                 if self.flags.mb {
-                    let text = self.membership(*mb_id, *subject, *old_sort, *new_sort, bindings, *whole);
+                    let text =
+                        self.membership(*mb_id, *subject, *old_sort, *new_sort, bindings, *whole);
                     self.out.push_str(&text);
                 }
             }
-            TraceEvent::TrialStart { kind, stmt_id, bindings, .. } => {
+            TraceEvent::TrialStart {
+                kind,
+                stmt_id,
+                bindings,
+                ..
+            } => {
                 if self.flags.stmt_enabled(*kind) {
                     self.trial_counter += 1;
                     let n = self.trial_counter;
@@ -214,13 +245,26 @@ impl Renderer<'_> {
                     self.out.push_str(&format!("{HEADER}{word} #{n}\n"));
                 }
             }
-            TraceEvent::FragmentStart { kind, stmt_id, index, first_attempt, .. } => {
+            TraceEvent::FragmentStart {
+                kind,
+                stmt_id,
+                index,
+                first_attempt,
+                ..
+            } => {
                 if self.flags.stmt_enabled(*kind) {
                     let text = self.fragment_start(*kind, *stmt_id, *index, *first_attempt);
                     self.out.push_str(&text);
                 }
             }
-            TraceEvent::FragmentEnd { kind, stmt_id, index, success, bindings, .. } => {
+            TraceEvent::FragmentEnd {
+                kind,
+                stmt_id,
+                index,
+                success,
+                bindings,
+                ..
+            } => {
                 if self.flags.stmt_enabled(*kind) {
                     let text = self.fragment_end(*kind, *stmt_id, *index, *success, bindings);
                     self.out.push_str(&text);
@@ -231,7 +275,15 @@ impl Renderer<'_> {
 
     // ---- equation / built-in rewrites (Maude `tracePreEqRewrite` + `tracePostEqRewrite`) ----
 
-    fn rewrite_eq(&self, eq_id: u32, redex: DagId, result: DagId, bindings: &[Option<DagId>], whole_before: Option<DagId>, whole_after: Option<DagId>) -> String {
+    fn rewrite_eq(
+        &self,
+        eq_id: u32,
+        redex: DagId,
+        result: DagId,
+        bindings: &[Option<DagId>],
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    ) -> String {
         let eqt = &self.m.eq_traces[eq_id as usize];
         let mut s = String::new();
         if self.flags.body {
@@ -252,7 +304,15 @@ impl Renderer<'_> {
 
     /// A rule step (Maude `tracePreRuleRewrite` + `tracePostRuleRewrite`): `*********** rule` + the rule
     /// body + substitution + the `redex ---> result` tail — the rewrite counterpart of [`rewrite_eq`].
-    fn rewrite_rule(&self, rule_id: u32, redex: DagId, result: DagId, bindings: &[Option<DagId>], whole_before: Option<DagId>, whole_after: Option<DagId>) -> String {
+    fn rewrite_rule(
+        &self,
+        rule_id: u32,
+        redex: DagId,
+        result: DagId,
+        bindings: &[Option<DagId>],
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    ) -> String {
         let rlt = &self.m.rl_traces[rule_id as usize];
         let mut s = String::new();
         if self.flags.body {
@@ -270,7 +330,13 @@ impl Renderer<'_> {
         s
     }
 
-    fn rewrite_builtin(&self, redex: DagId, result: DagId, whole_before: Option<DagId>, whole_after: Option<DagId>) -> String {
+    fn rewrite_builtin(
+        &self,
+        redex: DagId,
+        result: DagId,
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    ) -> String {
         let mut s = String::new();
         if self.flags.body {
             s.push_str(HEADER);
@@ -278,22 +344,40 @@ impl Renderer<'_> {
         }
         // The `(built-in equation for symbol …)` line is NOT body-gated (Maude prints it for equation==0
         // regardless). The symbol is the redex's top symbol's canonical (mixfix) name, e.g. `_+_`.
-        let name = self.m.engine.symbol(self.m.engine.node(redex).symbol()).name();
+        let name = self
+            .m
+            .engine
+            .symbol(self.m.engine.node(redex).symbol())
+            .name();
         s.push_str(&format!("(built-in equation for symbol {name})\n"));
         s.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
         s
     }
 
     /// The shared `[Old:] redex ---> result [New:]` tail of an equation/built-in step.
-    fn rewrite_tail(&self, redex: DagId, result: DagId, whole_before: Option<DagId>, whole_after: Option<DagId>) -> String {
+    fn rewrite_tail(
+        &self,
+        redex: DagId,
+        result: DagId,
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    ) -> String {
         let mut s = String::new();
-        if self.flags.whole && let Some(w) = whole_before {
+        if self.flags.whole
+            && let Some(w) = whole_before
+        {
             s.push_str(&format!("Old: {}\n", self.dag(w)));
         }
         if self.flags.rewrite {
-            s.push_str(&format!("{}\n--->\n{}\n", self.dag(redex), self.dag(result)));
+            s.push_str(&format!(
+                "{}\n--->\n{}\n",
+                self.dag(redex),
+                self.dag(result)
+            ));
         }
-        if self.flags.whole && let Some(w) = whole_after {
+        if self.flags.whole
+            && let Some(w) = whole_after
+        {
             s.push_str(&format!("New: {}\n", self.dag(w)));
         }
         s
@@ -301,7 +385,15 @@ impl Renderer<'_> {
 
     // ---- membership axioms (Maude `tracePreScApplication`) ----
 
-    fn membership(&self, mb_id: u32, subject: DagId, old_sort: SortId, new_sort: SortId, bindings: &[Option<DagId>], whole: Option<DagId>) -> String {
+    fn membership(
+        &self,
+        mb_id: u32,
+        subject: DagId,
+        old_sort: SortId,
+        new_sort: SortId,
+        bindings: &[Option<DagId>],
+        whole: Option<DagId>,
+    ) -> String {
         let mbt = &self.m.mb_traces[mb_id as usize];
         let mut s = String::new();
         if self.flags.body {
@@ -317,19 +409,32 @@ impl Renderer<'_> {
         }
         // `whole` for a membership is Maude's `Whole:` line; we don't reconstruct it (memberships fire at
         // node construction, off the reduce frame stack), so it is `None` — documented limitation.
-        if self.flags.whole && let Some(w) = whole {
+        if self.flags.whole
+            && let Some(w) = whole
+        {
             s.push_str(&format!("Whole: {}\n", self.dag(w)));
         }
         if self.flags.rewrite {
             let sorts = self.m.engine.sorts();
-            s.push_str(&format!("{}: {} becomes {}\n", sorts.name(old_sort), self.dag(subject), sorts.name(new_sort)));
+            s.push_str(&format!(
+                "{}: {} becomes {}\n",
+                sorts.name(old_sort),
+                self.dag(subject),
+                sorts.name(new_sort)
+            ));
         }
         s
     }
 
     // ---- conditional sub-stream (Maude `trial.cc`) ----
 
-    fn trial_start(&self, kind: StmtKind, stmt_id: u32, n: u32, bindings: &[Option<DagId>]) -> String {
+    fn trial_start(
+        &self,
+        kind: StmtKind,
+        stmt_id: u32,
+        n: u32,
+        bindings: &[Option<DagId>],
+    ) -> String {
         let (body, var_names) = self.stmt_body(kind, stmt_id);
         let mut s = format!("{HEADER}trial #{n}\n{body}\n");
         // Trial substitution is gated by `substitution` alone (not nested under `body`, unlike a rewrite).
@@ -339,14 +444,33 @@ impl Renderer<'_> {
         s
     }
 
-    fn fragment_start(&self, kind: StmtKind, stmt_id: u32, index: u32, first_attempt: bool) -> String {
+    fn fragment_start(
+        &self,
+        kind: StmtKind,
+        stmt_id: u32,
+        index: u32,
+        first_attempt: bool,
+    ) -> String {
         let prefix = if first_attempt { "" } else { "re-" };
-        format!("{HEADER}{prefix}solving condition fragment\n{}\n", self.fragment_text(kind, stmt_id, index))
+        format!(
+            "{HEADER}{prefix}solving condition fragment\n{}\n",
+            self.fragment_text(kind, stmt_id, index)
+        )
     }
 
-    fn fragment_end(&self, kind: StmtKind, stmt_id: u32, index: u32, success: bool, bindings: &[Option<DagId>]) -> String {
+    fn fragment_end(
+        &self,
+        kind: StmtKind,
+        stmt_id: u32,
+        index: u32,
+        success: bool,
+        bindings: &[Option<DagId>],
+    ) -> String {
         let word = if success { "success" } else { "failure" };
-        let mut s = format!("{HEADER}{word} for condition fragment\n{}\n", self.fragment_text(kind, stmt_id, index));
+        let mut s = format!(
+            "{HEADER}{word} for condition fragment\n{}\n",
+            self.fragment_text(kind, stmt_id, index)
+        );
         if success && self.flags.substitution {
             s.push_str(&self.substitution(self.stmt_var_names(kind, stmt_id), bindings));
         }
@@ -384,10 +508,21 @@ impl Renderer<'_> {
 
     /// `[c]eq lhs = rhs [if cond] [\[owise\]] .`
     fn eq_body(&self, eqt: &EqTrace) -> String {
-        let kw = if eqt.condition.is_empty() { "eq" } else { "ceq" };
-        let mut s = format!("{kw} {} = {}", self.term(&eqt.lhs, &eqt.var_names), self.term(&eqt.rhs, &eqt.var_names));
+        let kw = if eqt.condition.is_empty() {
+            "eq"
+        } else {
+            "ceq"
+        };
+        let mut s = format!(
+            "{kw} {} = {}",
+            self.term(&eqt.lhs, &eqt.var_names),
+            self.term(&eqt.rhs, &eqt.var_names)
+        );
         if !eqt.condition.is_empty() {
-            s.push_str(&format!(" if {}", self.condition(&eqt.condition, &eqt.var_names)));
+            s.push_str(&format!(
+                " if {}",
+                self.condition(&eqt.condition, &eqt.var_names)
+            ));
         }
         if eqt.owise {
             s.push_str(" [owise]");
@@ -398,10 +533,21 @@ impl Renderer<'_> {
 
     /// `[c]mb lhs : sort [if cond] .`
     fn mb_body(&self, mbt: &MbTrace) -> String {
-        let kw = if mbt.condition.is_empty() { "mb" } else { "cmb" };
-        let mut s = format!("{kw} {} : {}", self.term(&mbt.lhs, &mbt.var_names), self.m.engine.sorts().name(mbt.sort));
+        let kw = if mbt.condition.is_empty() {
+            "mb"
+        } else {
+            "cmb"
+        };
+        let mut s = format!(
+            "{kw} {} : {}",
+            self.term(&mbt.lhs, &mbt.var_names),
+            self.m.engine.sorts().name(mbt.sort)
+        );
         if !mbt.condition.is_empty() {
-            s.push_str(&format!(" if {}", self.condition(&mbt.condition, &mbt.var_names)));
+            s.push_str(&format!(
+                " if {}",
+                self.condition(&mbt.condition, &mbt.var_names)
+            ));
         }
         s.push_str(" .");
         s
@@ -409,7 +555,11 @@ impl Renderer<'_> {
 
     /// `[c]rl [\[label\] :] lhs => rhs [if cond] .`
     fn rl_body(&self, rlt: &RlTrace) -> String {
-        let kw = if rlt.condition.is_empty() { "rl" } else { "crl" };
+        let kw = if rlt.condition.is_empty() {
+            "rl"
+        } else {
+            "crl"
+        };
         let label = match &rlt.label {
             Some(l) => format!(" [{l}] :"),
             None => String::new(),
@@ -420,7 +570,13 @@ impl Renderer<'_> {
             self.term(&rlt.rhs, &rlt.var_names)
         );
         if !rlt.condition.is_empty() {
-            s.push_str(&format!(" if {}", self.condition(&rlt.condition, &rlt.var_names)));
+            s.push_str(&format!(
+                " if {}",
+                self.condition(&rlt.condition, &rlt.var_names)
+            ));
+        }
+        if rlt.narrowing {
+            s.push_str(" [narrowing]");
         }
         s.push_str(" .");
         s
@@ -448,23 +604,44 @@ impl Renderer<'_> {
 
     /// A condition (the `if` clause): fragments joined by ` /\ `.
     fn condition(&self, cond: &[ConditionFragment], var_names: &[String]) -> String {
-        cond.iter().map(|f| self.fragment(f, var_names)).collect::<Vec<_>>().join(" /\\ ")
+        cond.iter()
+            .map(|f| self.fragment(f, var_names))
+            .collect::<Vec<_>>()
+            .join(" /\\ ")
     }
 
     /// One condition fragment: `lhs = rhs` / `term : sort` / `pattern := subject`.
     fn fragment(&self, frag: &ConditionFragment, var_names: &[String]) -> String {
         match frag {
             ConditionFragment::Equality { lhs, rhs } => {
-                format!("{} = {}", self.term(lhs, var_names), self.term(rhs, var_names))
+                format!(
+                    "{} = {}",
+                    self.term(lhs, var_names),
+                    self.term(rhs, var_names)
+                )
             }
             ConditionFragment::SortTest { term, sort } => {
-                format!("{} : {}", self.term(term, var_names), self.m.engine.sorts().name(*sort))
+                format!(
+                    "{} : {}",
+                    self.term(term, var_names),
+                    self.m.engine.sorts().name(*sort)
+                )
             }
-            ConditionFragment::Matching { pattern, subject, .. } => {
-                format!("{} := {}", self.term(pattern, var_names), self.term(subject, var_names))
+            ConditionFragment::Matching {
+                pattern, subject, ..
+            } => {
+                format!(
+                    "{} := {}",
+                    self.term(pattern, var_names),
+                    self.term(subject, var_names)
+                )
             }
             ConditionFragment::Rewrite { lhs, pattern, .. } => {
-                format!("{} => {}", self.term(lhs, var_names), self.term(pattern, var_names))
+                format!(
+                    "{} => {}",
+                    self.term(lhs, var_names),
+                    self.term(pattern, var_names)
+                )
             }
         }
     }

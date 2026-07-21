@@ -17,6 +17,8 @@ pub mod engine;
 pub mod fresh;
 pub mod id;
 pub mod root;
+// S3: variant-based narrowing rule descriptors and symbolic state search.
+pub mod narrow;
 // Pillar A: resumable `rewrite`/`frewrite` sessions over the rule machinery in `engine`.
 pub mod rewrite;
 // Pillar A-iv: the reachable-state graph + breadth-first `search`.
@@ -37,11 +39,10 @@ pub(crate) mod diophantine;
 // S1c: Contejean–Devie minimal-solution (Hilbert-basis) enumerator for ACU unification.
 pub(crate) mod int_system;
 // B3: arbitrary-precision arithmetic (D4 `malachite`) behind a wrapper; the bignum backend is never
-// named outside `num`.
+// named outside `num`. `Nat` is re-exported because compact static `Term::Iter` nodes expose their
+// scalar count to frontend printers and module transforms.
 pub(crate) mod num;
-// The one number utility a consumer needs by value: Maude's `doubleToString` float rendering, shared by
-// the frontend pretty-printer and the `string(Float)` conversion (so display and conversion agree).
-pub use num::double_to_string;
+pub use num::{Nat, double_to_string};
 pub(crate) mod s;
 // S1 (subsystems goal): the order-sorted-unification sort computation (SortBdds + AllSat).
 pub(crate) mod sort_bdds;
@@ -50,3 +51,5 @@ pub(crate) mod theory;
 // enumeration driver. `pub` so the frontend can supply a `NameCodes` source for fresh variables;
 // the object-level `unify` command and `metaUnify` reach it through `Engine` methods.
 pub mod unify;
+// S2: folding variant narrowing and its resumable breadth-first search.
+pub mod variant;

@@ -147,7 +147,13 @@ mod tests {
     fn user_weak_gather_clamps_at_zero() {
         // gather (e) with prec 0 → -1 clamped to 0.
         let mut i = Interner::new();
-        let pg = compute(&frags("_!", &mut i), 1, Some(0), Some(&[GatherElem::Weak]), false);
+        let pg = compute(
+            &frags("_!", &mut i),
+            1,
+            Some(0),
+            Some(&[GatherElem::Weak]),
+            false,
+        );
         assert_eq!(pg.gather, vec![0]);
     }
 }

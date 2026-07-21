@@ -30,18 +30,33 @@ fn build(e: &mut Engine) -> Peano {
     let zero_t = || Term::constant(zero);
 
     // N + 0 = N ;  N + s M = s (N + M)
-    e.add_equation(Equation { lhs: Term::op(plus, vec![v(0), zero_t()]), rhs: v(0), nr_vars: 1 });
+    e.add_equation(Equation {
+        lhs: Term::op(plus, vec![v(0), zero_t()]),
+        rhs: v(0),
+        nr_vars: 1,
+    });
     e.add_equation(Equation {
         lhs: Term::op(plus, vec![v(0), s_of(v(1))]),
         rhs: s_of(Term::op(plus, vec![v(0), v(1)])),
         nr_vars: 2,
     });
     // fib 0 = 0 ;  fib s 0 = s 0 ;  fib s s N = fib(s N) + fib N
-    e.add_equation(Equation { lhs: Term::op(fib, vec![zero_t()]), rhs: zero_t(), nr_vars: 0 });
-    e.add_equation(Equation { lhs: Term::op(fib, vec![s_of(zero_t())]), rhs: s_of(zero_t()), nr_vars: 0 });
+    e.add_equation(Equation {
+        lhs: Term::op(fib, vec![zero_t()]),
+        rhs: zero_t(),
+        nr_vars: 0,
+    });
+    e.add_equation(Equation {
+        lhs: Term::op(fib, vec![s_of(zero_t())]),
+        rhs: s_of(zero_t()),
+        nr_vars: 0,
+    });
     e.add_equation(Equation {
         lhs: Term::op(fib, vec![s_of(s_of(v(0)))]),
-        rhs: Term::op(plus, vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])]),
+        rhs: Term::op(
+            plus,
+            vec![Term::op(fib, vec![s_of(v(0))]), Term::op(fib, vec![v(0)])],
+        ),
         nr_vars: 1,
     });
 
@@ -86,7 +101,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let f: u64 = args.get(1).and_then(|x| x.parse().ok()).unwrap_or(20);
     let reps: u64 = args.get(2).and_then(|x| x.parse().ok()).unwrap_or(50);
-    let gc_chain: u64 = args.get(3).and_then(|x| x.parse().ok()).unwrap_or(2_000_000);
+    let gc_chain: u64 = args
+        .get(3)
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(2_000_000);
 
     let mut e = Engine::new();
     let p = build(&mut e);
@@ -99,7 +117,10 @@ fn main() {
     let r = e.reduce(q);
     let val = decode(&e, r, &p);
     let per_fib = e.rewrites();
-    println!("fib({f}) = {val}   ({per_fib} rewrites, expected fib = {})", fib_ref(f));
+    println!(
+        "fib({f}) = {val}   ({per_fib} rewrites, expected fib = {})",
+        fib_ref(f)
+    );
     assert_eq!(val, fib_ref(f), "fib result must match");
     e.gc(Vec::new());
 
@@ -119,7 +140,10 @@ fn main() {
         dt,
         rw as f64 / dt.as_secs_f64() / 1e6
     );
-    println!("        peak DAG-arena capacity (bounded by GC): {} nodes", e.node_capacity());
+    println!(
+        "        peak DAG-arena capacity (bounded by GC): {} nodes",
+        e.node_capacity()
+    );
 
     // --- GC throughput: a long chain, time mark-all then sweep-all ---
     let big = numeral(&mut e, &p, gc_chain); // s^gc_chain 0  (gc_chain + 1 nodes)

@@ -7,7 +7,7 @@
 //! it, [`ensure_builtins`] parses this built-in copy into the database so flattening can resolve it. A
 //! user-defined `CONFIGURATION` (as `conformance/objects.maude` declares) is never overridden.
 
-use tnk_frontend::lex::{tokenize, Interner};
+use tnk_frontend::lex::{Interner, tokenize};
 use tnk_frontend::surface::ast::{Import, ModuleExpr};
 use tnk_frontend::surface::parser::Parser;
 
@@ -60,9 +60,13 @@ pub fn ensure_builtins(imports: &[Import], db: &mut ModuleDb, interner: &mut Int
         if db.get(&name).is_some() {
             continue; // already defined (user or prior injection)
         }
-        let Some(src) = builtin_src(&name) else { continue };
+        let Some(src) = builtin_src(&name) else {
+            continue;
+        };
         let toks = tokenize(src, interner);
-        let Ok(parsed) = Parser::new(&toks, interner).parse_source() else { continue };
+        let Ok(parsed) = Parser::new(&toks, interner).parse_source() else {
+            continue;
+        };
         for bm in parsed.modules {
             if db.get(&bm.name).is_none() {
                 db.insert(bm);

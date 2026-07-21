@@ -241,13 +241,24 @@ mod tests {
         let lines: Vec<&str> = wrapped.split('\n').collect();
         assert!(lines.len() > 1, "a 400-token line must wrap");
         for (i, line) in lines.iter().enumerate() {
-            assert!(line.len() <= 79, "line {i} is {} cols (> 79): {line:?}", line.len());
+            assert!(
+                line.len() <= 79,
+                "line {i} is {} cols (> 79): {line:?}",
+                line.len()
+            );
             if i > 0 {
-                assert!(line.starts_with("    "), "continuation line {i} is indented: {line:?}");
+                assert!(
+                    line.starts_with("    "),
+                    "continuation line {i} is indented: {line:?}"
+                );
             }
         }
         // Every `s` survives the wrap (only spaces are absorbed at break points, never content).
-        assert_eq!(wrapped.matches('s').count(), long.matches('s').count(), "no successor lost");
+        assert_eq!(
+            wrapped.matches('s').count(),
+            long.matches('s').count(),
+            "no successor lost"
+        );
     }
 
     /// ANSI color escapes (`ESC … m`) are not counted toward the column width, so colored output wraps at
@@ -259,7 +270,11 @@ mod tests {
         let plain = plain.trim_end();
         let colored = format!("result Nat: {}", "\x1b[33ms\x1b[0m ".repeat(100));
         let colored = colored.trim_end();
-        assert_eq!(strip_ansi(&auto_wrap(colored)), auto_wrap(plain), "colored wraps at visible columns");
+        assert_eq!(
+            strip_ansi(&auto_wrap(colored)),
+            auto_wrap(plain),
+            "colored wraps at visible columns"
+        );
     }
 
     fn strip_ansi(s: &str) -> String {
@@ -285,6 +300,10 @@ mod tests {
         let s = format!("result String: \"{}\"", "x".repeat(120));
         let wrapped = auto_wrap(&s);
         // The 120-x run is one unbreakable token (no space inside), so it stays on one physical line.
-        assert_eq!(wrapped.matches('\n').count(), 0, "no break inside the string: {wrapped:?}");
+        assert_eq!(
+            wrapped.matches('\n').count(),
+            0,
+            "no break inside the string: {wrapped:?}"
+        );
     }
 }

@@ -100,28 +100,35 @@ impl LhsAutomaton {
                 // `DagNode::matchVariableWithExtension`). Only the S and AU cases occur in the audit; any
                 // other subject (free constant, ACU, CUI, …) falls through to the whole-subject match,
                 // which prints no `Matched portion` line.
-                if command && ext_allowed && let Term::Var(v) = pat {
+                if command
+                    && ext_allowed
+                    && let Term::Var(v) = pat
+                {
                     match &rt.node(subject).term {
                         NodeTerm::S { symbol, count, arg } => {
-                            return Some(Subproblem::S(SSubproblem::match_variable_with_extension(
-                                *symbol,
-                                count.clone(),
-                                *arg,
-                                v.index,
-                                v.sort,
-                            )));
+                            return Some(Subproblem::S(
+                                SSubproblem::match_variable_with_extension(
+                                    *symbol,
+                                    count.clone(),
+                                    *arg,
+                                    v.index,
+                                    v.sort,
+                                ),
+                            ));
                         }
                         NodeTerm::Au { symbol, args } => {
                             let identity = sig.symbol(*symbol).identity();
-                            return Some(Subproblem::Au(AuSubproblem::match_variable_with_extension(
-                                rt,
-                                sig,
-                                args.clone(),
-                                *symbol,
-                                identity,
-                                v.index,
-                                v.sort,
-                            )));
+                            return Some(Subproblem::Au(
+                                AuSubproblem::match_variable_with_extension(
+                                    rt,
+                                    sig,
+                                    args.clone(),
+                                    *symbol,
+                                    identity,
+                                    v.index,
+                                    v.sort,
+                                ),
+                            ));
                         }
                         _ => {}
                     }
@@ -137,15 +144,15 @@ impl LhsAutomaton {
                 rt.match_skeleton(sig, pat, subject, subst, &mut aliens)
                     .then(|| Subproblem::Sequence(SequenceSubproblem::new(aliens)))
             }
-            LhsAutomaton::Acu(lhs) => {
-                lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Acu)
-            }
-            LhsAutomaton::Au(lhs) => {
-                lhs.match_(rt, sig, subject, ext_allowed, command).map(Subproblem::Au)
-            }
-            LhsAutomaton::Cui(lhs) => {
-                lhs.match_(rt, sig, subject, ext_allowed).map(Subproblem::Cui)
-            }
+            LhsAutomaton::Acu(lhs) => lhs
+                .match_(rt, sig, subject, ext_allowed)
+                .map(Subproblem::Acu),
+            LhsAutomaton::Au(lhs) => lhs
+                .match_(rt, sig, subject, ext_allowed, command)
+                .map(Subproblem::Au),
+            LhsAutomaton::Cui(lhs) => lhs
+                .match_(rt, sig, subject, ext_allowed)
+                .map(Subproblem::Cui),
             // S reads only the runtime (the count comparison) — no `sig`/`subst` in its first phase.
             LhsAutomaton::S(lhs) => lhs.match_(rt, subject, ext_allowed).map(Subproblem::S),
         }
@@ -249,7 +256,13 @@ impl SequenceSubproblem {
         for (t, _) in &aliens {
             collect_vars(t, &mut alien_var_indices);
         }
-        SequenceSubproblem { aliens, alien_var_indices, recorded: None, rec_cursor: 0, bound: Vec::new() }
+        SequenceSubproblem {
+            aliens,
+            alien_var_indices,
+            recorded: None,
+            rec_cursor: 0,
+            bound: Vec::new(),
+        }
     }
 
     fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
@@ -313,7 +326,12 @@ fn rec_aliens(
     out: &mut Vec<Vec<(u32, DagId)>>,
 ) {
     if idx == aliens.len() {
-        out.push(var_indices.iter().filter_map(|&i| scratch.get(i).map(|b| (i, b))).collect());
+        out.push(
+            var_indices
+                .iter()
+                .filter_map(|&i| scratch.get(i).map(|b| (i, b)))
+                .collect(),
+        );
         return;
     }
     let (pat, subj) = &aliens[idx];
@@ -337,6 +355,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
         }
         Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
+        Term::Iter { arg, .. } => collect_vars(arg, out),
     }
 }
 
@@ -365,11 +384,19 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(1);
         let (sig, rt) = e.parts_mut();
-        let mut sp = lhs.match_(rt, sig, subject, &mut subst, false, false).expect("f(a,a) matches f(X,a)");
+        let mut sp = lhs
+            .match_(rt, sig, subject, &mut subst, false, false)
+            .expect("f(a,a) matches f(X,a)");
         assert!(sp.next(rt, sig, &mut subst), "the one solution");
         assert_eq!(subst.get(0), Some(a0), "X bound to the first argument");
-        assert!(!sp.next(rt, sig, &mut subst), "free theory has a single solution");
-        assert!(!sp.next(rt, sig, &mut subst), "an exhausted subproblem stays exhausted");
+        assert!(
+            !sp.next(rt, sig, &mut subst),
+            "free theory has a single solution"
+        );
+        assert!(
+            !sp.next(rt, sig, &mut subst),
+            "an exhausted subproblem stays exhausted"
+        );
     }
 
     /// A non-matching subject yields `None` from `match_` (no subproblem to drive).
@@ -392,7 +419,15 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(1);
         assert!(
-            lhs.match_(e.runtime(), e.signature(), subject, &mut subst, false, false).is_none(),
+            lhs.match_(
+                e.runtime(),
+                e.signature(),
+                subject,
+                &mut subst,
+                false,
+                false
+            )
+            .is_none(),
             "f(b,b) does not match f(X,a)"
         );
     }

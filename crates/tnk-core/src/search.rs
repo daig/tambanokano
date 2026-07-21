@@ -179,7 +179,12 @@ impl Search {
                 return true;
             }
             let depth = self.states[s].depth;
-            self.expanding = Some(Expanding { state: s, depth, raw, cursor: 0 });
+            self.expanding = Some(Expanding {
+                state: s,
+                depth,
+                raw,
+                cursor: 0,
+            });
         }
         let exp = self.expanding.as_mut().unwrap();
         if exp.cursor >= exp.raw.len() {
@@ -210,7 +215,11 @@ impl Search {
                     expanded: false,
                 });
                 self.index.entry(h).or_default().push(new_idx);
-                self.states[src].fwd.entry(new_idx).or_default().insert(rule_id);
+                self.states[src]
+                    .fwd
+                    .entry(new_idx)
+                    .or_default()
+                    .insert(rule_id);
                 self.frontier.push_back(new_idx);
                 self.test_discovered(engine, new_idx); // `=>1`/`=>+`/`=>*` test on discovery
             }
@@ -259,9 +268,17 @@ impl Search {
     fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
         let term = self.states[s].term;
         let states = self.states.len();
-        for (bindings, rewrites) in engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term) {
+        for (bindings, rewrites) in
+            engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term)
+        {
             self.solution_count += 1;
-            self.pending.push_back(Solution { number: self.solution_count, state: s, bindings, states, rewrites });
+            self.pending.push_back(Solution {
+                number: self.solution_count,
+                state: s,
+                bindings,
+                states,
+                rewrites,
+            });
         }
     }
 
@@ -289,7 +306,11 @@ impl Search {
         }
         loop {
             let st = &self.states[cur];
-            steps.push(PathStep { state: cur, term: st.term, via: st.via });
+            steps.push(PathStep {
+                state: cur,
+                term: st.term,
+                via: st.via,
+            });
             match st.parent {
                 Some(p) => cur = p,
                 None => break,

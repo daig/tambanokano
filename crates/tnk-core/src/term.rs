@@ -7,6 +7,7 @@
 
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
+use crate::num::Nat;
 use crate::sort::SortId;
 use crate::symbol::{SymbolId, Theory};
 use std::collections::HashMap;
@@ -26,12 +27,26 @@ pub struct Var {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Var(Var),
-    Op { symbol: SymbolId, args: Vec<Term> },
+    Op {
+        symbol: SymbolId,
+        args: Vec<Term>,
+    },
+    /// A compact static S-theory application `symbol^count(arg)`. `count` is scalar bignum data, not
+    /// `count` nested unary [`Term::Op`] allocations. The constructor canonicalizes zero and adjacent
+    /// runs of the same symbol.
+    Iter {
+        symbol: SymbolId,
+        count: Nat,
+        arg: Box<Term>,
+    },
     /// A built-in atomic literal — a string / quoted-id / float constant (the `NA` theory). Its `symbol`
     /// is the pseudo-constructor (`<Strings>`/`<Qids>`/`<Floats>`); the `value` carries the payload a
     /// plain `Op` constant cannot (two `<Floats>` constants differ only by value). A leaf — ground, and
     /// matched only by an equal `Na` subject (Maude's `NA_Term`).
-    Na { symbol: SymbolId, value: NaValue },
+    Na {
+        symbol: SymbolId,
+        value: NaValue,
+    },
 }
 
 impl Term {
@@ -42,28 +57,81 @@ impl Term {
         Term::Op { symbol, args }
     }
     pub fn constant(symbol: SymbolId) -> Self {
-        Term::Op { symbol, args: Vec::new() }
+        Term::Op {
+            symbol,
+            args: Vec::new(),
+        }
+    }
+    /// Build a compact iterated S-theory application. A zero count is the argument itself; adjacent
+    /// iterations of the same symbol are folded (`s^j(s^k(x)) = s^(j+k)(x)`).
+    pub fn iter(symbol: SymbolId, mut count: Nat, mut arg: Term) -> Self {
+        if count.is_zero() {
+            return arg;
+        }
+        loop {
+            match arg {
+                Term::Iter {
+                    symbol: inner,
+                    count: inner_count,
+                    arg: inner_arg,
+                } if inner == symbol => {
+                    count = count.add(&inner_count);
+                    arg = *inner_arg;
+                }
+                Term::Op {
+                    symbol: inner,
+                    mut args,
+                } if inner == symbol && args.len() == 1 => {
+                    count = count.add(&Nat::one());
+                    arg = args.pop().unwrap();
+                }
+                arg => {
+                    return Term::Iter {
+                        symbol,
+                        count,
+                        arg: Box::new(arg),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Parse an arbitrary-size decimal count and build [`Term::iter`]. Returns `None` for a malformed
+    /// decimal; callers that lexed an iteration token can turn this into their source-level diagnostic.
+    pub fn iter_decimal(symbol: SymbolId, count: &str, arg: Term) -> Option<Self> {
+        Some(Self::iter(symbol, Nat::from_decimal(count)?, arg))
     }
     /// A float literal (`<Floats>`), stored as IEEE bits like [`NaValue::Float`].
     pub fn float(symbol: SymbolId, value: f64) -> Self {
         // "don't allow IEEE-754 -0.0" (floatTerm.cc) — mirror the dag-level normalization.
         let value = if value == 0.0 { 0.0 } else { value };
-        Term::Na { symbol, value: NaValue::Float(value.to_bits()) }
+        Term::Na {
+            symbol,
+            value: NaValue::Float(value.to_bits()),
+        }
     }
     /// A string literal (`<Strings>`) — a raw byte sequence (Maude strings are bytes, not UTF-8).
     pub fn string(symbol: SymbolId, value: &[u8]) -> Self {
-        Term::Na { symbol, value: NaValue::Str(Rc::from(value)) }
+        Term::Na {
+            symbol,
+            value: NaValue::Str(Rc::from(value)),
+        }
     }
     /// A quoted-identifier literal (`<Qids>`), stored without the leading quote.
     pub fn qid(symbol: SymbolId, value: &str) -> Self {
-        Term::Na { symbol, value: NaValue::Qid(Rc::from(value)) }
+        Term::Na {
+            symbol,
+            value: NaValue::Qid(Rc::from(value)),
+        }
     }
 
     /// Top symbol, if this is an application or a built-in literal (used to index equations by their lhs
     /// head — an `Na` literal heads on its pseudo-constructor symbol).
     pub fn top_symbol(&self) -> Option<SymbolId> {
         match self {
-            Term::Op { symbol, .. } | Term::Na { symbol, .. } => Some(*symbol),
+            Term::Op { symbol, .. } | Term::Iter { symbol, .. } | Term::Na { symbol, .. } => {
+                Some(*symbol)
+            }
             Term::Var(_) => None,
         }
     }
@@ -76,6 +144,7 @@ impl Term {
             Term::Var(_) => false,
             Term::Na { .. } => true,
             Term::Op { args, .. } => args.iter().all(Term::is_ground),
+            Term::Iter { arg, .. } => arg.is_ground(),
         }
     }
 
@@ -94,6 +163,9 @@ impl Term {
             // A built-in literal is a leaf matched only by an equal literal subject (the free matcher's
             // `Na` arm handles it) — like a free constant, it is free-matchable.
             Term::Na { .. } => true,
+            // An Iter is rooted in the S theory, so the free matcher must route it through the
+            // theory-automaton/alien seam rather than recursively treating it as a free application.
+            Term::Iter { .. } => false,
             Term::Op { symbol, args } => {
                 sig.symbol(*symbol).theory() == Theory::Free
                     && args.iter().all(|a| a.is_free_matchable(sig))
@@ -134,13 +206,21 @@ pub enum ConditionFragment {
     /// the **fresh** variables `fresh_vars` (the indices the pattern introduces). A multi-solution
     /// match backtracks: a later fragment's failure retries the next match. The pattern's non-fresh
     /// variables are checked (non-linearly) against their existing bindings.
-    Matching { pattern: Term, subject: Term, fresh_vars: Vec<u32> },
+    Matching {
+        pattern: Term,
+        subject: Term,
+        fresh_vars: Vec<u32>,
+    },
     /// `lhs => pattern` (a **rewrite** condition, legal **only** in a rule `crl` — Pillar A-v): holds iff
     /// `lhs`, instantiated and reduced, can reach (via `=>*`, zero or more rule steps) a state matching
     /// `pattern`, binding its **fresh** variables `fresh_vars`. The reachable states are searched
     /// breadth-first (the first match wins; a later fragment's failure retries the next reachable state),
     /// and each rule step counts as a rewrite.
-    Rewrite { lhs: Term, pattern: Term, fresh_vars: Vec<u32> },
+    Rewrite {
+        lhs: Term,
+        pattern: Term,
+        fresh_vars: Vec<u32>,
+    },
 }
 
 /// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].
@@ -222,11 +302,17 @@ impl Runtime {
             },
             // A literal pattern matches an identical literal subject (same pseudo-constructor + value).
             Term::Na { symbol, value } => match &self.node(subject).term {
-                NodeTerm::Na { symbol: ssym, value: sval } => *ssym == *symbol && *sval == *value,
+                NodeTerm::Na {
+                    symbol: ssym,
+                    value: sval,
+                } => *ssym == *symbol && *sval == *value,
                 _ => false,
             },
             Term::Op { symbol, args } => match &self.node(subject).term {
-                NodeTerm::Free { symbol: ssym, args: sargs } => {
+                NodeTerm::Free {
+                    symbol: ssym,
+                    args: sargs,
+                } => {
                     *ssym == *symbol
                         && sargs.len() == args.len()
                         && args
@@ -245,6 +331,9 @@ impl Runtime {
                 | NodeTerm::Na { .. }
                 | NodeTerm::Var { .. } => false,
             },
+            // An Iter pattern is S-theory rooted and is handled by `SLhs`, never the recursive free
+            // matcher. A variable can still bind an S subject in the `Var` arm above.
+            Term::Iter { .. } => false,
         }
     }
 
@@ -276,7 +365,10 @@ impl Runtime {
             },
             // A literal pattern matches an identical literal subject (a ground leaf, never an alien).
             Term::Na { symbol, value } => match &self.node(subject).term {
-                NodeTerm::Na { symbol: ssym, value: sval } => *ssym == *symbol && *sval == *value,
+                NodeTerm::Na {
+                    symbol: ssym,
+                    value: sval,
+                } => *ssym == *symbol && *sval == *value,
                 _ => false,
             },
             // A theory-rooted sub-pattern is an alien: record it (with its subject subterm) for the
@@ -285,8 +377,15 @@ impl Runtime {
                 aliens.push((pat.clone(), subject));
                 true
             }
+            Term::Iter { .. } => {
+                aliens.push((pat.clone(), subject));
+                true
+            }
             Term::Op { symbol, args } => match &self.node(subject).term {
-                NodeTerm::Free { symbol: ssym, args: sargs } => {
+                NodeTerm::Free {
+                    symbol: ssym,
+                    args: sargs,
+                } => {
                     *ssym == *symbol
                         && sargs.len() == args.len()
                         && args
@@ -332,8 +431,14 @@ impl Runtime {
             // The S successor's `count` is scalar identity, not a child: compare it explicitly, else
             // `s^2(0)` and `s^3(0)` — both `[arg]` under the generic child walk — would compare equal.
             // Equal symbols ⇒ same theory ⇒ both are the S arm; recurse on the argument.
-            if let (NodeTerm::S { count: cx, arg: ax, .. }, NodeTerm::S { count: cy, arg: ay, .. }) =
-                (&nx.term, &ny.term)
+            if let (
+                NodeTerm::S {
+                    count: cx, arg: ax, ..
+                },
+                NodeTerm::S {
+                    count: cy, arg: ay, ..
+                },
+            ) = (&nx.term, &ny.term)
             {
                 if cx != cy {
                     return false;
@@ -384,11 +489,19 @@ impl Runtime {
     /// signature stays borrowed — the A4 split that lets a rewrite instantiate without cloning the rhs.
     pub(crate) fn instantiate(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
         match term {
-            Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
+            Term::Var(v) => subst
+                .get(v.index)
+                .expect("unbound variable in instantiation"),
             Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
+            Term::Iter { symbol, count, arg } => {
+                let arg = self.instantiate(sig, arg, subst);
+                self.make_s(sig, *symbol, count.clone(), arg)
+            }
             Term::Op { symbol, args } => {
-                let arg_ids: Vec<DagId> =
-                    args.iter().map(|a| self.instantiate(sig, a, subst)).collect();
+                let arg_ids: Vec<DagId> = args
+                    .iter()
+                    .map(|a| self.instantiate(sig, a, subst))
+                    .collect();
                 // Dispatch on the operator's theory (an AC rhs builds a canonical multiset node, not a
                 // free node) — `rebuild` rejects neither.
                 self.rebuild(sig, *symbol, arg_ids)
@@ -406,15 +519,29 @@ impl Runtime {
         let mut counts: HashMap<&Term, u32> = HashMap::new();
         let mut stack = vec![term];
         while let Some(cur) = stack.pop() {
-            if let Term::Op { args, .. } = cur {
-                let n = counts.entry(cur).or_insert(0);
-                *n += 1;
-                if *n == 1 {
-                    stack.extend(args.iter());
+            match cur {
+                Term::Op { args, .. } => {
+                    let n = counts.entry(cur).or_insert(0);
+                    *n += 1;
+                    if *n == 1 {
+                        stack.extend(args.iter());
+                    }
                 }
+                Term::Iter { arg, .. } => {
+                    let n = counts.entry(cur).or_insert(0);
+                    *n += 1;
+                    if *n == 1 {
+                        stack.push(arg);
+                    }
+                }
+                Term::Var(_) | Term::Na { .. } => {}
             }
         }
-        let repeated: Vec<&Term> = counts.iter().filter(|&(_, &n)| n > 1).map(|(&t, _)| t).collect();
+        let repeated: Vec<&Term> = counts
+            .iter()
+            .filter(|&(_, &n)| n > 1)
+            .map(|(&t, _)| t)
+            .collect();
         let mut memo: Vec<(&Term, DagId)> = Vec::new();
         self.instantiate_cse_rec(sig, term, subst, &repeated, &mut memo)
     }
@@ -427,13 +554,20 @@ impl Runtime {
         repeated: &[&'t Term],
         memo: &mut Vec<(&'t Term, DagId)>,
     ) -> DagId {
-        let shared = matches!(term, Term::Op { .. }) && repeated.iter().any(|r| *r == term);
+        let shared = matches!(term, Term::Op { .. } | Term::Iter { .. })
+            && repeated.iter().any(|r| *r == term);
         if shared && let Some(&(_, d)) = memo.iter().find(|(k, _)| *k == term) {
             return d;
         }
         let d = match term {
-            Term::Var(v) => subst.get(v.index).expect("unbound variable in instantiation"),
+            Term::Var(v) => subst
+                .get(v.index)
+                .expect("unbound variable in instantiation"),
             Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
+            Term::Iter { symbol, count, arg } => {
+                let arg = self.instantiate_cse_rec(sig, arg, subst, repeated, memo);
+                self.make_s(sig, *symbol, count.clone(), arg)
+            }
             Term::Op { symbol, args } => {
                 let arg_ids: Vec<DagId> = args
                     .iter()
@@ -476,7 +610,14 @@ mod tests {
 
     #[test]
     fn binds_variable() {
-        let Ctx { mut e, nat, a, b, f, .. } = ctx();
+        let Ctx {
+            mut e,
+            nat,
+            a,
+            b,
+            f,
+            ..
+        } = ctx();
         let b0 = e.make_const(b);
         let a0 = e.make_const(a);
         let subject = e.make_free(f, vec![b0, a0]); // f(b, a)
@@ -490,7 +631,14 @@ mod tests {
 
     #[test]
     fn fails_on_symbol_mismatch() {
-        let Ctx { mut e, nat, a, b, f, .. } = ctx();
+        let Ctx {
+            mut e,
+            nat,
+            a,
+            b,
+            f,
+            ..
+        } = ctx();
         let b0 = e.make_const(b);
         let b1 = e.make_const(b);
         let subject = e.make_free(f, vec![b0, b1]); // f(b, b)
@@ -503,7 +651,14 @@ mod tests {
 
     #[test]
     fn nonlinear_pattern() {
-        let Ctx { mut e, nat, a, b, f, .. } = ctx();
+        let Ctx {
+            mut e,
+            nat,
+            a,
+            b,
+            f,
+            ..
+        } = ctx();
         let pat = Term::op(f, vec![Term::var(0, nat), Term::var(0, nat)]); // f(X, X)
 
         let a0 = e.make_const(a);
@@ -522,7 +677,9 @@ mod tests {
 
     #[test]
     fn instantiate_builds_dag() {
-        let Ctx { mut e, nat, b, g, .. } = ctx();
+        let Ctx {
+            mut e, nat, b, g, ..
+        } = ctx();
         let b0 = e.make_const(b);
         let mut s = Subst::new();
         s.reset(1);
@@ -548,9 +705,15 @@ mod tests {
 
         let mut s = Subst::new();
         s.reset(1);
-        assert!(!e.match_pattern(&Term::var(0, nznat), z0, &mut s), "Zero is not <= NzNat");
+        assert!(
+            !e.match_pattern(&Term::var(0, nznat), z0, &mut s),
+            "Zero is not <= NzNat"
+        );
         s.reset(1);
-        assert!(e.match_pattern(&Term::var(0, nat), z0, &mut s), "Zero <= Nat");
+        assert!(
+            e.match_pattern(&Term::var(0, nat), z0, &mut s),
+            "Zero <= Nat"
+        );
     }
 
     /// Two structurally-equal chains `g^200000(a)` with *distinct* node ids: the recursive
@@ -569,6 +732,9 @@ mod tests {
         let x = chain(&mut e, a, g, 200_000);
         let y = chain(&mut e, a, g, 200_000);
         assert_ne!(x, y, "distinct ids (no hash-consing)");
-        assert!(e.deep_equal(x, y), "structurally equal deep chains compare equal");
+        assert!(
+            e.deep_equal(x, y),
+            "structurally equal deep chains compare equal"
+        );
     }
 }

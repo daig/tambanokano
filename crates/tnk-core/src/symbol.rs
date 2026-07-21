@@ -11,8 +11,20 @@
 
 use crate::id::Id;
 use crate::sort::SortId;
+use crate::term::Term;
 
 pub type SymbolId = Id<Symbol>;
+
+pub(crate) type IdentityId = Id<Identity>;
+
+/// A ground identity term owned by the signature. Symbols carry an [`IdentityId`] rather than
+/// assuming the identity is a nullary operator; the runtime materializes `term` once as a rooted,
+/// reduced DAG for collapse, matching, and symbolic identity insertion.
+#[derive(Debug, Clone)]
+pub(crate) struct Identity {
+    pub(crate) term: Option<Term>,
+    pub(crate) sort: SortId,
+}
 
 /// The equational axioms an operator is declared with (Maude's `assoc`/`comm`/`id:` attributes).
 /// `idem` (and the assoc-only / comm-only theories) are later B1 sub-steps; this slice handles the
@@ -73,20 +85,12 @@ pub struct Symbol {
     pub(crate) decls: Vec<OpDeclaration>,
     /// The structural axioms this operator is declared with.
     pub(crate) axioms: Axioms,
-    /// The operator's two-sided identity (`id: <term>`), if any. Stored as the **constant** symbol
-    /// that is the identity (every conformance target — `0`/`empty`/`e` — is a constant); a general
-    /// identity *term* is a later generalization. Canonicalization drops identity arguments and a
-    /// matched AC variable may bind this constant (the "collapse to unit" solutions).
-    pub(crate) identity: Option<SymbolId>,
-    /// A **one-sided** identity (`left id:` / `right id:`), recorded for the symbolic engine only.
-    /// Construction-time collapse of one-sided identities stays in the *frontend* (which withholds
-    /// them from [`identity`] so the kernel's two-sided collapse never fires — fable-audit §3.4);
-    /// unification, however, must know the side: Maude's `CUI_Symbol::leftId()/rightId()` drive the
-    /// CUI collapse alternatives, and an *associative* operator with a one-sided identity is an
-    /// unimplemented unification theory (`AU_DagNode::computeBaseSortForGroundSubterms`). Read via
-    /// [`left_identity`](Self::left_identity)/[`right_identity`](Self::right_identity), which fold
-    /// the two-sided case in.
-    pub(crate) one_sided_id: Option<(IdentitySide, SymbolId)>,
+    /// The operator's two-sided identity (`id: <term>`), if any. The referenced signature entry owns
+    /// the general ground term; the runtime caches its normalized DAG as a permanent GC root.
+    pub(crate) identity: Option<IdentityId>,
+    /// A **one-sided** identity (`left id:` / `right id:`), recorded for construction and symbolic
+    /// collapse with the same general identity-term representation.
+    pub(crate) one_sided_id: Option<(IdentitySide, IdentityId)>,
     /// Evaluation strategy `strat (…)` (B2.4): the 0-based argument positions to reduce, in order,
     /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
     /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
@@ -209,7 +213,11 @@ pub enum SpecialOp {
     /// (Maude's `NumberOpSymbol`): a free op over numeric arguments. Relational ops (`bool_` present)
     /// rewrite to a Bool constant; arithmetic ops to a Nat. A non-numeric argument, division by zero, or
     /// a would-be-negative result falls through to user equations (`None`).
-    NumberOp { op: NumOp, nat: NatHooks, bool_: Option<BoolHooks> },
+    NumberOp {
+        op: NumOp,
+        nat: NatHooks,
+        bool_: Option<BoolHooks>,
+    },
     /// `sd` (Maude's `CUI_NumberOpSymbol`): a **commutative** 2-argument op over numeric arguments —
     /// symmetric difference `sd(m, n) = |m − n|`. The two operands come from the CUI node; the result is
     /// a Nat. A non-numeric argument falls through (`None`).
@@ -231,7 +239,11 @@ pub enum SpecialOp {
     },
     /// Float arithmetic / functions / comparisons (Maude's `FloatOpSymbol`): operate on `NodeTerm::Na`
     /// float (`f64`) values. `float_sym` builds float results; `bool_` is the comparison result hook.
-    FloatOp { op: FltOp, float_sym: SymbolId, bool_: Option<BoolHooks> },
+    FloatOp {
+        op: FltOp,
+        float_sym: SymbolId,
+        bool_: Option<BoolHooks>,
+    },
     /// `random : Nat -> Nat` (Maude's `RandomOpSymbol`): the n-th 32-bit output of MT19937 (Mersenne
     /// Twister) seeded with 0 — a deterministic pure function of `n`.
     Random { nat: NatHooks },
@@ -242,7 +254,11 @@ pub enum SpecialOp {
     Counter { nat: NatHooks },
     /// `string : Qid -> String` / `qid : String ~> Qid` (Maude's `QuotedIdentifierOpSymbol`): convert
     /// between a quoted identifier and its text. `qid_sym`/`str_sym` build the respective NA results.
-    QidOp { op: QidOp, qid_sym: SymbolId, str_sym: SymbolId },
+    QidOp {
+        op: QidOp,
+        qid_sym: SymbolId,
+        str_sym: SymbolId,
+    },
     /// The CONVERSION module's cross-type coercions (`float`/`rat`/`string`/`decFloat`, under Maude's
     /// `FloatOpSymbol`/`StringOpSymbol` with conversion codes). Each `op` uses the subset of hooks it
     /// needs: `float_sym` builds floats, `str_sym` strings, `nat` reads/builds numerals, `division` the
@@ -260,13 +276,15 @@ pub enum SpecialOp {
     /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
     /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
     Division { nat: NatHooks },
-    /// A META-LEVEL **descent function** (Maude's `MetaLevelOpSymbol`): `metaReduce`/`metaApply`/… — a
-    /// reflective operator that down-translates its meta-term arguments into an object module, runs an
-    /// engine operation in it, and up-translates the result. The meta-representation symbols it needs are
-    /// resolved from the op's `op-hook` list into [`MetaHooks`]; `op` selects which descent function.
-    /// Symbolic / SMT / strategy descent ([`MetaOp::Deferred`]) is declared but stays at the kind level
-    /// (Phase 3.2/3.3).
-    Meta { op: MetaOp, hooks: std::rc::Rc<MetaHooks> },
+    /// An **upper-layer descent hook**. META-LEVEL's `metaReduce`/`metaApply`/… use it to down-translate,
+    /// compute in an object module, and up-translate; LEXICAL's `tokenize`/`printTokens` use the same seam
+    /// because token interning lives above the kernel. Hook symbols are resolved from the operator's
+    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Narrowing / SMT / strategy descent
+    /// ([`MetaOp::Deferred`]) is declared but stays at the kind level (Phase 3.3+).
+    Meta {
+        op: MetaOp,
+        hooks: std::rc::Rc<MetaHooks>,
+    },
     /// A standard-stream **external-object manager** (Maude's `StreamManagerSymbol`): the 0-ary `Oid`
     /// constant `stdin`/`stdout`/`stderr` (Pillar 2.5-C). In `erewrite`'s EXTERNAL mode, with a `<>`
     /// portal in the soup, a message targeting this constant is handled by the manager — `stdout`/`stderr`
@@ -292,10 +310,9 @@ pub enum StdStream {
     Stderr,
 }
 
-/// Which META-LEVEL descent function a [`SpecialOp::Meta`] performs (Maude's `MetaLevelOpSymbol` code).
-/// The reflection-core functions (Phase 3.1) have their own variants; the symbolic/variant/narrowing,
-/// SMT, and strategy descent functions — gated on the BDD (D6) and Z3 (D7) backends and the strategy
-/// language (Phase 2 item 4) — collapse to [`MetaOp::Deferred`] (declared, inert).
+/// Which upper-layer operation a [`SpecialOp::Meta`] performs: META-LEVEL descent functions, symbolic
+/// variant functions, and LEXICAL's two token conversion hooks. Narrowing, SMT, and strategy descent
+/// remain [`MetaOp::Deferred`] until their backends land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaOp {
     Reduce,
@@ -338,12 +355,34 @@ pub enum MetaOp {
     UpView,
     UpTerm,
     DownTerm,
+    /// LEXICAL's `tokenize : String -> QidList` hook. It uses the frontend scanner through the descent
+    /// seam because strings are byte-valued kernel nodes while token interning lives above `tnk-core`.
+    Tokenize,
+    /// LEXICAL's `printTokens : QidList -> String` hook.
+    PrintTokens,
     /// Order-sorted unification descent (S1f). `disjoint` splits the solution across the two sides'
     /// variables (`UnificationTriple`); `irredundant` filters to the most-general unifiers; `legacy`
     /// selects the older `Nat`-family signature (result `{Substitution, Nat}` instead of
     /// `{Substitution, Qid}`).
-    Unify { disjoint: bool, irredundant: bool, legacy: bool },
-    /// Symbolic / SMT / strategy descent — declared so the tower loads, but inert (kind-level).
+    Unify {
+        disjoint: bool,
+        irredundant: bool,
+        legacy: bool,
+    },
+    /// Incremental folding-variant generation. `irredundant` selects the final survivor set; `legacy`
+    /// selects the older `Nat` fresh-family input/result signature.
+    GetVariant {
+        irredundant: bool,
+        legacy: bool,
+    },
+    /// Variant unification. `disjoint` splits lhs/rhs bindings; `legacy` selects `Nat` family values.
+    VariantUnify {
+        disjoint: bool,
+        legacy: bool,
+    },
+    /// Complete-set variant matching (the current Qid-family signature).
+    VariantMatch,
+    /// Narrowing / SMT / strategy descent — declared so the tower loads, but inert (kind-level).
     Deferred,
 }
 
@@ -567,25 +606,23 @@ impl Symbol {
         }
     }
 
-    /// The identity constant symbol, if this operator was declared with `id:`.
-    pub(crate) fn identity(&self) -> Option<SymbolId> {
+    /// The signature-owned identity term, if this operator was declared with `id:`.
+    pub(crate) fn identity(&self) -> Option<IdentityId> {
         self.identity
     }
 
-    /// The identity that collapses on the **left** (`f(e, x) = x`): a two-sided `id:` or a
-    /// `left id:` — Maude's `CUI_Symbol::leftId()`-guarded identity access.
-    pub(crate) fn left_identity(&self) -> Option<SymbolId> {
+    /// The identity that collapses on the **left** (`f(e, x) = x).
+    pub(crate) fn left_identity(&self) -> Option<IdentityId> {
         self.identity.or(match self.one_sided_id {
-            Some((IdentitySide::Left, c)) => Some(c),
+            Some((IdentitySide::Left, id)) => Some(id),
             _ => None,
         })
     }
 
-    /// The identity that collapses on the **right** (`f(x, e) = x`): a two-sided `id:` or a
-    /// `right id:`.
-    pub(crate) fn right_identity(&self) -> Option<SymbolId> {
+    /// The identity that collapses on the **right** (`f(x, e) = x).
+    pub(crate) fn right_identity(&self) -> Option<IdentityId> {
         self.identity.or(match self.one_sided_id {
-            Some((IdentitySide::Right, c)) => Some(c),
+            Some((IdentitySide::Right, id)) => Some(id),
             _ => None,
         })
     }

@@ -46,14 +46,14 @@ struct Soluble {
 
 /// One row of the system: a variable's coefficient and size bounds, plus match-time selection state.
 struct Row {
-    name: usize,      // original insertion index (the key `solution(row, _)` maps through row_permute)
-    coeff: i32,       // R component (variable multiplicity)
-    min_size: i32,    // minimum acceptable row sum
+    name: usize, // original insertion index (the key `solution(row, _)` maps through row_permute)
+    coeff: i32,  // R component (variable multiplicity)
+    min_size: i32, // minimum acceptable row sum
     min_product: i32, // coeff * min_size
-    min_leave: i32,   // minimum sum that must be left for remaining (later) rows
-    max_size: i32,    // maximum acceptable row sum
+    min_leave: i32, // minimum sum that must be left for remaining (later) rows
+    max_size: i32, // maximum acceptable row sum
     max_product: i32, // coeff * max_size
-    max_leave: i32,   // maximum sum that may be left for remaining rows
+    max_leave: i32, // maximum sum that may be left for remaining rows
     current_size: i32,
     current_max_size: i32,
     selection: Vec<Select>,
@@ -212,7 +212,8 @@ impl DiophantineSystem {
             min_total += r.min_product;
             max_total += r.max_product;
         }
-        if self.rows[nr_rows - 1].coeff > 1 || self.rows[nr_rows - 1].max_size < self.max_column_value
+        if self.rows[nr_rows - 1].coeff > 1
+            || self.rows[nr_rows - 1].max_size < self.max_column_value
         {
             // Complex case.
             self.build_solubility_vectors();
@@ -235,13 +236,22 @@ impl DiophantineSystem {
         // Solubility vector for the last row.
         {
             let r = &mut self.rows[nr_rows - 1];
-            r.soluble = vec![Soluble { min: INSOLUBLE, max: INSOLUBLE }; (mcv + 1) as usize];
+            r.soluble = vec![
+                Soluble {
+                    min: INSOLUBLE,
+                    max: INSOLUBLE
+                };
+                (mcv + 1) as usize
+            ];
             let coeff = r.coeff;
             r.soluble[0] = Soluble { min: 0, max: 0 };
             let mut count = 0;
             let mut j = 0;
             while j <= mcv && count <= r.max_size {
-                r.soluble[j as usize] = Soluble { min: count, max: count };
+                r.soluble[j as usize] = Soluble {
+                    min: count,
+                    max: count,
+                };
                 count += 1;
                 j += coeff;
             }
@@ -251,15 +261,29 @@ impl DiophantineSystem {
         for i in (0..nr_rows - 1).rev() {
             let coeff = self.rows[i].coeff;
             let max_size = self.rows[i].max_size;
-            let mut next = vec![Soluble { min: INSOLUBLE, max: INSOLUBLE }; (mcv + 1) as usize];
+            let mut next = vec![
+                Soluble {
+                    min: INSOLUBLE,
+                    max: INSOLUBLE
+                };
+                (mcv + 1) as usize
+            ];
             for j in 0..=mcv {
                 let ju = j as usize;
                 let t = j - coeff;
                 let prev_j_min = self.rows[i + 1].soluble[ju].min;
-                let next_t_min = if t >= 0 { next[t as usize].min } else { INSOLUBLE };
+                let next_t_min = if t >= 0 {
+                    next[t as usize].min
+                } else {
+                    INSOLUBLE
+                };
                 if t >= 0 && next_t_min != INSOLUBLE && next_t_min < max_size {
                     let next_t_max = next[t as usize].max;
-                    next[ju].min = if prev_j_min == INSOLUBLE { next_t_min + 1 } else { 0 };
+                    next[ju].min = if prev_j_min == INSOLUBLE {
+                        next_t_min + 1
+                    } else {
+                        0
+                    };
                     if next_t_max < max_size {
                         next[ju].max = next_t_max + 1;
                     } else {
@@ -273,7 +297,11 @@ impl DiophantineSystem {
                         next[ju].max = new_max;
                     }
                 } else {
-                    let v = if prev_j_min == INSOLUBLE { INSOLUBLE } else { 0 };
+                    let v = if prev_j_min == INSOLUBLE {
+                        INSOLUBLE
+                    } else {
+                        0
+                    };
                     next[ju] = Soluble { min: v, max: v };
                 }
             }
@@ -371,12 +399,14 @@ impl DiophantineSystem {
                     self.rows[row_nr].selection[i].max_extra = 0;
                 }
             }
-            let min_size = self.rows[row_nr]
-                .min_size
-                .max(ceiling_division(column_total - self.rows[row_nr].max_leave, coeff));
-            let max_size = max_sum
-                .min(self.rows[row_nr].max_size)
-                .min(floor_division(column_total - self.rows[row_nr].min_leave, coeff));
+            let min_size = self.rows[row_nr].min_size.max(ceiling_division(
+                column_total - self.rows[row_nr].max_leave,
+                coeff,
+            ));
+            let max_size = max_sum.min(self.rows[row_nr].max_size).min(floor_division(
+                column_total - self.rows[row_nr].min_leave,
+                coeff,
+            ));
             if min_size > max_size {
                 return false;
             }
@@ -493,7 +523,10 @@ impl DiophantineSystem {
                 let t = self.columns[i];
                 let min = self.rows[row_nr].soluble[t as usize].min;
                 let max = self.rows[row_nr].soluble[t as usize].max;
-                debug_assert!(min != INSOLUBLE && max != INSOLUBLE && min <= max, "solubility bug");
+                debug_assert!(
+                    min != INSOLUBLE && max != INSOLUBLE && min <= max,
+                    "solubility bug"
+                );
                 self.rows[row_nr].selection[i].base = min;
                 self.rows[row_nr].selection[i].extra = 0;
                 self.rows[row_nr].selection[i].max_extra = max - min;
@@ -503,10 +536,14 @@ impl DiophantineSystem {
             }
             let min_size = min_sum
                 .max(self.rows[row_nr].min_size)
-                .max(ceiling_division(column_total - self.rows[row_nr].max_leave, coeff));
-            let max_size = max_sum
-                .min(self.rows[row_nr].max_size)
-                .min(floor_division(column_total - self.rows[row_nr].min_leave, coeff));
+                .max(ceiling_division(
+                    column_total - self.rows[row_nr].max_leave,
+                    coeff,
+                ));
+            let max_size = max_sum.min(self.rows[row_nr].max_size).min(floor_division(
+                column_total - self.rows[row_nr].min_leave,
+                coeff,
+            ));
             if min_size > max_size {
                 return false;
             }
@@ -663,21 +700,13 @@ fn split_row_and_soluble(rows: &mut [Row], row_nr: usize) -> (&mut Row, &[Solubl
 /// `ceil(a / b)` for `b > 0`, matching Maude's `ceilingDivision` (handles negative `a`).
 fn ceiling_division(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
-    if a >= 0 {
-        (a + b - 1) / b
-    } else {
-        -((-a) / b)
-    }
+    if a >= 0 { (a + b - 1) / b } else { -((-a) / b) }
 }
 
 /// `floor(a / b)` for `b > 0`, matching Maude's `floorDivision` (handles negative `a`).
 fn floor_division(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
-    if a >= 0 {
-        a / b
-    } else {
-        -(((-a) + b - 1) / b)
-    }
+    if a >= 0 { a / b } else { -(((-a) + b - 1) / b) }
 }
 
 #[cfg(test)]

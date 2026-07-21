@@ -20,7 +20,7 @@
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
-use crate::symbol::SymbolId;
+use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
 use crate::theory::LhsAutomaton;
 
@@ -29,7 +29,7 @@ use crate::theory::LhsAutomaton;
 pub(crate) struct AuLhs {
     symbol: SymbolId,
     elements: Vec<AuElem>,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     /// `true` when the pattern has an alien or a non-linear (repeated) variable — matched by the
     /// binding-aware path in [`AuSubproblem::next`] rather than the pure positional enumeration.
     complex: bool,
@@ -66,7 +66,10 @@ impl AuLhs {
                         complex = true; // a repeated (non-linear) variable
                     }
                     seen_vars.push(v.index);
-                    elements.push(AuElem::Var { index: v.index, sort: v.sort });
+                    elements.push(AuElem::Var {
+                        index: v.index,
+                        sort: v.sort,
+                    });
                 }
                 // A built-in literal is a ground, free-matchable leaf — same fast path as a ground Op.
                 t @ Term::Na { .. } => elements.push(AuElem::Ground(t)),
@@ -77,9 +80,18 @@ impl AuLhs {
                     complex = true;
                     elements.push(AuElem::Alien(alien));
                 }
+                alien @ Term::Iter { .. } => {
+                    complex = true;
+                    elements.push(AuElem::Alien(alien));
+                }
             }
         }
-        AuLhs { symbol, elements, identity, complex }
+        AuLhs {
+            symbol,
+            elements,
+            identity,
+            complex,
+        }
     }
 
     /// First match phase: the subject must be an AU node of this operator; enumerate every contiguous
@@ -103,7 +115,10 @@ impl AuLhs {
         // would enumerate spurious residue splits of a one-element subject).
         let (seq, ext): (Vec<DagId>, bool) = match &rt.node(subject).term {
             NodeTerm::Au { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
-            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == self.identity => {
+            _ if self
+                .identity
+                .is_some_and(|id| rt.is_identity(sig, id, subject)) =>
+            {
                 (Vec::new(), false)
             }
             _ => (vec![subject], false),
@@ -160,7 +175,18 @@ impl AuLhs {
             let last_start = if ext { n } else { 0 };
             for start in 0..=last_start {
                 let mut lengths = Vec::with_capacity(self.elements.len());
-                self.walk(rt, sig, &seq, start, 0, start, ext, &mut lengths, &mut throwaway, &mut candidates);
+                self.walk(
+                    rt,
+                    sig,
+                    &seq,
+                    start,
+                    0,
+                    start,
+                    ext,
+                    &mut lengths,
+                    &mut throwaway,
+                    &mut candidates,
+                );
             }
             // Maximal matched portion first → a lone linear variable absorbs the remainder (collector).
             candidates.sort_by_key(|c| std::cmp::Reverse(c.matched()));
@@ -173,7 +199,9 @@ impl AuLhs {
             .map(|e| match e {
                 AuElem::Var { index, sort } => Some((*index, *sort)),
                 AuElem::Ground(_) => None,
-                AuElem::Alien(_) => unreachable!("the pure path has no aliens (would set `complex`)"),
+                AuElem::Alien(_) => {
+                    unreachable!("the pure path has no aliens (would set `complex`)")
+                }
             })
             .collect();
         Some(AuSubproblem {
@@ -217,7 +245,10 @@ impl AuLhs {
             // All elements placed, ending at `pos`. With extension the tail `seq[pos..]` is residue;
             // without it the match must reach the end.
             if ext_allowed || pos == n {
-                out.push(Candidate { start, lengths: lengths.clone() });
+                out.push(Candidate {
+                    start,
+                    lengths: lengths.clone(),
+                });
             }
             return;
         }
@@ -225,7 +256,18 @@ impl AuLhs {
             AuElem::Ground(g) => {
                 if pos < n && rt.match_pattern(sig, g, seq[pos], throwaway) {
                     lengths.push(1);
-                    self.walk(rt, sig, seq, pos + 1, elem_idx + 1, start, ext_allowed, lengths, throwaway, out);
+                    self.walk(
+                        rt,
+                        sig,
+                        seq,
+                        pos + 1,
+                        elem_idx + 1,
+                        start,
+                        ext_allowed,
+                        lengths,
+                        throwaway,
+                        out,
+                    );
                     lengths.pop();
                 }
             }
@@ -233,7 +275,18 @@ impl AuLhs {
                 let min_len = usize::from(self.identity.is_none()); // ≥1 without identity, else ≥0
                 for len in min_len..=(n - pos) {
                     lengths.push(len);
-                    self.walk(rt, sig, seq, pos + len, elem_idx + 1, start, ext_allowed, lengths, throwaway, out);
+                    self.walk(
+                        rt,
+                        sig,
+                        seq,
+                        pos + len,
+                        elem_idx + 1,
+                        start,
+                        ext_allowed,
+                        lengths,
+                        throwaway,
+                        out,
+                    );
                     lengths.pop();
                 }
             }
@@ -252,16 +305,23 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
         }
         Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
+        Term::Iter { arg, .. } => collect_vars(arg, out),
     }
 }
 
 /// The run length a bound variable's value occupies in the subject sequence — its flattened element
 /// count under `symbol` (an AU node spreads into its args; the identity is 0; anything else is 1) —
 /// used to force a repeated (non-linear) variable to re-match the exact same run.
-fn au_run_len(rt: &Runtime, binding: DagId, symbol: SymbolId, identity: Option<SymbolId>) -> usize {
+fn au_run_len(
+    rt: &Runtime,
+    sig: &Signature,
+    binding: DagId,
+    symbol: SymbolId,
+    identity: Option<IdentityId>,
+) -> usize {
     match &rt.node(binding).term {
         NodeTerm::Au { symbol: s, args } if *s == symbol => args.len(),
-        NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == identity => 0,
+        _ if identity.is_some_and(|id| rt.is_identity(sig, id, binding)) => 0,
         _ => 1,
     }
 }
@@ -273,11 +333,11 @@ fn build_run(
     rt: &mut Runtime,
     sig: &Signature,
     symbol: SymbolId,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     run: &[DagId],
 ) -> Option<DagId> {
     match run {
-        [] => identity.map(|id| rt.make_const(sig, id)),
+        [] => identity.map(|id| rt.identity_dag(sig, id)),
         [single] => Some(*single),
         many => Some(rt.make_au(sig, symbol, many.to_vec())),
     }
@@ -352,7 +412,13 @@ impl SeqPartition {
     fn insert_part(&mut self, min_length: i64, max_length: i64) {
         let sum_prev_min = self.min_sum;
         let sum_prev_max = self.max_sum;
-        self.parts.push(SeqPart { min_length, max_length, sum_prev_min, sum_prev_max, start: 0 });
+        self.parts.push(SeqPart {
+            min_length,
+            max_length,
+            sum_prev_min,
+            sum_prev_max,
+            start: 0,
+        });
         self.min_sum += min_length;
         self.max_sum = uplus(self.max_sum, max_length);
     }
@@ -477,7 +543,10 @@ fn seq_partition_candidates(
             lengths.push(len as usize);
         }
         if ok {
-            out.push(Candidate { start: matched_start as usize, lengths });
+            out.push(Candidate {
+                start: matched_start as usize,
+                lengths,
+            });
         }
     }
     out
@@ -488,7 +557,7 @@ fn seq_partition_candidates(
 /// driver makes between solutions.
 pub(crate) struct AuSubproblem {
     symbol: SymbolId,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     subject: Vec<DagId>,
     // ---- pure path (no aliens, all-linear): precomputed `(start, run-lengths)` plans ----
     /// Per pattern element: `Some((index, sort))` for a variable, `None` for a ground.
@@ -532,11 +601,14 @@ impl AuSubproblem {
         sig: &Signature,
         subject_args: Vec<DagId>,
         symbol: SymbolId,
-        identity: Option<SymbolId>,
+        identity: Option<IdentityId>,
         var_index: u32,
         var_sort: SortId,
     ) -> AuSubproblem {
-        let elements = [AuElem::Var { index: var_index, sort: var_sort }];
+        let elements = [AuElem::Var {
+            index: var_index,
+            sort: var_sort,
+        }];
         let candidates = seq_partition_candidates(rt, sig, &subject_args, &elements, 2, 2);
         AuSubproblem {
             symbol,
@@ -592,7 +664,7 @@ impl AuSubproblem {
                         let run = &self.subject[pos..pos + len];
                         let binding = match run {
                             [] => match self.identity {
-                                Some(id_sym) => rt.make_const(sig, id_sym),
+                                Some(identity) => rt.identity_dag(sig, identity),
                                 None => {
                                     ok = false;
                                     break;
@@ -601,11 +673,17 @@ impl AuSubproblem {
                             [single] => *single,
                             many => rt.make_au(sig, self.symbol, many.to_vec()),
                         };
-                        if !sig.sorts().leq(rt.sort_of(binding), sort) {
+                        if !sig.sorts().leq(rt.sort_of(binding), sort)
+                            || subst
+                                .get(index)
+                                .is_some_and(|existing| !rt.deep_equal(existing, binding))
+                        {
                             ok = false;
                             break;
                         }
-                        to_bind.push((index, binding));
+                        if subst.get(index).is_none() {
+                            to_bind.push((index, binding));
+                        }
                     }
                     pos += len;
                 }
@@ -643,8 +721,14 @@ impl AuSubproblem {
         };
         self.rec_cursor += 1;
         for &(idx, b) in &binds {
-            subst.bind(idx, b);
-            self.bound.push(idx);
+            match subst.get(idx) {
+                Some(existing) if !rt.deep_equal(existing, b) => return false,
+                Some(_) => {}
+                None => {
+                    subst.bind(idx, b);
+                    self.bound.push(idx);
+                }
+            }
         }
         self.prefix = self.subject[..start].to_vec();
         self.suffix = self.subject[end..].to_vec();
@@ -656,7 +740,12 @@ impl AuSubproblem {
     /// and forcing non-linear repeats; var run-lengths ascending then a stable maximal-matched-first
     /// sort, so the lone variable absorbs the remainder and an alien binds to its leftmost position —
     /// the order Maude's greedy matcher fixes the reduce count by.
-    fn enumerate_complex(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<AuRecorded> {
+    fn enumerate_complex(
+        &self,
+        rt: &mut Runtime,
+        sig: &Signature,
+        base: &Subst,
+    ) -> Vec<AuRecorded> {
         let n = self.subject.len();
         let last_start = if self.ext_allowed { n } else { 0 };
         let mut out = Vec::new();
@@ -694,7 +783,11 @@ impl AuSubproblem {
                     .iter()
                     .filter_map(|&i| scratch.get(i).map(|b| (i, b)))
                     .collect();
-                out.push(AuRecorded { binds, start, end: pos });
+                out.push(AuRecorded {
+                    binds,
+                    start,
+                    end: pos,
+                });
             }
             return;
         }
@@ -705,13 +798,21 @@ impl AuSubproblem {
                 }
             }
             AuElem::Alien(t) => {
-                if pos < n {
-                    let automaton = LhsAutomaton::compile(t.clone(), sig);
+                let automaton = LhsAutomaton::compile(t.clone(), sig);
+                for len in 1..=n - pos {
                     let checkpoint = scratch.clone();
-                    // An alien consumes one element — no extension on the sub-match.
-                    if let Some(mut sp) = automaton.match_(rt, sig, self.subject[pos], scratch, false, false) {
+                    let subject = build_run(
+                        rt,
+                        sig,
+                        self.symbol,
+                        self.identity,
+                        &self.subject[pos..pos + len],
+                    )
+                    .expect("a nonempty AU run always builds");
+                    if let Some(mut sp) = automaton.match_(rt, sig, subject, scratch, false, false)
+                    {
                         while sp.next(rt, sig, scratch) {
-                            self.rec_complex(elem_idx + 1, pos + 1, start, rt, sig, scratch, out);
+                            self.rec_complex(elem_idx + 1, pos + len, start, rt, sig, scratch, out);
                         }
                     }
                     *scratch = checkpoint;
@@ -721,9 +822,15 @@ impl AuSubproblem {
                 let (index, sort) = (*index, *sort);
                 if let Some(b) = scratch.get(index) {
                     // Repeated (non-linear) variable: the run is forced to equal the existing binding.
-                    let blen = au_run_len(rt, b, self.symbol, self.identity);
+                    let blen = au_run_len(rt, sig, b, self.symbol, self.identity);
                     if pos + blen <= n
-                        && let Some(run) = build_run(rt, sig, self.symbol, self.identity, &self.subject[pos..pos + blen])
+                        && let Some(run) = build_run(
+                            rt,
+                            sig,
+                            self.symbol,
+                            self.identity,
+                            &self.subject[pos..pos + blen],
+                        )
                         && rt.deep_equal(run, b)
                     {
                         self.rec_complex(elem_idx + 1, pos + blen, start, rt, sig, scratch, out);
@@ -731,9 +838,13 @@ impl AuSubproblem {
                 } else {
                     let min_len = usize::from(self.identity.is_none()); // ≥1 without identity, else ≥0
                     for len in min_len..=(n - pos) {
-                        let Some(binding) =
-                            build_run(rt, sig, self.symbol, self.identity, &self.subject[pos..pos + len])
-                        else {
+                        let Some(binding) = build_run(
+                            rt,
+                            sig,
+                            self.symbol,
+                            self.identity,
+                            &self.subject[pos..pos + len],
+                        ) else {
                             continue;
                         };
                         if !sig.sorts().leq(rt.sort_of(binding), sort) {
@@ -779,7 +890,9 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
-        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed, false) else { return Vec::new() };
+        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed, false) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         while sp.next(rt, sig, &mut subst) {
             out.push((0..nr_vars).map(|i| subst.get(i)).collect());
@@ -799,7 +912,15 @@ mod tests {
         }
     }
 
-    fn au_ctx() -> (Engine, SortId, SymbolId, SymbolId, SymbolId, SymbolId, SymbolId) {
+    fn au_ctx() -> (
+        Engine,
+        SortId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+        SymbolId,
+    ) {
         let mut e = Engine::new();
         let s = e.add_sort("E");
         e.close_sorts();
@@ -858,7 +979,11 @@ mod tests {
         let abc_left = e.reduce(abc_left);
         let abc_right = e.reduce(abc_right);
         assert!(e.deep_equal(abc_left, abc_right), "(a b) c == a (b c)");
-        assert_eq!(e.node(abc_left).children().count(), 3, "flattened to 3 ordered children");
+        assert_eq!(
+            e.node(abc_left).children().count(),
+            3,
+            "flattened to 3 ordered children"
+        );
 
         let a_nil = {
             let (x, u) = (e.make_const(a), e.make_const(nil));
@@ -887,7 +1012,10 @@ mod tests {
         let succ = e.add_op("s", vec![s], s);
         // eq (s M) L = M L .   (M = var 0, L = var 1)
         e.add_equation(Equation {
-            lhs: Term::op(cat, vec![Term::op(succ, vec![Term::var(0, s)]), Term::var(1, s)]),
+            lhs: Term::op(
+                cat,
+                vec![Term::op(succ, vec![Term::var(0, s)]), Term::var(1, s)],
+            ),
             rhs: Term::op(cat, vec![Term::var(0, s), Term::var(1, s)]),
             nr_vars: 2,
         });

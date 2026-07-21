@@ -4,8 +4,7 @@ set show timing off .
 set show advisories off .
 
 ***
-***	Compute unifiers and variant unifiers (without equations
-***	to minimize unifier set) and test them.
+***	Compute base unifiers and test them.
 ***
 
 fmod CHECK is
@@ -28,8 +27,7 @@ var M : Module .
 vars SS ST : String .
 
   op check : Module String String -> ResultList .
-  eq check(M, SS, ST) = check(M, convert(M, SS), convert(M, ST), 0)
-     	      	      	check2(M, convert(M, SS), convert(M, ST), 0) .
+  eq check(M, SS, ST) = check(M, convert(M, SS), convert(M, ST), 0) .
 
   op convert : Module String -> Term .
   eq convert(M, SS) =  getTerm(metaParse(M, none, tokenize(SS), anyType)) .
@@ -46,17 +44,6 @@ vars SS ST : String .
       fi
     fi .
 
-  op check2 : Module Term Term Nat -> ResultList .
-  eq check2(M, T, T', N) =
-    if (metaVariantUnify(M, T =? T', empty, '%, none, N) == noUnifier) then
-      unifierCount(N)
-    else
-      if (metaVariantUnify(M, T =? T', empty, '%, none, N) == noUnifierIncomplete) then
-        unifierCountIncomplete(N)
-      else
-        verify(M, T, T', metaVariantUnify(M, T =? T', empty, '%, none, N)) check2(M, T, T', s N)
-      fi
-    fi .
 
 
   op verify : Module Term Term UnificationPair -> Result .

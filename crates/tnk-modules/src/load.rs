@@ -6,14 +6,14 @@
 //! list + a name→index map), and run commands against the current module.
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::{tokenize, Interner};
-use tnk_frontend::load::{build_loaded_module_homed, LoadedModule};
+use tnk_frontend::lex::{Interner, tokenize};
+use tnk_frontend::load::{LoadedModule, build_loaded_module_homed};
 use tnk_frontend::surface::ast::{Command, ModuleExpr, PreModule, Source, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten_with_homes;
-use crate::view::{validate_view, ViewDb};
+use crate::view::{ViewDb, validate_view};
 
 /// Flatten `name`'s import closure and build it into a runnable [`LoadedModule`], applying the **D1a
 /// import-reparse point-fix**: a statement the flattened grammar parses ambiguously is re-parsed against
@@ -109,8 +109,11 @@ pub fn view_dep_names(v: &ViewDecl) -> HashSet<String> {
 pub fn load_program(src: &str) -> Result<Program, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
-    let Source { modules: pre, views: pre_views, commands } =
-        Parser::new(&toks, &interner).parse_source()?;
+    let Source {
+        modules: pre,
+        views: pre_views,
+        commands,
+    } = Parser::new(&toks, &interner).parse_source()?;
 
     // Names in file order (the command-index basis), and the database for import resolution.
     let names: Vec<String> = pre.iter().map(|m| m.name.clone()).collect();
@@ -132,7 +135,10 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     let mut modules: Vec<LoadedModule> = Vec::with_capacity(names.len());
     let mut module_index: HashMap<String, usize> = HashMap::new();
     for (idx, name) in names.iter().enumerate() {
-        let imports = db.get(name).map(|pm| pm.imports.clone()).unwrap_or_default();
+        let imports = db
+            .get(name)
+            .map(|pm| pm.imports.clone())
+            .unwrap_or_default();
         crate::prelude::ensure_builtins(&imports, &mut db, &mut interner);
         // Resolve an imported statement's home to its already-built module (built earlier in file order —
         // imports precede importers in a well-formed file). Scoped to a block so the immutable borrows of
@@ -146,13 +152,19 @@ pub fn load_program(src: &str) -> Result<Program, String> {
         module_index.insert(name.clone(), idx);
         modules.push(lm);
     }
-    Ok(Program { interner, modules, module_index, views, commands })
+    Ok(Program {
+        interner,
+        modules,
+        module_index,
+        views,
+        commands,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tnk_frontend::lex::{tokenize, Token};
+    use tnk_frontend::lex::{Token, tokenize};
     use tnk_frontend::load::reduce_command;
     use tnk_frontend::pretty::print_raw;
 
@@ -166,7 +178,11 @@ mod tests {
         rewrites: u64,
     }
     const fn e(sort: &'static str, term: &'static str, rewrites: u64) -> Expect {
-        Expect { sort, term, rewrites }
+        Expect {
+            sort,
+            term,
+            rewrites,
+        }
     }
 
     /// Load a multi-module `.maude` program through the module system and assert each `reduce` command's
@@ -189,7 +205,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("command {idx}: {err}"));
             {
                 let eng = &prog.modules[*m].built.engine;
-                assert_eq!(eng.sorts().name(eng.sort_of(got)), exp.sort, "command {idx} sort");
+                assert_eq!(
+                    eng.sorts().name(eng.sort_of(got)),
+                    exp.sort,
+                    "command {idx} sort"
+                );
             }
             assert_eq!(rw, exp.rewrites, "command {idx} rewrite count");
 
@@ -199,7 +219,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("command {idx} expected `{}`: {err}", exp.term));
             {
                 let eng = &prog.modules[*m].built.engine;
-                assert!(eng.deep_equal(got, want), "command {idx} value: expected `{}`", exp.term);
+                assert!(
+                    eng.deep_equal(got, want),
+                    "command {idx} value: expected `{}`",
+                    exp.term
+                );
             }
 
             // Round-trip: the printed result re-parses to the same term.
@@ -208,13 +232,20 @@ mod tests {
             let (reparsed, _) = reduce_command(&mut prog.modules[*m], &prog.interner, &toks)
                 .unwrap_or_else(|err| panic!("command {idx} reparse `{printed}`: {err}"));
             let eng = &prog.modules[*m].built.engine;
-            assert!(eng.deep_equal(got, reparsed), "command {idx}: `{printed}` did not round-trip");
+            assert!(
+                eng.deep_equal(got, reparsed),
+                "command {idx}: `{printed}` did not round-trip"
+            );
         }
     }
 
     macro_rules! conformance_file {
         ($name:expr) => {
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/", $name))
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../conformance/",
+                $name
+            ))
         };
     }
 
@@ -224,8 +255,8 @@ mod tests {
         conform(
             conformance_file!("import-protecting.maude"),
             &[
-                e("N", "s(s(s(s(0))))", 4),                   // double(2) = 4
-                e("N", "s(s(s(s(s(s(s(0)))))))", 7),          // 1 + double(3) = 7
+                e("N", "s(s(s(s(0))))", 4),          // double(2) = 4
+                e("N", "s(s(s(s(s(s(s(0)))))))", 7), // 1 + double(3) = 7
             ],
         );
     }
@@ -235,7 +266,11 @@ mod tests {
     fn import_modes_conforms() {
         conform(
             conformance_file!("import-modes.maude"),
-            &[e("N", "s(s(s(s(0))))", 4), e("N", "s(s(s(s(0))))", 4), e("N", "s(s(s(s(0))))", 4)],
+            &[
+                e("N", "s(s(s(s(0))))", 4),
+                e("N", "s(s(s(s(0))))", 4),
+                e("N", "s(s(s(s(0))))", 4),
+            ],
         );
     }
 
@@ -243,7 +278,10 @@ mod tests {
     /// so `combine(1) = 2·1 + 3·1 = 5` with the binary's exact rewrite count.
     #[test]
     fn import_diamond_conforms() {
-        conform(conformance_file!("import-diamond.maude"), &[e("N", "s(s(s(s(s(0)))))", 12)]);
+        conform(
+            conformance_file!("import-diamond.maude"),
+            &[e("N", "s(s(s(s(s(0)))))", 12)],
+        );
     }
 
     /// Module summation `A + B`: the importer sees both signatures.
@@ -262,6 +300,85 @@ mod tests {
         conform(
             conformance_file!("import-renaming.maude"),
             &[e("Item", "e", 2), e("Item", "e", 1)],
+        );
+    }
+
+    /// A compound identity is a ground term in the copied signature, not a source symbol id. It survives a
+    /// plain import, a whole-module sort/operator rename, and parameter instantiation through a view whose
+    /// prefix source operator becomes mixfix in the target. Results and counts are the live Maude 3.5.1
+    /// outputs for the same source.
+    #[test]
+    fn compound_identity_transfer_conforms() {
+        conform(
+            "fmod ID-BASE is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               op g : S -> S [ctor iter] .\n\
+               op pair : S S -> S [ctor] .\n\
+               op join : S S -> S [assoc id: pair(g^1000000(a),b)] .\n\
+             endfm\n\
+             red in ID-BASE : join(pair(g^1000000(a),b),a) .\n\
+             fmod ID-IMPORT is protecting ID-BASE . endfm\n\
+             red in ID-IMPORT : join(pair(g^1000000(a),b),b) .\n\
+             fmod ID-RENAME is\n\
+               protecting ID-BASE * (sort S to T, op a to x, op b to y,\n\
+                 op g to h, op pair to _+_, op join to merge) .\n\
+             endfm\n\
+             red in ID-RENAME : merge(h^1000000(x) + y,x) .\n\
+             fth ID-TH is\n\
+               sort Elt .\n\
+               ops zero one : -> Elt [ctor] .\n\
+               op step : Elt -> Elt [ctor iter] .\n\
+               op mk : Elt Elt -> Elt [ctor] .\n\
+             endfth\n\
+             fmod COLOR is\n\
+               sort Hue .\n\
+               ops cx cy : -> Hue [ctor] .\n\
+               op hop : Hue -> Hue [ctor iter] .\n\
+               op _+_ : Hue Hue -> Hue [ctor] .\n\
+             endfm\n\
+             view V from ID-TH to COLOR is\n\
+               sort Elt to Hue .\n\
+               op zero to cx .\n\
+               op one to cy .\n\
+               op step to hop .\n\
+               op mk to _+_ .\n\
+             endv\n\
+             fmod ID-BAG{X :: ID-TH} is\n\
+               sort Bag{X} .\n\
+               op box : X$Elt -> Bag{X} [ctor] .\n\
+               op put : Bag{X} Bag{X} -> Bag{X}\n\
+                 [assoc id: box(mk(step^1000000((zero).X$Elt),(one).X$Elt))] .\n\
+             endfm\n\
+             fmod ID-USE is protecting ID-BAG{V} . endfm\n\
+             red in ID-USE : put(box(hop^1000000((cx).Hue) + (cy).Hue),box(cx)) .\n",
+            &[
+                e("S", "a", 0),
+                e("S", "b", 0),
+                e("T", "x", 0),
+                e("Bag{V}", "box(cx)", 0),
+            ],
+        );
+    }
+
+    /// A whole-module rename must rewrite a structured sort inside an existing identity qualifier
+    /// without wrapping the already-qualified constant again. This is the shape used by the stock
+    /// `linear.maude` `Vector{Int0}`/`Matrix{Int0}` renames.
+    #[test]
+    fn structured_sort_identity_rename_conforms() {
+        conform(
+            "fmod STRUCT-ID is\n\
+               sorts Int0 Vector{Int0} .\n\
+               op empty : -> Vector{Int0} [ctor] .\n\
+               op _;_ : Vector{Int0} Vector{Int0} -> Vector{Int0}\n\
+                 [ctor assoc comm id: (empty).Vector{Int0}] .\n\
+             endfm\n\
+             fmod RENAMED-STRUCT-ID is\n\
+               protecting STRUCT-ID *\n\
+                 (sort Vector{Int0} to IntVector, op empty to zeroVector) .\n\
+             endfm\n\
+             reduce in RENAMED-STRUCT-ID : zeroVector ; zeroVector .\n",
+            &[e("IntVector", "zeroVector", 0)],
         );
     }
 
@@ -290,7 +407,10 @@ mod tests {
     /// target module's reduces are unaffected (`p(s(z)) = z`). The view itself is exercised in B-iv.
     #[test]
     fn view_good_conforms() {
-        conform(conformance_file!("view-good.maude"), &[e("N", "z", 1), e("N", "s(z)", 1)]);
+        conform(
+            conformance_file!("view-good.maude"),
+            &[e("N", "z", 1), e("N", "s(z)", 1)],
+        );
     }
 
     /// B-iii: a parameterized module `fmod CTR{X :: TRIV}` builds and reduces ground terms. The parameter
@@ -355,7 +475,11 @@ mod tests {
             conformance_file!("instantiation-byparam.maude"),
             &[
                 e("List{ToN}", "cons(0, cons(s(0), nil))", 1),
-                e("List{ToN}", "cons(0, cons(0, cons(s(0), cons(s(0), nil))))", 5),
+                e(
+                    "List{ToN}",
+                    "cons(0, cons(0, cons(s(0), cons(s(0), nil))))",
+                    5,
+                ),
                 e("List{ToN}", "cons(0, cons(0, nil))", 2),
             ],
         );
@@ -439,7 +563,10 @@ mod tests {
     fn instantiation_set_ac_conforms() {
         conform(
             conformance_file!("instantiation-set-ac.maude"),
-            &[e("NeSet{ToN}", "sing(0), sing(s(0))", 1), e("NeSet{ToN}", "sing(0)", 2)],
+            &[
+                e("NeSet{ToN}", "sing(0), sing(s(0))", 1),
+                e("NeSet{ToN}", "sing(0)", 2),
+            ],
         );
     }
 
@@ -485,7 +612,10 @@ mod tests {
     /// maps `Elt ↦ N`, `cmp ↦ le`, so `check(w(n0),w(n0)) = tt`. Byte-identical to the binary.
     #[test]
     fn param_theory_module_sorts_conforms() {
-        conform(conformance_file!("param-theory-module-sorts.maude"), &[e("Bool", "tt", 2)]);
+        conform(
+            conformance_file!("param-theory-module-sorts.maude"),
+            &[e("Bool", "tt", 2)],
+        );
     }
 
     /// Cross-kind ad-hoc operator overloading (the kernel prerequisite nested instantiation surfaced):
@@ -521,6 +651,9 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected the bad view to be rejected"),
         };
-        assert!(err.contains("failed to find sort NoSuch in NUM"), "got: {err}");
+        assert!(
+            err.contains("failed to find sort NoSuch in NUM"),
+            "got: {err}"
+        );
     }
 }

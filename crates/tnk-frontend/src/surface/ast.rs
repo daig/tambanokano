@@ -103,7 +103,10 @@ pub enum ModuleExpr {
 /// name shared by several (only that overload is renamed). A `label l to m` renames a statement label.
 #[derive(Debug, Clone)]
 pub enum RenameItem {
-    Sort { from: String, to: String },
+    Sort {
+        from: String,
+        to: String,
+    },
     Op {
         from: String,
         to: String,
@@ -113,7 +116,10 @@ pub enum RenameItem {
         attrs: Attrs,
     },
     /// `label l to m` — rename a statement label (rule/eq/mb label) `l` to `m`.
-    Label { from: String, to: String },
+    Label {
+        from: String,
+        to: String,
+    },
 }
 
 /// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
@@ -257,11 +263,34 @@ pub struct SpecialSpec {
 /// be too). Such statements parse and carry through flattening, but are skipped when loading the engine.
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Eq { lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, owise: bool, nonexec: bool, label: Option<String> },
-    Mb { lhs: Vec<Token>, sort: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool, label: Option<String> },
+    Eq {
+        lhs: Vec<Token>,
+        rhs: Vec<Token>,
+        cond: Option<Vec<Token>>,
+        owise: bool,
+        variant: bool,
+        nonexec: bool,
+        label: Option<String>,
+    },
+    Mb {
+        lhs: Vec<Token>,
+        sort: Vec<Token>,
+        cond: Option<Vec<Token>>,
+        nonexec: bool,
+        label: Option<String>,
+    },
     /// `rl [\[label\] :] lhs => rhs .` (or `crl … if cond .`). A rule condition may carry a rewrite
     /// fragment `t => p` (Pillar A-v) in addition to the `ceq`-style fragments.
-    Rule { label: Option<String>, lhs: Vec<Token>, rhs: Vec<Token>, cond: Option<Vec<Token>>, nonexec: bool },
+    Rule {
+        label: Option<String>,
+        lhs: Vec<Token>,
+        rhs: Vec<Token>,
+        cond: Option<Vec<Token>>,
+        nonexec: bool,
+        /// A rule selected by variant-based narrowing. Independent of `nonexec`: nonexec narrowing
+        /// rules participate in symbolic narrowing but never ordinary rewriting.
+        narrowing: bool,
+    },
 }
 
 /// A **strategy declaration** `strat name : <domain> @ Sort .` (Pillar 2.4) — names a strategy with its
@@ -316,7 +345,11 @@ pub enum StratExpr {
     All,
     /// `label[σ]{E,…}` — apply the rule(s) labelled `label`; `subst` is the optional initial substitution
     /// (`x <- t` bubbles), `substrats` the substrategies for the rule's rewrite conditions.
-    Apply { label: String, subst: Vec<(Vec<Token>, Vec<Token>)>, substrats: Vec<StratExpr> },
+    Apply {
+        label: String,
+        subst: Vec<(Vec<Token>, Vec<Token>)>,
+        substrats: Vec<StratExpr>,
+    },
     /// `top(E)` — apply `E` only at the top of the subject.
     Top(Box<StratExpr>),
     /// `one(E)` — at most the first solution of `E`.
@@ -333,15 +366,31 @@ pub enum StratExpr {
     Normalize(Box<StratExpr>),
     /// `test ? success : failure` — if `test` has ≥1 solution, run `success` on each; else `failure` on the
     /// original subject. The primitive behind `try`/`not`/`test`/`or-else`.
-    Branch { test: Box<StratExpr>, success: Box<StratExpr>, failure: Box<StratExpr> },
+    Branch {
+        test: Box<StratExpr>,
+        success: Box<StratExpr>,
+        failure: Box<StratExpr>,
+    },
     /// `match P [s.t. C]` / `xmatch` / `amatch` — a test (no rewrite): succeed iff `P` matches.
-    Test { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>> },
+    Test {
+        kind: TestKind,
+        pattern: Vec<Token>,
+        cond: Option<Vec<Token>>,
+    },
     /// `matchrew P [s.t. C] by x1 using E1, …` — match `P`, run `Eᵢ` on the subterm bound to `xᵢ`, rebuild.
-    MatchRew { kind: TestKind, pattern: Vec<Token>, cond: Option<Vec<Token>>, subs: Vec<(Vec<Token>, StratExpr)> },
+    MatchRew {
+        kind: TestKind,
+        pattern: Vec<Token>,
+        cond: Option<Vec<Token>>,
+        subs: Vec<(Vec<Token>, StratExpr)>,
+    },
     /// A derived branch form kept in its SURFACE spelling for the command echo — `try(α)`, `not(α)`,
     /// `test(α)`, `or-else(α, β)` — resolution desugars to the `? :` branch (fable-audit.md §3.9.8 ii:
     /// the round-trip must preserve the surface form).
-    Sugar { kind: StratSugar, args: Vec<StratExpr> },
+    Sugar {
+        kind: StratSugar,
+        args: Vec<StratExpr>,
+    },
     /// A named strategy `s` / `s(args)`, resolved against the module's `sd`/`csd` definitions.
     Call { name: String, args: Vec<Vec<Token>> },
 }
@@ -352,17 +401,39 @@ pub enum StratExpr {
 pub enum Command {
     /// `reduce [in M :] term .`. The optional `module` is Maude's `in <MODULE> :` qualifier — reduce in
     /// that module instead of the current one (a one-shot override; the current module is unchanged).
-    Reduce { module: Option<String>, term: Vec<Token> },
-    Match { module: Option<String>, pattern: Vec<Token>, subject: Vec<Token>, xmatch: bool },
+    Reduce {
+        module: Option<String>,
+        term: Vec<Token>,
+    },
+    Match {
+        module: Option<String>,
+        pattern: Vec<Token>,
+        subject: Vec<Token>,
+        xmatch: bool,
+    },
     /// `rewrite [bound] term .` — rule-fair rewriting to a normal form (or `bound` rule applications).
-    Rewrite { module: Option<String>, bound: Option<u64>, term: Vec<Token> },
+    Rewrite {
+        module: Option<String>,
+        bound: Option<u64>,
+        term: Vec<Token>,
+    },
     /// `frewrite [bound [, gas]] term .` — position-fair rewriting (Pillar A-ii). `gas` (default 1) is the
     /// number of rule applications per position per pass (fable-audit.md §3.4).
-    Frewrite { module: Option<String>, bound: Option<u64>, gas: Option<u64>, term: Vec<Token> },
+    Frewrite {
+        module: Option<String>,
+        bound: Option<u64>,
+        gas: Option<u64>,
+        term: Vec<Token>,
+    },
     /// `erewrite [bound [, gas]] term .` — object-message-fair rewriting of a configuration (Pillar 2.5).
     /// `bound` caps **deliveries** (config-level rule rewrites); `gas` (default 1) is the per-position gas
     /// for the non-config fallback.
-    ERewrite { module: Option<String>, bound: Option<u64>, gas: Option<u64>, term: Vec<Token> },
+    ERewrite {
+        module: Option<String>,
+        bound: Option<u64>,
+        gas: Option<u64>,
+        term: Vec<Token>,
+    },
     /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
     /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
     Search {
@@ -378,12 +449,75 @@ pub enum Command {
     /// unification. `bound` = `[n]` (max unifiers before continuation); `irredundant` selects the
     /// minimal-complete-set filter. `body` is the raw `=?`/`/\`-separated bubble, split by the
     /// command builder.
-    Unify { module: Option<String>, bound: Option<u64>, irredundant: bool, body: Vec<Token> },
+    Unify {
+        module: Option<String>,
+        bound: Option<u64>,
+        irredundant: bool,
+        body: Vec<Token>,
+    },
+    /// Folding variant generation, optionally computing only the final irredundant survivor set.
+    GetVariants {
+        module: Option<String>,
+        bound: Option<u64>,
+        irredundant: bool,
+        term: Vec<Token>,
+        /// Raw comma-separated terms from `such that … irreducible`.
+        blockers: Vec<Token>,
+    },
+    /// Plain or filtered variant unification. `body` contains one or more `/\`-joined `=?` pairs.
+    VariantUnify {
+        module: Option<String>,
+        bound: Option<u64>,
+        filtered: bool,
+        body: Vec<Token>,
+        blockers: Vec<Token>,
+    },
+    /// Variant matching; variables in `subject` are treated as constants.
+    VariantMatch {
+        module: Option<String>,
+        bound: Option<u64>,
+        pattern: Vec<Token>,
+        subject: Vec<Token>,
+        blockers: Vec<Token>,
+    },
+    /// Variant-based narrowing (`vu-narrow` / `fvu-narrow`) with its two option blocks.
+    Narrow {
+        module: Option<String>,
+        max_solutions: Option<u64>,
+        max_depth: Option<u64>,
+        subject: Vec<Token>,
+        arrow: SearchArrow,
+        goal: Vec<Token>,
+        condition: Option<Vec<Token>>,
+        fold: bool,
+        vfold: bool,
+        path: bool,
+        filter: bool,
+        delay: bool,
+        fvu: bool,
+    },
+    ShowNarrowing {
+        display: NarrowDisplay,
+        state: Option<u64>,
+    },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
     /// `srewrite [in M :] T using E .` (fair) / `dsrewrite …` (depth-first) — strategy-controlled rewriting
     /// (Pillar 2.4). Enumerates the solutions of applying strategy `E` to `T`.
-    Srewrite { module: Option<String>, depth_first: bool, term: Vec<Token>, strategy: StratExpr },
+    Srewrite {
+        module: Option<String>,
+        depth_first: bool,
+        term: Vec<Token>,
+        strategy: StratExpr,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NarrowDisplay {
+    MostGeneral,
+    Frontier,
+    Path,
+    PathStates,
 }
 
 /// The reachability arrow of a `search` command (`=>1` / `=>+` / `=>*` / `=>!`).

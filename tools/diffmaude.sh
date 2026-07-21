@@ -2,7 +2,7 @@
 # tools/diffmaude.sh — oracle-diff harness (docs/migration/correctness-goal.md §1.1).
 #
 # Usage: tools/diffmaude.sh <fixture.maude> [-v]
-#   -v            print the normalized diff even when identical (verbose PASS)
+#   -v            report the pinned oracle version and print normalized output on PASS
 #
 # Exit codes:
 #   0  normalized outputs identical (PASS)
@@ -23,12 +23,12 @@
 # Normalization (exact; §1.1 — NOTHING else may be stripped):
 #   - `====…` separator lines
 #   - the tnk banner line, `Bye.`, `Maude>` prompts
-#   - the timing tail of `rewrites: N in …` / `states: N  rewrites: M in …`
-#     lines (the counts stay)
-#   - `Warning:` / `Advisory:` blocks (first line + continuations up to the
-#     next recognizable output line) — oracle diagnostics; phase E, not this goal
-#   - `error:` / `parse error:` / `error in module` blocks — tnk diagnostics,
-#     symmetric rationale (includes the pre-C6c LEXICAL/LOOP-MODE build errors)
+#   - timing values: the tail of `rewrites: N in …` / `states: N rewrites: M in …` lines
+#     (counts stay), and the volatile cpu/real values on `Decision time:` (the line stays)
+#   - diagnostic bodies are deliberately OUT OF parity (`DIAGNOSTIC_PARITY=ignore`):
+#     `Warning:` / `Advisory:` blocks and symmetric tnk `error:` / `parse error:` /
+#     `error in module` blocks are stripped through the next recognizable output line.
+#     S1 parity still includes incompleteness/exhaustion result forms; warning prose is not contractual.
 #   Everything else — echoes, result/Solution lines, sorts, counts, bindings,
 #   traces — compares byte-exact.
 
@@ -37,6 +37,8 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
 ORACLE_BIN=${ORACLE_BIN:-maude}
+ORACLE_VERSION=${ORACLE_VERSION:-3.5.1}
+DIAGNOSTIC_PARITY=${DIAGNOSTIC_PARITY:-ignore}
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
 TNK_STANDING_PRELUDE=${TNK_STANDING_PRELUDE:-1}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
@@ -58,6 +60,16 @@ if [ ! -f "$ORACLE_LIB/prelude.maude" ]; then
   echo "error: oracle prelude not found at $ORACLE_LIB/prelude.maude" >&2
   exit 2
 fi
+if [ "$DIAGNOSTIC_PARITY" != "ignore" ]; then
+  echo "error: DIAGNOSTIC_PARITY must be 'ignore' (warning prose is outside the parity contract)" >&2
+  exit 2
+fi
+IFS= read -r oracle_version < <("$ORACLE_BIN" --version 2>/dev/null)
+if [ "$oracle_version" != "$ORACLE_VERSION" ]; then
+  echo "error: oracle version '$oracle_version' does not match pinned '$ORACLE_VERSION'" >&2
+  exit 2
+fi
+[ "$verbose" = "-v" ] && echo "oracle: Maude $oracle_version (diagnostics ignored)" >&2
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/diffmaude.XXXXXX") || exit 2
 trap 'rm -rf "$tmpdir"' EXIT
@@ -68,6 +80,12 @@ normalize() {
     # strip interactive prompts (any run of them at line start)
     while (sub(/^Maude> /, "")) { }
 
+    # The ambiguity warning has a second paragraph after a blank line. Keep consuming it without
+    # preserving that internal blank as an output separator.
+    if ($0 ~ /^Warning:.*ambiguous term/) {
+      inblock = 2
+      next
+    }
     # diagnostic-block openers (both sides; symmetric)
     if ($0 ~ /^(Warning:|Advisory:|error:|parse error:|error in module)/) {
       inblock = 1
@@ -75,11 +93,23 @@ normalize() {
     }
 
     if (inblock) {
+      if (inblock == 2 && ($0 == "" || $0 ~ /^Arbitrarily taking the first as correct\./)) {
+        next
+      }
+      # Preserve the diagnostic terminating blank as the surrounding output separator. Without
+      # this, an ignored eager warning between two unifiers collapses their normal blank line only
+      # on the oracle side.
+      if ($0 == "") {
+        print
+        inblock = 0
+        next
+      }
       # a block runs until the next recognizable real-output line
       if ($0 ~ /^=+$/ || $0 ~ /^Bye\.$/ ||
-          $0 ~ /^(reduce|rewrite|frewrite|erewrite|search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|variant) / ||
-          $0 ~ /^(rewrites:|states:|result |Solution |No solution|No more solutions|No match|empty substitution)/ ||
-          $0 ~ /^(state [0-9]|arc [0-9])/ || $0 ~ /^\*\*\*\*/ ||
+          $0 ~ /^(reduce|rewrite|frewrite|erewrite|search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|irredundant unify|variant) / ||
+          $0 ~ /^(\{v?fold\} )?(f?vu-narrow|narrow) / ||
+          $0 ~ /^(rewrites:|states:|Decision time:|result |Solution |Unifier [0-9]+|Matcher [0-9]+|Variant [0-9]+|No solution|No more solutions|No unifier|No more unifiers|No match|empty substitution)/ ||
+          $0 ~ /^(state [0-9]|arc [0-9]|Narrowing solution [0-9]+)/ || $0 ~ /^\*\*\*\*/ ||
           $0 ~ /^(fmod |mod |fth |th |smod |omod |oth |view |tambanokano REPL )/) {
         inblock = 0
       } else {
@@ -92,9 +122,10 @@ normalize() {
     if ($0 ~ /^tambanokano REPL /) next
     if ($0 ~ /^Bye\.$/) next
 
-    # timing tails (counts stay)
+    # timing values (observable counts and line presence stay)
     if ($0 ~ /^rewrites: [0-9]+ in /) { sub(/ in .*/, "") }
     else if ($0 ~ /^states: [0-9]+ +rewrites: [0-9]+ in /) { sub(/ in .*/, "") }
+    else if ($0 ~ /^Decision time: /) { $0 = "Decision time:" }
 
     print
   }'

@@ -16,20 +16,19 @@ use malachite::base::rounding_modes::RoundingMode;
 use malachite::{Integer, Natural, Rational};
 
 /// A non-negative arbitrary-precision integer (Maude's `Natural`). `Clone`/`Eq`/`Ord`/`Debug` are
-/// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) can derive `Debug` and the S-theory's
-/// equality/order can compare counts directly (the count is scalar payload, not a child id). `min`/`max`
-/// come from the derived `Ord` (`std::cmp::min`/`max`). `Hash` lets [`NodeTerm`](crate::dag::NodeTerm)
-/// be a construction-dedup memo key (C7), so an `S` (`iter`) successor keys on its count.
+/// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) and the compact static
+/// [`Term::Iter`](crate::term::Term::Iter) can carry an iteration count as scalar data rather than
+/// allocating one unary node per successor. The backend remains private.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
-pub(crate) struct Nat(Natural);
+pub struct Nat(Natural);
 
 impl Nat {
     /// `0`.
-    pub(crate) fn zero() -> Self {
+    pub fn zero() -> Self {
         Nat(Natural::ZERO)
     }
     /// `1` — the successor increment (`rebuild` folds nested `s_` layers one at a time).
-    pub(crate) fn one() -> Self {
+    pub fn one() -> Self {
         Nat(Natural::ONE)
     }
     /// From a machine integer (numerals built in tests / by the future parser).
@@ -41,7 +40,7 @@ impl Nat {
     }
 
     /// `self + other` (the S-theory `s^j(s^k(x)) = s^(j+k)(x)` flatten).
-    pub(crate) fn add(&self, other: &Nat) -> Nat {
+    pub fn add(&self, other: &Nat) -> Nat {
         Nat(&self.0 + &other.0)
     }
     /// `self - other`, or `None` if it would go negative — `Natural` subtraction is partial (monus).
@@ -79,9 +78,11 @@ impl Nat {
 
     /// `self << amount` / `self >> amount` (`_<<_` / `_>>_`); `>>` floors toward zero (shifts away the
     /// low bits). `amount` is a machine `u64` (the shift count fits — a bignum count is unrepresentable).
+    #[cfg(test)]
     pub(crate) fn shl(&self, amount: u64) -> Nat {
         Nat(&self.0 << amount)
     }
+    #[cfg(test)]
     pub(crate) fn shr(&self, amount: u64) -> Nat {
         Nat(&self.0 >> amount)
     }
@@ -92,7 +93,7 @@ impl Nat {
     }
     /// Base-10 rendering — for the pretty-printer's decimal numerals / iter counts (a `usize` would
     /// truncate a bignum count). Malachite's `Natural` is `Display`.
-    pub(crate) fn to_decimal(&self) -> String {
+    pub fn to_decimal(&self) -> String {
         self.0.to_string()
     }
     /// `self % m` as a machine `usize` (the S sort-path cycle index; `m` is the small cycle length, so
@@ -268,9 +269,13 @@ pub fn double_to_string(f: f64) -> String {
     // 16 fractional digits ⇒ 17 significant digits, mantissa in [1, 10), correctly rounded — the same
     // value `ecvt(d, 17, …)` produces. Rust's `{:e}` writes `D.DDD…eE` (lowercase, no `+`, no padding).
     let sci = format!("{:.*e}", 16, f.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("scientific notation has an exponent");
+    let (mantissa, exp) = sci
+        .split_once('e')
+        .expect("scientific notation has an exponent");
     let exp: i64 = exp.parse().expect("exponent is an integer");
-    let (int_part, frac) = mantissa.split_once('.').expect("a `.16e` mantissa has a decimal point");
+    let (int_part, frac) = mantissa
+        .split_once('.')
+        .expect("a `.16e` mantissa has a decimal point");
     // Strip trailing zeros but keep at least one fractional digit (Maude's `next > 4` guard).
     let frac = frac.trim_end_matches('0');
     let frac = if frac.is_empty() { "0" } else { frac };
@@ -279,11 +284,7 @@ pub fn double_to_string(f: f64) -> String {
         e if e > 0 => format!("{int_part}.{frac}e+{e}"),
         e => format!("{int_part}.{frac}e{e}"), // a negative exponent already carries its `-`
     };
-    if f < 0.0 {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if f < 0.0 { format!("-{body}") } else { body }
 }
 
 #[cfg(test)]
@@ -340,7 +341,11 @@ mod tests {
         assert_eq!(n(5).shl(3), n(40)); // 5 * 8
         assert_eq!(n(40).shr(3), n(5)); // 40 / 8
         assert_eq!(n(5).shr(100), n(0));
-        assert_eq!(n(1).shl(64), n(u64::MAX).add(&n(1)), "1 << 64 = 2^64 (bignum)");
+        assert_eq!(
+            n(1).shl(64),
+            n(u64::MAX).add(&n(1)),
+            "1 << 64 = 2^64 (bignum)"
+        );
         // Modular exponentiation (`modExp`).
         assert_eq!(n(2).mod_pow(&n(10), &n(1000)), n(24)); // 1024 mod 1000
         assert_eq!(n(7).mod_pow(&n(0), &n(13)), n(1)); // x^0 = 1

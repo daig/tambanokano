@@ -10,10 +10,11 @@
 //! resolved — so the unchanged frontend `build_loaded_module` builds it directly.
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::{tokenize, Interner, Token};
+use tnk_frontend::lex::{Interner, Token, tokenize};
 use tnk_frontend::rename_terms::{ReconTarget, ViewOpSubst};
 use tnk_frontend::surface::ast::{
-    Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl, ViewDecl,
+    Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl,
+    ViewDecl,
 };
 
 use crate::db::ModuleDb;
@@ -61,10 +62,16 @@ impl Acc {
         self.subsorts.extend(d.subsorts);
         self.ops.extend(d.ops);
         for v in d.vars {
-            let names: Vec<String> =
-                v.names.into_iter().filter(|n| self.var_set.insert(n.clone())).collect();
+            let names: Vec<String> = v
+                .names
+                .into_iter()
+                .filter(|n| self.var_set.insert(n.clone()))
+                .collect();
             if !names.is_empty() {
-                self.vars.push(VarDecl { names, sort: v.sort });
+                self.vars.push(VarDecl {
+                    names,
+                    sort: v.sort,
+                });
             }
         }
         self.statement_homes
@@ -116,7 +123,10 @@ fn inline_shadowed_vars(d: &mut FlatDecls, prior: &Acc, i: &mut Interner) {
     let mut var_inline: HashMap<String, String> = HashMap::new();
     for v in &d.vars {
         for n in &v.names {
-            if declared.get(n.as_str()).is_some_and(|s| *s != v.sort.as_str()) {
+            if declared
+                .get(n.as_str())
+                .is_some_and(|s| *s != v.sort.as_str())
+            {
                 var_inline.insert(n.clone(), v.sort.clone()); // this module's var loses the name-dedup
             }
         }
@@ -189,8 +199,9 @@ pub fn flatten_with_homes(
         .unwrap_or((ModuleKind::Functional, false, false, false));
     // Carry the root module's own strategy declarations/definitions through (a strategy module flattened by
     // name keeps its own `strat`/`sd`; merging an *import's* strategies is the Pillar-2.4 follow-on).
-    let (strat_decls, strat_defs) =
-        root.map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone())).unwrap_or_default();
+    let (strat_decls, strat_defs) = root
+        .map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone()))
+        .unwrap_or_default();
     let homes = std::mem::take(&mut acc.statement_homes);
     let mut d = acc.into_decls();
     // Variable aliases are module-local in Maude: a command in module M parses with M's OWN `var`
@@ -201,15 +212,22 @@ pub fn flatten_with_homes(
     // (D1a) and the root's own collisions were already inlined to colon variables
     // (`inline_shadowed_vars`), so only the command/grammar view changes.
     if let Some(pm) = root {
-        let own_var_names: HashSet<String> =
-            pm.vars.iter().flat_map(|v| v.names.iter().cloned()).collect();
+        let own_var_names: HashSet<String> = pm
+            .vars
+            .iter()
+            .flat_map(|v| v.names.iter().cloned())
+            .collect();
         for vd in &mut d.vars {
             vd.names.retain(|n| !own_var_names.contains(n));
         }
         d.vars.retain(|vd| !vd.names.is_empty());
         d.vars.extend(pm.vars.iter().cloned());
     }
-    debug_assert_eq!(homes.len(), d.statements.len(), "statement_homes parallel to statements");
+    debug_assert_eq!(
+        homes.len(),
+        d.statements.len(),
+        "statement_homes parallel to statements"
+    );
     let pm = PreModule {
         name: name.to_string(),
         kind,
@@ -248,14 +266,25 @@ pub fn flatten_pre(
     let mut acc = Acc::default();
     let mut visited = HashSet::new();
     visited.insert(SENTINEL.to_string());
-    let params: Vec<(String, String)> =
-        pm.params.iter().map(|p| (p.name.clone(), p.theory.clone())).collect();
+    let params: Vec<(String, String)> = pm
+        .params
+        .iter()
+        .map(|p| (p.name.clone(), p.theory.clone()))
+        .collect();
     for (param, theory) in &params {
         add_parameter_copy(param, theory, db, views, &mut acc, interner)?;
     }
     let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
-        collect_expr(&imp.expr, db, views, &mut acc, &mut visited, interner, &scope)?;
+        collect_expr(
+            &imp.expr,
+            db,
+            views,
+            &mut acc,
+            &mut visited,
+            interner,
+            &scope,
+        )?;
     }
     let mut own = own_decls(pm);
     inline_shadowed_vars(&mut own, &acc, interner);
@@ -328,12 +357,21 @@ fn expr_base_is_theory(e: &ModuleExpr, db: &ModuleDb) -> bool {
 /// Whether an instantiation argument leaves its parameter free: a **theory-view** (its `to` target is a
 /// theory) does; a **module-view** grounds it; a **by-parameter** argument (an enclosing parameter, in
 /// `scope`) is free but legitimately bound by the importer's own parameter.
-fn arg_leaves_free_param(arg: &ModuleExpr, db: &ModuleDb, views: &ViewDb, scope: &[String]) -> bool {
+fn arg_leaves_free_param(
+    arg: &ModuleExpr,
+    db: &ModuleDb,
+    views: &ViewDb,
+    scope: &[String],
+) -> bool {
     match arg {
         ModuleExpr::Named(p) if scope.iter().any(|n| n == p) => false, // by-parameter (bound by importer)
-        ModuleExpr::Named(v) => views.get(v).is_some_and(|view| expr_base_is_theory(&view.to, db)),
+        ModuleExpr::Named(v) => views
+            .get(v)
+            .is_some_and(|view| expr_base_is_theory(&view.to, db)),
         ModuleExpr::Instantiation(base, _) => match &**base {
-            ModuleExpr::Named(v) => views.get(v).is_some_and(|view| expr_base_is_theory(&view.to, db)),
+            ModuleExpr::Named(v) => views
+                .get(v)
+                .is_some_and(|view| expr_base_is_theory(&view.to, db)),
             _ => false,
         },
         _ => false,
@@ -345,10 +383,20 @@ fn arg_leaves_free_param(arg: &ModuleExpr, db: &ModuleDb, views: &ViewDb, scope:
 /// parameters. Only the last level of an instantiation chain grounds the parameter (`BOX{ToT2}{C2}` is
 /// grounded by `C2`), so only the last level is inspected; a renamed instance (`unchain` = `None`) is not
 /// gated here.
-fn import_leaves_free_param(expr: &ModuleExpr, db: &ModuleDb, views: &ViewDb, scope: &[String]) -> bool {
-    let Some((_, arg_lists)) = unchain(expr) else { return false };
-    let Some(last) = arg_lists.last() else { return false };
-    last.iter().any(|a| arg_leaves_free_param(a, db, views, scope))
+fn import_leaves_free_param(
+    expr: &ModuleExpr,
+    db: &ModuleDb,
+    views: &ViewDb,
+    scope: &[String],
+) -> bool {
+    let Some((_, arg_lists)) = unchain(expr) else {
+        return false;
+    };
+    let Some(last) = arg_lists.last() else {
+        return false;
+    };
+    last.iter()
+        .any(|a| arg_leaves_free_param(a, db, views, scope))
 }
 
 fn collect_named(
@@ -362,11 +410,16 @@ fn collect_named(
     if !visited.insert(name.to_string()) {
         return Ok(()); // already merged (diamond)
     }
-    let pm = db.get(name).ok_or_else(|| format!("imported module `{name}` is not defined"))?;
+    let pm = db
+        .get(name)
+        .ok_or_else(|| format!("imported module `{name}` is not defined"))?;
     // Parameter copies first (a parameter `X :: T` behaves like an import of a renamed `T`), then the
     // regular imports, then the module's own declarations.
-    let params: Vec<(String, String)> =
-        pm.params.iter().map(|p| (p.name.clone(), p.theory.clone())).collect();
+    let params: Vec<(String, String)> = pm
+        .params
+        .iter()
+        .map(|p| (p.name.clone(), p.theory.clone()))
+        .collect();
     for (param, theory) in &params {
         add_parameter_copy(param, theory, db, views, acc, interner)?;
     }
@@ -379,7 +432,9 @@ fn collect_named(
         // Maude marks the module unusable due to unpatchable errors, so flattening fails and it is never
         // built (C4c). Checked first, before the theory/free-param recoveries.
         if import_names_self(&imp.expr, name) {
-            return Err(format!("mutually recursive import of module `{name}` ignored"));
+            return Err(format!(
+                "mutually recursive import of module `{name}` ignored"
+            ));
         }
         // A plain module (`fmod`/`mod`) importing a THEORY (`fth`/`th`) is not allowed: Maude recovers by
         // IGNORING the import — the module stays, minus the theory's contents (its axioms never run) (C4a).
@@ -433,7 +488,10 @@ fn add_parameter_copy(
         .sorts
         .iter()
         .filter(|s| param_sorts.contains(s.as_str()))
-        .map(|s| RenameItem::Sort { from: s.clone(), to: format!("{param}${s}") })
+        .map(|s| RenameItem::Sort {
+            from: s.clone(),
+            to: format!("{param}${s}"),
+        })
         .collect();
     // A parameter constant `op c : … [pconst]` is prefixed like a parameter sort: `c ↦ X$c` (the body
     // refers to it as `X$c`, and instantiation maps `X$c` through the view's op map for `c`).
@@ -470,8 +528,18 @@ fn theory_param_sorts(
     collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
     let sorts = tmp.into_decls().sorts;
     let mut module_sorts = HashSet::new();
-    module_origin_sorts(theory, db, views, interner, &mut HashSet::new(), &mut module_sorts)?;
-    Ok(sorts.into_iter().filter(|s| !module_sorts.contains(s)).collect())
+    module_origin_sorts(
+        theory,
+        db,
+        views,
+        interner,
+        &mut HashSet::new(),
+        &mut module_sorts,
+    )?;
+    Ok(sorts
+        .into_iter()
+        .filter(|s| !module_sorts.contains(s))
+        .collect())
 }
 
 /// The canonical names of a theory's **parameter constants** (`op c : … [pconst]`) — the constants a
@@ -509,7 +577,9 @@ fn module_origin_sorts(
     if !seen.insert(name.to_string()) {
         return Ok(());
     }
-    let Some(pm) = db.get(name) else { return Ok(()) };
+    let Some(pm) = db.get(name) else {
+        return Ok(());
+    };
     let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
     for imp in &imports {
         let ModuleExpr::Named(n) = imp else { continue };
@@ -547,7 +617,15 @@ fn collect_expr(
             }
             let mut tmp = Acc::default();
             let mut tmp_visited = HashSet::new();
-            collect_expr(inner, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
+            collect_expr(
+                inner,
+                db,
+                views,
+                &mut tmp,
+                &mut tmp_visited,
+                interner,
+                scope,
+            )?;
             let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
             // Renamed donation: bubbles are rewritten in-place, parse against the flattened grammar (D1a
             // scoped to plain named imports).
@@ -568,7 +646,15 @@ fn collect_expr(
                 let mut tmp = Acc::default();
                 let mut tmp_visited = HashSet::new();
                 let inst = ModuleExpr::Instantiation(inner.clone(), args.clone());
-                collect_expr(&inst, db, views, &mut tmp, &mut tmp_visited, interner, scope)?;
+                collect_expr(
+                    &inst,
+                    db,
+                    views,
+                    &mut tmp,
+                    &mut tmp_visited,
+                    interner,
+                    scope,
+                )?;
                 // The rename's structured names reference the INNER module's parameters
                 // (`sort Array{X,Y} to Vector{Y}` over ARRAY{X :: TRIV, Y :: TRIV}); the
                 // instance's sorts carry the ARGUMENT names (`Array{Nat,Int0}`), so substitute
@@ -616,8 +702,12 @@ fn subst_rename_item_params(
     db: &ModuleDb,
     items: &[RenameItem],
 ) -> Vec<RenameItem> {
-    let ModuleExpr::Named(mname) = inner else { return items.to_vec() };
-    let Some(pm) = db.get(mname) else { return items.to_vec() };
+    let ModuleExpr::Named(mname) = inner else {
+        return items.to_vec();
+    };
+    let Some(pm) = db.get(mname) else {
+        return items.to_vec();
+    };
     let map: HashMap<&str, String> = pm
         .params
         .iter()
@@ -628,10 +718,17 @@ fn subst_rename_item_params(
     items
         .iter()
         .map(|it| match it {
-            RenameItem::Sort { from, to } => {
-                RenameItem::Sort { from: subst(from), to: subst(to) }
-            }
-            RenameItem::Op { from, to, attrs, dom_range, .. } => RenameItem::Op {
+            RenameItem::Sort { from, to } => RenameItem::Sort {
+                from: subst(from),
+                to: subst(to),
+            },
+            RenameItem::Op {
+                from,
+                to,
+                attrs,
+                dom_range,
+                ..
+            } => RenameItem::Op {
                 from: subst(from),
                 to: subst(to),
                 attrs: attrs.clone(),
@@ -693,7 +790,9 @@ fn instantiate(
     interner: &mut Interner,
     scope: &[String],
 ) -> Result<(), String> {
-    let pm = db.get(mname).ok_or_else(|| format!("instantiated module `{mname}` is not defined"))?;
+    let pm = db
+        .get(mname)
+        .ok_or_else(|| format!("instantiated module `{mname}` is not defined"))?;
     let nparams = pm.params.len();
     for lvl in arg_lists {
         if lvl.len() != nparams {
@@ -738,8 +837,10 @@ fn instantiate(
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
         let mut sort_image: HashMap<String, String> = HashMap::new();
-        let sources: HashSet<String> =
-            resolutions.iter().flat_map(|r| r.binding.sort_image.keys().cloned()).collect();
+        let sources: HashSet<String> = resolutions
+            .iter()
+            .flat_map(|r| r.binding.sort_image.keys().cloned())
+            .collect();
         for s in sources {
             let mut cur = s.clone();
             for r in &resolutions {
@@ -747,29 +848,41 @@ fn instantiate(
             }
             sort_image.insert(s, cur);
         }
-        let view_name =
-            chain.iter().map(|a| canonical_key(a)).collect::<Vec<_>>().join("}{");
+        let view_name = chain
+            .iter()
+            .map(|a| canonical_key(a))
+            .collect::<Vec<_>>()
+            .join("}{");
         // The parameter theory's genuine sorts — so a fake `X$Foo` in the body survives (A4d).
         let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
-        bindings.insert(param.name.clone(), ParamBinding {
-            view_name,
-            // The by-parameter `$`-sort rename uses only the last level (the surviving parameter), not the
-            // joined chain — so `LIST{ORD}{X}` renames `X$Elt ↦ X$Elt`, not `↦ ORD}{X$Elt`.
-            final_name: last.binding.view_name.clone(),
-            sort_image,
-            by_param: last.binding.by_param,
-            theory_sorts: Some(theory_sorts),
-        });
+        bindings.insert(
+            param.name.clone(),
+            ParamBinding {
+                view_name,
+                // The by-parameter `$`-sort rename uses only the last level (the surviving parameter), not the
+                // joined chain — so `LIST{ORD}{X}` renames `X$Elt ↦ X$Elt`, not `↦ ORD}{X$Elt`.
+                final_name: last.binding.view_name.clone(),
+                sort_image,
+                by_param: last.binding.by_param,
+                theory_sorts: Some(theory_sorts),
+            },
+        );
         // For re-instantiating `mname`'s imports that mention the parameter, the last level's argument is
         // the effective binding (an intervening theory-view changes only the theory, not the value).
-        param_to_arg.insert(param.name.clone(), (**chain.last().expect("at least one level")).clone());
+        param_to_arg.insert(
+            param.name.clone(),
+            (**chain.last().expect("at least one level")).clone(),
+        );
     }
 
     // `M`'s regular imports with the parameter substitution applied (a bound parameter `X` in an import
     // `LIST{X}` becomes its argument — `LIST{ToN}` for a view, `LIST{Y}` for an enclosing parameter), then
     // its own declarations under the binding. Deduped via `visited`.
-    let imports: Vec<ModuleExpr> =
-        pm.imports.iter().map(|imp| subst_params_in_expr(&imp.expr, &param_to_arg, db)).collect();
+    let imports: Vec<ModuleExpr> = pm
+        .imports
+        .iter()
+        .map(|imp| subst_params_in_expr(&imp.expr, &param_to_arg, db))
+        .collect();
     for imp in &imports {
         collect_expr(imp, db, views, acc, visited, interner, scope)?;
     }
@@ -783,7 +896,10 @@ fn instantiate(
     }
     // Instantiated donation: variables/sorts inlined into the bubbles, so parse against the flattened
     // grammar (no distinct home) — D1a is scoped to plain named imports.
-    acc.add(instantiate_decls(decls, &bindings, &op_subst, interner), None);
+    acc.add(
+        instantiate_decls(decls, &bindings, &op_subst, interner),
+        None,
+    );
     Ok(())
 }
 
@@ -808,8 +924,11 @@ fn apply_view_op_recon(
     // wrong sort in the source grammar, and a bubble like `lt(A, B)` fails to parse. The module's own
     // variables must win here: drop every source declaration of an own-variable name, then re-add the own
     // declarations authoritatively.
-    let own_var_names: HashSet<String> =
-        d.vars.iter().flat_map(|v| v.names.iter().cloned()).collect();
+    let own_var_names: HashSet<String> = d
+        .vars
+        .iter()
+        .flat_map(|v| v.names.iter().cloned())
+        .collect();
     for vd in &mut src.vars {
         vd.names.retain(|n| !own_var_names.contains(n));
     }
@@ -818,6 +937,13 @@ fn apply_view_op_recon(
     let Some(mapper) = ViewOpSubst::new(&src, op_recon, interner)? else {
         return Ok(());
     };
+    // Identity attributes are ground term bubbles, not declaration metadata: a view's operator map must
+    // reconstruct mapped mixfix occurrences in them exactly as it does in statement terms.
+    for op in &mut d.ops {
+        if let Some(identity) = &mut op.attrs.id {
+            *identity = mapper.rewrite(identity, interner);
+        }
+    }
     for st in &mut d.statements {
         match st {
             Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => {
@@ -907,7 +1033,9 @@ fn resolve_arg(
     }
     match arg {
         ModuleExpr::Named(view_name) => {
-            let v = views.get(view_name).ok_or_else(|| format!("view `{view_name}` is not defined"))?;
+            let v = views
+                .get(view_name)
+                .ok_or_else(|| format!("view `{view_name}` is not defined"))?;
             if !v.params.is_empty() {
                 return Err(format!(
                     "parameterized view `{view_name}` must be instantiated with arguments"
@@ -929,11 +1057,15 @@ fn resolve_arg(
         }
         ModuleExpr::Instantiation(base, inner_args) => {
             let ModuleExpr::Named(view_name) = &**base else {
-                return Err("an instantiation argument must be a view name or a parameterized-view \
+                return Err(
+                    "an instantiation argument must be a view name or a parameterized-view \
                             instantiation"
-                    .into());
+                        .into(),
+                );
             };
-            let v = views.get(view_name).ok_or_else(|| format!("view `{view_name}` is not defined"))?;
+            let v = views
+                .get(view_name)
+                .ok_or_else(|| format!("view `{view_name}` is not defined"))?;
             if v.params.len() != inner_args.len() {
                 return Err(format!(
                     "view `{view_name}{{…}}` has {} argument(s) but `{view_name}` has {} parameter(s)",
@@ -952,8 +1084,11 @@ fn resolve_arg(
                 inner.insert(vp.name.clone(), r.binding);
             }
             let target = subst_params_in_expr(&v.to, &inner_to_arg, db);
-            let sort_image =
-                v.sort_maps.iter().map(|(a, b)| (a.clone(), inst_sort(b, &inner))).collect();
+            let sort_image = v
+                .sort_maps
+                .iter()
+                .map(|(a, b)| (a.clone(), inst_sort(b, &inner)))
+                .collect();
             let (op_subst, op_recon) = op_maps_of(v, i)?;
             Ok(ArgResolution {
                 binding: ParamBinding {
@@ -968,11 +1103,11 @@ fn resolve_arg(
                 op_recon,
             })
         }
-        ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => {
-            Err("an instantiation argument must be a view name or a parameterized-view instantiation \
+        ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => Err(
+            "an instantiation argument must be a view name or a parameterized-view instantiation \
                  (a sum/renaming argument is not supported)"
-                .into())
-        }
+                .into(),
+        ),
     }
 }
 
@@ -1019,9 +1154,18 @@ fn op_maps_of(
                 // `op f(A, B, …) to term <template>`: a prefix source applied to argument variables.
                 _ => {
                     let (name, formals) = op_pattern_formals(from, i).ok_or_else(|| {
-                        format!("view `{}`: a mixfix operator→term map is a follow-up", v.name)
+                        format!(
+                            "view `{}`: a mixfix operator→term map is a follow-up",
+                            v.name
+                        )
                     })?;
-                    op_recon.push((name, ReconTarget::Term { formals, template: to.clone() }));
+                    op_recon.push((
+                        name,
+                        ReconTarget::Term {
+                            formals,
+                            template: to.clone(),
+                        },
+                    ));
                 }
             },
         }
@@ -1033,9 +1177,7 @@ fn op_maps_of(
 /// base-names (the text before any `:sort` suffix), in order. `None` if it is not a prefix application of
 /// single-token argument variables (a mixfix source, or a non-variable argument — the follow-up case).
 fn op_pattern_formals(from: &[Token], i: &Interner) -> Option<(String, Vec<String>)> {
-    if from.len() < 3
-        || i.resolve(from[1].sym) != "("
-        || i.resolve(from[from.len() - 1].sym) != ")"
+    if from.len() < 3 || i.resolve(from[1].sym) != "(" || i.resolve(from[from.len() - 1].sym) != ")"
     {
         return None;
     }
@@ -1147,7 +1289,12 @@ fn subst_params_in_expr(
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
                     },
-                    RenameItem::Op { from, to, dom_range, attrs } => RenameItem::Op {
+                    RenameItem::Op {
+                        from,
+                        to,
+                        dom_range,
+                        attrs,
+                    } => RenameItem::Op {
                         from: subst_param_name(from, &names),
                         to: subst_param_name(to, &names),
                         dom_range: dom_range.as_ref().map(|(d, r)| {
@@ -1158,16 +1305,19 @@ fn subst_params_in_expr(
                         }),
                         attrs: attrs.clone(),
                     },
-                    RenameItem::Label { from, to } => {
-                        RenameItem::Label { from: from.clone(), to: to.clone() }
-                    }
+                    RenameItem::Label { from, to } => RenameItem::Label {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
                 })
                 .collect();
             ModuleExpr::Rename(Box::new(subst_params_in_expr(inner, map, db)), new_items)
         }
         ModuleExpr::Instantiation(base, args) => ModuleExpr::Instantiation(
             Box::new(subst_params_in_expr(base, map, db)),
-            args.iter().map(|a| subst_params_in_expr(a, map, db)).collect(),
+            args.iter()
+                .map(|a| subst_params_in_expr(a, map, db))
+                .collect(),
         ),
     }
 }
@@ -1182,7 +1332,12 @@ fn subst_param_name(name: &str, names: &HashMap<String, String>) -> String {
     for c in name.chars() {
         if matches!(c, '{' | '}' | ',') {
             if !ident.is_empty() {
-                out.push_str(names.get(ident.as_str()).map(String::as_str).unwrap_or(&ident));
+                out.push_str(
+                    names
+                        .get(ident.as_str())
+                        .map(String::as_str)
+                        .unwrap_or(&ident),
+                );
                 ident.clear();
             }
             out.push(c);
@@ -1191,7 +1346,12 @@ fn subst_param_name(name: &str, names: &HashMap<String, String>) -> String {
         }
     }
     if !ident.is_empty() {
-        out.push_str(names.get(ident.as_str()).map(String::as_str).unwrap_or(&ident));
+        out.push_str(
+            names
+                .get(ident.as_str())
+                .map(String::as_str)
+                .unwrap_or(&ident),
+        );
     }
     out
 }
@@ -1231,6 +1391,15 @@ fn instantiate_decls(
             var_inline.insert(n.clone(), v.sort.clone());
         }
     }
+    // An identity is a signature-owned ground term. It follows the same view/operator and parameter-sort
+    // substitution as statement terms, but never receives variable inlining (groundness is checked by the
+    // frontend when the rebuilt signature installs it).
+    let no_vars = HashMap::new();
+    for op in &mut d.ops {
+        if let Some(identity) = &mut op.attrs.id {
+            *identity = subst_bubble(identity, bindings, op_subst, &no_vars, i);
+        }
+    }
     // Rewrite statement bubbles: the views' operator maps (A1); each declared variable inlined as a
     // single-token colon variable at its instantiated sort (`H ↦ H:List{ToN}`); and parameter-sort
     // substitution inside glued source colon variables (`E:X$Elt ↦ E:Box{ToColor}`). The colon-variable
@@ -1246,7 +1415,9 @@ fn instantiate_decls(
                     *c = subst_bubble(c, bindings, op_subst, &var_inline, i);
                 }
             }
-            Statement::Mb { lhs, sort, cond, .. } => {
+            Statement::Mb {
+                lhs, sort, cond, ..
+            } => {
                 *lhs = subst_bubble(lhs, bindings, op_subst, &var_inline, i);
                 // The membership's *sort* is a whole sort name (possibly structured, `NeList{X}`):
                 // instantiate it as a sort, not as a term bubble.
@@ -1270,10 +1441,18 @@ fn instantiate_decls(
 /// Instantiate a membership's sort bubble: reassemble the (possibly structured) sort name, run it through
 /// [`inst_sort`] (`NeList{X} ↦ NeList{ToN}`, `X$Elt ↦ Nat`), and re-tokenize. Unchanged sorts keep their
 /// original tokens.
-fn inst_sort_bubble(sort: &[Token], bindings: &HashMap<String, ParamBinding>, i: &mut Interner) -> Vec<Token> {
+fn inst_sort_bubble(
+    sort: &[Token],
+    bindings: &HashMap<String, ParamBinding>,
+    i: &mut Interner,
+) -> Vec<Token> {
     let name: String = sort.iter().map(|t| i.resolve(t.sym)).collect();
     let new = inst_sort(&name, bindings);
-    if new == name { sort.to_vec() } else { tokenize(&new, i) }
+    if new == name {
+        sort.to_vec()
+    } else {
+        tokenize(&new, i)
+    }
 }
 
 /// Rewrite a statement bubble under an instantiation. A token that is a mapped source operator becomes its
@@ -1291,10 +1470,45 @@ fn subst_bubble(
     i: &mut Interner,
 ) -> Vec<Token> {
     let mut out = Vec::with_capacity(bubble.len());
-    for t in bubble {
+    for (idx, t) in bubble.iter().enumerate() {
         let text = i.resolve(t.sym).to_string();
+        let qualified_sort = text
+            .strip_prefix('.')
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                (idx > 0 && i.resolve(bubble[idx - 1].sym) == ".").then_some(text.as_str())
+            });
+        if let Some(sort) = qualified_sort {
+            let mapped_sort = inst_sort(sort, bindings);
+            if mapped_sort != sort {
+                let mapped = if text.starts_with('.') {
+                    format!(".{mapped_sort}")
+                } else {
+                    mapped_sort
+                };
+                let mut nt = *t;
+                nt.sym = i.intern(&mapped);
+                out.push(nt);
+                continue;
+            }
+        }
         if let Some(repl) = op_subst.get(&text) {
             out.extend(repl.iter().copied());
+            continue;
+        }
+        if let Some((base, count)) = text.rsplit_once('^')
+            && !base.is_empty()
+            && !count.is_empty()
+            && count.bytes().all(|b| b.is_ascii_digit())
+            && let Some(repl) = op_subst.get(base)
+            && let [target] = repl.as_slice()
+        {
+            // Compact iter syntax glues the scalar count to the source operator (`g^N`). A view maps
+            // operator identity, so re-root the token at its one-token target while retaining `N`.
+            let mut nt = *t;
+            let mapped = format!("{}^{count}", i.resolve(target.sym));
+            nt.sym = i.intern(&mapped);
+            out.push(nt);
             continue;
         }
         if let Some(sort) = var_inline.get(&text) {
@@ -1333,7 +1547,7 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
             .iter()
             .map(|a| match bindings.get(a.as_str()) {
                 Some(b) => b.view_name.clone(), // a bare parameter name → the view / argument name
-                None => inst_sort(a, bindings),  // nested structured / parameter sort
+                None => inst_sort(a, bindings), // nested structured / parameter sort
             })
             .collect();
         return format!("{base}{{{}}}", new_args.join(","));
@@ -1355,7 +1569,10 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
         return if b.by_param {
             format!("{}${s}", b.final_name)
         } else {
-            b.sort_image.get(s).cloned().unwrap_or_else(|| s.to_string())
+            b.sort_image
+                .get(s)
+                .cloned()
+                .unwrap_or_else(|| s.to_string())
         };
     }
     name.to_string()
@@ -1398,7 +1615,12 @@ fn canonical_key(expr: &ModuleExpr) -> String {
                 .iter()
                 .map(|it| match it {
                     RenameItem::Sort { from, to } => format!("sort {from} to {to}"),
-                    RenameItem::Op { from, to, dom_range: Some((d, r)), .. } => {
+                    RenameItem::Op {
+                        from,
+                        to,
+                        dom_range: Some((d, r)),
+                        ..
+                    } => {
                         format!("op {from} : {} -> {r} to {to}", d.join(" "))
                     }
                     RenameItem::Op { from, to, .. } => format!("op {from} to {to}"),
@@ -1447,11 +1669,26 @@ fmod TOP is protecting L . protecting R . endfm
 ";
         let (db, views, mut i) = db_of(src);
         let flat = flatten("TOP", &db, &views, &mut i).expect("flatten");
-        assert_eq!(flat.sorts, ["S"], "BASE's sort S appears once despite two import paths");
-        assert_eq!(flat.statements.len(), 1, "BASE's single equation is not duplicated");
-        let opnames: Vec<String> =
-            flat.ops.iter().map(|o| i.resolve(o.name[0].sym).to_string()).collect();
-        assert!(["a", "f", "l", "r"].iter().all(|n| opnames.contains(&n.to_string())));
+        assert_eq!(
+            flat.sorts,
+            ["S"],
+            "BASE's sort S appears once despite two import paths"
+        );
+        assert_eq!(
+            flat.statements.len(),
+            1,
+            "BASE's single equation is not duplicated"
+        );
+        let opnames: Vec<String> = flat
+            .ops
+            .iter()
+            .map(|o| i.resolve(o.name[0].sym).to_string())
+            .collect();
+        assert!(
+            ["a", "f", "l", "r"]
+                .iter()
+                .all(|n| opnames.contains(&n.to_string()))
+        );
     }
 
     /// An import-free module flattens to itself (so `load_program` handles single-module files).
@@ -1473,9 +1710,20 @@ fmod TOP is protecting L . protecting R . endfm
              fmod BOX{X :: TRIV} is sort Box{X} . op b : X$Elt -> Box{X} [ctor] . endfm\n",
         );
         let flat = flatten("BOX", &db, &views, &mut i).expect("flatten");
-        assert!(flat.sorts.contains(&"X$Elt".to_string()), "X$Elt present: {:?}", flat.sorts);
-        assert!(flat.sorts.contains(&"Box{X}".to_string()), "Box{{X}} present: {:?}", flat.sorts);
-        assert!(flat.params.is_empty(), "no formal parameters remain after flattening");
+        assert!(
+            flat.sorts.contains(&"X$Elt".to_string()),
+            "X$Elt present: {:?}",
+            flat.sorts
+        );
+        assert!(
+            flat.sorts.contains(&"Box{X}".to_string()),
+            "Box{{X}} present: {:?}",
+            flat.sorts
+        );
+        assert!(
+            flat.params.is_empty(),
+            "no formal parameters remain after flattening"
+        );
     }
 
     /// B-iv: instantiation `BOX{V}` resolves to the parameter sort's view image and the structured sort's
@@ -1491,13 +1739,35 @@ fmod TOP is protecting L . protecting R . endfm
              fmod USE is protecting BOX{V} . endfm\n",
         );
         let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
-        assert!(flat.sorts.contains(&"Box{V}".to_string()), "structured instance sort: {:?}", flat.sorts);
-        assert!(flat.sorts.contains(&"Hue".to_string()), "view target sort imported: {:?}", flat.sorts);
-        assert!(!flat.sorts.contains(&"X$Elt".to_string()), "parameter sort is substituted away");
-        assert!(!flat.sorts.contains(&"Box{X}".to_string()), "parameterized sort is instantiated");
+        assert!(
+            flat.sorts.contains(&"Box{V}".to_string()),
+            "structured instance sort: {:?}",
+            flat.sorts
+        );
+        assert!(
+            flat.sorts.contains(&"Hue".to_string()),
+            "view target sort imported: {:?}",
+            flat.sorts
+        );
+        assert!(
+            !flat.sorts.contains(&"X$Elt".to_string()),
+            "parameter sort is substituted away"
+        );
+        assert!(
+            !flat.sorts.contains(&"Box{X}".to_string()),
+            "parameterized sort is instantiated"
+        );
         // `wrap` now has domain `Hue` (the view image of `X$Elt`).
-        let wrap = flat.ops.iter().find(|o| i.resolve(o.name[0].sym) == "wrap").expect("wrap op");
-        assert_eq!(wrap.domain, ["Hue"], "X$Elt domain substituted to the view image");
+        let wrap = flat
+            .ops
+            .iter()
+            .find(|o| i.resolve(o.name[0].sym) == "wrap")
+            .expect("wrap op");
+        assert_eq!(
+            wrap.domain,
+            ["Hue"],
+            "X$Elt domain substituted to the view image"
+        );
         assert_eq!(wrap.range, "Box{V}");
     }
 
@@ -1517,7 +1787,11 @@ fmod TOP is protecting L . protecting R . endfm
         );
         let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
         for s in ["Hue", "Box{ToColor}", "Box{BoxV{ToColor}}"] {
-            assert!(flat.sorts.contains(&s.to_string()), "sort {s} present: {:?}", flat.sorts);
+            assert!(
+                flat.sorts.contains(&s.to_string()),
+                "sort {s} present: {:?}",
+                flat.sorts
+            );
         }
         // Both `wrap` overloads: the inner `Hue -> Box{ToColor}` and the outer `Box{ToColor} -> Box{…}`.
         let wraps: Vec<(&Vec<String>, &String)> = flat
@@ -1527,13 +1801,15 @@ fmod TOP is protecting L . protecting R . endfm
             .map(|o| (&o.domain, &o.range))
             .collect();
         assert!(
-            wraps.iter().any(|(d, r)| d.as_slice() == ["Hue"] && r.as_str() == "Box{ToColor}"),
+            wraps
+                .iter()
+                .any(|(d, r)| d.as_slice() == ["Hue"] && r.as_str() == "Box{ToColor}"),
             "inner wrap: {wraps:?}"
         );
         assert!(
-            wraps
-                .iter()
-                .any(|(d, r)| d.as_slice() == ["Box{ToColor}"] && r.as_str() == "Box{BoxV{ToColor}}"),
+            wraps.iter().any(
+                |(d, r)| d.as_slice() == ["Box{ToColor}"] && r.as_str() == "Box{BoxV{ToColor}}"
+            ),
             "outer wrap: {wraps:?}"
         );
     }
@@ -1549,10 +1825,22 @@ fmod TOP is protecting L . protecting R . endfm
              fmod PAIR{X :: TRIV} is protecting LIST{X} . op two : X$Elt -> List{X} . endfm\n",
         );
         let flat = flatten("PAIR", &db, &views, &mut i).expect("flatten");
-        assert!(flat.sorts.contains(&"List{X}".to_string()), "List{{X}} present: {:?}", flat.sorts);
-        assert!(flat.sorts.contains(&"X$Elt".to_string()), "X$Elt present: {:?}", flat.sorts);
+        assert!(
+            flat.sorts.contains(&"List{X}".to_string()),
+            "List{{X}} present: {:?}",
+            flat.sorts
+        );
+        assert!(
+            flat.sorts.contains(&"X$Elt".to_string()),
+            "X$Elt present: {:?}",
+            flat.sorts
+        );
         // `cons` came from `LIST{X}` with its parameter `E` renamed to `X`: `X$Elt List{X} -> List{X}`.
-        let cons = flat.ops.iter().find(|o| i.resolve(o.name[0].sym) == "cons").expect("cons");
+        let cons = flat
+            .ops
+            .iter()
+            .find(|o| i.resolve(o.name[0].sym) == "cons")
+            .expect("cons");
         assert_eq!(cons.domain, ["X$Elt", "List{X}"]);
         assert_eq!(cons.range, "List{X}");
     }

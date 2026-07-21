@@ -82,7 +82,11 @@ impl IntSystem {
         if self.upper_bounds.is_empty() {
             self.upper_bounds = vec![UNBOUNDED; self.nr_variables];
         } else {
-            debug_assert_eq!(self.upper_bounds.len(), self.nr_variables, "row size differs");
+            debug_assert_eq!(
+                self.upper_bounds.len(),
+                self.nr_variables,
+                "row size differs"
+            );
         }
     }
 
@@ -119,7 +123,11 @@ impl IntSystem {
             if self.upper_bounds[i] == 1 {
                 frozen.insert(i);
             }
-            self.states.push(State { assignment, residue, frozen: frozen.clone() });
+            self.states.push(State {
+                assignment,
+                residue,
+                frozen: frozen.clone(),
+            });
             frozen.insert(i);
         }
         self.current = State::empty(self.nr_variables, nr_equations);
@@ -130,7 +138,8 @@ impl IntSystem {
     /// Ensure `states[index]` is writable (the search stack grows past `nr_variables`).
     fn ensure_state(&mut self, index: usize) {
         while self.states.len() <= index {
-            self.states.push(State::empty(self.nr_variables, self.eqns.len()));
+            self.states
+                .push(State::empty(self.nr_variables, self.eqns.len()));
         }
     }
 
@@ -261,7 +270,9 @@ mod tests {
         let set: BTreeSet<Vec<i32>> = sols.iter().cloned().collect();
         assert_eq!(
             set,
-            [vec![1, 0, 1], vec![0, 1, 1]].into_iter().collect::<BTreeSet<_>>(),
+            [vec![1, 0, 1], vec![0, 1, 1]]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
             "Hilbert basis of x + y = z"
         );
         // Minimality: no solution dominates another.

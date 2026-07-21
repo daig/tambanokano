@@ -1,26 +1,31 @@
-# Migration audit — tnk vs Maude 3.5.1 (2026-07-01)
+# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-19)
 
-> **Ledger state (2026-07-05, correctness goal `docs/migration/correctness-goal.md`):** every finding
-> in the goal's frozen manifest is closed — `tools/audit-scoreboard.sh` = **77/77 PASS** (74 at goal
-> close; §3.10's post-goal E-fixtures grew the denominator), the legacy
-> corpus is **87/87 CLEAN** (`tools/legacy-sweep.sh`; two counts-only recorded divergences of the
-> §3.3 [D] matchrew/exploration-schedule class were ratified by the user 2026-07-05 in
-> `conformance/accepted-diffs/README.md`), `cargo test --release` fully green, and the stock
-> `term-order.maude` / `machine-int.maude` / `linear.maude` load clean through the binary. Findings
-> below carry per-item `RESOLVED (<commit>)` annotations; still-open items are the out-of-scope
-> subsystems (§2/roadmap E–G) and the §3.7 cosmetic classes.
+> **Current ledger (2026-07-19):** the correctness-goal corpus remains closed. Symbolic phases S1 and S2
+> are complete: `tools/subsystems-scoreboard.sh -p U` = **27/27 PASS** over 676 commands and
+> `tools/subsystems-scoreboard.sh -p V` = **21/21 PASS** over 289 commands. The frozen gates were re-run
+> on the completed S2 tree: audit **77/77**, legacy **87/87**, `cargo test --release` **394 passed**, and
+> `term-order.maude` / `machine-int.maude` / `linear.maude` load clean. The LEXICAL hooks, prefix
+> iter-input grammar, compact command iteration, and the Diophantine/bipartite AC matcher remain landed.
+> S3 narrowing is next and **READY**: 15 frozen fixtures, 168 primary commands, all prerequisites closed,
+> the formerly nonterminating probe bounded, and the legacy-meta policy fixed. Its current **0/15** gate
+> is the expected preimplementation baseline; all 15 return without an oracle timeout.
+> Uncommitted identifiers in prose below are explicitly marked as 2026-07-19 working-tree results.
+>
+> The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close; §3.10's
+> post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two counts-only
+> matchrew/exploration-schedule divergences are recorded in `conformance/accepted-diffs/README.md`.
 
 Independent differential audit of the Rust port against the C++ oracle (`maude` 3.5.1 on PATH; source at
 `~/code/maude-lang/maude`, same version). Method: a shared normalizing diff harness (strips only `====`
-separators, banner, `Bye.`, timing tails, and the two documented LEXICAL/LOOP-MODE build errors); roughly a
+separators, banner, `Bye.`, timing tails, and designated non-semantic diagnostic blocks); roughly a
 thousand differential runs across seven surface-area sweeps (the 231-test C++ suite, equational theories,
 builtins, module algebra, commands, syntax/printing, dynamics/meta) plus main-session architecture probes;
 every headline finding reproduced with a minimal case through both binaries (the highest-severity ones
 re-verified independently of the sweep that found them). Repo docs (`docs/migration/*`) were used as leads
 only — several claims were found stale in both directions (too pessimistic: ACU value printing, kind-sort
 declarations, erewrite round-robin all now conform; too optimistic: collapse-at-top "value same",
-`metaPrettyPrint` done, flatten "counts only"). The port's own test suite is green (312/312) and its 88
-conformance fixtures were re-diffed against the live oracle.
+`metaPrettyPrint` done, flatten "counts only"). At initial audit time the port's test suite was 312/312 and
+its 88 conformance fixtures were re-diffed against the live oracle; the current counts are in the ledger above.
 
 **Bottom line.** The core engine — reduction, all four axiom-theory matchers on their common paths, sorts/
 memberships, rules/search/strategies, the data-type builtins, the module algebra on its exercised paths, and
@@ -44,10 +49,10 @@ Everything in this list was re-verified against the live oracle this session (no
   (`eq`/`ceq` with `=`/`:=` fragments), memberships, rules (`rl`/`crl` incl. `=>` conditions), `owise`,
   `nonexec`, `frozen`, `ctor`, `iter` (print side), `strat` laziness (values AND counts), `format`
   directives, `metadata`/`label` (trailing form).
-- **The real 3.5.1 prelude loads** except `LEXICAL` and `LOOP-MODE` (documented). All data types work:
-  NAT/INT/RAT/FLOAT/STRING/QID/CONVERSION/RANDOM (exact MT19937 seed-0 sequence)/COUNTER/BOUND; containers
-  LIST/SET/MAP/ARRAY incl. parameterized instantiation; ~360 builtin edge-case probes conformant outside the
-  bugs in §3.
+- **The real 3.5.1 prelude loads** except `LOOP-MODE`. LEXICAL's `tokenize`/`printTokens` hooks are now
+  implemented. All data types work: NAT/INT/RAT/FLOAT/STRING/QID/CONVERSION/RANDOM (exact MT19937 seed-0
+  sequence)/COUNTER/BOUND; containers LIST/SET/MAP/ARRAY incl. parameterized instantiation; ~360 builtin
+  edge-case probes conformant outside the bugs in §3.
 - **Theories.** Free/AC/ACU/AU/C/CUI/S matching on confluent common paths: values, sorts, counts. Non-linear
   AC, cross-argument bindings, free/AC/AU alternation, extension matching at the top of larger subjects,
   two-sided `id:` with assoc/comm, `comm idem`/`assoc comm idem`, preregularity least-sort picks, error-sort
@@ -73,6 +78,9 @@ Everything in this list was re-verified against the live oracle this session (no
   metaPrettyPrint on binary-nested inputs — including `upModule` of an *instantiated* parameterized module
   (`upModule('LIST`{Nat`})` is byte-identical). The flat-assoc reader gap and parameterized-module
   up-translation losses are in §3.2.
+- **Order-sorted unification** modulo free/S/CUI/AC/ACU/A/AU, including irredundant filtering, disjoint and
+  legacy/current META descent, incomplete associative search, exact solution order, duplicate behavior, and
+  fresh numbering. Durable gate: 27/27 S1 fixtures, 676 commands, byte-exact against Maude 3.5.1.
 - **Objects**: `omod` desugaring, class completion, plain and object-message-fair `erewrite` on the
   bank/ping-pong shapes, STD-STREAM scripted IO.
 - **Robustness beyond Maude in two spots** (divergence in tnk's favor): a 300k-deep term reduce+print works
@@ -84,20 +92,18 @@ Everything in this list was re-verified against the live oracle this session (no
 
 ## 2. Intended features not built yet
 
-Whole subsystems (all planned in `roadmap.md`, all failing *gracefully* today with clear errors):
+Whole subsystems still planned in `roadmap.md`:
 
-- **Unification / variants / narrowing** (`unify`, `variant unify/match`, `get variants`, `vu-narrow`,
-  `fvu-narrow`) — commands rejected cleanly; META declarations present but inert.
+- **Variants / narrowing** (`variant unify/match`, `get variants`, `vu-narrow`, `fvu-narrow`) — commands
+  remain deferred; their META declarations are inert. Base `unify` and the `metaUnify` family are complete.
 - **SMT** (`smt-search`, `check`; `smt.maude` needs `SMT_Symbol`) and the **model checker**
   (`model-checker.maude`: `SatSolverSymbol`/`ModelCheckerSymbol`).
 - **Meta-interpreters** (`metaInterpreter.maude`: `InterpreterManagerSymbol`).
-- **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Note: per the revised
-  D5 decision (2026-06-30) these are now *intentionally out of scope for the engine* (host-embedding model);
-  the audit records the consequence: existing Maude IO programs will not run unmodified, and `process.maude`
-  additionally trips over the missing `sload`.
-- **LOOP-MODE / LEXICAL** (the two prelude modules that don't build), Full Maude, LaTeX output.
-- **`memo`** (parsed, ignored) and the **Diophantine/bipartite AC matcher** (naive backtracking stands in;
-  plan exists in `ac-matcher-plan.md`).
+- **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Per revised D5 these
+  are intentionally out of scope for the engine (host-embedding model); existing Maude IO programs do not
+  run unmodified, and `process.maude` additionally requires `sload`.
+- **LOOP-MODE**, Full Maude, and LaTeX output. LEXICAL is no longer in this list.
+- **`memo`** remains parsed but ignored.
 - **Tracing inside `search`** (and inside a rewrite-condition's nested `=>` search): with `set trace on`,
   Maude prints the per-rule trace blocks during the search; tnk prints none (verified — results and counts
   unaffected). `reduce`/`rewrite` tracing itself conforms.
@@ -276,10 +282,9 @@ Each of these breaks real specs; several break stock library files.
   context-dependent, which Maude's module algebra forbids.
 - **[N] Glued rational literals never parse**: **RESOLVED (04f7515; the 1/6+1/6 count via 6e963ae's lazy ACU merge).** `reduce in RAT : 1/6 .` → no parse (spaced `1 / 6` works);
   tnk *prints* `1/6`, so its own output doesn't re-read. Fixtures avoided the glued form entirely.
-- **[N] Numeric literal classes capped/missing**: **RESOLVED (04f7515 + 5028a8e bignum facade).** integers > 2^64−1 → `bad numeral` (tnk computes and
-  prints them fine — asymmetric); float forms `1.`, `.5`, `1.e3`, `1e3`, `Infinity` rejected (the lexer
-  unit test asserts Maude rejects these — it doesn't); iter input `s_^k(t)` unparseable at ANY k (tnk
-  prints that form for k ≥ 2).
+- **[N] Numeric literal classes capped/missing:** **RESOLVED (04f7515 + 5028a8e bignum facade; prefix
+  iter-input grammar completed in the 2026-07-19 working tree).** This covered integers beyond `u64`,
+  Maude's float token forms, and `s_^k(t)` input. The latter now round-trips the same notation tnk prints.
 - **[N] `eq [label] : lhs = rhs .` (leading bracketed labels on eq/ceq/mb/cmb) rejected** **RESOLVED (04f7515.)** — only rl/crl
   accept them; the ubiquitous labeled-equation style kills whole modules.
 - **[N] A single bad statement kills its whole module** **RESOLVED (04f7515 — statement dropped, module kept.)** (Maude drops the statement, keeps the module) —
@@ -454,8 +459,7 @@ denominator-growth rule.
   is length-first (ACU_/AU_DagNode `compareArguments`) — observable in `_xor_` soups of `_and_`
   conjunctions; (iii) float `-0.0` normalizes to `+0.0` at Term/dag construction ("don't allow
   IEEE-754 -0.0", floatTerm.cc), so structural and value equality of float zeros coincide. The three
-  `s^k`-notation commands of the reference test stay with the §3.4 iter-input-notation finding;
-  fixture E1a spells them as nested applications.
+  `s^k`-notation commands now use the implemented prefix-iteration input grammar and are covered by S1.
 - **[E2] Imported variable aliases shadowed the module's own in commands (rejection + wrong sort —
   §3.4 class).** **RESOLVED (with fixture E2a).** The flatten's shared first-wins variable namespace
   let prelude BOOL-OPS's `vars A B C : Bool` capture those names for the command grammar of every

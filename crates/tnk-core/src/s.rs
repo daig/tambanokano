@@ -53,6 +53,14 @@ impl SLhs {
         let mut t = lhs;
         loop {
             match t {
+                Term::Iter {
+                    symbol: s,
+                    count: n,
+                    arg,
+                } if s == symbol => {
+                    count = count.add(&n);
+                    t = *arg;
+                }
                 Term::Op { symbol: s, args } if s == symbol && args.len() == 1 => {
                     count = count.add(&Nat::one());
                     t = args.into_iter().next().unwrap();
@@ -65,7 +73,10 @@ impl SLhs {
         }
         debug_assert!(!count.is_zero(), "an S pattern has at least one successor");
         let sub = match t {
-            Term::Var(v) => SSub::Var { index: v.index, sort: v.sort },
+            Term::Var(v) => SSub::Var {
+                index: v.index,
+                sort: v.sort,
+            },
             other => {
                 // Any non-variable sub-pattern (ground / free alien / theory-rooted) matches the base
                 // through the full matcher seam in `next` (`enumerate_alien_solutions`).
@@ -105,7 +116,11 @@ impl SLhs {
             }
             SSub::Var { index, sort } => {
                 // No extension: X absorbs the whole surplus (residue 0).
-                SState::VarWhole { index: *index, sort: *sort, j: diff }
+                SState::VarWhole {
+                    index: *index,
+                    sort: *sort,
+                    j: diff,
+                }
             }
             SSub::Pat { pat, vars } => {
                 if !ext_allowed && !diff.is_zero() {
@@ -155,13 +170,25 @@ enum SState {
     /// `diff − j`. Lazy because `diff` may be astronomically large. `floor` is 0 for a peeled `s^k X`
     /// pattern and 1 for a bare variable (Maude's `S_Subproblem` `mustMatchAtLeast`, so the matched
     /// portion keeps at least one successor).
-    VarExt { index: u32, sort: SortId, diff: Nat, next_j: Option<Nat>, floor: Nat },
+    VarExt {
+        index: u32,
+        sort: SortId,
+        diff: Nat,
+        next_j: Option<Nat>,
+        floor: Nat,
+    },
     /// Variable, no extension: a single solution `X = s^j(base)`, residue 0.
     VarWhole { index: u32, sort: SortId, j: Nat },
     /// Non-variable sub-pattern matched against the base (through the full matcher seam, so it may be
     /// theory-rooted), with a fixed `residue` (`diff`). Multi-solution: `recorded` holds the per-solution
     /// variable snapshots (enumerated lazily on the first `next`), `cursor` the replay position.
-    Pat { pat: Term, vars: Vec<u32>, residue: Nat, recorded: Option<Vec<Vec<(u32, DagId)>>>, cursor: usize },
+    Pat {
+        pat: Term,
+        vars: Vec<u32>,
+        residue: Nat,
+        recorded: Option<Vec<Vec<(u32, DagId)>>>,
+        cursor: usize,
+    },
     /// Exhausted (the single-solution arms transition here after yielding once).
     Done,
 }
@@ -228,7 +255,12 @@ impl SSubproblem {
                 }
             }
             let (binds, residue) = match &mut self.state {
-                SState::Pat { recorded: Some(sols), cursor, residue, .. } => {
+                SState::Pat {
+                    recorded: Some(sols),
+                    cursor,
+                    residue,
+                    ..
+                } => {
                     if *cursor >= sols.len() {
                         return false;
                     }
@@ -252,7 +284,13 @@ impl SSubproblem {
             // residue)` (releasing the `self.state` borrow), build `s^j(base)`, bind. Sort-violating `j`
             // skips to the next.
             let (index, sort, j, residue) = match &mut self.state {
-                SState::VarExt { index, sort, diff, next_j, floor } => match next_j.take() {
+                SState::VarExt {
+                    index,
+                    sort,
+                    diff,
+                    next_j,
+                    floor,
+                } => match next_j.take() {
                     None => return false,
                     Some(j) => {
                         // Descend to `floor` (0 for `s^k X`, 1 for a bare variable — Maude's
@@ -320,6 +358,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 collect_vars(a, out);
             }
         }
+        Term::Iter { arg, .. } => collect_vars(arg, out),
     }
 }
 
@@ -358,7 +397,9 @@ mod tests {
         let mut bindings: Vec<DagId> = Vec::new();
         {
             let (sig, rt) = e.parts_mut();
-            let Some(mut sp) = lhs.match_(rt, subject, ext) else { return Vec::new() };
+            let Some(mut sp) = lhs.match_(rt, subject, ext) else {
+                return Vec::new();
+            };
             while sp.next(rt, sig, &mut subst) {
                 bindings.push(subst.get(0).expect("X bound"));
             }
@@ -374,7 +415,11 @@ mod tests {
         let z0 = e.make_const(z);
         let subject = e.make_iter(s, 3, z0); // s^3(0)
         let pat = Term::op(s, vec![Term::var(0, nat)]); // s X
-        assert_eq!(solutions(&mut e, pat, subject, true), vec![2, 1, 0], "X = s^2 0, s 0, 0");
+        assert_eq!(
+            solutions(&mut e, pat, subject, true),
+            vec![2, 1, 0],
+            "X = s^2 0, s 0, 0"
+        );
     }
 
     /// Without extension a variable sub-pattern absorbs the *whole* surplus — the single collector
@@ -385,7 +430,11 @@ mod tests {
         let z0 = e.make_const(z);
         let subject = e.make_iter(s, 3, z0);
         let pat = Term::op(s, vec![Term::var(0, nat)]); // s X
-        assert_eq!(solutions(&mut e, pat, subject, false), vec![2], "only X = s^2 0 (whole)");
+        assert_eq!(
+            solutions(&mut e, pat, subject, false),
+            vec![2],
+            "only X = s^2 0 (whole)"
+        );
     }
 
     /// A pattern needing more successors than the subject has does not match; a ground sub matches only
@@ -397,6 +446,9 @@ mod tests {
         let s1 = e.make_iter(s, 1, z0); // s^1(0)
         // s s X <=? s 0 : pattern needs 2 successors, subject has 1 → no match.
         let pat = Term::op(s, vec![Term::op(s, vec![Term::var(0, nat)])]);
-        assert!(solutions(&mut e, pat, s1, true).is_empty(), "s s X !<=? s 0");
+        assert!(
+            solutions(&mut e, pat, s1, true).is_empty(),
+            "s s X !<=? s 0"
+        );
     }
 }

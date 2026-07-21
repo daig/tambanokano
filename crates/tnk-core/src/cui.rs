@@ -16,7 +16,7 @@
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
-use crate::symbol::SymbolId;
+use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
 use crate::theory::enumerate_alien_solutions;
 
@@ -40,14 +40,19 @@ impl CuiLhs {
                 let p1 = args.pop().unwrap();
                 (p1, p2)
             }
-            Term::Var(_) | Term::Na { .. } => {
-                unreachable!("compile is only called on an application lhs")
+            Term::Var(_) | Term::Iter { .. } | Term::Na { .. } => {
+                unreachable!("compile is only called on a CUI application lhs")
             }
         };
         let mut var_indices = Vec::new();
         collect_vars(&p1, &mut var_indices);
         collect_vars(&p2, &mut var_indices);
-        CuiLhs { symbol, p1, p2, var_indices }
+        CuiLhs {
+            symbol,
+            p1,
+            p2,
+            var_indices,
+        }
     }
 
     /// Match the binary pattern against a subject. Pairings are enumerated lazily in
@@ -79,24 +84,60 @@ impl CuiLhs {
                 let (s1, s2) = (args[0], args[1]);
                 if ext_allowed && identity.is_some() {
                     // Identity-first: the collapse-extension options precede the whole matches.
-                    pairings.push(Pairing { t1: Target::Dag(s1), t2: Target::Identity, residue: Some(s2) });
-                    pairings.push(Pairing { t1: Target::Dag(s2), t2: Target::Identity, residue: Some(s1) });
-                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(s1), residue: Some(s2) });
-                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(s2), residue: Some(s1) });
+                    pairings.push(Pairing {
+                        t1: Target::Dag(s1),
+                        t2: Target::Identity,
+                        residue: Some(s2),
+                    });
+                    pairings.push(Pairing {
+                        t1: Target::Dag(s2),
+                        t2: Target::Identity,
+                        residue: Some(s1),
+                    });
+                    pairings.push(Pairing {
+                        t1: Target::Identity,
+                        t2: Target::Dag(s1),
+                        residue: Some(s2),
+                    });
+                    pairings.push(Pairing {
+                        t1: Target::Identity,
+                        t2: Target::Dag(s2),
+                        residue: Some(s1),
+                    });
                 }
-                pairings.push(Pairing { t1: Target::Dag(s1), t2: Target::Dag(s2), residue: None });
+                pairings.push(Pairing {
+                    t1: Target::Dag(s1),
+                    t2: Target::Dag(s2),
+                    residue: None,
+                });
                 if comm {
-                    pairings.push(Pairing { t1: Target::Dag(s2), t2: Target::Dag(s1), residue: None });
+                    pairings.push(Pairing {
+                        t1: Target::Dag(s2),
+                        t2: Target::Dag(s1),
+                        residue: None,
+                    });
                 }
             }
             _ => {
                 // Collapse arms against a non-`f` subject (whole matches, no residue).
                 if identity.is_some() {
-                    pairings.push(Pairing { t1: Target::Dag(subject), t2: Target::Identity, residue: None });
-                    pairings.push(Pairing { t1: Target::Identity, t2: Target::Dag(subject), residue: None });
+                    pairings.push(Pairing {
+                        t1: Target::Dag(subject),
+                        t2: Target::Identity,
+                        residue: None,
+                    });
+                    pairings.push(Pairing {
+                        t1: Target::Identity,
+                        t2: Target::Dag(subject),
+                        residue: None,
+                    });
                 }
                 if idem {
-                    pairings.push(Pairing { t1: Target::Dag(subject), t2: Target::Dag(subject), residue: None });
+                    pairings.push(Pairing {
+                        t1: Target::Dag(subject),
+                        t2: Target::Dag(subject),
+                        residue: None,
+                    });
                 }
                 if pairings.is_empty() {
                     return None;
@@ -148,6 +189,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
                 collect_vars(a, out);
             }
         }
+        Term::Iter { arg, .. } => collect_vars(arg, out),
     }
 }
 
@@ -156,7 +198,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
 /// through the full matcher seam, so a theory-rooted argument needs `&mut Runtime` — then replayed.
 pub(crate) struct CuiSubproblem {
     symbol: SymbolId,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     p1: Term,
     p2: Term,
     var_indices: Vec<u32>,
@@ -250,7 +292,9 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(2);
         let (sig, rt) = e.parts_mut();
-        let mut sp = lhs.match_(rt, sig, subject, false).expect("f(X,Y) matches f(a,b)");
+        let mut sp = lhs
+            .match_(rt, sig, subject, false)
+            .expect("f(X,Y) matches f(a,b)");
         let mut got: Vec<(Option<DagId>, Option<DagId>)> = Vec::new();
         while sp.next(rt, sig, &mut subst) {
             got.push((subst.get(0), subst.get(1)));

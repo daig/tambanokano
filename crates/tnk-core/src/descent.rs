@@ -54,6 +54,15 @@ impl MetaCtx<'_> {
     pub fn sort_name(&self, s: SortId) -> &str {
         self.sig.sorts().name(s)
     }
+    /// Structural equality in the current meta-module engine. DAG ids from separately parsed commands
+    /// need not be pointer-equal even when they denote the same reflected term.
+    pub fn deep_equal(&self, lhs: DagId, rhs: DagId) -> bool {
+        self.rt.deep_equal(lhs, rhs)
+    }
+    /// Pin a meta-term DAG while a persistent descent cache holds its id across commands.
+    pub fn root(&self, id: DagId) -> crate::root::RootGuard {
+        self.rt.root(id)
+    }
 
     /// Build an atomic constant (string / quoted-id / float) for `sym`.
     pub fn make_na(&mut self, sym: SymbolId, value: NaValue) -> DagId {
@@ -64,14 +73,54 @@ impl MetaCtx<'_> {
     pub fn app(&mut self, sym: SymbolId, args: Vec<DagId>) -> DagId {
         self.rt.rebuild(self.sig, sym, args)
     }
+    /// Build an overloaded constant at an explicit declaration range. Nullary overloads have no
+    /// argument sorts from which ordinary `app` construction could select the intended declaration.
+    pub fn constant_at_sort(&mut self, name: &str, sort_name: &str) -> Option<DagId> {
+        let sort = (0..self.sig.sorts().num_sorts())
+            .map(|index| SortId::from_raw(index as u32))
+            .find(|&sort| self.sig.sorts().name(sort) == sort_name)?;
+        let symbol = self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name
+                && symbol
+                    .decls()
+                    .iter()
+                    .any(|decl| decl.domain.is_empty() && decl.range == sort))
+            .then_some(id)
+        })?;
+        Some(self.rt.make_const_at_sort(self.sig, symbol, sort))
+    }
     /// Build an `iter` successor `sym^count(arg)` in the current engine (`downTerm`'s `'s_^n[t]`).
     pub fn make_iter(&mut self, sym: SymbolId, count: u64, arg: DagId) -> DagId {
-        self.rt.make_s(self.sig, sym, crate::num::Nat::from_u64(count), arg)
+        self.rt
+            .make_s(self.sig, sym, crate::num::Nat::from_u64(count), arg)
+    }
+    /// Materialize the exact `zeroTerm` attached to an `iter` successor.
+    /// Resolve the concrete `iter` symbol that owns a `zeroTerm`, avoiding unrelated same-name
+    /// overloads selected by the generic name/arity table.
+    pub fn resolve_iter(&self, name: &str) -> Option<SymbolId> {
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name && self.sig.succ_zero(id).is_some()).then_some(id)
+        })
+    }
+    pub fn iter_zero(&mut self, succ: SymbolId) -> Option<DagId> {
+        let zero = self.sig.succ_zero(succ)?;
+        let domain = *self.sig.symbol(succ).decls().first()?.domain.first()?;
+        let sort = self
+            .sig
+            .symbol(zero)
+            .decls()
+            .iter()
+            .map(|decl| decl.range)
+            .find(|&range| self.sig.sorts().leq(range, domain))?;
+        Some(self.rt.make_const_at_sort(self.sig, zero, sort))
     }
     /// Build an `iter` successor with a **decimal** (unbounded) count — for a `Nat` result that does not
     /// fit `u64` (the legacy `metaUnify` next-index). `None` if `count` is not a decimal numeral.
     pub fn make_iter_decimal(&mut self, sym: SymbolId, count: &str, arg: DagId) -> Option<DagId> {
-        Some(self.rt.make_s(self.sig, sym, crate::num::Nat::from_decimal(count)?, arg))
+        Some(
+            self.rt
+                .make_s(self.sig, sym, crate::num::Nat::from_decimal(count)?, arg),
+        )
     }
     /// Resolve an operator by canonical name + arity in the **current** module (the engine the redex is
     /// reducing in) — for building result constants (`true`/`false`/`leastSort`'s qids resolve from

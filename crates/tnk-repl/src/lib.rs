@@ -11,24 +11,28 @@ mod trace;
 mod wrap;
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::{tokenize, Interner, Token, TokKind};
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
+use tnk_frontend::lex::{Interner, TokKind, Token, tokenize};
 use tnk_frontend::load::{
-    build_command_dag, command_echo, erewrite_command, format_matchers,
-    frewrite_command, match_command, render_unifier, rewrite_command, search_command, unify_command,
-    InternerNames, LoadedModule,
+    InternerNames, LoadedModule, build_command_dag, command_echo,
+    command_variable_display_name, erewrite_command, format_matchers, frewrite_command,
+    match_command, maude_variable_name_rank, narrow_command, render_unifier, rewrite_command,
+    search_command, unify_command, variant_command, variant_match_command, variant_unify_command,
 };
 use tnk_frontend::pretty::print_pretty;
-use tnk_frontend::surface::ast::{Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl};
+use tnk_frontend::surface::ast::{
+    Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl,
+    NarrowDisplay,
+};
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
 use tnk_modules::load::{flatten_and_build, module_dep_names, view_dep_names};
-use tnk_modules::meta::MetaDescent;
-use tnk_modules::view::{validate_view, ViewDb};
-use trace::{render_trace, TraceFlags};
+use tnk_modules::meta::{MetaDescent, MetaState};
+use tnk_modules::view::{ViewDb, validate_view};
+use trace::{TraceFlags, render_trace};
 
 /// The result of evaluating one input submission: the text to print, and whether to exit the loop.
 #[derive(Debug, Default)]
@@ -47,6 +51,9 @@ pub struct Repl {
     modules: HashMap<String, LoadedModule>,
     /// Validated view definitions (B-ii), keyed by name.
     views: ViewDb,
+    /// Reflection-core search state retained across commands, including Maude's metalevel
+    /// variant-unification cache.
+    meta_state: MetaState,
     /// The direct dependency set of every defined module **and** view, keyed by name (a module/view name →
     /// the module/view names its flatten closure references directly). Maintained on every (re)definition
     /// so that redefining a name can re-flatten its transitive dependents (A4c): a redefinition of `M`
@@ -81,6 +88,9 @@ pub struct Repl {
     /// `match`/`xmatch`/`unify` (the only commands whose output the flag affects — `reduce`/`rewrite`
     /// timing tails are already normalized away). Other timing-tail lines are hardcoded 0ms.
     show_timing: bool,
+    show_breakdown: bool,
+    /// `set verbose on|off`: show narrowing fold decisions and terminal state counts.
+    verbose: bool,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -90,6 +100,11 @@ enum Continuation {
     /// A `search` session (the state graph + the goal's variable index for rendering). Boxed: the search
     /// state graph is much larger than a `Rewriting`, so this keeps the enum (and the `last` slot) small.
     Search(Box<SearchSession>),
+    /// A folding-variant enumeration, including its external numbering and output mode.
+    Variants(Box<VariantSession>),
+    /// A plain/filtered variant-unification enumeration.
+    VariantUnifiers(Box<VariantUnifySession>),
+    Narrow(Box<NarrowSession>),
 }
 
 /// A `search` session plus what the REPL needs to render and resume it.
@@ -99,6 +114,40 @@ struct SearchSession {
     vars: VarIndex,
 }
 
+/// A `get variants` session plus the source names needed for substitution rendering.
+struct VariantSession {
+    search: tnk_core::variant::VariantSearch,
+    var_names: Vec<String>,
+    irredundant: bool,
+    reported_total: bool,
+}
+
+
+struct VariantUnifySession {
+    search: tnk_core::variant::VariantSearch,
+    var_names: Vec<String>,
+    upfront: bool,
+    matching: bool,
+    subject: Option<DagId>,
+    restorations: Vec<(DagId, DagId)>,
+    fresh_base: String,
+    prepared: bool,
+    exhausted: bool,
+    reported_total: bool,
+    next_number: u64,
+    stream: tnk_core::variant::FilteredVariantUnifierStream,
+}
+
+struct NarrowSession {
+    search: tnk_core::narrow::NarrowSearch,
+    variables: VarIndex,
+    initial_variable_count: usize,
+    initial_variables: Option<Vec<VarIndex>>,
+    initial_echoes: Vec<String>,
+    next_number: u64,
+    path: bool,
+}
+
 impl Repl {
     pub fn new(color: bool) -> Self {
         Self {
@@ -106,6 +155,7 @@ impl Repl {
             db: ModuleDb::new(),
             modules: HashMap::new(),
             views: ViewDb::new(),
+            meta_state: MetaState::default(),
             deps: HashMap::new(),
             order: Vec::new(),
             view_order: Vec::new(),
@@ -117,6 +167,8 @@ impl Repl {
             include_bool: false,
             loaded_files: std::collections::HashSet::new(),
             show_timing: true,
+            show_breakdown: false,
+            verbose: false,
         }
     }
 
@@ -156,7 +208,10 @@ impl Repl {
                 buffer.clear();
                 append_block(&mut output, &ev.output);
                 if ev.exit {
-                    return Eval { output: output.trim_end().to_string(), exit: true };
+                    return Eval {
+                        output: output.trim_end().to_string(),
+                        exit: true,
+                    };
                 }
             }
         }
@@ -166,7 +221,10 @@ impl Repl {
             let ev = self.dispatch_one(&buffer);
             append_block(&mut output, &ev.output);
         }
-        Eval { output: output.trim_end().to_string(), exit: false }
+        Eval {
+            output: output.trim_end().to_string(),
+            exit: false,
+        }
     }
 
     /// Dispatch ONE complete statement: a `set`/`show`/`select`/`quit` meta-command (by its first word),
@@ -185,7 +243,12 @@ impl Repl {
             return Eval::default(); // comment-only / blank submission
         };
         match first {
-            "quit" | "q" | "exit" => return Eval { output: "Bye.".into(), exit: true },
+            "quit" | "q" | "exit" => {
+                return Eval {
+                    output: "Bye.".into(),
+                    exit: true,
+                };
+            }
             "load" | "sload" => {
                 // Filename = the raw text after the keyword on ITS line, to end of line (Maude:
                 // no `.` terminator). Comments may precede the load line in the chunk, so find
@@ -237,7 +300,10 @@ impl Repl {
         {
             // The diagnostic text is stripped by the diff harness; the pin is that no results appear.
             output.push_str("error: more than one command on a line.\n");
-            return Eval { output: output.trim_end().to_string(), exit: false };
+            return Eval {
+                output: output.trim_end().to_string(),
+                exit: false,
+            };
         }
         for item in items {
             match item {
@@ -246,7 +312,10 @@ impl Repl {
                 TopItem::Command(c) => self.run_command(c, &mut output),
             }
         }
-        Eval { output: output.trim_end().to_string(), exit: false }
+        Eval {
+            output: output.trim_end().to_string(),
+            exit: false,
+        }
     }
 
     /// Define (or redefine) a module: insert into the DB, flatten its import closure, build it, and make
@@ -267,6 +336,7 @@ impl Repl {
             );
         }
         self.last = None; // a (re)built module invalidates any saved rewrite continuation
+        self.meta_state.clear(); // rebuilt engines invalidate persistent metalevel DAG keys
         // Record this module's direct dependencies (imports + parameter theories) so a later redefinition
         // of anything it references can find and re-flatten it (A4c).
         self.deps.insert(name.clone(), module_dep_names(&pm));
@@ -315,6 +385,7 @@ impl Repl {
                     self.view_order.push(v.name.clone());
                 }
                 self.views.insert(v);
+                self.meta_state.clear(); // view semantics participate in reflected module construction
                 // A redefined view leaves the cached builds of modules that instantiate with it stale
                 // (`M{V}` was flattened with the old view), so re-flatten its transitive dependents (A4c).
                 self.rebuild_dependents(&name, out);
@@ -379,9 +450,19 @@ impl Repl {
             Command::Frewrite { bound, gas, .. } | Command::ERewrite { bound, gas, .. } => {
                 *bound == Some(0) || *gas == Some(0)
             }
-            Command::Search { max_solutions, max_depth, .. } => {
-                *max_solutions == Some(0) || *max_depth == Some(0)
-            }
+            Command::Search {
+                max_solutions,
+                max_depth,
+                ..
+            } => *max_solutions == Some(0) || *max_depth == Some(0),
+            Command::GetVariants { bound, .. }
+            | Command::VariantUnify { bound, .. }
+            | Command::VariantMatch { bound, .. } => *bound == Some(0),
+            Command::Narrow {
+                max_solutions,
+                max_depth,
+                ..
+            } => *max_solutions == Some(0) || *max_depth == Some(0),
             _ => false,
         };
         if zero_bound {
@@ -400,8 +481,12 @@ impl Repl {
             | Command::ERewrite { module, .. }
             | Command::Search { module, .. }
             | Command::Unify { module, .. }
+            | Command::GetVariants { module, .. }
+            | Command::VariantUnify { module, .. }
+            | Command::VariantMatch { module, .. }
+            | Command::Narrow { module, .. }
             | Command::Srewrite { module, .. } => module.clone(),
-            Command::Continue { .. } => None,
+            Command::ShowNarrowing { .. } | Command::Continue { .. } => None,
         };
         let Some(cur) = m_override.or_else(|| self.current.clone()) else {
             out.push_str("no current module — enter a module first.\n");
@@ -427,8 +512,12 @@ impl Repl {
                 // object module (resolving imports from the db) and reduces in it. The descent borrows the
                 // interner mutably, so it is dropped before the (immutable-interner) pretty-print.
                 let reduced = build_command_dag(lm, &self.interner, &term).map(|dag| {
-                    let mut descent =
-                        MetaDescent { interner: &mut self.interner, db: &self.db, views: &self.views };
+                    let mut descent = MetaDescent::new(
+                        &mut self.interner,
+                        &self.db,
+                        &self.views,
+                        &mut self.meta_state,
+                    );
                     let result = lm.built.engine.reduce_with(dag, &mut descent);
                     (result, lm.built.engine.rewrites())
                 });
@@ -654,6 +743,240 @@ impl Repl {
                     }
                 }
             }
+            Command::GetVariants { bound, irredundant, term, blockers, .. } => {
+                self.last = None;
+                let irr = if irredundant { "irredundant " } else { "" };
+                let bnd = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
+                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let lm = modules.get_mut(&cur).expect("current module is built");
+                let blocker_terms = (!blockers.is_empty()).then_some(blockers.as_slice());
+                match variant_command(lm, interner, &term, blocker_terms, irredundant) {
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                    Ok(vc) => {
+                        out.push_str(&format!("get {irr}variants{bnd} in {cur} : {} .\n", vc.echo));
+                        if vc.names_ok {
+                            let mut session = VariantSession {
+                                search: vc.search,
+                                var_names: vc.var_names,
+                                irredundant,
+                                reported_total: false,
+                            };
+                            let body = render_variants(&mut session, lm, interner, self.color, bound);
+                            out.push_str(&body);
+                            self.last = Some((cur.clone(), Continuation::Variants(Box::new(session))));
+                        }
+                    }
+                }
+            }
+            Command::VariantUnify { bound, filtered, body, blockers, .. } => {
+                self.last = None;
+                let prefix = if filtered { "filtered " } else { "" };
+                let bnd = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
+                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let lm = modules.get_mut(&cur).expect("current module is built");
+                let blocker_terms = (!blockers.is_empty()).then_some(blockers.as_slice());
+                match variant_unify_command(lm, interner, &body, blocker_terms, filtered) {
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                    Ok(vc) => {
+                        out.push_str(&format!(
+                            "{prefix}variant unify{bnd} in {cur} : {} .\n",
+                            vc.echo
+                        ));
+                        if vc.names_ok {
+                            let mut session = VariantUnifySession {
+                                search: vc.search,
+                                var_names: vc.var_names,
+                                stream: tnk_core::variant::FilteredVariantUnifierStream::new(filtered),
+                                upfront: filtered,
+                                matching: false,
+                                subject: None,
+                                restorations: Vec::new(),
+                                fresh_base: "0".to_string(),
+                                prepared: false,
+                                exhausted: false,
+                                reported_total: false,
+                                next_number: 0,
+                            };
+                            let body =
+                                render_variant_unifiers(&mut session, lm, interner, bound);
+                            out.push_str(&body);
+                            self.last =
+                                Some((cur.clone(), Continuation::VariantUnifiers(Box::new(session))));
+                        }
+                    }
+                }
+            }
+            Command::VariantMatch { bound, pattern, subject, blockers, .. } => {
+                self.last = None;
+                let bnd = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
+                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let lm = modules.get_mut(&cur).expect("current module is built");
+                let blocker_terms = (!blockers.is_empty()).then_some(blockers.as_slice());
+                match variant_match_command(lm, interner, &pattern, &subject, blocker_terms) {
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                    Ok(vc) => {
+                        out.push_str(&format!(
+                            "variant match{bnd} in {cur} : {} .\n",
+                            vc.echo
+                        ));
+                        if vc.names_ok {
+                            let mut session = VariantUnifySession {
+                                search: vc.search,
+                                var_names: vc.var_names,
+                                stream: tnk_core::variant::FilteredVariantUnifierStream::new(false),
+                                upfront: true,
+                                matching: true,
+                                subject: Some(vc.subject),
+                                restorations: vc.restorations,
+                                fresh_base: vc.fresh_base,
+                                prepared: false,
+                                exhausted: false,
+                                reported_total: false,
+                                next_number: 0,
+                            };
+                            let body =
+                                render_variant_unifiers(&mut session, lm, interner, bound);
+                            out.push_str(&body);
+                            self.last = Some((
+                                cur.clone(),
+                                Continuation::VariantUnifiers(Box::new(session)),
+                            ));
+                        }
+                    }
+                }
+            }
+            Command::Narrow {
+                max_solutions,
+                max_depth,
+                subject,
+                arrow,
+                goal,
+                condition,
+                fold,
+                vfold,
+                path,
+                filter,
+                delay,
+                fvu,
+                ..
+            } => {
+                self.last = None;
+                if condition.is_some() {
+                    out.push_str("error: conditions are not currently supported for narrowing.\n");
+                    return;
+                }
+                let bound_str = match (max_solutions, max_depth) {
+                    (None, None) => String::new(),
+                    (Some(n), None) => format!(" [{n}]"),
+                    (Some(n), Some(m)) => format!(" [{n}, {m}]"),
+                    (None, Some(m)) => format!(" [, {m}]"),
+                };
+                let prefix = if fvu {
+                    String::new()
+                } else {
+                    let mut options = Vec::new();
+                    if fold {
+                        options.push("fold");
+                    }
+                    if vfold {
+                        options.push("vfold");
+                    }
+                    if path {
+                        options.push("path");
+                    }
+                    if options.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{{{}}} ", options.join(", "))
+                    }
+                };
+                let keyword = if fvu { "fvu-narrow" } else { "vu-narrow" };
+                let mut stream_options = Vec::new();
+                if delay {
+                    stream_options.push("delay");
+                }
+                if filter {
+                    stream_options.push("filter");
+                }
+                let stream_options = if stream_options.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {{{}}}", stream_options.join(", "))
+                };
+                let arrow_echo = match arrow {
+                    SearchArrow::One => "=>1",
+                    SearchArrow::Plus => "=>+",
+                    SearchArrow::Star => "=>*",
+                    SearchArrow::Bang => "=>!",
+                };
+                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let lm = modules.get_mut(&cur).expect("current module is built");
+                match narrow_command(
+                    lm,
+                    interner,
+                    &subject,
+                    arrow,
+                    &goal,
+                    max_depth,
+                    fold,
+                    vfold,
+                    path,
+                    filter,
+                    delay,
+                ) {
+                    Err(error) => out.push_str(&format!("error: {error}\n")),
+                    Ok(command) => {
+                        out.push_str(&format!(
+                            "{prefix}{keyword}{stream_options}{bound_str} in {cur} : {} \
+                             {arrow_echo} {} .\n",
+                            command.subject_echo, command.goal_echo
+                        ));
+                        let mut session = NarrowSession {
+                            search: command.search,
+                            variables: command.variables,
+                            initial_variable_count: command.initial_variable_count,
+                            initial_variables: command.initial_variables,
+                            initial_echoes: command.initial_echoes,
+                            next_number: 0,
+                            path,
+                        };
+                        let body = render_narrowing(
+                            &mut session,
+                            lm,
+                            interner,
+                            self.color,
+                            self.show_timing,
+                            self.show_breakdown,
+                            self.verbose,
+                            path,
+                            max_solutions,
+                        );
+                        out.push_str(&body);
+                        self.last = Some((cur.clone(), Continuation::Narrow(Box::new(session))));
+                    }
+                }
+            }
+            Command::ShowNarrowing { display, state } => {
+                let Some((module, Continuation::Narrow(session))) = &mut self.last else {
+                    out.push_str("error: no narrowing state graph is available.\n");
+                    return;
+                };
+                if *module != cur {
+                    out.push_str("error: the narrowing state graph belongs to another module.\n");
+                    return;
+                }
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                let body = render_narrowing_display(
+                    session,
+                    lm,
+                    &self.interner,
+                    self.color,
+                    display,
+                    state.map(|number| number as usize),
+                );
+                out.push_str(&body);
+                out.push('\n');
+            }
             Command::Continue { bound } => match self.last.take() {
                 Some((m, Continuation::Rewrite(mut rw))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
@@ -674,31 +997,79 @@ impl Repl {
                     out.push_str(&body);
                     self.last = Some((m, Continuation::Search(session)));
                 }
-                // (`session` is a `Box<SearchSession>`; `&mut session` derefs to the inner session.)
-                _ => out.push_str("No previous rewriting or search to continue in this module.\n"),
+                Some((m, Continuation::Variants(mut session))) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    lm.built.engine.reset_rewrites();
+                    let body =
+                        render_variants(&mut session, lm, &mut self.interner, self.color, bound);
+                    out.push_str(&body);
+                    self.last = Some((m, Continuation::Variants(session)));
+                }
+                Some((m, Continuation::VariantUnifiers(mut session))) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    lm.built.engine.reset_rewrites();
+                    let body =
+                        render_variant_unifiers(&mut session, lm, &mut self.interner, bound);
+                    out.push_str(&body);
+                    self.last = Some((m, Continuation::VariantUnifiers(session)));
+                }
+                Some((m, Continuation::Narrow(mut session))) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    lm.built.engine.reset_rewrites();
+                    let show_state_number = session.path;
+                    let body = render_narrowing(
+                        &mut session,
+                        lm,
+                        &mut self.interner,
+                        self.color,
+                        self.show_timing,
+                        self.show_breakdown,
+                        self.verbose,
+                        show_state_number,
+                        bound,
+                    );
+                    out.push_str(&body);
+                    self.last = Some((m, Continuation::Narrow(session)));
+                }
+                _ => out.push_str(
+                    "No previous rewriting, search, or variant enumeration to continue in this module.\n",
+                ),
             },
         }
     }
 
     /// `select <NAME> .` — make `NAME` the current module.
     fn meta_select(&mut self, line: &str) -> Eval {
-        let name = line.split_whitespace().nth(1).map(|s| s.trim_end_matches('.')).unwrap_or("");
+        let name = line
+            .split_whitespace()
+            .nth(1)
+            .map(|s| s.trim_end_matches('.'))
+            .unwrap_or("");
         let out = if name.is_empty() {
             "select: expected a module name.".to_string()
         } else if self.modules.contains_key(name) {
+            if self.current.as_deref() != Some(name) {
+                self.meta_state.clear();
+            }
             self.current = Some(name.to_string());
             self.last = None; // switching modules invalidates the saved rewrite continuation
             String::new()
         } else {
             format!("select: no module `{name}` — enter it first.")
         };
-        Eval { output: out, exit: false }
+        Eval {
+            output: out,
+            exit: false,
+        }
     }
 
     /// `show modules` (the entered names) or `show module [NAME]` (a module's sorts + ops).
     fn meta_show(&mut self, line: &str) -> Eval {
-        let words: Vec<&str> =
-            line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
+        let words: Vec<&str> = line
+            .split_whitespace()
+            .map(|s| s.trim_end_matches('.'))
+            .filter(|s| !s.is_empty())
+            .collect();
         let out = match words.get(1).copied() {
             Some("modules") => {
                 let list = if self.order.is_empty() { "(none)".into() } else { self.order.join(" ") };
@@ -720,19 +1091,77 @@ impl Repl {
                 Some(v) => render_view(v, &self.interner),
                 None => "show view: no such view (usage: `show view NAME .`).".into(),
             },
-            // `show path N .` — the transition path from the initial state to state N of the last search.
+            // `show path [states] N .` — regular-search or narrowing history.
             Some("path") => {
-                let n: Option<usize> = words.get(2).and_then(|s| s.parse().ok());
+                let path_states = words.get(2).copied() == Some("states");
+                let number_slot = if path_states { 3 } else { 2 };
+                let n: Option<usize> = words.get(number_slot).and_then(|s| s.parse().ok());
                 match (n, self.current.as_deref()) {
                     (Some(n), Some(cur)) => match &self.last {
-                        Some((m, Continuation::Search(session))) if m == cur => {
+                        Some((m, Continuation::Search(session))) if m == cur && !path_states => {
                             let lm = self.modules.get(cur).expect("current module is built");
                             render_path(&session.search, lm, &self.interner, n, self.color)
+                        }
+                        Some((m, Continuation::Narrow(session))) if m == cur => {
+                            let lm = self.modules.get(cur).expect("current module is built");
+                            render_narrowing_display(
+                                session,
+                                lm,
+                                &self.interner,
+                                self.color,
+                                if path_states {
+                                    NarrowDisplay::PathStates
+                                } else {
+                                    NarrowDisplay::Path
+                                },
+                                Some(n),
+                            )
                         }
                         _ => "show path: no current search (run `search` first).".into(),
                     },
                     (None, _) => "show path: expected a state number.".into(),
                     _ => "show path: no current module.".into(),
+                }
+            }
+            Some("frontier") if words.get(2).copied() == Some("states") => {
+                match self.current.as_deref() {
+                    Some(cur) => match &self.last {
+                        Some((m, Continuation::Narrow(session))) if m == cur => {
+                            let lm = self.modules.get(cur).expect("current module is built");
+                            render_narrowing_display(
+                                session,
+                                lm,
+                                &self.interner,
+                                self.color,
+                                NarrowDisplay::Frontier,
+                                None,
+                            )
+                        }
+                        _ => "show frontier states: no current narrowing search.".into(),
+                    },
+                    None => "show frontier states: no current module.".into(),
+                }
+            }
+            Some("most")
+                if words.get(2).copied() == Some("general")
+                    && words.get(3).copied() == Some("states") =>
+            {
+                match self.current.as_deref() {
+                    Some(cur) => match &self.last {
+                        Some((m, Continuation::Narrow(session))) if m == cur => {
+                            let lm = self.modules.get(cur).expect("current module is built");
+                            render_narrowing_display(
+                                session,
+                                lm,
+                                &self.interner,
+                                self.color,
+                                NarrowDisplay::MostGeneral,
+                                None,
+                            )
+                        }
+                        _ => "show most general states: no current narrowing search.".into(),
+                    },
+                    None => "show most general states: no current module.".into(),
                 }
             }
             // `show search graph .` — the whole reachable-state graph of the last search.
@@ -750,14 +1179,20 @@ impl Repl {
             }
             _ => "show: try `show module .` / `show modules .` / `show view NAME .` / `show views .` / `show path N .` / `show search graph .`".into(),
         };
-        Eval { output: out, exit: false }
+        Eval {
+            output: out,
+            exit: false,
+        }
     }
 
     /// `set trace [<option>] on|off` — the full `trace` flag surface (master + body / substitution /
     /// rewrite / whole / condition / eqs / mbs / builtin). Other `set` options are a follow-up.
     fn meta_set(&mut self, line: &str) -> Eval {
-        let words: Vec<&str> =
-            line.split_whitespace().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()).collect();
+        let words: Vec<&str> = line
+            .split_whitespace()
+            .map(|s| s.trim_end_matches('.'))
+            .filter(|s| !s.is_empty())
+            .collect();
         let out = match words.get(1).copied() {
             Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
             // `set include BOOL on|off` (D11): toggle the implicit-BOOL auto-import. Other
@@ -779,13 +1214,32 @@ impl Repl {
                 }
                 String::new()
             }
+            Some("show") if words.get(2).copied() == Some("breakdown") => {
+                match words.get(3).copied() {
+                    Some("on") => self.show_breakdown = true,
+                    Some("off") => self.show_breakdown = false,
+                    _ => {}
+                }
+                String::new()
+            }
+            Some("verbose") => {
+                match words.get(2).copied() {
+                    Some("on") => self.verbose = true,
+                    Some("off") => self.verbose = false,
+                    _ => {}
+                }
+                String::new()
+            }
             // Every other interpreter directive (`set show advisories off`, `set include … on/off`,
             // `set oo include … on`, …) is a silent no-op, as the file-loading parser already treats
             // `set` (we never auto-import, and these toggles do not affect our output). Silence matches
             // Maude — it applies these without echoing — so loaded `.maude` files stay byte-comparable.
             _ => String::new(),
         };
-        Eval { output: out, exit: false }
+        Eval {
+            output: out,
+            exit: false,
+        }
     }
 
     /// `load <file>` / `sload <file>` (D11): read the file and evaluate its contents in place
@@ -793,7 +1247,10 @@ impl Repl {
     /// with and without an appended `.maude`. `sload` skips a file that was already loaded.
     fn meta_load(&mut self, sload: bool, path: &str) -> Eval {
         if path.is_empty() {
-            return Eval { output: "error: load needs a file name".into(), exit: false };
+            return Eval {
+                output: "error: load needs a file name".into(),
+                exit: false,
+            };
         }
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         for base in [path.to_string(), format!("{path}.maude")] {
@@ -805,7 +1262,10 @@ impl Repl {
             }
         }
         let Some(found) = candidates.iter().find(|p| p.is_file()) else {
-            return Eval { output: format!("error: cannot open file `{path}`"), exit: false };
+            return Eval {
+                output: format!("error: cannot open file `{path}`"),
+                exit: false,
+            };
         };
         let canonical = std::fs::canonicalize(found).unwrap_or_else(|_| found.clone());
         if sload && self.loaded_files.contains(&canonical) {
@@ -813,7 +1273,12 @@ impl Repl {
         }
         let src = match std::fs::read_to_string(found) {
             Ok(s) => s,
-            Err(e) => return Eval { output: format!("error: cannot read `{path}`: {e}"), exit: false },
+            Err(e) => {
+                return Eval {
+                    output: format!("error: cannot read `{path}`: {e}"),
+                    exit: false,
+                };
+            }
         };
         self.loaded_files.insert(canonical);
         self.eval_dispatch(&src)
@@ -842,7 +1307,9 @@ impl Repl {
             }
         }
         let toks = tokenize(input, &mut self.interner);
-        let Some(last) = toks.last().copied() else { return false };
+        let Some(last) = toks.last().copied() else {
+            return false;
+        };
         // Track module nesting, but only count a module keyword (`fmod`/`endfm`/…) when it is a real
         // delimiter: at bracket depth 0 and in statement-leading position. The meta-level's
         // module-constructor operators put `fmod`/`is`/`sorts`/`endfm` *inside* a term
@@ -851,7 +1318,15 @@ impl Repl {
         let is_close = |s: &str| {
             matches!(
                 s,
-                "endfm" | "endm" | "endfth" | "endth" | "endv" | "endsm" | "endsth" | "endom" | "endoth"
+                "endfm"
+                    | "endm"
+                    | "endfth"
+                    | "endth"
+                    | "endv"
+                    | "endsm"
+                    | "endsth"
+                    | "endom"
+                    | "endoth"
             )
         };
         // A command keyword *claims* the statement it leads (`red …`, `search …`): a module-open keyword
@@ -862,9 +1337,26 @@ impl Repl {
         let is_command = |s: &str| {
             matches!(
                 s,
-                "reduce" | "red" | "rewrite" | "rew" | "frewrite" | "frew" | "erewrite" | "erew"
-                    | "search" | "match" | "xmatch" | "continue" | "cont" | "srewrite" | "srew"
-                    | "dsrewrite" | "dsrew" | "unify" | "irredundant" | "irred"
+                "reduce"
+                    | "red"
+                    | "rewrite"
+                    | "rew"
+                    | "frewrite"
+                    | "frew"
+                    | "erewrite"
+                    | "erew"
+                    | "search"
+                    | "match"
+                    | "xmatch"
+                    | "continue"
+                    | "cont"
+                    | "srewrite"
+                    | "srew"
+                    | "dsrewrite"
+                    | "dsrew"
+                    | "unify"
+                    | "irredundant"
+                    | "irred"
             )
         };
         let mut open = false;
@@ -968,7 +1460,9 @@ fn render_rewriting(
     } else {
         format!("result (sort not calculated): {value}")
     };
-    format!("{trace}rewrites: {rw_count} in 0ms cpu (0ms real) (~ rewrites/second)\n{result_line}\n")
+    format!(
+        "{trace}rewrites: {rw_count} in 0ms cpu (0ms real) (~ rewrites/second)\n{result_line}\n"
+    )
 }
 
 /// The `search` command's echoed query: `{subject} {arrow} {pattern}[ such that {cond}]`.
@@ -1031,10 +1525,537 @@ fn render_search(
     }
 }
 
+/// Pull up to `limit` variants from one resumable folding search. Incremental mode reports the rewrite
+/// snapshot for each layer; irredundant mode computes the survivor set first and reports one total.
+fn render_variants(
+    session: &mut VariantSession,
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    color: bool,
+    limit: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0u64;
+    loop {
+        if limit == Some(shown) {
+            return out;
+        }
+        let next = {
+            let mut names = InternerNames(i);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut lm.built.engine,
+                names: &mut names,
+            };
+            session.search.find_next(&mut env)
+        };
+        if session.irredundant && !session.reported_total {
+            let rewrites = lm.built.engine.rewrites();
+            out.push_str(&format!(
+                "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)\n"
+            ));
+            session.reported_total = true;
+        }
+        match next {
+            Some(variant) => {
+                shown += 1;
+                let eng = &lm.built.engine;
+                let sort = eng.sorts().name(eng.sort_of(variant.term));
+                let value = print_pretty(&lm.built, i, variant.term, color);
+                out.push_str(&format!("\nVariant {}\n", variant.index + 1));
+                if !session.irredundant {
+                    out.push_str(&format!(
+                        "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
+                        variant.rewrites
+                    ));
+                }
+                out.push_str(&format!("{sort}: {value}\n"));
+                for (slot, &binding) in variant.substitution.iter().enumerate() {
+                    let value = print_pretty(&lm.built, i, binding, color);
+                    out.push_str(&format!("{} --> {value}\n", session.var_names[slot]));
+                }
+            }
+            None => {
+                out.push_str("\nNo more variants.\n");
+                if !session.irredundant {
+                    let rewrites = lm.built.engine.rewrites();
+                    out.push_str(&format!(
+                        "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)\n"
+                    ));
+                }
+                return out;
+            }
+        }
+    }
+}
+
+impl VariantUnifySession {
+
+    fn advance(&mut self, lm: &mut LoadedModule, i: &mut Interner) {
+        if self.exhausted {
+            return;
+        }
+        let mut names = InternerNames(i);
+        let mut env = tnk_core::unify::UnifyEnv {
+            e: &mut lm.built.engine,
+            names: &mut names,
+        };
+        if self.matching {
+            let subject = self.subject.expect("variant matching subject");
+            while let Some(variant) = self.search.find_next(&mut env) {
+                let matches = tnk_core::variant::variant_match_bindings(
+                    &mut env,
+                    &variant,
+                    subject,
+                    &self.fresh_base,
+                );
+                if matches.is_empty() {
+                    continue;
+                }
+                let rewrites = env.e.rewrites();
+                for bindings in matches {
+                    let equations = self.search.variant_equations();
+                    self.stream
+                        .insert(&mut env, bindings, variant.family, rewrites, &equations);
+                }
+                return;
+            }
+            self.exhausted = true;
+            return;
+        }
+        let Some(variant) = self.search.find_next(&mut env) else {
+            self.exhausted = true;
+            return;
+        };
+        debug_assert!(variant.unifier);
+        let rewrites = env.e.rewrites();
+        let equations = self.search.variant_equations();
+        self.stream.insert(
+            &mut env,
+            variant.substitution,
+            variant.family,
+            rewrites,
+            &equations,
+        );
+    }
+
+    fn prepare_filtered(&mut self, lm: &mut LoadedModule, i: &mut Interner) {
+        if self.prepared {
+            return;
+        }
+        while !self.exhausted {
+            self.advance(lm, i);
+        }
+        self.stream.finish();
+        self.prepared = true;
+    }
+
+}
+
+fn render_variant_unifiers(
+    session: &mut VariantUnifySession,
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    limit: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    if session.upfront {
+        session.prepare_filtered(lm, i);
+        if !session.reported_total {
+            out.push_str(&format!(
+                "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
+                lm.built.engine.rewrites()
+            ));
+            session.reported_total = true;
+        }
+    }
+    let mut shown = 0;
+    loop {
+        if limit == Some(shown) {
+            return out;
+        }
+        let index = loop {
+            if let Some(index) = session.stream.pop_pending() {
+                break Some(index);
+            }
+            if session.exhausted {
+                break None;
+            }
+            session.advance(lm, i);
+        };
+        let Some(index) = index else {
+            let noun = if session.matching {
+                "matchers"
+            } else {
+                "unifiers"
+            };
+            let message = if session.next_number == 0 {
+                format!("No {noun}.")
+            } else {
+                format!("No more {noun}.")
+            };
+            out.push_str(&format!("\n{message}\n"));
+            if !session.upfront {
+                out.push_str(&format!(
+                    "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
+                    lm.built.engine.rewrites()
+                ));
+            }
+            return out;
+        };
+        shown += 1;
+        session.next_number += 1;
+        let result_rewrites = session.stream.rewrites(index);
+        let label = if session.matching {
+            "Matcher"
+        } else {
+            "Unifier"
+        };
+        out.push_str(&format!("\n{label} {}\n", session.next_number));
+        if !session.upfront {
+            out.push_str(&format!(
+                "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
+                result_rewrites
+            ));
+        }
+        let bindings = if session.matching {
+            session
+                .stream
+                .bindings(index)
+                .iter()
+                .map(|&dag| {
+                    tnk_core::variant::restore_subject_variables(
+                        &mut lm.built.engine,
+                        dag,
+                        &session.restorations,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            session.stream.bindings(index).to_vec()
+        };
+        out.push_str(&render_unifier(&lm.built, i, &session.var_names, &bindings));
+        out.push('\n');
+    }
+}
+
 /// `Var --> value` lines for a search solution. The variable is rendered by its written name (Maude
 /// echoes a goal variable as written: a declared `X` prints `X`, an on-the-fly `X:Sort` prints
+fn narrowing_rewrite_line(rewrites: u64, show_timing: bool) -> String {
+    if show_timing {
+        format!(
+            "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)"
+        )
+    } else {
+        format!("rewrites: {rewrites}")
+    }
+}
+
+fn render_narrow_accumulated(
+    session: &NarrowSession,
+    lm: &LoadedModule,
+    i: &Interner,
+    state: usize,
+    color: bool,
+) -> String {
+    let (_, substitution, _, _) = session.search.state(state);
+    let (variables, count) = if let Some(initials) = &session.initial_variables {
+        let variables = &initials[session.search.root_index(state)];
+        (variables, variables.count() as usize)
+    } else {
+        (&session.variables, session.initial_variable_count)
+    };
+    (0..count)
+        .map(|slot| {
+            let value = print_pretty(&lm.built, i, substitution[slot], color);
+            let name = command_variable_display_name(
+                &lm.grammar,
+                i,
+                variables.name(slot as u32),
+                variables.sort(slot as u32),
+            );
+            format!("{name} --> {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_narrow_variant_unifier(
+    lm: &LoadedModule,
+    i: &Interner,
+    variables: &[tnk_core::unify::problem::VarSpec],
+    bindings: &[DagId],
+    color: bool,
+    source_variables: Option<(&VarIndex, usize)>,
+) -> String {
+    variables
+        .iter()
+        .zip(bindings)
+        .map(|(variable, &binding)| {
+            let source_name = source_variables.and_then(|(variables, first_goal)| {
+                (first_goal..variables.count() as usize).find_map(|slot| {
+                    let source = variables.name(slot as u32);
+                    let base = source.split_once(':').map_or(source, |(name, _)| name);
+                    let code = i.get(base)?.index();
+                    (variable.name == maude_variable_name_rank(base, code)
+                        && variable.sort == variables.sort(slot as u32))
+                    .then(|| {
+                        command_variable_display_name(
+                            &lm.grammar,
+                            i,
+                            source,
+                            variables.sort(slot as u32),
+                        )
+                    })
+                })
+            });
+            let name = source_name.unwrap_or_else(|| {
+                let base = i.resolve(tnk_frontend::lex::Sym::from_raw(variable.name));
+                if matches!(base.as_bytes().first(), Some(b'#' | b'%' | b'@')) {
+                    format!("{base}:{}", lm.built.engine.sorts().name(variable.sort))
+                } else {
+                    base.to_string()
+                }
+            });
+            let value = print_pretty(&lm.built, i, binding, color);
+            format!("{name} --> {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn narrowing_breakdown(lm: &LoadedModule, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let total = lm.built.engine.rewrites();
+    let (variant, narrowing) = lm.built.engine.narrowing_breakdown();
+    let equational = total.saturating_sub(variant + narrowing);
+    format!(
+        "\nmb applications: 0  equational rewrites: {equational}  rule rewrites: 0  \
+         variant narrowing steps: {variant}  narrowing steps: {narrowing}"
+    )
+}
+
+fn render_narrow_folding_events(
+    session: &mut NarrowSession,
+    lm: &LoadedModule,
+    i: &Interner,
+    color: bool,
+) -> String {
+    let mut out = String::new();
+    for event in session.search.take_folding_events() {
+        match event {
+            tnk_core::narrow::FoldingEvent::Subsumed { state, by, .. } => {
+                let candidate = print_pretty(&lm.built, i, session.search.state(state).0, color);
+                let retained = print_pretty(&lm.built, i, session.search.state(by).0, color);
+                out.push_str(&format!("New state {candidate} subsumed by {retained}\n"));
+            }
+            tnk_core::narrow::FoldingEvent::Evicted { state, by } => {
+                let candidate = print_pretty(&lm.built, i, session.search.state(by).0, color);
+                let victim = print_pretty(&lm.built, i, session.search.state(state).0, color);
+                out.push_str(&format!(
+                    "New state {candidate} subsumed older state {victim}\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn render_narrowing(
+    session: &mut NarrowSession,
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    color: bool,
+    show_timing: bool,
+    show_breakdown: bool,
+    verbose: bool,
+    show_state_number: bool,
+    limit: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0;
+    loop {
+        if limit == Some(shown) {
+            return out;
+        }
+        let solution = {
+            let mut names = InternerNames(i);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut lm.built.engine,
+                names: &mut names,
+            };
+            session.search.find_next(&mut env)
+        };
+        if verbose {
+            out.push_str(&render_narrow_folding_events(session, lm, i, color));
+        }
+        let Some(solution) = solution else {
+            if verbose {
+                out.push_str(&format!(
+                    "Total number of states seen = {}\n\
+                     Of which {} were considered for further narrowing.\n",
+                    session.search.state_count(),
+                    session.search.states_expanded(),
+                ));
+            }
+            let message = if session.next_number == 0 {
+                "No solution."
+            } else {
+                "No more solutions."
+            };
+            out.push_str(&format!(
+                "\n{message}\n{}{}\n",
+                narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing),
+                narrowing_breakdown(lm, show_breakdown),
+            ));
+            return out;
+        };
+        shown += 1;
+        session.next_number += 1;
+        let (term, _, _, _) = session.search.state(solution.state);
+        let state = print_pretty(&lm.built, i, term, color);
+        let state_number = if show_state_number {
+            format!(" (state {})", solution.state)
+        } else {
+            String::new()
+        };
+        let initial_state = session.initial_variables.as_ref().map_or_else(String::new, |_| {
+            format!(
+                "\ninitial state: {}",
+                session.initial_echoes[session.search.root_index(solution.state)]
+            )
+        });
+        let accumulated =
+            render_narrow_accumulated(session, lm, i, solution.state, color);
+        let accumulated_newline = if accumulated.is_empty() { "" } else { "\n" };
+        let unifier = render_narrow_variant_unifier(
+            lm,
+            i,
+            &solution.variables,
+            &solution.bindings,
+            color,
+            Some((&session.variables, session.initial_variable_count)),
+        );
+        let unifier_newline = if unifier.is_empty() { "" } else { "\n" };
+        out.push_str(&format!(
+            "\nSolution {}{state_number}\n{}{}\nstate: {state}{initial_state}\n\
+             accumulated substitution:\n{accumulated}{accumulated_newline}variant unifier:\n{unifier}{unifier_newline}",
+            session.next_number,
+            narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing),
+            narrowing_breakdown(lm, show_breakdown),
+        ));
+    }
+}
+
+fn render_narrow_state(
+    session: &NarrowSession,
+    lm: &LoadedModule,
+    i: &Interner,
+    state: usize,
+    color: bool,
+) -> String {
+    let (term, _, _, _) = session.search.state(state);
+    let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(term));
+    let value = print_pretty(&lm.built, i, term, color);
+    let accumulated = render_narrow_accumulated(session, lm, i, state, color);
+    format!(
+        "state {state}, {sort}: {value}\naccumulated substitution:\n{accumulated}"
+    )
+}
+
+fn render_narrowing_display(
+    session: &NarrowSession,
+    lm: &LoadedModule,
+    i: &Interner,
+    color: bool,
+    display: NarrowDisplay,
+    requested: Option<usize>,
+) -> String {
+    match display {
+        NarrowDisplay::MostGeneral | NarrowDisplay::Frontier => {
+            let states: Vec<_> = if matches!(display, NarrowDisplay::MostGeneral) {
+                session.search.alive_states().collect()
+            } else {
+                session.search.frontier_states().collect()
+            };
+            if states.is_empty() {
+                return if matches!(display, NarrowDisplay::Frontier) {
+                    "*** frontier is empty ***".to_string()
+                } else {
+                    "*** there are no most general states ***".to_string()
+                };
+            }
+            states
+                .iter()
+                .map(|&state| {
+                    let (term, _, _, _) = session.search.state(state);
+                    print_pretty(&lm.built, i, term, color)
+                })
+                .collect::<Vec<_>>()
+                .join(" \\/\n")
+        }
+        NarrowDisplay::Path | NarrowDisplay::PathStates => {
+            let state = requested.expect("show path carries a state");
+            let path = session.search.path_indices(state);
+            if path.is_empty() {
+                return format!("show path: no state {state}.");
+            }
+            let mut out = String::new();
+            for (position, &index) in path.iter().enumerate() {
+                if position > 0 {
+                    let step = session.search.step(index).expect("non-root path state");
+                    let rule = &lm.built.engine.narrowing_rules()[step.rule_index];
+                    if matches!(display, NarrowDisplay::PathStates) {
+                        out.push_str(&format!(
+                            "--- {} --->\n",
+                            rule.label.as_deref().unwrap_or("unlabeled")
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "===[ {} ]===>\nvariant unifier:\n",
+                            trace::rule_body(&lm.built, i, step.rule_id, color)
+                        ));
+                        for (name, &binding) in
+                            rule.variable_names.iter().zip(&step.source_substitution)
+                        {
+                            let value = print_pretty(&lm.built, i, binding, color);
+                            out.push_str(&format!("{name} --> {value}\n"));
+                        }
+                        let parent = session.search.parent(index).expect("path child has parent");
+                        let variables = session.search.state_variables(parent);
+                        let rendered = render_narrow_variant_unifier(
+                            lm,
+                            i,
+                            variables,
+                            &step.state_unifier,
+                            color,
+                            None,
+                        );
+                        if !rendered.is_empty() {
+                            out.push_str(&rendered);
+                            out.push('\n');
+                        }
+                    }
+                }
+                out.push_str(&render_narrow_state(session, lm, i, index, color));
+                if position + 1 != path.len() {
+                    out.push('\n');
+                }
+            }
+            out
+        }
+    }
+}
+
 /// `X:Sort` — the colon form is part of the variable name once on-the-fly variables are supported).
-fn render_search_bindings(lm: &LoadedModule, i: &Interner, vars: &VarIndex, bindings: &[DagId], color: bool) -> String {
+fn render_search_bindings(
+    lm: &LoadedModule,
+    i: &Interner,
+    vars: &VarIndex,
+    bindings: &[DagId],
+    color: bool,
+) -> String {
     if vars.count() == 0 {
         return "empty substitution".to_string();
     }
@@ -1057,10 +2078,17 @@ fn render_path(search: &Search, lm: &LoadedModule, i: &Interner, n: usize, color
     let mut out = String::new();
     for (idx, step) in steps.iter().enumerate() {
         if idx > 0 {
-            let rb = step.via.map(|r| trace::rule_body(&lm.built, i, r, color)).unwrap_or_default();
+            let rb = step
+                .via
+                .map(|r| trace::rule_body(&lm.built, i, r, color))
+                .unwrap_or_default();
             out.push_str(&format!("===[ {rb} ]===>\n"));
         }
-        let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(step.term));
+        let sort = lm
+            .built
+            .engine
+            .sorts()
+            .name(lm.built.engine.sort_of(step.term));
         let value = print_pretty(&lm.built, i, step.term, color);
         out.push_str(&format!("state {}, {sort}: {value}\n", step.state));
     }
@@ -1081,8 +2109,10 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
         // One arc per distinct successor state; all rules reaching it are listed on that single arc, each
         // in its own parens (Maude merges arcs by target — fable-audit.md §3.3 B5).
         for (arc_n, (target, rules)) in arcs.iter().enumerate() {
-            let bodies: String =
-                rules.iter().map(|rid| format!(" ({})", trace::rule_body(&lm.built, i, *rid, color))).collect();
+            let bodies: String = rules
+                .iter()
+                .map(|rid| format!(" ({})", trace::rule_body(&lm.built, i, *rid, color)))
+                .collect();
             out.push_str(&format!("arc {arc_n} ===> state {target}{bodies}\n"));
         }
     }
@@ -1105,10 +2135,18 @@ fn render_view(v: &ViewDecl, i: &Interner) -> String {
     for m in &v.op_maps {
         match m {
             OpMap::Op { from, to } => {
-                s.push_str(&format!("  op {} to {} .\n", join_tokens(from, i), join_tokens(to, i)));
+                s.push_str(&format!(
+                    "  op {} to {} .\n",
+                    join_tokens(from, i),
+                    join_tokens(to, i)
+                ));
             }
             OpMap::Term { from, to } => {
-                s.push_str(&format!("  op {} to term {} .\n", join_tokens(from, i), join_tokens(to, i)));
+                s.push_str(&format!(
+                    "  op {} to term {} .\n",
+                    join_tokens(from, i),
+                    join_tokens(to, i)
+                ));
             }
         }
     }
@@ -1137,7 +2175,11 @@ fn render_module(name: &str, lm: &LoadedModule) -> String {
     sorts.sort_unstable();
     let mut ops: Vec<String> = b.ops.keys().map(|(n, a)| format!("{n}/{a}")).collect();
     ops.sort_unstable();
-    format!("fmod {name}\n  sorts: {}\n  ops: {}", sorts.join(" "), ops.join(" "))
+    format!(
+        "fmod {name}\n  sorts: {}\n  ops: {}",
+        sorts.join(" "),
+        ops.join(" ")
+    )
 }
 
 #[cfg(test)]

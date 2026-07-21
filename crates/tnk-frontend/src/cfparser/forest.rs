@@ -32,7 +32,12 @@ pub struct Parse {
 }
 
 /// Extract the first parse for `start` from the chart, or an error describing why there is none.
-pub fn extract(g: &CompiledGrammar, chart: &Chart, n_tokens: usize, start: Nt) -> Result<Parse, String> {
+pub fn extract(
+    g: &CompiledGrammar,
+    chart: &Chart,
+    n_tokens: usize,
+    start: Nt,
+) -> Result<Parse, String> {
     let roots: Vec<Item> = chart.root_items(g, start).collect();
     let root = match roots.first() {
         None => return Err("no parse".to_string()),
@@ -68,7 +73,12 @@ fn extract_item(
     }
     debug_assert_eq!(pos, origin, "rhs spans did not tile [origin, end)");
     kids_rev.reverse();
-    PTree { prod, start: origin, end, nt_children: kids_rev }
+    PTree {
+        prod,
+        start: origin,
+        end,
+        nt_children: kids_rev,
+    }
 }
 
 /// Find the split for the `k`-th rhs symbol (a nonterminal `nt`) of `prod` (started at `origin`) whose
@@ -87,7 +97,11 @@ fn find_split(
     end: usize,
     ambiguous: &mut bool,
 ) -> (usize, u32) {
-    let prefix = Item { prod, dot: k as u16, origin: origin as u32 };
+    let prefix = Item {
+        prod,
+        dot: k as u16,
+        origin: origin as u32,
+    };
     let mut found: Option<(usize, u32)> = None;
     for &it in &chart.sets[end] {
         let q = &g.prods[it.prod as usize];

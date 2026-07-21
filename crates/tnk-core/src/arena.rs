@@ -119,15 +119,18 @@ impl<T> Arena<T> {
     /// (so it round-trips through [`get`](Self::get)). Used for reverse lookups (name → symbol) that the
     /// kernel does not index.
     pub fn iter(&self) -> impl Iterator<Item = (Id<T>, &T)> + '_ {
-        self.slots.iter().enumerate().filter_map(move |(raw, slot)| match slot {
-            Slot::Occupied(v) => {
-                let id = Id::from_raw(raw as u32);
-                #[cfg(debug_assertions)]
-                let id = id.stamp(self.generations[raw], self.id);
-                Some((id, v))
-            }
-            Slot::Free => None,
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(move |(raw, slot)| match slot {
+                Slot::Occupied(v) => {
+                    let id = Id::from_raw(raw as u32);
+                    #[cfg(debug_assertions)]
+                    let id = id.stamp(self.generations[raw], self.id);
+                    Some((id, v))
+                }
+                Slot::Free => None,
+            })
     }
 
     pub(crate) fn get_mut(&mut self, id: Id<T>) -> &mut T {
@@ -187,7 +190,10 @@ impl<T> Arena<T> {
             "cross-arena/cross-engine Id {id:?}: minted by arena {arena}, used on arena {}",
             self.id
         );
-        assert!(id.index() < self.generations.len(), "out-of-range Id {id:?}");
+        assert!(
+            id.index() < self.generations.len(),
+            "out-of-range Id {id:?}"
+        );
         assert_eq!(
             generation,
             self.generations[id.index()],

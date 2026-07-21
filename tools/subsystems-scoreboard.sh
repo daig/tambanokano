@@ -11,17 +11,29 @@
 # T* SMT, M* model checker, I* meta-interpreters (local mode).
 #
 # Options:
-#   -d    also print the diff for each failing fixture
-
+#   -d           also print the diff for each failing fixture
+#   -p PREFIX    run only fixture IDs beginning with PREFIX (for example, `-p U` for S1)
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 show_diffs=0
-[ "${1:-}" = "-d" ] && show_diffs=1
+prefix=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) show_diffs=1; shift ;;
+    -p)
+      [ "$#" -ge 2 ] || { echo "usage: $0 [-d] [-p PREFIX]" >&2; exit 2; }
+      prefix=$2
+      shift 2
+      ;;
+    *) echo "usage: $0 [-d] [-p PREFIX]" >&2; exit 2 ;;
+  esac
+done
+case "$prefix" in *[!A-Za-z0-9_-]*) echo "error: invalid fixture prefix '$prefix'" >&2; exit 2 ;; esac
 
 pass=0
 total=0
-for f in "$ROOT"/conformance/subsystems/*.maude; do
+for f in "$ROOT"/conformance/subsystems/"$prefix"*.maude; do
   [ -e "$f" ] || { echo "no fixtures found in conformance/subsystems/" >&2; exit 2; }
   id=$(basename "$f" .maude)
   total=$((total + 1))

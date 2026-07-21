@@ -11,4 +11,4 @@ endm
 vu-narrow [1] s(X) =>1 s(s(z)) .
 vu-narrow [2] X =>* s(z) .
 vu-narrow [1, 3] z =>! s(s(s(z))) .
-vu-narrow [1] s(X) =>* z .
+vu-narrow [1, 3] s(X) =>* z .

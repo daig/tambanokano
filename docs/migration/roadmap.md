@@ -209,10 +209,12 @@ Ordered by (dependency, size); references are the kept deep-dives.
   `metaSrewrite`). Prerequisites are structural, not incidental (§3.9.8): meta-constructor resolution by
   result sort, and preserving the un-desugared surface strategy form through resolution. Also fixes the
   §3.2 `upModule`-of-`smod` wrong result (SModule/strat-decl omission). Small relative to G2–G4; do first.
-- **G2. Symbolic:** order-sorted unification modulo axioms → variants (folding: most-general + descendant
-  eviction) → narrowing (v3 only). Brings in **D6** (`biodivine-lib-bdd` behind the facade) — prototype
-  the `SortBdds` sort-function + AllSat path *before* committing (unchanged risk). Unlocks ~30 C++ suite
-  tests and the `metaUnify`/`metaVariant*`/`metaNarrow*` descent tier. Reference: `reports/A8`.
+- **G2. Symbolic:** S0 (BDD/AllSat spike), S1 (order-sorted unification modulo
+  free/S/CUI/AC/ACU/A/AU), and S2 (folding variants, variant unification/matching, and all
+  `metaVariant*` surfaces) are complete. Durable gates: S1 is 27/27 fixtures and 676 byte-exact
+  commands; S2 is 21/21 and 289. S3 narrowing is **READY** with a frozen 15-fixture,
+  168-primary-command manifest and binding decisions in `remaining-plans/03-narrowing.md`; it is the
+  only remaining symbolic dependency-chain item and completes the `metaNarrow*` descent tier.
 - **G3. SMT** (`check`, `smt-search`) over **D7** (`z3` trait backend); variant satisfiability as a
   `.maude` library on top of G2.
 - **G4. Model checking:** LTL→Büchi (Gastin-Oddoux) + nested DFS with counterexamples; SAT-solver hook
@@ -220,10 +222,10 @@ Ordered by (dependency, size); references are the kept deep-dives.
   `reports/A8`.
 - **G5. Meta-interpreters** (`metaInterpreter.maude`): separate `Engine` instances communicating by
   term translation, per **D1**. Reference: `reports/A7`.
-- **G6. Prelude tail + IO stance.** `LEXICAL` (`printTokens`/`tokenize` hooks) and `LOOP-MODE`
-  (`LoopSymbol`) so the prelude finally loads whole. External IO stays host-owned per revised **D5**:
-  design the minimal embedding API when embedding is taken up; the shelved in-engine reactor plan lives
-  in `objects-io-plan.md` §§2.5–2.9/4-C,D if that stance ever reverses.
+- **G6. Prelude tail + IO stance.** The `LEXICAL` `printTokens`/`tokenize` hooks are implemented; remaining
+  here is `LOOP-MODE` (`LoopSymbol`) so the prelude finally loads whole. External IO stays host-owned per
+  revised **D5**: design the minimal embedding API when embedding is taken up; the shelved in-engine reactor
+  plan lives in `objects-io-plan.md` §§2.5–2.9/4-C,D if that stance ever reverses.
 - **G7. Full Maude** as a meta-level `.maude` library — gated on A5 + D1 + G1 (it metaprograms
   parameterized modules; the audit's meta-fidelity items are exactly its substrate).
 
@@ -249,11 +251,12 @@ generations — the drop list in `01-architecture-map.md` §5 stands).
    second.
 5. **Ambiguity-policy faithfulness** (C5/D9) — MSCP's pick order may be impractical to reproduce; decide
    with evidence, not aspiration.
-6. **BDD backend maturity** (G2, unchanged) — prototype before committing.
-7. **Incompleteness propagation** (G2, unchanged) — thread the assoc-unification incompleteness flag
-   unify→variant→narrow so warnings fire end-to-end.
-8. **Fresh-variable families** (`#n`/`%n`, G2) — centralize one generator before three subsystems invent
-   their own.
+6. **BDD backend maturity — resolved for S0/S1.** The D6 spike selected `biodivine-lib-bdd`; the production
+   `SortBdds`/AllSat path is covered by S1.
+7. **Incompleteness propagation.** AU produces and `metaUnify` preserves the flag; S2 carries it
+   through variants and `metaVariant*`; narrowing must preserve the same field through its final layer.
+8. **Fresh-variable families — centralized.** `tnk-core/src/fresh.rs` owns `#n`/`%n`/`@n`; S2 consumes
+   it and S3 must reuse it rather than introduce local counters.
 9. **Search/state-graph memory** (unchanged) — the state graph needs the same GC discipline the
    re-entrant reducer got.
 

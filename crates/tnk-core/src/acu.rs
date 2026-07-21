@@ -23,7 +23,7 @@ use crate::dag::{DagId, NodeTerm};
 use crate::diophantine::UNBOUNDED;
 use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
-use crate::symbol::SymbolId;
+use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
 use crate::theory::LhsAutomaton;
 
@@ -44,7 +44,7 @@ pub(crate) struct AcuLhs {
     aliens: Vec<AcuAlien>,
     /// Distinct variable occurrences under the operator (a repeated index is non-linear).
     vars: Vec<AcuVar>,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
 }
 
 #[derive(Clone)]
@@ -77,9 +77,28 @@ struct AcuVar {
 fn term_eq(a: &Term, b: &Term) -> bool {
     match (a, b) {
         (Term::Var(x), Term::Var(y)) => x.index == y.index,
-        (Term::Op { symbol: sa, args: aa }, Term::Op { symbol: sb, args: ab }) => {
-            sa == sb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| term_eq(x, y))
-        }
+        (
+            Term::Op {
+                symbol: sa,
+                args: aa,
+            },
+            Term::Op {
+                symbol: sb,
+                args: ab,
+            },
+        ) => sa == sb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| term_eq(x, y)),
+        (
+            Term::Iter {
+                symbol: sa,
+                count: ca,
+                arg: aa,
+            },
+            Term::Iter {
+                symbol: sb,
+                count: cb,
+                arg: ab,
+            },
+        ) => sa == sb && ca == cb && term_eq(aa, ab),
         _ => false,
     }
 }
@@ -101,11 +120,21 @@ impl AcuLhs {
         let mut stack = vec![lhs];
         while let Some(t) = stack.pop() {
             match t {
-                Term::Op { symbol: s, args } if s == symbol => stack.extend(args),
+                Term::Op { symbol: s, args } if s == symbol => {
+                    // `stack` is LIFO, so push arguments right-to-left. Maude records top
+                    // variables in left-to-right pattern order, and equal Diophantine rows retain
+                    // that order; it therefore determines which variable receives the first
+                    // canonical subject element during solution enumeration.
+                    stack.extend(args.into_iter().rev());
+                }
                 Term::Var(v) => match vars.iter_mut().find(|av| av.index == v.index) {
                     Some(av) => av.count += 1,
                     None => {
-                        let lower_bound = if sig.acu_take_identity(symbol, v.sort) { 0 } else { 1 };
+                        let lower_bound = if sig.acu_take_identity(symbol, v.sort) {
+                            0
+                        } else {
+                            1
+                        };
                         let upper_bound = sort_bounds.get(&v.sort).copied().unwrap_or(UNBOUNDED);
                         vars.push(AcuVar {
                             index: v.index,
@@ -123,13 +152,33 @@ impl AcuLhs {
                 // a theory-rooted one — is an **alien**, matched recursively by its own automaton; merge
                 // structurally-equal aliens, as the canonical pattern multiset does.
                 t @ Term::Op { .. } if t.is_ground() && t.is_free_matchable(sig) => grounds.push(t),
-                alien @ Term::Op { .. } => match aliens.iter_mut().find(|a| term_eq(&a.term, &alien)) {
-                    Some(a) => a.multiplicity += 1,
-                    None => aliens.push(AcuAlien { term: alien, multiplicity: 1 }),
-                },
+                alien @ Term::Op { .. } => {
+                    match aliens.iter_mut().find(|a| term_eq(&a.term, &alien)) {
+                        Some(a) => a.multiplicity += 1,
+                        None => aliens.push(AcuAlien {
+                            term: alien,
+                            multiplicity: 1,
+                        }),
+                    }
+                }
+                alien @ Term::Iter { .. } => {
+                    match aliens.iter_mut().find(|a| term_eq(&a.term, &alien)) {
+                        Some(a) => a.multiplicity += 1,
+                        None => aliens.push(AcuAlien {
+                            term: alien,
+                            multiplicity: 1,
+                        }),
+                    }
+                }
             }
         }
-        AcuLhs { symbol, grounds, aliens, vars, identity }
+        AcuLhs {
+            symbol,
+            grounds,
+            aliens,
+            vars,
+            identity,
+        }
     }
 
     /// First match phase: the subject must be an ACU node of this operator; its ground sub-patterns
@@ -155,7 +204,10 @@ impl AcuLhs {
         let mut subject_is_identity = false;
         let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
             NodeTerm::Acu { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
-            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == self.identity => {
+            _ if self
+                .identity
+                .is_some_and(|id| rt.is_identity(sig, id, subject)) =>
+            {
                 subject_is_identity = true;
                 (Vec::new(), false)
             }
@@ -166,7 +218,9 @@ impl AcuLhs {
         let mut throwaway = Subst::new();
         throwaway.reset(0);
         for g in &self.grounds {
-            let pos = multiset.iter().position(|&(e, _)| rt.match_pattern(sig, g, e, &mut throwaway))?;
+            let pos = multiset
+                .iter()
+                .position(|&(e, _)| rt.match_pattern(sig, g, e, &mut throwaway))?;
             multiset[pos].1 -= 1;
             if multiset[pos].1 == 0 {
                 multiset.remove(pos);
@@ -242,6 +296,7 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
         }
         Term::Na { .. } => {} // a literal introduces no variables
         Term::Op { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
+        Term::Iter { arg, .. } => collect_vars(arg, out),
     }
 }
 
@@ -282,8 +337,10 @@ fn enumerate_distributions(
             to_var,
         }];
     }
-    let per_element: Vec<Vec<Split>> =
-        mults.iter().map(|&m| compositions(m, coeffs, ext_allowed)).collect();
+    let per_element: Vec<Vec<Split>> = mults
+        .iter()
+        .map(|&m| compositions(m, coeffs, ext_allowed))
+        .collect();
     // An element with no valid composition makes the whole match impossible.
     if per_element.iter().any(|s| s.is_empty()) {
         return Vec::new();
@@ -293,7 +350,11 @@ fn enumerate_distributions(
     let mut idx = vec![0usize; per_element.len()];
     let mut out: Vec<Candidate> = Vec::new();
     loop {
-        let chosen: Vec<&Split> = idx.iter().enumerate().map(|(i, &j)| &per_element[i][j]).collect();
+        let chosen: Vec<&Split> = idx
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| &per_element[i][j])
+            .collect();
         let mut var_total = vec![0u32; r];
         for s in &chosen {
             for (vt, &c) in var_total.iter_mut().zip(&s.to_var) {
@@ -338,10 +399,20 @@ fn compositions(m: u32, coeffs: &[u32], allow_residue: bool) -> Vec<Split> {
     out
 }
 
-fn compose(k: usize, remaining: u32, coeffs: &[u32], cur: &mut Vec<u32>, residue: bool, out: &mut Vec<Split>) {
+fn compose(
+    k: usize,
+    remaining: u32,
+    coeffs: &[u32],
+    cur: &mut Vec<u32>,
+    residue: bool,
+    out: &mut Vec<Split>,
+) {
     if k == coeffs.len() {
         if residue || remaining == 0 {
-            out.push(Split { to_var: cur.clone(), residue: remaining });
+            out.push(Split {
+                to_var: cur.clone(),
+                residue: remaining,
+            });
         }
         return;
     }
@@ -359,10 +430,18 @@ fn compose(k: usize, remaining: u32, coeffs: &[u32], cur: &mut Vec<u32>, residue
 fn subtract_binding(
     avail: &mut Vec<(DagId, u32)>,
     rt: &Runtime,
+    sig: &Signature,
     binding: DagId,
     coeff: u32,
     symbol: SymbolId,
+    identity: Option<IdentityId>,
 ) -> bool {
+    // A prebound variable at the ACU identity contributes the empty multiset. Treating the
+    // canonical identity DAG as an ordinary alien element makes a shared match spuriously fail:
+    // there is (correctly) no explicit identity element in the normalized subject multiset.
+    if identity.is_some_and(|id| rt.is_identity(sig, id, binding)) {
+        return true;
+    }
     let elems: Vec<(DagId, u32)> = match &rt.node(binding).term {
         NodeTerm::Acu { symbol: s, args } if *s == symbol => args.clone(),
         _ => vec![(binding, 1)],
@@ -402,7 +481,7 @@ fn increment_mixed_radix(idx: &mut [usize], radices: &[usize]) -> bool {
 /// the engine — so it survives across the `&mut Runtime` calls the driver makes between solutions.
 pub(crate) struct AcuSubproblem {
     symbol: SymbolId,
-    identity: Option<SymbolId>,
+    identity: Option<IdentityId>,
     ext_allowed: bool,
     var_indices: Vec<u32>,
     var_sorts: Vec<SortId>,
@@ -450,7 +529,10 @@ impl AcuSubproblem {
         }
 
         // No-alien path: the lazy Diophantine enumerator owns its own bind/unbind lifecycle.
-        let matcher = self.matcher.as_mut().expect("no-alien subproblem has a matcher");
+        let matcher = self
+            .matcher
+            .as_mut()
+            .expect("no-alien subproblem has a matcher");
         if matcher.next(rt, sig, subst) {
             self.residue = matcher.residue().to_vec();
             self.matched_whole = matcher.matched_whole();
@@ -478,8 +560,14 @@ impl AcuSubproblem {
         };
         self.rec_cursor += 1;
         for &(idx, b) in &binds {
-            subst.bind(idx, b);
-            self.bound.push(idx);
+            match subst.get(idx) {
+                Some(existing) if !rt.deep_equal(existing, b) => return false,
+                Some(_) => {}
+                None => {
+                    subst.bind(idx, b);
+                    self.bound.push(idx);
+                }
+            }
         }
         self.matched_whole = residue.is_empty();
         self.residue = residue;
@@ -490,7 +578,12 @@ impl AcuSubproblem {
     /// **greedy-first** (Maude's `ACU_GreedyMatcher` order): each alien is tried against the subject
     /// elements in canonical order, taking the first match before the next. `base` seeds the scratch
     /// substitution so existing (outer / non-linear) bindings are respected.
-    fn enumerate_aliens(&self, rt: &mut Runtime, sig: &Signature, base: &Subst) -> Vec<RecordedSolution> {
+    fn enumerate_aliens(
+        &self,
+        rt: &mut Runtime,
+        sig: &Signature,
+        base: &Subst,
+    ) -> Vec<RecordedSolution> {
         let mut out = Vec::new();
         let mut scratch = base.clone();
         let multiset = self.multiset.clone();
@@ -555,7 +648,15 @@ impl AcuSubproblem {
         for k in 0..self.var_indices.len() {
             match scratch.get(self.var_indices[k]) {
                 Some(b) => {
-                    if !subtract_binding(&mut avail, rt, b, self.var_coeffs[k], self.symbol) {
+                    if !subtract_binding(
+                        &mut avail,
+                        rt,
+                        sig,
+                        b,
+                        self.var_coeffs[k],
+                        self.symbol,
+                        self.identity,
+                    ) {
                         return; // the bound variable's value isn't present in the remainder
                     }
                     prebound.push((self.var_indices[k], b));
@@ -673,7 +774,9 @@ mod tests {
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
-        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed) else { return Vec::new() };
+        let Some(mut sp) = lhs.match_(rt, sig, subject, ext_allowed) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         while sp.next(rt, sig, &mut subst) {
             let bindings = (0..nr_vars).map(|i| subst.get(i)).collect();
@@ -695,7 +798,10 @@ mod tests {
         nr_vars: u32,
     ) -> Solutions {
         let lhs = AcuLhs::compile(pattern, e.signature());
-        assert!(lhs.aliens.is_empty(), "naive cross-check is for the no-alien path");
+        assert!(
+            lhs.aliens.is_empty(),
+            "naive cross-check is for the no-alien path"
+        );
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
@@ -703,7 +809,10 @@ mod tests {
         let mut subject_is_identity = false;
         let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
             NodeTerm::Acu { symbol, args } if *symbol == lhs.symbol => (args.clone(), ext_allowed),
-            NodeTerm::Free { symbol: s, args } if args.is_empty() && Some(*s) == lhs.identity => {
+            _ if lhs
+                .identity
+                .is_some_and(|id| rt.is_identity(sig, id, subject)) =>
+            {
                 subject_is_identity = true;
                 (Vec::new(), false)
             }
@@ -712,7 +821,9 @@ mod tests {
         let mut throwaway = Subst::new();
         throwaway.reset(0);
         for g in &lhs.grounds {
-            let Some(pos) = multiset.iter().position(|&(el, _)| rt.match_pattern(sig, g, el, &mut throwaway))
+            let Some(pos) = multiset
+                .iter()
+                .position(|&(el, _)| rt.match_pattern(sig, g, el, &mut throwaway))
             else {
                 return Vec::new();
             };
@@ -781,15 +892,20 @@ mod tests {
     /// Canonicalize a solution stream to a *set* of comparable name-tuples (per-variable binding
     /// name-multiset + residue name-multiset), so two matchers' outputs can be compared ignoring
     /// enumeration order and node identity.
-    fn solution_set(e: &Engine, sols: &Solutions, nr_vars: u32) -> std::collections::BTreeSet<Vec<Vec<String>>> {
+    fn solution_set(
+        e: &Engine,
+        sols: &Solutions,
+        nr_vars: u32,
+    ) -> std::collections::BTreeSet<Vec<Vec<String>>> {
         sols.iter()
             .map(|(binds, residue)| {
                 let mut row: Vec<Vec<String>> = (0..nr_vars as usize)
                     .map(|i| binds[i].map(|d| names(e, d)).unwrap_or_default())
                     .collect();
-                let mut res: Vec<String> = residue.iter().flat_map(|&(d, m)| {
-                    std::iter::repeat_n(names(e, d), m as usize).flatten()
-                }).collect();
+                let mut res: Vec<String> = residue
+                    .iter()
+                    .flat_map(|&(d, m)| std::iter::repeat_n(names(e, d), m as usize).flatten())
+                    .collect();
                 res.sort();
                 row.push(res);
                 row
@@ -842,16 +958,46 @@ mod tests {
         // Each case: (pattern, subject, ext, nr_vars).
         let cases: Vec<(Term, DagId, bool, u32)> = vec![
             // X , Y  (two collectors) over a,b,c  — with id: also offers identity bindings.
-            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), three, false, 2),
-            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), two, false, 2),
+            (
+                Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]),
+                three,
+                false,
+                2,
+            ),
+            (
+                Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]),
+                two,
+                false,
+                2,
+            ),
             // E , S  (element + collector) over a,b,c — the D2a shape at small size.
-            (Term::op(comma, vec![Term::var(0, elt), Term::var(1, set)]), three, false, 2),
+            (
+                Term::op(comma, vec![Term::var(0, elt), Term::var(1, set)]),
+                three,
+                false,
+                2,
+            ),
             // X , X  (coefficient-2 variable) over a,a,b.
-            (Term::op(comma, vec![Term::var(0, set), Term::var(0, set)]), aab, false, 1),
+            (
+                Term::op(comma, vec![Term::var(0, set), Term::var(0, set)]),
+                aab,
+                false,
+                1,
+            ),
             // ground a , X  with extension over a,b,c (the collapse/identity-first case).
-            (Term::op(comma, vec![Term::constant(a), Term::var(0, set)]), three, true, 1),
+            (
+                Term::op(comma, vec![Term::constant(a), Term::var(0, set)]),
+                three,
+                true,
+                1,
+            ),
             // X , Y with extension over a,b (residue splits).
-            (Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]), two, true, 2),
+            (
+                Term::op(comma, vec![Term::var(0, set), Term::var(1, set)]),
+                two,
+                true,
+                2,
+            ),
         ];
         for (i, (pat, subj, ext, nv)) in cases.into_iter().enumerate() {
             let new_sols = match_all(&mut e, pat.clone(), subj, ext, nv);
@@ -859,7 +1005,8 @@ mod tests {
             let new_set = solution_set(&e, &new_sols, nv);
             let naive_set = solution_set(&e, &naive_sols, nv);
             assert_eq!(
-                new_set, naive_set,
+                new_set,
+                naive_set,
                 "case {i}: Diophantine and naive matchers disagree (new={} naive={})",
                 new_sols.len(),
                 naive_sols.len()
@@ -867,8 +1014,8 @@ mod tests {
         }
     }
 
-    /// `match X + Y <=? a + b + c` over `[assoc comm]` — the 6 solutions of the reference binary
-    /// (every split of {a,b,c} into two non-empty ordered parts).
+    /// `match X + Y <=? a + b + c` over `[assoc comm]` — the exact 6-solution sequence of the
+    /// reference binary (every split of {a,b,c} into two non-empty ordered parts).
     #[test]
     fn ac_match_two_vars_six_solutions() {
         let mut e = Engine::new();
@@ -883,12 +1030,11 @@ mod tests {
         let pat = Term::op(plus, vec![Term::var(0, s), Term::var(1, s)]);
 
         let sols = match_all(&mut e, pat, subject, false, 2);
-        let mut got: Vec<(Vec<String>, Vec<String>)> = sols
+        let got: Vec<(Vec<String>, Vec<String>)> = sols
             .iter()
             .map(|(bnd, _)| (names(&e, bnd[0].unwrap()), names(&e, bnd[1].unwrap())))
             .collect();
-        got.sort();
-        let mut expected = vec![
+        let expected = vec![
             (vec!["a".into()], vec!["b".into(), "c".into()]),
             (vec!["b".into()], vec!["a".into(), "c".into()]),
             (vec!["c".into()], vec!["a".into(), "b".into()]),
@@ -896,9 +1042,7 @@ mod tests {
             (vec!["a".into(), "c".into()], vec!["b".into()]),
             (vec!["b".into(), "c".into()], vec!["a".into()]),
         ];
-        expected.sort();
-        assert_eq!(got.len(), 6, "six matchers");
-        assert_eq!(got, expected);
+        assert_eq!(got, expected, "exact six-matcher sequence");
     }
 
     /// `match X + Y <=? a + b` over `[assoc comm id: e]` — the 4 solutions, including the two where a
@@ -970,7 +1114,10 @@ mod tests {
         let (a0, b0, c0) = (e.make_const(a), e.make_const(b), e.make_const(c));
         let subject = e.make_ac(plus, vec![a0, b0, c0]);
         let pat = Term::op(plus, vec![Term::constant(a), Term::constant(b)]);
-        assert!(match_all(&mut e, pat, subject, false, 0).is_empty(), "a+b !<=? a+b+c without ext");
+        assert!(
+            match_all(&mut e, pat, subject, false, 0).is_empty(),
+            "a+b !<=? a+b+c without ext"
+        );
     }
 
     /// C8: ACU **alien** matching end to end. `eq s M + N = s (M + N)` reduces `s z + s s z` to
@@ -994,8 +1141,14 @@ mod tests {
         });
         // eq s M + N = s (M + N) .
         e.add_equation(Equation {
-            lhs: Term::op(plus, vec![Term::op(s, vec![Term::var(0, nat)]), Term::var(1, nat)]),
-            rhs: Term::op(s, vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])]),
+            lhs: Term::op(
+                plus,
+                vec![Term::op(s, vec![Term::var(0, nat)]), Term::var(1, nat)],
+            ),
+            rhs: Term::op(
+                s,
+                vec![Term::op(plus, vec![Term::var(0, nat), Term::var(1, nat)])],
+            ),
             nr_vars: 2,
         });
         let num = |e: &mut Engine, k: u32| {
@@ -1008,7 +1161,11 @@ mod tests {
         let (one, two) = (num(&mut e, 1), num(&mut e, 2));
         let subject = e.make_ac(plus, vec![one, two]); // s z + s s z
         let r = e.reduce(subject);
-        assert_eq!(e.rewrites(), 2, "greedy binds the alien to the smaller element: 2 rewrites, not 3");
+        assert_eq!(
+            e.rewrites(),
+            2,
+            "greedy binds the alien to the smaller element: 2 rewrites, not 3"
+        );
         let three = num(&mut e, 3);
         assert!(e.deep_equal(r, three), "s z + s s z = s s s z");
     }

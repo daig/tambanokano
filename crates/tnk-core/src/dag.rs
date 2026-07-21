@@ -56,7 +56,10 @@ pub(crate) enum NodeTerm {
     /// matches Maude's `ArgVec<Pair>` (the red-black tree rep above `CONVERT_THRESHOLD` is a later
     /// perf step). Built only by `make_acu` (decision **D3**: a pure additive arm — GC, equality, and
     /// reduction traverse it through the [`children`](DagNode::children) visitor unchanged).
-    Acu { symbol: SymbolId, args: Vec<(DagId, u32)> },
+    Acu {
+        symbol: SymbolId,
+        args: Vec<(DagId, u32)>,
+    },
     /// An **AU** application (`assoc`, optionally `id:`; **not** commutative): the operator's
     /// arguments as a canonical **ordered sequence** — nested same-symbol applications flattened and
     /// identity elements dropped, but **not** sorted or multiplicity-merged (order is significant). A
@@ -75,7 +78,11 @@ pub(crate) enum NodeTerm {
     /// is exactly why `deep_equal`/`dag_compare` need theory-specific arms that also compare `count`
     /// (without them `s^2(0)` and `s^3(0)` would compare equal). Built only by `make_s`, which keeps
     /// `count >= 1` (`s^0(x)` collapses to `x`) and flattens nested same-symbol successors.
-    S { symbol: SymbolId, count: crate::num::Nat, arg: DagId },
+    S {
+        symbol: SymbolId,
+        count: crate::num::Nat,
+        arg: DagId,
+    },
     /// An **NA** (atomic built-in constant): a leaf carrying a [`NaValue`] (a string / quoted-id /
     /// float), built by the built-in seam (string/qid/float literals + results). Like the S `count`,
     /// the `value` is scalar payload, not a child, so equality/order need theory-specific arms. Has no
@@ -91,7 +98,11 @@ pub(crate) enum NodeTerm {
     /// frontend for printing. `index` is the variable's slot in the owning problem's substitution
     /// (`VariableDagNode::index`) — bookkeeping, deliberately **not** part of equality or order.
     /// Built only by `make_var`.
-    Var { symbol: SymbolId, name: u32, index: u32 },
+    Var {
+        symbol: SymbolId,
+        name: u32,
+        index: u32,
+    },
 }
 
 /// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
@@ -160,9 +171,9 @@ impl DagNode {
     pub fn for_each_child(&self, mut f: impl FnMut(DagId)) {
         match &self.term {
             // Free, AU, and CUI are all an ordered `Vec<DagId>` (a contiguous child slice).
-            NodeTerm::Free { args, .. } | NodeTerm::Au { args, .. } | NodeTerm::Cui { args, .. } => {
-                args.iter().for_each(|&c| f(c))
-            }
+            NodeTerm::Free { args, .. }
+            | NodeTerm::Au { args, .. }
+            | NodeTerm::Cui { args, .. } => args.iter().for_each(|&c| f(c)),
             // The ACU multiset: each distinct element is visited `multiplicity` times, in canonical
             // order — the same sequence [`children`](Self::children) yields (the equality/GC contract
             // of review R3 H3 / `07` §1.3).
@@ -191,7 +202,10 @@ impl DagNode {
             NodeTerm::Free { args, .. }
             | NodeTerm::Au { args, .. }
             | NodeTerm::Cui { args, .. } => ChildIter::Free(args.iter()),
-            NodeTerm::Acu { args, .. } => ChildIter::Acu { pairs: args.iter(), current: None },
+            NodeTerm::Acu { args, .. } => ChildIter::Acu {
+                pairs: args.iter(),
+                current: None,
+            },
             // The S successor's single child reuses the slice iterator via `from_ref` — no new arm.
             NodeTerm::S { arg, .. } => ChildIter::Free(std::slice::from_ref(arg).iter()),
             // An atomic NA constant or a variable is a leaf — an empty child iterator.
@@ -216,6 +230,14 @@ impl DagNode {
         self.sort
     }
 
+    /// The owning substitution slot for a symbolic variable leaf.
+    pub fn variable_index(&self) -> Option<u32> {
+        match &self.term {
+            NodeTerm::Var { index, .. } => Some(*index),
+            _ => None,
+        }
+    }
+
     /// A read-only view exposing the scalar payload (`iter` count / `Na` value) the generic child visitor
     /// cannot — for the frontend pretty-printer (B4.6). Operator applications are [`NodeRepr::App`]
     /// (rendered from `symbol()` + `children()`); only S/NA carry extra payload.
@@ -225,7 +247,10 @@ impl DagNode {
             | NodeTerm::Acu { .. }
             | NodeTerm::Au { .. }
             | NodeTerm::Cui { .. } => NodeRepr::App,
-            NodeTerm::S { count, arg, .. } => NodeRepr::Iter { count: count.to_decimal(), arg: *arg },
+            NodeTerm::S { count, arg, .. } => NodeRepr::Iter {
+                count: count.to_decimal(),
+                arg: *arg,
+            },
             NodeTerm::Na { value, .. } => match value {
                 NaValue::Str(s) => NodeRepr::Str(s),
                 NaValue::Qid(q) => NodeRepr::Qid(q),
@@ -242,7 +267,10 @@ impl DagNode {
 /// times (so the yielded sequence is the full canonical multiset, repeats included).
 pub enum ChildIter<'a> {
     Free(std::slice::Iter<'a, DagId>),
-    Acu { pairs: std::slice::Iter<'a, (DagId, u32)>, current: Option<(DagId, u32)> },
+    Acu {
+        pairs: std::slice::Iter<'a, (DagId, u32)>,
+        current: Option<(DagId, u32)>,
+    },
 }
 
 impl Iterator for ChildIter<'_> {
@@ -287,9 +315,16 @@ mod tests {
         let mut via_visitor = Vec::new();
         node.for_each_child(|c| via_visitor.push(c));
         assert_eq!(via_iter, vec![x, y], "children() yields the args in order");
-        assert_eq!(via_iter, via_visitor, "children() and for_each_child enumerate the same set");
+        assert_eq!(
+            via_iter, via_visitor,
+            "children() and for_each_child enumerate the same set"
+        );
 
-        assert_eq!(e.node(x).children().count(), 0, "a constant has no children");
+        assert_eq!(
+            e.node(x).children().count(),
+            0,
+            "a constant has no children"
+        );
     }
 
     /// `repr` exposes the S-theory iter `count` (a value the generic child visitor cannot reach) as a
@@ -314,6 +349,9 @@ mod tests {
             }
             other => panic!("expected Iter, got {other:?}"),
         }
-        assert!(matches!(e.node(z).repr(), NodeRepr::App), "a constant is an App");
+        assert!(
+            matches!(e.node(z).repr(), NodeRepr::App),
+            "a constant is an App"
+        );
     }
 }

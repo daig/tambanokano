@@ -1,8 +1,8 @@
 //! The frontend's syntax + resolution tables, produced by [`build_module`](super::build_sig::build_module)
 //! and consumed by the grammar builder (B4.3) and pretty-printer (B4.6).
 
-use crate::lex::Frag;
-use crate::surface::ast::{GatherElem, Statement};
+use crate::lex::{Frag, Token};
+use crate::surface::ast::{GatherElem, IdSide, Statement};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
 use tnk_core::sort::SortId;
@@ -55,6 +55,8 @@ pub struct EqTrace {
     /// Statement-local variable names, indexed as the kernel's substitution is (first occurrence order).
     pub var_names: Vec<String>,
     pub owise: bool,
+    /// Whether the equation carries Maude's `[variant]` attribute.
+    pub variant: bool,
     /// The `[label …]` name, if any — retained for META `upEqs`/`upModule` (renders `[label('l)]`), not
     /// used by execution.
     pub label: Option<String>,
@@ -92,6 +94,16 @@ pub struct RlTrace {
     pub label: Option<String>,
     /// A `[nonexec]` rule — see [`EqTrace::nonexec`].
     pub nonexec: bool,
+    /// A `[narrowing]` rule. It remains available to symbolic narrowing even when `nonexec` is set.
+    pub narrowing: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdentitySpec {
+    pub symbol: SymbolId,
+    pub sort: SortId,
+    pub side: IdSide,
+    pub tokens: Vec<Token>,
 }
 
 /// A built module: the `Engine` (sorts + ops + attributes, but **not** statements — those need the grammar,
@@ -145,11 +157,9 @@ pub struct BuiltModule {
     /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
     /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
     pub strat_defs: Vec<crate::surface::ast::StratDef>,
-    /// Operators declared with a **one-sided** identity (`assoc left id: e` / `right id: e`, fable-audit.md
-    /// §3.4): symbol → (side, identity-constant symbol). Such an op is registered in the kernel *without*
-    /// an identity (the kernel's collapse is two-sided), so command-term construction applies the
-    /// declared-side collapse itself ([`crate::load`]'s one-sided post-pass). Empty for the common case.
-    pub one_sided_id: HashMap<SymbolId, (crate::surface::ast::IdSide, SymbolId)>,
+    /// Identity attribute bubbles retained until the module grammar exists, then parsed and installed
+    /// as signature-owned ground terms before statements are compiled.
+    pub identity_specs: Vec<IdentitySpec>,
 }
 
 /// Another symbol shares this one's name ([`BuiltModule::overload`]).

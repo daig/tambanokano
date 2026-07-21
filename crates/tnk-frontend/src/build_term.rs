@@ -5,8 +5,8 @@
 //! production carries an [`Action`] resolved at grammar-build time, and the tree-walk dispatches on it —
 //! `MakeTerm` builds `symbol(args…)` from the nonterminal children (flattening a single assoc-list child,
 //! Maude's `makeAssocList`); `MakeVariable` resolves a token to a statement-local variable index;
-//! `MakeNatural` expands a decimal into a successor chain; `PassThru` forwards its one child. The kernel
-//! then folds the uniform `Term` into the right theory node at `instantiate` time (`rebuild`).
+//! `MakeNatural` and `MakeIter` build one compact bignum-backed [`Term::Iter`]; `PassThru` forwards its
+//! one child. Instantiation preserves that compact S-theory representation in the runtime DAG.
 
 use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
@@ -21,7 +21,7 @@ use tnk_core::term::Term;
 
 /// Assigns each distinct variable *name* a statement-local index (Maude's `Term`s index variables, not
 /// name them). Shared across a statement's lhs/rhs/condition so the same name maps to the same index.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VarIndex {
     entries: Vec<(String, SortId)>,
 }
@@ -55,6 +55,15 @@ impl VarIndex {
     pub fn sort(&self, index: u32) -> SortId {
         self.entries[index as usize].1
     }
+
+    /// Reorder slots after theory normalization has fixed the command's canonical variable order.
+    pub(crate) fn reorder(&mut self, old_slots: &[usize]) {
+        debug_assert_eq!(old_slots.len(), self.entries.len());
+        self.entries = old_slots
+            .iter()
+            .map(|&slot| self.entries[slot].clone())
+            .collect();
+    }
 }
 
 /// Build a kernel [`Term`] from a parse tree. `vars` accumulates the statement-local variable indices
@@ -82,44 +91,49 @@ pub fn build_term(
         }
         Action::MakeNatural(succ) => {
             let text = tokens[tree.start].text(i);
-            let n: u64 = text.parse().map_err(|_| format!("bad numeral `{text}`"))?;
             let zero = m.nat_zero.ok_or("MAKE_NATURAL without a zero symbol")?;
-            Ok(numeral_term(succ, zero, n))
+            numeral_term(succ, zero, text)
         }
         Action::MakeInteger(minus) => {
             let text = tokens[tree.start].text(i);
-            let n: u64 = neg_magnitude(text)?;
-            let succ = m.nat_succ.ok_or("MAKE_INTEGER without a successor symbol")?;
+            let magnitude = text.strip_prefix('-').unwrap_or(text);
+            let succ = m
+                .nat_succ
+                .ok_or("MAKE_INTEGER without a successor symbol")?;
             let zero = m.nat_zero.ok_or("MAKE_INTEGER without a zero symbol")?;
-            Ok(Term::op(minus, vec![numeral_term(succ, zero, n)]))
+            Ok(Term::op(minus, vec![numeral_term(succ, zero, magnitude)?]))
         }
         Action::MakeRational { division, minus } => {
             let text = tokens[tree.start].text(i);
             let (neg, num, den) = rational_parts(text)?;
-            let succ = m.nat_succ.ok_or("MAKE_RATIONAL without a successor symbol")?;
+            let succ = m
+                .nat_succ
+                .ok_or("MAKE_RATIONAL without a successor symbol")?;
             let zero = m.nat_zero.ok_or("MAKE_RATIONAL without a zero symbol")?;
-            let num_n: u64 = num.parse().map_err(|_| format!("bad rational `{text}`"))?;
-            let den_n: u64 = den.parse().map_err(|_| format!("bad rational `{text}`"))?;
             let numerator = if neg {
-                Term::op(minus, vec![numeral_term(succ, zero, num_n)])
+                Term::op(minus, vec![numeral_term(succ, zero, num)?])
             } else {
-                numeral_term(succ, zero, num_n)
+                numeral_term(succ, zero, num)?
             };
-            Ok(Term::op(division, vec![numerator, numeral_term(succ, zero, den_n)]))
+            Ok(Term::op(
+                division,
+                vec![numerator, numeral_term(succ, zero, den)?],
+            ))
         }
         Action::MakeIter(sym) => {
             let text = tokens[tree.start].text(i);
-            let count: u64 = iter_count(text)?.parse().map_err(|_| format!("bad iter count `{text}`"))?;
-            let child = tree.nt_children.first().ok_or("MakeIter without an argument")?;
-            let mut t = build_term(child, g, m, tokens, i, vars)?;
-            for _ in 0..count {
-                t = Term::op(sym, vec![t]);
-            }
-            Ok(t)
+            let count = iter_count(text)?;
+            let child = tree
+                .nt_children
+                .first()
+                .ok_or("MakeIter without an argument")?;
+            let arg = build_term(child, g, m, tokens, i, vars)?;
+            Term::iter_decimal(sym, count, arg).ok_or_else(|| format!("bad iter count `{text}`"))
         }
-        Action::MakeString(sym) => {
-            Ok(Term::string(sym, &unquote_string(tokens[tree.start].text(i))))
-        }
+        Action::MakeString(sym) => Ok(Term::string(
+            sym,
+            &unquote_string(tokens[tree.start].text(i)),
+        )),
         Action::MakeQid(sym) => {
             let text = tokens[tree.start].text(i);
             Ok(Term::qid(sym, text.strip_prefix('\'').unwrap_or(text)))
@@ -148,7 +162,10 @@ fn make_args(
     if tree.nt_children.len() == 1 && is_assoc_list(g, &tree.nt_children[0]) {
         flatten_assoc(&tree.nt_children[0], g, m, tokens, i, vars)
     } else {
-        tree.nt_children.iter().map(|c| build_term(c, g, m, tokens, i, vars)).collect()
+        tree.nt_children
+            .iter()
+            .map(|c| build_term(c, g, m, tokens, i, vars))
+            .collect()
     }
 }
 
@@ -181,22 +198,22 @@ fn flatten_assoc(
         }
     }
     subtrees.reverse();
-    subtrees.iter().map(|st| build_term(st, g, m, tokens, i, vars)).collect()
+    subtrees
+        .iter()
+        .map(|st| build_term(st, g, m, tokens, i, vars))
+        .collect()
 }
 
 fn is_assoc_list(g: &CompiledGrammar, t: &PTree) -> bool {
     matches!(g.prods[t.prod as usize].action, Action::AssocList)
 }
 
-/// `s^n(zero)` as a successor-chain term; the kernel folds it into one compact `s^n(0)` iter node at
-/// `instantiate` time. Adequate for milestone-sized numerals; a direct bignum iter node is the fast path
-/// for large literals (B4.5).
-fn numeral_term(succ: SymbolId, zero: SymbolId, n: u64) -> Term {
-    let mut t = Term::constant(zero);
-    for _ in 0..n {
-        t = Term::op(succ, vec![t]);
-    }
-    t
+/// Build a compact static `s^count(zero)` term. The arbitrary-size count is scalar [`tnk_core::Nat`]
+/// data, so a million-successor identity or statement literal allocates one [`Term::Iter`] plus its
+/// zero child rather than a million nested [`Term::Op`] nodes.
+fn numeral_term(succ: SymbolId, zero: SymbolId, count: &str) -> Result<Term, String> {
+    Term::iter_decimal(succ, count, Term::constant(zero))
+        .ok_or_else(|| format!("bad numeral `{count}`"))
 }
 
 /// Build `s^count(base)` for the `iter` successor `succ` from a decimal `count`, on the DAG side.
@@ -226,18 +243,10 @@ fn rational_parts(text: &str) -> Result<(bool, &str, &str), String> {
         Some(r) => (true, r),
         None => (false, text),
     };
-    let (num, den) = rest.split_once('/').ok_or_else(|| format!("bad rational `{text}`"))?;
+    let (num, den) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("bad rational `{text}`"))?;
     Ok((neg, num, den))
-}
-
-/// The magnitude of a `SMALL_NEG` token `-N` (Maude builds `-(s^N(0))` via `MinusSymbol::makeIntTerm`).
-/// Like [`numeral_term`]'s caller it bounds the literal to `u64` (large literals are a deferred bignum
-/// path); the lexer guarantees the `-` prefix + digits.
-fn neg_magnitude(text: &str) -> Result<u64, String> {
-    text.strip_prefix('-')
-        .unwrap_or(text)
-        .parse()
-        .map_err(|_| format!("bad negative integer `{text}`"))
 }
 
 /// Build a kernel `DagId` directly from a parse tree — the **ground command-term** path. Unlike
@@ -254,13 +263,90 @@ pub fn build_dag(
     tokens: &[Token],
     i: &Interner,
 ) -> Result<DagId, String> {
+    let mut vars = VarIndex::new();
+    build_dag_inner(
+        tree,
+        g,
+        engine,
+        nat_zero,
+        nat_succ,
+        tokens,
+        i,
+        &mut vars,
+        DagVarMode::Reject,
+    )
+}
+
+/// Build a symbolic command DAG directly, keeping variables as genuine logic-variable leaves.
+/// Unlike [`build_term`], compact `f^N(arg)` iteration remains one bignum-backed DAG node.
+pub fn build_logic_dag(
+    tree: &PTree,
+    g: &CompiledGrammar,
+    engine: &mut Engine,
+    nat_zero: Option<SymbolId>,
+    nat_succ: Option<SymbolId>,
+    tokens: &[Token],
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<DagId, String> {
+    build_dag_inner(
+        tree,
+        g,
+        engine,
+        nat_zero,
+        nat_succ,
+        tokens,
+        i,
+        vars,
+        DagVarMode::Logic,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DagVarMode {
+    Reject,
+    Logic,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dag_inner(
+    tree: &PTree,
+    g: &CompiledGrammar,
+    engine: &mut Engine,
+    nat_zero: Option<SymbolId>,
+    nat_succ: Option<SymbolId>,
+    tokens: &[Token],
+    i: &Interner,
+    vars: &mut VarIndex,
+    variable_mode: DagVarMode,
+) -> Result<DagId, String> {
     match g.prods[tree.prod as usize].action {
         Action::PassThru => {
             let child = tree.nt_children.first().ok_or("PassThru without a child")?;
-            build_dag(child, g, engine, nat_zero, nat_succ, tokens, i)
+            build_dag_inner(
+                child,
+                g,
+                engine,
+                nat_zero,
+                nat_succ,
+                tokens,
+                i,
+                vars,
+                variable_mode,
+            )
         }
         Action::MakeTerm(sym) => {
-            let args = dag_args(tree, g, engine, nat_zero, nat_succ, tokens, i)?;
+            let args = dag_args(
+                tree,
+                g,
+                engine,
+                nat_zero,
+                nat_succ,
+                tokens,
+                i,
+                vars,
+                variable_mode,
+            )?;
             Ok(engine.make_node(sym, args))
         }
         Action::MakeNatural(succ) => {
@@ -284,21 +370,39 @@ pub fn build_dag(
             let zero = nat_zero.ok_or("MAKE_RATIONAL without a zero symbol")?;
             let succ = nat_succ.ok_or("MAKE_RATIONAL without a successor symbol")?;
             let base = engine.make_const(zero);
-            // numerator: `s^num(0)`, wrapped in `minus` when negative (Maude's `makeRatTerm`).
             let num_base = engine.make_const(zero);
             let num_nat = build_iter_dag(engine, succ, num_base, num)?;
-            let numerator = if neg { engine.make_node(minus, vec![num_nat]) } else { num_nat };
+            let numerator = if neg {
+                engine.make_node(minus, vec![num_nat])
+            } else {
+                num_nat
+            };
             let denominator = build_iter_dag(engine, succ, base, den)?;
             Ok(engine.make_node(division, vec![numerator, denominator]))
         }
         Action::MakeIter(sym) => {
             let text = tokens[tree.start].text(i);
             let count = iter_count(text)?;
-            let arg = tree.nt_children.first().ok_or("MakeIter without an argument")?;
-            let base = build_dag(arg, g, engine, nat_zero, nat_succ, tokens, i)?;
+            let arg = tree
+                .nt_children
+                .first()
+                .ok_or("MakeIter without an argument")?;
+            let base = build_dag_inner(
+                arg,
+                g,
+                engine,
+                nat_zero,
+                nat_succ,
+                tokens,
+                i,
+                vars,
+                variable_mode,
+            )?;
             build_iter_dag(engine, sym, base, count)
         }
-        Action::MakeString(sym) => Ok(engine.make_string(sym, &unquote_string(tokens[tree.start].text(i)))),
+        Action::MakeString(sym) => {
+            Ok(engine.make_string(sym, &unquote_string(tokens[tree.start].text(i))))
+        }
         Action::MakeQid(sym) => {
             let text = tokens[tree.start].text(i);
             Ok(engine.make_qid(sym, text.strip_prefix('\'').unwrap_or(text)))
@@ -308,7 +412,19 @@ pub fn build_dag(
             let v: f64 = text.parse().map_err(|_| format!("bad float `{text}`"))?;
             Ok(engine.make_float(sym, v))
         }
-        Action::MakeVariable(_) => Err("a reduce-command term must be ground (no variables)".into()),
+        Action::MakeVariable(sort) => match variable_mode {
+            DagVarMode::Reject => Err("a reduce-command term must be ground (no variables)".into()),
+            DagVarMode::Logic => {
+                let token = &tokens[tree.start];
+                let name = token.text(i);
+                let index = vars.index_of(name, sort);
+                // Maude's MAKE_VARIABLE calls `Token::split` and stores the base-name code in the
+                // VariableTerm; the full `X:Sort` token code is not the variable id.
+                let base = name.split_once(':').map_or(name, |(base, _)| base);
+                let name = i.get(base).unwrap_or(token.sym).index();
+                Ok(engine.make_var(sort, name, index))
+            }
+        },
         Action::AssocList => Err("assoc-list node reached build_dag directly".into()),
         Action::Nop => Err("a sort production has no term".into()),
     }
@@ -325,13 +441,35 @@ fn dag_args(
     nat_succ: Option<SymbolId>,
     tokens: &[Token],
     i: &Interner,
+    vars: &mut VarIndex,
+    variable_mode: DagVarMode,
 ) -> Result<Vec<DagId>, String> {
     if tree.nt_children.len() == 1 && is_assoc_list(g, &tree.nt_children[0]) {
-        return flatten_dag_assoc(&tree.nt_children[0], g, engine, nat_zero, nat_succ, tokens, i);
+        return flatten_dag_assoc(
+            &tree.nt_children[0],
+            g,
+            engine,
+            nat_zero,
+            nat_succ,
+            tokens,
+            i,
+            vars,
+            variable_mode,
+        );
     }
     let mut args = Vec::with_capacity(tree.nt_children.len());
     for c in &tree.nt_children {
-        args.push(build_dag(c, g, engine, nat_zero, nat_succ, tokens, i)?);
+        args.push(build_dag_inner(
+            c,
+            g,
+            engine,
+            nat_zero,
+            nat_succ,
+            tokens,
+            i,
+            vars,
+            variable_mode,
+        )?);
     }
     Ok(args)
 }
@@ -344,31 +482,51 @@ fn flatten_dag_assoc(
     nat_succ: Option<SymbolId>,
     tokens: &[Token],
     i: &Interner,
+    vars: &mut VarIndex,
+    variable_mode: DagVarMode,
 ) -> Result<Vec<DagId>, String> {
-    let mut rev = Vec::new();
+    let mut subtrees = Vec::new();
     let mut cur = node;
     loop {
-        rev.push(build_dag(&cur.nt_children[1], g, engine, nat_zero, nat_succ, tokens, i)?);
+        subtrees.push(&cur.nt_children[1]);
         let left = &cur.nt_children[0];
         if is_assoc_list(g, left) {
             cur = left;
         } else {
-            rev.push(build_dag(left, g, engine, nat_zero, nat_succ, tokens, i)?);
+            subtrees.push(left);
             break;
         }
     }
-    rev.reverse();
-    Ok(rev)
+    subtrees.reverse();
+    let mut args = Vec::with_capacity(subtrees.len());
+    for subtree in subtrees {
+        args.push(build_dag_inner(
+            subtree,
+            g,
+            engine,
+            nat_zero,
+            nat_succ,
+            tokens,
+            i,
+            vars,
+            variable_mode,
+        )?);
+    }
+    Ok(args)
 }
 
 /// Strip a string literal's surrounding quotes and undo its escapes (the lexer keeps the quotes),
 /// yielding the raw **byte** value. Maude strings are byte sequences, so this iterates the token text's
 /// bytes — a source literal `"héllo"` is UTF-8 in the file, so its 6 source bytes become 6 value bytes.
-/// Ported from `Token::stringToRope`: the named control escapes `\a`(7) `\b`(8) `\f`(12) `\n \r \t`
-/// `\v`(11), `\"`, `\\`, a 1–3 digit octal escape `\ooo` (value truncated to a byte, C semantics), and
-/// any other `\c` → the bare byte `c` (e.g. `\q` → `q`, verified against the oracle).
+/// Ported from `Token::stringToRope`: backslash-newline is a source continuation (both bytes disappear);
+/// the named control escapes `\a`(7) `\b`(8) `\f`(12) `\n \r \t` `\v`(11), `\"`, `\\`, a 1–3 digit
+/// octal escape (value truncated to a byte, C semantics), and any other `\c` → the bare byte `c`
+/// (e.g. `\q` → `q`, verified against the oracle).
 fn unquote_string(tok: &str) -> Vec<u8> {
-    let inner = tok.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(tok);
+    let inner = tok
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(tok);
     let bytes = inner.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -382,6 +540,7 @@ fn unquote_string(tok: &str) -> Vec<u8> {
         i += 1; // consume the backslash
         let Some(&c) = bytes.get(i) else { break }; // a trailing backslash is dropped
         match c {
+            b'\n' => {} // source continuation: Token::fixUp removes the pair
             b'a' => out.push(0x07),
             b'b' => out.push(0x08),
             b'f' => out.push(0x0c),
@@ -412,7 +571,7 @@ fn unquote_string(tok: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::cfparser::{earley, forest};
-    use crate::grammar::{build::build_grammar, Nt};
+    use crate::grammar::{Nt, build::build_grammar};
     use crate::lex::tokenize;
     use crate::sig::build_sig::build_module;
     use crate::surface::parser::Parser;
@@ -474,7 +633,11 @@ endfm
         }
 
         fn sort_name(&self, d: tnk_core::dag::DagId) -> String {
-            self.m.engine.sorts().name(self.m.engine.sort_of(d)).to_string()
+            self.m
+                .engine
+                .sorts()
+                .name(self.m.engine.sort_of(d))
+                .to_string()
         }
     }
 
@@ -523,5 +686,29 @@ endfm
         let mut e = natb();
         let (r, _) = e.reduce("2 < 3");
         assert_eq!(e.sort_name(r), "Truth", "2 < 3 : Truth");
+    }
+    #[test]
+    fn static_prefix_iteration_is_one_bignum_term_node() {
+        let mut e = natb();
+        let tokens = tokenize("s_^1000000(0)", &mut e.i);
+        let chart = earley::parse(&e.g, &tokens, Nt::Term, &e.i);
+        let parse =
+            forest::extract(&e.g, &chart, tokens.len(), Nt::Term).expect("parse compact iter");
+        assert!(!parse.ambiguous);
+        let term = build_term(&parse.tree, &e.g, &e.m, &tokens, &e.i, &mut VarIndex::new())
+            .expect("build compact static iter");
+
+        match term {
+            Term::Iter { symbol, count, arg } => {
+                assert_eq!(Some(symbol), e.m.nat_succ);
+                assert_eq!(count.to_decimal(), "1000000");
+                assert!(matches!(
+                    *arg,
+                    Term::Op { symbol, ref args }
+                        if Some(symbol) == e.m.nat_zero && args.is_empty()
+                ));
+            }
+            other => panic!("expected one compact static iter node, got {other:?}"),
+        }
     }
 }

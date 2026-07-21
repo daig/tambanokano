@@ -143,7 +143,12 @@ pub fn complete_statement(
         pattern_attrs.extend(added_attrs.iter().cloned());
         plans.insert(
             obj.oid.clone(),
-            ObjPlan { class_replace, atts_var, pattern_attrs, added_attrs },
+            ObjPlan {
+                class_replace,
+                atts_var,
+                pattern_attrs,
+                added_attrs,
+            },
         );
     }
 
@@ -203,7 +208,13 @@ fn record_object(
                     *ignore = true;
                     return;
                 };
-                objs.push(ObjInfo { oid: oid.clone(), class_sort, class_var, pattern, subjects: Vec::new() });
+                objs.push(ObjInfo {
+                    oid: oid.clone(),
+                    class_sort,
+                    class_var,
+                    pattern,
+                    subjects: Vec::new(),
+                });
             }
             // First seen on a RHS/condition: a "new" object with no LHS occurrence — quietly ignored.
             Mode::Subject => {}
@@ -235,8 +246,12 @@ fn gather_condition(
             gather(lhs, Mode::Subject, info, m, objs, ignore);
             gather(rhs, Mode::Subject, info, m, objs, ignore);
         }
-        ConditionFragment::SortTest { term, .. } => gather(term, Mode::Subject, info, m, objs, ignore),
-        ConditionFragment::Matching { pattern, subject, .. } => {
+        ConditionFragment::SortTest { term, .. } => {
+            gather(term, Mode::Subject, info, m, objs, ignore)
+        }
+        ConditionFragment::Matching {
+            pattern, subject, ..
+        } => {
             gather(pattern, Mode::CondPattern, info, m, objs, ignore);
             gather(subject, Mode::Subject, info, m, objs, ignore);
         }
@@ -252,7 +267,10 @@ fn gather_condition(
 /// `None` (which disables completion). Mirrors `recordClassArgument`.
 fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortId, Option<u32>)> {
     match class {
-        Term::Var(v) => info.class_sorts.contains(&v.sort).then_some((v.sort, Some(v.index))),
+        Term::Var(v) => info
+            .class_sorts
+            .contains(&v.sort)
+            .then_some((v.sort, Some(v.index))),
         Term::Op { symbol, args } if args.is_empty() => {
             let range = m.engine.symbol_declarations(*symbol).first()?.1;
             info.class_sorts.contains(&range).then_some((range, None))
@@ -266,7 +284,10 @@ fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortI
 /// set variable, a variable of a non-AttributeSet sort, or an unrecognized subterm — mirroring
 /// `analyzeAttributeSetArgument`.
 fn decompose_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule) -> Option<Occ> {
-    let mut occ = Occ { attrs: Vec::new(), set_var: None };
+    let mut occ = Occ {
+        attrs: Vec::new(),
+        set_var: None,
+    };
     walk_attr_set(term, info, m, &mut occ).then_some(occ)
 }
 
@@ -303,9 +324,12 @@ fn walk_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule, occ: &mut Occ) -> 
 /// Whether `sym` is an attribute operator — its result sort is a **strict** subsort of the AttributeSet
 /// sort (i.e. `Attribute`). Structural stand-in for Maude's `attributeSymbols` membership.
 fn is_attribute_op(sym: SymbolId, info: &OoInfo, m: &BuiltModule) -> bool {
-    m.engine.symbol_declarations(sym).first().is_some_and(|(_, range)| {
-        *range != info.attr_set_sort && m.engine.sorts().leq(*range, info.attr_set_sort)
-    })
+    m.engine
+        .symbol_declarations(sym)
+        .first()
+        .is_some_and(|(_, range)| {
+            *range != info.attr_set_sort && m.engine.sorts().leq(*range, info.attr_set_sort)
+        })
 }
 
 /// Maude's `checkVariables`: a set variable in the pattern must appear (identically) in every subject
@@ -362,7 +386,13 @@ fn check_variables(
 }
 
 /// Rewrite each object occurrence in `term` under `mode` from its plan.
-fn transform(term: &mut Term, mode: Mode, plans: &HashMap<Term, ObjPlan>, info: &OoInfo, m: &BuiltModule) {
+fn transform(
+    term: &mut Term,
+    mode: Mode,
+    plans: &HashMap<Term, ObjPlan>,
+    info: &OoInfo,
+    m: &BuiltModule,
+) {
     if let Term::Op { symbol, args } = term {
         if *symbol == info.object_ctor
             && args.len() == 3
@@ -388,7 +418,9 @@ fn transform_condition(
             transform(rhs, Mode::Subject, plans, info, m);
         }
         ConditionFragment::SortTest { term, .. } => transform(term, Mode::Subject, plans, info, m),
-        ConditionFragment::Matching { pattern, subject, .. } => {
+        ConditionFragment::Matching {
+            pattern, subject, ..
+        } => {
             transform(pattern, Mode::CondPattern, plans, info, m);
             transform(subject, Mode::Subject, plans, info, m);
         }
@@ -407,9 +439,15 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
     }
     // The occurrence's own attributes + set variable, then the shared attribute-set variable. (The set
     // was validated during gather, so this re-walk succeeds.)
-    let mut own = Occ { attrs: Vec::new(), set_var: None };
+    let mut own = Occ {
+        attrs: Vec::new(),
+        set_var: None,
+    };
     let _ = walk_attr_set(&args[2], info, m, &mut own);
-    let atts = own.set_var.as_ref().map_or_else(|| plan.atts_var.clone(), |v| Term::Var(v.clone()));
+    let atts = own
+        .set_var
+        .as_ref()
+        .map_or_else(|| plan.atts_var.clone(), |v| Term::Var(v.clone()));
 
     let mut elems: Vec<Term> = Vec::new();
     match mode {
@@ -448,6 +486,7 @@ fn canonicalize_attr_set(elems: &mut [Term]) {
             // (arity, is-variable, symbol): arity first; at equal arity a constant precedes a variable.
             Term::Op { symbol, args } => (args.len(), false, Some(*symbol)),
             Term::Na { symbol, .. } => (0, false, Some(*symbol)),
+            Term::Iter { symbol, .. } => (1, false, Some(*symbol)),
             Term::Var(_) => (0, true, None),
         }
     }
@@ -459,7 +498,11 @@ fn canonicalize_attr_set(elems: &mut [Term]) {
 /// (`a :_ : S -> Attribute`); on the degenerate 0-ary case, fall back to the AttributeSet kind.
 fn attribute_kind_sort(m: &BuiltModule, info: &OoInfo, attr_sym: SymbolId) -> SortId {
     let sorts = m.engine.sorts();
-    let dom = m.engine.symbol_declarations(attr_sym).into_iter().find_map(|(d, _)| d.first().copied());
+    let dom = m
+        .engine
+        .symbol_declarations(attr_sym)
+        .into_iter()
+        .find_map(|(d, _)| d.first().copied());
     sorts.error_sort(sorts.kind_of(dom.unwrap_or(info.attr_set_sort)))
 }
 
@@ -469,6 +512,7 @@ fn count_vars(term: &Term, counts: &mut HashMap<u32, usize>) {
         Term::Var(v) => *counts.entry(v.index).or_insert(0) += 1,
         Term::Op { args, .. } => args.iter().for_each(|a| count_vars(a, counts)),
         Term::Na { .. } => {}
+        Term::Iter { arg, .. } => count_vars(arg, counts),
     }
 }
 
@@ -477,7 +521,9 @@ fn condition_terms(frag: &ConditionFragment) -> Vec<&Term> {
     match frag {
         ConditionFragment::Equality { lhs, rhs } => vec![lhs, rhs],
         ConditionFragment::SortTest { term, .. } => vec![term],
-        ConditionFragment::Matching { pattern, subject, .. } => vec![pattern, subject],
+        ConditionFragment::Matching {
+            pattern, subject, ..
+        } => vec![pattern, subject],
         ConditionFragment::Rewrite { lhs, pattern, .. } => vec![lhs, pattern],
     }
 }

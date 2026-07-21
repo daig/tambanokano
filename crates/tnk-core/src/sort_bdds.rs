@@ -26,23 +26,22 @@
 //! `[scratch1: maxbits][scratch2: maxbits][domain: maxdom][real: real_capacity]` — `maxdom`, the
 //! widest operator domain, is computed up front via `Signature::symbols_iter`.
 //!
-//! **Not in this module (driver-side, `unify` phase S1d):** the `computeGeneralizedSort` term walk
-//! over a `DagNode` and free-variable collection. This module provides the BDD primitives the walk
-//! and the unifier/maximal assembly need: [`SortBdds::make_variable_bdd`],
-//! [`SortBdds::operator_compose`], [`SortBdds::apply_leq_relation`],
-//! [`SortBdds::get_remapped_leq_relation`], [`SortBdds::make_index_vector`], and
-//! [`SortBdds::maximal_from_unifier`].
-
-// The SortBdds primitives are complete and unit-tested but not yet wired to a caller: the
-// UnificationProblem driver (S1d) assembles unifier/maximal from them. Scoped dead-code allowance
-// until then; removed when the driver lands (subsystems-goal §5 S1).
+//! **Driver integration (`unify/problem.rs`):** the driver walks each solved DAG to compute generalized
+//! sorts and collect free variables, builds the per-problem maximality BDD, then owns [`AllSat`] while
+//! emitting the maximal order-sorted refinements. This module supplies the backend primitives:
+//! [`SortBdds::make_variable_bdd`], [`SortBdds::operator_compose`],
+//! [`SortBdds::apply_leq_relation`], [`SortBdds::get_remapped_leq_relation`],
+//! [`SortBdds::make_index_vector`], and [`SortBdds::maximal_from_unifier`].
+//!
+//! A few Maude-compatible primitives remain unit-test/reference surfaces rather than direct production
+//! call sites; keep their dead-code allowance scoped to this backend module.
 #![allow(dead_code)]
 
 use crate::engine::Signature;
 use crate::sort::{KindId, SortId};
 use crate::symbol::SymbolId;
 use biodivine_lib_bdd::{
-    op_function, Bdd, BddPartialValuation, BddPointer, BddVariable, BddVariableSet,
+    Bdd, BddPartialValuation, BddPointer, BddVariable, BddVariableSet, op_function,
 };
 use std::collections::HashMap;
 
@@ -156,7 +155,11 @@ impl SortBdds {
             let leq: Vec<Bdd> = (0..leq_local[ki].len())
                 .map(|li| sb.leq_at(&leq_local[ki], kbits, li as u32, 0))
                 .collect();
-            sb.kinds.push(KindBdds { bits: kbits, gt, leq });
+            sb.kinds.push(KindBdds {
+                bits: kbits,
+                gt,
+                leq,
+            });
         }
         sb
     }
@@ -267,7 +270,8 @@ impl SortBdds {
         let bits = self.kinds[kind.index()].bits;
         let base = self.kinds[kind.index()].leq[li as usize].clone();
         let remapped = self.shift_block(&base, 0, bits, first_real);
-        self.remapped_leq.insert((sort, first_real), remapped.clone());
+        self.remapped_leq
+            .insert((sort, first_real), remapped.clone());
         remapped
     }
 
@@ -281,7 +285,8 @@ impl SortBdds {
         let bits = self.kinds[kind.index()].bits;
         let base = self.kinds[kind.index()].gt.clone();
         let remapped = self.shift_block(&base, self.maxbits, bits, first_real);
-        self.remapped_gt.insert((kind.index(), first_real), remapped.clone());
+        self.remapped_gt
+            .insert((kind.index(), first_real), remapped.clone());
         remapped
     }
 
@@ -327,8 +332,11 @@ impl SortBdds {
         }
 
         // Per-argument domain kinds (all declarations share kinds per position).
-        let arg_kinds: Vec<KindId> =
-            sym.decls[0].domain.iter().map(|&d| sorts.kind_of(d)).collect();
+        let arg_kinds: Vec<KindId> = sym.decls[0]
+            .domain
+            .iter()
+            .map(|&d| sorts.kind_of(d))
+            .collect();
         // Start from the constant ERROR_SORT (local index 0) function.
         let mut f = self.make_index_vector(rbits, 0);
         for decl in sym.decls.iter().rev() {
@@ -385,7 +393,10 @@ impl SortBdds {
     /// `makeVariableBdd`: the literal bit vector for a free variable's real block.
     pub(crate) fn make_variable_bdd(&self, first_real: u16, bits: u16) -> Vec<Bdd> {
         (0..bits)
-            .map(|k| self.universe.mk_literal(self.vars[(first_real + k) as usize], true))
+            .map(|k| {
+                self.universe
+                    .mk_literal(self.vars[(first_real + k) as usize], true)
+            })
             .collect()
     }
 
@@ -680,7 +691,11 @@ mod tests {
                     li |= 1 << k;
                 }
             }
-            got.push(sig.sorts().name(sig.sorts().kind(kind).index_order[li as usize]).to_string());
+            got.push(
+                sig.sorts()
+                    .name(sig.sorts().kind(kind).index_order[li as usize])
+                    .to_string(),
+            );
         }
         let mut got_sorted = got.clone();
         got_sorted.sort();
@@ -701,7 +716,11 @@ mod tests {
         assert_eq!(got.len(), 2, "two maximal lower bounds: A and B");
 
         let count = sb.cardinality_over_real_range(&maximal, last_real);
-        assert_eq!(count, num_bigint::BigInt::from(got.len()), "AllSat count vs cardinality");
+        assert_eq!(
+            count,
+            num_bigint::BigInt::from(got.len()),
+            "AllSat count vs cardinality"
+        );
     }
 
     /// The rename-remap path yields the identical canonical BDD as building the relation directly at
@@ -742,6 +761,10 @@ mod tests {
         while all.next_assignment() {
             seq.push(all.assignment()[0]);
         }
-        assert_eq!(seq, vec![0, 1], "don't-care expands low (0) first, then high (1)");
+        assert_eq!(
+            seq,
+            vec![0, 1],
+            "don't-care expands low (0) first, then high (1)"
+        );
     }
 }

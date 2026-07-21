@@ -1,8 +1,8 @@
 //! The `tnk-repl` binary: load an optional `.maude` file from `argv`, then drive [`Repl`] interactively
 //! with `rustyline`, buffering multi-line input until it is complete.
 
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::io::IsTerminal;
 use tnk_repl::Repl;
 
@@ -25,7 +25,9 @@ fn main() -> rustyline::Result<()> {
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let mut repl = Repl::new(std::io::stdout().is_terminal());
     if !no_banner {
-        println!("tambanokano REPL — enter modules, `reduce`/`match`, `show`/`select`; `quit` to exit.");
+        println!(
+            "tambanokano REPL — enter modules, `reduce`/`match`, `show`/`select`; `quit` to exit."
+        );
     }
 
     // Standing prelude (D11): load `prelude.maude` from `$MAUDE_LIB` (colon-separated dirs) or
@@ -38,7 +40,9 @@ fn main() -> rustyline::Result<()> {
                 Err(e) => eprintln!("error reading prelude `{}`: {e}", p.display()),
             },
             None => {
-                eprintln!("no prelude.maude found (set MAUDE_LIB or use -no-prelude); continuing without");
+                eprintln!(
+                    "no prelude.maude found (set MAUDE_LIB or use -no-prelude); continuing without"
+                );
             }
         }
     }

@@ -16,6 +16,8 @@ pub type PResult<T> = Result<T, String>;
 struct StmtAttrs {
     owise: bool,
     nonexec: bool,
+    variant: bool,
+    narrowing: bool,
     label: Option<String>,
     /// The tokens of a `[print …]` attribute's content (the strings/variables after `print`), captured for
     /// validation: a print variable must resolve to a variable of the statement (Maude rejects an unknown
@@ -78,9 +80,23 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
     }
     let Some(open) = open else { return sa };
     let is_attr_kw = |s: &str| {
-        matches!(s, "owise" | "nonexec" | "label" | "metadata" | "print" | "format" | "variant" | "narrowing")
+        matches!(
+            s,
+            "owise"
+                | "nonexec"
+                | "label"
+                | "metadata"
+                | "print"
+                | "format"
+                | "variant"
+                | "narrowing"
+        )
     };
-    if !body.get(open + 1).map(|t| i.resolve(t.sym)).is_some_and(is_attr_kw) {
+    if !body
+        .get(open + 1)
+        .map(|t| i.resolve(t.sym))
+        .is_some_and(is_attr_kw)
+    {
         return sa; // a `[_]`-list / `{_}`-set term, not attributes
     }
     // `label`/`metadata` each take one following argument token; capture the label name (for META
@@ -105,6 +121,8 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
         match s {
             "owise" => sa.owise = true,
             "nonexec" => sa.nonexec = true,
+            "variant" => sa.variant = true,
+            "narrowing" => sa.narrowing = true,
             "label" | "metadata" => want_arg = Some(s),
             "print" => in_print = true,
             _ => {}
@@ -112,6 +130,27 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
     }
     body.truncate(open);
     sa
+}
+
+/// Remove a top-level `such that … irreducible` suffix from a variant-command body and return the
+/// comma-separated blocker bubble. The command builder parses each blocker against the same variable
+/// namespace as the principal term/problem.
+fn peel_irreducible_suffix(body: &mut Vec<Token>, i: &Interner) -> PResult<Vec<Token>> {
+    let Some(such) = top_level_find(body, i, "such", false) else {
+        return Ok(Vec::new());
+    };
+    if body.get(such + 1).map(|t| i.resolve(t.sym)) != Some("that")
+        || body.last().map(|t| i.resolve(t.sym)) != Some("irreducible")
+    {
+        return Err("expected `such that <terms> irreducible`".into());
+    }
+    let mut blockers = body.split_off(such + 2);
+    body.truncate(such);
+    blockers.pop(); // `irreducible`
+    if blockers.is_empty() {
+        return Err("irreducibility constraint needs at least one term".into());
+    }
+    Ok(blockers)
 }
 
 /// A `[print …]` attribute is well-formed iff each of its non-string items resolves to a variable of the
@@ -201,8 +240,15 @@ impl<'a> Parser<'a> {
     /// the token *text* is load-bearing downstream (`canonical_name` concatenates it, `split_mixfix`
     /// re-splits), so the kind is a plain `Ident`.
     fn frag_token(&self, frag: &str, line: u32) -> Token {
-        let sym = self.i.get(frag).expect("`:`/`_` mixfix fragment must be pre-interned by tokenize");
-        Token { sym, line, kind: TokKind::Ident }
+        let sym = self
+            .i
+            .get(frag)
+            .expect("`:`/`_` mixfix fragment must be pre-interned by tokenize");
+        Token {
+            sym,
+            line,
+            kind: TokKind::Ident,
+        }
     }
 
     /// Desugar `class C` into a sort `C`, a subsort `C < Cid`, and the honorary class constant
@@ -211,13 +257,17 @@ impl<'a> Parser<'a> {
     fn desugar_class(&self, m: &mut PreModule, ctok: Token, cname: &str) {
         m.sorts.push(cname.to_string());
         // `C < Cid`: a two-group chain (`[[C], [Cid]]`), as the `subsort` parser builds it.
-        m.subsorts.push(vec![vec![cname.to_string()], vec!["Cid".to_string()]]);
+        m.subsorts
+            .push(vec![vec![cname.to_string()], vec!["Cid".to_string()]]);
         m.ops.push(OpDecl {
             name: vec![ctok],
             domain: Vec::new(),
             range: cname.to_string(),
             partial: false,
-            attrs: Attrs { ctor: true, ..Attrs::default() },
+            attrs: Attrs {
+                ctor: true,
+                ..Attrs::default()
+            },
         });
     }
 
@@ -225,13 +275,21 @@ impl<'a> Parser<'a> {
     /// `processClassOps`: the `attributeSuffix` ``"`:_"``, range `Attribute`, `gather (&)`). `atok` is the
     /// attribute name's own token; the mixfix name is `[a, :, _]` (canonical `a:_`, re-split to `a :_`).
     fn desugar_attribute(&self, m: &mut PreModule, atok: Token, asort: String) {
-        let name = vec![atok, self.frag_token(":", atok.line), self.frag_token("_", atok.line)];
+        let name = vec![
+            atok,
+            self.frag_token(":", atok.line),
+            self.frag_token("_", atok.line),
+        ];
         m.ops.push(OpDecl {
             name,
             domain: vec![asort],
             range: "Attribute".to_string(),
             partial: false,
-            attrs: Attrs { ctor: true, gather: Some(vec![GatherElem::Any]), ..Attrs::default() },
+            attrs: Attrs {
+                ctor: true,
+                gather: Some(vec![GatherElem::Any]),
+                ..Attrs::default()
+            },
         });
     }
 
@@ -254,6 +312,27 @@ impl<'a> Parser<'a> {
             self.advance();
         }
         out
+    }
+
+    /// Consume an operator name and its signature delimiter. Literal colons are legal name
+    /// fragments (`<_:Snd|buff:_>`), so the delimiter is the last top-level `:` before the
+    /// signature's top-level arrow, not the first colon token.
+    fn op_names_before_signature(&mut self) -> PResult<Vec<Token>> {
+        let mut depth = 0i32;
+        let mut delimiter = None;
+        for position in self.pos..self.toks.len() {
+            match self.i.resolve(self.toks[position].sym) {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                ":" if depth == 0 => delimiter = Some(position),
+                "->" | "~>" if depth == 0 => break,
+                _ => {}
+            }
+        }
+        let delimiter = delimiter.ok_or_else(|| "operator declaration is missing `:`".to_string())?;
+        let names = self.toks[self.pos..delimiter].to_vec();
+        self.pos = delimiter + 1;
+        Ok(names)
     }
 
     /// Collect a whole statement body up to the top-level terminator `.` (left unconsumed), tracking
@@ -301,18 +380,173 @@ impl<'a> Parser<'a> {
         Err("unbalanced `(`".into())
     }
 
+    fn narrowing_prefix_options(&mut self) -> PResult<(bool, bool, bool)> {
+        self.eat("{")?;
+        let mut fold = false;
+        let mut vfold = false;
+        let mut path = false;
+        loop {
+            match self.peek_text() {
+                Some("fold") => fold = true,
+                Some("vfold") => vfold = true,
+                Some("path") => path = true,
+                other => {
+                    return Err(format!(
+                        "vu-narrow: expected `fold`, `vfold`, or `path`, found {other:?}"
+                    ));
+                }
+            }
+            self.advance();
+            if self.at(",") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat("}")?;
+        Ok((fold, vfold, path))
+    }
+
+    fn narrowing_command(
+        &mut self,
+        mut fold: bool,
+        vfold: bool,
+        path: bool,
+    ) -> PResult<Command> {
+        let fvu = self.at("fvu-narrow");
+        if !fvu && !self.at("vu-narrow") {
+            return Err("expected `vu-narrow` or `fvu-narrow`".into());
+        }
+        self.advance();
+        fold |= fvu;
+        let mut filter = false;
+        let mut delay = false;
+        if self.at("{")
+            && self
+                .toks
+                .get(self.pos + 1)
+                .is_some_and(|token| matches!(self.i.resolve(token.sym), "filter" | "delay"))
+        {
+            self.advance();
+            loop {
+                match self.peek_text() {
+                    Some("filter") => filter = true,
+                    Some("delay") => delay = true,
+                    other => {
+                        return Err(format!(
+                            "vu-narrow: expected `filter` or `delay`, found {other:?}"
+                        ));
+                    }
+                }
+                self.advance();
+                if self.at(",") {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.eat("}")?;
+        }
+        let (max_solutions, max_depth) = self.opt_search_bound()?;
+        let module = self.opt_in_module()?;
+        let subject = self.collect_until(&["=>1", "=>+", "=>*", "=>!"]);
+        let arrow = match self.peek_text() {
+            Some("=>1") => SearchArrow::One,
+            Some("=>+") => SearchArrow::Plus,
+            Some("=>*") => SearchArrow::Star,
+            Some("=>!") => SearchArrow::Bang,
+            other => {
+                return Err(format!(
+                    "vu-narrow: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                ));
+            }
+        };
+        self.advance();
+        let goal = self.collect_until(&["such"]);
+        let condition = if self.at("such") {
+            self.advance();
+            self.eat("that")?;
+            Some(self.collect_until(&[]))
+        } else {
+            None
+        };
+        self.eat_dot()?;
+        Ok(Command::Narrow {
+            module,
+            max_solutions,
+            max_depth,
+            subject,
+            arrow,
+            goal,
+            condition,
+            fold,
+            fvu,
+            vfold,
+            path,
+            filter,
+            delay,
+        })
+    }
+
     // ---- top level ----
 
     /// Parse one top-level item — a module or a (module-untagged) command — or `None` at end of input.
     /// The REPL drives this directly (a command binds to its persistent current module); `parse_source`
     /// loops over it and re-applies Maude's most-recently-entered-module tagging.
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
-        let Some(txt) = self.peek_text() else { return Ok(None) };
+        let Some(txt) = self.peek_text() else {
+            return Ok(None);
+        };
         let item = match txt {
             "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
                 TopItem::Module(self.module()?)
             }
             "view" => TopItem::View(self.view()?),
+            "{" => {
+                let (fold, vfold, path) = self.narrowing_prefix_options()?;
+                TopItem::Command(self.narrowing_command(fold, vfold, path)?)
+            }
+            "vu-narrow" | "fvu-narrow" => {
+                TopItem::Command(self.narrowing_command(false, false, false)?)
+            }
+            "show" => {
+                self.advance();
+                let (display, state) = match self.peek_text() {
+                    Some("frontier") => {
+                        self.advance();
+                        self.eat("states")?;
+                        (NarrowDisplay::Frontier, None)
+                    }
+                    Some("most") => {
+                        self.advance();
+                        self.eat("general")?;
+                        self.eat("states")?;
+                        (NarrowDisplay::MostGeneral, None)
+                    }
+                    Some("path") => {
+                        self.advance();
+                        let display = if self.at("states") {
+                            self.advance();
+                            NarrowDisplay::PathStates
+                        } else {
+                            NarrowDisplay::Path
+                        };
+                        let state = Some(
+                            self.name()?
+                                .parse::<u64>()
+                                .map_err(|_| "show path: expected a state number".to_string())?,
+                        );
+                        (display, state)
+                    }
+                    other => {
+                        return Err(format!(
+                            "show: expected `frontier states`, `most general states`, or `path`, found {other:?}"
+                        ));
+                    }
+                };
+                self.eat_dot()?;
+                TopItem::Command(Command::ShowNarrowing { display, state })
+            }
             "srewrite" | "srew" | "dsrewrite" | "dsrew" => {
                 let depth_first = txt.starts_with('d');
                 self.advance();
@@ -321,7 +555,12 @@ impl<'a> Parser<'a> {
                 self.eat("using")?;
                 let strategy = self.strategy()?;
                 self.eat_dot()?;
-                TopItem::Command(Command::Srewrite { module, depth_first, term, strategy })
+                TopItem::Command(Command::Srewrite {
+                    module,
+                    depth_first,
+                    term,
+                    strategy,
+                })
             }
             "reduce" | "red" => {
                 self.advance();
@@ -329,6 +568,74 @@ impl<'a> Parser<'a> {
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
                 TopItem::Command(Command::Reduce { module, term })
+            }
+            "get" => {
+                self.advance();
+                let irredundant = if self.at("irredundant") {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.eat("variants")?;
+                let bound = self.opt_bound()?;
+                let module = self.opt_in_module()?;
+                let mut term = self.collect_until(&[]);
+                self.eat_dot()?;
+                let blockers = peel_irreducible_suffix(&mut term, self.i)?;
+                TopItem::Command(Command::GetVariants {
+                    module,
+                    bound,
+                    irredundant,
+                    term,
+                    blockers,
+                })
+            }
+            "variant" | "filtered" => {
+                let filtered = txt == "filtered";
+                self.advance();
+                if filtered {
+                    self.eat("variant")?;
+                }
+                match self.peek_text() {
+                    Some("unify") => {
+                        self.advance();
+                        let bound = self.opt_bound()?;
+                        let module = self.opt_in_module()?;
+                        let mut body = self.collect_until(&[]);
+                        self.eat_dot()?;
+                        let blockers = peel_irreducible_suffix(&mut body, self.i)?;
+                        TopItem::Command(Command::VariantUnify {
+                            module,
+                            bound,
+                            filtered,
+                            body,
+                            blockers,
+                        })
+                    }
+                    Some("match") if !filtered => {
+                        self.advance();
+                        let bound = self.opt_bound()?;
+                        let module = self.opt_in_module()?;
+                        let pattern = self.collect_until(&["<=?"]);
+                        self.eat("<=?")?;
+                        let mut subject = self.collect_until(&[]);
+                        self.eat_dot()?;
+                        let blockers = peel_irreducible_suffix(&mut subject, self.i)?;
+                        TopItem::Command(Command::VariantMatch {
+                            module,
+                            bound,
+                            pattern,
+                            subject,
+                            blockers,
+                        })
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected `unify` or `match` after `variant`, found {other:?}"
+                        ));
+                    }
+                }
             }
             "match" | "xmatch" => {
                 let xmatch = txt == "xmatch";
@@ -338,7 +645,12 @@ impl<'a> Parser<'a> {
                 self.eat("<=?")?;
                 let subject = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Match { module, pattern, subject, xmatch })
+                TopItem::Command(Command::Match {
+                    module,
+                    pattern,
+                    subject,
+                    xmatch,
+                })
             }
             "unify" | "irredundant" | "irred" => {
                 // `[irredundant] unify [[n]] [in M :] T1 =? T2 [/\ …] .`. The body (the
@@ -353,7 +665,12 @@ impl<'a> Parser<'a> {
                 let module = self.opt_in_module()?;
                 let body = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Unify { module, bound, irredundant, body })
+                TopItem::Command(Command::Unify {
+                    module,
+                    bound,
+                    irredundant,
+                    body,
+                })
             }
             "rewrite" | "rew" => {
                 self.advance();
@@ -361,7 +678,11 @@ impl<'a> Parser<'a> {
                 let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Rewrite { module, bound, term })
+                TopItem::Command(Command::Rewrite {
+                    module,
+                    bound,
+                    term,
+                })
             }
             "frewrite" | "frew" => {
                 // `frewrite [n]` (rewrite bound) or `frewrite [n, g]` (bound + gas). The two-number form
@@ -372,7 +693,12 @@ impl<'a> Parser<'a> {
                 let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::Frewrite { module, bound, gas, term })
+                TopItem::Command(Command::Frewrite {
+                    module,
+                    bound,
+                    gas,
+                    term,
+                })
             }
             "erewrite" | "erew" => {
                 // `erewrite [n]` (delivery bound) or `erewrite [n, g]` (bound + gas). The two-number form
@@ -382,7 +708,12 @@ impl<'a> Parser<'a> {
                 let module = self.opt_in_module()?;
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
-                TopItem::Command(Command::ERewrite { module, bound, gas, term })
+                TopItem::Command(Command::ERewrite {
+                    module,
+                    bound,
+                    gas,
+                    term,
+                })
             }
             "search" => {
                 self.advance();
@@ -395,7 +726,11 @@ impl<'a> Parser<'a> {
                     Some("=>+") => SearchArrow::Plus,
                     Some("=>*") => SearchArrow::Star,
                     Some("=>!") => SearchArrow::Bang,
-                    other => return Err(format!("search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}")),
+                    other => {
+                        return Err(format!(
+                            "search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                        ));
+                    }
                 };
                 self.advance(); // the arrow
                 let pattern = self.collect_until(&["such"]);
@@ -407,7 +742,15 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.eat_dot()?;
-                TopItem::Command(Command::Search { module, max_solutions, max_depth, subject, arrow, pattern, such_that })
+                TopItem::Command(Command::Search {
+                    module,
+                    max_solutions,
+                    max_depth,
+                    subject,
+                    arrow,
+                    pattern,
+                    such_that,
+                })
             }
             "continue" | "cont" => {
                 // `continue n .` takes a **bare** number (unlike `rewrite [n]`'s bracketed bound); an
@@ -457,7 +800,11 @@ impl<'a> Parser<'a> {
                 TopItem::View(v) => src.views.push(v),
                 // A command runs against the most recently entered module (Maude's current module).
                 TopItem::Command(c) => {
-                    let m = src.modules.len().checked_sub(1).ok_or("command before any module")?;
+                    let m = src
+                        .modules
+                        .len()
+                        .checked_sub(1)
+                        .ok_or("command before any module")?;
                     src.commands.push((m, c));
                 }
             }
@@ -483,7 +830,11 @@ impl<'a> Parser<'a> {
         self.advance(); // fmod / mod / fth / th / smod / sth / omod / oth
         let name = self.name()?;
         // Optional formal parameters `{X :: T, …}` (B-iii). The stored name stays the bare base.
-        let params = if self.at("{") { self.param_list()? } else { Vec::new() };
+        let params = if self.at("{") {
+            self.param_list()?
+        } else {
+            Vec::new()
+        };
         self.eat("is")?;
         let mut m = PreModule {
             name,
@@ -574,7 +925,9 @@ impl<'a> Parser<'a> {
         // rejects the whole declaration (bail-on-first-error), matching Maude's "module unusable" recovery
         // (fable-audit.md §3.6, C4d).
         if name.contains('.') {
-            return Err(format!("`{name}` is not a valid sort name (`.` not allowed)"));
+            return Err(format!(
+                "`{name}` is not a valid sort name (`.` not allowed)"
+            ));
         }
         // A *chain* of `{ … }` groups, not just one: a nested instantiation's renaming names the inner
         // structured sort `NeList{STRICT-WEAK-ORDER}{X}` (Axis-A5), and `List{List{X}}` nests via the
@@ -603,7 +956,11 @@ impl<'a> Parser<'a> {
     fn view(&mut self) -> PResult<ViewDecl> {
         self.eat("view")?;
         let name = self.name()?;
-        let params = if self.at("{") { self.param_list()? } else { Vec::new() };
+        let params = if self.at("{") {
+            self.param_list()?
+        } else {
+            Vec::new()
+        };
         // `module_expr` parses an atom/`*`/`+` chain and stops at the first other token (it does not
         // consume a terminator), so it ends naturally at `to` / `is`.
         self.eat("from")?;
@@ -629,7 +986,9 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let from = self.collect_until(&["to"]);
                     if from.iter().any(|t| self.i.resolve(t.sym) == ":") {
-                        return Err("disambiguated view op map `op f : … to …` is a B-ii follow-up".into());
+                        return Err(
+                            "disambiguated view op map `op f : … to …` is a B-ii follow-up".into(),
+                        );
                     }
                     self.eat("to")?;
                     if self.at("term") {
@@ -652,11 +1011,20 @@ impl<'a> Parser<'a> {
             }
         }
         self.advance(); // endv
-        Ok(ViewDecl { name, params, from, to, sort_maps, op_maps })
+        Ok(ViewDecl {
+            name,
+            params,
+            from,
+            to,
+            sort_maps,
+            op_maps,
+        })
     }
 
     fn decl(&mut self, m: &mut PreModule) -> PResult<()> {
-        let kw = self.peek_text().ok_or("unexpected end of input in module")?;
+        let kw = self
+            .peek_text()
+            .ok_or("unexpected end of input in module")?;
         match kw {
             "protecting" | "pr" | "extending" | "ex" | "including" | "inc" => {
                 let mode = match kw {
@@ -676,7 +1044,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let expr = self.module_expr()?;
                 self.eat_dot()?;
-                m.imports.push(Import { mode: ImportMode::Protecting, expr });
+                m.imports.push(Import {
+                    mode: ImportMode::Protecting,
+                    expr,
+                });
             }
             "sort" | "sorts" => {
                 self.advance();
@@ -703,8 +1074,7 @@ impl<'a> Parser<'a> {
             "op" | "ops" => {
                 let multi = kw == "ops";
                 self.advance();
-                let names = self.collect_until(&[":"]);
-                self.eat(":")?;
+                let names = self.op_names_before_signature()?;
                 let mut domain = Vec::new();
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
@@ -718,7 +1088,11 @@ impl<'a> Parser<'a> {
                     self.eat("->")?;
                 }
                 let range = self.sort_name()?;
-                let attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
+                let attrs = if self.at("[") {
+                    self.attrs()?
+                } else {
+                    Attrs::default()
+                };
                 self.eat_dot()?;
                 if multi {
                     for t in names {
@@ -731,7 +1105,13 @@ impl<'a> Parser<'a> {
                         });
                     }
                 } else {
-                    m.ops.push(OpDecl { name: names, domain, range, partial, attrs });
+                    m.ops.push(OpDecl {
+                        name: names,
+                        domain,
+                        range,
+                        partial,
+                        attrs,
+                    });
                 }
             }
             "var" | "vars" => {
@@ -776,7 +1156,9 @@ impl<'a> Parser<'a> {
                         let aname = self.name()?;
                         // The attribute op name is `a` + `` `:_ ``; an underscore in `a` would corrupt it.
                         if aname.contains('_') {
-                            return Err(format!("underscore not allowed in attribute name `{aname}`"));
+                            return Err(format!(
+                                "underscore not allowed in attribute name `{aname}`"
+                            ));
                         }
                         self.eat(":")?;
                         let asort = self.sort_name()?;
@@ -823,15 +1205,18 @@ impl<'a> Parser<'a> {
                 self.advance();
                 // `msg m : S1 S2 -> Msg .` desugars to `op m : S1 S2 -> Msg [ctor msg]` (Maude's `endMsg`
                 // sets `MESSAGE | CTOR`); the range is whatever the user writes (`Msg` by convention).
-                let names = self.collect_until(&[":"]);
-                self.eat(":")?;
+                let names = self.op_names_before_signature()?;
                 let mut domain = Vec::new();
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
                 }
                 self.eat("->")?;
                 let range = self.sort_name()?;
-                let mut attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
+                let mut attrs = if self.at("[") {
+                    self.attrs()?
+                } else {
+                    Attrs::default()
+                };
                 attrs.ctor = true;
                 attrs.message = true;
                 self.eat_dot()?;
@@ -846,7 +1231,13 @@ impl<'a> Parser<'a> {
                         });
                     }
                 } else {
-                    m.ops.push(OpDecl { name: names, domain, range, partial: false, attrs });
+                    m.ops.push(OpDecl {
+                        name: names,
+                        domain,
+                        range,
+                        partial: false,
+                        attrs,
+                    });
                 }
             }
             "eq" | "ceq" => {
@@ -877,10 +1268,19 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let eq = top_level_find(&body, self.i, "=", true).ok_or("equation is missing `=`")?;
+                let eq =
+                    top_level_find(&body, self.i, "=", true).ok_or("equation is missing `=`")?;
                 let rhs = body.split_off(eq + 1);
                 body.pop(); // the `=`
-                m.statements.push(Statement::Eq { lhs: body, rhs, cond, owise: sa.owise, nonexec: sa.nonexec, label: leading.or(sa.label) });
+                m.statements.push(Statement::Eq {
+                    lhs: body,
+                    rhs,
+                    cond,
+                    owise: sa.owise,
+                    variant: sa.variant,
+                    nonexec: sa.nonexec,
+                    label: leading.or(sa.label),
+                });
             }
             "mb" | "cmb" => {
                 let conditional = kw == "cmb";
@@ -906,7 +1306,13 @@ impl<'a> Parser<'a> {
                 if !print_attr_ok(&sa.print, m, self.i) {
                     return Ok(()); // bad `[print …]` variable: drop the statement, keep the module (C4f)
                 }
-                m.statements.push(Statement::Mb { lhs, sort, cond, nonexec: sa.nonexec, label: leading.or(sa.label) });
+                m.statements.push(Statement::Mb {
+                    lhs,
+                    sort,
+                    cond,
+                    nonexec: sa.nonexec,
+                    label: leading.or(sa.label),
+                });
             }
             "rl" | "crl" => {
                 if m.kind == ModuleKind::Functional {
@@ -933,7 +1339,8 @@ impl<'a> Parser<'a> {
                 }
                 // The arrow `=>` lexes as one token (a run of non-punctuation chars); an unspaced `t=>p`
                 // lexes as a single token and so will not split here — rejected exactly as Maude rejects it.
-                let arrow = top_level_find(&body, self.i, "=>", false).ok_or("rule is missing `=>`")?;
+                let arrow =
+                    top_level_find(&body, self.i, "=>", false).ok_or("rule is missing `=>`")?;
                 let mut rest = body.split_off(arrow + 1);
                 body.pop(); // the `=>`
                 let lhs = body;
@@ -951,7 +1358,14 @@ impl<'a> Parser<'a> {
                 }
                 // The label may be written either as the leading `[name] :` or as a trailing `[label name]`;
                 // the leading form wins if both appear.
-                m.statements.push(Statement::Rule { label: label.or(sa.label), lhs, rhs, cond, nonexec: sa.nonexec });
+                m.statements.push(Statement::Rule {
+                    label: label.or(sa.label),
+                    lhs,
+                    rhs,
+                    cond,
+                    nonexec: sa.nonexec,
+                    narrowing: sa.narrowing,
+                });
             }
             "strat" | "strats" => {
                 if !m.is_strategy {
@@ -975,7 +1389,11 @@ impl<'a> Parser<'a> {
                 let subject = self.sort_name()?;
                 self.eat_dot()?;
                 for name in names {
-                    m.strat_decls.push(StratDecl { name, domain: domain.clone(), subject: subject.clone() });
+                    m.strat_decls.push(StratDecl {
+                        name,
+                        domain: domain.clone(),
+                        subject: subject.clone(),
+                    });
                 }
             }
             "sd" | "csd" => {
@@ -989,7 +1407,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.name()?;
                 // Optional call parameters `name(p1, …)` — raw bubbles, split at top-level commas.
-                let params = if self.at("(") { self.paren_arg_bubbles()? } else { Vec::new() };
+                let params = if self.at("(") {
+                    self.paren_arg_bubbles()?
+                } else {
+                    Vec::new()
+                };
                 self.eat(":=")?;
                 let body = self.strategy()?;
                 let cond = if conditional {
@@ -999,7 +1421,12 @@ impl<'a> Parser<'a> {
                     None
                 };
                 self.eat_dot()?;
-                m.strat_defs.push(StratDef { name, params, body, cond });
+                m.strat_defs.push(StratDef {
+                    name,
+                    params,
+                    body,
+                    cond,
+                });
             }
             other => return Err(format!("unsupported declaration `{other}`")),
         }
@@ -1087,7 +1514,11 @@ impl<'a> Parser<'a> {
                 self.eat("(")?;
                 let e = Box::new(self.strategy()?);
                 self.eat(")")?;
-                if txt == "top" { StratExpr::Top(e) } else { StratExpr::One(e) }
+                if txt == "top" {
+                    StratExpr::Top(e)
+                } else {
+                    StratExpr::One(e)
+                }
             }
             // Derived branch forms — kept in surface spelling (echo fidelity); resolution desugars.
             "try" | "not" | "test" => {
@@ -1100,7 +1531,10 @@ impl<'a> Parser<'a> {
                     "test" => StratSugar::TestS,
                     _ => StratSugar::Try,
                 };
-                StratExpr::Sugar { kind, args: vec![e] }
+                StratExpr::Sugar {
+                    kind,
+                    args: vec![e],
+                }
             }
             "or-else" => {
                 self.advance();
@@ -1109,13 +1543,20 @@ impl<'a> Parser<'a> {
                 self.eat(",")?;
                 let b = self.strategy()?;
                 self.eat(")")?;
-                StratExpr::Sugar { kind: StratSugar::OrElse, args: vec![a, b] }
+                StratExpr::Sugar {
+                    kind: StratSugar::OrElse,
+                    args: vec![a, b],
+                }
             }
             "match" | "xmatch" | "amatch" => {
                 self.advance();
                 let kind = Self::test_kind(txt);
                 let (pattern, cond) = self.strat_pattern_cond()?;
-                StratExpr::Test { kind, pattern, cond }
+                StratExpr::Test {
+                    kind,
+                    pattern,
+                    cond,
+                }
             }
             "matchrew" | "xmatchrew" | "amatchrew" => {
                 self.advance();
@@ -1138,17 +1579,37 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
-                StratExpr::MatchRew { kind, pattern, cond, subs }
+                StratExpr::MatchRew {
+                    kind,
+                    pattern,
+                    cond,
+                    subs,
+                }
             }
             // A rule application `label[σ]{strats}` or a strategy call `name(args)` / bare `name`.
             _ => {
                 let name = self.name()?;
                 if self.at("(") {
-                    StratExpr::Call { name, args: self.paren_arg_bubbles()? }
+                    StratExpr::Call {
+                        name,
+                        args: self.paren_arg_bubbles()?,
+                    }
                 } else {
-                    let subst = if self.at("[") { self.strat_subst()? } else { Vec::new() };
-                    let substrats = if self.at("{") { self.strat_brace_strats()? } else { Vec::new() };
-                    StratExpr::Apply { label: name, subst, substrats }
+                    let subst = if self.at("[") {
+                        self.strat_subst()?
+                    } else {
+                        Vec::new()
+                    };
+                    let substrats = if self.at("{") {
+                        self.strat_brace_strats()?
+                    } else {
+                        Vec::new()
+                    };
+                    StratExpr::Apply {
+                        label: name,
+                        subst,
+                        substrats,
+                    }
                 }
             }
         })
@@ -1185,7 +1646,10 @@ impl<'a> Parser<'a> {
 
     /// As [`strat_pattern_cond`](Self::strat_pattern_cond) but `extra` adds pattern/condition stop tokens
     /// (matchrew stops the pattern/condition at `by`).
-    fn strat_pattern_cond_until(&mut self, extra: &[&str]) -> PResult<(Vec<Token>, Option<Vec<Token>>)> {
+    fn strat_pattern_cond_until(
+        &mut self,
+        extra: &[&str],
+    ) -> PResult<(Vec<Token>, Option<Vec<Token>>)> {
         let mut stops = vec!["such", ";", "|", "?", ":", ")", ",", "*", "+", "!"];
         stops.extend_from_slice(extra);
         let pattern = self.collect_until(&stops);
@@ -1352,8 +1816,16 @@ impl<'a> Parser<'a> {
                     let from = self.name()?;
                     self.eat("to")?;
                     let to = self.name()?;
-                    items.push(RenameItem::Sort { from: from.clone(), to: to.clone() });
-                    items.push(RenameItem::Op { from, to, dom_range: None, attrs: Attrs::default() });
+                    items.push(RenameItem::Sort {
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                    items.push(RenameItem::Op {
+                        from,
+                        to,
+                        dom_range: None,
+                        attrs: Attrs::default(),
+                    });
                 }
                 "attr" => {
                     // `attr a [. C] to b`: the attribute op is `a`:_` (range `Attribute`); the optional
@@ -1377,7 +1849,12 @@ impl<'a> Parser<'a> {
                     let from = self.name()?;
                     self.eat("to")?;
                     let to = self.name()?;
-                    items.push(RenameItem::Op { from, to, dom_range: None, attrs: Attrs::default() });
+                    items.push(RenameItem::Op {
+                        from,
+                        to,
+                        dom_range: None,
+                        attrs: Attrs::default(),
+                    });
                 }
                 other => {
                     return Err(format!(
@@ -1418,13 +1895,22 @@ impl<'a> Parser<'a> {
         // The to-name runs to the next item separator `,`, the attribute `[`, or `)`. A parenthesized
         // target `(_,_)` (grouping so a mixfix target reads unambiguously) has its outer parens stripped.
         let to_toks = self.collect_until(&[",", "[", ")"]);
-        let attrs = if self.at("[") { self.attrs()? } else { Attrs::default() };
+        let attrs = if self.at("[") {
+            self.attrs()?
+        } else {
+            Attrs::default()
+        };
         let from: String = from_toks.iter().map(|t| self.i.resolve(t.sym)).collect();
         let mut to: String = to_toks.iter().map(|t| self.i.resolve(t.sym)).collect();
         if let Some(inner) = to.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
             to = inner.to_string();
         }
-        Ok(RenameItem::Op { from, to, dom_range, attrs })
+        Ok(RenameItem::Op {
+            from,
+            to,
+            dom_range,
+            attrs,
+        })
     }
 
     /// An optional leading `[name] :` statement label (Maude's labelled-statement syntax, valid on
@@ -1465,9 +1951,9 @@ impl<'a> Parser<'a> {
         Ok(Some(l))
     }
 
-    /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. `owise`/`nonexec` (execution)
-    /// and the `label` name (for META up-translation) are retained; `metadata` (and its argument) plus any
-    /// other attribute (`print`, `format`, …) are parsed and ignored. Absent `[` ⇒ defaults.
+    /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. `owise`, `nonexec`,
+    /// equation `variant`, rule `narrowing`, and the `label` name are retained; `metadata` and
+    /// presentation-only attributes (`format`, …) are parsed and ignored. Absent `[` ⇒ defaults.
     fn stmt_attrs(&mut self) -> PResult<StmtAttrs> {
         let mut sa = StmtAttrs::default();
         if !self.at("[") {
@@ -1475,13 +1961,24 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // [
         while !self.at("]") {
-            match self.peek_text().ok_or("unterminated statement attribute `[`")? {
+            match self
+                .peek_text()
+                .ok_or("unterminated statement attribute `[`")?
+            {
                 "owise" => {
                     sa.owise = true;
                     self.advance();
                 }
                 "nonexec" => {
                     sa.nonexec = true;
+                    self.advance();
+                }
+                "variant" => {
+                    sa.variant = true;
+                    self.advance();
+                }
+                "narrowing" => {
+                    sa.narrowing = true;
                     self.advance();
                 }
                 "label" => {
@@ -1508,8 +2005,14 @@ impl<'a> Parser<'a> {
                         let s = self.i.resolve(t.sym);
                         let is_attr_kw = matches!(
                             s,
-                            "owise" | "nonexec" | "label" | "metadata" | "print" | "format"
-                                | "variant" | "narrowing"
+                            "owise"
+                                | "nonexec"
+                                | "label"
+                                | "metadata"
+                                | "print"
+                                | "format"
+                                | "variant"
+                                | "narrowing"
                         );
                         if t.kind != TokKind::Str && is_attr_kw {
                             break;
@@ -1546,19 +2049,39 @@ impl<'a> Parser<'a> {
     /// An optional `search` bound `[n]` (max solutions) or `[n, m]` (max solutions, max depth). Returns
     /// `(max_solutions, max_depth)`, both `None` when absent.
     fn opt_search_bound(&mut self) -> PResult<(Option<u64>, Option<u64>)> {
-        if !self.at("[") {
+        let bound_head = self
+            .toks
+            .get(self.pos + 1)
+            .map(|token| self.i.resolve(token.sym));
+        if !self.at("[")
+            || !bound_head.is_some_and(|text| {
+                text == "," || (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+        {
             return Ok((None, None));
         }
         self.advance();
-        let n = self.name()?.parse::<u64>().map_err(|_| "expected a number in search bound".to_string())?;
+        let n = if self.at(",") {
+            None
+        } else {
+            Some(
+                self.name()?
+                    .parse::<u64>()
+                    .map_err(|_| "expected a number in search bound".to_string())?,
+            )
+        };
         let m = if self.at(",") {
             self.advance();
-            Some(self.name()?.parse::<u64>().map_err(|_| "expected a depth in search bound".to_string())?)
+            Some(
+                self.name()?
+                    .parse::<u64>()
+                    .map_err(|_| "expected a depth in search bound".to_string())?,
+            )
         } else {
             None
         };
         self.eat("]")?;
-        Ok((Some(n), m))
+        Ok((n, m))
     }
 
     // ---- operator attributes ----
@@ -1568,27 +2091,64 @@ impl<'a> Parser<'a> {
         while !self.at("]") {
             let kw = self.peek_text().ok_or("unexpected end in op attributes")?;
             match kw {
-                "assoc" => { self.advance(); a.assoc = true; }
-                "comm" => { self.advance(); a.comm = true; }
-                "idem" => { self.advance(); a.idem = true; }
-                "iter" => { self.advance(); a.iter = true; }
-                "ctor" => { self.advance(); a.ctor = true; }
-                "ditto" => { self.advance(); a.ditto = true; }
-                "memo" => { self.advance(); }
+                "assoc" => {
+                    self.advance();
+                    a.assoc = true;
+                }
+                "comm" => {
+                    self.advance();
+                    a.comm = true;
+                }
+                "idem" => {
+                    self.advance();
+                    a.idem = true;
+                }
+                "iter" => {
+                    self.advance();
+                    a.iter = true;
+                }
+                "ctor" => {
+                    self.advance();
+                    a.ctor = true;
+                }
+                "ditto" => {
+                    self.advance();
+                    a.ditto = true;
+                }
+                "memo" => {
+                    self.advance();
+                }
                 // Object-system role attributes (Pillar 2.5). `obj`≡`object`, `msg`≡`message`,
                 // `config`≡`configuration` (Maude's lexer aliases). Recorded onto the symbol; they
                 // drive the `erewrite` object-message scheduler but are inert for plain rewrite/search.
-                "config" | "configuration" => { self.advance(); a.config = true; }
-                "obj" | "object" => { self.advance(); a.object = true; }
-                "msg" | "message" => { self.advance(); a.message = true; }
-                "portal" => { self.advance(); a.portal = true; }
+                "config" | "configuration" => {
+                    self.advance();
+                    a.config = true;
+                }
+                "obj" | "object" => {
+                    self.advance();
+                    a.object = true;
+                }
+                "msg" | "message" => {
+                    self.advance();
+                    a.message = true;
+                }
+                "portal" => {
+                    self.advance();
+                    a.portal = true;
+                }
                 "frozen" => {
                     self.advance();
                     // `frozen` = all args; `frozen (1 2)` = those 1-based positions.
                     let positions = if self.at("(") {
                         let toks = self.balanced()?;
                         toks.iter()
-                            .map(|t| self.i.resolve(t.sym).parse::<u32>().map_err(|_| "bad frozen position".to_string()))
+                            .map(|t| {
+                                self.i
+                                    .resolve(t.sym)
+                                    .parse::<u32>()
+                                    .map_err(|_| "bad frozen position".to_string())
+                            })
                             .collect::<Result<_, _>>()?
                     } else {
                         Vec::new()
@@ -1602,7 +2162,11 @@ impl<'a> Parser<'a> {
                 // One-sided identity `left id:` / `right id:` (Maude's `assoc left id: e`): the identity
                 // collapses only on the declared side (fable-audit.md §3.4).
                 "left" | "right" => {
-                    a.id_side = if kw == "left" { IdSide::Left } else { IdSide::Right };
+                    a.id_side = if kw == "left" {
+                        IdSide::Left
+                    } else {
+                        IdSide::Right
+                    };
                     self.advance(); // left / right
                     self.eat("id:")?;
                     a.id = Some(self.id_term());
@@ -1621,7 +2185,12 @@ impl<'a> Parser<'a> {
                     let s = self.balanced()?;
                     a.strat = Some(
                         s.iter()
-                            .map(|t| self.i.resolve(t.sym).parse::<u32>().map_err(|_| "bad strat".to_string()))
+                            .map(|t| {
+                                self.i
+                                    .resolve(t.sym)
+                                    .parse::<u32>()
+                                    .map_err(|_| "bad strat".to_string())
+                            })
                             .collect::<Result<_, _>>()?,
                     );
                 }
@@ -1635,7 +2204,12 @@ impl<'a> Parser<'a> {
                     let toks = self.balanced()?;
                     a.poly = Some(
                         toks.iter()
-                            .map(|t| self.i.resolve(t.sym).parse::<u32>().map_err(|_| "bad poly position".to_string()))
+                            .map(|t| {
+                                self.i
+                                    .resolve(t.sym)
+                                    .parse::<u32>()
+                                    .map_err(|_| "bad poly position".to_string())
+                            })
                             .collect::<Result<_, _>>()?,
                     );
                 }
@@ -1645,7 +2219,11 @@ impl<'a> Parser<'a> {
                     // the pretty-printer; the words are interpreted there.
                     self.advance();
                     let toks = self.balanced()?;
-                    a.format = Some(toks.iter().map(|t| self.i.resolve(t.sym).to_string()).collect());
+                    a.format = Some(
+                        toks.iter()
+                            .map(|t| self.i.resolve(t.sym).to_string())
+                            .collect(),
+                    );
                 }
                 "metadata" | "latex" => {
                     // skip the keyword and its `( … )` / token argument (not modelled in the subset).
@@ -1685,9 +2263,35 @@ impl<'a> Parser<'a> {
     /// constructor-application argument (`a |-> a, a |-> a`).
     fn id_term(&mut self) -> Vec<Token> {
         self.collect_until(&[
-            "assoc", "comm", "idem", "iter", "ctor", "ditto", "memo", "config", "configuration", "obj",
-            "object", "msg", "message", "portal", "frozen", "id:", "left", "right", "prec", "gather",
-            "strat", "special", "poly", "format", "metadata", "latex", "pconst", "rpo", "]",
+            "assoc",
+            "comm",
+            "idem",
+            "iter",
+            "ctor",
+            "ditto",
+            "memo",
+            "config",
+            "configuration",
+            "obj",
+            "object",
+            "msg",
+            "message",
+            "portal",
+            "frozen",
+            "id:",
+            "left",
+            "right",
+            "prec",
+            "gather",
+            "strat",
+            "special",
+            "poly",
+            "format",
+            "metadata",
+            "latex",
+            "pconst",
+            "rpo",
+            "]",
         ])
     }
 
@@ -1712,7 +2316,10 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let class = self.name()?;
                     let data = if self.at("(") {
-                        self.balanced()?.iter().map(|t| self.i.resolve(t.sym).to_string()).collect()
+                        self.balanced()?
+                            .iter()
+                            .map(|t| self.i.resolve(t.sym).to_string())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -1796,7 +2403,13 @@ red s s s s s 0 .
         let m = &s.modules[0];
         assert_eq!(m.name, "ITER");
         assert_eq!(m.sorts, ["Zero", "NzNat", "Nat"]);
-        assert_eq!(m.subsorts, vec![vec![vec!["Zero".to_string(), "NzNat".into()], vec!["Nat".into()]]]);
+        assert_eq!(
+            m.subsorts,
+            vec![vec![
+                vec!["Zero".to_string(), "NzNat".into()],
+                vec!["Nat".into()]
+            ]]
+        );
         assert_eq!(m.ops.len(), 2);
         assert_eq!(m.ops[0].range, "Zero");
         assert!(m.ops[0].attrs.ctor && m.ops[0].domain.is_empty());
@@ -1820,7 +2433,13 @@ endfm
 ";
         let m = &parse(src).modules[0];
         // `ops tt ff` → two constants.
-        assert_eq!(m.ops.iter().filter(|o| o.range == "Truth" && o.domain.is_empty()).count(), 2);
+        assert_eq!(
+            m.ops
+                .iter()
+                .filter(|o| o.range == "Truth" && o.domain.is_empty())
+                .count(),
+            2
+        );
         let plus0 = &m.ops[2];
         assert!(plus0.attrs.assoc && plus0.attrs.comm && plus0.attrs.special.is_some());
         let plus1 = &m.ops[3];
@@ -1864,8 +2483,12 @@ endfm
             ModuleExpr::Rename(base, items) => {
                 assert!(matches!(&**base, ModuleExpr::Named(n) if n == "BAZ"));
                 assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], RenameItem::Sort { from, to } if from == "S" && to == "T"));
-                assert!(matches!(&items[1], RenameItem::Op { from, to, .. } if from == "f" && to == "g"));
+                assert!(
+                    matches!(&items[0], RenameItem::Sort { from, to } if from == "S" && to == "T")
+                );
+                assert!(
+                    matches!(&items[1], RenameItem::Op { from, to, .. } if from == "f" && to == "g")
+                );
             }
             other => panic!("expected Rename, got {other:?}"),
         }
@@ -1914,7 +2537,9 @@ endfth
             other => panic!("expected Eq, got {other:?}"),
         }
         match &m.statements[1] {
-            Statement::Eq { nonexec, .. } => assert!(!*nonexec, "an ordinary equation is executable"),
+            Statement::Eq { nonexec, .. } => {
+                assert!(!*nonexec, "an ordinary equation is executable")
+            }
             other => panic!("expected Eq, got {other:?}"),
         }
     }
@@ -1933,7 +2558,10 @@ endfth
         let mut i = Interner::new();
         let toks = tokenize(bad, &mut i);
         let err = Parser::new(&toks, &i).parse_source().unwrap_err();
-        assert!(err.contains("functional"), "rules rejected in a functional theory: {err}");
+        assert!(
+            err.contains("functional"),
+            "rules rejected in a functional theory: {err}"
+        );
     }
 
     /// B-iii: a parameterized module parses its formal parameters and structured sort names (`Ctr{X}`,
@@ -1953,7 +2581,13 @@ endfm
         assert_eq!(m.params[0].name, "X");
         assert_eq!(m.params[0].theory, "TRIV");
         assert_eq!(m.sorts, ["Ctr{X}", "NzCtr{X}"]);
-        assert_eq!(m.subsorts, vec![vec![vec!["NzCtr{X}".to_string()], vec!["Ctr{X}".to_string()]]]);
+        assert_eq!(
+            m.subsorts,
+            vec![vec![
+                vec!["NzCtr{X}".to_string()],
+                vec!["Ctr{X}".to_string()]
+            ]]
+        );
         let put = &m.ops[0];
         assert_eq!(put.domain, ["X$Elt", "Ctr{X}"]);
         assert_eq!(put.range, "NzCtr{X}");
@@ -1990,7 +2624,10 @@ endv
         assert_eq!(v.sort_maps, vec![("Elt".to_string(), "N".to_string())]);
         assert_eq!(v.op_maps.len(), 2);
         assert!(matches!(&v.op_maps[0], OpMap::Op { .. }), "op e to z");
-        assert!(matches!(&v.op_maps[1], OpMap::Term { .. }), "op 0 to term zero");
+        assert!(
+            matches!(&v.op_maps[1], OpMap::Term { .. }),
+            "op 0 to term zero"
+        );
     }
 
     /// B-ii: an empty view (`view V from T to M is endv`) parses with no maps.
@@ -2010,7 +2647,10 @@ endv
         let s = Parser::new(&toks, &i).parse_source().expect("parse");
         let v = &s.views[0];
         assert_eq!(v.params.len(), 1);
-        assert_eq!((v.params[0].name.as_str(), v.params[0].theory.as_str()), ("X", "TRIV"));
+        assert_eq!(
+            (v.params[0].name.as_str(), v.params[0].theory.as_str()),
+            ("X", "TRIV")
+        );
         match &v.to {
             ModuleExpr::Instantiation(base, args) => {
                 assert!(matches!(&**base, ModuleExpr::Named(n) if n == "LIST"));

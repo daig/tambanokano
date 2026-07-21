@@ -40,6 +40,10 @@ impl Interner {
     pub fn resolve(&self, sym: Sym) -> &str {
         &self.strings[sym.0 as usize]
     }
+    /// Resolve a raw token code stored by the kernel in a variable DAG node.
+    pub fn resolve_index(&self, index: u32) -> &str {
+        &self.strings[index as usize]
+    }
     /// The [`Sym`] for an already-interned string, or `None`. Immutable lookup (no interning) — used by
     /// the surface parser (which holds `&Interner`) to obtain the mixfix fragment chars (`:`/`_`) it
     /// splices into synthesized `omod` attribute-operator names; [`tokenize`] guarantees they are interned.
@@ -139,12 +143,43 @@ fn is_line_comment_start(chars: &[char], j: usize) -> bool {
 fn is_top_level_keyword(w: &str) -> bool {
     matches!(
         w,
-        "fmod" | "mod" | "fth" | "th" | "endfm" | "endm" | "endfth" | "endth"
-            | "view" | "endv"
-            | "sort" | "sorts" | "subsort" | "subsorts" | "op" | "ops" | "var" | "vars"
-            | "protecting" | "pr" | "extending" | "ex" | "including" | "inc"
-            | "eq" | "ceq" | "mb" | "cmb" | "rl" | "crl"
-            | "red" | "reduce" | "match" | "xmatch" | "rew" | "rewrite" | "search"
+        "fmod"
+            | "mod"
+            | "fth"
+            | "th"
+            | "endfm"
+            | "endm"
+            | "endfth"
+            | "endth"
+            | "view"
+            | "endv"
+            | "sort"
+            | "sorts"
+            | "subsort"
+            | "subsorts"
+            | "op"
+            | "ops"
+            | "var"
+            | "vars"
+            | "protecting"
+            | "pr"
+            | "extending"
+            | "ex"
+            | "including"
+            | "inc"
+            | "eq"
+            | "ceq"
+            | "mb"
+            | "cmb"
+            | "rl"
+            | "crl"
+            | "red"
+            | "reduce"
+            | "match"
+            | "xmatch"
+            | "rew"
+            | "rewrite"
+            | "search"
     )
 }
 
@@ -234,7 +269,9 @@ fn is_rational_literal(text: &str) -> bool {
         Some(r) => (true, r),
         None => (false, text),
     };
-    let Some((num, den)) = rest.split_once('/') else { return false };
+    let Some((num, den)) = rest.split_once('/') else {
+        return false;
+    };
     // Numerator: all digits, non-empty; a `0` numerator is allowed only unsigned and only as exactly `0`.
     if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
         return false;
@@ -244,9 +281,7 @@ fn is_rational_literal(text: &str) -> bool {
     }
     // Denominator: all digits, non-empty, with a nonzero leading digit (>= 1, no leading zero) and no
     // further `/`.
-    !den.is_empty()
-        && den.bytes().all(|b| b.is_ascii_digit())
-        && den.as_bytes()[0] != b'0'
+    !den.is_empty() && den.bytes().all(|b| b.is_ascii_digit()) && den.as_bytes()[0] != b'0'
 }
 
 /// An `iter`-symbol input token `f^count` — a faithful mirror of Maude's `ITER_SYMBOL` branch of
@@ -254,7 +289,9 @@ fn is_rational_literal(text: &str) -> bool {
 /// maximal run of trailing digits whose first digit is nonzero (so `f^0`/`f^01` are *not* iter tokens).
 /// The prefix may itself contain `_` (`s_^10`). `k` may be a bignum (`s_^18446744073709551616`).
 fn is_iter_token(text: &str) -> bool {
-    let Some((prefix, digits)) = text.rsplit_once('^') else { return false };
+    let Some((prefix, digits)) = text.rsplit_once('^') else {
+        return false;
+    };
     !prefix.is_empty()
         && !digits.is_empty()
         && digits.bytes().all(|b| b.is_ascii_digit())
@@ -266,7 +303,9 @@ fn is_iter_token(text: &str) -> bool {
 /// first; `-0`/`-00` (magnitude zero) is excluded — `0` is solely the declared zero constant (Maude maps
 /// it to `ZERO`), and a glued `-0` is a degenerate input.
 fn is_neg_integer(text: &str) -> bool {
-    let Some(digits) = text.strip_prefix('-') else { return false };
+    let Some(digits) = text.strip_prefix('-') else {
+        return false;
+    };
     !digits.is_empty()
         && digits.bytes().all(|b| b.is_ascii_digit())
         && digits.bytes().any(|b| b != b'0')
@@ -346,9 +385,8 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
         // (Maude's `eatComment` parenMode, `lexerAux.cc`); a backquoted paren does not count. Otherwise it
         // is a line comment to end of line. (The `***>`/`--->` echo forms have `>` as the first character,
         // so they fall through to the line-comment case — never bracketed — just as in Maude.)
-        let is_comment = |k: char| {
-            chars[i] == k && chars.get(i + 1) == Some(&k) && chars.get(i + 2) == Some(&k)
-        };
+        let is_comment =
+            |k: char| chars[i] == k && chars.get(i + 1) == Some(&k) && chars.get(i + 2) == Some(&k);
         if is_comment('*') || is_comment('-') {
             i += 3;
             let mut j = i;
@@ -384,13 +422,21 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
         }
         if is_punct(c) {
             let sym = interner.intern(&c.to_string());
-            out.push(Token { sym, line, kind: TokKind::Punct });
+            out.push(Token {
+                sym,
+                line,
+                kind: TokKind::Punct,
+            });
             i += 1;
             continue;
         }
         if c == '.' && is_terminator_dot(&chars, i) {
             let sym = interner.intern(".");
-            out.push(Token { sym, line, kind: TokKind::Dot });
+            out.push(Token {
+                sym,
+                line,
+                kind: TokKind::Dot,
+            });
             i += 1;
             continue;
         }
@@ -424,6 +470,29 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                     i += 1;
                 }
                 continue;
+            }
+            // A colon glued on only one side is syntax punctuation, not a colon-variable token:
+            // object syntax writes both `:Snd` and `buff:` without spaces. Preserve `X:Sort` as one
+            // token, but emit a leading/trailing maximal colon run separately.
+            if ch == ':' {
+                if text.is_empty() {
+                    while i < n && chars[i] == ':' {
+                        text.push(':');
+                        i += 1;
+                    }
+                    break;
+                }
+                let next_is_boundary = chars
+                    .get(i + 1)
+                    .is_none_or(|next| next.is_whitespace() || is_punct(*next));
+                if next_is_boundary {
+                    if text == "id" {
+                        text.push(':');
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
             }
             // A structured-sort colon variable keeps its braces in one token: `L:List{Nat}` (and the chained
             // `X:Box{ToT2}{C2}`) — consume the balanced `{ … }` group rather than letting `{` split it off.
@@ -581,7 +650,10 @@ mod tests {
     fn lex(src: &str) -> (Interner, Vec<(String, TokKind)>) {
         let mut i = Interner::new();
         let toks = tokenize(src, &mut i);
-        let decoded = toks.iter().map(|t| (t.text(&i).to_string(), t.kind)).collect();
+        let decoded = toks
+            .iter()
+            .map(|t| (t.text(&i).to_string(), t.kind))
+            .collect();
         (i, decoded)
     }
 
@@ -590,7 +662,21 @@ mod tests {
         let (_i, t) = lex("op _+_ : Nat Nat -> Nat .");
         let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(texts, ["op", "_+_", ":", "Nat", "Nat", "->", "Nat", "."]);
-        assert_eq!(t.last().unwrap().1, TokKind::Dot, "trailing . is the terminator");
+        assert_eq!(
+            t.last().unwrap().1,
+            TokKind::Dot,
+            "trailing . is the terminator"
+        );
+    }
+
+    #[test]
+    fn splits_one_sided_object_colons_but_keeps_colon_variables() {
+        let (_i, t) = lex("< O :Snd | buff: L > X:Sort X::Y ::");
+        let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["<", "O", ":", "Snd", "|", "buff", ":", "L", ">", "X:Sort", "X::Y", "::"]
+        );
     }
 
     /// A structured-sort colon variable keeps its braces in one token (`L:List{Nat}`, and the chained
@@ -600,12 +686,32 @@ mod tests {
     fn structured_colon_variable_is_one_token() {
         let (_i, t) = lex("hd(c(N:Nat, L:List{Nat}), X:Box{A}{B}) List{Nat}");
         let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(texts, [
-            "hd", "(", "c", "(", "N:Nat", ",", "L:List{Nat}", ")", ",", "X:Box{A}{B}", ")",
-            // a plain structured sort (no colon) is unaffected — still `List { Nat }`.
-            "List", "{", "Nat", "}",
-        ]);
-        assert_eq!(t[6].1, TokKind::Ident, "the colon-var token classifies as an identifier");
+        assert_eq!(
+            texts,
+            [
+                "hd",
+                "(",
+                "c",
+                "(",
+                "N:Nat",
+                ",",
+                "L:List{Nat}",
+                ")",
+                ",",
+                "X:Box{A}{B}",
+                ")",
+                // a plain structured sort (no colon) is unaffected — still `List { Nat }`.
+                "List",
+                "{",
+                "Nat",
+                "}",
+            ]
+        );
+        assert_eq!(
+            t[6].1,
+            TokKind::Ident,
+            "the colon-var token classifies as an identifier"
+        );
     }
 
     /// A bracketed comment `***( … )` / `---( … )` (the first non-blank after the marker is `(`) runs until
@@ -652,27 +758,41 @@ mod tests {
         let t = |s| lex(s).1;
         // A token that is exactly one string is `Str` (close-quote is the last char).
         assert_eq!(t(r#""hello""#), [("\"hello\"".into(), Str)]);
-        assert_eq!(t(r#""""#), [("\"\"".into(), Str)], "the empty string is a Str");
+        assert_eq!(
+            t(r#""""#),
+            [("\"\"".into(), Str)],
+            "the empty string is a Str"
+        );
         // A string glued into an identifier is ONE `Ident` token (Maude keeps the whole maudeId).
         assert_eq!(t(r#"a"b"c"#), [("a\"b\"c".into(), Ident)]);
         assert_eq!(t(r#"foo"bar""#), [("foo\"bar\"".into(), Ident)]);
-        assert_eq!(t(r#""x"y"#), [("\"x\"y".into(), Ident)], "leading string + glued suffix = Ident");
+        assert_eq!(
+            t(r#""x"y"#),
+            [("\"x\"y".into(), Ident)],
+            "leading string + glued suffix = Ident"
+        );
         // An escaped quote inside the string does not end it; the trailing `"` does.
         assert_eq!(t(r#""a\"b""#), [("\"a\\\"b\"".into(), Str)]);
         // Bare strings separated by space/paren/comma still split (the only form real specs use).
-        assert_eq!(t(r#"len("hello")"#), [
-            ("len".into(), Ident),
-            ("(".into(), Punct),
-            ("\"hello\"".into(), Str),
-            (")".into(), Punct),
-        ]);
+        assert_eq!(
+            t(r#"len("hello")"#),
+            [
+                ("len".into(), Ident),
+                ("(".into(), Punct),
+                ("\"hello\"".into(), Str),
+                (")".into(), Punct),
+            ]
+        );
         // `"ab" . "cd"` is `_._` String concat: the middle `.` (followed by `"cd"`, not a keyword) is an
         // ordinary `Ident` operator token, not a terminator — exactly as in `red "ab" . "cd" .`.
-        assert_eq!(t(r#""ab" . "cd""#), [
-            ("\"ab\"".into(), Str),
-            (".".into(), Ident),
-            ("\"cd\"".into(), Str),
-        ]);
+        assert_eq!(
+            t(r#""ab" . "cd""#),
+            [
+                ("\"ab\"".into(), Str),
+                (".".into(), Ident),
+                ("\"cd\"".into(), Str),
+            ]
+        );
     }
 
     /// Leading-zero numerals stay the broad `Number` kind. `classify` assigns `Number` to *every*
@@ -688,9 +808,17 @@ mod tests {
     fn leading_zero_numerals_stay_number() {
         use TokKind::*;
         assert_eq!(classify("0"), Number, "the bare zero constant");
-        assert_eq!(classify("00"), Number, "all-zero run: Number here; rejected at the grammar terminal");
+        assert_eq!(
+            classify("00"),
+            Number,
+            "all-zero run: Number here; rejected at the grammar terminal"
+        );
         assert_eq!(classify("000"), Number);
-        assert_eq!(classify("01"), Number, "leading-zero numeral: Number, becomes `1` (zeros stripped)");
+        assert_eq!(
+            classify("01"),
+            Number,
+            "leading-zero numeral: Number, becomes `1` (zeros stripped)"
+        );
         assert_eq!(classify("007"), Number);
         assert_eq!(classify("123"), Number);
         // A glued negative-zero is not a numeral at all — Maude excludes it (`-0` → no parse) and so do we.
@@ -718,9 +846,17 @@ mod tests {
         assert_eq!(classify("2.0E+3"), TokKind::Float);
         assert_eq!(classify("4.0"), TokKind::Float);
         // A dotless `-N` is a negative-integer literal (Maude's `SMALL_NEG`), not a float.
-        assert_eq!(classify("-3"), TokKind::NegNumber, "`-3` is a SMALL_NEG, parsed via the `-_` op");
+        assert_eq!(
+            classify("-3"),
+            TokKind::NegNumber,
+            "`-3` is a SMALL_NEG, parsed via the `-_` op"
+        );
         assert_eq!(classify("-7"), TokKind::NegNumber);
-        assert_eq!(classify("-0"), TokKind::Ident, "`-0` (magnitude zero) is not SMALL_NEG");
+        assert_eq!(
+            classify("-0"),
+            TokKind::Ident,
+            "`-0` (magnitude zero) is not SMALL_NEG"
+        );
         // Abbreviated float forms Maude's `looksLikeFloat` ACCEPTS (verified against Maude 3.5.1:
         // `reduce in FLOAT : 1. .` → `result FiniteFloat: 1.0`, `.5` → `5.0e-1`, `1.e3`/`1e3` → `1.0e+3`,
         // `.5e2` → `5.0e+1`, `Infinity` → `result Float: Infinity`). The prior pins asserted Maude
@@ -733,19 +869,54 @@ mod tests {
         assert_eq!(classify("Infinity"), TokKind::Float);
         assert_eq!(classify("-Infinity"), TokKind::Float, "signed Infinity");
         // …and the forms it still REJECTS (verified: `1.5e` → `bad token 1.5e`, lone `.` → parse error).
-        assert_eq!(classify("1.5e"), TokKind::Ident, "a dangling exponent is not a float");
+        assert_eq!(
+            classify("1.5e"),
+            TokKind::Ident,
+            "a dangling exponent is not a float"
+        );
         assert_eq!(classify("."), TokKind::Ident, "a lone dot is not a float");
-        assert_eq!(classify("5"), TokKind::Number, "a bare integer numeral is a Number, not a Float");
+        assert_eq!(
+            classify("5"),
+            TokKind::Number,
+            "a bare integer numeral is a Number, not a Float"
+        );
         // `5.0 - 1.5` keeps the spaced `-` as a separate Ident token (binary minus).
         let (_i, t) = lex("5.0 - 1.5");
         let decoded: Vec<(&str, TokKind)> = t.iter().map(|(s, k)| (s.as_str(), *k)).collect();
-        assert_eq!(decoded, [("5.0", TokKind::Float), ("-", TokKind::Ident), ("1.5", TokKind::Float)]);
+        assert_eq!(
+            decoded,
+            [
+                ("5.0", TokKind::Float),
+                ("-", TokKind::Ident),
+                ("1.5", TokKind::Float)
+            ]
+        );
         // A glued `-7` is one `NegNumber` token; a spaced `- 7` and `5 - 7` keep `-` separate. So `5 -7`
         // lexes as `5`, `-7` (which then fails to parse, exactly as the reference binary rejects it).
         let toks = |s| lex(s).1;
-        assert_eq!(toks("-7 quo 2"), [("-7".into(), TokKind::NegNumber), ("quo".into(), TokKind::Ident), ("2".into(), TokKind::Number)]);
-        assert_eq!(toks("5 -7"), [("5".into(), TokKind::Number), ("-7".into(), TokKind::NegNumber)]);
-        assert_eq!(toks("5 - 7"), [("5".into(), TokKind::Number), ("-".into(), TokKind::Ident), ("7".into(), TokKind::Number)]);
+        assert_eq!(
+            toks("-7 quo 2"),
+            [
+                ("-7".into(), TokKind::NegNumber),
+                ("quo".into(), TokKind::Ident),
+                ("2".into(), TokKind::Number)
+            ]
+        );
+        assert_eq!(
+            toks("5 -7"),
+            [
+                ("5".into(), TokKind::Number),
+                ("-7".into(), TokKind::NegNumber)
+            ]
+        );
+        assert_eq!(
+            toks("5 - 7"),
+            [
+                ("5".into(), TokKind::Number),
+                ("-".into(), TokKind::Ident),
+                ("7".into(), TokKind::Number)
+            ]
+        );
     }
 
     #[test]
@@ -773,7 +944,14 @@ mod tests {
         assert_eq!(frag("s_", &mut i), ["s", "_"]);
         assert_eq!(frag("-_", &mut i), ["-", "_"]);
         assert_eq!(frag("_<=_", &mut i), ["_", "<=", "_"]);
-        assert_eq!(frag("if_then_else_fi", &mut i), ["if", "_", "then", "_", "else", "_", "fi"]);
-        assert_eq!(frag("gcd", &mut i), ["gcd"], "a bare identifier is prefix-only");
+        assert_eq!(
+            frag("if_then_else_fi", &mut i),
+            ["if", "_", "then", "_", "else", "_", "fi"]
+        );
+        assert_eq!(
+            frag("gcd", &mut i),
+            ["gcd"],
+            "a bare identifier is prefix-only"
+        );
     }
 }

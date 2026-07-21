@@ -8,8 +8,8 @@
 
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
-use crate::num::{Int, Nat};
 use crate::num;
+use crate::num::{Int, Nat};
 use crate::symbol::{
     BoolHooks, CharClass, ConvOp, FltOp, NatHooks, NumOp, QidOp, SpecialOp, StrOp, SymbolClass,
     SymbolId,
@@ -27,9 +27,13 @@ impl Runtime {
     ) -> Option<DagId> {
         match op {
             SpecialOp::Equality { eq, neq } => self.reduce_equality(sig, id, *eq, *neq),
-            SpecialOp::DecomposeEquality { eq, neq, conj, disj, siblings } => {
-                self.reduce_decompose_equality(sig, id, *eq, *neq, *conj, *disj, siblings)
-            }
+            SpecialOp::DecomposeEquality {
+                eq,
+                neq,
+                conj,
+                disj,
+                siblings,
+            } => self.reduce_decompose_equality(sig, id, *eq, *neq, *conj, *disj, siblings),
             SpecialOp::Branch { tests } => self.reduce_branch(id, tests),
             SpecialOp::AcuNumberOp { op, nat } => self.reduce_acu_number_op(sig, id, *op, nat),
             SpecialOp::NumberOp { op, nat, bool_ } => {
@@ -37,21 +41,52 @@ impl Runtime {
             }
             SpecialOp::CuiNumberOp { op, nat } => self.reduce_cui_number_op(sig, id, *op, nat),
             SpecialOp::Minus { nat } => self.reduce_minus(id, nat),
-            SpecialOp::StringOp { op, str_sym, nat, bool_, not_found } => {
-                self.reduce_string_op(sig, id, *op, *str_sym, nat.as_ref(), bool_.as_ref(), *not_found)
-            }
-            SpecialOp::FloatOp { op, float_sym, bool_ } => {
-                self.reduce_float_op(sig, id, *op, *float_sym, bool_.as_ref())
-            }
+            SpecialOp::StringOp {
+                op,
+                str_sym,
+                nat,
+                bool_,
+                not_found,
+            } => self.reduce_string_op(
+                sig,
+                id,
+                *op,
+                *str_sym,
+                nat.as_ref(),
+                bool_.as_ref(),
+                *not_found,
+            ),
+            SpecialOp::FloatOp {
+                op,
+                float_sym,
+                bool_,
+            } => self.reduce_float_op(sig, id, *op, *float_sym, bool_.as_ref()),
             SpecialOp::Random { nat } => self.reduce_random(sig, id, nat),
-            SpecialOp::Conversion { op, float_sym, str_sym, nat, division, dec_float } => self
-                .reduce_conversion(sig, id, *op, *float_sym, *str_sym, nat.as_ref(), *division, *dec_float),
+            SpecialOp::Conversion {
+                op,
+                float_sym,
+                str_sym,
+                nat,
+                division,
+                dec_float,
+            } => self.reduce_conversion(
+                sig,
+                id,
+                *op,
+                *float_sym,
+                *str_sym,
+                nat.as_ref(),
+                *division,
+                *dec_float,
+            ),
             // `counter` is inert under equational reduction — it only advances under `rewrite`/`frewrite`
             // (see `try_counter`), so a `reduce` leaves it as the kind constant `[Nat]: counter`.
             SpecialOp::Counter { .. } => None,
-            SpecialOp::QidOp { op, qid_sym, str_sym } => {
-                self.reduce_qid_op(sig, id, *op, *qid_sym, *str_sym)
-            }
+            SpecialOp::QidOp {
+                op,
+                qid_sym,
+                str_sym,
+            } => self.reduce_qid_op(sig, id, *op, *qid_sym, *str_sym),
             SpecialOp::Division { nat } => self.reduce_division(sig, id, nat),
             // META-LEVEL descent: down-translate the meta-term arguments, run the engine operation in the
             // object module, up-translate the result. The build pipeline + module database live above this
@@ -78,7 +113,11 @@ impl Runtime {
         qid_sym: SymbolId,
         str_sym: SymbolId,
     ) -> Option<DagId> {
-        let arg = self.node(id).children().next().expect("string/qid is unary");
+        let arg = self
+            .node(id)
+            .children()
+            .next()
+            .expect("string/qid is unary");
         match op {
             QidOp::String => {
                 // The qid's canonical text (already valid UTF-8) as the string's raw bytes.
@@ -100,7 +139,12 @@ impl Runtime {
 
     /// Read a rational from `id`: an integer numeral → `(i, 1)`, or a `_/_` node `I / N` → `(I, N)`.
     /// `None` if `id` is neither.
-    fn as_rational(&self, id: DagId, nat: &NatHooks, division: Option<SymbolId>) -> Option<(Int, Nat)> {
+    fn as_rational(
+        &self,
+        id: DagId,
+        nat: &NatHooks,
+        division: Option<SymbolId>,
+    ) -> Option<(Int, Nat)> {
         if let Some(i) = self.as_int(id, nat) {
             return Some((i, Nat::one()));
         }
@@ -167,7 +211,11 @@ impl Runtime {
                 let s = if den == Nat::one() {
                     num.to_string_base(base)
                 } else {
-                    format!("{}/{}", num.to_string_base(base), Int::from_nat(&den).to_string_base(base))
+                    format!(
+                        "{}/{}",
+                        num.to_string_base(base),
+                        Int::from_nat(&den).to_string_base(base)
+                    )
                 };
                 Some(self.make_na(sig, str_sym?, NaValue::Str(s.into_bytes().into())))
             }
@@ -178,9 +226,10 @@ impl Runtime {
                 let s = std::str::from_utf8(&s).ok()?; // non-UTF-8 bytes are not a numeral ⇒ fall through
                 let base = conv_base(self.as_nat(kids[1], nat)?)?;
                 let (num, den) = match s.split_once('/') {
-                    Some((n, d)) => {
-                        (Int::from_string_base(base, n)?, Int::from_string_base(base, d)?.magnitude())
-                    }
+                    Some((n, d)) => (
+                        Int::from_string_base(base, n)?,
+                        Int::from_string_base(base, d)?.magnitude(),
+                    ),
                     None => (Int::from_string_base(base, s)?, Nat::one()),
                 };
                 if den.is_zero() {
@@ -218,7 +267,8 @@ impl Runtime {
                     Int::from_nat(&Nat::from_u64(exp as u64))
                 };
                 let sign_dag = self.make_int(sig, nat, sign_val)?;
-                let digits_dag = self.make_na(sig, str_sym?, NaValue::Str(digits.into_bytes().into()));
+                let digits_dag =
+                    self.make_na(sig, str_sym?, NaValue::Str(digits.into_bytes().into()));
                 let exp_dag = self.make_int(sig, nat, exp_val)?;
                 Some(self.make_free(sig, dec_float?, vec![sign_dag, digits_dag, exp_dag]))
             }
@@ -258,7 +308,10 @@ impl Runtime {
     /// Read a quoted-identifier value from a `NodeTerm::Na::Qid` (the text without its `'`), or `None`.
     fn as_qid(&self, id: DagId) -> Option<Rc<str>> {
         match &self.node(id).term {
-            NodeTerm::Na { value: NaValue::Qid(q), .. } => Some(q.clone()),
+            NodeTerm::Na {
+                value: NaValue::Qid(q),
+                ..
+            } => Some(q.clone()),
             _ => None,
         }
     }
@@ -275,7 +328,10 @@ impl Runtime {
     ) -> Option<DagId> {
         let (l, r) = {
             let mut kids = self.node(id).children();
-            (kids.next().expect("_==_ is binary"), kids.next().expect("_==_ is binary"))
+            (
+                kids.next().expect("_==_ is binary"),
+                kids.next().expect("_==_ is binary"),
+            )
         };
         // Floats compare by IEEE value, not bit pattern: `- 0.0 == 0.0` is true (Maude's
         // FloatDagNode compares the doubles; NaN never occurs — the float ops gate it out).
@@ -306,7 +362,10 @@ impl Runtime {
     ) -> Option<DagId> {
         let (l, r) = {
             let mut kids = self.node(id).children();
-            (kids.next().expect("_.=._ is binary"), kids.next().expect("_.=._ is binary"))
+            (
+                kids.next().expect("_.=._ is binary"),
+                kids.next().expect("_.=._ is binary"),
+            )
         };
         // Equal dags are always equal (arguments arrive reduced — standard strategy).
         if self.deep_equal(l, r) {
@@ -355,7 +414,9 @@ impl Runtime {
 
     /// Whether some immediate argument of `bigger` equals `smaller`.
     fn has_immediate_subterm(&self, bigger: DagId, smaller: DagId) -> bool {
-        self.node(bigger).children().any(|c| self.deep_equal(c, smaller))
+        self.node(bigger)
+            .children()
+            .any(|c| self.deep_equal(c, smaller))
     }
 
     /// The `.=.` polymorph instance for the kind of `sort` (Maude's
@@ -367,7 +428,10 @@ impl Runtime {
         siblings: &Rc<[Option<SymbolId>]>,
         sort: crate::sort::SortId,
     ) -> Option<SymbolId> {
-        siblings.get(sig.sorts().kind_of(sort).index()).copied().flatten()
+        siblings
+            .get(sig.sorts().kind_of(sort).index())
+            .copied()
+            .flatten()
     }
 
     /// Build one decomposed `.=.` pair, sharing the node with any content-equal pair already built
@@ -426,14 +490,24 @@ impl Runtime {
                 Some(if arity == 1 {
                     subterms[0]
                 } else {
-                    self.make_acu(sig, conj.unwrap(), subterms.into_iter().map(|s| (s, 1)).collect())
+                    self.make_acu(
+                        sig,
+                        conj.unwrap(),
+                        subterms.into_iter().map(|s| (s, 1)).collect(),
+                    )
                 })
             }
             // Iter theory: peel the common successor count; domain kind == range kind, so the
             // subject's own instance is the sibling.
             (
-                NodeTerm::S { symbol, count: lc, arg: la },
-                NodeTerm::S { count: rc, arg: ra, .. },
+                NodeTerm::S {
+                    symbol,
+                    count: lc,
+                    arg: la,
+                },
+                NodeTerm::S {
+                    count: rc, arg: ra, ..
+                },
             ) => {
                 let (x, y) = if lc > rc {
                     let d = lc.checked_sub(rc).expect("lc > rc");
@@ -450,11 +524,15 @@ impl Runtime {
             // Commutative (CUI) theory: four single-pair cases, else a disjunction of the two
             // pairings.
             (NodeTerm::Cui { symbol, args: la }, NodeTerm::Cui { args: ra, .. }) => {
-                let sibling = self.dec_sibling(sig, siblings, sig.symbol(*symbol).decls[0].domain[0])?;
+                let sibling =
+                    self.dec_sibling(sig, siblings, sig.symbol(*symbol).decls[0].domain[0])?;
                 let (l0, l1, r0, r1) = (la[0], la[1], ra[0], ra[1]);
-                for (a, b, c, d) in
-                    [(l0, r0, l1, r1), (l1, r1, l0, r0), (l0, r1, l1, r0), (l1, r0, l0, r1)]
-                {
+                for (a, b, c, d) in [
+                    (l0, r0, l1, r1),
+                    (l1, r1, l0, r0),
+                    (l0, r1, l1, r0),
+                    (l1, r0, l0, r1),
+                ] {
                     if self.deep_equal(a, b) {
                         return Some(self.make_cui(sig, sibling, c, d));
                     }
@@ -609,7 +687,11 @@ impl Runtime {
         Some(if arity == 1 {
             and_args[0]
         } else {
-            self.make_acu(sig, conj.unwrap(), and_args.into_iter().map(|a| (a, 1)).collect())
+            self.make_acu(
+                sig,
+                conj.unwrap(),
+                and_args.into_iter().map(|a| (a, 1)).collect(),
+            )
         })
     }
 
@@ -658,7 +740,11 @@ impl Runtime {
     fn rebuild_ac(&mut self, sig: &Signature, f: SymbolId, ms: Vec<(DagId, u32)>) -> DagId {
         let total: u64 = ms.iter().map(|&(_, m)| u64::from(m)).sum();
         debug_assert!(total >= 1, "empty multiset after unequal-cancel");
-        if total == 1 { ms[0].0 } else { self.make_acu(sig, f, ms) }
+        if total == 1 {
+            ms[0].0
+        } else {
+            self.make_acu(sig, f, ms)
+        }
     }
 
     /// Port of `acProvablyUnequal`: try to prove two argument multisets can never be made equal
@@ -749,7 +835,10 @@ impl Runtime {
     fn reduce_branch(&self, id: DagId, tests: &[SymbolId]) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
         let cond_sym = self.node(kids[0]).symbol();
-        tests.iter().position(|&t| t == cond_sym).map(|i| kids[i + 1])
+        tests
+            .iter()
+            .position(|&t| t == cond_sym)
+            .map(|i| kids[i + 1])
     }
 
     /// The magnitude of a non-negative numeral at `id` — the `zero` constant (`0`) or `s^count(0)` — or
@@ -759,12 +848,14 @@ impl Runtime {
             NodeTerm::Free { symbol, args } if *symbol == nat.zero && args.is_empty() => {
                 Some(Nat::zero())
             }
-            NodeTerm::S { symbol, count, arg } if *symbol == nat.succ => match &self.node(*arg).term {
-                NodeTerm::Free { symbol: b, args } if *b == nat.zero && args.is_empty() => {
-                    Some(count.clone())
+            NodeTerm::S { symbol, count, arg } if *symbol == nat.succ => {
+                match &self.node(*arg).term {
+                    NodeTerm::Free { symbol: b, args } if *b == nat.zero && args.is_empty() => {
+                        Some(count.clone())
+                    }
+                    _ => None, // s^count(non-zero) is not a ground numeral
                 }
-                _ => None, // s^count(non-zero) is not a ground numeral
-            },
+            }
             _ => None,
         }
     }
@@ -920,7 +1011,9 @@ impl Runtime {
                 if a[2].is_zero() {
                     return None; // modulus 0 (the `NzNat` arg guards this; defend anyway)
                 }
-                let r = a[0].magnitude().mod_pow(&a[1].magnitude(), &a[2].magnitude());
+                let r = a[0]
+                    .magnitude()
+                    .mod_pow(&a[1].magnitude(), &a[2].magnitude());
                 self.make_int(sig, nat, Int::from_nat(&r))
             }
             // `_>>_` / `_<<_ : Int Nat -> Int`: arithmetic shifts on the signed value (`>>` floors toward
@@ -928,12 +1021,24 @@ impl Runtime {
             // (a bignum count is unrepresentable ⇒ fall through).
             NumOp::Shr | NumOp::Shl => {
                 let amount = a[1].magnitude().to_u64()?;
-                let r = if matches!(op, NumOp::Shr) { a[0].shr(amount) } else { a[0].shl(amount) };
+                let r = if matches!(op, NumOp::Shr) {
+                    a[0].shr(amount)
+                } else {
+                    a[0].shl(amount)
+                };
                 self.make_int(sig, nat, r)
             }
             // ACU / CUI ops never reach the free path (the seam pairs each op with the right arm).
-            NumOp::Add | NumOp::Mul | NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max
-            | NumOp::Xor | NumOp::And | NumOp::Or | NumOp::Sd => {
+            NumOp::Add
+            | NumOp::Mul
+            | NumOp::Gcd
+            | NumOp::Lcm
+            | NumOp::Min
+            | NumOp::Max
+            | NumOp::Xor
+            | NumOp::And
+            | NumOp::Or
+            | NumOp::Sd => {
                 unreachable!("non-free number op `{op:?}` reached the free NumberOp path")
             }
         }
@@ -961,7 +1066,10 @@ impl Runtime {
     /// Read a string value (raw bytes) from a `NodeTerm::Na::Str`, or `None` (not a string literal/result).
     pub(crate) fn as_str(&self, id: DagId) -> Option<Rc<[u8]>> {
         match &self.node(id).term {
-            NodeTerm::Na { value: NaValue::Str(s), .. } => Some(s.clone()),
+            NodeTerm::Na {
+                value: NaValue::Str(s),
+                ..
+            } => Some(s.clone()),
             _ => None,
         }
     }
@@ -990,7 +1098,8 @@ impl Runtime {
         not_found: Option<SymbolId>,
     ) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
-        let make_str = |this: &mut Self, s: Vec<u8>| this.make_na(sig, str_sym, NaValue::Str(s.into()));
+        let make_str =
+            |this: &mut Self, s: Vec<u8>| this.make_na(sig, str_sym, NaValue::Str(s.into()));
         match op {
             StrOp::Concat => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
@@ -1076,7 +1185,14 @@ impl Runtime {
                     _ => return None, // not a single byte
                 };
                 let h = bool_?;
-                Some(self.make_const(sig, if char_in_class(b as char, class) { h.true_ } else { h.false_ }))
+                Some(self.make_const(
+                    sig,
+                    if char_in_class(b as char, class) {
+                        h.true_
+                    } else {
+                        h.false_
+                    },
+                ))
             }
             // `startsWith` / `endsWith : String String -> Bool` (byte prefix/suffix).
             StrOp::StartsWith | StrOp::EndsWith => {
@@ -1125,7 +1241,10 @@ impl Runtime {
     /// Read an `f64` from a `NodeTerm::Na::Float`, or `None`.
     fn as_float(&self, id: DagId) -> Option<f64> {
         match &self.node(id).term {
-            NodeTerm::Na { value: NaValue::Float(bits), .. } => Some(f64::from_bits(*bits)),
+            NodeTerm::Na {
+                value: NaValue::Float(bits),
+                ..
+            } => Some(f64::from_bits(*bits)),
             _ => None,
         }
     }
@@ -1142,7 +1261,8 @@ impl Runtime {
     ) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
         let a = self.as_float(kids[0])?;
-        let make_f = |this: &mut Self, v: f64| this.make_na(sig, float_sym, NaValue::Float(v.to_bits()));
+        let make_f =
+            |this: &mut Self, v: f64| this.make_na(sig, float_sym, NaValue::Float(v.to_bits()));
         // Comparisons → Bool.
         if matches!(op, FltOp::Lt | FltOp::Le | FltOp::Gt | FltOp::Ge) {
             let b = self.as_float(kids[1])?;
@@ -1222,7 +1342,10 @@ impl Runtime {
             return self.make_int(sig, nat, new_num); // denominator 1 → the integer
         }
         if gcd > Nat::one() {
-            let (nn, dn) = (self.make_int(sig, nat, new_num)?, self.make_int(sig, nat, new_den)?);
+            let (nn, dn) = (
+                self.make_int(sig, nat, new_num)?,
+                self.make_int(sig, nat, new_den)?,
+            );
             return Some(self.make_free(sig, symbol, vec![nn, dn]));
         }
         None // already in lowest terms
@@ -1293,7 +1416,9 @@ fn char_in_class(c: char, class: CharClass) -> bool {
 
 /// A conversion base as a `u8` in 2..=36, or `None` (out of range / too large) — Maude's base argument.
 fn conv_base(n: Nat) -> Option<u8> {
-    u8::try_from(n.to_u64()?).ok().filter(|&b| (2..=36).contains(&b))
+    u8::try_from(n.to_u64()?)
+        .ok()
+        .filter(|&b| (2..=36).contains(&b))
 }
 
 /// Decompose a float for `decFloat(f, prec)` into `(sign, digits, exp)` with value `sign · 0.digits ·
@@ -1374,14 +1499,16 @@ fn byte_rfind(hay: &[u8], needle: &[u8], pos: usize) -> Option<usize> {
         return Some(pos.min(hay.len()));
     }
     let last = hay.len().checked_sub(needle.len())?;
-    (0..=pos.min(last)).rev().find(|&i| &hay[i..i + needle.len()] == needle)
+    (0..=pos.min(last))
+        .rev()
+        .find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
 /// The first numeric operand `n` (multiplicity `m`) folded into a fresh accumulator.
 fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
     match op {
         NumOp::Add => n.mul(&Int::from_nat(&Nat::from_u64(u64::from(m)))), // n added m times
-        NumOp::Mul => n.pow_u64(u64::from(m)),                            // n multiplied m times
+        NumOp::Mul => n.pow_u64(u64::from(m)),                             // n multiplied m times
         // gcd/lcm/min/max are idempotent in multiplicity; their operands are non-negative.
         NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => Int::from_nat(&n.magnitude()),
         // Bitwise: `xor` cancels in pairs (even multiplicity ⇒ 0); `&`/`|` are idempotent (m ⩾ 1 ⇒ n).
