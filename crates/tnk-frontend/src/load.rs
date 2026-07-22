@@ -296,12 +296,7 @@ pub fn load_statements_homed<'m>(
 /// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover the
 /// original variable slots for source-form rendering. Maude prints `[narrowing]` rules from normalized
 /// `Term`s in `show path`, so AC/ACU arguments there follow canonical order rather than parser order.
-fn normalize_trace_term(
-    m: &mut BuiltModule,
-    i: &Interner,
-    vars: &VarIndex,
-    term: &Term,
-) -> Term {
+fn normalize_trace_term(m: &mut BuiltModule, i: &Interner, vars: &VarIndex, term: &Term) -> Term {
     let bindings: Vec<_> = (0..vars.count())
         .map(|slot| {
             let source = vars.name(slot);
@@ -321,11 +316,7 @@ fn normalize_trace_term(
 /// until a genuine adjacent inversion forces a sort. The runtime DAG canonicalizer always sorts the
 /// whole soup. Restore that observable partition while retaining the kernel's canonical order within
 /// the variable and nonvariable groups (notably `M:Marking a c` versus `N' + M + K`).
-fn restore_echo_variable_positions(
-    m: &BuiltModule,
-    source: &Term,
-    normalized: Term,
-) -> Term {
+fn restore_echo_variable_positions(m: &BuiltModule, source: &Term, normalized: Term) -> Term {
     fn source_soup<'a>(symbol: SymbolId, term: &'a Term, out: &mut Vec<&'a Term>) {
         if let Term::Op {
             symbol: child_symbol,
@@ -376,7 +367,6 @@ fn restore_echo_variable_positions(
         }
     }
 
-
     match (source, normalized) {
         (
             Term::Op {
@@ -390,9 +380,10 @@ fn restore_echo_variable_positions(
         ) if *source_symbol == symbol => {
             let mut flattened_source = Vec::new();
             let mut flattened = Vec::new();
-            let blank_juxtaposition = m.syntax.get(&symbol).is_some_and(
-                |syntax| matches!(syntax.frags.as_slice(), [Frag::Hole, Frag::Hole]),
-            );
+            let blank_juxtaposition = m
+                .syntax
+                .get(&symbol)
+                .is_some_and(|syntax| matches!(syntax.frags.as_slice(), [Frag::Hole, Frag::Hole]));
             let (source_args, args, restore_shape, left_fold_candidate) =
                 if direct_source_args.len() == direct_args.len() {
                     (
@@ -408,12 +399,7 @@ fn restore_echo_variable_positions(
                     for arg in direct_args {
                         normalized_soup(symbol, arg, &mut flattened);
                     }
-                    (
-                        flattened_source,
-                        flattened,
-                        true,
-                        blank_juxtaposition,
-                    )
+                    (flattened_source, flattened, true, blank_juxtaposition)
                 };
             if source_args.len() != args.len() {
                 return Term::op(symbol, args);
@@ -437,8 +423,9 @@ fn restore_echo_variable_positions(
             let has_variables = mask.iter().any(|&is_variable| is_variable);
             let has_nonvariables = mask.iter().any(|&is_variable| !is_variable);
             let ordered = if has_variables && has_nonvariables {
-                let (variables, nonvariables): (Vec<_>, Vec<_>) =
-                    args.into_iter().partition(|arg| matches!(arg, Term::Var(_)));
+                let (variables, nonvariables): (Vec<_>, Vec<_>) = args
+                    .into_iter()
+                    .partition(|arg| matches!(arg, Term::Var(_)));
                 let mut variables = variables.into_iter();
                 let mut nonvariables = nonvariables.into_iter();
                 mask.into_iter()
@@ -458,9 +445,7 @@ fn restore_echo_variable_positions(
             let restored: Vec<_> = source_args
                 .into_iter()
                 .zip(ordered)
-                .map(|(source, normalized)| {
-                    restore_echo_variable_positions(m, source, normalized)
-                })
+                .map(|(source, normalized)| restore_echo_variable_positions(m, source, normalized))
                 .collect();
             if restore_shape {
                 source_shape(symbol, source, &mut restored.into_iter())
@@ -490,7 +475,6 @@ fn restore_echo_variable_positions(
         (_, normalized) => normalized,
     }
 }
-
 
 /// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
 /// the D1a home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
@@ -669,28 +653,28 @@ fn load_one_stmt(
             }
             let nr = vars.count();
             let variable_names: Vec<String> =
-                (0..nr).map(|k| vars.name(k).to_string()).collect();
-            let variable_specs = (0..nr)
-                .map(|slot| {
-                    let source = vars.name(slot);
-                    let base = source.split_once(':').map_or(source, |(base, _)| base);
-                    let code = i
-                        .get(base)
-                        .expect("statement variable base was interned by the lexer")
-                        .index();
-                    tnk_core::unify::problem::VarSpec {
-                        sort: vars.sort(slot),
-                        name: maude_variable_name_rank(base, code),
-                    }
-                })
-                .collect();
+                (0..nr).map(|slot| vars.name(slot).to_string()).collect();
+            let variable_specs = if *narrowing {
+                (0..nr)
+                    .map(|slot| {
+                        let source = vars.name(slot);
+                        let base = source.split_once(':').map_or(source, |(base, _)| base);
+                        let code = i.get(base).map_or(slot, |symbol| symbol.index());
+                        tnk_core::unify::problem::VarSpec {
+                            sort: vars.sort(slot),
+                            name: maude_variable_name_rank(base, code),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Maude rejects conditions on `[narrowing]` rules; the statement remains loadable but has
             // no symbolic or executable rule instance.
             if *narrowing && !condition.is_empty() {
                 return Ok(());
             }
-            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t))
-                && !(*narrowing && *nonexec)
+            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) && !(*narrowing && *nonexec)
             {
                 return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
             }
@@ -1502,17 +1486,15 @@ pub fn narrow_command(
         &mut variables,
     )?;
     let initial_variable_count = variables.count() as usize;
-    let goal_term = build_term(
-        &goal_tree,
-        &lm.grammar,
-        &lm.built,
-        goal,
-        i,
-        &mut variables,
-    )?;
+    let goal_term = build_term(&goal_tree, &lm.grammar, &lm.built, goal, i, &mut variables)?;
     let goal_variable_names: Vec<_> = (0..variables.count())
         .map(|slot| {
-            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                variables.name(slot),
+                variables.sort(slot),
+            )
         })
         .collect();
     for slot in 0..variables.count() {
@@ -1585,9 +1567,8 @@ pub fn narrow_command(
             )
         })
         .collect();
-    subject_dag =
-        tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, subject_dag)
-            .unwrap_or(subject_dag);
+    subject_dag = tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, subject_dag)
+        .unwrap_or(subject_dag);
     goal_dag = tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, goal_dag)
         .unwrap_or(goal_dag);
     specs = variable_order
@@ -1597,7 +1578,12 @@ pub fn narrow_command(
     variables.reorder(&variable_order);
     let echo_variables: Vec<_> = (0..variables.count())
         .map(|slot| {
-            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                variables.name(slot),
+                variables.sort(slot),
+            )
         })
         .collect();
     let subject_echo =
@@ -1642,12 +1628,7 @@ pub fn narrow_command(
         "0",
         options,
     )?;
-    let goal = NarrowGoal::new(
-        env.e,
-        goal_dag,
-        specs,
-        initial_variable_count,
-    );
+    let goal = NarrowGoal::new(env.e, goal_dag, specs, initial_variable_count);
     search.set_goal(goal);
     let _ = VariableFamily::Unify;
     Ok(NarrowCommand {
@@ -1750,17 +1731,15 @@ fn narrow_disjunction_command(
 
     let goal_tree = parse_forest_pick(goal, &lm.grammar, i)?;
     let mut variables = VarIndex::new();
-    let goal_term = build_term(
-        &goal_tree,
-        &lm.grammar,
-        &lm.built,
-        goal,
-        i,
-        &mut variables,
-    )?;
+    let goal_term = build_term(&goal_tree, &lm.grammar, &lm.built, goal, i, &mut variables)?;
     let goal_variable_names: Vec<_> = (0..variables.count())
         .map(|slot| {
-            command_variable_display_name(&lm.grammar, i, variables.name(slot), variables.sort(slot))
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                variables.name(slot),
+                variables.sort(slot),
+            )
         })
         .collect();
     for slot in 0..variables.count() {
@@ -1798,8 +1777,12 @@ fn narrow_disjunction_command(
         &mut variables,
     );
     lm.built.engine.end_dedup();
-    let (goal_dag, goal_specs) =
-        canonicalize_narrow_command_dag(&mut lm.built.engine, goal_dag?, goal_specs, &mut variables)?;
+    let (goal_dag, goal_specs) = canonicalize_narrow_command_dag(
+        &mut lm.built.engine,
+        goal_dag?,
+        goal_specs,
+        &mut variables,
+    )?;
     let goal_echo = print_term(&lm.built, i, &goal_term, &goal_variable_names, false);
 
     let equations = executable_variant_equations(&mut lm.built, i);

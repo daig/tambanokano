@@ -279,8 +279,8 @@ pub enum SpecialOp {
     /// An **upper-layer descent hook**. META-LEVEL's `metaReduce`/`metaApply`/… use it to down-translate,
     /// compute in an object module, and up-translate; LEXICAL's `tokenize`/`printTokens` use the same seam
     /// because token interning lives above the kernel. Hook symbols are resolved from the operator's
-    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Narrowing / SMT / strategy descent
-    /// ([`MetaOp::Deferred`]) is declared but stays at the kind level (Phase 3.3+).
+    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Only SMT and strategy-meta descent
+    /// remain declared-but-inert through [`MetaOp::Deferred`].
     Meta {
         op: MetaOp,
         hooks: std::rc::Rc<MetaHooks>,
@@ -311,7 +311,7 @@ pub enum StdStream {
 }
 
 /// Which upper-layer operation a [`SpecialOp::Meta`] performs: META-LEVEL descent functions, symbolic
-/// variant functions, and LEXICAL's two token conversion hooks. Narrowing, SMT, and strategy descent
+/// variant/narrowing functions, and LEXICAL's two token conversion hooks. SMT and strategy descent
 /// remain [`MetaOp::Deferred`] until their backends land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaOp {
@@ -382,7 +382,17 @@ pub enum MetaOp {
     },
     /// Complete-set variant matching (the current Qid-family signature).
     VariantMatch,
-    /// Narrowing / SMT / strategy descent — declared so the tower loads, but inert (kind-level).
+    /// Legacy `metaNarrow`; `metaNarrow2` is recognized separately but intentionally inert (S3 §8.2).
+    Narrow {
+        state_only: bool,
+    },
+    /// One-step variant narrowing with optional irreducibility constraints.
+    NarrowingApply,
+    /// Variant-based narrowing search, with either a solution or a full path result.
+    NarrowingSearch {
+        path: bool,
+    },
+    /// SMT / strategy descent — declared so the tower loads, but inert (kind-level).
     Deferred,
 }
 

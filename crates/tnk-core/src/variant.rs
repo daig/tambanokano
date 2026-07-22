@@ -14,7 +14,10 @@ use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
 use crate::unify::filter::subsumes;
 use crate::unify::problem::{UnifyProblem, VarSpec};
-use crate::unify::{UnifyEnv, instantiate, is_ground};
+use crate::unify::{
+    UnifyEnv, instantiate, instantiate_preserving_representation, is_ground,
+    replace_and_instantiate_preserving_representation,
+};
 
 /// An executable `[variant]` equation in module order. The frontend supplies the source terms and
 /// variable names retained in `EqTrace`; keeping this separate from the ordinary rewrite automaton
@@ -207,14 +210,8 @@ impl FilteredVariantUnifierStream {
         equations: &[VariantEquation],
     ) {
         if !self.filtered {
-            let (retained, incomplete) = Self::make_retained(
-                env,
-                bindings,
-                family,
-                rewrites,
-                Vec::new(),
-                false,
-            );
+            let (retained, incomplete) =
+                Self::make_retained(env, bindings, family, rewrites, Vec::new(), false);
             let index = self.retained.len();
             self.incomplete |= incomplete;
             self.retained.push(retained);
@@ -233,14 +230,8 @@ impl FilteredVariantUnifierStream {
             }
         }
 
-        let (retained, incomplete) = Self::make_retained(
-            env,
-            bindings,
-            family,
-            rewrites,
-            equations.to_vec(),
-            true,
-        );
+        let (retained, incomplete) =
+            Self::make_retained(env, bindings, family, rewrites, equations.to_vec(), true);
         self.incomplete |= incomplete;
         for index in existing {
             if retained
@@ -301,12 +292,14 @@ impl FilteredVariantUnifierStream {
         self.retained[index].rewrites
     }
 
-
     pub fn is_incomplete(&self) -> bool {
         self.incomplete
     }
     pub fn alive_len(&self) -> usize {
-        self.retained.iter().filter(|retained| retained.alive).count()
+        self.retained
+            .iter()
+            .filter(|retained| retained.alive)
+            .count()
     }
 }
 
@@ -383,9 +376,6 @@ impl VariantSearch {
         incoming_family: Option<VariableFamily>,
         base: &str,
     ) -> Result<Self, String> {
-        let input_initial = initial;
-        let count_before_initial = env.e.rewrites();
-        let input_cache_before = env.e.reduction_cache_state(input_initial);
         let first_family = if incoming_family == Some(VariableFamily::Unify) {
             VariableFamily::Variant
         } else {
@@ -427,11 +417,19 @@ impl VariantSearch {
         let initial = if slot_map.is_empty() {
             initial
         } else {
-            rebuild_slots(env.e, initial, &slot_map)
+            if mode == VariantMode::Subsumption {
+                rebuild_slots_canonical(env.e, initial, &slot_map)
+            } else {
+                rebuild_slots(env.e, initial, &slot_map)
+            }
         };
         for blocker in &mut blockers {
             if !slot_map.is_empty() {
-                *blocker = rebuild_slots(env.e, *blocker, &slot_map);
+                *blocker = if mode == VariantMode::Subsumption {
+                    rebuild_slots_canonical(env.e, *blocker, &slot_map)
+                } else {
+                    rebuild_slots(env.e, *blocker, &slot_map)
+                };
             }
         }
         let original_variables: Vec<VarSpec> = original_order
@@ -448,30 +446,14 @@ impl VariantSearch {
             values[slot] = Some(var);
             substitution.push(var);
         }
-        let renamed = rebuild_variables_preserving_reduced(
-            env.e,
-            initial,
-            &mut |_, name, sort| {
-                let slot = original_variables
-                    .iter()
-                    .position(|spec| spec.name == name && spec.sort == sort)
-                    .expect("initial variant variable");
-                values[slot].expect("fresh variant variable")
-            },
-        );
+        let renamed = if mode == VariantMode::Subsumption {
+            rebuild_variables_preserving_reduced(env.e, initial, &mut |_, _, _, index| {
+                values[index as usize].expect("fresh variant variable")
+            })
+        } else {
+            instantiate_preserving_representation(env.e, &values, initial).unwrap_or(initial)
+        };
         let term = env.e.reduce(renamed);
-        if std::env::var_os("TNK_NARROW_COUNT_TRACE").is_some() {
-            let input_children: Vec<_> = env.e.node(input_initial).children().collect();
-            let slotted_children: Vec<_> = env.e.node(initial).children().collect();
-            let renamed_children: Vec<_> = env.e.node(renamed).children().collect();
-            eprintln!(
-                "NCOUNT variant-init order={original_order:?} family={first_family:?} input={input_initial:?}/{input_cache_before:?}/{input_children:?} slotted={initial:?}/{:?}/{slotted_children:?} renamed={renamed:?}/{:?}/{renamed_children:?} term={term:?}/{:?} equations={}",
-                env.e.reduction_cache_state(initial),
-                env.e.reduction_cache_state(renamed),
-                env.e.reduction_cache_state(term),
-                env.e.rewrites().saturating_sub(count_before_initial),
-            );
-        }
 
         for blocker in &mut blockers {
             *blocker = env.e.normalize_for_unify(*blocker);
@@ -639,6 +621,17 @@ impl VariantSearch {
             let v = &self.variants[parent];
             (v.term, v.substitution.clone())
         };
+        let (state_term, state_substitution) = if self.term_only_folding {
+            (
+                env.e.normalize_for_unify(state_term),
+                state_substitution
+                    .into_iter()
+                    .map(|dag| env.e.normalize_for_unify(dag))
+                    .collect(),
+            )
+        } else {
+            (state_term, state_substitution)
+        };
         let (state_term, state_substitution, state_specs, _, _) =
             reslot_state(env.e, state_term, &state_substitution);
         let mut results = Vec::new();
@@ -684,6 +677,7 @@ impl VariantSearch {
             family,
             &self.base,
             self.skip_root,
+            false,
             false,
             Some(&mut results),
         );
@@ -825,17 +819,12 @@ impl VariantSearch {
     }
 }
 pub(crate) trait VariantNarrowingSource {
-    fn source_id(&self) -> u32;
     fn lhs(&self) -> &Term;
     fn rhs(&self) -> &Term;
     fn variables(&self) -> &[VarSpec];
 }
 
 impl VariantNarrowingSource for VariantEquation {
-    fn source_id(&self) -> u32 {
-        self.id
-    }
-
     fn lhs(&self) -> &Term {
         &self.lhs
     }
@@ -873,11 +862,6 @@ pub(crate) struct VariantNarrowingStep {
     pub substitution: Vec<DagId>,
     pub interesting: Vec<DagId>,
     pub family: VariableFamily,
-    pub source_index: usize,
-    pub source_id: u32,
-    pub path: Vec<usize>,
-    pub source_substitution: Vec<DagId>,
-    pub state_unifier: Vec<DagId>,
 }
 
 /// One equation/rule-neutral variant-narrowing expansion. Every source shares one state-wide
@@ -893,6 +877,7 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
     base: &str,
     skip_root: bool,
     respect_frozen: bool,
+    preserve_rebuild_representation: bool,
     mut competing: Option<&mut Vec<ExpandedVariant>>,
 ) -> (Vec<VariantNarrowingStep>, bool) {
     let interesting_slots = variables_in_dag(env.e, state.term);
@@ -957,9 +942,9 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
             for slot in 0..state.variables.len() {
                 if !target_slots.contains(&slot) {
                     let spec = state.variables[slot];
-                    let variable =
-                        env.e
-                            .make_var(spec.sort, spec.name, (state_base + slot) as u32);
+                    let variable = env
+                        .e
+                        .make_var(spec.sort, spec.name, (state_base + slot) as u32);
                     unificands.push((variable, variable));
                 }
             }
@@ -1070,13 +1055,23 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
             rhs_subst.bind(slot as u32, value);
         }
         let replacement = env.e.instantiate(source.rhs(), &rhs_subst);
-        let rebuilt = replace_and_instantiate(
-            env.e,
-            state.term,
-            &candidate.path,
-            replacement,
-            &candidate.state_values,
-        );
+        let rebuilt = if preserve_rebuild_representation {
+            replace_and_instantiate_preserving_representation(
+                env.e,
+                state.term,
+                &candidate.path,
+                replacement,
+                &candidate.state_values,
+            )
+        } else {
+            replace_and_instantiate_canonical(
+                env.e,
+                state.term,
+                &candidate.path,
+                replacement,
+                &candidate.state_values,
+            )
+        };
         env.e.count_variant_narrowing_step();
         let term = env.e.reduce(rebuilt);
         let (term, substitution, _, _, _) = reslot_state(env.e, term, &new_substitution);
@@ -1087,15 +1082,6 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
             substitution,
             interesting: candidate.interesting,
             family,
-            source_index: candidate.source_index,
-            source_id: source.source_id(),
-            path: candidate.path,
-            source_substitution: candidate.source_values,
-            state_unifier: candidate
-                .state_values
-                .into_iter()
-                .map(|value| value.expect("state solution"))
-                .collect(),
         });
     }
     (results, incomplete)
@@ -1516,7 +1502,7 @@ pub fn variant_match_bindings(
                 .substitution
                 .iter()
                 .map(|&binding| {
-                    rebuild_variables(env.e, binding, &mut |e, name, sort| {
+                    rebuild_variables(env.e, binding, &mut |e, name, sort, _| {
                         variables
                             .iter()
                             .position(|&key| key == (name, sort))
@@ -1545,7 +1531,7 @@ pub fn variant_match_bindings(
                 })
                 .collect();
             for binding in &mut bindings {
-                *binding = rebuild_variables(env.e, *binding, &mut |e, name, sort| {
+                *binding = rebuild_variables(env.e, *binding, &mut |e, name, sort, _| {
                     let (_, fresh, index) = replacements
                         .iter()
                         .find(|(key, _, _)| *key == (name, sort))
@@ -1754,7 +1740,7 @@ fn retag_foreign_family_variables(
         return;
     }
     for value in values {
-        *value = rebuild_variables(env.e, *value, &mut |e, name, sort| {
+        *value = rebuild_variables(env.e, *value, &mut |e, name, sort, _| {
             let fresh = replacements
                 .iter()
                 .find(|&&(candidate, candidate_sort, _)| {
@@ -1795,7 +1781,7 @@ fn canonicalize_family_variables(
         })
         .collect();
     for value in values {
-        *value = rebuild_variables(env.e, *value, &mut |e, name, sort| {
+        *value = rebuild_variables(env.e, *value, &mut |e, name, sort, _| {
             let &(_, _, fresh, index) = replacements
                 .iter()
                 .find(|&&(candidate, candidate_sort, _, _)| {
@@ -1954,14 +1940,10 @@ fn reslot_state(
     term: DagId,
     substitution: &[DagId],
 ) -> (DagId, Vec<DagId>, Vec<VarSpec>, Vec<DagId>, usize) {
-    // Narrowing replacement and substitution composition can retain an AC argument order that was
-    // canonical before instantiation but is stale afterward. Maude's DAGs restore that order before
-    // `indexVariables`; do the same so fresh-slot assignment follows canonical term traversal.
-    let term = e.normalize_for_unify(term);
-    let substitution: Vec<_> = substitution
-        .iter()
-        .map(|&dag| e.normalize_for_unify(dag))
-        .collect();
+    // Maude's `indexVariables` mutates variable indices in place. Do not theory-normalize here:
+    // retained symbolic DAGs can deliberately contain copied, structurally equal AC arguments whose
+    // independent reduction state is observable in rewrite counts.
+    let substitution = substitution.to_vec();
     let mut keys = Vec::new();
     collect_variable_keys(e, term, &mut keys);
     for &dag in &substitution {
@@ -2004,7 +1986,7 @@ fn collect_variable_keys(e: &Engine, root: DagId, keys: &mut Vec<(u32, SortId)>)
 }
 
 fn reindex_by_keys(e: &mut Engine, dag: DagId, keys: &[(u32, SortId)]) -> DagId {
-    rebuild_variables_preserving_reduced(e, dag, &mut |e, name, sort| {
+    rebuild_variables_preserving_reduced(e, dag, &mut |e, name, sort, _| {
         let slot = keys
             .iter()
             .position(|&k| k == (name, sort))
@@ -2052,7 +2034,7 @@ pub fn ground_subject_variables(e: &mut Engine, dag: DagId) -> (DagId, Vec<(DagI
             (name, sort, constant, variable)
         })
         .collect();
-    let grounded = rebuild_variables(e, dag, &mut |_, name, sort| {
+    let grounded = rebuild_variables(e, dag, &mut |_, name, sort, _| {
         replacements
             .iter()
             .find(|&&(candidate, candidate_sort, _, _)| candidate == name && candidate_sort == sort)
@@ -2140,31 +2122,39 @@ pub fn restore_subject_variables(
 fn rebuild_variables(
     e: &mut Engine,
     dag: DagId,
-    leaf: &mut dyn FnMut(&mut Engine, u32, SortId) -> DagId,
+    leaf: &mut dyn FnMut(&mut Engine, u32, SortId, u32) -> DagId,
 ) -> DagId {
-    rebuild_variables_inner(e, dag, leaf, false)
+    let mut rebuilt = HashMap::new();
+    rebuild_variables_inner(e, dag, leaf, false, &mut rebuilt)
 }
 
 fn rebuild_variables_preserving_reduced(
     e: &mut Engine,
     dag: DagId,
-    leaf: &mut dyn FnMut(&mut Engine, u32, SortId) -> DagId,
+    leaf: &mut dyn FnMut(&mut Engine, u32, SortId, u32) -> DagId,
 ) -> DagId {
-    rebuild_variables_inner(e, dag, leaf, true)
+    let mut rebuilt = HashMap::new();
+    rebuild_variables_inner(e, dag, leaf, true, &mut rebuilt)
 }
 
-/// Generic variable-leaf rebuild preserving every theory representation.
+/// Generic variable-leaf alpha rebuild preserving every theory representation. When
+/// `preserve_reduced` is set, reduced stamps are safe to inherit because only variable names and
+/// slots change; this avoids recounting already-normal sub-DAGs in nested variant searches.
 fn rebuild_variables_inner(
     e: &mut Engine,
     dag: DagId,
-    leaf: &mut dyn FnMut(&mut Engine, u32, SortId) -> DagId,
+    leaf: &mut dyn FnMut(&mut Engine, u32, SortId, u32) -> DagId,
     preserve_reduced: bool,
+    rebuilt_dags: &mut HashMap<DagId, DagId>,
 ) -> DagId {
     if is_ground(e, dag) {
         return dag;
     }
+    if let Some(&rebuilt) = rebuilt_dags.get(&dag) {
+        return rebuilt;
+    }
     enum Shape {
-        Var(u32, SortId),
+        Var(u32, SortId, u32),
         Free(SymbolId, Vec<DagId>),
         Acu(SymbolId, Vec<(DagId, u32)>),
         Au(SymbolId, Vec<DagId>),
@@ -2173,7 +2163,7 @@ fn rebuild_variables_inner(
         Ground,
     }
     let shape = match &e.node(dag).term {
-        NodeTerm::Var { name, .. } => Shape::Var(*name, e.sort_of(dag)),
+        NodeTerm::Var { name, index, .. } => Shape::Var(*name, e.sort_of(dag), *index),
         NodeTerm::Free { symbol, args } => Shape::Free(*symbol, args.clone()),
         NodeTerm::Acu { symbol, args } => Shape::Acu(*symbol, args.clone()),
         NodeTerm::Au { symbol, args } => Shape::Au(*symbol, args.clone()),
@@ -2182,37 +2172,42 @@ fn rebuild_variables_inner(
         NodeTerm::Na { .. } => Shape::Ground,
     };
     let rebuilt = match shape {
-        Shape::Var(name, sort) => leaf(e, name, sort),
+        Shape::Var(name, sort, index) => leaf(e, name, sort, index),
         Shape::Free(symbol, args) => {
             let args = args
                 .into_iter()
-                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced))
+                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced, rebuilt_dags))
                 .collect();
             e.make_free(symbol, args)
         }
         Shape::Acu(symbol, args) => {
             let args = args
                 .into_iter()
-                .map(|(d, m)| (rebuild_variables_inner(e, d, leaf, preserve_reduced), m))
+                .map(|(d, m)| {
+                    (
+                        rebuild_variables_inner(e, d, leaf, preserve_reduced, rebuilt_dags),
+                        m,
+                    )
+                })
                 .collect();
             e.make_acu_preserving_order(symbol, args)
         }
         Shape::Au(symbol, args) => {
             let args = args
                 .into_iter()
-                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced))
+                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced, rebuilt_dags))
                 .collect();
             e.make_au(symbol, args)
         }
         Shape::Cui(symbol, args) => {
             let args: Vec<_> = args
                 .into_iter()
-                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced))
+                .map(|d| rebuild_variables_inner(e, d, leaf, preserve_reduced, rebuilt_dags))
                 .collect();
             e.make_cui(symbol, args[0], args[1])
         }
         Shape::S(symbol, count, arg) => {
-            let arg = rebuild_variables_inner(e, arg, leaf, preserve_reduced);
+            let arg = rebuild_variables_inner(e, arg, leaf, preserve_reduced, rebuilt_dags);
             e.make_iter_decimal(symbol, &count.to_decimal(), arg)
                 .expect("valid Nat count")
         }
@@ -2221,64 +2216,28 @@ fn rebuild_variables_inner(
     if preserve_reduced {
         e.inherit_reduced_status(dag, rebuilt);
     }
+    rebuilt_dags.insert(dag, rebuilt);
     rebuilt
 }
 
 /// Indexed version needed to map a state's slots into one local unification problem.
+///
+/// Maude changes variable indices in place and does not normalize enclosing theory nodes. Preserve
+/// that representation here: final narrowing goals can deliberately contain shared, noncanonical
+/// AC/AU children produced by `instantiate(..., false)`.
 fn rebuild_slots(e: &mut Engine, dag: DagId, map: &[Option<u32>]) -> DagId {
-    enum Shape {
-        Var(u32, u32, SortId),
-        Free(SymbolId, Vec<DagId>),
-        Acu(SymbolId, Vec<(DagId, u32)>),
-        Au(SymbolId, Vec<DagId>),
-        Cui(SymbolId, Vec<DagId>),
-        S(SymbolId, Nat, DagId),
-        Ground,
-    }
-    if is_ground(e, dag) {
-        return dag;
-    }
-    let shape = match &e.node(dag).term {
-        NodeTerm::Var { name, index, .. } => Shape::Var(*name, *index, e.sort_of(dag)),
-        NodeTerm::Free { symbol, args } => Shape::Free(*symbol, args.clone()),
-        NodeTerm::Acu { symbol, args } => Shape::Acu(*symbol, args.clone()),
-        NodeTerm::Au { symbol, args } => Shape::Au(*symbol, args.clone()),
-        NodeTerm::Cui { symbol, args } => Shape::Cui(*symbol, args.clone()),
-        NodeTerm::S { symbol, count, arg } => Shape::S(*symbol, count.clone(), *arg),
-        NodeTerm::Na { .. } => Shape::Ground,
-    };
-    let rebuilt = match shape {
-        Shape::Var(name, old, sort) => {
-            e.make_var(sort, name, map[old as usize].expect("selected slot"))
-        }
-        Shape::Free(symbol, args) => {
-            let args = args.into_iter().map(|d| rebuild_slots(e, d, map)).collect();
-            e.make_free(symbol, args)
-        }
-        Shape::Acu(symbol, args) => {
-            let args = args
-                .into_iter()
-                .map(|(d, m)| (rebuild_slots(e, d, map), m))
-                .collect();
-            e.make_acu(symbol, args)
-        }
-        Shape::Au(symbol, args) => {
-            let args = args.into_iter().map(|d| rebuild_slots(e, d, map)).collect();
-            e.make_au(symbol, args)
-        }
-        Shape::Cui(symbol, args) => {
-            let args: Vec<_> = args.into_iter().map(|d| rebuild_slots(e, d, map)).collect();
-            e.make_cui(symbol, args[0], args[1])
-        }
-        Shape::S(symbol, count, arg) => {
-            let arg = rebuild_slots(e, arg, map);
-            e.make_iter_decimal(symbol, &count.to_decimal(), arg)
-                .expect("valid Nat count")
-        }
-        Shape::Ground => dag,
-    };
-    e.inherit_reduced_status(dag, rebuilt);
-    rebuilt
+    let slots: Vec<u32> = map.iter().map(|slot| slot.unwrap_or(0)).collect();
+    e.remap_variable_slots_preserving_representation(dag, &slots)
+}
+
+fn rebuild_slots_canonical(e: &mut Engine, dag: DagId, map: &[Option<u32>]) -> DagId {
+    rebuild_variables_preserving_reduced(e, dag, &mut |e, name, sort, index| {
+        e.make_var(
+            sort,
+            name,
+            map[index as usize].expect("selected canonical slot"),
+        )
+    })
 }
 
 fn positions_breadth_first(
@@ -2306,7 +2265,10 @@ fn positions_breadth_first(
     result
 }
 
-fn replace_and_instantiate(
+/// The variant-filter's `SUBSUMPTION_MODE` rebuild. Its temporary tuple variants are canonicalized
+/// eagerly, as Maude's variant folder does; object/narrowing successors use the representation-
+/// preserving path because their copied AC/AU structure remains rewrite-count observable.
+fn replace_and_instantiate_canonical(
     e: &mut Engine,
     dag: DagId,
     path: &[usize],
@@ -2321,7 +2283,7 @@ fn replace_and_instantiate(
     let selected = path[0];
     for (index, child) in children.iter_mut().enumerate() {
         *child = if index == selected {
-            replace_and_instantiate(e, *child, &path[1..], replacement, values)
+            replace_and_instantiate_canonical(e, *child, &path[1..], replacement, values)
         } else {
             instantiate(e, values, *child).unwrap_or(*child)
         };

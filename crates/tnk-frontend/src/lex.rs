@@ -475,6 +475,15 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             // object syntax writes both `:Snd` and `buff:` without spaces. Preserve `X:Sort` as one
             // token, but emit a leading/trailing maximal colon run separately.
             if ch == ':' {
+                // `:=` is a reserved statement/strategy connective. The one-sided object-colon
+                // split below must not turn it into the two tokens `:` and `=`.
+                if chars.get(i + 1) == Some(&'=') {
+                    if text.is_empty() {
+                        text.push_str(":=");
+                        i += 2;
+                    }
+                    break;
+                }
                 if text.is_empty() {
                     while i < n && chars[i] == ':' {
                         text.push(':');
@@ -670,12 +679,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_matching_and_strategy_definition_connective() {
+        let (_i, t) = lex("ceq pred(N) = M if s M := N . sd go:= r1 .");
+        let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "ceq", "pred", "(", "N", ")", "=", "M", "if", "s", "M", ":=", "N", ".", "sd", "go",
+                ":=", "r1", ".",
+            ]
+        );
+    }
+
+    #[test]
     fn splits_one_sided_object_colons_but_keeps_colon_variables() {
         let (_i, t) = lex("< O :Snd | buff: L > X:Sort X::Y ::");
         let texts: Vec<&str> = t.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(
             texts,
-            ["<", "O", ":", "Snd", "|", "buff", ":", "L", ">", "X:Sort", "X::Y", "::"]
+            [
+                "<", "O", ":", "Snd", "|", "buff", ":", "L", ">", "X:Sort", "X::Y", "::"
+            ]
         );
     }
 

@@ -518,7 +518,7 @@ impl AcuSubproblem {
         // When the left-identity collapse can change a sort, non-maximal selections may have
         // sortings the maximal one lacks — keep them all. Otherwise assume each fresh variable can
         // disappear by taking identity, so only maximal selections matter.
-        let maximal = if unequal_left_id_collapse(e, self.top) {
+        let maximal = if unequal_left_identity_collapse(e, self.top).is_some() {
             legal
         } else {
             let mut m = legal.clone();
@@ -693,13 +693,15 @@ fn range_sort(e: &Engine, sym: SymbolId) -> crate::sort::SortId {
     e.symbol(sym).decls()[0].range
 }
 
-/// Maude's `BinarySymbol::hasUnequalLeftIdentityCollapse` (`leftIdentitySortCheck`): whether the
-/// left-identity collapse `f(e, x) = x` can change a sort — i.e. some range-component sort `i` has
-/// `compute_sort(f, [id_sort, i]) != i`. It gates the maximal-selection optimization.
-fn unequal_left_id_collapse(e: &Engine, top: SymbolId) -> bool {
-    let Some(identity) = e.symbol(top).identity() else {
-        return false;
-    };
+/// Maude's `BinarySymbol::hasUnequalLeftIdentityCollapse` (`leftIdentitySortCheck`): return
+/// the first `(computed result, collapsed argument)` sort pair for which `f(e, x) = x`
+/// changes sort. Besides gating ACU's maximal-selection optimization, the REPL uses the
+/// pair for Maude's byte-visible `set verbose on` diagnostic.
+pub fn unequal_left_identity_collapse(
+    e: &Engine,
+    top: SymbolId,
+) -> Option<(crate::sort::SortId, crate::sort::SortId)> {
+    let identity = e.symbol(top).identity()?;
     let sig = e.signature();
     let id_sort = sig.identity_sort(identity);
     let kind = sig.sorts().kind_of(range_sort(e, top));
@@ -708,7 +710,10 @@ fn unequal_left_id_collapse(e: &Engine, top: SymbolId) -> bool {
         .members
         .clone()
         .into_iter()
-        .any(|s| sig.compute_sort(top, &[id_sort, s]) != s)
+        .find_map(|sort| {
+            let result = sig.compute_sort(top, &[id_sort, sort]);
+            (result != sort).then_some((result, sort))
+        })
 }
 
 /// The operator's two-sided identity DAG (`getIdentityDag`).

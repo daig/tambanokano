@@ -26,6 +26,7 @@ use crate::sort::SortId;
 use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
 use crate::theory::LhsAutomaton;
+use std::collections::HashSet;
 
 /// A compiled ACU left-hand side: the flattened pattern multiset partitioned into ground subterms
 /// (each consumes one structurally-equal subject element), **aliens** (non-ground non-variable
@@ -45,6 +46,9 @@ pub(crate) struct AcuLhs {
     /// Distinct variable occurrences under the operator (a repeated index is non-linear).
     vars: Vec<AcuVar>,
     identity: Option<IdentityId>,
+    /// `true` when this pattern is Maude's top-level repeated-variable special case
+    /// (`X + ... + X`, no grounds/aliens, no identity or condition-variable conflict).
+    special_nonlinear: bool,
 }
 
 #[derive(Clone)]
@@ -104,10 +108,14 @@ fn term_eq(a: &Term, b: &Term) -> bool {
 }
 
 impl AcuLhs {
-    /// Compile an ACU pattern. The lhs is flattened modulo associativity, then each argument is
-    /// classified as a nested same-operator application (spliced), a variable (accumulated by index),
-    /// or a ground subterm. Alien subterms are not yet supported (a loud assert, never silent).
-    pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+    /// Compile an ACU pattern, suppressing the repeated-variable fast path when its variable occurs
+    /// in the enclosing statement's condition. Maude then needs the general solution stream so a
+    /// failed condition can backtrack.
+    pub(crate) fn compile_avoiding_nonlinear_vars(
+        lhs: Term,
+        sig: &Signature,
+        condition_variables: &HashSet<u32>,
+    ) -> Self {
         let symbol = lhs.top_symbol().expect("ACU lhs must be an application");
         let identity = sig.symbol(symbol).identity();
         // Per-sort bounds for this operator's kind (Maude's `sortBound`), computed once: each top
@@ -172,12 +180,20 @@ impl AcuLhs {
                 }
             }
         }
+        let special_nonlinear = grounds.is_empty()
+            && aliens.is_empty()
+            && vars.len() == 1
+            && vars[0].count >= 2
+            && vars[0].lower_bound == 1
+            && !condition_variables.contains(&vars[0].index)
+            && sig.acu_nonlinear_sort_safe(symbol, vars[0].sort);
         AcuLhs {
             symbol,
             grounds,
             aliens,
             vars,
             identity,
+            special_nonlinear,
         }
     }
 
@@ -227,6 +243,24 @@ impl AcuLhs {
             }
         }
 
+        // Symbolic instantiation copies bindings up to eager, so a retained ACU DAG can contain
+        // distinct entries that are structurally equal. Maude's AC matcher treats those entries as
+        // one multiset element; coalesce the residual here (without rewriting the retained DAG) before
+        // constructing the Diophantine columns. Keeping the first occurrence preserves enumeration
+        // order while making a nonlinear pattern such as `X * X` match two copied equal arguments.
+        let mut merged = Vec::with_capacity(multiset.len());
+        for (element, multiplicity) in multiset {
+            if let Some((_, count)) = merged
+                .iter_mut()
+                .find(|(retained, _)| rt.deep_equal(*retained, element))
+            {
+                *count += multiplicity;
+            } else {
+                merged.push((element, multiplicity));
+            }
+        }
+        let multiset = merged;
+
         let var_coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
         // No aliens: the whole match is a pure Diophantine distribution of the residual multiset among
         // the top variables (+ an extension row). The [`AcuMatcher`] enumerates it **lazily** in
@@ -256,6 +290,7 @@ impl AcuLhs {
                 ext,
                 !self.grounds.is_empty(),
                 subject_is_identity,
+                self.special_nonlinear,
             ))
         } else {
             None
@@ -770,7 +805,7 @@ mod tests {
         ext_allowed: bool,
         nr_vars: u32,
     ) -> Solutions {
-        let lhs = AcuLhs::compile(pattern, e.signature());
+        let lhs = AcuLhs::compile_avoiding_nonlinear_vars(pattern, e.signature(), &HashSet::new());
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
@@ -797,7 +832,7 @@ mod tests {
         ext_allowed: bool,
         nr_vars: u32,
     ) -> Solutions {
-        let lhs = AcuLhs::compile(pattern, e.signature());
+        let lhs = AcuLhs::compile_avoiding_nonlinear_vars(pattern, e.signature(), &HashSet::new());
         assert!(
             lhs.aliens.is_empty(),
             "naive cross-check is for the no-alien path"

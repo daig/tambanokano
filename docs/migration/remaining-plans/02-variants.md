@@ -49,7 +49,9 @@ finite; the machinery also gives a bounded approximation for non-FVP theories. O
 generation sit: **variant unification** (unify `l =? r` by narrowing `eq(l,r)` to `tt`, manual §14.8),
 **variant matching** (rhs treated ground), and **filtered** unification (Escobar–Sapiña *most general
 variant unifiers*). S2 is the substrate for S3 narrowing (which folds *states* the same way) and for
-phase-T variant satisfiability (a `.maude` library over variant unification).
+phase-T variant satisfiability. The official 2016 prototype has now been recovered and pinned as an
+executable oracle; T6 is a separate native Rust decision procedure plus `VAR-SAT-TOOL` facade because
+the old, unlicensed metalevel source is not production input. See `04-smt.md` §4.7/T6.
 
 **What the 21 V\* fixtures exercise**:
 

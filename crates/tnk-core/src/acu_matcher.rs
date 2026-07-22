@@ -5,17 +5,17 @@
 //! the whole bipartite-graph layer collapses away and matching is a pure Diophantine problem: one row
 //! per top variable (coefficient = its multiplicity, size bounds from its sort's identity-capability
 //! and `sortBound`), one column per residual subject element, plus one **extension** row when matching
-//! with a residue. The solver enumerates solutions **lazily and in Maude's order** (minimal variable
-//! size first) — so a pattern like SET's `(E, S)` over a 30-element set yields its first solution
-//! immediately instead of the naive matcher's `2^30` eager materialisation (the D2a hang).
+//! with a residue. The general solver enumerates solutions **lazily in Maude's order**. A repeated
+//! sole variable in extension mode instead takes Maude's `ACU_NonLinearLhsAutomaton` fast path:
+//! every divisible subject multiplicity contributes to one maximal binding.
 //!
 //! Element variables (`upperBound == 1`, e.g. SET's `E : X$Elt`) are *not* special-cased into
 //! bipartite pattern nodes as Maude does; a Diophantine row with `maxSize == 1` produces the identical
 //! accepted-solution order (rows sort *ascending by maxSize*, so element variables enumerate outer,
 //! collectors inner — exactly Maude's patterns-outer/Diophantine-inner order) with no extra cost.
 //!
-//! The special cases (`noVariableCase`, the empty-multiset "trivial system", the identity-first
-//! collapse gating) are ported faithfully; extension uses the **unbounded** residue model of the
+//! The special cases (`ACU_NonLinearLhsAutomaton`, `noVariableCase`, the empty-multiset "trivial
+//! system", and identity-first collapse gating) are ported faithfully; extension uses the
 //! existing matcher (oracle-verified: `a + b + d` under `eq a + X = c` leaves the two-element residue
 //! `b + d`), with the degenerate all-identity/all-extension no-op skipped unless the subject *is* the
 //! identity or the pattern has ground subterms (the B1 gating).
@@ -74,6 +74,10 @@ pub(crate) struct AcuMatcher {
     /// residue for the [`Mode::NoVar`] case and the source of the Diophantine columns.
     residual: Vec<(DagId, u32)>,
     mode: Mode,
+    /// Whether the sole repeated-variable extension fast path is eligible, and whether its one
+    /// deterministic attempt has already been made.
+    special_nonlinear: bool,
+    special_attempted: bool,
     /// Variable indices bound by the most recent solution (unbound at the next `next`).
     bound: Vec<u32>,
     residue: Vec<(DagId, u32)>,
@@ -94,6 +98,7 @@ impl AcuMatcher {
         ext_allowed: bool,
         has_grounds: bool,
         subject_is_identity: bool,
+        special_nonlinear: bool,
     ) -> Self {
         debug_assert_eq!(elements.len(), mult.len());
         // The residual multiset: elements with positive multiplicity (the Diophantine columns).
@@ -164,6 +169,8 @@ impl AcuMatcher {
             elements,
             residual,
             mode,
+            special_nonlinear: special_nonlinear && ext_allowed,
+            special_attempted: false,
             bound: Vec::new(),
             residue: Vec::new(),
             matched_whole: true,
@@ -188,6 +195,19 @@ impl AcuMatcher {
         }
         self.bound.clear();
 
+        // Maude compiles a top-level `X + ... + X` pattern with no other arguments into
+        // `ACU_NonLinearLhsAutomaton`. Unlike the general Diophantine stream, it returns one maximal
+        // quotient match: on a flat `a*a*b*b`, `X*X` binds `X := a*b` in one step. If an outer match
+        // already bound X, the specialized automaton falls back to the general matcher.
+        if self.special_nonlinear && !self.special_attempted {
+            self.special_attempted = true;
+            let index = self.vars[0].index;
+            if subst.get(index).is_none() && self.finish_nonlinear(rt, sig, subst) {
+                self.mode = Mode::Done;
+                return true;
+            }
+        }
+
         match &mut self.mode {
             Mode::Done => false,
             Mode::NoVar { done } => {
@@ -206,6 +226,69 @@ impl AcuMatcher {
             }
             Mode::System { .. } => self.next_system(rt, sig, subst),
         }
+    }
+
+    /// `ACU_NonLinearLhsAutomaton`: match a sole variable of coefficient `m >= 2` against every
+    /// assignable subject entry with multiplicity at least `m`. An element-sort variable takes the
+    /// first such entry; a limit/pure collector takes all of them, dividing each multiplicity by `m`
+    /// and leaving each remainder in the extension.
+    fn finish_nonlinear(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
+        let variable = self.vars[0].clone();
+        debug_assert!(variable.coeff >= 2);
+        let unit_sort = variable.upper_bound == 1;
+        let assignable = |rt: &Runtime, dag: DagId| sig.sorts().leq(rt.sort_of(dag), variable.sort);
+
+        let mut binding_parts = Vec::new();
+        let mut residue = Vec::new();
+        if unit_sort {
+            let Some(chosen) = self.residual.iter().position(|&(dag, multiplicity)| {
+                multiplicity >= variable.coeff && assignable(rt, dag)
+            }) else {
+                return false;
+            };
+            let (binding, _) = self.residual[chosen];
+            let source = &self.residual;
+            binding_parts.push((binding, 1));
+            for (index, &(dag, multiplicity)) in source.iter().enumerate() {
+                let remaining = if index == chosen {
+                    multiplicity - variable.coeff
+                } else {
+                    multiplicity
+                };
+                if remaining != 0 {
+                    residue.push((dag, remaining));
+                }
+            }
+        } else {
+            for &(dag, multiplicity) in &self.residual {
+                if multiplicity >= variable.coeff && assignable(rt, dag) {
+                    binding_parts.push((dag, multiplicity / variable.coeff));
+                    let remaining = multiplicity % variable.coeff;
+                    if remaining != 0 {
+                        residue.push((dag, remaining));
+                    }
+                } else {
+                    residue.push((dag, multiplicity));
+                }
+            }
+            if binding_parts.is_empty() {
+                return false;
+            }
+        }
+
+        let binding = if binding_parts.len() == 1 && binding_parts[0].1 == 1 {
+            binding_parts[0].0
+        } else {
+            rt.make_acu(sig, self.symbol, binding_parts)
+        };
+        if !sig.sorts().leq(rt.sort_of(binding), variable.sort)
+            || !self.apply_binds(rt, &[(variable.index, binding)], subst)
+        {
+            return false;
+        }
+        self.matched_whole = residue.is_empty();
+        self.residue = residue;
+        true
     }
 
     /// `noVariableCase`: 0 unbound variables. The residue is the whole residual multiset (extension);

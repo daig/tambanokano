@@ -7,5 +7,5 @@ publish = false
 [workspace]
 
 [dependencies]
-z3 = "0.12"
+z3 = "0.20.2"
 rand = { version = "0.8", features = ["small_rng"] }

@@ -124,14 +124,18 @@ Reference-suite lifts: `V01-variant-unification`, `V02-variant-matching`,
 `V-ch14-01` … `V-ch14-06`. Fresh probe: `V-probe-01-idem-variants`. The formerly inert V09
 `metaVariantUnify` loop now terminates with reference-identical cached results.
 
-**N\* — narrowing (S3), 15 fixtures; 168 substantive primary commands; READY 2026-07-19.**
+**N\* — narrowing (S3), 15 completion fixtures + 1 post-close regression; 169 substantive primary
+commands; live gate 16/16 PASS on 2026-07-21.**
 Reference-suite lifts: `N01-narrow` (`vu-narrow`/`fvu-narrow`), `N02-narrow2` (`{fold}`/`{vfold}`)
 from `tests/Misc/`; `N03-meta-narrow` (`metaNarrowingApply`/`metaNarrowingSearch`/
 `metaNarrowingSearchPath` + legacy `metaNarrow`) from `tests/Meta/`. Manual ch. 15: `N-ch15-01` …
 `N-ch15-11` (`N-ch15-07/08` include the oracle's deterministic `set verbose on` state/folding trace).
 Fresh probe: `N-probe-01-vu-narrow-basic`; its unreachable fourth query is frozen with depth bound 3
-(`No solution.`, 9 rewrites) rather than an expected timeout. Legacy `metaNarrow` stays in the gate via
-an oracle-equivalent v3 adapter or, only if required, the minimal v1-compatible path. No exclusions.
+(`No solution.`, 9 rewrites) rather than an expected timeout. All 168 primary commands also pass in
+isolation. Legacy `metaNarrow` is served by the oracle-equivalent v3 result adapter; the retired
+`metaNarrow2` remains an explicit non-goal. No fixture exclusions or accepted divergences.
+Post-close `N-probe-02-multi-root-zero-step` guards the `=>*` zero-step solution from every disjunct;
+it grew the live denominator without changing the frozen S3 completion contract.
 
 **Enumerated exclusions (phase-S seeding; nothing silent).**
 - `tests/Meta/metaInt*` (17 files) and `tests/Meta/russianDolls*` (non-`Proc` variants) —
@@ -147,21 +151,38 @@ an oracle-equivalent v3 adapter or, only if required, the minimal v1-compatible 
   prose-only (no runnable command/output pair); ch. 13 §13.4.6 verbose diagnostics and the
   381-unifier dump are representative examples.
 
-### Phase T — SMT (after S; soft dependency: variant satisfiability layers on S2)
+### Phase T — SMT (next; core independent of M; T6 variant satisfiability uses completed S2)
 
-- `check` and `smt-search` against the `z3` crate behind the D7 `SmtEngine` trait,
-  **feature-gated**: the default build stays pure-Rust and green without z3 installed (CI implication
-  recorded in the working rules). Variant satisfiability lands as a `.maude` library over S2.
-  `smt.maude` loads; its `SMT_Symbol` hooks compute. Fixtures: reference-suite SMT directory +
-  manual examples; byte-exact including model/`sat`/`unsat` rendering.
+- **T0 gate is done; T fixtures are not yet seeded.** The first phase-T change is the fixture-only T0a
+  split of `tests/Misc/smtTest.maude` plus manual probes. All non-debug object `check`/`smt-search`,
+  `metaCheck`, and `metaSmtSearch` semantics are in scope; only its `debug`/`step`/`resume` block is an
+  enumerated roadmap-F4 exclusion.
+- **T1–T5 core:** recognize the 25 SMT hooks and number leaves; ship a byte-identical `smt.maude`;
+  implement `check` and `smt-search` through the D7 `SmtEngine` seam; then the mandatory meta
+  surfaces. The `z3` 0.20.2 backend is behind `smt-z3`; the default remains pure Rust, loads/parses
+  the surface, and degrades to `undecided`/no solutions without linking a solver. The z3 lane owns
+  the T fixture denominator. Output is verdict/state/substitution/constraint only—the reference SMT
+  APIs do **not** print solver models.
+- **T6 variant satisfiability:** the official 2016 `var-sat-rel3.tgz` package and paper are recovered
+  and pinned. The package targets Maude 2.7, its prototype-owned files have no explicit license, its
+  finite-sort check depends on model checking, and its old three-field variant API no longer computes
+  on Maude 3.5. It is therefore an executable semantic oracle only. Production is a new native Rust
+  FVP/OS-compact constructor-variant decision procedure using S2, exposed through a thin compatible
+  `VAR-SAT-TOOL` Maude facade. It has no z3, T1–T5, M, or Full-Maude dependency and copies no
+  prototype source. Full algorithm, provenance, old-oracle lane, fixtures, accepted count boundary,
+  and T6a–T6g gates: `remaining-plans/04-smt.md` §4.7/§6.
 
-### Phase M — model checker (independent of S and T; may interleave with T)
+### Phase M — model checker (independent; selected after T for serial work, parallel-safe)
 
-- LTL→Büchi (Gastin–Oddoux per roadmap) + nested-DFS emptiness with **counterexample output
-  byte-exact** to the reference (paths are deterministic; they are the pass criterion, not just the
-  verdict). `SatSolverSymbol`/`ModelCheckerSymbol` id-hooks bound so `model-checker.maude` loads and
-  computes. Reuses the existing state-graph machinery; the search/state-graph GC discipline note in
-  the roadmap risk register applies.
+- **M0 fixtures are not yet seeded** and must precede production code. Freeze minimal
+  true/counterexample/nil-lead-in/deadlock/multi-label cases, manual ch. 12, `dekker`,
+  dining-philosophers, LTL-simplifier, and `satSolve`/`tautCheck` prime-implicant cases.
+- Port the exact Gastin–Oddoux automata + nested DFS; alternative valid automata/lassos do not satisfy
+  the byte-exact counterexample contract. Extract the rewrite successor core from the existing
+  `Search` into a shared `StateGraph` rather than duplicating it. Bind
+  `SatSolverSymbol`/`ModelCheckerSymbol`, preserve exact rewrites/order/labels/lassos, and complete
+  the sibling satisfiability/tautology surface before M closes. Plan:
+  `remaining-plans/05-model-checking.md`.
 
 ### Phase I — sessions & meta-interpreters (last; internal order I0→I1→I2→I3→I4)
 
@@ -197,12 +218,13 @@ an oracle-equivalent v3 adapter or, only if required, the minimal v1-compatible 
 ## 3. Decision points
 
 - **D12** (I0) — content checklist above; written and committed before phase-I implementation.
-- **D6** binds at S0 (spike gate); **D7** binds at phase T start (confirm z3 incremental push/pop
-  matches `smt-search` pruning before the trait is frozen).
-- RATIFIED 2026-07-05: D9/D10/D11 and the criterion-3 amendment (`conformance/accepted-diffs/`
-  `README.md`). D12 recorded 2026-07-05 (ahead of phase I). D7 bound 2026-07-05 by its gate spike
-  (`spikes/smt-spike/`, report `docs/migration/reports/T0-smt-spike.md`): z3 crate confirmed; the
-  oracle is now the Yices2-enabled rebuild (baseline-neutral, verified).
+- **D6** bound at S0. **D7 is bound:** refreshed gate run 2026-07-21
+  (`spikes/smt-spike/`, `reports/T0-smt-spike.md`) uses `z3` 0.20.2 / `z3-sys` 0.11 and proved
+  incremental push/pop equivalent to a fresh solver across 894 randomized state-tree nodes; all
+  fixture-shaped Boolean/integer/real/coercion probes are green against the Yices2 oracle. The
+  production placement and feature-lane decisions are recorded in `remaining-plans/04-smt.md` §8.
+- RATIFIED 2026-07-05: D9/D10/D11, D12, and the criterion-3 amendment
+  (`conformance/accepted-diffs/README.md`).
 
 ## 4. Working rules (carried over; deltas in bold)
 
@@ -231,11 +253,16 @@ an oracle-equivalent v3 adapter or, only if required, the minimal v1-compatible 
   676 commands; commit hash to append when committed)
 - [x] S2 variants — working tree 2026-07-19 (`tools/subsystems-scoreboard.sh -p V`: 21/21;
   289 commands; commit hash to append when committed)
-- [ ] S3 narrowing — READY 2026-07-19 (15 fixtures; 168 substantive primary commands;
-  decisions in `remaining-plans/03-narrowing.md` §8)
-- [ ] T SMT —
+- [x] S3 narrowing — working tree 2026-07-21 (`tools/subsystems-scoreboard.sh -p N`: 16/16,
+  including one post-close regression; `tools/diffmaude-command.py`: 169/169 isolated commands;
+  commit hash to append when committed)
+- [x] T0 z3/Yices2 spike + D7 resolution — refreshed working tree 2026-07-21 (`z3` 0.20.2;
+  894-node incremental≡fresh gate; `reports/T0-smt-spike.md`)
+- [ ] T0a SMT fixture manifest —
+- [ ] T1–T5 SMT theory, object commands, and mandatory meta surfaces —
+- [ ] T6 variant-satisfiability library —
 - [ ] M model checker —
-- [ ] I0 D12 recorded —
+- [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
 - [ ] I1 session extraction —
 - [ ] I2 local meta-interpreters —
 - [ ] I3 cancellation —

@@ -120,24 +120,31 @@ production implementation uses fused apply-quantify, order-preserving block shif
 precondition-documented `unsafe`), and substitute, and is wired through `unify/problem.rs`. The 27/27 S1
 gate resolved the fallback question: BuDDy FFI is unmotivated.
 
-## D7 — SMT: `z3` crate default, behind a trait
-**Decision.** Default to the **`z3` crate** behind `trait SmtEngine` (assert/check/push/pop/fresh-var),
-**runtime/feature-selectable** (not build-time-fixed as in C++). cvc5/yices2 remain feature alternates.
-Variant satisfiability stays a `.maude` library over variant unification.
+## D7 — SMT: feature-gated `z3` 0.20.2 behind `SmtEngine`
+**Decision.** Use `z3` 0.20.2 behind a narrow solver trait
+(`assert_dag`/`check_dag`/`clear`/`push`/`pop`). SMT fresh-variable construction is pure tnk code,
+not a backend method. The concrete backend lives under `tnk-core`'s optional `smt-z3` feature;
+`tnk-repl` forwards it. The default build has a `NullSmtEngine`, remains pure Rust, and
+loads/parses/degrades the SMT surface without libz3. Build the z3 lane in a separate target directory
+and select its binary through the harness's existing `TNK_BIN` override.
 
-**Why.** Best Rust SMT bindings; superset of Maude's theories (QF_LIA/QF_LRA/mixed); solid incremental
-push/pop for `smt-search`.
-**Impact.** Per-backend work is `DagNode → solver term` translation + sort mapping, isolated by the trait.
-**Revisit:** **Phase 3** (confirm Z3 incremental semantics match `smt-search`'s pruning).
+**Why.** z3 covers Maude's QF_LIA/QF_LRA/mixed surface and has sound incremental push/pop.
+Keeping the trait inside core avoids a dependency cycle; gating only the concrete translator/backend
+keeps all frontend, metadata, number, and search code testable in the default build.
 
-**Resolution (2026-07-06, T0 gate spike — binding, run early by user decision).** Spike ran
-(`spikes/smt-spike/`, report `docs/migration/reports/T0-smt-spike.md`): **z3 crate confirmed.**
-Incremental push/pop verdicts are identical to fresh-solver-per-node semantics across 894 randomized
-search-tree nodes (the `smt-search` pruning model); verdicts match the reference on every fixture
-shape; bignum/rational mapping via string numerals. Key context: Maude 3.5.1's SMT output surface is
-verdict-only (no model values anywhere), so solver identity cannot leak into fixture bytes — the
-oracle now runs the Yices2-enabled rebuild (`Opt-buddy-bison-yices2`, validated against upstream's
-`smtTest.expected` and baseline-neutral on F1/F2) while tnk uses z3, safely.
+**Resolution (2026-07-21 refresh of the T0 gate — binding).** `spikes/smt-spike/` and
+`reports/T0-smt-spike.md` now compile against `z3` 0.20.2 / `z3-sys` 0.11 and brew `libz3`.
+Incremental push/pop equals fresh-solver-per-node verdicts across 894 randomized search-tree nodes;
+all fixture-shaped Boolean/integer/real/coercion probes match the Yices2 oracle, including bignum and
+exact-rational string mapping. Maude's observable SMT surface is verdict/state/substitution/
+constraint only—never model values—so backend identity does not leak into fixture bytes.
+
+**Scope correction (refreshed 2026-07-21).** Variant satisfiability still belongs after S2 and is
+independent of the solver backend. The official 2016 `var-sat-rel3.tgz` prototype is now recovered
+and checksum-pinned, but it targets Maude 2.7, does not compute through current variant result tuples,
+and its prototype-owned files have no explicit license. Binding T6 choice: use it as an executable
+semantic oracle only; implement a new native Rust decision procedure behind a source-compatible
+`VAR-SAT-TOOL` Maude facade, with no z3/model-checker/Full-Maude dependency and no source reuse.
 
 ## D8 — Naming: codename `tambanokano`, `tnk-` crate prefix
 **Decision.** Repo/umbrella codename **`tambanokano`**; crates prefixed **`tnk-`** (`tnk-core`,

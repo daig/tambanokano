@@ -17,15 +17,14 @@ use tnk_core::search::Search;
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{Interner, TokKind, Token, tokenize};
 use tnk_frontend::load::{
-    InternerNames, LoadedModule, build_command_dag, command_echo,
-    command_variable_display_name, erewrite_command, format_matchers, frewrite_command,
-    match_command, maude_variable_name_rank, narrow_command, render_unifier, rewrite_command,
-    search_command, unify_command, variant_command, variant_match_command, variant_unify_command,
+    InternerNames, LoadedModule, build_command_dag, command_echo, command_variable_display_name,
+    erewrite_command, format_matchers, frewrite_command, match_command, maude_variable_name_rank,
+    narrow_command, render_unifier, rewrite_command, search_command, unify_command,
+    variant_command, variant_match_command, variant_unify_command,
 };
 use tnk_frontend::pretty::print_pretty;
 use tnk_frontend::surface::ast::{
-    Command, ModuleExpr, OpMap, PreModule, SearchArrow, TopItem, ViewDecl,
-    NarrowDisplay,
+    Command, ModuleExpr, NarrowDisplay, OpMap, PreModule, SearchArrow, TopItem, ViewDecl,
 };
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
@@ -91,6 +90,9 @@ pub struct Repl {
     show_breakdown: bool,
     /// `set verbose on|off`: show narrowing fold decisions and terminal state counts.
     verbose: bool,
+    /// Unequal identity-collapse notices already emitted by a lazy symbolic command. Maude
+    /// computes this property once per operator, so `set verbose on` prints each notice once.
+    reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId)>,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -121,7 +123,6 @@ struct VariantSession {
     irredundant: bool,
     reported_total: bool,
 }
-
 
 struct VariantUnifySession {
     search: tnk_core::variant::VariantSearch,
@@ -169,6 +170,7 @@ impl Repl {
             show_timing: true,
             show_breakdown: false,
             verbose: false,
+            reported_identity_collapses: HashSet::new(),
         }
     }
 
@@ -359,6 +361,8 @@ impl Repl {
                 if !self.modules.contains_key(&name) {
                     self.order.push(name.clone());
                 }
+                self.reported_identity_collapses
+                    .retain(|(module, _)| module != &name);
                 self.modules.insert(name.clone(), lm);
                 self.current = Some(name.clone());
             }
@@ -426,6 +430,8 @@ impl Repl {
             };
             match built {
                 Ok(lm) => {
+                    self.reported_identity_collapses
+                        .retain(|(module, _)| module != &name);
                     self.modules.insert(name, lm);
                     rebuilt = true;
                 }
@@ -909,7 +915,12 @@ impl Repl {
                     SearchArrow::Star => "=>*",
                     SearchArrow::Bang => "=>!",
                 };
-                let (interner, modules) = (&mut self.interner, &mut self.modules);
+                let verbose = self.verbose;
+                let (interner, modules, reported_identity_collapses) = (
+                    &mut self.interner,
+                    &mut self.modules,
+                    &mut self.reported_identity_collapses,
+                );
                 let lm = modules.get_mut(&cur).expect("current module is built");
                 match narrow_command(
                     lm,
@@ -926,6 +937,14 @@ impl Repl {
                 ) {
                     Err(error) => out.push_str(&format!("error: {error}\n")),
                     Ok(command) => {
+                        if verbose {
+                            append_verbose_identity_collapse_diagnostics(
+                                lm,
+                                &cur,
+                                reported_identity_collapses,
+                                out,
+                            );
+                        }
                         out.push_str(&format!(
                             "{prefix}{keyword}{stream_options}{bound_str} in {cur} : {} \
                              {arrow_echo} {} .\n",
@@ -947,7 +966,7 @@ impl Repl {
                             self.color,
                             self.show_timing,
                             self.show_breakdown,
-                            self.verbose,
+                            verbose,
                             path,
                             max_solutions,
                         );
@@ -1137,7 +1156,7 @@ impl Repl {
                                 None,
                             )
                         }
-                        _ => "show frontier states: no current narrowing search.".into(),
+                        _ => "Warning: no narrowing state forest.".into(),
                     },
                     None => "show frontier states: no current module.".into(),
                 }
@@ -1159,7 +1178,7 @@ impl Repl {
                                 None,
                             )
                         }
-                        _ => "show most general states: no current narrowing search.".into(),
+                        _ => "Warning: no narrowing state forest.".into(),
                     },
                     None => "show most general states: no current module.".into(),
                 }
@@ -1402,6 +1421,36 @@ impl Repl {
     }
 }
 
+/// Maude defers binary-symbol sort checks until a symbolic command first needs them. Under
+/// `set verbose on`, an identity whose collapse lowers the result sort therefore reports once,
+/// immediately before that command's echo.
+fn append_verbose_identity_collapse_diagnostics(
+    lm: &LoadedModule,
+    module: &str,
+    reported: &mut HashSet<(String, tnk_core::symbol::SymbolId)>,
+    out: &mut String,
+) {
+    let mut symbols: Vec<_> = lm.built.ops.values().copied().collect();
+    symbols.sort_unstable();
+    symbols.dedup();
+    for symbol in symbols {
+        let Some((result, collapsed)) =
+            tnk_core::unify::unequal_left_identity_collapse(&lm.built.engine, symbol)
+        else {
+            continue;
+        };
+        if !reported.insert((module.to_string(), symbol)) {
+            continue;
+        }
+        out.push_str(&format!(
+            "op {} left-identity collapse from {} to {} is unequal.\n",
+            lm.built.engine.symbol(symbol).name(),
+            lm.built.engine.sorts().name(result),
+            lm.built.engine.sorts().name(collapsed),
+        ));
+    }
+}
+
 /// Append a non-empty per-statement output block to the accumulated submission output, separating
 /// consecutive blocks by a single newline.
 fn append_block(out: &mut String, block: &str) {
@@ -1589,7 +1638,6 @@ fn render_variants(
 }
 
 impl VariantUnifySession {
-
     fn advance(&mut self, lm: &mut LoadedModule, i: &mut Interner) {
         if self.exhausted {
             return;
@@ -1648,7 +1696,6 @@ impl VariantUnifySession {
         self.stream.finish();
         self.prepared = true;
     }
-
 }
 
 fn render_variant_unifiers(
@@ -1742,9 +1789,7 @@ fn render_variant_unifiers(
 /// echoes a goal variable as written: a declared `X` prints `X`, an on-the-fly `X:Sort` prints
 fn narrowing_rewrite_line(rewrites: u64, show_timing: bool) -> String {
     if show_timing {
-        format!(
-            "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)"
-        )
+        format!("rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)")
     } else {
         format!("rewrites: {rewrites}")
     }
@@ -1920,14 +1965,16 @@ fn render_narrowing(
         } else {
             String::new()
         };
-        let initial_state = session.initial_variables.as_ref().map_or_else(String::new, |_| {
-            format!(
-                "\ninitial state: {}",
-                session.initial_echoes[session.search.root_index(solution.state)]
-            )
-        });
-        let accumulated =
-            render_narrow_accumulated(session, lm, i, solution.state, color);
+        let initial_state = session
+            .initial_variables
+            .as_ref()
+            .map_or_else(String::new, |_| {
+                format!(
+                    "\ninitial state: {}",
+                    session.initial_echoes[session.search.root_index(solution.state)]
+                )
+            });
+        let accumulated = render_narrow_accumulated(session, lm, i, solution.state, color);
         let accumulated_newline = if accumulated.is_empty() { "" } else { "\n" };
         let unifier = render_narrow_variant_unifier(
             lm,
@@ -1959,9 +2006,7 @@ fn render_narrow_state(
     let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(term));
     let value = print_pretty(&lm.built, i, term, color);
     let accumulated = render_narrow_accumulated(session, lm, i, state, color);
-    format!(
-        "state {state}, {sort}: {value}\naccumulated substitution:\n{accumulated}"
-    )
+    format!("state {state}, {sort}: {value}\naccumulated substitution:\n{accumulated}")
 }
 
 fn render_narrowing_display(

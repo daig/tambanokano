@@ -86,6 +86,34 @@ fn term_variable_indices(term: &Term) -> HashSet<u32> {
     variables
 }
 
+/// Variables mentioned by a statement condition. ACU's specialized sole nonlinear-variable
+/// automaton is invalid for one of these variables because a failed condition must be able to
+/// backtrack through the general matcher stream.
+fn condition_variable_indices(condition: &[ConditionFragment]) -> HashSet<u32> {
+    let mut variables = HashSet::new();
+    let mut add = |term: &Term| variables.extend(term_variable_indices(term));
+    for fragment in condition {
+        match fragment {
+            ConditionFragment::Equality { lhs, rhs } => {
+                add(lhs);
+                add(rhs);
+            }
+            ConditionFragment::SortTest { term, .. } => add(term),
+            ConditionFragment::Matching {
+                pattern, subject, ..
+            } => {
+                add(pattern);
+                add(subject);
+            }
+            ConditionFragment::Rewrite { lhs, pattern, .. } => {
+                add(lhs);
+                add(pattern);
+            }
+        }
+    }
+    variables
+}
+
 /// Structural equation-pattern matching for static terms. Pattern variables are wildcards, with
 /// repeated occurrences required to denote the same subject subtree.
 fn term_matches_pattern(pattern: &Term, subject: &Term) -> bool {
@@ -1458,6 +1486,32 @@ impl Signature {
         bounds
     }
 
+    /// Whether `sort` has Maude's `LIMIT_SORT` (or stronger `PURE_SORT`) property for an associative
+    /// operator: combining any two arguments whose sorts are `<= sort` still has sort `<= sort`.
+    /// `ACU_NonLinearLhsAutomaton` requires this closure before it may collect several subject
+    /// elements into one repeated-variable binding.
+    pub(crate) fn acu_nonlinear_sort_safe(&self, op: SymbolId, sort: SortId) -> bool {
+        let kind = self.sorts.kind_of(sort);
+        self.sorts
+            .kind(kind)
+            .index_order
+            .iter()
+            .copied()
+            .all(|left| {
+                !self.sorts.leq(left, sort)
+                    || self
+                        .sorts
+                        .kind(kind)
+                        .index_order
+                        .iter()
+                        .copied()
+                        .all(|right| {
+                            !self.sorts.leq(right, sort)
+                                || self.sorts.leq(self.compute_sort(op, &[left, right]), sort)
+                        })
+            })
+    }
+
     /// Least sort of an **S** node `s^count(arg)` (Maude's `S_Symbol::computeBaseSort` /
     /// `SortPath::computeSortIndex`). The successor's unary sort function, iterated over the argument
     /// sort, is eventually periodic (it maps a finite kind into itself), so the sort follows a **lead**
@@ -1555,6 +1609,7 @@ impl Signature {
             .expect("equation lhs must be an application");
         self.note_collapse_pattern(&lhs, &rhs);
         self.note_substitution_layout(&lhs, nr_vars, Some(&rhs), &condition);
+        let condition_variables = condition_variable_indices(&condition);
         let id = self.next_eq_id;
         self.next_eq_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
@@ -1566,7 +1621,7 @@ impl Signature {
         let extra_targets = self.collapse_targets(&lhs, top);
         let compiled = CompiledEquation {
             id,
-            lhs: LhsAutomaton::compile(lhs, self),
+            lhs: LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables),
             rhs,
             nr_vars,
             condition: self.compile_condition(condition, CondOwner::EqOrMb),
@@ -1756,10 +1811,11 @@ impl Signature {
         let id = self.next_rule_id;
         self.next_rule_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
+        let condition_variables = condition_variable_indices(&condition);
         let oo = self.classify_oo_rule(&lhs);
         let compiled = CompiledRule {
             id,
-            lhs: LhsAutomaton::compile(lhs, self),
+            lhs: LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables),
             rhs,
             nr_vars,
             oo,
@@ -1862,9 +1918,10 @@ impl Signature {
             .expect("membership lhs must be an application");
         let id = self.next_mb_id;
         self.next_mb_id += 1;
+        let condition_variables = condition_variable_indices(&condition);
         let compiled = SortConstraint {
             id,
-            lhs: LhsAutomaton::compile(lhs, self),
+            lhs: LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables),
             sort,
             nr_vars,
             condition: self.compile_condition(condition, CondOwner::EqOrMb),
@@ -2118,6 +2175,43 @@ impl Runtime {
         );
         let sort = self.free_sort(sig, symbol, &args);
         self.alloc_node(sort, NodeTerm::Free { symbol, args })
+    }
+
+    /// Rebuild a node after substitution while preserving its exact theory representation.
+    ///
+    /// Maude's `DagNode::instantiate(..., false)` deliberately skips top normalization: an AC/AU
+    /// binding inserted below the same symbol remains a shared nested child until ordinary reduction
+    /// visits it. Narrowing's final goal instantiation relies on that sharing for observable rewrite
+    /// counts. The source node is canonical, so this can only create a transient noncanonical
+    /// application; callers must pass it directly to reduction.
+    pub(crate) fn make_preserving_representation(
+        &mut self,
+        sig: &Signature,
+        term: NodeTerm,
+    ) -> DagId {
+        let sort = match &term {
+            NodeTerm::Free { symbol, args } => self.free_sort(sig, *symbol, args),
+            NodeTerm::Acu { symbol, args } => {
+                let elem_sorts: Vec<SortId> = args
+                    .iter()
+                    .flat_map(|&(arg, multiplicity)| {
+                        std::iter::repeat_n(self.dags.get(arg).sort, multiplicity as usize)
+                    })
+                    .collect();
+                sig.compute_sort_fold(*symbol, &elem_sorts)
+            }
+            NodeTerm::Au { symbol, args } | NodeTerm::Cui { symbol, args } => {
+                let elem_sorts: Vec<SortId> =
+                    args.iter().map(|&arg| self.dags.get(arg).sort).collect();
+                sig.compute_sort_fold(*symbol, &elem_sorts)
+            }
+            NodeTerm::S { symbol, count, arg } => {
+                sig.compute_s_sort(*symbol, self.dags.get(*arg).sort, count)
+            }
+            NodeTerm::Na { symbol, value } => sig.compute_na_sort(*symbol, value),
+            NodeTerm::Var { symbol, .. } => sig.symbol(*symbol).decls[0].range,
+        };
+        self.alloc_node(sort, term)
     }
 
     /// Least sort of a free node `symbol(args…)`. The common case — a single declaration, no
@@ -2408,39 +2502,22 @@ impl Runtime {
     }
 
     /// Rebuild an ACU node after changing only variable indices while retaining the existing
-    /// argument order. Maude indexes retained variant variables in place, so routing this through
-    /// `make_acu` would incorrectly reorder arguments by their new slots. Reindexing can make two
-    /// formerly distinct variables structurally equal, however, so restore the canonical multiset
-    /// invariant by merging such elements without moving their first occurrence.
+    /// argument order, multiplicities, and duplicate entries. Maude indexes retained symbolic DAGs
+    /// in place, so this path must not sort, merge structurally equal elements, or collapse: copied
+    /// ground subterms can deliberately occupy distinct argument entries and carry independent
+    /// reduction-count state.
     pub(crate) fn make_acu_preserving_order(
         &mut self,
         sig: &Signature,
         symbol: SymbolId,
         args: Vec<(DagId, u32)>,
     ) -> DagId {
-        let mut merged: Vec<(DagId, u32)> = Vec::with_capacity(args.len());
-        for (element, multiplicity) in args {
-            if let Some((_, retained_multiplicity)) = merged
-                .iter_mut()
-                .find(|(retained, _)| self.deep_equal(*retained, element))
-            {
-                *retained_multiplicity += multiplicity;
-            } else {
-                merged.push((element, multiplicity));
-            }
-        }
-        let elem_sorts: Vec<SortId> = merged
+        let elem_sorts: Vec<SortId> = args
             .iter()
             .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
             .collect();
         let sort = sig.compute_sort_fold(symbol, &elem_sorts);
-        self.alloc_node(
-            sort,
-            NodeTerm::Acu {
-                symbol,
-                args: merged,
-            },
-        )
+        self.alloc_node(sort, NodeTerm::Acu { symbol, args })
     }
 
     /// Eagerly put `dag` into **theory normal form** for the symbolic engine (unification/variants):
@@ -2529,7 +2606,6 @@ impl Runtime {
                 self.make_au(sig, symbol, flat) // flat already spliced; make_au drops identities/collapses
             }
         };
-        self.inherit_reduced_status(sig, dag, normalized);
         normalized
     }
 
@@ -4714,16 +4790,7 @@ impl Engine {
 
     /// Carry the current-epoch self-normal stamp across a semantics-preserving alpha rebuild.
     pub(crate) fn inherit_reduced_status(&mut self, source: DagId, rebuilt: DagId) {
-        self.rt
-            .inherit_reduced_status(&self.sig, source, rebuilt);
-    }
-
-    pub(crate) fn reduction_cache_state(&self, dag: DagId) -> (bool, bool) {
-        let node = self.rt.dags.get(dag);
-        (
-            node.reduced_epoch == self.sig.eq_epoch(),
-            node.nf.is_some(),
-        )
+        self.rt.inherit_reduced_status(&self.sig, source, rebuilt);
     }
 
     /// Rebuild a symbolic DAG with each original variable slot replaced by `new_slots[old_slot]`.
@@ -4731,6 +4798,32 @@ impl Engine {
     /// `indexVariables`, so commutative canonical order—not parser encounter order—defines the visible
     /// substitution slots. The iterative postorder walk preserves sharing and compact `S` counts.
     pub(crate) fn remap_variable_slots(&mut self, root: DagId, new_slots: &[u32]) -> DagId {
+        self.remap_variable_slots_inner(root, new_slots, false)
+    }
+
+    /// Remap variable slots without normalizing any enclosing theory node.
+    ///
+    /// This is the slot-indexing counterpart of Maude's `instantiate(..., false)`: final narrowing
+    /// goals may contain shared, transiently noncanonical AC/AU children, and rebuilding them through
+    /// the canonical builders would destroy the sharing before reduction.
+    pub(crate) fn remap_variable_slots_preserving_representation(
+        &mut self,
+        root: DagId,
+        new_slots: &[u32],
+    ) -> DagId {
+        self.remap_variable_slots_inner(root, new_slots, true)
+    }
+
+    fn remap_variable_slots_inner(
+        &mut self,
+        root: DagId,
+        new_slots: &[u32],
+        preserve_representation: bool,
+    ) -> DagId {
+        if new_slots.is_empty() {
+            return root;
+        }
+
         #[derive(Clone)]
         enum Shape {
             Free(SymbolId, Vec<DagId>),
@@ -4787,25 +4880,65 @@ impl Engine {
             let new = match shape {
                 Shape::Free(symbol, args) => {
                     let args = args.into_iter().map(map_child).collect();
-                    self.rt.make_free(&self.sig, symbol, args)
+                    if preserve_representation {
+                        self.rt.make_preserving_representation(
+                            &self.sig,
+                            NodeTerm::Free { symbol, args },
+                        )
+                    } else {
+                        self.rt.make_free(&self.sig, symbol, args)
+                    }
                 }
                 Shape::Acu(symbol, args) => {
                     let args = args
                         .into_iter()
                         .map(|(child, mult)| (map_child(child), mult))
                         .collect();
-                    self.rt.make_acu(&self.sig, symbol, args)
+                    if preserve_representation {
+                        self.rt.make_preserving_representation(
+                            &self.sig,
+                            NodeTerm::Acu { symbol, args },
+                        )
+                    } else {
+                        self.rt.make_acu(&self.sig, symbol, args)
+                    }
                 }
                 Shape::Au(symbol, args) => {
                     let args = args.into_iter().map(map_child).collect();
-                    self.rt.make_au(&self.sig, symbol, args)
+                    if preserve_representation {
+                        self.rt.make_preserving_representation(
+                            &self.sig,
+                            NodeTerm::Au { symbol, args },
+                        )
+                    } else {
+                        self.rt.make_au(&self.sig, symbol, args)
+                    }
                 }
                 Shape::Cui(symbol, x, y) => {
-                    self.rt
-                        .make_cui(&self.sig, symbol, map_child(x), map_child(y))
+                    let x = map_child(x);
+                    let y = map_child(y);
+                    if preserve_representation {
+                        self.rt.make_preserving_representation(
+                            &self.sig,
+                            NodeTerm::Cui {
+                                symbol,
+                                args: vec![x, y],
+                            },
+                        )
+                    } else {
+                        self.rt.make_cui(&self.sig, symbol, x, y)
+                    }
                 }
                 Shape::S(symbol, count, arg) => {
-                    self.rt.make_s(&self.sig, symbol, count, map_child(arg))
+                    let arg = map_child(arg);
+                    if preserve_representation {
+                        self.rt.make_preserving_representation(
+                            &self.sig,
+                            NodeTerm::S { symbol, count, arg },
+                        )
+                    } else {
+                        self.rt.make_s(&self.sig, symbol, count, arg)
+                    }
                 }
                 Shape::Na => id,
                 Shape::Var(symbol, name, old_slot) => {
@@ -4813,8 +4946,7 @@ impl Engine {
                         .make_var(&self.sig, symbol, name, new_slots[old_slot as usize])
                 }
             };
-            self.rt
-                .inherit_reduced_status(&self.sig, id, new);
+            self.rt.inherit_reduced_status(&self.sig, id, new);
             rebuilt.insert(id, new);
         }
         rebuilt[&root]
@@ -7824,18 +7956,19 @@ mod tests {
         assert_eq!(e.node(r).children().count(), 2, "result is 0 ; s0");
     }
 
-    /// B1.5 reduce lock: non-linear pure-AC idempotency `eq X + X = X` on `a+a+a+a` → `a` in **3**
-    /// rewrites (X binds a single `a` each step — minimal binding, not the whole half).
+    /// Direct, already-flattened AC node: the specialized non-linear automaton binds the maximal
+    /// quotient first, so `eq X + X = X` reduces flat `a+a+a+a` to `a` in **2** rewrites. Parsed
+    /// source still reports 3 because its three binary construction nodes reduce bottom-up; that
+    /// observable command contract is locked by `conformance/acu-reduce.maude`.
     #[test]
-    fn ac_reduce_nonlinear_idempotency_three_rewrites() {
+    fn ac_reduce_flat_nonlinear_idempotency_two_rewrites() {
         let (mut e, s, a, _b, _c, plus) = ac_ctx();
         e.add_equation(Equation {
             lhs: Term::op(plus, vec![Term::var(0, s), Term::var(0, s)]), // X + X
             rhs: Term::var(0, s),
             nr_vars: 1,
         });
-        // Construction-dedup window, as every real command subject is built (C7): the four `a`
-        // occurrences share one node, so the multiset merges by identity as in the real pipeline.
+        // Merge equal leaves into one canonical flat multiset entry with multiplicity four.
         e.begin_dedup();
         let (a0, a1, a2, a3) = (
             e.make_const(a),
@@ -7848,8 +7981,8 @@ mod tests {
         let r = e.reduce(subject);
         assert_eq!(
             e.rewrites(),
-            3,
-            "X binds a single `a` each step (== reference binary)"
+            2,
+            "the specialized matcher takes the maximal quotient of a flat AC node"
         );
         assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
     }

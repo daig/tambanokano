@@ -6,18 +6,21 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::engine::Engine;
 use crate::dag::{DagId, NodeTerm};
+use crate::engine::Engine;
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
 use crate::num::Nat;
 use crate::root::RootGuard;
 use crate::term::{ConditionFragment, Term, Var};
 use crate::unify::problem::VarSpec;
-use crate::unify::{UnifyEnv, instantiate};
+use crate::unify::{
+    UnifyEnv, instantiate, instantiate_preserving_representation,
+    replace_and_instantiate_preserving_representation,
+};
 use crate::variant::{
     FilteredVariantUnifierStream, PreparedVariantNarrowingState, VariantMode,
     VariantNarrowingSource, VariantSearch, compile_variant_equation,
-    prepare_variant_narrowing_state, term_from_dag_slots,
+    prepare_variant_narrowing_state,
 };
 
 /// One source rule eligible for variant-based narrowing, in flattened module order.
@@ -35,10 +38,6 @@ pub struct NarrowingRule {
 }
 
 impl VariantNarrowingSource for NarrowingRule {
-    fn source_id(&self) -> u32 {
-        self.id
-    }
-
     fn lhs(&self) -> &Term {
         &self.lhs
     }
@@ -173,6 +172,7 @@ impl PairUnifierSearch {
         env: &mut UnifyEnv,
         target: DagId,
         specs: Vec<VarSpec>,
+        blockers: Vec<DagId>,
         equations: Vec<crate::variant::VariantEquation>,
         incoming_family: VariableFamily,
         base: &str,
@@ -183,7 +183,7 @@ impl PairUnifierSearch {
             env,
             target,
             specs,
-            Vec::new(),
+            blockers,
             equations.clone(),
             VariantMode::Incremental,
             Some(incoming_family),
@@ -302,6 +302,7 @@ impl RuleVariantUnifierSearch {
         state: &PreparedVariantNarrowingState,
         redex: DagId,
         rule: &NarrowingRule,
+        blockers: &[DagId],
         equations: Vec<crate::variant::VariantEquation>,
         incoming_family: VariableFamily,
         base: &str,
@@ -319,13 +320,11 @@ impl RuleVariantUnifierSearch {
             specs.push(rule.variables[source_slot]);
             pair_bindings.push(PairBinding::Source(source_slot));
         }
-        for state_slot in state_slots {
+        for &state_slot in &state_slots {
             state_map[state_slot] = specs.len() as u32;
             specs.push(state.variables[state_slot]);
             pair_bindings.push(PairBinding::State(state_slot));
         }
-        let count_before_pair = env.e.rewrites();
-        let redex_cache = env.e.reduction_cache_state(redex);
         let lhs = remap_term(&rule.lhs, &source_map);
         let range = env
             .e
@@ -341,26 +340,30 @@ impl RuleVariantUnifierSearch {
             .collect();
         let lhs_target = env.e.instantiate_bindings(&lhs, &variables);
         let state_target = env.e.remap_variable_slots(redex, &state_map);
-        let pair_target = env
-            .e
-            .make_node(pair_symbol, vec![lhs_target, state_target]);
+        let pair_target = env.e.make_node(pair_symbol, vec![lhs_target, state_target]);
+        let mut blocker_map = state_map;
+        let mut next_blocker_slot = specs.len() as u32;
+        for slot in 0..blocker_map.len() {
+            if !state_slots.contains(&slot) {
+                blocker_map[slot] = next_blocker_slot;
+                next_blocker_slot += 1;
+            }
+        }
+        let blockers = blockers
+            .iter()
+            .map(|&blocker| env.e.remap_variable_slots(blocker, &blocker_map))
+            .collect();
         let pair = PairUnifierSearch::new(
             env,
             pair_target,
             specs,
+            blockers,
             equations,
             incoming_family,
             base,
             filtered,
             delayed,
         )?;
-        if std::env::var_os("TNK_NARROW_COUNT_TRACE").is_some() {
-            eprintln!(
-                "NCOUNT rule-pair redex={redex_cache:?} mapped={:?} init={}",
-                env.e.reduction_cache_state(state_target),
-                env.e.rewrites().saturating_sub(count_before_pair),
-            );
-        }
         Ok(Self {
             pair,
             pair_bindings,
@@ -390,8 +393,9 @@ impl RuleVariantUnifierSearch {
             collect_variable_keys(env.e, binding, &mut variable_keys);
         }
         let mut next_fresh = variable_keys.len();
-        let mut generator =
-            FreshVariableGenerator::with_base(Nat::from_decimal(&self.base).unwrap_or_else(Nat::zero));
+        let mut generator = FreshVariableGenerator::with_base(
+            Nat::from_decimal(&self.base).unwrap_or_else(Nat::zero),
+        );
         for (slot, binding) in source_bindings.iter_mut().enumerate() {
             if binding.is_none() {
                 let spec = self.source_specs[slot];
@@ -516,34 +520,6 @@ fn narrowing_positions(e: &Engine, root: DagId) -> Vec<(Vec<usize>, DagId)> {
     result
 }
 
-fn replace_and_instantiate(
-    e: &mut Engine,
-    dag: DagId,
-    path: &[usize],
-    replacement: DagId,
-    values: &[Option<DagId>],
-) -> DagId {
-    if path.is_empty() {
-        return replacement;
-    }
-    let symbol = e.node(dag).symbol();
-    let mut children: Vec<_> = e.node(dag).children().collect();
-    let selected = path[0];
-    for (index, child) in children.iter_mut().enumerate() {
-        *child = if index == selected {
-            replace_and_instantiate(e, *child, &path[1..], replacement, values)
-        } else {
-            instantiate(e, values, *child).unwrap_or(*child)
-        };
-    }
-    match &e.node(dag).term {
-        NodeTerm::S { count, .. } => e
-            .make_iter_decimal(symbol, &count.to_decimal(), children[0])
-            .expect("valid iterator count"),
-        _ => e.make_node(symbol, children),
-    }
-}
-
 fn apply_rule_unifier(
     e: &mut Engine,
     state: &PreparedVariantNarrowingState,
@@ -555,23 +531,21 @@ fn apply_rule_unifier(
     let mut accumulated = Vec::with_capacity(state.substitution.len());
     for dag in state.substitution.iter().copied() {
         let dag = instantiate(e, &state_values, dag).unwrap_or(dag);
-        accumulated.push(e.normalize_for_unify(dag));
+        let dag = e.normalize_for_unify(dag);
+        accumulated.push(dag);
     }
     let replacement = e.instantiate_bindings(&rule.rhs, &unifier.source_bindings);
-    let rebuilt =
-        replace_and_instantiate(e, state.term, path, replacement, &state_values);
+    let rebuilt = replace_and_instantiate_preserving_representation(
+        e,
+        state.term,
+        path,
+        replacement,
+        &state_values,
+    );
     e.count_narrowing_step();
-    let before_reduction = e.rewrites();
     let reduced = e.reduce(rebuilt);
-    if std::env::var_os("TNK_NARROW_COUNT_TRACE").is_some() {
-        eprintln!(
-            "NCOUNT successor rebuilt={:?} reduced={:?} equations={}",
-            e.reduction_cache_state(rebuilt),
-            e.reduction_cache_state(reduced),
-            e.rewrites().saturating_sub(before_reduction),
-        );
-    }
-    prepare_variant_narrowing_state(e, reduced, &accumulated)
+    let prepared = prepare_variant_narrowing_state(e, reduced, &accumulated);
+    prepared
 }
 
 /// Search arrow selected by `=>1`, `=>+`, `=>*`, or `=>!`.
@@ -770,6 +744,7 @@ impl StateExpansion {
         env: &mut UnifyEnv,
         state: &StoredNarrowingState,
         rules: &[NarrowingRule],
+        blockers: &[DagId],
         equations: &[crate::variant::VariantEquation],
         options: &NarrowOptions,
         base: &str,
@@ -817,6 +792,7 @@ impl StateExpansion {
                     &state.prepared,
                     redex,
                     rule,
+                    blockers,
                     equations.to_vec(),
                     state.family,
                     base,
@@ -845,10 +821,12 @@ pub struct NarrowSearch {
     rules: Vec<NarrowingRule>,
     equations: Vec<crate::variant::VariantEquation>,
     options: NarrowOptions,
+    blockers: Vec<DagId>,
+    _blocker_roots: Vec<RootGuard>,
     base: String,
     expansion: Option<StateExpansion>,
     expand_cursor: usize,
-    initial_to_try: usize,
+    untried_initials: std::ops::Range<usize>,
     exhausted: bool,
     incomplete: bool,
     states_expanded: usize,
@@ -898,20 +876,22 @@ impl NarrowSearch {
         if options.search_type == NarrowSearchType::One {
             options.max_depth = Some(1);
         }
-        let initial_to_try = if options.search_type == NarrowSearchType::Any {
-            initials.len()
+        let untried_initials = if options.search_type == NarrowSearchType::Any {
+            0..initials.len()
         } else {
-            0
+            0..0
         };
         let mut search = Self {
             states: Vec::with_capacity(initials.len()),
             rules: rules.to_vec(),
             equations,
             options,
+            blockers: Vec::new(),
+            _blocker_roots: Vec::new(),
             base: base.to_string(),
             expansion: None,
             expand_cursor: 0,
-            initial_to_try,
+            untried_initials,
             exhausted: false,
             incomplete: false,
             states_expanded: 0,
@@ -920,8 +900,9 @@ impl NarrowSearch {
             goal_search: None,
         };
         for (root_index, (initial, initial_variables)) in initials.into_iter().enumerate() {
-            let mut generator =
-                FreshVariableGenerator::with_base(Nat::from_decimal(base).unwrap_or_else(Nat::zero));
+            let mut generator = FreshVariableGenerator::with_base(
+                Nat::from_decimal(base).unwrap_or_else(Nat::zero),
+            );
             let mut renaming = Vec::with_capacity(initial_variables.len());
             for (slot, spec) in initial_variables.iter().enumerate() {
                 let name = env
@@ -952,6 +933,58 @@ impl NarrowSearch {
             );
             search.insert_state(env, initial);
         }
+        Ok(search)
+    }
+
+    /// Construct a single narrowing graph without renaming the incoming state variables.
+    ///
+    /// META-LEVEL callers use this path because their `family` argument names the protected
+    /// variable family already present in the down-translated state. `blockers` are irreducibility
+    /// constraints over the same original variable slots; each rule-unification search receives
+    /// their image under the state's accumulated substitution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_preserving(
+        env: &mut UnifyEnv,
+        initial: DagId,
+        initial_variables: Vec<VarSpec>,
+        family: VariableFamily,
+        blockers: Vec<DagId>,
+        rules: &[NarrowingRule],
+        equations: Vec<crate::variant::VariantEquation>,
+        base: &str,
+        mut options: NarrowOptions,
+    ) -> Result<Self, String> {
+        if options.search_type == NarrowSearchType::One {
+            options.max_depth = Some(1);
+        }
+        let untried_initials = 0..usize::from(options.search_type == NarrowSearchType::Any);
+        let blocker_roots = blockers.iter().map(|&dag| env.e.root(dag)).collect();
+        let mut substitution = Vec::with_capacity(initial_variables.len());
+        for (slot, spec) in initial_variables.iter().enumerate() {
+            substitution.push(env.e.make_var(spec.sort, spec.name, slot as u32));
+        }
+        let reduced = env.e.reduce(initial);
+        let prepared = prepare_variant_narrowing_state(env.e, reduced, &substitution);
+        let initial = StoredNarrowingState::new(env.e, prepared, family, None, 0, 0, None);
+        let mut search = Self {
+            states: Vec::with_capacity(1),
+            rules: rules.to_vec(),
+            blockers,
+            _blocker_roots: blocker_roots,
+            equations,
+            options,
+            base: base.to_string(),
+            expansion: None,
+            expand_cursor: 0,
+            untried_initials,
+            exhausted: false,
+            incomplete: false,
+            states_expanded: 0,
+            folding_events: Vec::new(),
+            goal: None,
+            goal_search: None,
+        };
+        search.insert_state(env, initial);
         Ok(search)
     }
 
@@ -998,17 +1031,9 @@ impl NarrowSearch {
             {
                 values[slot] = Some(dag);
             }
-            if std::env::var_os("TNK_NARROW_COUNT_TRACE").is_some() {
-                let values: Vec<_> = values
-                    .iter()
-                    .map(|value| value.map(|dag| term_from_dag_slots(env.e, dag)))
-                    .collect();
-                eprintln!("NCOUNT goal-values {values:#?}");
-            }
-            env.e.begin_dedup();
             let instantiated_goal =
-                instantiate(env.e, &values, goal.term).unwrap_or(goal.term);
-            env.e.end_dedup();
+                instantiate_preserving_representation(env.e, &values, goal.term)
+                    .unwrap_or(goal.term);
             let state_term = self.states[state].prepared.term;
             match build_goal_search(
                 env,
@@ -1032,13 +1057,11 @@ impl NarrowSearch {
         }
     }
 
-
     /// Next state which should be tested against the goal. State ids are Maude's creation-order ids.
     pub fn next_interesting_state(&mut self, env: &mut UnifyEnv) -> Option<usize> {
-        if self.initial_to_try > 0 {
-            self.initial_to_try -= 1;
-            if self.states[0].alive {
-                return Some(0);
+        for index in self.untried_initials.by_ref() {
+            if self.states[index].alive {
+                return Some(index);
             }
         }
         loop {
@@ -1049,10 +1072,26 @@ impl NarrowSearch {
                     .options
                     .max_depth
                     .is_some_and(|bound| parent_depth >= bound);
+                let state_values: Vec<_> = self.states[state_index]
+                    .prepared
+                    .substitution
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect();
+                let instantiated_blockers: Vec<_> = self
+                    .blockers
+                    .iter()
+                    .map(|&blocker| {
+                        instantiate_preserving_representation(env.e, &state_values, blocker)
+                            .unwrap_or(blocker)
+                    })
+                    .collect();
                 let pending = expansion.next(
                     env,
                     &self.states[state_index],
                     &self.rules,
+                    &instantiated_blockers,
                     &self.equations,
                     &self.options,
                     &self.base,
@@ -1305,9 +1344,10 @@ impl NarrowSearch {
     }
 
     pub fn frontier_states(&self) -> impl Iterator<Item = usize> + '_ {
-        self.states.iter().enumerate().filter_map(|(index, state)| {
-            (state.alive && !state.expanded).then_some(index)
-        })
+        self.states
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| (state.alive && !state.expanded).then_some(index))
     }
 
     pub fn take_folding_events(&mut self) -> Vec<FoldingEvent> {
@@ -1334,51 +1374,6 @@ impl NarrowSearch {
         }
         path.reverse();
         path
-    }
-}
-
-fn dag_to_keyed_term(
-    e: &Engine,
-    dag: DagId,
-    keys: &mut Vec<(u32, crate::sort::SortId)>,
-) -> Term {
-    match &e.node(dag).term {
-        NodeTerm::Var { name, .. } => {
-            let key = (*name, e.sort_of(dag));
-            let slot = keys
-                .iter()
-                .position(|candidate| *candidate == key)
-                .unwrap_or_else(|| {
-                    keys.push(key);
-                    keys.len() - 1
-                });
-            Term::Var(Var {
-                index: slot as u32,
-                sort: key.1,
-            })
-        }
-        NodeTerm::Cui { symbol, args } => Term::op(
-            *symbol,
-            args.iter()
-                .map(|&child| dag_to_keyed_term(e, child, keys))
-                .collect(),
-        ),
-        NodeTerm::S { symbol, count, arg } => Term::iter(
-            *symbol,
-            count.clone(),
-            dag_to_keyed_term(e, *arg, keys),
-        ),
-        NodeTerm::Na { symbol, value } => Term::Na {
-            symbol: *symbol,
-            value: value.clone(),
-        },
-        _ => Term::op(
-            e.node(dag).symbol(),
-            e.node(dag)
-                .children()
-                .map(|child| dag_to_keyed_term(e, child, keys))
-                .collect(),
-        ),
     }
 }
 
@@ -1429,31 +1424,24 @@ fn build_goal_search(
     filtered: bool,
     delayed: bool,
 ) -> Result<(Vec<VarSpec>, PairUnifierSearch), String> {
-    let count_before_pair = env.e.rewrites();
-    let state_cache = env.e.reduction_cache_state(state);
-    let goal_cache = env.e.reduction_cache_state(goal);
     let state_sort = env.e.sort_of(state);
     let mut keys = Vec::new();
-    let goal = dag_to_keyed_term(env.e, goal, &mut keys);
+    let goal_slots = dag_to_keyed_slot_map(env.e, goal, &mut keys);
     let state_slots = dag_to_keyed_slot_map(env.e, state, &mut keys);
     let specs: Vec<_> = keys
         .iter()
         .map(|&(name, sort)| VarSpec { sort, name })
         .collect();
-    let range = env
-        .e
-        .sorts()
-        .error_sort(env.e.sorts().kind_of(state_sort));
+    let range = env.e.sorts().error_sort(env.e.sorts().kind_of(state_sort));
     let pair_symbol = env
         .e
         .add_op("$narrowing-goal-pair", vec![range, range], range);
-    let values: Vec<_> = specs
-        .iter()
-        .enumerate()
-        .map(|(slot, spec)| env.e.make_var(spec.sort, spec.name, slot as u32))
-        .collect();
-    let goal_target = env.e.instantiate_bindings(&goal, &values);
-    let state_target = env.e.remap_variable_slots(state, &state_slots);
+    let goal_target = env
+        .e
+        .remap_variable_slots_preserving_representation(goal, &goal_slots);
+    let state_target = env
+        .e
+        .remap_variable_slots_preserving_representation(state, &state_slots);
     let target = env
         .e
         .make_node(pair_symbol, vec![goal_target, state_target]);
@@ -1461,19 +1449,12 @@ fn build_goal_search(
         env,
         target,
         specs.clone(),
+        Vec::new(),
         equations,
         incoming_family,
         base,
         filtered,
         delayed,
     )?;
-    if std::env::var_os("TNK_NARROW_COUNT_TRACE").is_some() {
-        eprintln!(
-            "NCOUNT goal-pair goal={goal:?}/{goal_cache:?} rebuilt-goal={goal_target:?}/{:?} state={state:?}/{state_cache:?} mapped={state_target:?}/{:?} pair={target:?} init={}",
-            env.e.reduction_cache_state(goal_target),
-            env.e.reduction_cache_state(state_target),
-            env.e.rewrites().saturating_sub(count_before_pair),
-        );
-    }
     Ok((specs, search))
 }

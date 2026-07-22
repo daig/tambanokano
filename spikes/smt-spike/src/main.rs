@@ -19,8 +19,9 @@
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use z3::ast::{Ast, Bool, Int, Real};
-use z3::{Config, Context, SatResult, Solver};
+use std::str::FromStr;
+use z3::ast::{Bool, Int, Real};
+use z3::{SatResult, Solver};
 
 fn verdict(s: SatResult) -> &'static str {
     match s {
@@ -30,121 +31,110 @@ fn verdict(s: SatResult) -> &'static str {
     }
 }
 
-fn p1_version(ctx: &Context) {
+fn p1_version() {
     println!("== P1: z3 build sanity ==");
     // A trivial end-to-end round trip proves the brew libz3 linked and answers.
-    let s = Solver::new(ctx);
-    s.assert(&Bool::from_bool(ctx, true));
+    let s = Solver::new();
+    s.assert(&Bool::from_bool(true));
     println!("  linked libz3 answers: {}", verdict(s.check()));
 }
 
-fn p2_fixture_shapes(ctx: &Context) {
-    println!("\n== P2: fixture-shaped verdicts (expected values from smtTest.expected / manual ch.16) ==");
+fn p2_fixture_shapes() {
+    println!(
+        "\n== P2: fixture-shaped verdicts (expected values from smtTest.expected / manual ch.16) =="
+    );
     let cases: Vec<(&str, Bool, &str)> = {
-        let w = Bool::new_const(ctx, "W");
-        let x = Bool::new_const(ctx, "X");
-        let y = Bool::new_const(ctx, "Y");
-        let i = Int::new_const(ctx, "i");
-        let j = Int::new_const(ctx, "j");
-        let r = Real::new_const(ctx, "r");
+        let w = Bool::new_const("W");
+        let x = Bool::new_const("X");
+        let y = Bool::new_const("Y");
+        let i = Int::new_const("i");
+        let j = Int::new_const("j");
+        let r = Real::new_const("r");
         vec![
             // tests/Misc/smtTest.maude TEST-B shapes:
-            ("W =/== (X and Y)", w._eq(&Bool::and(ctx, &[&x, &y])).not(), "sat"),
-            ("W === (X and Y)", w._eq(&Bool::and(ctx, &[&x, &y])), "sat"),
+            ("W =/== (X and Y)", w.eq(Bool::and(&[&x, &y])).not(), "sat"),
+            ("W === (X and Y)", w.eq(Bool::and(&[&x, &y])), "sat"),
             (
                 "X=/=true, X=/=Y, Y=/=true",
-                Bool::and(
-                    ctx,
-                    &[
-                        &x._eq(&Bool::from_bool(ctx, true)).not(),
-                        &x._eq(&y).not(),
-                        &y._eq(&Bool::from_bool(ctx, true)).not(),
-                    ],
-                ),
+                Bool::and(&[
+                    &x.eq(Bool::from_bool(true)).not(),
+                    &x.eq(&y).not(),
+                    &y.eq(Bool::from_bool(true)).not(),
+                ]),
                 "unsat",
             ),
             (
                 "X=/=true, X=/=Y, Y=/=false",
-                Bool::and(
-                    ctx,
-                    &[
-                        &x._eq(&Bool::from_bool(ctx, true)).not(),
-                        &x._eq(&y).not(),
-                        &y._eq(&Bool::from_bool(ctx, false)).not(),
-                    ],
-                ),
+                Bool::and(&[
+                    &x.eq(Bool::from_bool(true)).not(),
+                    &x.eq(&y).not(),
+                    &y.eq(Bool::from_bool(false)).not(),
+                ]),
                 "sat", // X = false, Y = true satisfies; verified in smtTest.expected AND the Yices2 oracle
             ),
             // QF_LIA:
             (
                 "i > 0 and i < 0",
-                Bool::and(ctx, &[&i.gt(&Int::from_i64(ctx, 0)), &i.lt(&Int::from_i64(ctx, 0))]),
+                Bool::and(&[&i.gt(Int::from_i64(0)), &i.lt(Int::from_i64(0))]),
                 "unsat",
             ),
             (
                 "i + j > 10 and i < -5",
-                Bool::and(
-                    ctx,
-                    &[
-                        &Int::add(ctx, &[&i, &j]).gt(&Int::from_i64(ctx, 10)),
-                        &i.lt(&Int::from_i64(ctx, -5)),
-                    ],
-                ),
+                Bool::and(&[
+                    &Int::add(&[&i, &j]).gt(Int::from_i64(10)),
+                    &i.lt(Int::from_i64(-5)),
+                ]),
                 "sat",
             ),
             // QF_LRA:
             (
                 "r > 0 and 3r < 1",
-                Bool::and(
-                    ctx,
-                    &[
-                        &r.gt(&Real::from_real(ctx, 0, 1)),
-                        &Real::mul(ctx, &[&Real::from_real(ctx, 3, 1), &r])
-                            .lt(&Real::from_real(ctx, 1, 1)),
-                    ],
-                ),
+                Bool::and(&[
+                    &r.gt(Real::from_rational(0, 1)),
+                    &Real::mul(&[&Real::from_rational(3, 1), &r]).lt(Real::from_rational(1, 1)),
+                ]),
                 "sat",
             ),
         ]
     };
     let mut all_ok = true;
     for (label, formula, expected) in &cases {
-        let s = Solver::new(ctx);
+        let s = Solver::new();
         s.assert(formula);
         let got = verdict(s.check());
         let ok = got == *expected;
         all_ok &= ok;
-        println!("  {} {label}: {got} (expected {expected})", if ok { "ok " } else { "XXX" });
+        println!(
+            "  {} {label}: {got} (expected {expected})",
+            if ok { "ok " } else { "XXX" }
+        );
     }
     assert!(all_ok, "P2 verdict mismatch");
 }
 
 /// One random linear atom over the given integer variables.
-fn random_atom<'a>(ctx: &'a Context, vars: &[Int<'a>], rng: &mut SmallRng) -> Bool<'a> {
+fn random_atom(vars: &[Int], rng: &mut SmallRng) -> Bool {
     let a = rng.gen_range(-4i64..=4);
     let b = rng.gen_range(-4i64..=4);
     let c = rng.gen_range(-12i64..=12);
     let v1 = &vars[rng.gen_range(0..vars.len())];
     let v2 = &vars[rng.gen_range(0..vars.len())];
-    let lhs = Int::add(
-        ctx,
-        &[
-            &Int::mul(ctx, &[&Int::from_i64(ctx, a), v1]),
-            &Int::mul(ctx, &[&Int::from_i64(ctx, b), v2]),
-        ],
-    );
-    let rhs = Int::from_i64(ctx, c);
+    let lhs = Int::add(&[
+        &Int::mul(&[&Int::from_i64(a), v1]),
+        &Int::mul(&[&Int::from_i64(b), v2]),
+    ]);
+    let rhs = Int::from_i64(c);
     match rng.gen_range(0..4) {
         0 => lhs.gt(&rhs),
         1 => lhs.lt(&rhs),
         2 => lhs.ge(&rhs),
-        _ => lhs._eq(&rhs),
+        _ => lhs.eq(&rhs),
     }
 }
 
-fn p3_incremental_vs_fresh(ctx: &Context) {
+fn p3_incremental_vs_fresh() {
     println!("\n== P3 (the gate): incremental push/pop DFS vs fresh-solver-per-node ==");
-    let vars: Vec<Int> = (0..3).map(|k| Int::new_const(ctx, format!("x{k}"))).collect();
+    let vars: Vec<Int> = (0..3).map(|k| Int::new_const(format!("x{k}"))).collect();
     let mut nodes = 0usize;
     let mut sat_nodes = 0usize;
     for seed in 0..40u64 {
@@ -152,17 +142,16 @@ fn p3_incremental_vs_fresh(ctx: &Context) {
         // A random constraint tree: branching 2, depth 4 — one atom per edge, like the
         // accumulated path constraints of an smt-search exploration.
         let depth = 4usize;
-        let solver = Solver::new(ctx);
+        let solver = Solver::new();
         // DFS with explicit stack of (path, child index); incremental solver mirrors the path.
         let mut path: Vec<Bool> = Vec::new();
         // Recursive closure via explicit stack: at each node, verify incremental verdict ==
         // fresh verdict, then descend.
-        fn explore<'a>(
-            ctx: &'a Context,
-            solver: &Solver<'a>,
-            vars: &[Int<'a>],
+        fn explore(
+            solver: &Solver,
+            vars: &[Int],
             rng: &mut SmallRng,
-            path: &mut Vec<Bool<'a>>,
+            path: &mut Vec<Bool>,
             depth: usize,
             nodes: &mut usize,
             sat_nodes: &mut usize,
@@ -170,9 +159,9 @@ fn p3_incremental_vs_fresh(ctx: &Context) {
             // Verdict from the incremental solver state (path already asserted).
             let inc = solver.check();
             // Verdict from a fresh solver over the accumulated conjunction.
-            let fresh_solver = Solver::new(ctx);
-            for c in path.iter() {
-                fresh_solver.assert(c);
+            let fresh_solver = Solver::new();
+            for constraint in path.iter() {
+                fresh_solver.assert(constraint);
             }
             let fresh = fresh_solver.check();
             assert_eq!(
@@ -191,54 +180,66 @@ fn p3_incremental_vs_fresh(ctx: &Context) {
                 return;
             }
             for _child in 0..2 {
-                let atom = random_atom(ctx, vars, rng);
+                let atom = random_atom(vars, rng);
                 solver.push();
                 solver.assert(&atom);
                 path.push(atom);
-                explore(ctx, solver, vars, rng, path, depth - 1, nodes, sat_nodes);
+                explore(solver, vars, rng, path, depth - 1, nodes, sat_nodes);
                 path.pop();
                 solver.pop(1);
             }
         }
-        explore(ctx, &solver, &vars, &mut rng, &mut path, depth, &mut nodes, &mut sat_nodes);
-        assert_eq!(solver.get_assertions().len(), 0, "pop imbalance after tree {seed}");
+        explore(
+            &solver,
+            &vars,
+            &mut rng,
+            &mut path,
+            depth,
+            &mut nodes,
+            &mut sat_nodes,
+        );
+        assert_eq!(
+            solver.get_assertions().len(),
+            0,
+            "pop imbalance after tree {seed}"
+        );
     }
-    println!("  {nodes} nodes verified across 40 random trees ({sat_nodes} sat); zero divergences, pops balanced");
+    println!(
+        "  {nodes} nodes verified across 40 random trees ({sat_nodes} sat); zero divergences, pops balanced"
+    );
 }
 
-fn p4_value_mapping(ctx: &Context) {
+fn p4_value_mapping() {
     println!("\n== P4: Maude value-mapping edges ==");
     // Arbitrary-precision integer coefficients (Maude Integers are bignums).
     let big = "123456789012345678901234567890123456789";
-    let n = Int::from_str(ctx, big).expect("bignum literal");
-    let x = Int::new_const(ctx, "x");
-    let s = Solver::new(ctx);
+    let n = Int::from_str(big).expect("bignum literal");
+    let x = Int::new_const("x");
+    let s = Solver::new();
     s.assert(&x.gt(&n));
     assert_eq!(verdict(s.check()), "sat");
     println!("  ok  40-digit integer coefficient accepted (x > {big}... sat)");
     // Rational Real constants (Maude Real is exact rational arithmetic).
-    let third = Real::from_real(ctx, 1, 3);
-    let r = Real::new_const(ctx, "r");
-    let s = Solver::new(ctx);
-    s.assert(&Real::add(ctx, &[&r, &r, &r])._eq(&Real::from_real(ctx, 1, 1)));
-    s.assert(&r._eq(&third).not());
+    let third = Real::from_rational(1, 3);
+    let r = Real::new_const("r");
+    let s = Solver::new();
+    s.assert(Real::add(&[&r, &r, &r]).eq(Real::from_rational(1, 1)));
+    s.assert(r.eq(&third).not());
     assert_eq!(verdict(s.check()), "unsat");
     println!("  ok  exact rational semantics (r+r+r = 1 forces r = 1/3... unsat with r =/= 1/3)");
     // Int/Real mixing via toReal (smt.maude's toReal/toInteger seam).
-    let i = Int::new_const(ctx, "i");
-    let s = Solver::new(ctx);
-    s.assert(&Real::from_int(&i).gt(&Real::from_real(ctx, 1, 2)));
-    s.assert(&i.le(&Int::from_i64(ctx, 0)));
+    let i = Int::new_const("i");
+    let s = Solver::new();
+    s.assert(&Real::from_int(&i).gt(&Real::from_rational(1, 2)));
+    s.assert(&i.le(&Int::from_i64(0)));
     assert_eq!(verdict(s.check()), "unsat");
     println!("  ok  toReal coercion (real(i) > 1/2 and i <= 0... unsat)");
 }
 
 fn main() {
-    let cfg = Config::new();
-    let ctx = Context::new(&cfg);
-    p1_version(&ctx);
-    p2_fixture_shapes(&ctx);
-    p3_incremental_vs_fresh(&ctx);
-    p4_value_mapping(&ctx);
+    p1_version();
+    p2_fixture_shapes();
+    p3_incremental_vs_fresh();
+    p4_value_mapping();
     println!("\nall probes green.");
 }

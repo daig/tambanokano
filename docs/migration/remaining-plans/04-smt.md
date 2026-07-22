@@ -1,9 +1,13 @@
-# Phase T — SMT (`check`, `smt-search`) — implementation plan
+# Phase T — SMT (`check`, `smt-search`) + variant satisfiability — implementation plan
 
-Status: PLAN (no production SMT code exists; SMT id-hooks are declared-inert). D7 is **bound** by the
-T0 gate spike (`spikes/smt-spike/`, `reports/T0-smt-spike.md`): the `z3` crate is the default backend
-behind `trait SmtEngine`, feature-gated, default build stays pure-Rust. This document is the phase-T
-build plan under `subsystems-goal.md` §2 (Phase T) and the roadmap §G3.
+**Status: NEXT (2026-07-21).** No production SMT code exists: `smt.maude` and
+`model-checker.maude` load because unknown id-hooks degrade, but `check true .` is silently unparsed
+and the solver hooks remain inert. D7 is bound by the T0 gate spike (`spikes/smt-spike/`,
+`reports/T0-smt-spike.md`): `z3` 0.20.2 is the feature-gated backend behind `trait SmtEngine`; the
+default build stays pure Rust. The previously missing variant-satisfiability research package has
+now been recovered and studied (§4.7), removing the source-discovery blocker but exposing a license
+gate and substantial Maude-2.7 API drift. This is the phase-T build plan under
+`subsystems-goal.md` §2 and roadmap §G3; §8 records the bound implementation choices.
 
 This plan cites both trees: **tnk** = `crates/…`, **ref** = `~/code/maude-lang/maude/src/…`. The oracle
 is the **Yices2-enabled** rebuild (`~/.local/bin/maude`); run
@@ -55,8 +59,9 @@ There are also two **meta-level** entry points (ref `Main/prelude.maude:2977–2
 
 Role: SMT is one of the three symbolic verification subsystems (with variants/narrowing and LTL model
 checking). It sits on the kernel + free/NA theories + the search machinery; it does **not** depend on
-order-sorted unification or BDDs. Its one soft dependency is **variant satisfiability** (manual §16.6),
-a `.maude` library over variants (S2) — out of core scope here (§4.7).
+order-sorted unification or BDDs. The roadmap's **variant satisfiability** deliverable uses S2, but is
+independent of the solver core. Its external 2016 prototype is now a pinned oracle, not production
+source (§4.7).
 
 ---
 
@@ -185,9 +190,14 @@ printed by the ordinary mixfix pretty-printer over the SMT operators' `prec`/`ga
 
 ### 2.5 Module validity for SMT rewriting
 
-Ref `Mixfix/mixfixModule.cc:1603+` (`validForSMT_Rewriting`): the module must have **no equations, no
-membership axioms, at least one rule, an SMT conjunction operator, and no collapse-axiom symbols**;
-each failure issues a (stripped) warning. This gates `smt-search`.
+Ref `Mixfix/mixfixModule.cc:1603–1742` (`validForSMT_Rewriting`): the module must have **no
+equations, no membership axioms, at least one rule, an SMT conjunction operator, and no
+collapse-axiom symbols**. In addition, no non-SMT operator may have an SMT sort as its range, and
+every rule LHS must contain neither an SMT operator nor a nonlinear variable. Each failure issues a
+(stripped) warning and gates `smt-search`. The command separately rejects `=>!`/`=>#`, term
+disjunctions, and a target pattern containing an SMT operator or nonlinear variable
+(`Mixfix/search.cc:39–143`). Unsupported non-equality command-condition fragments are warned and
+skipped; a non-equality **rule** condition makes that candidate fail at runtime.
 
 ### 2.6 What is conformance-load-bearing (and what is not)
 
@@ -215,29 +225,45 @@ problem (the D6/BDD analogue) has no counterpart here. This is the single most d
   trivial `match`; `NodeTerm::Var { symbol, name, index }` (`:94`) is the genuine variable leaf the
   translation keys on (`name` is the interned base token — exactly Maude's `(sortIndex, nameId)` cache
   key). `NaValue` (`:103–115`) currently has `Str/Qid/Float`; SMT numbers need a rational value (§4.2).
-- **Bignums** (tnk `num.rs`): `Int`/`Rat` (malachite) with `to_string_base`/`from_string_base`
-  (`num.rs:166–173`) — SMT numerals cross to z3 as **string numerals** (spike P4), no i64 truncation.
-- **The search / state-graph machinery** (tnk `search.rs`): the existing `Search` is a **hash-consing
-  BFS** and is *not* directly reusable for `smt-search` (symbolic states must not collapse), but it is
-  the structural precedent — a `State` vector with parent/rule/depth links, lazy one-successor-at-a-time
-  expansion, `RootGuard` pinning, and `continue` resume. The reusable primitives are the engine's
-  one-step rewrite (`engine.state_successors`/`reduce_successor`) and goal matching (`engine.eval_goal`,
-  the `such_that` `CompiledFragment`s).
-- **The central fresh-variable generator** (tnk `fresh.rs`, landed as S1 groundwork) — the `#n`/`%n`/`@n`
-  families. `smt-search`'s `#n-Base` fresh SMT variables must come from **this** generator (roadmap risk
-  #8: one generator before a second consumer exists).
+- **Bignums** (tnk `num.rs`): `Nat`/`Int` wrap malachite integers, but there is currently **no**
+  general `Rat` node/value despite older plan prose assuming one. T1 adds a narrow canonical
+  `SmtNumber` wrapper over `malachite::Rational`; SMT numerals cross to z3 as strings (spike P4), so
+  no path truncates to `i64`.
+- **The search / state-graph machinery** (tnk `search.rs`) is a structural precedent only. Its
+  hash-consing BFS is wrong for constraint-bearing SMT states, and its existing
+  `state_successors`/`reduce_successor`/`eval_goal` helpers are also semantically wrong here: they
+  rewrite nested positions, perform equational reduction, and evaluate ordinary conditions. SMT
+  search matches **non-extension rule LHSs at the root only**, never equationally reduces states, and
+  turns equality conditions into solver clauses. T4 therefore needs a dedicated matcher/constructor
+  boundary in `engine.rs`, while reusing the underlying LHS automata, `Subst`, RHS instantiation,
+  `RootGuard`, and continuation patterns.
+- **Rule retention is a real prerequisite.** `load.rs` currently skips an ordinary `[nonexec]` rule
+  before parsing it, including `smtTest`'s load-bearing `f(I, X) => g(I + 1, Y)` whose unbound `Y`
+  must become `#1-Y`. Do **not** widen `CompiledRule` and add skip branches to every ordinary rewrite
+  path. Add a dedicated source-ordered `Signature::smt_rules` table (compiled LHS plus
+  RHS/condition/slot-sort/base-name metadata), populated for every rule in a module with SMT metadata
+  before the existing nonexec/executable split. Ordinary `rules` remains executable-only and
+  unchanged; the SMT table alone retains the extra-RHS-variable nonexec case.
+- **SMT fresh names are not a fourth symbolic family.** `fresh.rs` owns only the `#n`/`%n`/`@n`
+  family contract. A solver-independent helper in `smt.rs` builds `#<Nat>-<base>`, interns it
+  through `NameCodes`, and calls `Engine::make_var(sort, code, u32::MAX)`—the Rust sentinel
+  corresponding to C++ `VariableDagNode(..., NONE)`. Object search starts at zero and
+  `metaSmtSearch` supplies the arbitrary-precision base. This keeps the distinct C++
+  `VariableGenerator::makeFreshVariable` convention out of `FreshVariableGenerator`/`UnifyEnv`.
 - **The object-message seam / command precedent**: the **`unify` command** is the exact template for
   wiring a new symbolic command — surface parse (`surface/parser.rs:343–357`) → `Command::Unify` →
   REPL dispatch reaching into `lm.built.engine` (`repl/lib.rs:598–655`) via a builder function
   (`unify_command`) with a dedicated renderer (`render_unifier`). `check`/`smt-search` follow this shape.
-- **`load` resolution** (tnk `repl/lib.rs:792–814`, `meta_load`): resolves a name against CWD then
-  `$MAUDE_LIB` (colon-separated), with and without `.maude`. `load smt` needs `smt.maude` findable → ship
-  a byte-identical copy in tnk's lib dir (§4.5).
-- **The z3 spike** (`spikes/smt-spike/`, `reports/T0-smt-spike.md`): z3 crate 0.12 / z3-sys 0.8 against
-  brew `libz3`; build plumbing `Z3_SYS_Z3_HEADER=/opt/homebrew/include/z3.h` + `-L /opt/homebrew/lib`.
-  Every fixture-shaped verdict (P2), the incremental≡fresh gate (P3), and bignum/rational/coercion
-  mapping (P4) are green. The spike's `verdict()`, `dagToYices2`-shaped `match`, and push/pop DFS
-  transcribe directly into the production `translate.rs` and `smt-search` state machine.
+- **`load` resolution** (tnk `repl/lib.rs`, `meta_load`) resolves a name against CWD then
+  `$MAUDE_LIB`, with and without `.maude`. T1 checks in a byte-identical repository-root
+  `smt.maude`; it is found through the normal filesystem path, with no compiled-in special case
+  (§4.5).
+- **The z3 spike** (`spikes/smt-spike/`, `reports/T0-smt-spike.md`) now uses `z3` 0.20.2 /
+  `z3-sys` 0.11 against brew `libz3`. The verified build variables are
+  `Z3_SYS_Z3_HEADER=/opt/homebrew/opt/z3/include/z3.h` and
+  `Z3_LIBRARY_PATH_OVERRIDE=/opt/homebrew/opt/z3/lib`. Every fixture-shaped verdict (P2), the
+  incremental≡fresh gate (P3), and bignum/rational/coercion mapping (P4) are green. The refreshed
+  spike is the production API reference; the old lifetime-parameterized z3 0.12 calls are obsolete.
 
 ---
 
@@ -249,57 +275,59 @@ Mirror `SMT_EngineWrapper` as a narrow Rust trait (D3 "traits only at open seams
 genuinely open seam):
 
 ```rust
-pub enum SmtResult { Sat, Unsat, Unknown, BadDag }   // == Maude's SAT/UNSAT/SAT_UNKNOWN/BAD_DAG
+pub enum SmtResult { Sat, Unsat, Unknown, BadDag }
 
 pub trait SmtEngine {
     fn assert_dag(&mut self, e: &Engine, dag: DagId) -> SmtResult;
-    fn check_dag(&mut self, e: &Engine, dag: DagId) -> SmtResult;   // push/assert/check/pop
+    fn check_dag(&mut self, e: &Engine, dag: DagId) -> SmtResult; // push/assert/check/pop
     fn clear(&mut self);
     fn push(&mut self);
     fn pop(&mut self);
-    fn make_fresh_variable(&mut self, e: &mut Engine, base: DagId, n: &Int) -> DagId; // "#n-base"
 }
 ```
 
-The trait takes `&Engine` because the translation reads the tnk DAG (unlike Maude, whose `DagNode`
-carries its own `symbol()`); it needs the per-module SMT sort/op map (§4.3). `make_fresh_variable`
-delegates to `fresh.rs` and builds a `NodeTerm::Var` — it is **solver-independent** (like Maude's shared
-`variableGenerator.cc:109`), so it can live outside the feature gate.
+The trait takes `&Engine` because translation reads the tnk DAG and the signature's SMT sort/op
+table (§4.3). Fresh-DAG construction is deliberately **not** a solver operation: the pure helper
+described in §3 owns `#n-Base`, accepts a `Nat`, and uses `NameCodes` + `Engine::make_var`.
 
-**Feature gate.** The trait and all pure-Rust plumbing (SMT theory recognition, the SMT_Info analog, the
-`smt-search` state machine, command parsing/rendering, `make_fresh_variable`) live in the **default,
-pure-Rust build**. Only the concrete z3 backend (`translate.rs` DAG→`z3::ast`, and the `z3::Solver`
-wrapper) is behind a cargo feature `smt-z3` that pulls the `z3` crate. Two backends resolve at runtime
-via the trait:
-- `smt-z3` on → `Z3Engine` (real verdicts).
-- default → `NullSmtEngine`, mirroring Maude's no-solver path exactly: its constructor emits
-  `Warning: No SMT solver linked at compile time.` and `check_dag`/`assert_dag` return `Unknown`, so
-  `check` degrades to `undecided` and `smt-search` finds nothing. **This keeps even the default build
-  oracle-faithful — to a *no-solver* Maude.** (See §4.4 for why that is the right degrade target and how
-  the scoreboard handles it.)
+**Feature gate.** All pure plumbing—SMT recognition/metadata, number values, fresh naming, search
+state, and command/meta dispatch—lives in the default build. Only DAG→z3 translation and `Z3Engine`
+are behind `smt-z3`. Two implementations resolve through the trait:
+- `smt-z3` on → `Z3Engine` with real verdicts.
+- default → `NullSmtEngine`; assertions/checks return `Unknown`, so valid `check` prints
+  `undecided` and `smt-search` has no solutions. The no-solver Maude warning requires the future
+  phase-E diagnostic sink and is intentionally outside this phase's normalized output.
 
-Placement: the trait + `SmtResult` + the `smt-search` state machine belong in `tnk-core` (they need
-`Engine`/`DagId`/the rewrite primitives); the `z3` dependency and `translate.rs` sit behind
-`#[cfg(feature = "smt-z3")]`. If z3's build plumbing proves awkward to gate inside `tnk-core`, the
-alternative is a thin `tnk-smt` crate that `tnk-core` depends on only under the feature — decide at T2
-(§8). **`tnk-core` must never unconditionally depend on `z3`.**
+Placement is bound: the trait, `SmtResult`, `SmtNumber`, metadata, pure fresh helper, and search state
+machine live in `tnk-core::smt`; `tnk-core::smt::z3` and the optional `z3 = 0.20.2` dependency are
+behind `#[cfg(feature = "smt-z3")]`. `tnk-repl` exposes a same-named feature forwarding to
+`tnk-core/smt-z3`. A separate backend crate would either need the core DAG dependency injected from
+the REPL or create a cycle; there is no payoff for that split now. **`tnk-core` must never
+unconditionally depend on z3.**
+`ConfiguredSmtEngine` is a small cfg-shaped enum (`Null`, plus `Z3` when enabled) implementing the
+trait; `SmtSearch<ConfiguredSmtEngine>` owns the persistent solver. The main `Engine` does not own a
+solver, and there is no per-successor trait-object allocation.
 
-**CI.** Two lanes: (1) default `cargo test --release` (pure Rust; F1–F4; must not require `libz3`);
-(2) `cargo test --release --features smt-z3` (needs brew `libz3` + the header/link env from the spike)
-where the T* fixtures live. A `cargo build --no-default-features`/default-only lane guards against an
-accidental non-gated z3 dependency.
+
+Two lanes: (1) default `cargo test --release` without libz3; (2) a distinct
+`CARGO_TARGET_DIR=target/smt-z3` build with `--features smt-z3`, the two brew variables above, and the
+T fixture scoreboard. Separate target directories prevent a feature build from silently replacing
+the default `target/release/tnk-repl`.
 
 ### 4.2 SMT number representation
 
 SMT `Integer`/`Real` are **distinct sorts** from NAT/INT/RAT and their literals are their own NA
-constructors (Maude: `SMT_NumberDagNode` holding `mpq_class`). tnk represents NAT/INT via the S-theory
-(`NodeTerm::S { count: Nat }`) and RAT via `_/_`, which is the *wrong* model here (those sorts don't
-exist in `smt.maude`). Cleanest fit: a new `NaValue::SmtNum(Rc<Rat>)` arm (a canonical rational), with
-the **symbol's range-sort SMT type deciding printing** — INTEGER prints the numerator, REAL prints
-`num/den` (mirrors `handleSMT_Number`, ref `termPrint.cc:217–245`). Reading: wire an SMT-number grammar
-terminal (like the existing `<Floats>`/`<Strings>` token classes) so a numeral/rational token parses to
-`NaValue::SmtNum` at an SMT sort (mirrors `MAKE_SMT_NUMBER`, ref `mixfixParser.cc:914–921`;
-`mpq` canonicalised via `Rat`). The value crosses to z3 as a string numeral (spike P4).
+constructors (Maude: `SMT_NumberDagNode` holding `mpq_class`). tnk represents NAT/INT via the
+S-theory and RAT structurally via `_/_`; neither is the right scalar payload here. Add
+`NaValue::SmtNum(Rc<SmtNumber>)`, where `SmtNumber` is a private canonical
+`malachite::Rational` wrapper with decimal numerator/denominator accessors. Extend `NodeRepr`,
+hash/order/sort classification, static `Term`, and both pretty paths exhaustively.
+
+The **symbol range sort** decides rendering: INTEGER prints only the numerator; REAL always prints
+`num/den`, including denominator `1` (ref `termPrint.cc:217–245`). A dedicated SMT-number grammar
+action accepts exactly the integer/rational token classes at the appropriate constructor and
+canonicalizes once. Translation passes numerator/denominator strings to z3; it never converts
+through a machine integer or float.
 
 ### 4.3 The SMT_Info analog
 
@@ -311,53 +339,198 @@ special-op resolution — the data is already available from the `SpecialOp::Smt
 
 ### 4.4 `smt-search` fit with the search machinery
 
-`smt-search` gets its **own** state machine (in `tnk-core`, next to `search.rs`), not the hash-consing
-`Search`. It transcribes `SMT_RewriteSequenceSearch` + `SMT_RewriteSearchState`:
-- A `Vec<SmtState { term: DagId (RootGuard-pinned), constraint: DagId (pinned), avoid_var: Int,
-  parent, rule, depth }>`, walked in index order; **no hash-consing**.
-- Per-state expansion drives the `SmtEngine` incrementally: `clear`, assert the state constraint (prune
-  if UNSAT), then per rule — match the LHS, bind unbound rule vars to `make_fresh_variable`, build the
-  condition's SMT clause, `push`+`assert_dag`, prune-or-keep, `pop` on backtrack. New state term from the
-  rule RHS; new constraint = old ∧ condition.
-- Pattern matching per discovered state reuses the engine's matcher; the match-constraint sat-check and
-  `finalConstraint` follow `checkMatchConstraint` (ref `SMT_RewriteSequenceSearch.cc:269–320`).
-- **GC discipline** (roadmap risk #9): every state pins its `term` and `constraint` as roots (RootGuard),
-  plus the pattern's SMT-var dags and any `finalConstraint` — the Rust analogue of C++
-  `markReachableNodes` (ref `SMT_RewriteSequenceSearch.cc:127–146`). Same discipline the re-entrant
-  reducer and `Search` already got.
-- `continue` support mirrors `smtSearchCont` (ref `smtSearch.cc:119–134`): the REPL stores the state
-  machine between calls (as it does for `Search`).
+`smt-search` gets its **own** state machine in `tnk-core::smt`, not the hash-consing `Search`:
+- `Vec<SmtState { term, constraint, avoid_var: Nat, parent, rule, depth }>` in creation order, with
+  `RootGuard`s for both DAGs and no structural state collapse.
+- A dedicated crate-internal engine seam enumerates the source-ordered `smt_rules` table ×
+  non-extension root-match and returns the rule descriptor + substitution without running ordinary
+  conditions. A second step binds every unbound rule slot to a `#n-Base` variable, instantiates
+  equality fragments without reduction, solver-checks the clause, and only then constructs the RHS.
+  Do **not** call ordinary `state_successors`, `reduce_successor`, `eval_goal`, or `drive_match` with
+  its normal condition path.
+- Per-state expansion uses one solver incrementally: `clear`, assert the accumulated constraint,
+  then candidate `push`/assert/check/pop. One accepted rule application increments the rewrite count;
+  there are no reduction rewrites.
+- The goal is a linear, non-SMT pattern. Goal variables of SMT sorts retain their source name codes;
+  their match bindings become equality clauses checked with the state constraint. The final printed
+  constraint is accumulated-state ∧ match-constraint.
+- The command builder must pass source variable names/codes for both rules and the goal because
+  `Term::Var` stores only `(slot, sort)`. `continue` retains the search object and solver, mirroring
+  `smtSearchCont`.
+- All states, pattern-variable DAGs, pending fresh variables, and final constraints are rooted across
+  callbacks and commands.
 
 The **incremental push/pop pruning is precisely what the T0 spike P3 validated** as equivalent to a
 fresh solver per node — so this composition is sound by the gate.
 
 ### 4.5 Shipping `smt.maude`
 
-`smt.maude` is pure op-declaration data (no C++), so tnk ships a **byte-identical copy** in its lib dir
-(next to `prelude.maude`), found by `load smt` via `$MAUDE_LIB` (tnk `repl/lib.rs:792–814`). No
-special-casing; it loads through the normal module system once the SMT id-hooks resolve to
-`SpecialOp::Smt` (i.e. from T1 on, `smt.maude` loads with computing hooks rather than inert ones). Note
-`smt.maude` toggles `set include BOOL off/on` around its modules — tnk's D11 `set include BOOL` support
-(`repl/lib.rs:763`) already handles that.
+`smt.maude` is pure declarations, so T1 checks in a **byte-identical repository-root copy** of
+`Main/smt.maude`. `load smt` finds it through the existing CWD/`$MAUDE_LIB` search with no
+special-casing or compile-time embedding. The harness normally points `$MAUDE_LIB` at the oracle tree,
+so T1 also needs a smoke run with `MAUDE_LIB=$PWD` to prove the shipped copy—not merely the reference
+copy—loads. Pin its bytes/checksum in the T1 verification. Its `set include BOOL off/on` directives
+already use the D11 path.
 
-### 4.6 Meta surfaces (`metaCheck`, `metaSmtSearch`)
+### 4.6 Meta surfaces (`metaCheck`, `metaSmtSearch`) — required
 
-Ref `Main/prelude.maude:2977–2985`: `metaCheck : Module Term ~> Bool` (sat→`true`, unsat→`false`,
-malformed→stays kind-level `[Bool]`) and `metaSmtSearch : … ~> SmtResult?` returning the 4-tuple
-`{stateTerm, substitution, constraint, Nat}` (ctor `Main/prelude.maude:2303`) or `failure`
-(`:2361`); op-hooks `smtResultSymbol`/`smtFailureSymbol` (`:2742,2770`). These are `MetaLevelOpSymbol`
-descent ops, currently `MetaOp::Deferred` (tnk `symbol.rs:347`, `build_sig.rs:781`). They ride the
-existing descent machinery (down-translate module+term, run check/smt-search, up-translate the result)
-plus byte-exact `SmtResult`/`#n-Base:Sort` rendering. They are a **distinct, later stage** (T5) — see the
-scope decision in §8, because the sole reference test bundles them with the object-level commands.
+Ref `Main/prelude.maude:2977–2985`: `metaCheck : Module Term ~> Bool` maps SAT/UNSAT to meta
+`true`/`false`; `Unknown` or `BadDag` leaves the redex unreduced. `metaSmtSearch : … ~> SmtResult?`
+returns `{stateTerm, substitution, constraint, maxVariableNumber}` or `failure`. Its input fresh
+counter is a `Nat`, and the returned counter is the largest `#n-Base` number used.
 
-### 4.7 The S2 soft-dependency
+These `MetaOp` arms are mandatory T5 surface, not an optional follow-on. They reuse the existing
+down/up module/term machinery, but `metaSmtSearch` must also use the persistent solution cache:
+same/equal request reuses the result, a forward index resumes, a backward index restarts, and
+exhaustion returns `failure`. The meta goal has the same no-SMT-operator/nonlinear-variable checks as
+the object command. The one reference fixture exercises base `42`, bounded/unbounded search, result
+construction, and cache progression.
 
-**Variant satisfiability** (manual §16.6) is a Maude-level prototype (`.maude` library) built on variant
-unification. Its S2 dependency is now satisfied (21/21 variant fixtures on 2026-07-19). The core phase-T
-deliverables — the SMT theory, `check`, `smt-search`, and the meta surfaces — remain independent of S2.
-Variant satisfiability lands as a shipped `.maude` library as the T6 follow-on and remains outside the
-T1–T5 critical path.
+### 4.7 Variant satisfiability: recovered oracle, separate Rust deliverable
+
+This is **not SMT solving**. It decides quantifier-free equational formulas in the initial algebra of
+an FVP decomposition whose constructor decomposition is OS-compact. It uses variant generation and
+variant unification; it does not call z3, `check`, or `smt-search`, and does not depend on T1–T5 or M.
+
+#### 4.7.1 Recovered primary evidence
+
+The source/test tree still contains no implementation, but the manual's external prototype is no
+longer missing:
+
+- Official tool page: `https://maude.cs.illinois.edu/tools/var-sat/`.
+- Official archive: `https://maude.cs.illinois.edu/tools/var-sat/var-sat-rel3.tgz`;
+  SHA-256 `03f8f91362d90295ca9ae8497dd7dc7af3bc1d704ee7dce1679aa566983fce47`.
+- Paper: Stephen Skeirik and José Meseguer, *Metalevel Algorithms for Variant Satisfiability*,
+  DOI `10.1016/j.jlamp.2017.12.006`. The paper gives the decision procedure and its
+  FVP/OS-compactness assumptions; the archive supplies a reflective Maude implementation and examples.
+- The archive contains **1,246 lines** across the five core files `ctor-refine.maude`,
+  `ctor-var-unif.maude`, `empty-fin-sorts.maude`, `var-sat.maude`, and `vs-wf-check.maude`, plus
+  utility modules, 25 example theory files, 12 example drivers, Full Maude 2.7, and a bundled
+  x86-64 Linux Maude executable. Its README recommends Maude 2.7 Alpha 108.
+- The prototype-owned files carry **no explicit license**. The bundled Full Maude file has its own
+  GPLv2-or-later notice, which does not establish a license for the prototype files. Until the owner
+  records acceptable provenance, those files are executable/reference material only: do not copy,
+  adapt, or check them into this repository.
+
+The package is also not source-compatible with Maude 3.5.1. A live run loads enough to make
+`vswf-check(nat-acu)` reduce to `true`, but the actual `var-valid` call remains partially reduced:
+the prototype matches the old three-field `Variant` result while current `metaGetVariant` returns
+`{term, substitution, familyQid, parent, moreInLayer}`. Full Maude view syntax has also drifted, and
+the archive's nested relative loads rely on behavior tnk's current CWD/`MAUDE_LIB` loader does not
+provide. The bundled ELF therefore remains the authoritative behavior oracle and must run in an
+x86-64 Linux lane; “it loads under 3.5.1” is not an implementation shortcut.
+
+#### 4.7.2 The actual algorithm
+
+For each DNF branch `G /\ D`, where `G` contains equalities and `D` disequalities:
+
+1. Compute a complete set of **constructor unifiers** for `G`. The prototype first obtains ordinary
+   variant unifiers, then computes each result's most-general constructor instances (MGCI) by
+   disjoint unification against a constructor-sort-refined signature.
+2. Apply each constructor unifier to `D`, hygienically rename branch variables, normalize, and
+   compute the finite complete set of **constructor variants** of the resulting disequalities.
+3. Discard a branch containing a constructor disequality whose two sides are equal modulo the
+   constructor theory.
+4. Classify the remaining variables by finite versus infinite constructor sort. Enumerate the
+   finitely many canonical ground representatives for finite-sort variables, streaming the Cartesian
+   product. After each assignment, the OS-compactness theorem says a conjunction of consistent
+   disequalities over only infinite-sort variables is satisfiable.
+5. Short-circuit on the first satisfiable branch. `var-valid(M,F)` is
+   `not var-sat(M, not F)` after formula normalization.
+
+This is exactly the paper's reduction: constructor unifiers handle positive literals; constructor
+variants plus OS-compact finite-sort instantiation handle negative literals. Solver-SMT concepts and
+the z3 backend play no role.
+
+#### 4.7.3 Supported contract and prototype defects
+
+The public semantic precondition is not “any Maude module.” The input must be an FVP decomposition
+with finitary `B`-unification and an OS-compact constructor decomposition. For the theorem-5
+syntactic class, constructor axioms may be any ACCU combination except an associative-but-not-
+commutative operator, and every typing in an overloaded family must carry the same axioms.
+Membership axioms are outside the recovered implementation's domain.
+
+The prototype's `vswf-check` is only advisory. It checks (1) no associative-without-commutative
+operator and (2) constructor preregularity below the whole signature. It explicitly omits the
+constructor-freeness-modulo-`B` check, defines but never invokes another same-arguments/different-
+result check, and cannot establish the FVP assumption. Its finite-sort classifier calls
+`modelCheck`; examples with identity axioms manually pass finite and infinite sort sets. The README
+also says disjunction is unsupported even though the shipped code implements `\/` and uses it in an
+example. Source plus executable behavior, not those stale README claims, define the oracle.
+
+Production must therefore:
+
+- preserve the theorem's precondition instead of returning a plausible Boolean for a definitely
+  invalid module;
+- implement every sound syntactic eligibility check available from the built signature and distinguish
+  **rejected**, **proved by the supported syntactic class**, and **caller-preconditioned/unknown**
+  internally;
+- preserve the explicit finite/infinite-sort overloads for theories where automatic classification
+  is not justified, rejecting overlapping, unknown, or falsely finite declarations;
+- reject memberships and unsupported constructor axiom families explicitly; do not silently feed
+  them to the algorithm;
+- use no arbitrary variant bound. Termination is guaranteed by the declared FVP precondition, not by
+  truncating a search and calling the partial answer complete.
+
+#### 4.7.4 Bound implementation approach
+
+Implement a **new native Rust decision procedure with a thin source-compatible Maude facade**.
+The facade ships as repository-root `variant-satisfiability.maude`, defines `VAR-SAT-TOOL`, the
+formula sorts/operators, and the prototype's documented entry points:
+
+- `var-sat : FModule DNF -> Bool`;
+- `var-sat : FModule SortSet SortSet DNF -> Bool`;
+- `var-valid : FModule DNF -> Bool`;
+- `var-valid : FModule SortSet SortSet DNF -> Bool`;
+- `vswf-check : Module -> Bool`.
+
+There is no invented REPL command; users invoke these with ordinary `red`, normally passing
+`upModule(<name>, true)`. Formula syntax remains `==?`, `=!?`, `/\`, `\/`, and `~`.
+
+The facade's top operators carry a dedicated meta descent hook. `MetaDescent` down-translates the
+reflected module through the existing flatten/build path, converts the formula's meta-terms into that
+object engine, calls `tnk-core::variant_sat`, and returns a Bool in the outer engine. Hook arguments
+identify every formula constructor by symbol ID; the implementation must not dispatch on printed
+names. Cache entries are structural and module-generation-sensitive, following the existing
+variant/narrowing meta caches.
+
+This choice is binding for T6 because it:
+
+1. reuses the completed Rust `VariantSearch`, variant-unification, disjoint-unification, filtering,
+   sort lattice, canonical DAG, and fresh-variable machinery directly;
+2. keeps T6 independent of the unimplemented model checker and Full Maude;
+3. replaces the prototype's reflective finite-sort model-checking construction with a direct,
+   auditable graph analysis;
+4. avoids copying unlicensed source and avoids importing the obsolete Full Maude 2.7 library/runtime;
+5. avoids the archive's old variant tuple, reserved `#`/`@` sort names, and nested-loader assumptions.
+
+The prototype remains the semantic oracle. No prototype source text or utility module enters
+production. A pure-Maude reimplementation would preserve implementation rewrite counts better, but
+would duplicate the Rust symbolic engine through reflection and retain every dependency above; that
+is the wrong layer for this Rust rewrite.
+
+#### 4.7.5 Internal shape
+
+Keep the algorithm in `tnk-core` and the reflected-module adapter in `tnk-modules`:
+
+- `variant_sat` owns a query-local formula AST, constructor-signature view, eligibility result,
+  constructor variant/unifier adapters, finite-sort analysis, and the decision iterator.
+- A cached **derived constructor engine** adds private refined sorts and constructor overloads once
+  per object-module generation. Explicit ID maps translate only query terms/substitutions across
+  engines; no `DagId`, `SortId`, or `SymbolId` crosses an engine boundary untyped. The cache avoids
+  cloning a signature for every MGCI request.
+- MGCI calls the existing disjoint-unifier in that derived engine, lifts refined sorts through the
+  ID map, and composes substitutions with the ordinary variant result. Constructor unifiers and
+  constructor variants retain only the existing most-general filtered frontier.
+- Empty/finite-sort analysis runs over the constructor production graph. Empty sorts are a least
+  fixpoint. Productive dependencies form the finiteness graph; a reachable productive cycle means
+  infinite for the supported no-identity class. Finite ground terms are generated in topological
+  order, canonicalized by the object engine, and deduplicated. Identity-bearing theories use the
+  explicit override path unless a separate proof handles the collapse.
+- Finite assignments and DNF branches are iterators, not materialized powersets. The implementation
+  short-circuits on the first witness and roots every live DAG across allocation/GC.
+- Fresh variables come only from `FreshVariableGenerator`; private refinement IDs eliminate the
+  prototype's reserved-name convention.
 
 ---
 
@@ -368,32 +541,32 @@ T1–T5 critical path.
   machine can mirror Maude's `VariableGenerator` seam directly (no adaptation layer).
 - **Solver-independence — PROVEN (very low risk).** No model values are ever printed (§2.6). z3 vs
   Yices2 is byte-safe by construction. This removes the class of risk that dominated the BDD subsystem.
-- **Feature-gate discipline — the primary real risk.** The default build must compile pure-Rust, stay
-  green on F1–F4, load `smt.maude`, and parse+degrade `check`/`smt-search` without ever linking `libz3`.
-  Mitigation: isolate all z3 code behind `#[cfg(feature = "smt-z3")]` (ideally a `tnk-smt` sub-crate),
-  a `NullSmtEngine` for the default path, and a CI lane that builds default-only. Fragility is
-  organizational (a stray unconditional `use z3`), not algorithmic.
-- **Byte-exact rendering — low/medium.** Verdicts are a single token (trivial). `smt-search` constraints
-  render through the ordinary mixfix printer over the SMT ops' `prec`/`gather` — tnk's printer already
-  does prec/gather, so parenthesization matches once the SMT ops carry their `smt.maude` syntax. The two
-  additions: SMT number printing (integer numerator / real `num/den`, §4.2) and the `#n-Base` fresh-var
-  spelling (from `fresh.rs`). The **doubled "saw but saw" typo** in the BAD_DAG warning
-  (`yices2_Bindings.cc:244`) is inside a warning block the harness strips, so tnk need not reproduce the
-  typo for conformance — but should degrade a BAD_DAG `check` to *no result line* (only a stripped
-  warning), which is the observable behaviour.
-- **`undecided` mapping — low.** With z3, QF_LIA/QF_LRA/Boolean always decide; `Unknown` is reachable
-  only for genuinely undecidable input (e.g. nonlinear) or the null backend. Map z3 `Unknown` →
-  `undecided`.
-- **Unseeded fixtures — medium (effort, not correctness).** The manifest names `tests/Misc/smtTest` as
-  the seed but nothing is in `conformance/subsystems/` yet, and that **one** file bundles `check`,
-  `smt-search`, `metaCheck`, and `metaSmtSearch` (plus a deliberate `[:` no-parse at line 208 and
-  `select META-LEVEL`). Seeding means splitting it into `T*` fixtures per surface, oracle-verifying each
-  against the Yices2 build, and freezing the manifest in `subsystems-goal.md` §2 (the phase-step-0 rule).
-  The manual ch. 16 worked examples supplement it. Risk is in the split + the feature-gate/scoreboard
-  interaction (§7), not in producing the values.
-- **Module-validity warnings — low.** `validForSMT_Rewriting` (§2.5) issues warnings (stripped) and
-  gates `smt-search`; tnk must reproduce the gating behaviour (no eqs/mbs, has rules, has conjunction),
-  which is a straightforward pre-check.
+- **Feature-gate discipline — medium.** The placement and lane policy are now bound (§4.1/§7):
+  optional z3 only in `tnk-core::smt::z3`, feature forwarded by `tnk-repl`, and a separate target dir.
+  The default must still load the theory and parse/degrade both commands without linking libz3.
+- **Dedicated source-rule table + match seam — the primary structural risk.** The reference fixture
+  depends on an extra-RHS-variable `[nonexec]` rule that tnk currently skips before parsing. Populate
+  `smt_rules` without admitting that rule to ordinary `CompiledRule`; preserve flattened source order,
+  slot sorts, and source base names. Keep SMT matching root-only/non-extension/no-reduction. Reusing
+  the ordinary successor path would silently produce wrong states and counts.
+- **Byte-exact rendering — low/medium.** Verdicts are a token. Constraints use the ordinary mixfix
+  printer once `smt.maude` syntax is present. New leaves are exact SMT numbers and `#n-Base` names
+  from `smt.rs`. The doubled reference `"saw but saw"` BAD_DAG typo is in ignored diagnostics; the
+  observable contract is no result line.
+- **`undecided` mapping — low.** z3 `Unknown` and the null backend map to `undecided`; QF
+  LIA/LRA/Boolean cases should decide.
+- **Unseeded fixtures — immediate next work.** `tests/Misc/smtTest.maude` bundles all object/meta
+  surfaces and restriction failures. Split it before code. Its `[4, 0]` command is an intentional
+  parse rejection, not a `[:` token. Its `debug smt-search`/`step`/`resume` blocks belong to roadmap
+  F4 and are an enumerated T exclusion; all non-debug `metaCheck`/`metaSmtSearch` blocks are required.
+- **Validity fidelity — medium.** The gate includes the range-sort and rule-LHS restrictions omitted
+  by the earlier plan (§2.5), plus different handling for unsupported command versus rule condition
+  fragments. Seed every bottom-of-`smtTest` rejection case.
+- **Variant-satisfiability provenance/domain — medium/high.** The official archive and algorithm are
+  now pinned (§4.7), so source discovery is resolved. The prototype has no explicit license, targets
+  Maude 2.7, omits a constructor-freeness check, and assumes FVP/OS-compactness. The bound native
+  implementation avoids source reuse, but its eligibility boundary and old-oracle harness must be
+  explicit and reproducible.
 
 ---
 
@@ -401,95 +574,144 @@ T1–T5 critical path.
 
 Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 green (working-rules §4).
 
-- **T0 — spike + oracle (DONE).** z3 crate confirmed, Yices2 oracle rebuilt (`reports/T0-smt-spike.md`).
+- **T0 — spike + oracle (DONE).** z3 0.20.2 confirmed and the Yices2 oracle rebuilt
+  (`reports/T0-smt-spike.md`).
 
-- **T1 — SMT theory recognition + `smt.maude` loads.** (Pure Rust; no solver yet.)
-  1. `SpecialOp::Smt { op: SmtOp }` — new enum (the 24-op `OPERATORS` set) resolved from the `SMT_Symbol`
-     id-hook in `build_sig.rs` (mirror `attachData`'s `-`→arity split); a marker NA constructor for
-     `SMT_NumberSymbol` (`integers`/`reals`).
-  2. `NaValue::SmtNum(Rc<Rat>)` (§4.2) + the SMT-number grammar terminal + printing.
-  3. The SMT_Info analog (§4.3) built at module-build.
-  4. Ship `smt.maude` (§4.5). **Gate:** `smt.maude` loads; SMT ops recognized (not inert); a `reduce`
-     leaving an SMT term unreduced matches the oracle; F1–F4 green.
+- **T0a — fixture seeding (NEXT, before production code).** Split all non-debug SMT semantics from
+  `tests/Misc/smtTest.maude`, add manual ch. 16 and bignum/rational probes, enumerate the F4 debugger
+  exclusion, oracle-run every command, and freeze the T manifest in `subsystems-goal.md`.
 
-- **T2 — `SmtEngine` trait + z3 backend + `check` (smallest vertical slice).**
-  1. `trait SmtEngine` + `SmtResult` + `NullSmtEngine` (default) in `tnk-core`; `Z3Engine` + `translate.rs`
-     behind `smt-z3` (§4.1). Translation transcribes the spike's `dagToYices2` match into z3 asts.
-  2. `check` command: surface parse (`check` → `Command::Check`), REPL dispatch (the `unify` template) →
-     dagify, build engine, `check_dag`, print `Result from sat solver is: …` or the BAD_DAG no-result
-     path.
-  3. First fixture `T01-check-bool` (a slice of `smtTest` TEST-B). **Gate:** byte-exact under
-     `--features smt-z3`; default build parses + degrades to `undecided`.
+- **T1 — SMT theory recognition + shipped `smt.maude`.** (Pure Rust; no solver yet.)
+  1. `SpecialOp::Smt { op: SmtOp }` for the **25** C++ `OPERATORS`, including the arity-sensitive
+     `"-"` split; marker-class `SMT_NumberSymbol` constructors for integers/reals.
+  2. `NaValue::SmtNum(Rc<SmtNumber>)`, grammar actions, exact sorting/hashing, and printing (§4.2).
+  3. `Signature::smt_info` with sort types, conjunction, true, and per-kind equality symbols.
+  4. Check in and pin `smt.maude`. **Gate:** shipped-copy load smoke; all hooks recognized but
+     intentionally reduction-inert; SMT leaf parse/print and ordinary `reduce` match the oracle;
+     default F1–F4 green.
 
-- **T3 — full `check` conformance.** TEST-B / TEST-I / TEST-R / TEST-RI from `smtTest` → `T*` fixtures;
-  the BAD_DAG path; bignum coefficient + exact-rational + `toReal` coercion cases (spike P4). Manual
-  ch. 16 `check` examples.
+- **T2 — `SmtEngine` + z3 backend + `check`.**
+  1. Pure trait/`SmtResult`/`NullSmtEngine`; cfg-gated `Z3Engine` and DAG translator in
+     `tnk-core::smt`; workspace feature forwarding.
+  2. Parse/dispatch/render `check` without equationally reducing its subject. BAD_DAG emits no result;
+     null emits `undecided`.
+  3. **Gate:** T01 Boolean byte-exact in the z3 lane; default command parses and degrades; both builds.
 
-- **T4 — `smt-search`.** The `SMT_RewriteSequenceSearch` state machine (§4.4): per-state incremental
-  rewrite + fresh SMT vars + condition→clause + prune, pattern match + match-constraint sat-check,
-  accumulated constraint, `Solution`/`state:`/subst/`where` rendering, `continue`. The
-  `validForSMT_Rewriting` gate (§2.5). Fixtures: the `smtTest` `smt-search` blocks (MULTI/ITEST — solution
-  order/counts, `#n-Base` names, constraint parenthesization all load-bearing).
+- **T3 — full `check` conformance.** TEST-B/I/R/RI, BAD_DAG, bignum coefficients, exact rationals,
+  mixed coercions, and manual examples.
 
-- **T5 — meta surfaces (scope decision, §8).** `metaCheck`/`metaSmtSearch`: map the `MetaOp` codes,
-  down/up translation, `SmtResult`/`failure` + `'#n-Base:Sort` rendering. Fixtures: the meta blocks of
-  `smtTest`.
+- **T4 — `smt-search`.** Add the dedicated source-ordered `smt_rules` descriptor table for all rules
+  in SMT-aware modules, including nonexec/extra-RHS-variable rules, while leaving ordinary
+  `CompiledRule` executable-only. Add the root/non-extension/no-reduction candidate seam, then the
+  incremental state machine, rule/command constraint construction, goal match constraints,
+  counters/rendering, restriction gate, and `continue`. **Gate:** all object search and rejection
+  fixtures, exact order/counts/`#n-Base`/parentheses, plus default Null degradation.
 
-- **T6 — variant satisfiability (deferred, post-S2).** Ship the `.maude` library once S2 exists (§4.7).
+- **T5 — mandatory meta surfaces.** Implement `metaCheck` and cached `metaSmtSearch`, including input
+  and returned fresh counters, bounded/unbounded search, `SmtResult`/`failure`, and equal/forward/
+  backward cache requests. **Gate:** every non-debug meta block from `smtTest`.
+
+- **T6 — native variant-satisfiability + Maude facade (independent of T1–T5/M).**
+  1. **T6a — provenance + executable oracle.** Pin the official URL/checksum above. In an x86-64
+     Linux sandbox, run the untouched archive with its bundled interpreter from the documented
+     working directory; freeze version, every command from the 12 example drivers, exit status, and
+     result value/sort. Record that no prototype license was found. Do not vendor the archive.
+  2. **T6b — contract fixtures before code.** Write independent minimal fixtures, not copies of the
+     package examples: free equality-only sat/unsat; finite and infinite disequalities; mixed
+     positive/negative literals; multiple constructor unifiers; disjunction and validity; overloaded
+     constructor typings; AC, C, ACU, and one-sided-identity cases with explicit sort overrides;
+     empty sort; no ground assignment; definitely invalid A-without-C, memberships, inconsistent
+     constructor family axioms, and constructor-preregularity cases. Add helper-oracle probes for
+     MGCI, constructor variants, constructor unifiers, finite sorts, and canonical representatives.
+  3. **T6c — eligibility + constructor view.** Extract constructor declarations/axioms from the built
+     signature; implement the prototype-compatible `vswf-check` result plus the richer internal
+     eligibility classification. Build and generation-cache the derived refined constructor engine,
+     with typed sort/symbol/DAG/substitution translation maps and collision-free private IDs.
+     **Gate:** all rejection fixtures and constructor-refinement unit contracts.
+  4. **T6d — constructor variants and unifiers.** Adapt `VariantSearch`,
+     variant-unification, `meta`-equivalent disjoint unification, substitution composition, and
+     `filter::subsumes` to implement MGCI, constructor variants, and constructor unifiers. Preserve
+     deterministic family/solution order and root every cross-search DAG. **Gate:** helper fixtures
+     match the pinned oracle on sets/order after the declared old-version normalization.
+  5. **T6e — empty/finite sorts and representatives.** Implement the productive-constructor
+     fixpoints/SCC analysis, canonical finite-term enumeration, and validated finite/infinite
+     overrides. Unit cases cover empty sorts, singleton and multi-element finite sorts, subsorts,
+     productive recursion, dead recursion, AC canonical deduplication, and identity override errors.
+     **Gate:** no model-checker dependency and no materialized Cartesian product.
+  6. **T6f — formula decision procedure.** Down-translate and validate formula literals, lazily
+     normalize Boolean structure into DNF branches, solve positives with constructor unifiers,
+     apply/rename/normalize negatives, enumerate constructor variants and finite assignments, test
+     remaining disequalities, and implement validity by negation. Preserve short-circuit order and
+     query-local state; no hidden bound or solver call.
+  7. **T6g — facade + differential lane.** Ship one flat
+     `variant-satisfiability.maude` defining `VAR-SAT-TOOL` and its hook contract; add the `MetaOp`,
+     hook resolution, `MetaDescent` adapter/cache, and root-level load smoke. Extend the harness with
+     side-specific silent prefixes: the oracle side loads the pinned package, while tnk loads the
+     shipped facade, then both evaluate the same fixture body. **Gate:** all T6 values, result sorts,
+     termination, helper sets, and declared ordering match; default `cargo build/test --release`
+     remains independent of z3, Full Maude, model checking, and the downloaded archive.
 
 ---
 
 ## 7. Verification
 
-- **Fixture seeding.** Split `tests/Misc/smtTest.maude` into `conformance/subsystems/T*.maude` per
-  surface (`T01…` check-Boolean, `T02…` check-Integer, `T03…` check-Real, `T04…` check-RealInteger,
-  `T05…` smt-search-object, and — if in scope — `T06…` metaCheck, `T07…` metaSmtSearch), plus manual
-  ch. 16 probes and a fresh minimal probe. Oracle-verify **each** against the Yices2 build at authoring;
-  freeze the `T*` manifest by appending it to `subsystems-goal.md` §2 in the same commit as the fixtures
-  (phase-step-0 rule). Every fixture is expected to FAIL until its stage lands.
-- **Harness.** `tools/subsystems-scoreboard.sh` / `diffmaude.sh` against the Yices2 oracle, same
-  normalization (strips `====`, banner, `Bye.`, timing tails, **and warning blocks** — so BAD_DAG checks
-  and the module-validity/no-solver warnings normalize out).
-- **Feature-gate/scoreboard interaction (the key policy).** T* fixtures assert real verdicts, so they
-  pass only in the `smt-z3` build; the default (Null) build degrades to `undecided`/no-solution and
-  would diff. Recommendation: the T* fixtures are a **z3-lane-only** addition — the SUBSYSTEMS
-  denominator grows in a `--features smt-z3` scoreboard run; the default lane runs F1–F4 (pure Rust) and
-  does not include the T* verdicts (it only proves `smt.maude` loads and the commands parse/degrade).
-  This keeps both lanes oracle-faithful: default ≡ no-solver Maude on SMT surfaces (un-fixtured), z3 lane
-  ≡ Yices2 Maude (fixtured). The exact scoreboard mechanism (a `requires: smt-z3` fixture tag vs a
-  separate lane invocation) is an open call (§8).
-- **Unit tests.** `translate.rs` round-trips reproducing the spike P2/P4 shapes as tnk-DAG→z3; push/pop
-  balance after a search tree (spike P3); `make_fresh_variable` naming (`#n-Base`); SMT-number
-  parse/print.
-- **Pure-Rust-default-green requirement (F-invariant).** A CI job runs `cargo build`/`cargo test`
-  **without** `smt-z3` and must be green without `libz3` present.
+- **Fixture seeding.** Split `tests/Misc/smtTest.maude` into `T01…` check-Boolean, `T02…`
+  check-Integer, `T03…` check-Real, `T04…` check-RealInteger, `T05…` object search/restrictions,
+  `T06…` metaCheck, and `T07…` metaSmtSearch, plus manual/fresh probes. T06/T07 are mandatory.
+  Enumerate only the debugger block as an F4-owned exclusion. Oracle-verify each command against the
+  Yices2 build before freezing the manifest.
+- **Harness.** The z3 lane uses the existing `TNK_BIN` override—no fixture tags and no silent skips:
+  `CARGO_TARGET_DIR=target/smt-z3 cargo build --release -p tnk-repl --features smt-z3` with
+  `Z3_SYS_Z3_HEADER=/opt/homebrew/opt/z3/include/z3.h` and
+  `Z3_LIBRARY_PATH_OVERRIDE=/opt/homebrew/opt/z3/lib`, then
+  `TNK_BIN=target/smt-z3/release/tnk-repl tools/subsystems-scoreboard.sh -p T`.
+  An aggregate subsystem run may use that superset binary. The default lane never asserts solver
+  verdict fixtures; it runs F1–F4 plus dedicated parse/load/degrade smoke tests.
+- **Normalization.** Existing diagnostic stripping applies. BAD_DAG and restriction warnings may
+  differ until phase E, but absence/presence of command echoes, verdicts, solutions, counts,
+  substitutions, states, and constraints remains byte-exact.
+- **Unit contracts.** DAG→z3 translation for every `SmtOp`; exact number parse/print; variable cache
+  key `(sort,name)`; `#n-Base` naming with bignum counters and `u32::MAX` non-slot index;
+  retained-nonexec isolation; root-only rewrite; unsupported condition handling; balanced push/pop;
+  cache forward/equal/backward/exhausted.
+- **T6 oracle contract.** The 2016 executable is a semantic oracle, not a Maude-3.5 byte oracle:
+  require exact Bool value, result sort, termination, canonical helper sets, and documented
+  enumeration order. A native hook cannot reproduce the prototype's thousands of Maude-level
+  rewrites; keep global normalization unchanged and record a narrow T6-only accepted difference for
+  rewrite counts and old-version command wrapping. Never weaken the U/V/N/T1–T5 count contract.
+- **T6 stress contracts.** Stream finite assignments and disjunction branches; prove bounded live
+  roots on a large finite product with an early witness, no stale cache after module replacement,
+  deterministic repeat output, and no z3/model-checker/Full-Maude linkage.
+- **Pure-Rust invariant.** `cargo build --release` and `cargo test --release` without `smt-z3` remain
+  green on a machine with no libz3.
+- **Shipped copy.** Smoke `load smt` with `MAUDE_LIB=$PWD` and verify the checked-in file bytes against
+  the pinned reference copy.
 
 ---
 
-## 8. Open questions / decisions
+## 8. Bound decisions and remaining prerequisite
 
-1. **`SmtEngine` trait shape & placement.** The §4.1 signature (does `check_dag` take `&Engine`; does
-   `make_fresh_variable` live inside or outside the gate) and whether the z3 backend is a
-   `#[cfg]` submodule of `tnk-core` or a separate `tnk-smt` crate `tnk-core` pulls only under the
-   feature. Recommend: submodule first, promote to a crate only if z3's build plumbing forces it.
-2. **Default-build degrade behaviour.** Mirror Maude's no-solver path exactly (emit
-   `Warning: No SMT solver linked at compile time.` + `undecided`) so the default build is faithful to a
-   no-solver Maude — recommended — vs a tnk-specific message. (Warning text is stripped by the harness
-   either way; the recommendation matters only for interactive parity.)
-3. **Scoreboard treatment of z3-gated fixtures.** A per-fixture `requires: smt-z3` tag the scoreboard
-   skips in the default lane, vs a separate `--features smt-z3` scoreboard invocation whose denominator
-   is disjoint from the default one. Either keeps F1–F4 pure-Rust; pick one and record it in the working
-   rules.
-4. **Meta-surface scope (T5).** `metaCheck`/`metaSmtSearch` are bundled into the one reference SMT test,
-   so **full byte-exact conformance on `smtTest` requires them**. Decide whether phase-T's
-   definition-of-done is (a) the object-level commands + `smt.maude` loading (meta surfaces split into
-   separately-gated fixtures, landed at T5), or (b) the whole `smtTest` file byte-exact (T5 mandatory).
-   `subsystems-goal.md` §2 phrasing ("`smt.maude` loads; its `SMT_Symbol` hooks compute … byte-exact
-   including … `sat`/`unsat` rendering") reads as the object-level commands; the meta descent functions
-   are a reasonable T5 follow-on — but this is a user call.
-5. **SMT number representation.** `NaValue::SmtNum(Rc<Rat>)` (recommended) vs a dedicated node; plus the
-   const-disambiguation fidelity (`(1).Integer` under `PRINT_DISAMBIG_CONST` / overloaded-integer cases,
-   ref `termPrint.cc:236`) — likely negligible for the fixtures but noted.
-6. **`smt.maude` shipping.** A filesystem copy on the tnk `$MAUDE_LIB` (recommended, no special-casing)
-   vs bundling it compiled-in like the prelude. The copy must stay byte-identical to
-   `Main/smt.maude` (a checked-in-copy drift risk — pin it).
+1. **Trait/placement — bound.** Solver operations only; fresh naming stays pure. The z3 backend is a
+   cfg-gated `tnk-core` submodule and `tnk-repl` forwards the feature.
+2. **Default degradation — bound.** Match the no-solver result semantics (`undecided` for valid
+   `check`, no solutions for SMT search). Warning text waits for the single phase-E diagnostic sink
+   instead of adding a one-off warning channel; diagnostics are outside the current byte contract.
+3. **Scoreboard — bound.** Separate `target/smt-z3` binary selected through existing `TNK_BIN`;
+   `-p T` is the z3-only denominator. No per-fixture skip metadata.
+4. **Meta scope — bound.** T5 is required. “Full SMT semantics from `smtTest`” excludes only its
+   debugger-owned F4 block, not `metaCheck`/`metaSmtSearch`.
+5. **Number representation — bound.** `NaValue::SmtNum(Rc<SmtNumber>)`, not a new DAG variant and not
+   the structural RAT representation. Preserve explicit INTEGER/REAL constant disambiguation.
+6. **`smt.maude` shipping — bound.** Byte-identical filesystem copy at repository root, normal
+   CWD/`$MAUDE_LIB` loading, no compiled-in special case.
+7. **Variant-satisfiability source — resolved.** The official `var-sat-rel3.tgz` archive and paper
+   are pinned in §4.7. The archive is an old executable oracle, not a file from the Maude 3.5 tree.
+8. **Variant-satisfiability implementation — bound.** New native Rust core plus a thin
+   `VAR-SAT-TOOL` Maude facade; no new REPL command and no prototype source reuse. T6 is independent
+   of z3, T1–T5, M, and Full Maude.
+9. **Variant-satisfiability provenance — bound conservatively.** No explicit license was found for
+   the prototype-owned files. Do not vendor or adapt them unless the owner separately records
+   acceptable provenance. Published algorithm + observed behavior are the implementation inputs.
+10. **Variant-satisfiability parity — bound.** Exact semantic values/sorts/sets/order; a narrow,
+    explicit accepted difference for native-vs-reflective rewrite counts and Maude-2.7 wrapping.
+    Global harness normalization remains strict.

@@ -6,17 +6,15 @@ state-transition system is searched for an accepting cycle by nested DFS, and a
 **counterexample lasso** (lead-in prefix + cycle) is returned. Plus the sibling LTL
 satisfiability/tautology solver (`satSolve`/`tautCheck`).
 
-**Status when this plan was written.** No temporal / model-checking code exists in tnk.
-`modelCheck`/`satSolve`/`counterexample`/`Büchi` appear nowhere in the tree except one
-comment naming `SatSolverSymbol` at
-`crates/tnk-frontend/src/sig/build_sig.rs:716`. The `MODEL-CHECKER` prelude's two
-`special` operators are currently **declared-inert**: their id-hooks fall through the
-graceful-degrade arm `_other => return Ok(None)` at `build_sig.rs:720`, so
-`model-checker.maude` *loads* but `modelCheck(...)` never reduces. This subsystem is
-**independent of phase S (symbolic) and phase T (SMT)** (subsystems-goal §2, line 156:
-"independent of S and T; may interleave with T") and can proceed in parallel.
+**Status: PLANNED (2026-07-21); sequence after phase T unless run as an independent parallel
+track.** No temporal/model-checking production code or frozen `M*` manifest exists. The
+`MODEL-CHECKER` prelude's two special operators remain declared-inert: unknown id-hooks fall through
+`build_sig.rs`'s graceful-degrade arm, so `load model-checker` succeeds but
+`reduce in SAT-SOLVER : satSolve(True) .` returns the unreduced term and `modelCheck(...)` likewise
+cannot compute. Stage M0 fixture seeding is therefore the first change. M is independent of S and T
+(`subsystems-goal.md` §2), but T is the selected next serial phase.
 
-**Pass criterion (the hard part).** subsystems-goal §2 (lines 158–160): counterexample
+**Pass criterion (the hard part).** Per `subsystems-goal.md` §2, counterexample
 output must be **byte-exact** to the reference — *"paths are deterministic; they are the
 pass criterion, not just the verdict."* This elevates the README's "(where it matters)
 byte-for-byte output" to a hard requirement for phase M. A logically-correct but
@@ -620,39 +618,24 @@ oracle that catches "wrong-but-plausible" lassos distinct from the byte diff. (M
 
 ---
 
-## 8. Open questions / decisions
+## 8. Bound constraints and early gates
 
-1. **LTL→Büchi algorithm choice.** Recommendation: **port Gastin–Oddoux exactly** (VWAA →
-   GBA → degeneralized Büchi, + Somenzi–Bloem SCC opt), as the roadmap G4 specifies and the
-   reference implements. Rationale: byte-exact counterexamples require the *same* automaton
-   the reference builds; an alternative construction (e.g. LTL2BA/ltl3ba/Spot-style) would
-   produce different (valid) lassos and fail conformance. This is not really open — it is
-   forced by the pass criterion — but worth recording as a ratified constraint: **the
-   algorithm is part of the spec, not an implementation choice.**
-2. **BDD canonicity ⇒ automaton determinism.** The plan asserts (§4.3 #3) that a canonical
-   ROBDD facade with variable-order = proposition-index-order reproduces Maude's automaton
-   regardless of library, because no ordering-sensitive container is keyed by BDD identity.
-   This should be **empirically confirmed early** via the intermediate-`dump()` diff on a
-   formula battery before committing to the full port. If it fails, fall back to BuDDy-FFI
-   (D6 keeps it as a recorded escape hatch) — but this is not expected.
-3. **`satSolve` prime-implicant rendering fidelity.** BuDDy's `extractPrimeImplicant` output
-   order/polarity must be reproduced by biodivine's clause/valuation extraction to make
-   `model(...)` byte-exact. This is the least-certain sub-target. **Decision to record:**
-   sequence `satSolve`/`tautCheck` *after* `modelCheck` (Stage M7), and if the prime-
-   implicant match proves fiddly, seed its fixtures but let that sub-metric lag `modelCheck`
-   (the primary G4 deliverable) rather than block it.
-4. **The multi-rule arc-label edge case (§4.3 #1).** When one target state is reached by two
-   differently-labeled rules, Maude prints the pointer-first rule's label; tnk prints the
-   min-id rule's label. Confirm these agree on the seeded fixtures; if a manual example
-   exercises it and diverges, decide whether to match Maude's pointer order explicitly.
-   (Low priority — no seeded fixture is known to hit it.)
-5. **`Search` refactor scope (§6.4).** Confirm the extract-shared-`StateGraph` refactor is
-   acceptable now (recommended: yes — it prevents a drifting second copy of successor
-   generation and is regression-guarded by the existing `search` fixtures) versus a
-   standalone graph for the checker.
-6. **The `LTL-SIMPLIFIER` interaction.** It is optional prelude equations; when a user
-   includes it, the formula reduces to a smaller NNF and the automaton (and possibly the
-   lasso) changes. Since it is pure order-sorted reduction that tnk already does
-   byte-exactly, no model-checker-specific work is needed — but fixtures should include at
-   least one `including LTL-SIMPLIFIER` case to confirm the reduced formula feeds the
-   pipeline identically.
+1. **LTL→Büchi algorithm — bound.** Port the reference Gastin–Oddoux pipeline exactly (VWAA → GBA →
+   degeneralized Büchi, plus the Somenzi–Bloem SCC optimization). Byte-exact counterexamples make the
+   automaton and traversal order part of the spec; an alternative valid construction is not conformant.
+2. **BDD backend gate.** Before the full port, diff intermediate automaton dumps for a formula battery
+   using proposition-index variable order. If `biodivine-lib-bdd` does not reproduce the reference
+   structure/order through the facade, use D6's recorded BuDDy-FFI escape hatch. Do not discover this
+   only at final lasso rendering.
+3. **`satSolve`/`tautCheck` ordering — bound.** Implement after `modelCheck` (M7), but it may not lag the
+   completed M denominator. Its BuDDy prime-implicant polarity/order is a byte-visible contract; seed
+   it separately and finish exact `model(...)` rendering before phase M closes.
+4. **Multi-rule arc labels.** Seed the two-rules/one-target case in M0. If tnk's current min-rule-id
+   representative differs from the live oracle, preserve the reference's actual insertion/selection
+   order in the shared graph; a different but logically valid label is not acceptable output.
+5. **Shared `StateGraph` refactor — bound yes.** Extract successor generation from the already
+   conformance-verified `Search`; do not build a second rewrite graph for the checker. Existing search
+   fixtures guard the mechanical refactor, and M0 adds deadlock/self-loop coverage.
+6. **`LTL-SIMPLIFIER`.** No checker-specific implementation: ordinary reduction already handles its
+   equations. Include at least one M0 fixture proving the reduced formula enters the identical
+   automaton/checker pipeline.

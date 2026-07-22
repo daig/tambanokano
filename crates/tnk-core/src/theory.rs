@@ -27,6 +27,7 @@ use crate::engine::{Runtime, Signature};
 use crate::s::{SLhs, SSubproblem};
 use crate::symbol::Theory;
 use crate::term::{Subst, Term};
+use std::collections::HashSet;
 
 /// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); this slice has
 /// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
@@ -53,10 +54,24 @@ pub(crate) enum LhsAutomaton {
 }
 
 impl LhsAutomaton {
-    /// Compile a pattern `lhs` into an automaton for its theory, chosen from the top symbol's theory.
+    /// Compile a pattern with no enclosing condition-variable conflicts.
     pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
+        Self::compile_avoiding_nonlinear_vars(lhs, sig, &HashSet::new())
+    }
+
+    /// Compile a statement pattern while preventing ACU's sole repeated-variable special case for
+    /// variables used by the statement condition. All other theories ignore `condition_variables`.
+    pub(crate) fn compile_avoiding_nonlinear_vars(
+        lhs: Term,
+        sig: &Signature,
+        condition_variables: &HashSet<u32>,
+    ) -> Self {
         match lhs.top_symbol().map(|s| sig.symbol(s).theory()) {
-            Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile(lhs, sig)),
+            Some(Theory::Acu) => LhsAutomaton::Acu(AcuLhs::compile_avoiding_nonlinear_vars(
+                lhs,
+                sig,
+                condition_variables,
+            )),
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
             Some(Theory::S) => LhsAutomaton::S(SLhs::compile(lhs, sig)),

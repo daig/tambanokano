@@ -797,7 +797,7 @@ fn special_op(
 }
 
 /// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. Reflection and symbolic
-/// variant functions have dedicated variants; narrowing, SMT, and strategy descent map to
+/// variant/narrowing functions have dedicated variants; SMT and strategy descent map to
 /// [`MetaOp::Deferred`] (declared, inert — Phase 3.3+).
 fn meta_op(code: &str) -> MetaOp {
     match code {
@@ -907,7 +907,12 @@ fn meta_op(code: &str) -> MetaOp {
             legacy: true,
         },
         "metaVariantMatch" => MetaOp::VariantMatch,
-        // Remaining symbolic (narrowing), SMT, strategy, and legacy descent — Phase 3.3+.
+        "metaNarrow" => MetaOp::Narrow { state_only: false },
+        "metaNarrow2" => MetaOp::Narrow { state_only: true },
+        "metaNarrowingApply" => MetaOp::NarrowingApply,
+        "metaNarrowingSearch" => MetaOp::NarrowingSearch { path: false },
+        "metaNarrowingSearchPath" => MetaOp::NarrowingSearch { path: true },
+        // Remaining symbolic (SMT and strategy) descent — Phase 3.3+.
         _ => MetaOp::Deferred,
     }
 }

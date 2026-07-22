@@ -110,12 +110,15 @@ constants via `SMT_NumberSymbol/Term/DagNode`; sort↔type mapping in `SMT_Info`
 (`SMT_RewriteSequenceSearch.hh`) accumulates a per-state `constraint` dag and a `MatchSearchState`,
 calling `engine->checkDag` to prune infeasible states.
 
-**Rust migration** — ADAPT. Keep the `trait SmtEngine { fn assert/check/push/pop/fresh_var }` seam —
-it is already idiomatic. For the backend, prefer the **`z3` crate** (well-supported Rust bindings) as
-the default rather than CVC4/Yices2, with the trait allowing alternatives; do NOT hardwire one solver
-at build time — make it a runtime/feature choice. *Rationale: Z3 has the best Rust story and matches
-the SMT-LIB theories used.* The DagNode→solver translation is a straightforward recursive `match` on
-the term enum. Variant satisfiability stays a `.maude` library on top of variant unification.
+**Rust migration** — ADAPT. D7 is now bound: keep a narrow
+`trait SmtEngine { assert_dag/check_dag/clear/push/pop }` in core, with the concrete `z3` 0.20.2
+translator/backend behind `smt-z3`; the default selects a pure-Rust null backend. Fresh
+`#n-Base` DAGs are engine-owned, not a solver method. The DAG→solver translation is a recursive
+match plus exact bignum/rational string conversion. Variant satisfiability remains a separate
+deliverable over variant unification. The official 2016 Maude-2.7 prototype is now recovered and
+checksum-pinned as an executable oracle; because its source has no explicit license and its reflective
+dependencies/API are obsolete, phase T6 implements a new native Rust decision procedure behind a
+compatible `VAR-SAT-TOOL` facade rather than copying it.
 
 ---
 

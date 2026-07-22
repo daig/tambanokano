@@ -6,8 +6,8 @@
 //! flatten+build pipeline), down-translate the subject meta-term into that module, run the engine
 //! operation, and **up**-translate the result back into the meta-level engine (via `ctx`).
 //!
-//! Scope (Stages 1–5 — the whole META-LEVEL surface): base unification and folding-variant descent are
-//! implemented; narrowing, SMT, and strategy descent remain deferred until their backends land.
+//! Scope (Stages 1–5 — the whole META-LEVEL surface): base unification, folding-variant descent, and
+//! narrowing descent are implemented; SMT and strategy descent remain deferred until their backends land.
 //!
 //! * **The rewriting/matching/search family** (Stage 3) computes over a down-translated object module —
 //!   `metaReduce`/`metaNormalize` (→ `ResultPair`), `metaRewrite`/`metaFrewrite` (rule-/position-fair),
@@ -31,10 +31,10 @@
 //!   and `metaWellFormed{Module,Term,Substitution}` (structural checks → `Bool`).
 //!
 //! Every implemented descent function conforms on **value, sort, rewrite count, *and* layout** (Stage 3.5
-//! taught `print_pretty` the `format` attribute). Base unification and the current/legacy variant families
-//! have dedicated `MetaOp` variants; narrowing, **SMT**, and **strategy-meta** descent remain in
-//! `MetaOp::Deferred`. Those deferred operations parse and load but reduce to the kind level; exhaustive
-//! dispatch still forces an explicit choice whenever a new descent operation is added. The strategy
+//! taught `print_pretty` the `format` attribute). Base unification, variants, and narrowing have dedicated
+//! `MetaOp` variants; **SMT** and **strategy-meta** descent remain in `MetaOp::Deferred`. Those deferred
+//! operations parse and load but reduce to the kind level; exhaustive dispatch still forces an explicit
+//! choice whenever a new descent operation is added. The strategy
 //! *language* itself
 //! (`srewrite`/`dsrewrite`, the full
 //! combinator + matchrew + conditional-rule surface) is **complete and conformant** in `tnk-frontend::strategy`
@@ -78,18 +78,18 @@ use crate::db::ModuleDb;
 use crate::flatten::{flatten, flatten_pre};
 use crate::view::ViewDb;
 
-const META_VARIANT_CACHE_CAPACITY: usize = 4;
+const META_CACHE_CAPACITY: usize = 4;
 
 #[derive(Default)]
 pub struct MetaState {
-    variant_caches: Vec<MetaVariantCache>,
+    caches: Vec<MetaCache>,
 }
 
 impl MetaState {
     /// Drop cached descent states before the REPL replaces the outer module engine that owns their
     /// structurally keyed meta-term DAGs.
     pub fn clear(&mut self) {
-        self.variant_caches.clear();
+        self.caches.clear();
     }
 
     fn take_get_variant(
@@ -98,10 +98,10 @@ impl MetaState {
         ctx: &MetaCtx,
         requested: usize,
     ) -> Option<MetaGetVariantCache> {
-        let index = self.variant_caches.iter().position(
-            |entry| matches!(entry, MetaVariantCache::Get(cache) if cache.key.matches(key, ctx)),
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::Get(cache) if cache.key.matches(key, ctx)),
         )?;
-        let MetaVariantCache::Get(cache) = self.variant_caches.remove(index) else {
+        let MetaCache::Get(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
         (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
@@ -113,26 +113,184 @@ impl MetaState {
         ctx: &MetaCtx,
         requested: usize,
     ) -> Option<MetaVariantUnifyCache> {
-        let index = self.variant_caches.iter().position(
-            |entry| matches!(entry, MetaVariantCache::Unify(cache) if cache.key.matches(key, ctx)),
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::Unify(cache) if cache.key.matches(key, ctx)),
         )?;
-        let MetaVariantCache::Unify(cache) = self.variant_caches.remove(index) else {
+        let MetaCache::Unify(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
         (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
     }
 
-    fn insert(&mut self, cache: MetaVariantCache) {
-        if self.variant_caches.len() == META_VARIANT_CACHE_CAPACITY {
-            self.variant_caches.remove(0);
+    fn take_narrow_apply(
+        &mut self,
+        key: &MetaNarrowApplyCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaNarrowApplyCache> {
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::NarrowApply(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaCache::NarrowApply(cache) = self.caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+    }
+
+    fn take_narrow_search(
+        &mut self,
+        key: &MetaNarrowSearchCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaNarrowSearchCache> {
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::NarrowSearch(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaCache::NarrowSearch(cache) = self.caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+    }
+
+    fn take_legacy_narrow(
+        &mut self,
+        key: &MetaLegacyNarrowCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaLegacyNarrowCache> {
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::LegacyNarrow(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaCache::LegacyNarrow(cache) = self.caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+    }
+
+    fn insert(&mut self, cache: MetaCache) {
+        if self.caches.len() == META_CACHE_CAPACITY {
+            self.caches.remove(0);
         }
-        self.variant_caches.push(cache);
+        self.caches.push(cache);
     }
 }
 
-enum MetaVariantCache {
+enum MetaCache {
     Get(MetaGetVariantCache),
     Unify(MetaVariantUnifyCache),
+    NarrowApply(MetaNarrowApplyCache),
+    NarrowSearch(MetaNarrowSearchCache),
+    LegacyNarrow(MetaLegacyNarrowCache),
+}
+
+#[derive(Clone)]
+struct MetaNarrowApplyCacheKey {
+    module: DagId,
+    roots: Vec<DagId>,
+    family: tnk_core::fresh::VariableFamily,
+    filtered: bool,
+    delayed: bool,
+}
+
+impl MetaNarrowApplyCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.family == other.family
+            && self.filtered == other.filtered
+            && self.delayed == other.delayed
+            && ctx.deep_equal(self.module, other.module)
+            && self.roots.len() == other.roots.len()
+            && self
+                .roots
+                .iter()
+                .zip(&other.roots)
+                .all(|(&lhs, &rhs)| ctx.deep_equal(lhs, rhs))
+    }
+}
+
+struct MetaNarrowApplyCache {
+    key: MetaNarrowApplyCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::narrow::NarrowSearch,
+    variable_names: Vec<String>,
+    target_variable_count: usize,
+    states: Vec<usize>,
+    last_solution: Option<usize>,
+    rewrite_checkpoint: u64,
+}
+
+#[derive(Clone)]
+struct MetaNarrowSearchCacheKey {
+    module: DagId,
+    subject: DagId,
+    goal: DagId,
+    search_type: tnk_core::narrow::NarrowSearchType,
+    max_depth: Option<usize>,
+    fold: tnk_core::narrow::NarrowFold,
+    filtered: bool,
+    delayed: bool,
+    path: bool,
+}
+
+impl MetaNarrowSearchCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.search_type == other.search_type
+            && self.max_depth == other.max_depth
+            && self.fold == other.fold
+            && self.filtered == other.filtered
+            && self.delayed == other.delayed
+            && self.path == other.path
+            && ctx.deep_equal(self.module, other.module)
+            && ctx.deep_equal(self.subject, other.subject)
+            && ctx.deep_equal(self.goal, other.goal)
+    }
+}
+
+struct RootedNarrowingSolution {
+    solution: tnk_core::narrow::NarrowingSolution,
+    _roots: Vec<tnk_core::root::RootGuard>,
+}
+
+struct MetaNarrowSearchCache {
+    key: MetaNarrowSearchCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::narrow::NarrowSearch,
+    initial_variable_names: Vec<String>,
+    initial_variable_count: usize,
+    solutions: Vec<RootedNarrowingSolution>,
+    last_solution: Option<usize>,
+    rewrite_checkpoint: u64,
+}
+
+#[derive(Clone)]
+struct MetaLegacyNarrowCacheKey {
+    module: DagId,
+    subject: DagId,
+    goal: DagId,
+    search_type: tnk_core::narrow::NarrowSearchType,
+    max_depth: Option<usize>,
+}
+
+impl MetaLegacyNarrowCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.search_type == other.search_type
+            && self.max_depth == other.max_depth
+            && ctx.deep_equal(self.module, other.module)
+            && ctx.deep_equal(self.subject, other.subject)
+            && ctx.deep_equal(self.goal, other.goal)
+    }
+}
+
+struct MetaLegacyNarrowCache {
+    key: MetaLegacyNarrowCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::narrow::NarrowSearch,
+    goal_variables: Vec<(u32, SortId, String)>,
+    solutions: Vec<RootedNarrowingSolution>,
+    last_solution: Option<usize>,
+    rewrite_checkpoint: u64,
 }
 
 /// The descent handler: the module database/views (to resolve a meta-module's imports), the interner
@@ -237,7 +395,6 @@ impl MetaVariantUnifyCacheKey {
     }
 }
 
-
 struct MetaVariantUnifyCache {
     key: MetaVariantUnifyCacheKey,
     _key_roots: Vec<tnk_core::root::RootGuard>,
@@ -260,7 +417,6 @@ struct MetaVariantUnifyCache {
 }
 
 impl MetaVariantUnifyCache {
-
     fn advance(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
         if self.exhausted {
             return;
@@ -473,7 +629,6 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::UpMbs => self.meta_up_part(ctx, hooks, redex, UpPart::Mbs),
             MetaOp::UpEqs => self.meta_up_part(ctx, hooks, redex, UpPart::Eqs),
             MetaOp::UpRls => self.meta_up_part(ctx, hooks, redex, UpPart::Rls),
-            // Stage 4 — the term-level wrappers (over the *current* module, via the MetaCtx resolver).
             MetaOp::UpTerm => {
                 let arg = *ctx.children(redex).first()?;
                 Some(up_term_ctx(ctx, hooks, arg))
@@ -493,11 +648,10 @@ impl DescentOps for MetaDescent<'_> {
             // interner, while their inputs/results remain ordinary String/Qid NA nodes in this engine.
             MetaOp::Tokenize => self.lexical_tokenize(ctx, hooks, redex),
             MetaOp::PrintTokens => self.lexical_print_tokens(ctx, hooks, redex),
-            // Stage 5 — declared but **inert**: narrowing, SMT, and strategy descent. Base unification
-            // and S2 variants have explicit arms below; `MetaOp::Deferred` now contains only the
-            // remaining `metaNarrow*`, `metaSmtSearch`/`metaCheck`, and strategy-meta operations.
-            // These surfaces parse and load but reduce to the kind level until their backends land.
-            // The exhaustive match forces a dispatch choice when a new descent op is added.
+            // Stage 5 — declared but **inert**: SMT and strategy descent. Symbolic narrowing has
+            // explicit arms below; `MetaOp::Deferred` now contains only `metaSmtSearch`/`metaCheck`
+            // and strategy-meta operations. Those surfaces parse and load but reduce to the kind
+            // level until their backends land. Exhaustive dispatch forces a choice for every new op.
             // Strategy-meta up maps are structurally deferred (G1, §3.9.8) — but the EMPTY sets
             // need none of G1's prerequisites: a module with no strat declarations/definitions
             // up-translates to the empty-set constant ((none).StratDeclSet, 1 rewrite), as Maude
@@ -533,6 +687,11 @@ impl DescentOps for MetaDescent<'_> {
                 self.meta_variant_unify(ctx, hooks, redex, disjoint, legacy)
             }
             MetaOp::VariantMatch => self.meta_variant_match(ctx, hooks, redex),
+            MetaOp::NarrowingApply => self.meta_narrowing_apply(ctx, hooks, redex),
+            MetaOp::NarrowingSearch { path } => self.meta_narrowing_search(ctx, hooks, redex, path),
+            MetaOp::Narrow { state_only: false } => self.meta_narrow(ctx, hooks, redex),
+            // The retired v1 state-enumeration surface is recognized but out of scope by S3 §8.2.
+            MetaOp::Narrow { state_only: true } => None,
             MetaOp::Deferred => None,
         }
     }
@@ -936,6 +1095,874 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
+    /// One-step variant narrowing. The incoming family is preserved on the subject; each rule
+    /// unifier chooses the next protected family. Equal/forward solution requests resume the same
+    /// structurally keyed search, while a backward request starts a fresh search.
+    fn meta_narrowing_apply(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        use tnk_core::fresh::VariableFamily;
+        use tnk_core::narrow::{NarrowFold, NarrowOptions, NarrowSearch, NarrowSearchType};
+        use tnk_core::unify::problem::VarSpec;
+
+        let kids = ctx.children(redex);
+        if kids.len() != 6 {
+            return None;
+        }
+        let family = VariableFamily::of_root(&qid_text(ctx, kids[3])?)?;
+        let (filtered, delayed) = down_variant_options(ctx, kids[4]);
+        let blocker_roots = down_term_list_roots(ctx, hooks, kids[2])?;
+        let mut roots = Vec::with_capacity(blocker_roots.len() + 1);
+        roots.push(kids[1]);
+        roots.extend(blocker_roots.iter().copied());
+        let key = MetaNarrowApplyCacheKey {
+            module: kids[0],
+            roots,
+            family,
+            filtered,
+            delayed,
+        };
+        let sol_nr = down_nat64(ctx, kids[5])? as usize;
+
+        let mut cache = if let Some(cache) = self.state.take_narrow_apply(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let mut vars = VarIndex::new();
+            let target_term = down_term_to_term(ctx, hooks, kids[1], &loaded.built, &mut vars)?;
+            let target_variable_count = vars.count() as usize;
+            let blocker_terms: Vec<Term> = blocker_roots
+                .iter()
+                .map(|&root| down_term_to_term(ctx, hooks, root, &loaded.built, &mut vars))
+                .collect::<Option<_>>()?;
+            let variable_names = (0..target_variable_count)
+                .map(|slot| vars.name(slot as u32).to_string())
+                .collect();
+            let codes: Vec<u32> = (0..vars.count())
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let bindings: Vec<DagId> = (0..vars.count())
+                .map(|slot| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(vars.sort(slot), codes[slot as usize], slot)
+                })
+                .collect();
+            let target = loaded
+                .built
+                .engine
+                .instantiate_bindings(&target_term, &bindings);
+            let blockers = blocker_terms
+                .iter()
+                .map(|term| loaded.built.engine.instantiate_bindings(term, &bindings))
+                .collect();
+            let specs: Vec<VarSpec> = (0..vars.count())
+                .map(|slot| VarSpec {
+                    sort: vars.sort(slot),
+                    name: codes[slot as usize],
+                })
+                .collect();
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            let rules = loaded.built.engine.narrowing_rules().to_vec();
+            loaded.built.engine.reset_rewrites();
+            let options = NarrowOptions {
+                search_type: NarrowSearchType::One,
+                max_depth: Some(1),
+                filter: filtered,
+                delay: delayed,
+                fold: NarrowFold::None,
+                keep_history: true,
+                keep_paths: false,
+                respect_frozen: true,
+            };
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let search = NarrowSearch::new_preserving(
+                &mut env, target, specs, family, blockers, &rules, equations, "0", options,
+            )
+            .ok()?;
+            let key_roots = std::iter::once(key.module)
+                .chain(key.roots.iter().copied())
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaNarrowApplyCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                variable_names,
+                target_variable_count,
+                states: Vec::new(),
+                last_solution: None,
+                rewrite_checkpoint: 0,
+            }
+        };
+
+        let mut rewrite_charge = 0;
+        let mut successful_steps = 0u64;
+        while cache.states.len() <= sol_nr {
+            let next = {
+                let mut names = InternerNames(self.interner);
+                let mut env = tnk_core::unify::UnifyEnv {
+                    e: &mut cache.loaded.built.engine,
+                    names: &mut names,
+                };
+                cache.search.next_interesting_state(&mut env)
+            };
+            let rewrites = cache.loaded.built.engine.rewrites();
+            rewrite_charge += rewrites.saturating_sub(cache.rewrite_checkpoint);
+            cache.rewrite_checkpoint = rewrites;
+            let Some(state) = next else {
+                // The reference counts at most the one narrowing step it returns, not the
+                // intermediate solutions skipped while seeking a later ordinal.
+                ctx.add_rewrites(rewrite_charge.saturating_sub(successful_steps));
+                let hook = if cache.search.is_incomplete() {
+                    "narrowingApplyFailureIncompleteSymbol"
+                } else {
+                    "narrowingApplyFailureSymbol"
+                };
+                return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+            };
+            successful_steps += 1;
+            cache.states.push(state);
+        }
+        ctx.add_rewrites(rewrite_charge.saturating_sub(successful_steps.saturating_sub(1)));
+
+        let state = cache.states[sol_nr];
+        let (term, substitution, family, _) = {
+            let (term, substitution, family, depth) = cache.search.state(state);
+            (term, substitution.to_vec(), family, depth)
+        };
+        let parent = cache.search.parent(state)?;
+        let parent_term = cache.search.state(parent).0;
+        let (rule_index, path, source_substitution) = {
+            let step = cache.search.step(state)?;
+            (
+                step.rule_index,
+                step.path.clone(),
+                step.source_substitution.clone(),
+            )
+        };
+        let rule = cache
+            .loaded
+            .built
+            .engine
+            .narrowing_rules()
+            .get(rule_index)?
+            .clone();
+        let term_meta = up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, term);
+        let sort_meta = up_type(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            cache.loaded.built.engine.sort_of(term),
+        );
+        let context_meta = up_context(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            parent_term,
+            &path,
+        );
+        let label_meta = ctx.make_na(
+            hooks.ops["qidSymbol"],
+            NaValue::Qid(rule.label.unwrap_or_default().into()),
+        );
+        let subject_substitution = up_substitution(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &cache.variable_names,
+            &substitution[..cache.target_variable_count],
+        );
+        let rule_variable_names: Vec<String> = rule
+            .variable_names
+            .iter()
+            .zip(&rule.variables)
+            .map(|(name, spec)| {
+                if name.contains(':') {
+                    name.clone()
+                } else {
+                    format!(
+                        "{name}:{}",
+                        cache.loaded.built.engine.sorts().name(spec.sort)
+                    )
+                }
+            })
+            .collect();
+        let rule_substitution = up_substitution(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &rule_variable_names,
+            &source_substitution,
+        );
+        let family_meta = ctx.make_na(
+            hooks.ops["qidSymbol"],
+            NaValue::Qid(variant_family_root(family).into()),
+        );
+        let result = ctx.app(
+            *hooks.ops.get("narrowingApplyResultSymbol")?,
+            vec![
+                term_meta,
+                sort_meta,
+                context_meta,
+                label_meta,
+                subject_substitution,
+                rule_substitution,
+                family_meta,
+            ],
+        );
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaCache::NarrowApply(cache));
+        Some(result)
+    }
+
+    /// Frozen v1 `metaNarrow` served by the v3 narrowing graph. The adapter composes the final
+    /// goal unifier into the reached state and returns only bindings for variables introduced by
+    /// the goal, reproducing the legacy `ResultTriple` contract.
+    fn meta_narrow(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        use tnk_core::narrow::{
+            NarrowFold, NarrowGoal, NarrowOptions, NarrowSearch, NarrowSearchType,
+        };
+        use tnk_core::unify::problem::VarSpec;
+
+        let kids = ctx.children(redex);
+        if kids.len() != 6 {
+            return None;
+        }
+        let search_type = match qid_text(ctx, kids[3])?.as_str() {
+            "1" => NarrowSearchType::One,
+            "+" => NarrowSearchType::AtLeastOne,
+            "*" => NarrowSearchType::Any,
+            "!" => NarrowSearchType::NormalForm,
+            _ => return None,
+        };
+        let max_depth = down_bound(ctx, hooks, kids[4]).map(|bound| bound as usize);
+        let key = MetaLegacyNarrowCacheKey {
+            module: kids[0],
+            subject: kids[1],
+            goal: kids[2],
+            search_type,
+            max_depth,
+        };
+        let sol_nr = down_nat64(ctx, kids[5])? as usize;
+
+        let mut cache = if let Some(cache) = self.state.take_legacy_narrow(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let mut vars = VarIndex::new();
+            let subject_term = down_term_to_term(ctx, hooks, kids[1], &loaded.built, &mut vars)?;
+            let initial_variable_count = vars.count() as usize;
+            let goal_term = down_term_to_term(ctx, hooks, kids[2], &loaded.built, &mut vars)?;
+            let codes: Vec<u32> = (0..vars.count())
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let goal_variables: Vec<_> = (initial_variable_count..vars.count() as usize)
+                .map(|slot| {
+                    (
+                        codes[slot],
+                        vars.sort(slot as u32),
+                        vars.name(slot as u32).to_string(),
+                    )
+                })
+                .collect();
+            let bindings: Vec<DagId> = (0..vars.count())
+                .map(|slot| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(vars.sort(slot), codes[slot as usize], slot)
+                })
+                .collect();
+            let mut subject = loaded
+                .built
+                .engine
+                .instantiate_bindings(&subject_term, &bindings);
+            let mut goal = loaded
+                .built
+                .engine
+                .instantiate_bindings(&goal_term, &bindings);
+            let mut specs: Vec<VarSpec> = (0..vars.count())
+                .map(|slot| VarSpec {
+                    sort: vars.sort(slot),
+                    name: codes[slot as usize],
+                })
+                .collect();
+            let mut variable_order =
+                tnk_core::variant::variables_in_dag(&loaded.built.engine, subject);
+            for slot in tnk_core::variant::variables_in_dag(&loaded.built.engine, goal) {
+                if !variable_order.contains(&slot) {
+                    variable_order.push(slot);
+                }
+            }
+            if variable_order.len() != specs.len() {
+                return None;
+            }
+            let mut new_slot = vec![0u32; specs.len()];
+            for (new, &old) in variable_order.iter().enumerate() {
+                new_slot[old] = new as u32;
+            }
+            let remapping: Vec<_> = specs
+                .iter()
+                .enumerate()
+                .map(|(old, spec)| {
+                    Some(
+                        loaded
+                            .built
+                            .engine
+                            .make_var(spec.sort, spec.name, new_slot[old]),
+                    )
+                })
+                .collect();
+            subject = tnk_core::unify::instantiate(&mut loaded.built.engine, &remapping, subject)
+                .unwrap_or(subject);
+            goal = tnk_core::unify::instantiate(&mut loaded.built.engine, &remapping, goal)
+                .unwrap_or(goal);
+            specs = variable_order.iter().map(|&old| specs[old]).collect();
+
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            let rules = loaded.built.engine.narrowing_rules().to_vec();
+            loaded.built.engine.reset_rewrites();
+            let options = NarrowOptions {
+                search_type,
+                max_depth,
+                filter: false,
+                delay: false,
+                fold: NarrowFold::None,
+                keep_history: false,
+                keep_paths: false,
+                respect_frozen: true,
+            };
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let mut search = NarrowSearch::new(
+                &mut env,
+                subject,
+                specs[..initial_variable_count].to_vec(),
+                &rules,
+                equations,
+                "0",
+                options,
+            )
+            .ok()?;
+            search.set_goal(NarrowGoal::new(env.e, goal, specs, initial_variable_count));
+            let key_roots = [key.module, key.subject, key.goal]
+                .into_iter()
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaLegacyNarrowCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                goal_variables,
+                solutions: Vec::new(),
+                last_solution: None,
+                rewrite_checkpoint: 0,
+            }
+        };
+
+        while cache.solutions.len() <= sol_nr {
+            let next = {
+                let mut names = InternerNames(self.interner);
+                let mut env = tnk_core::unify::UnifyEnv {
+                    e: &mut cache.loaded.built.engine,
+                    names: &mut names,
+                };
+                cache.search.find_next(&mut env)
+            };
+            let rewrites = cache.loaded.built.engine.rewrites();
+            ctx.add_rewrites(rewrites.saturating_sub(cache.rewrite_checkpoint));
+            cache.rewrite_checkpoint = rewrites;
+            let Some(solution) = next else {
+                let hook = if cache.search.is_incomplete() {
+                    "failureIncomplete3Symbol"
+                } else {
+                    "failure3Symbol"
+                };
+                return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+            };
+            let roots = solution
+                .bindings
+                .iter()
+                .map(|&dag| cache.loaded.built.engine.root(dag))
+                .collect();
+            cache.solutions.push(RootedNarrowingSolution {
+                solution,
+                _roots: roots,
+            });
+        }
+
+        let solution = &cache.solutions[sol_nr].solution;
+        let alpha =
+            legacy_narrowing_alpha_map(&mut cache.loaded.built.engine, self.interner, solution);
+        let state_term = cache.search.state(solution.state).0;
+        let term =
+            instantiate_narrowing_solution(&mut cache.loaded.built.engine, state_term, solution);
+        let term = tnk_core::unify::instantiate(&mut cache.loaded.built.engine, &alpha, term)
+            .unwrap_or(term);
+        let mut goal_names = Vec::with_capacity(cache.goal_variables.len());
+        let mut goal_bindings = Vec::with_capacity(cache.goal_variables.len());
+        for (name, sort, display) in &cache.goal_variables {
+            let slot = solution
+                .variables
+                .iter()
+                .position(|spec| spec.name == *name && spec.sort == *sort)?;
+            goal_names.push(display.clone());
+            let binding = solution.bindings[slot];
+            let binding =
+                tnk_core::unify::instantiate(&mut cache.loaded.built.engine, &alpha, binding)
+                    .unwrap_or(binding);
+            goal_bindings.push(binding);
+        }
+        let term_meta = up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, term);
+        let type_meta = up_type(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            cache.loaded.built.engine.sort_of(term),
+        );
+        let substitution_meta = up_substitution(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &goal_names,
+            &goal_bindings,
+        );
+        let result = ctx.app(
+            *hooks.ops.get("resultTripleSymbol")?,
+            vec![term_meta, type_meta, substitution_meta],
+        );
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaCache::LegacyNarrow(cache));
+        Some(result)
+    }
+
+    /// Variant-based narrowing search and its history-preserving path form.
+    fn meta_narrowing_search(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        path: bool,
+    ) -> Option<DagId> {
+        use tnk_core::narrow::{
+            NarrowFold, NarrowGoal, NarrowOptions, NarrowSearch, NarrowSearchType,
+        };
+        use tnk_core::unify::problem::VarSpec;
+
+        let kids = ctx.children(redex);
+        if kids.len() != 8 {
+            return None;
+        }
+        let search_type = match qid_text(ctx, kids[3])?.as_str() {
+            "1" => NarrowSearchType::One,
+            "+" => NarrowSearchType::AtLeastOne,
+            "*" => NarrowSearchType::Any,
+            "!" => NarrowSearchType::NormalForm,
+            _ => return None,
+        };
+        let max_depth = down_bound(ctx, hooks, kids[4]).map(|bound| bound as usize);
+        let fold = match qid_text(ctx, kids[5])?.as_str() {
+            "none" => NarrowFold::None,
+            "match" => NarrowFold::Match,
+            "variant" => NarrowFold::Variant,
+            _ => return None,
+        };
+        let (filtered, delayed) = down_variant_options(ctx, kids[6]);
+        let key = MetaNarrowSearchCacheKey {
+            module: kids[0],
+            subject: kids[1],
+            goal: kids[2],
+            search_type,
+            max_depth,
+            fold,
+            filtered,
+            delayed,
+            path,
+        };
+        let sol_nr = down_nat64(ctx, kids[7])? as usize;
+
+        let mut cache = if let Some(cache) = self.state.take_narrow_search(&key, ctx, sol_nr) {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+            let mut vars = VarIndex::new();
+            let subject_term = down_term_to_term(ctx, hooks, kids[1], &loaded.built, &mut vars)?;
+            let initial_variable_count = vars.count() as usize;
+            let goal_term = down_term_to_term(ctx, hooks, kids[2], &loaded.built, &mut vars)?;
+            let source_names: Vec<String> = (0..vars.count())
+                .map(|slot| vars.name(slot).to_string())
+                .collect();
+            let codes: Vec<u32> = (0..vars.count())
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let bare = source.split_once(':').map_or(source, |(bare, _)| bare);
+                    self.interner.intern(bare).index()
+                })
+                .collect();
+            let bindings: Vec<DagId> = (0..vars.count())
+                .map(|slot| {
+                    loaded
+                        .built
+                        .engine
+                        .make_var(vars.sort(slot), codes[slot as usize], slot)
+                })
+                .collect();
+            let mut subject = loaded
+                .built
+                .engine
+                .instantiate_bindings(&subject_term, &bindings);
+            let mut goal = loaded
+                .built
+                .engine
+                .instantiate_bindings(&goal_term, &bindings);
+            let mut specs: Vec<VarSpec> = (0..vars.count())
+                .map(|slot| VarSpec {
+                    sort: vars.sort(slot),
+                    name: codes[slot as usize],
+                })
+                .collect();
+
+            // Maude indexes source variables by the canonical subject DAG, then appends goal-only
+            // variables. This remains visible in the initial renaming and every accumulated substitution.
+            let mut variable_order =
+                tnk_core::variant::variables_in_dag(&loaded.built.engine, subject);
+            for slot in tnk_core::variant::variables_in_dag(&loaded.built.engine, goal) {
+                if !variable_order.contains(&slot) {
+                    variable_order.push(slot);
+                }
+            }
+            if variable_order.len() != specs.len() {
+                return None;
+            }
+            let mut new_slot = vec![0u32; specs.len()];
+            for (new, &old) in variable_order.iter().enumerate() {
+                new_slot[old] = new as u32;
+            }
+            let remapping: Vec<_> = specs
+                .iter()
+                .enumerate()
+                .map(|(old, spec)| {
+                    Some(
+                        loaded
+                            .built
+                            .engine
+                            .make_var(spec.sort, spec.name, new_slot[old]),
+                    )
+                })
+                .collect();
+            subject = tnk_core::unify::instantiate(&mut loaded.built.engine, &remapping, subject)
+                .unwrap_or(subject);
+            goal = tnk_core::unify::instantiate(&mut loaded.built.engine, &remapping, goal)
+                .unwrap_or(goal);
+            specs = variable_order.iter().map(|&old| specs[old]).collect();
+            let initial_variable_names = variable_order
+                .iter()
+                .take(initial_variable_count)
+                .map(|&old| source_names[old].clone())
+                .collect();
+
+            let equations = executable_variant_equations(&mut loaded.built, self.interner);
+            let rules = loaded.built.engine.narrowing_rules().to_vec();
+            loaded.built.engine.reset_rewrites();
+            let options = NarrowOptions {
+                search_type,
+                max_depth,
+                filter: filtered,
+                delay: delayed,
+                fold,
+                keep_history: path,
+                keep_paths: path,
+                respect_frozen: true,
+            };
+            let mut names = InternerNames(self.interner);
+            let mut env = tnk_core::unify::UnifyEnv {
+                e: &mut loaded.built.engine,
+                names: &mut names,
+            };
+            let mut search = NarrowSearch::new(
+                &mut env,
+                subject,
+                specs[..initial_variable_count].to_vec(),
+                &rules,
+                equations,
+                "0",
+                options,
+            )
+            .ok()?;
+            search.set_goal(NarrowGoal::new(env.e, goal, specs, initial_variable_count));
+            let key_roots = [key.module, key.subject, key.goal]
+                .into_iter()
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaNarrowSearchCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                initial_variable_names,
+                initial_variable_count,
+                solutions: Vec::new(),
+                last_solution: None,
+                rewrite_checkpoint: 0,
+            }
+        };
+
+        while cache.solutions.len() <= sol_nr {
+            let next = {
+                let mut names = InternerNames(self.interner);
+                let mut env = tnk_core::unify::UnifyEnv {
+                    e: &mut cache.loaded.built.engine,
+                    names: &mut names,
+                };
+                cache.search.find_next(&mut env)
+            };
+            let rewrites = cache.loaded.built.engine.rewrites();
+            ctx.add_rewrites(rewrites.saturating_sub(cache.rewrite_checkpoint));
+            cache.rewrite_checkpoint = rewrites;
+            let Some(solution) = next else {
+                let hook = match (path, cache.search.is_incomplete()) {
+                    (false, false) => "narrowingSearchFailureSymbol",
+                    (false, true) => "narrowingSearchFailureIncompleteSymbol",
+                    (true, false) => "narrowingSearchPathFailureSymbol",
+                    (true, true) => "narrowingSearchPathFailureIncompleteSymbol",
+                };
+                return Some(ctx.app(*hooks.ops.get(hook)?, vec![]));
+            };
+            let roots = solution
+                .bindings
+                .iter()
+                .map(|&dag| cache.loaded.built.engine.root(dag))
+                .collect();
+            cache.solutions.push(RootedNarrowingSolution {
+                solution,
+                _roots: roots,
+            });
+        }
+
+        let solution = &cache.solutions[sol_nr].solution;
+        let result = if path {
+            let (initial_term, initial_substitution, _, _) = cache.search.state(0);
+            let initial_term_meta =
+                up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, initial_term);
+            let initial_type_meta = up_type(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                cache.loaded.built.engine.sort_of(initial_term),
+            );
+            let initial_substitution_meta = up_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &cache.initial_variable_names,
+                &initial_substitution[..cache.initial_variable_count],
+            );
+            let mut trace_steps = Vec::new();
+            for state in cache
+                .search
+                .path_indices(solution.state)
+                .into_iter()
+                .skip(1)
+            {
+                let parent = cache.search.parent(state)?;
+                let parent_term = cache.search.state(parent).0;
+                let (new_term, accumulated, _, _) = cache.search.state(state);
+                let (rule_index, step_path, state_unifier, source_substitution, step_family) = {
+                    let step = cache.search.step(state)?;
+                    (
+                        step.rule_index,
+                        step.path.clone(),
+                        step.state_unifier.clone(),
+                        step.source_substitution.clone(),
+                        step.family,
+                    )
+                };
+                let rule = cache
+                    .loaded
+                    .built
+                    .engine
+                    .narrowing_rules()
+                    .get(rule_index)?;
+                let mut unifier_names = meta_variable_spec_names(
+                    &cache.loaded.built.engine,
+                    self.interner,
+                    cache.search.state_variables(parent),
+                );
+                unifier_names.extend(meta_rule_variable_names(
+                    &cache.loaded.built.engine,
+                    &rule.variable_names,
+                    &rule.variables,
+                ));
+                let mut unifier_bindings = state_unifier;
+                unifier_bindings.extend(source_substitution);
+                let context_meta = up_context(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    parent_term,
+                    &step_path,
+                );
+                let label_meta = ctx.make_na(
+                    hooks.ops["qidSymbol"],
+                    NaValue::Qid(rule.label.clone().unwrap_or_default().into()),
+                );
+                let unifier_meta = up_substitution(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    &unifier_names,
+                    &unifier_bindings,
+                );
+                let family_meta = ctx.make_na(
+                    hooks.ops["qidSymbol"],
+                    NaValue::Qid(variant_family_root(step_family).into()),
+                );
+                let new_term_meta =
+                    up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, new_term);
+                let new_type_meta = up_type(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    cache.loaded.built.engine.sort_of(new_term),
+                );
+                let accumulated_meta = up_substitution(
+                    ctx,
+                    hooks,
+                    &cache.loaded.built,
+                    self.interner,
+                    &cache.initial_variable_names,
+                    &accumulated[..cache.initial_variable_count],
+                );
+                trace_steps.push(ctx.app(
+                    *hooks.ops.get("narrowingStepSymbol")?,
+                    vec![
+                        context_meta,
+                        label_meta,
+                        unifier_meta,
+                        family_meta,
+                        new_term_meta,
+                        new_type_meta,
+                        accumulated_meta,
+                    ],
+                ));
+            }
+            let trace = match trace_steps.len() {
+                0 => ctx.app(*hooks.ops.get("nilNarrowingTraceSymbol")?, vec![]),
+                1 => trace_steps[0],
+                _ => ctx.app(*hooks.ops.get("narrowingTraceSymbol")?, trace_steps),
+            };
+            let goal_names = meta_variable_spec_names(
+                &cache.loaded.built.engine,
+                self.interner,
+                &solution.variables,
+            );
+            let goal_substitution = up_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &goal_names,
+                &solution.bindings,
+            );
+            let goal_family = ctx.make_na(
+                hooks.ops["qidSymbol"],
+                NaValue::Qid(variant_family_root(solution.family).into()),
+            );
+            ctx.app(
+                *hooks.ops.get("narrowingSearchPathResultSymbol")?,
+                vec![
+                    initial_term_meta,
+                    initial_type_meta,
+                    initial_substitution_meta,
+                    trace,
+                    goal_substitution,
+                    goal_family,
+                ],
+            )
+        } else {
+            let (term, accumulated, family, _) = cache.search.state(solution.state);
+            let term_meta = up_parsed_term(ctx, hooks, &cache.loaded.built, self.interner, term);
+            let type_meta = up_type(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                cache.loaded.built.engine.sort_of(term),
+            );
+            let accumulated_meta = up_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &cache.initial_variable_names,
+                &accumulated[..cache.initial_variable_count],
+            );
+            let state_family = ctx.make_na(
+                hooks.ops["qidSymbol"],
+                NaValue::Qid(variant_family_root(family).into()),
+            );
+            let goal_names = meta_variable_spec_names(
+                &cache.loaded.built.engine,
+                self.interner,
+                &solution.variables,
+            );
+            let goal_substitution = up_substitution(
+                ctx,
+                hooks,
+                &cache.loaded.built,
+                self.interner,
+                &goal_names,
+                &solution.bindings,
+            );
+            let goal_family = ctx.make_na(
+                hooks.ops["qidSymbol"],
+                NaValue::Qid(variant_family_root(solution.family).into()),
+            );
+            ctx.app(
+                *hooks.ops.get("narrowingSearchResultSymbol")?,
+                vec![
+                    term_meta,
+                    type_meta,
+                    accumulated_meta,
+                    state_family,
+                    goal_substitution,
+                    goal_family,
+                ],
+            )
+        };
+        cache.last_solution = Some(sol_nr);
+        self.state.insert(MetaCache::NarrowSearch(cache));
+        Some(result)
+    }
+
     /// `metaGetVariant(M, T, TL, F, n)` returns the `n`th folding variant of `T`. Maude retains the
     /// live search in its four-entry structural meta-operation cache: equal indices reuse the current
     /// result, forward indices resume it, and a backward request discards it and starts over.
@@ -1149,7 +2176,7 @@ impl MetaDescent<'_> {
             )
         };
         cache.last_solution = Some(sol_nr);
-        self.state.insert(MetaVariantCache::Get(cache));
+        self.state.insert(MetaCache::Get(cache));
         Some(result)
     }
 
@@ -1501,7 +2528,7 @@ impl MetaDescent<'_> {
             }
         };
         cache.last_solution = Some(sol_nr);
-        self.state.insert(MetaVariantCache::Unify(cache));
+        self.state.insert(MetaCache::Unify(cache));
         Some(result_dag)
     }
 
@@ -1818,7 +2845,7 @@ impl MetaDescent<'_> {
             )
         };
         cache.last_solution = Some(sol_nr);
-        self.state.insert(MetaVariantCache::Unify(cache));
+        self.state.insert(MetaCache::Unify(cache));
         Some(result_dag)
     }
 
@@ -2852,13 +3879,7 @@ impl MetaDescent<'_> {
         install_membs(ctx, hooks, *kids.get(5)?, &mut loaded.built)?;
         install_eqs(ctx, hooks, *kids.get(6)?, &mut loaded.built)?;
         if kind == ModuleKind::System {
-            install_rules(
-                ctx,
-                hooks,
-                *kids.get(7)?,
-                &mut loaded.built,
-                self.interner,
-            )?;
+            install_rules(ctx, hooks, *kids.get(7)?, &mut loaded.built, self.interner)?;
         }
         Some(loaded)
     }
@@ -4950,6 +5971,105 @@ fn up_condition_fragment(
             ctx.app(hooks.ops["rewriteConditionSymbol"], vec![l, p])
         }
     }
+}
+
+fn instantiate_narrowing_solution(
+    engine: &mut Engine,
+    term: DagId,
+    solution: &tnk_core::narrow::NarrowingSolution,
+) -> DagId {
+    let mut values = Vec::new();
+    let mut work = vec![term];
+    while let Some(dag) = work.pop() {
+        let node = engine.node(dag);
+        if let (Some(index), NodeRepr::Var { name }) = (node.variable_index(), node.repr()) {
+            if let Some(slot) = solution
+                .variables
+                .iter()
+                .position(|spec| spec.name == name && spec.sort == engine.sort_of(dag))
+            {
+                let index = index as usize;
+                if values.len() <= index {
+                    values.resize(index + 1, None);
+                }
+                values[index] = Some(solution.bindings[slot]);
+            }
+        } else {
+            work.extend(node.children());
+        }
+    }
+    tnk_core::unify::instantiate(engine, &values, term).unwrap_or(term)
+}
+
+/// Legacy narrowing names the goal match's variables by the reached state's variable ordinals.
+/// The v3 goal unifier may alpha-permute those variables (for example `@1 -> %2`,
+/// `@2 -> %1`), so compose the inverse ordinal-preserving alpha map into the adapter result.
+fn legacy_narrowing_alpha_map(
+    engine: &mut Engine,
+    interner: &mut Interner,
+    solution: &tnk_core::narrow::NarrowingSolution,
+) -> Vec<Option<DagId>> {
+    let mut values = Vec::new();
+    for (spec, &binding) in solution.variables.iter().zip(&solution.bindings) {
+        let source_name = interner.resolve_index(spec.name).to_string();
+        let source_bytes = source_name.as_bytes();
+        if !matches!(source_bytes.first(), Some(b'#' | b'%' | b'@')) {
+            continue;
+        }
+        let node = engine.node(binding);
+        let (Some(index), NodeRepr::Var { name }) = (node.variable_index(), node.repr()) else {
+            continue;
+        };
+        let target_name = interner.resolve_index(name).to_string();
+        let target_bytes = target_name.as_bytes();
+        if !matches!(target_bytes.first(), Some(b'#' | b'%' | b'@')) {
+            continue;
+        }
+        let desired = format!("{}{}", target_bytes[0] as char, &source_name[1..]);
+        let desired_code = interner.intern(&desired).index();
+        let renamed = engine.make_var(engine.sort_of(binding), desired_code, index);
+        let index = index as usize;
+        if values.len() <= index {
+            values.resize(index + 1, None);
+        }
+        values[index] = Some(renamed);
+    }
+    values
+}
+
+fn meta_variable_spec_names(
+    engine: &Engine,
+    interner: &Interner,
+    specs: &[tnk_core::unify::problem::VarSpec],
+) -> Vec<String> {
+    specs
+        .iter()
+        .map(|spec| {
+            format!(
+                "{}:{}",
+                interner.resolve_index(spec.name),
+                engine.sorts().name(spec.sort)
+            )
+        })
+        .collect()
+}
+
+fn meta_rule_variable_names(
+    engine: &Engine,
+    names: &[String],
+    specs: &[tnk_core::unify::problem::VarSpec],
+) -> Vec<String> {
+    names
+        .iter()
+        .zip(specs)
+        .map(|(name, spec)| {
+            if name.contains(':') {
+                name.clone()
+            } else {
+                format!("{name}:{}", engine.sorts().name(spec.sort))
+            }
+        })
+        .collect()
 }
 
 /// Up-translate a solution substitution: each bound variable `'X:Sort` to an assignment

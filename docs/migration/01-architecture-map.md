@@ -5,7 +5,7 @@ manual. Per-subsystem deep-dives in `reports/A1`…`A8`.* This doubles as the **
 (§2) and feature inventory (§3) describe what Maude is; the cross-cutting decisions (§4) are our porting
 strategy (now largely realized — see `03-open-decisions.md`).
 
-> **Build status (refreshed 2026-07-19).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
+> **Build status (refreshed 2026-07-21).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
 > Built-ins** — DONE, including the Diophantine/bipartite AC matcher and sequence-verifying cross-check.
 > **L5 Frontend** (lexer incl. bracketed comments / structured colon-vars, mixfix grammar, Earley parser,
 > pretty-printer incl. `(t).Sort` disambiguation) — DONE. **L4 Operational — rules + rewriting (Pillar A)
@@ -21,12 +21,13 @@ strategy (now largely realized — see `03-open-decisions.md`).
 > reflection core: `META-LEVEL` builds, and its descent family (`metaReduce`/`metaRewrite`/`metaApply`/
 > `metaMatch`/`metaSearch`/`metaSearchPath`/… + the `format`-attribute display) computes byte-identically
 > — as do the META `up*`/query/parse layer, the strategy language, and the object system
-> (`omod`/`erewrite`/STD-STREAM). **L7 Reflection/meta** core is done, including base unification and
-> variant descent. **L8 Symbolic S0/S1/S2 are DONE**: BDD sort enumeration; order-sorted unification
-> modulo free/S/CUI/AC/ACU/A/AU at 27/27 fixtures (676 commands); and folding variants at 21/21
-> (289 commands). S3 narrowing is READY and next; SMT and LTL remain.
+> (`omod`/`erewrite`/STD-STREAM). **L7 Reflection/meta** core is done, including unification, variant,
+> and all in-scope narrowing descent. **L8 Symbolic S0–S3 is DONE**: BDD sort enumeration;
+> order-sorted unification modulo free/S/CUI/AC/ACU/A/AU at 27/27 fixtures (676 commands); folding
+> variants at 21/21 (289 commands); and v3 variant-based narrowing at 16/16 (the 15-fixture completion
+> manifest plus one post-close regression; 169 independently passing primary commands). SMT and LTL remain.
 > **Current verified state incl. all known deviations: `../../fable-audit.md`** (status refreshed
-> 2026-07-19); forward plan: `roadmap.md`. Feature inventory (§3) remains the parity target list.
+> 2026-07-21); forward plan: `roadmap.md`. Feature inventory (§3) remains the parity target list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*
@@ -117,7 +118,8 @@ language → reflect it → add symbolic reasoning (unification/variants/narrowi
 7. **Bignums** → **`malachite`** (pure Rust) behind a `tnk-core::num` wrapper; `rug` (GMP) as a benchmarked escape hatch (decision **D4**).
 8. **BDDs are cross-cutting** (order-sorted unifier filtering, ACU Diophantine selection, LTL Büchi
    labels) → pure-Rust **`biodivine-lib-bdd`** behind a `bdd` facade, feature-gated; BuDDy FFI as fallback (decision **D6**).
-9. **SMT backend** → the **`z3` crate** behind a `trait SmtEngine`, runtime/feature-selectable (not build-time-fixed as C++) (decision **D7**).
+9. **SMT backend** → optional **`z3` 0.20.2** in `tnk-core::smt::z3`, behind a pure-core
+   `trait SmtEngine`; the default selects `NullSmtEngine` and links no solver (decision **D7**).
 10. **External IO/concurrency** → an owned **`mio`** reactor + `signal-hook` (single-threaded deterministic
     interleave), replacing the global poll-reactor + signal plumbing; `tokio` only for a future networked direction (decision **D5**).
 

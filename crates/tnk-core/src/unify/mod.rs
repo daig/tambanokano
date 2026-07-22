@@ -31,6 +31,8 @@ pub mod filter;
 pub mod problem;
 pub(crate) mod word;
 
+pub use acu::unequal_left_identity_collapse;
+
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
@@ -249,10 +251,33 @@ pub(crate) fn insert_variables(e: &Engine, id: DagId, occurs: &mut BTreeSet<usiz
     }
 }
 
-/// Instantiate `id` under the context (`DagNode::instantiate` with invariants maintained):
-/// `None` = unchanged. Rebuilding goes through the canonical `make_*` builders, so collapse,
-/// flattening, ordering, and base sorts are maintained exactly as at construction.
+/// Instantiate `id` under `values`, maintaining canonical theory representations.
+///
+/// `None` means unchanged. Rebuilding goes through the canonical `make_*` builders, matching
+/// Maude's `DagNode::instantiate(..., true)`.
 pub fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Option<DagId> {
+    instantiate_inner(e, values, id, true)
+}
+
+/// Instantiate `id` without normalizing a changed node at its top.
+///
+/// This is Maude's `DagNode::instantiate(..., false)`: inserted AC/AU/CUI/S bindings remain shared
+/// nested children until the resulting term is reduced. Narrowing uses it when instantiating a final
+/// goal by the accumulated substitution.
+pub(crate) fn instantiate_preserving_representation(
+    e: &mut Engine,
+    values: &[Option<DagId>],
+    id: DagId,
+) -> Option<DagId> {
+    instantiate_inner(e, values, id, false)
+}
+
+fn instantiate_inner(
+    e: &mut Engine,
+    values: &[Option<DagId>],
+    id: DagId,
+    maintain_invariants: bool,
+) -> Option<DagId> {
     enum Rep {
         Free(SymbolId, Vec<DagId>),
         Acu(SymbolId, Vec<(DagId, u32)>),
@@ -269,59 +294,237 @@ pub fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Optio
         NodeTerm::Cui { symbol, args } => Rep::Cui(*symbol, args[0], args[1]),
         NodeTerm::S { symbol, count, arg } => Rep::S(*symbol, count.clone(), *arg),
     };
+
+    let build = |e: &mut Engine, term: NodeTerm| {
+        let (sig, rt) = e.parts_mut();
+        rt.make_preserving_representation(sig, term)
+    };
     match rep {
         Rep::Free(symbol, mut args) => {
             let mut changed = false;
-            for a in &mut args {
-                if let Some(n) = instantiate(e, values, *a) {
-                    *a = n;
+            for arg in &mut args {
+                if let Some(instantiated) = instantiate_inner(e, values, *arg, maintain_invariants)
+                {
+                    *arg = instantiated;
                     changed = true;
                 }
             }
             changed.then(|| {
-                let (sig, rt) = e.parts_mut();
-                rt.make_free(sig, symbol, args)
+                if maintain_invariants {
+                    let (sig, rt) = e.parts_mut();
+                    rt.make_free(sig, symbol, args)
+                } else {
+                    build(e, NodeTerm::Free { symbol, args })
+                }
             })
         }
-        Rep::Acu(symbol, mut pairs) => {
+        Rep::Acu(symbol, mut args) => {
             let mut changed = false;
-            for (a, _) in &mut pairs {
-                if let Some(n) = instantiate(e, values, *a) {
-                    *a = n;
+            for (arg, _) in &mut args {
+                if let Some(instantiated) = instantiate_inner(e, values, *arg, maintain_invariants)
+                {
+                    *arg = instantiated;
                     changed = true;
                 }
             }
             changed.then(|| {
-                let (sig, rt) = e.parts_mut();
-                rt.make_acu(sig, symbol, pairs)
+                if maintain_invariants {
+                    let (sig, rt) = e.parts_mut();
+                    rt.make_acu(sig, symbol, args)
+                } else {
+                    build(e, NodeTerm::Acu { symbol, args })
+                }
             })
         }
         Rep::Au(symbol, mut args) => {
             let mut changed = false;
-            for a in &mut args {
-                if let Some(n) = instantiate(e, values, *a) {
-                    *a = n;
+            for arg in &mut args {
+                if let Some(instantiated) = instantiate_inner(e, values, *arg, maintain_invariants)
+                {
+                    *arg = instantiated;
                     changed = true;
                 }
             }
             changed.then(|| {
-                let (sig, rt) = e.parts_mut();
-                rt.make_au(sig, symbol, args)
+                if maintain_invariants {
+                    let (sig, rt) = e.parts_mut();
+                    rt.make_au(sig, symbol, args)
+                } else {
+                    build(e, NodeTerm::Au { symbol, args })
+                }
             })
         }
         Rep::Cui(symbol, x, y) => {
-            let nx = instantiate(e, values, x);
-            let ny = instantiate(e, values, y);
+            let nx = instantiate_inner(e, values, x, maintain_invariants);
+            let ny = instantiate_inner(e, values, y, maintain_invariants);
             if nx.is_none() && ny.is_none() {
                 return None;
             }
-            let (sig, rt) = e.parts_mut();
-            Some(rt.make_cui(sig, symbol, nx.unwrap_or(x), ny.unwrap_or(y)))
+            let x = nx.unwrap_or(x);
+            let y = ny.unwrap_or(y);
+            Some(if maintain_invariants {
+                let (sig, rt) = e.parts_mut();
+                rt.make_cui(sig, symbol, x, y)
+            } else {
+                build(
+                    e,
+                    NodeTerm::Cui {
+                        symbol,
+                        args: vec![x, y],
+                    },
+                )
+            })
         }
-        Rep::S(symbol, count, arg) => instantiate(e, values, arg).map(|n| {
-            let (sig, rt) = e.parts_mut();
-            rt.make_s(sig, symbol, count, n)
-        }),
+        Rep::S(symbol, count, arg) => {
+            instantiate_inner(e, values, arg, maintain_invariants).map(|arg| {
+                if maintain_invariants {
+                    let (sig, rt) = e.parts_mut();
+                    rt.make_s(sig, symbol, count, arg)
+                } else {
+                    build(e, NodeTerm::S { symbol, count, arg })
+                }
+            })
+        }
+    }
+}
+
+/// Replace one occurrence selected by a flattened child path and instantiate every sibling without
+/// normalizing its theory representation. Maude's variant/narrowing rebuilds use
+/// `instantiate(..., false)`: a binding headed by the enclosing AC/AU operator stays nested until
+/// ordinary reduction visits the successor. That representation is rewrite-count observable.
+pub(crate) fn replace_and_instantiate_preserving_representation(
+    e: &mut Engine,
+    dag: DagId,
+    path: &[usize],
+    replacement: DagId,
+    values: &[Option<DagId>],
+) -> DagId {
+    if path.is_empty() {
+        return replacement;
+    }
+
+    enum Rep {
+        Free(SymbolId, Vec<DagId>),
+        Acu(SymbolId, Vec<(DagId, u32)>),
+        Au(SymbolId, Vec<DagId>),
+        Cui(SymbolId, Vec<DagId>),
+        S(SymbolId, Nat, DagId),
+        Leaf,
+    }
+    let rep = match &e.node(dag).term {
+        NodeTerm::Free { symbol, args } => Rep::Free(*symbol, args.clone()),
+        NodeTerm::Acu { symbol, args } => Rep::Acu(*symbol, args.clone()),
+        NodeTerm::Au { symbol, args } => Rep::Au(*symbol, args.clone()),
+        NodeTerm::Cui { symbol, args } => Rep::Cui(*symbol, args.clone()),
+        NodeTerm::S { symbol, count, arg } => Rep::S(*symbol, count.clone(), *arg),
+        NodeTerm::Na { .. } | NodeTerm::Var { .. } => Rep::Leaf,
+    };
+    let selected = path[0];
+    let instantiate_sibling = |e: &mut Engine, child| {
+        instantiate_preserving_representation(e, values, child).unwrap_or(child)
+    };
+    let build = |e: &mut Engine, term| {
+        let (sig, rt) = e.parts_mut();
+        rt.make_preserving_representation(sig, term)
+    };
+
+    match rep {
+        Rep::Free(symbol, mut args) => {
+            for (index, child) in args.iter_mut().enumerate() {
+                *child = if index == selected {
+                    replace_and_instantiate_preserving_representation(
+                        e,
+                        *child,
+                        &path[1..],
+                        replacement,
+                        values,
+                    )
+                } else {
+                    instantiate_sibling(e, *child)
+                };
+            }
+            build(e, NodeTerm::Free { symbol, args })
+        }
+        Rep::Acu(symbol, args) => {
+            let mut flat_index = 0;
+            let mut rebuilt = Vec::with_capacity(args.len() + 1);
+            for (child, multiplicity) in args {
+                let mut runs: Vec<(DagId, u32)> = Vec::new();
+                for _ in 0..multiplicity {
+                    let next = if flat_index == selected {
+                        replace_and_instantiate_preserving_representation(
+                            e,
+                            child,
+                            &path[1..],
+                            replacement,
+                            values,
+                        )
+                    } else {
+                        instantiate_sibling(e, child)
+                    };
+                    flat_index += 1;
+                    if let Some((prior, count)) = runs.last_mut()
+                        && *prior == next
+                    {
+                        *count += 1;
+                    } else {
+                        runs.push((next, 1));
+                    }
+                }
+                rebuilt.extend(runs);
+            }
+            build(
+                e,
+                NodeTerm::Acu {
+                    symbol,
+                    args: rebuilt,
+                },
+            )
+        }
+        Rep::Au(symbol, mut args) => {
+            for (index, child) in args.iter_mut().enumerate() {
+                *child = if index == selected {
+                    replace_and_instantiate_preserving_representation(
+                        e,
+                        *child,
+                        &path[1..],
+                        replacement,
+                        values,
+                    )
+                } else {
+                    instantiate_sibling(e, *child)
+                };
+            }
+            build(e, NodeTerm::Au { symbol, args })
+        }
+        Rep::Cui(symbol, mut args) => {
+            for (index, child) in args.iter_mut().enumerate() {
+                *child = if index == selected {
+                    replace_and_instantiate_preserving_representation(
+                        e,
+                        *child,
+                        &path[1..],
+                        replacement,
+                        values,
+                    )
+                } else {
+                    instantiate_sibling(e, *child)
+                };
+            }
+            build(e, NodeTerm::Cui { symbol, args })
+        }
+        Rep::S(symbol, count, arg) => {
+            debug_assert_eq!(selected, 0);
+            let arg = replace_and_instantiate_preserving_representation(
+                e,
+                arg,
+                &path[1..],
+                replacement,
+                values,
+            );
+            build(e, NodeTerm::S { symbol, count, arg })
+        }
+        Rep::Leaf => dag,
     }
 }
 

@@ -1,0 +1,10 @@
+*** N-probe-02-multi-root-zero-step — every disjunct is eligible for a zero-step =>* solution
+mod NARROW-MULTI-ROOT-ZERO is
+  sort S .
+  ops a b c : -> S .
+  rl [irrelevant] : a => c [narrowing] .
+endm
+
+set show timing off .
+*** expected: one zero-rewrite solution from the second initial state b
+vu-narrow in NARROW-MULTI-ROOT-ZERO : a \/ b =>* b .

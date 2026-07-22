@@ -19,12 +19,14 @@ decisions doc).
 - **Modules** (`tnk-modules`): import/flatten (`protecting`/`extending`/`including`), summation `+`, renaming.
 - **REPL** (`tnk-repl`): `reduce`/`match`/`xmatch`, `show`/`select`/`set trace`, file load, output line-wrapping.
 
-**Symbolic phases S1 + S2 complete (2026-07-19).** `tnk-core::unify` implements order-sorted unification
-modulo free/S/CUI/AC/ACU/A/AU; `tnk-core::variant` adds layered folding variant narrowing, irredundant
-subsumption, variant unification, matching, blockers, and centralized fresh-variable families. All
-object-level and current/legacy `metaUnify*`/`metaVariant*` surfaces are live, including resumable command
-enumeration and persistent meta caches. Durable gates: S1 is 27/27 fixtures and 676 byte-exact commands;
-S2 is 21/21 and 289. S3 narrowing is READY and next, with 15 frozen fixtures and 168 primary commands.
+**Symbolic phase S complete (2026-07-21).** `tnk-core::unify` implements order-sorted unification modulo
+free/S/CUI/AC/ACU/A/AU; `tnk-core::variant` provides layered variants, subsumption, filtered variant
+unification/matching, and the shared one-step machinery; `tnk-core::narrow` owns the rooted, resumable v3
+narrowing graph with fold/vfold, history, paths, goal unification, and centralized fresh-variable
+families. Object commands, continuations/state displays, current and legacy `metaUnify*`/`metaVariant*`,
+the in-scope `metaNarrow*` operations, and their persistent caches are live. Durable byte-exact gates:
+S1 is 27/27 fixtures and 676 commands; S2 is 21/21 and 289; the live S3 gate is 16/16 (15 completion
+fixtures plus one post-close regression), and all 169 primary commands also pass independently.
 
 **Phase 2 in progress.** Pillar A (the *rewriting* layer) is **done**: rules (`rl`/`crl` incl. the rewrite
 `=>` condition), `rewrite`/`frewrite`, `search` (+ state graph, `such that`, `show path`/`graph`),
@@ -40,8 +42,15 @@ library `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* **the reflection core**: `META-LEV
 family (`metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/`metaSearchPath`/… + the
 `format`-attribute display) computes byte-identically. The META `up*`/query/parse layer, the strategy
 language, LEXICAL hooks, and the object system (`omod`/`erewrite`/STD-STREAM) have since landed too.
+**Next: phase T / SMT.** T0 has bound the optional `z3` 0.20.2 backend; T0a must now seed the
+non-debug `smtTest`/manual fixtures before production code. The core through mandatory
+`metaCheck`/`metaSmtSearch` is specified in `remaining-plans/04-smt.md`. The external 2016
+variant-satisfiability prototype is now recovered and checksum-pinned; because it targets Maude 2.7
+and has no explicit prototype-source license, T6 uses it as an executable oracle for a new native
+Rust decision procedure behind a source-compatible `VAR-SAT-TOOL` facade.
+
 **The verified current state — including every known deviation — is `../../fable-audit.md`** (status
-refreshed 2026-07-19); the forward plan is `roadmap.md`.
+refreshed 2026-07-21); the forward plan is `roadmap.md`.
 
 ## Crate layout
 
@@ -65,6 +74,8 @@ tnk-repl      the interactive shell (lib + bin); reuses everything below
 | `../../fable-audit.md` | conformance ground truth | the 2026-07-01 differential audit vs Maude 3.5.1 — verified deviations, missing features, non-obvious fix constraints (supersedes the retired `gaps.md`) |
 | `roadmap.md` | remaining plan | correctness-first completion plan (post-audit): panics/wrong values → counts → input acceptance → the two architecture reworks → diagnostics/tool surface → new subsystems |
 | `correctness-goal.md` | goal contract | the frozen fixture manifest + scoreboard metric, decision defaults, and completion criteria driving the correctness goal (`/goal`) |
+| `subsystems-goal.md` | active goal contract | completed S ledger; T/M/I scope, invariants, manifests, and gates |
+| `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, and model checking |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 
 The detailed **current behavior** lives in the code (the crates carry thorough module/function doc comments);

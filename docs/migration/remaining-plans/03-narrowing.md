@@ -1,11 +1,20 @@
-# Phase S3 — Narrowing (`vu-narrow` / `fvu-narrow` + meta counterparts) — implementation plan
+# Phase S3 — Narrowing (`vu-narrow` / `fvu-narrow` + meta counterparts) — implementation record
 
-**Status: READY (inventory refreshed 2026-07-19; no S3 code written).** This is the S3 item of the
-subsystems goal (`docs/migration/subsystems-goal.md` §2, Phase S). S1 order-sorted unification and S2
-folding variants are closed, including A/AU, incompleteness propagation, persistent meta caches, and
-fresh-family alternation; all hard prerequisites are present. The former fixture and legacy-surface
-decisions are resolved in §8. Scope remains **variant-based narrowing, v3 semantics**, with only the
-oracle-compatible legacy `metaNarrow` boundary retained.
+**Status: DONE (2026-07-21).** `crates/tnk-core/src/narrow.rs` owns the rooted, resumable symbolic
+state graph, folding/history, goal search, and source-rule descriptors; shared variant-narrowing steps
+and filtered-unifier machinery remain in `variant.rs`. `tnk-repl` implements every object command,
+continuation, counter, trace, and state/path display. `tnk-modules/src/meta.rs` implements
+`metaNarrowingApply`, sequence/path search, persistent caches, and the oracle-compatible v3 adapter for
+legacy `metaNarrow`; retired `metaNarrow2` remains deliberately inert per §8.2. The implementation
+consolidates the planned `narrow/sequence.rs` + `narrow/folder.rs` split into one cohesive graph module.
+
+`tools/subsystems-scoreboard.sh -p N` verifies the **15/15 completion fixtures plus one post-close
+regression (live gate 16/16)**, and `tools/diffmaude-command.py` verifies all **169/169** current primary
+commands independently, byte-for-byte against Maude 3.5.1. Simultaneous frozen gates: U 27/27,
+V 21/21, audit 77/77, legacy 87/87, **397** release tests, and all three stock libraries. No S3
+timeout, fixture exclusion, accepted divergence, deferred in-scope hook, or command-specific output
+branch remains. The staged plan below preserves the preimplementation source/behavior map;
+present-tense “missing” claims are historical.
 
 All reference citations are into `~/code/maude-lang/maude/src/`; all tnk citations into
 `/Users/dai/Downloads/tambanokano/`. Behaviour claims were confirmed against the live oracle
@@ -41,10 +50,12 @@ the start term is the goal pattern reachable?".
 | meta `metaNarrowingSearchPath` | + full narrowing trace | `NarrowingSequenceSearch3` + `KEEP_HISTORY` |
 | meta legacy `metaNarrow` | classic (v1) narrowing, `ResultTriple` | `NarrowingSequenceSearch` **(v1!)** |
 
-### What the 15 N* fixtures exercise (168 substantive primary commands; frozen manifest, `subsystems-goal.md` §2)
+### What the 15-fixture completion manifest plus current post-close regression exercise (169 substantive primary commands)
 
 - **N-probe-01** (free `COUNT`, one narrowing rule `X => s(X)`): `=>1/=>*/=>!`, bounded/unbounded,
   and no-solution behavior. Its formerly nonterminating fourth command is now depth-bounded at 3 (§8).
+- **N-probe-02** (post-close, free disjunction): guards `=>*` zero-step enumeration from every initial
+  disjunct; this grew the live N gate to 16 fixtures without altering the completion contract.
 - **N01-narrow** (`BAZ`: free ops + one `[variant]` equation; `FOO`: one free rule): `vu-narrow` /
   `fvu-narrow`, `=>*/=>+/=>!`, depth bounds, `set show breakdown on`.
 - **N02-narrow2**: `R&W` (free + `NAT`, `{fold}`/`{vfold}`, `\/` disjunction, `show most general/frontier
@@ -476,11 +487,12 @@ high-risk long pole. All three now depend on S2 order fidelity, not missing S1 t
 
 ## 7. Verification and completion criteria
 
-S3 is complete only when all of the following hold on one working tree:
+S3 closed on 2026-07-21 with all of the following holding on one working tree:
 
-1. `tools/subsystems-scoreboard.sh -p N` reports **15/15 PASS**, with no timeout, removed command,
-   accepted divergence, or new normalization. All **168** substantive primary commands also pass
-   through `tools/diffmaude-command.py` in isolation where the command is self-contained; stateful
+1. At S3 close, `tools/subsystems-scoreboard.sh -p N` reported **15/15 PASS**, with no timeout, removed
+   command, accepted divergence, or new normalization. The post-close multi-root regression grows the
+   live gate to **16/16**. All **169** current substantive primary commands pass through
+   `tools/diffmaude-command.py` in isolation where the command is self-contained; stateful
    `show`/`continue` sequences remain covered by their full fixtures.
 2. Exact output includes solution/state order, state numbers, parent/path history, accumulated
    substitutions, variant unifiers, fresh families, rewrite/breakdown counts, incompleteness, frontier
@@ -491,11 +503,12 @@ S3 is complete only when all of the following hold on one working tree:
    behavior. Keep a slow unfolded breadth-first reference path live as a differential cross-check until
    the byte-exact N gate closes.
 4. Existing gates remain green simultaneously: U **27/27**, V **21/21**, audit **77/77**, legacy
-   **87/87**, `cargo test --release` (current baseline 394 tests), and all three stock libraries.
+   **87/87**, `cargo test --release` (**397 passed**), and all three stock libraries.
 5. Object commands, `continue`, all `show …states/path` commands, current meta operations, and legacy
-   `metaNarrow` are reachable end to end; no declared S3 operation remains in `MetaOp::Deferred`.
-6. Refresh `subsystems-goal.md`, `roadmap.md`, `README.md`, `fable-audit.md`, and this plan's status/ledger
-   with observed fixture and command totals. Do not begin SMT, model checking, or session extraction.
+   `metaNarrow` are reachable end to end; no declared in-scope S3 operation remains in
+   `MetaOp::Deferred`.
+6. `subsystems-goal.md`, `roadmap.md`, `README.md`, `fable-audit.md`, and this implementation record
+   carry the observed completion state. SMT, model checking, and session extraction remain untouched.
 
 ---
 

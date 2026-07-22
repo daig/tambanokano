@@ -208,18 +208,32 @@ Ordered by (dependency, size); references are the kept deep-dives.
 - **G1. Strategy-meta tail** (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`,
   `metaSrewrite`). Prerequisites are structural, not incidental (§3.9.8): meta-constructor resolution by
   result sort, and preserving the un-desugared surface strategy form through resolution. Also fixes the
-  §3.2 `upModule`-of-`smod` wrong result (SModule/strat-decl omission). Small relative to G2–G4; do first.
-- **G2. Symbolic:** S0 (BDD/AllSat spike), S1 (order-sorted unification modulo
-  free/S/CUI/AC/ACU/A/AU), and S2 (folding variants, variant unification/matching, and all
-  `metaVariant*` surfaces) are complete. Durable gates: S1 is 27/27 fixtures and 676 byte-exact
-  commands; S2 is 21/21 and 289. S3 narrowing is **READY** with a frozen 15-fixture,
-  168-primary-command manifest and binding decisions in `remaining-plans/03-narrowing.md`; it is the
-  only remaining symbolic dependency-chain item and completes the `metaNarrow*` descent tier.
-- **G3. SMT** (`check`, `smt-search`) over **D7** (`z3` trait backend); variant satisfiability as a
-  `.maude` library on top of G2.
-- **G4. Model checking:** LTL→Büchi (Gastin-Oddoux) + nested DFS with counterexamples; SAT-solver hook
-  for the `SatSolverSymbol`/`ModelCheckerSymbol` id-hooks so `model-checker.maude` loads. Reference:
-  `reports/A8`.
+  §3.2 `upModule`-of-`smod` wrong result (SModule/strat-decl omission). Still open. Its former “do first”
+  ordering was superseded by the newer `subsystems-goal.md` contract; it does not block T or M, but remains
+  a prerequisite for faithful strategy reflection and should precede G7.
+- **G2. Symbolic — complete (2026-07-21):** S0 (BDD/AllSat spike), S1 (order-sorted unification modulo
+  free/S/CUI/AC/ACU/A/AU), S2 (folding variants and variant unification/matching), and S3 (v3
+  variant-based narrowing, folding/filtering/history, paths/continuations, and all in-scope
+  `metaNarrow*` surfaces). Durable gates: S1 is 27/27 fixtures and 676 byte-exact commands; S2 is
+  21/21 and 289; the live S3 gate is 16/16 (15 completion fixtures plus one post-close regression),
+  with all 169 primary commands passing independently. The implementation record and binding decisions
+  are in `remaining-plans/03-narrowing.md`.
+- **G3. SMT — next:** T0 bound D7 on `z3` 0.20.2; T0a must now seed/freeze the non-debug
+  `smtTest` + manual fixture manifest before production code. T1–T5 deliver the 25 hooks, exact SMT
+  number leaves, shipped `smt.maude`, `check`, root-only constraint-bearing `smt-search`, and mandatory
+  `metaCheck`/`metaSmtSearch`. z3 is feature-gated; the default build remains pure Rust and
+  parse/load/degrades the surface. T6 is independent of the solver core and uses completed G2: the
+  official 2016 variant-satisfiability package is now checksum-pinned as an executable oracle, while
+  production is a new native Rust constructor-variant/OS-compact decision procedure behind a thin
+  `VAR-SAT-TOOL` Maude facade. No unlicensed prototype source is copied, and T6 does not wait on z3
+  or model checking. Contract: `subsystems-goal.md` §2; implementation plan:
+  `remaining-plans/04-smt.md`.
+- **G4. Model checking — planned after G3 (independent, so parallel-safe):** M0 first seeds/freeze the
+  reference/manual manifest. Then port the exact Gastin–Oddoux automata + nested DFS, refactor the
+  conformance-verified rewrite successor core into a shared `StateGraph`, bind
+  `SatSolverSymbol`/`ModelCheckerSymbol`, and finish byte-exact counterexample lassos plus
+  `satSolve`/`tautCheck` prime implicants. Plan: `remaining-plans/05-model-checking.md`; reference:
+  `reports/A8-symbolic-smt-ltl.md`.
 - **G5. Meta-interpreters** (`metaInterpreter.maude`): separate `Engine` instances communicating by
   term translation, per **D1**. Reference: `reports/A7`.
 - **G6. Prelude tail + IO stance.** The `LEXICAL` `printTokens`/`tokenize` hooks are implemented; remaining
@@ -253,12 +267,12 @@ generations — the drop list in `01-architecture-map.md` §5 stands).
    with evidence, not aspiration.
 6. **BDD backend maturity — resolved for S0/S1.** The D6 spike selected `biodivine-lib-bdd`; the production
    `SortBdds`/AllSat path is covered by S1.
-7. **Incompleteness propagation.** AU produces and `metaUnify` preserves the flag; S2 carries it
-   through variants and `metaVariant*`; narrowing must preserve the same field through its final layer.
-8. **Fresh-variable families — centralized.** `tnk-core/src/fresh.rs` owns `#n`/`%n`/`@n`; S2 consumes
-   it and S3 must reuse it rather than introduce local counters.
-9. **Search/state-graph memory** (unchanged) — the state graph needs the same GC discipline the
-   re-entrant reducer got.
+7. **Incompleteness propagation — resolved through S3.** AU produces the flag; unification, variants,
+   narrowing object results, and the corresponding meta result constructors preserve it end to end.
+8. **Fresh-variable families — resolved and centralized.** `tnk-core/src/fresh.rs` owns
+   `#n`/`%n`/`@n`; variants and narrowing share it, including the byte-visible family alternation.
+9. **Search/state-graph memory — resolved for S3.** Retained states own `RootGuard`s; descendant
+   eviction and session/cache teardown release those roots under the existing arena-GC discipline.
 
 ## Conformance strategy (unchanged in spirit, upgraded in mechanism)
 
