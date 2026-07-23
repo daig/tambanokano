@@ -370,7 +370,9 @@ fix and regression-cover it rather than defer it.
 - [x] M4 nested DFS + synthetic System gate — c4a14a2 (5 focused exact-lasso,
   proposition-memo, and successor-order tests; M 0/10 inert; cargo 436/436, audit 77/77,
   legacy 87/87)
-- [ ] M5 shared StateGraph + hooks + toggle slice —
+- [x] M5 shared StateGraph + hooks + toggle slice — 6afb47d (M01/M03 byte-exact;
+  shared graph/search fixture and typed-stats tests pass; shipped library checksum pinned; M 5/10
+  with M02/M04/M06 also conforming; cargo 437/437, audit 77/77, legacy 87/87)
 - [ ] M6 complete modelCheck fixture closure —
 - [ ] M7 satSolve/tautCheck fixture closure —
 - [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
