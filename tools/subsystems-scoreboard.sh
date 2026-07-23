@@ -2,10 +2,10 @@
 # tools/subsystems-scoreboard.sh — the subsystems-goal progress metric
 # (docs/migration/subsystems-goal.md §1.2).
 #
-# Runs every fixture in conformance/subsystems/*.maude through tools/diffmaude.sh
-# (same harness and normalization as the audit scoreboard; per-fixture 60s timeout
-# on each side, a timeout is a FAIL attributed to whichever side hung), prints one
-# PASS/FAIL line per fixture and a final
+# Runs ordinary fixtures through tools/diffmaude.sh. T11 uses the dedicated native
+# value/sort contract checker because its authoritative oracle is the external Maude-2.7
+# prototype, not the Maude-3.5 binary used by the global differential harness.
+# Prints one PASS/FAIL line per fixture and a final
 #   SUBSYSTEMS <n>/<m> PASS
 # Exit 0 iff n = m. ID prefixes: U* unification, V* variants, N* narrowing,
 # T* SMT, M* model checker, I* meta-interpreters (local mode).
@@ -37,7 +37,11 @@ for f in "$ROOT"/conformance/subsystems/"$prefix"*.maude; do
   [ -e "$f" ] || { echo "no fixtures found in conformance/subsystems/" >&2; exit 2; }
   id=$(basename "$f" .maude)
   total=$((total + 1))
-  out=$("$ROOT"/tools/diffmaude.sh "$f" 2>&1)
+  if [ "$id" = "T11-variant-satisfiability" ]; then
+    out=$("$ROOT"/tools/variant-sat-check.sh "$f" 2>&1)
+  else
+    out=$("$ROOT"/tools/diffmaude.sh "$f" 2>&1)
+  fi
   rc=$?
   case $rc in
     0) echo "PASS $id"; pass=$((pass + 1)) ;;

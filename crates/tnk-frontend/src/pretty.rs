@@ -16,6 +16,7 @@ use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use std::borrow::Cow;
 use tnk_core::Nat;
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
+use tnk_core::smt::SmtNumber;
 use tnk_core::sort::KindId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
@@ -153,6 +154,7 @@ enum Work<'a, 't> {
         lcap: Cap,
         rcap: Cap,
         range_known: bool,
+        top_level: bool,
     },
 }
 
@@ -184,6 +186,7 @@ impl<'a> Printer<'a> {
             lcap: NONE_CAP,
             rcap: NONE_CAP,
             range_known: false,
+            top_level: true,
         }];
         let mut pieces: Vec<Work<'a, 't>> = Vec::new();
         // The `format`-attribute indentation level (in spaces), shifted by `+`/`-` directives as the walk
@@ -207,8 +210,17 @@ impl<'a> Printer<'a> {
                     lcap,
                     rcap,
                     range_known,
+                    top_level,
                 } => {
-                    self.layout(item, req_prec, lcap, rcap, range_known, &mut pieces);
+                    self.layout(
+                        item,
+                        req_prec,
+                        lcap,
+                        rcap,
+                        range_known,
+                        top_level,
+                        &mut pieces,
+                    );
                     stack.extend(pieces.drain(..).rev());
                 }
             }
@@ -224,6 +236,7 @@ impl<'a> Printer<'a> {
         lcap: Cap,
         rcap: Cap,
         range_known: bool,
+        top_level: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
         match item {
@@ -265,19 +278,20 @@ impl<'a> Printer<'a> {
                     self.layout_iter(*symbol, &count, Item::Term(arg), req_prec, lcap, rcap, out);
                 }
             }
-            // A built-in literal renders exactly as its DAG leaf would (string/qid/float).
-            Item::Term(Term::Na { value, .. }) => {
+            // A built-in literal renders exactly as its DAG leaf would.
+            Item::Term(Term::Na { symbol, value }) => {
                 let text = match value {
                     NaValue::Str(s) => render_string(s),
                     NaValue::Qid(q) => render_qid(q),
                     NaValue::Float(bits) => render_float(f64::from_bits(*bits)),
+                    NaValue::SmtNum(number) => self.smt_number_text(*symbol, number),
                 };
                 out.push(Work::Text {
                     cat: Cat::Lit,
                     text: Cow::Owned(text),
                 });
             }
-            Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, range_known, out),
+            Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, range_known, top_level, out),
         }
     }
 
@@ -291,6 +305,7 @@ impl<'a> Printer<'a> {
         lcap: Cap,
         rcap: Cap,
         range_known: bool,
+        top_level: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
         let symbol = self.m.engine.node(d).symbol();
@@ -302,6 +317,7 @@ impl<'a> Printer<'a> {
                 NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
                 NodeRepr::Qid(q) => Some(Leaf::Atom(render_qid(q))),
                 NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
+                NodeRepr::SmtNum(number) => Some(Leaf::Atom(self.smt_number_text(symbol, number))),
                 // A genuine variable leaf (symbolic-engine DAGs): `base:Sort`, the form Maude
                 // prints for a `VariableDagNode` (only fresh `#n`/`%n`/`@n` variables survive into
                 // printed unifiers, and those always print with their sort).
@@ -332,7 +348,24 @@ impl<'a> Printer<'a> {
                 text: Cow::Owned(text),
             }),
             Some(Leaf::Iter { count, arg }) => {
-                self.layout_iter(symbol, &count, Item::Dag(arg), req_prec, lcap, rcap, out)
+                // A Nat numeral is a pseudo literal. In an unknown-range context Maude qualifies it only
+                // if two kinds provide integer syntax (for example NAT plus SMT integers), or a nullary
+                // user operator has the same numeric spelling.
+                if !top_level
+                    && !range_known
+                    && self.m.nat_succ == Some(symbol)
+                    && self.is_zero(arg)
+                    && (self.m.integer_literal_kind_count > 1
+                        || self.m.overloaded_naturals.contains(&count))
+                {
+                    let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
+                    out.push(Work::Text {
+                        cat: Cat::Lit,
+                        text: Cow::Owned(format!("({count}).{sort}")),
+                    });
+                } else {
+                    self.layout_iter(symbol, &count, Item::Dag(arg), req_prec, lcap, rcap, out);
+                }
             }
             None => {
                 let children: Vec<DagId> = self.m.engine.node(d).children().collect();
@@ -401,6 +434,7 @@ impl<'a> Printer<'a> {
         arg_rk: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
+        let command_arguments = self.m.engine.symbol(symbol).is_meta_operation();
         let Some(syn) = self.m.syntax.get(&symbol) else {
             // No recorded syntax (should not happen for a user op): prefix-print with the kernel name.
             out.push(Work::Text {
@@ -408,7 +442,7 @@ impl<'a> Printer<'a> {
                 text: Cow::Borrowed(self.m.engine.symbol(symbol).name()),
             });
             if !children.is_empty() {
-                self.layout_arg_list(children, arg_rk, out);
+                self.layout_arg_list(children, arg_rk, command_arguments, out);
             }
             return;
         };
@@ -440,7 +474,7 @@ impl<'a> Printer<'a> {
                 text: Cow::Owned(name),
             });
             if !children.is_empty() {
-                self.layout_arg_list(children, arg_rk, out);
+                self.layout_arg_list(children, arg_rk, command_arguments, out);
             }
             return;
         }
@@ -464,7 +498,16 @@ impl<'a> Printer<'a> {
         } else {
             (lcap, rcap)
         };
-        self.layout_mixfix(syn, &pg, children, lcap, rcap, arg_rk, out);
+        self.layout_mixfix(
+            syn,
+            &pg,
+            children,
+            lcap,
+            rcap,
+            arg_rk,
+            command_arguments,
+            out,
+        );
         if paren {
             out.push(Work::Text {
                 cat: Cat::Punct,
@@ -485,6 +528,7 @@ impl<'a> Printer<'a> {
         lcap: Cap,
         rcap: Cap,
         arg_rk: bool,
+        command_arguments: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
         let nr_args = syn.domain.len();
@@ -531,7 +575,8 @@ impl<'a> Printer<'a> {
                     req_prec: bound,
                     lcap: NONE_CAP,
                     rcap: NONE_CAP,
-                    range_known: arg_rk,
+                    range_known: arg_rk || (command_arguments && self.is_nonzero_nat_item(*c)),
+                    top_level: false,
                 });
             }
             if let Some(f) = format {
@@ -567,7 +612,10 @@ impl<'a> Printer<'a> {
                     let text = self.i.resolve(*s);
                     let special = matches!(text, "(" | ")" | "[" | "]" | "{" | "}");
                     let default_space = if object_colons && text == ":" {
-                        matches!(pos.checked_sub(1).and_then(|p| syn.frags.get(p)), Some(Frag::Hole))
+                        matches!(
+                            pos.checked_sub(1).and_then(|p| syn.frags.get(p)),
+                            Some(Frag::Hole)
+                        )
                     } else {
                         !(no_space || special || text == ",")
                     };
@@ -592,7 +640,9 @@ impl<'a> Printer<'a> {
                         req_prec: pg.gather[k],
                         lcap: lc,
                         rcap: rc,
-                        range_known: arg_rk,
+                        range_known: arg_rk
+                            || (command_arguments && self.is_nonzero_nat_item(children[k])),
+                        top_level: false,
                     });
                     k += 1;
                     no_space = false;
@@ -718,6 +768,7 @@ impl<'a> Printer<'a> {
                 lcap: NONE_CAP,
                 rcap: NONE_CAP,
                 range_known: true,
+                top_level: false,
             });
             out.push(Work::Text {
                 cat: Cat::Punct,
@@ -734,6 +785,7 @@ impl<'a> Printer<'a> {
         &self,
         children: &[Item<'t>],
         arg_rk: bool,
+        command_arguments: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
         out.push(Work::Text {
@@ -753,13 +805,30 @@ impl<'a> Printer<'a> {
                 req_prec: PREFIX_GATHER,
                 lcap: NONE_CAP,
                 rcap: NONE_CAP,
-                range_known: arg_rk,
+                range_known: arg_rk || (command_arguments && self.is_nonzero_nat_item(*c)),
+                top_level: false,
             });
         }
         out.push(Work::Text {
             cat: Cat::Punct,
             text: Cow::Borrowed(")"),
         });
+    }
+
+    /// Nonzero Nat pseudo literals in META command arguments retain their source-style bare spelling.
+    /// Zero is an ordinary constant and still receives Maude's `(0).Zero` disambiguation when required.
+    fn is_nonzero_nat_item(&self, item: Item<'_>) -> bool {
+        match item {
+            Item::Dag(d) => {
+                let node = self.m.engine.node(d);
+                self.m.nat_succ == Some(node.symbol())
+                    && matches!(node.repr(), NodeRepr::Iter { arg, .. } if self.is_zero(arg))
+            }
+            Item::Term(Term::Iter { symbol, arg, .. }) => {
+                self.m.nat_succ == Some(*symbol) && self.is_zero_term(arg)
+            }
+            Item::Term(_) => false,
+        }
     }
 
     /// Whether `arg` is the module's zero constant (so a successor over it is a numeral).
@@ -806,6 +875,16 @@ impl<'a> Printer<'a> {
             Some(syn) => syn.frags.iter().map(|f| self.frag_text(f)).collect(),
             None => self.m.engine.symbol(symbol).name().to_string(),
         }
+    }
+
+    fn smt_number_text(&self, symbol: SymbolId, number: &SmtNumber) -> String {
+        let range = self.m.syntax[&symbol].range;
+        let kind = self
+            .m
+            .engine
+            .smt_type(range)
+            .expect("SMT number symbol without range metadata");
+        number.to_maude(kind)
     }
 
     /// The compact `num/den` text of a `DivisionSymbol` rational special constant (Maude's

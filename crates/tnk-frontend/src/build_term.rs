@@ -15,6 +15,7 @@ use crate::lex::{Interner, Token};
 use crate::sig::syntax::BuiltModule;
 use tnk_core::dag::DagId;
 use tnk_core::engine::Engine;
+use tnk_core::smt::SmtNumber;
 use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
@@ -119,6 +120,12 @@ pub fn build_term(
                 division,
                 vec![numerator, numeral_term(succ, zero, den)?],
             ))
+        }
+        Action::MakeSmtNumber { symbol, kind } => {
+            let text = tokens[tree.start].text(i);
+            let value =
+                SmtNumber::parse(text, kind).ok_or_else(|| format!("bad SMT number `{text}`"))?;
+            Ok(Term::smt_number(symbol, value))
         }
         Action::MakeIter(sym) => {
             let text = tokens[tree.start].text(i);
@@ -379,6 +386,12 @@ fn build_dag_inner(
             };
             let denominator = build_iter_dag(engine, succ, base, den)?;
             Ok(engine.make_node(division, vec![numerator, denominator]))
+        }
+        Action::MakeSmtNumber { symbol, kind } => {
+            let text = tokens[tree.start].text(i);
+            let value =
+                SmtNumber::parse(text, kind).ok_or_else(|| format!("bad SMT number `{text}`"))?;
+            Ok(engine.make_smt_number(symbol, value))
         }
         Action::MakeIter(sym) => {
             let text = tokens[tree.start].text(i);

@@ -42,15 +42,18 @@ library `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* **the reflection core**: `META-LEV
 family (`metaReduce`/`metaRewrite`/`metaApply`/`metaMatch`/`metaSearch`/`metaSearchPath`/… + the
 `format`-attribute display) computes byte-identically. The META `up*`/query/parse layer, the strategy
 language, LEXICAL hooks, and the object system (`omod`/`erewrite`/STD-STREAM) have since landed too.
-**Next: phase T / SMT.** T0 has bound the optional `z3` 0.20.2 backend; T0a must now seed the
-non-debug `smtTest`/manual fixtures before production code. The core through mandatory
-`metaCheck`/`metaSmtSearch` is specified in `remaining-plans/04-smt.md`. The external 2016
-variant-satisfiability prototype is now recovered and checksum-pinned; because it targets Maude 2.7
-and has no explicit prototype-source license, T6 uses it as an executable oracle for a new native
-Rust decision procedure behind a source-compatible `VAR-SAT-TOOL` facade.
+**Phase T / SMT complete (2026-07-23).** The optional z3 lane implements the full typed SMT
+language, exact number leaves, query-local incremental `check`, root-only constraint-bearing
+`smt-search`, `continue`, and cached `metaCheck`/`metaSmtSearch`; T01–T10 are byte-exact over all
+118 frozen commands. The default build remains pure Rust and degrades those solver queries to
+`undecided`/no solutions. Native FVP/OS-compact variant satisfiability and the source-compatible
+`VAR-SAT-TOOL` facade pass 27/27 contract results without z3, model checking, or copied prototype
+source; the untouched pinned Maude-2.7 oracle also passes its separately recorded 27 results.
+The complete Phase-T scoreboard is **11/11 PASS**. **Next serial phase: M0 model-checker fixture
+seeding.**
 
-**The verified current state — including every known deviation — is `../../fable-audit.md`** (status
-refreshed 2026-07-21); the forward plan is `roadmap.md`.
+**The verified current state—including every known deviation—is `../../fable-audit.md`** (status
+refreshed 2026-07-23); the forward plan is `roadmap.md`.
 
 ## Crate layout
 

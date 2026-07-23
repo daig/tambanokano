@@ -12,6 +12,7 @@ pub mod build;
 pub mod prec_gather;
 
 use crate::lex::Sym;
+use tnk_core::smt::SmtType;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::SymbolId;
 
@@ -117,6 +118,11 @@ pub enum Action {
     MakeRational {
         division: SymbolId,
         minus: SymbolId,
+    },
+    /// Build an exact `SMT_NumberSymbol` leaf from the integer/rational token class for `kind`.
+    MakeSmtNumber {
+        symbol: SymbolId,
+        kind: SmtType,
     },
     MakeFloat(SymbolId),
     MakeString(SymbolId),

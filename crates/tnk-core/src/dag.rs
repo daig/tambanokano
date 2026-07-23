@@ -10,6 +10,7 @@
 //! desync the cached sort).
 
 use crate::id::Id;
+use crate::smt::SmtNumber;
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 
@@ -123,6 +124,8 @@ pub enum NaValue {
     /// float ops are free (never AC, so `dag_compare` is not exercised on floats) and `==` on floats is
     /// not used (the float relational ops compare values directly).
     Float(u64),
+    /// An exact SMT integer/rational literal (`SMT_NumberSymbol`).
+    SmtNum(std::rc::Rc<SmtNumber>),
 }
 
 /// Compare two string byte sequences exactly as Maude's `Rope::compare` does — as sequences of **signed**
@@ -155,6 +158,8 @@ pub enum NodeRepr<'a> {
     Qid(&'a str),
     /// A float constant's value.
     Float(f64),
+    /// An exact SMT integer/rational constant.
+    SmtNum(&'a SmtNumber),
     /// A variable ([`NodeTerm::Var`]): `name` is the interned base-name token code the frontend
     /// resolves to text; the sort for the printed `name:Sort` form is the node's [`sort`](DagNode::sort).
     Var { name: u32 },
@@ -255,6 +260,7 @@ impl DagNode {
                 NaValue::Str(s) => NodeRepr::Str(s),
                 NaValue::Qid(q) => NodeRepr::Qid(q),
                 NaValue::Float(bits) => NodeRepr::Float(f64::from_bits(*bits)),
+                NaValue::SmtNum(number) => NodeRepr::SmtNum(number),
             },
             NodeTerm::Var { name, .. } => NodeRepr::Var { name: *name },
         }

@@ -1,0 +1,18 @@
+*** T10-fresh-names — object SMT-search fresh-variable spelling, source base names, numbering, and accumulated constraints
+set show timing off .
+load smt
+
+mod SMT-FRESH-PROBES is
+  pr INTEGER .
+  sorts Token State .
+  op seed : Integer -> State .
+  op branch : Integer Token -> State .
+  op done : Integer Token Token -> State .
+  vars I J : Integer .
+  vars X Y : Token .
+  crl [first] : seed(I) => branch(I + 1, X) if I < 0 = true [nonexec] .
+  crl [second] : branch(I, X) => done(I + 1, X, Y) if I < 1 = true [nonexec] .
+endm
+
+smt-search [3] seed(-1) =>* S:State .
+smt-search [2] seed(J) =>+ S:State .

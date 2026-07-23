@@ -1,0 +1,102 @@
+fmod VAR-SAT is
+  protecting META-LEVEL .
+  protecting BOOL .
+
+  sorts PosLit NegLit Lit PosConj NegConj Conj DNF Form
+        EmptyConjSet PosConjSet NegConjSet ConjSet .
+  subsort PosLit < PosConj < Conj PosConjSet .
+  subsort NegLit < NegConj < Conj NegConjSet .
+  subsorts PosLit NegLit < Lit < Conj < ConjSet .
+  subsort Conj < DNF < Form .
+  subsort EmptyConjSet < PosConjSet NegConjSet < ConjSet .
+
+  op _==?_ : Term Term -> PosLit [ctor prec 70] .
+  op _=!?_ : Term Term -> NegLit [ctor prec 70] .
+  op _/\_ : PosConj PosConj -> PosConj [ctor prec 80 assoc comm] .
+  op _/\_ : NegConj NegConj -> NegConj [ctor ditto] .
+  op _/\_ : Conj Conj -> Conj [ctor ditto] .
+  op _/\_ : Form Form -> Form [ctor ditto] .
+  op _\/_ : DNF DNF -> DNF [ctor prec 80 assoc comm] .
+  op _\/_ : Form Form -> Form [ditto] .
+  op ~_ : Form -> Form .
+  op _=>_ : Form Form -> Form .
+  op _<=>_ : Form Form -> Form .
+
+  op var-sat : FModule DNF -> Bool
+    [special (
+      id-hook MetaLevelOpSymbol (variantSat)
+      op-hook eqFormulaSymbol (_==?_ : Term Term ~> PosLit)
+      op-hook neqFormulaSymbol (_=!?_ : Term Term ~> NegLit)
+      op-hook formulaAndPosSymbol (_/\_ : PosConj PosConj ~> PosConj)
+      op-hook formulaAndNegSymbol (_/\_ : NegConj NegConj ~> NegConj)
+      op-hook formulaAndConjSymbol (_/\_ : Conj Conj ~> Conj)
+      op-hook formulaAndFormSymbol (_/\_ : Form Form ~> Form)
+      op-hook formulaOrDnfSymbol (_\/_ : DNF DNF ~> DNF)
+      op-hook formulaOrFormSymbol (_\/_ : Form Form ~> Form)
+      op-hook formulaNotSymbol (~_ : Form ~> Form)
+      op-hook formulaImpliesSymbol (_=>_ : Form Form ~> Form)
+      op-hook formulaIffSymbol (_<=>_ : Form Form ~> Form))] .
+
+  op var-sat : FModule SortSet SortSet DNF -> Bool
+    [special (
+      id-hook MetaLevelOpSymbol (variantSatWithSorts)
+      op-hook eqFormulaSymbol (_==?_ : Term Term ~> PosLit)
+      op-hook neqFormulaSymbol (_=!?_ : Term Term ~> NegLit)
+      op-hook formulaAndPosSymbol (_/\_ : PosConj PosConj ~> PosConj)
+      op-hook formulaAndNegSymbol (_/\_ : NegConj NegConj ~> NegConj)
+      op-hook formulaAndConjSymbol (_/\_ : Conj Conj ~> Conj)
+      op-hook formulaAndFormSymbol (_/\_ : Form Form ~> Form)
+      op-hook formulaOrDnfSymbol (_\/_ : DNF DNF ~> DNF)
+      op-hook formulaOrFormSymbol (_\/_ : Form Form ~> Form)
+      op-hook formulaNotSymbol (~_ : Form ~> Form)
+      op-hook formulaImpliesSymbol (_=>_ : Form Form ~> Form)
+      op-hook formulaIffSymbol (_<=>_ : Form Form ~> Form)
+      op-hook emptySortSetSymbol (none : ~> SortSet)
+      op-hook sortSetSymbol (_;_ : SortSet SortSet ~> SortSet))] .
+
+  op var-valid : FModule DNF -> Bool
+    [special (
+      id-hook MetaLevelOpSymbol (variantValid)
+      op-hook eqFormulaSymbol (_==?_ : Term Term ~> PosLit)
+      op-hook neqFormulaSymbol (_=!?_ : Term Term ~> NegLit)
+      op-hook formulaAndPosSymbol (_/\_ : PosConj PosConj ~> PosConj)
+      op-hook formulaAndNegSymbol (_/\_ : NegConj NegConj ~> NegConj)
+      op-hook formulaAndConjSymbol (_/\_ : Conj Conj ~> Conj)
+      op-hook formulaAndFormSymbol (_/\_ : Form Form ~> Form)
+      op-hook formulaOrDnfSymbol (_\/_ : DNF DNF ~> DNF)
+      op-hook formulaOrFormSymbol (_\/_ : Form Form ~> Form)
+      op-hook formulaNotSymbol (~_ : Form ~> Form)
+      op-hook formulaImpliesSymbol (_=>_ : Form Form ~> Form)
+      op-hook formulaIffSymbol (_<=>_ : Form Form ~> Form))] .
+
+  op var-valid : FModule SortSet SortSet DNF -> Bool
+    [special (
+      id-hook MetaLevelOpSymbol (variantValidWithSorts)
+      op-hook eqFormulaSymbol (_==?_ : Term Term ~> PosLit)
+      op-hook neqFormulaSymbol (_=!?_ : Term Term ~> NegLit)
+      op-hook formulaAndPosSymbol (_/\_ : PosConj PosConj ~> PosConj)
+      op-hook formulaAndNegSymbol (_/\_ : NegConj NegConj ~> NegConj)
+      op-hook formulaAndConjSymbol (_/\_ : Conj Conj ~> Conj)
+      op-hook formulaAndFormSymbol (_/\_ : Form Form ~> Form)
+      op-hook formulaOrDnfSymbol (_\/_ : DNF DNF ~> DNF)
+      op-hook formulaOrFormSymbol (_\/_ : Form Form ~> Form)
+      op-hook formulaNotSymbol (~_ : Form ~> Form)
+      op-hook formulaImpliesSymbol (_=>_ : Form Form ~> Form)
+      op-hook formulaIffSymbol (_<=>_ : Form Form ~> Form)
+      op-hook emptySortSetSymbol (none : ~> SortSet)
+      op-hook sortSetSymbol (_;_ : SortSet SortSet ~> SortSet))] .
+endfm
+
+fmod VSWF-CHECK is
+  protecting META-LEVEL .
+  protecting BOOL .
+
+  op vswf-check : Module -> Bool
+    [special (
+      id-hook MetaLevelOpSymbol (variantSatWellFormed))] .
+endfm
+
+fmod VAR-SAT-TOOL is
+  pr VAR-SAT .
+  pr VSWF-CHECK .
+endfm

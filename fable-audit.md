@@ -1,23 +1,26 @@
-# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-21)
+# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-23)
 
-> **Current ledger (2026-07-21):** the correctness-goal corpus remains closed and symbolic phases
-> S1–S3 are complete. `tools/subsystems-scoreboard.sh -p U` is **27/27 PASS** over 676 commands,
-> `-p V` is **21/21 PASS** over 289 commands, and `-p N` is **16/16 PASS** (the 15-fixture
-> S3 completion manifest plus one post-close multi-root regression); all **169** N primary commands
-> also pass independently through `tools/diffmaude-command.py`. There are no S3 fixture exclusions,
-> timeouts, or accepted divergences.
-> The frozen gates were re-run on the current tree: audit **77/77**, legacy **87/87**,
-> `cargo test --release` **397 passed**, and `term-order.maude` / `machine-int.maude` /
-> `linear.maude` load clean. The LEXICAL hooks, prefix iter-input grammar, compact command iteration,
-> and the Diophantine/bipartite AC matcher remain landed.
-> Phase T is next: the refreshed T0 spike validates optional `z3` 0.20.2, but no production SMT
-> code or T fixture manifest exists yet. `smt.maude` currently loads only because unknown hooks are
-> inert; `check true .` is silently unparsed and `satSolve(True)` remains unreduced.
-> Uncommitted identifiers in prose below are explicitly marked as 2026-07-21 working-tree results.
+> **Current ledger (2026-07-23):** the correctness corpus and symbolic phases S1–S3 remain closed.
+> `tools/subsystems-scoreboard.sh -p U` is **27/27 PASS** over 676 commands, `-p V` is **21/21
+> PASS** over 289, and `-p N` is **16/16 PASS**; all 169 N primary commands also pass independently.
+> The retained audit is **77/77 PASS**, legacy is **87/87 CLEAN**, and `cargo test --release`
+> passes all **410** tests across nine suites.
 >
-> The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close; §3.10's
-> post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two counts-only
-> matchrew/exploration-schedule divergences are recorded in `conformance/accepted-diffs/README.md`.
+> **Phase T is complete.** T01–T10 pass the frozen Maude-3.5/Yices2 byte contract—10 fixtures /
+> 118 commands—covering typed SMT values, `check`, root-only constraint-bearing `smt-search`,
+> `continue`, `metaCheck`, and cached `metaSmtSearch`. The optional z3 0.20.2 backend remains
+> query-local and feature-gated; the default build remains pure Rust with Null degradation.
+> T11's native FVP/OS-compact variant-satisfiability core and `VAR-SAT-TOOL` facade pass **27/27**;
+> the untouched checksum-pinned Maude-2.7 prototype passes its separately recorded **27/27** oracle
+> lane. The native contract explicitly fixes membership eligibility and both empty-constructor-domain
+> quantifier defects. The complete Phase-T scoreboard is **11/11 PASS**.
+>
+> Uncommitted identifiers in prose below are explicitly marked as 2026-07-23 working-tree results.
+>
+> The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close;
+> §3.10's post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two
+> counts-only matchrew/exploration-schedule divergences are recorded in
+> `conformance/accepted-diffs/README.md`.
 
 Independent differential audit of the Rust port against the C++ oracle (`maude` 3.5.1 on PATH; source at
 `~/code/maude-lang/maude`, same version). Method: a shared normalizing diff harness (strips only `====`
@@ -92,6 +95,12 @@ Everything in this list was re-verified against the live oracle this session (no
   verbose folding traces, and the in-scope `metaNarrow*` operations with persistent caches. Durable S3
   gate: 16/16 fixtures (15 completion fixtures plus one post-close regression) and 169/169 isolated
   primary commands, with exact order, counts, families, and trace output.
+- **SMT and variant satisfiability.** The typed SMT language, exact arbitrary-precision integer/real
+  leaves, `check`, root-only constraint-bearing `smt-search`, continuation, `metaCheck`, and cached
+  `metaSmtSearch` pass T01–T10's 118-command byte contract through the optional z3 lane; the default
+  build has solver-free Null semantics. Native constructor-variant satisfiability and validity,
+  finite/empty-sort analysis, formula DNF, and the `VAR-SAT-TOOL` facade pass T11's 27-result
+  contract. Durable Phase-T gate: 11/11 fixtures.
 - **Objects**: `omod` desugaring, class completion, plain and object-message-fair `erewrite` on the
   bank/ping-pong shapes, STD-STREAM scripted IO.
 - **Robustness beyond Maude in two spots** (divergence in tnk's favor): a 300k-deep term reduce+print works
@@ -105,11 +114,8 @@ Everything in this list was re-verified against the live oracle this session (no
 
 Whole subsystems still planned in `roadmap.md`:
 
-- **SMT** (`check`, `smt-search`, mandatory `metaCheck`/`metaSmtSearch`; `smt.maude` needs
-  `SMT_Symbol`) and the **model checker** (`model-checker.maude`:
-  `SatSolverSymbol`/`ModelCheckerSymbol`). Variant satisfiability is also pending. Its official 2016
-  prototype has now been recovered and pinned, but targets Maude 2.7 and has no explicit source
-  license; it is an executable oracle for the planned native Rust T6 implementation, not code to copy.
+- **Model checker** (`model-checker.maude`: `SatSolverSymbol`/`ModelCheckerSymbol`) remains unbuilt;
+  M0 fixture seeding is the next serial subsystem step.
 - **Meta-interpreters** (`metaInterpreter.maude`: `InterpreterManagerSymbol`).
 - **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Per revised D5 these
   are intentionally out of scope for the engine (host-embedding model); existing Maude IO programs do not

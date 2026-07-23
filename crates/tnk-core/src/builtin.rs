@@ -82,6 +82,9 @@ impl Runtime {
             // `counter` is inert under equational reduction — it only advances under `rewrite`/`frewrite`
             // (see `try_counter`), so a `reduce` leaves it as the kind constant `[Nat]: counter`.
             SpecialOp::Counter { .. } => None,
+            // T1 recognizes solver-language operators but deliberately leaves them inert. T2 translates
+            // these typed hooks into the selected `SmtEngine`; ordinary `reduce` must not evaluate them.
+            SpecialOp::Smt { .. } => None,
             SpecialOp::QidOp {
                 op,
                 qid_sym,

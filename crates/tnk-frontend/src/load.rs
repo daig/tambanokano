@@ -26,6 +26,7 @@ use tnk_core::dag::DagId;
 use tnk_core::engine::MatchedPortion;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::{Arrow, Search};
+use tnk_core::smt_search::SmtSearch;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
@@ -38,6 +39,23 @@ use tnk_core::variant::{
 pub struct LoadedModule {
     pub built: BuiltModule,
     pub grammar: CompiledGrammar,
+    /// Maude's module-wide `validForSMT_Rewriting` result.
+    pub smt_rewrite_valid: bool,
+}
+
+impl LoadedModule {
+    /// Recompute Maude's module-wide SMT-rewrite eligibility after callers install statements
+    /// directly into the built engine (the reflected-module path does this post-build).
+    pub fn refresh_smt_rewrite_valid(&mut self, pm: &PreModule) {
+        self.smt_rewrite_valid =
+            self.built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
+    }
+}
+
+fn has_regular_collapse_axiom(pm: &PreModule) -> bool {
+    pm.ops
+        .iter()
+        .any(|op| op.attrs.poly.is_none() && (op.attrs.idem || op.attrs.id.is_some()))
 }
 
 /// A loaded source: the shared interner, the modules (file order), and the commands tagged with the
@@ -60,7 +78,13 @@ pub fn build_loaded_module(
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
     load_statements(pm, &mut built, &grammar, interner)?;
-    Ok(LoadedModule { built, grammar })
+    let smt_rewrite_valid =
+        built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
+    Ok(LoadedModule {
+        built,
+        grammar,
+        smt_rewrite_valid,
+    })
 }
 
 /// Build a flattened `PreModule` into a [`LoadedModule`] with the **D1a import-reparse point-fix**: each
@@ -79,7 +103,13 @@ pub fn build_loaded_module_homed<'m>(
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
     load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
-    Ok(LoadedModule { built, grammar })
+    let smt_rewrite_valid =
+        built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
+    Ok(LoadedModule {
+        built,
+        grammar,
+        smt_rewrite_valid,
+    })
 }
 
 fn install_identities(
@@ -180,6 +210,10 @@ pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<Com
                 division: map_sym(division)?,
                 minus: map_sym(minus)?,
             },
+            Action::MakeSmtNumber { symbol, kind } => Action::MakeSmtNumber {
+                symbol: map_sym(symbol)?,
+                kind,
+            },
             keep @ (Action::PassThru | Action::AssocList | Action::Nop) => keep,
         })
     };
@@ -257,9 +291,10 @@ pub fn load_statements_homed<'m>(
     let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
 
     for (idx, stmt) in pm.statements.iter().enumerate() {
-        // Ordinary nonexec axioms are proof obligations. `[nonexec narrowing]` rules are different:
-        // symbolic narrowing consumes their source terms even though rewriting must not compile them.
-        if stmt_is_nonexec(stmt) && !stmt_is_narrowing_rule(stmt) {
+        // Ordinary nonexec equations/memberships are proof obligations. Rules still pass through:
+        // `[nonexec narrowing]` feeds symbolic narrowing, and an SMT-capable module retains every rule
+        // in its dedicated root-rewrite table without making it ordinarily executable.
+        if stmt_is_nonexec(stmt) && !matches!(stmt, Statement::Rule { .. }) {
             continue;
         }
         // Imported statements belong to their defining grammar. Trying the flattened grammar first is
@@ -598,6 +633,9 @@ fn load_one_stmt(
             if !statement_vars_bound(&lhs_t, &condition, None) {
                 return Ok(()); // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
             }
+            if lhs_t.top_symbol().is_none() {
+                return Ok(()); // a bare-variable membership is nonexec
+            }
             let trace = MbTrace {
                 lhs: lhs_t.clone(),
                 sort: sort_id,
@@ -674,6 +712,13 @@ fn load_one_stmt(
             if *narrowing && !condition.is_empty() {
                 return Ok(());
             }
+            m.engine.add_smt_rule(
+                lhs_t.clone(),
+                rhs_t.clone(),
+                (0..nr).map(|slot| vars.sort(slot)).collect(),
+                variable_names.clone(),
+                condition.clone(),
+            );
             if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) && !(*narrowing && *nonexec)
             {
                 return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
@@ -984,16 +1029,6 @@ fn stmt_is_nonexec(s: &Statement) -> bool {
         | Statement::Mb { nonexec, .. }
         | Statement::Rule { nonexec, .. } => *nonexec,
     }
-}
-
-fn stmt_is_narrowing_rule(s: &Statement) -> bool {
-    matches!(
-        s,
-        Statement::Rule {
-            narrowing: true,
-            ..
-        }
-    )
 }
 
 /// Reject a rewrite (`=>`) fragment in a non-rule condition — `=>` conditions are legal only in rules
@@ -1426,6 +1461,140 @@ pub fn search_command(
         .engine
         .search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32));
     Ok((search, vars))
+}
+
+pub struct SmtSearchCommand {
+    pub search: SmtSearch,
+    pub goal_variables: VarIndex,
+    pub target_variable_count: u32,
+}
+
+/// Build an object-level symbolic rewrite search modulo SMT. The initial state and accumulated
+/// constraint use genuine variable DAGs; the goal remains a static matcher pattern.
+#[allow(clippy::too_many_arguments)]
+pub fn smt_search_command(
+    lm: &mut LoadedModule,
+    i: &mut Interner,
+    subject: &[Token],
+    arrow: SearchArrow,
+    pattern: &[Token],
+    such_that: Option<&[Token]>,
+    max_depth: Option<u64>,
+) -> Result<SmtSearchCommand, String> {
+    if matches!(arrow, SearchArrow::Bang) {
+        return Err("=>! mode is not supported for searching modulo SMT".to_string());
+    }
+
+    let subject_tree = parse_forest_pick(subject, &lm.grammar, i)?;
+    let pattern_tree = parse_forest_pick(pattern, &lm.grammar, i)?;
+
+    let mut subject_variables = VarIndex::new();
+    let mut goal_variables = VarIndex::new();
+    let goal = build_term(
+        &pattern_tree,
+        &lm.grammar,
+        &lm.built,
+        pattern,
+        i,
+        &mut goal_variables,
+    )?;
+    let target_variable_count = goal_variables.count();
+    let mut bound: BTreeSet<u32> = (0..target_variable_count).collect();
+    let condition = match such_that {
+        Some(tokens) => parse_condition(
+            tokens,
+            &lm.grammar,
+            &lm.built,
+            i,
+            &mut goal_variables,
+            &mut bound,
+        )?,
+        None => Vec::new(),
+    };
+
+    if !lm.smt_rewrite_valid || !lm.built.engine.valid_smt_goal(&goal) {
+        return Err("module or goal does not satisfy SMT rewriting restrictions".to_string());
+    }
+
+    lm.built.engine.reset_rewrites();
+    lm.built.engine.begin_dedup();
+    let subject_dag = build_logic_dag(
+        &subject_tree,
+        &lm.grammar,
+        &mut lm.built.engine,
+        lm.built.nat_zero,
+        lm.built.nat_succ,
+        subject,
+        i,
+        &mut subject_variables,
+    );
+    lm.built.engine.end_dedup();
+    let subject_dag = subject_dag?;
+
+    let mut variable_names: Vec<String> = (0..subject_variables.count())
+        .map(|slot| {
+            command_variable_display_name(
+                &lm.grammar,
+                i,
+                subject_variables.name(slot),
+                subject_variables.sort(slot),
+            )
+        })
+        .collect();
+    let subject_variable_count = subject_variables.count();
+    let mut goal_variable_dags = Vec::with_capacity(goal_variables.count() as usize);
+    for slot in 0..goal_variables.count() {
+        let source = goal_variables.name(slot);
+        let base = source.split_once(':').map_or(source, |(base, _)| base);
+        let code = i.intern(base).index();
+        let global_slot = subject_variable_count + slot;
+        goal_variable_dags.push(lm.built.engine.make_var(
+            goal_variables.sort(slot),
+            code,
+            global_slot,
+        ));
+        variable_names.push(command_variable_display_name(
+            &lm.grammar,
+            i,
+            source,
+            goal_variables.sort(slot),
+        ));
+    }
+
+    let initial_constraint = lm
+        .built
+        .engine
+        .make_smt_constraint(&condition, &goal_variable_dags)?;
+    let goal_smt_variables = (0..target_variable_count)
+        .filter(|&slot| {
+            lm.built
+                .engine
+                .smt_type(goal_variables.sort(slot))
+                .is_some()
+        })
+        .map(|slot| (slot, goal_variable_dags[slot as usize]))
+        .collect();
+    let arrow = match arrow {
+        SearchArrow::One => Arrow::One,
+        SearchArrow::Plus => Arrow::Plus,
+        SearchArrow::Star => Arrow::Star,
+        SearchArrow::Bang => unreachable!("rejected above"),
+    };
+    let search = lm.built.engine.smt_search(
+        subject_dag,
+        initial_constraint,
+        goal,
+        target_variable_count,
+        goal_smt_variables,
+        arrow,
+        max_depth.map(|depth| depth as u32),
+        variable_names,
+    );
+    Ok(SmtSearchCommand {
+        search,
+        goal_variables,
+        target_variable_count,
+    })
 }
 
 pub struct NarrowCommand {

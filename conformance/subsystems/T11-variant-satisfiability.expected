@@ -1,0 +1,28 @@
+# Native Bool | Maude-2.7 prototype Bool | contract
+true  true   # vswf VS-NAT
+true  true   # vswf VS-ACU
+false false  # reject associative-without-commutative constructor
+false true   # hardened: reject memberships (prototype advisory omitted this check)
+true  true   # free equality satisfiable
+false false  # equality plus same disequality unsatisfiable
+true  true   # later DNF branch satisfiable
+true  true   # simultaneous positive unifiers
+false false  # incompatible positive unifiers
+true  true   # finite Bool disequality has a witness
+false false  # no Bool differs from both constructors
+true  true   # Bool constructor exhaustiveness is valid
+true  true   # negated equality satisfiable
+true  true   # implication valid
+true  true   # iff valid
+false true   # corrected: existential over empty constructor domain has no assignment
+true  false  # corrected: universal formula over empty constructor domain is vacuously valid
+true  true   # AC constructor unification
+true  true   # C constructor unification
+true  true   # CUI constructor unification
+true  true   # ACU constructor unification with explicit infinite override
+true  true   # one-sided identity constructor unification
+true  true   # variant equation reaches b
+false false  # variant equation cannot reach a
+false false  # constructor variants cover every infinite-sort assignment
+true  true   # overloaded constructor reflexivity
+true  true   # overloaded constructor disequality

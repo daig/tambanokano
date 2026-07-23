@@ -1,0 +1,115 @@
+*** T07-meta-smt-search — all metaSmtSearch cases lifted from the reference suite (Misc/smtTest.maude)
+*** PRELUDE
+set show timing off .
+load smt
+
+mod MULTI is
+  pr INTEGER .
+
+  vars A B C D E : Boolean .
+  vars I J K L M N : Integer .
+  vars X Y : Foo .
+
+  sort Pair .
+  sort State .
+  op <_|_> : State Boolean -> Pair .
+
+  sort Foo .
+  ops f g : Integer Foo -> State .
+
+  crl f(I, X) => g(I + 1, Y) if I < 0 = true [nonexec] .
+endm
+
+mod TEST is
+  pr MULTI .
+  pr META-LEVEL .
+  vars X Y : Foo .
+endm
+
+red metaSmtSearch(['MULTI],
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '*, 1, 1, 0) .
+
+*** Reflected inline-module regression: eligibility must be recomputed after down-translating rules.
+red metaSmtSearch(upModule('MULTI, false),
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '*, 1, 1, 0) .
+
+red metaSmtSearch(['MULTI],
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '*, 1, 1, 1) .
+
+red metaSmtSearch(['MULTI],
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '*, 1, 1, 2) .
+
+red metaSmtSearch(['MULTI],
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '+, 200, 1, 0) .
+
+red metaSmtSearch(['MULTI],
+                  upTerm(f(-2, X)),
+                  'Z:State,
+                  nil,
+                  '+, 200, 1, 1) .
+
+mod ITEST is
+  pr INTEGER .
+
+  vars A B C D E : Boolean .
+  vars I J K L M N : Integer .
+
+  sort State .
+  sort Foo .
+  op f : Integer -> State .
+  var X : State .
+
+  crl f(I) => f(I + 1) if I >= 10 = true /\ I <= 12 = true .
+  crl f(I) => f(I - 1) if I >= 10 = true /\ I <= 12 = true .
+endm
+
+mod TEST2 is
+  pr ITEST .
+  pr META-LEVEL .
+  vars I J K L M N : Integer .
+endm
+
+red metaSmtSearch(['ITEST],
+                  upTerm(f(J)),
+                  upTerm(f(K)),
+                  'J:Integer = 'K:Integer,
+                  '*, 42, 2, 0) .
+
+red metaSmtSearch(['ITEST],
+                  upTerm(f(J)),
+                  upTerm(f(K)),
+                  'J:Integer = 'K:Integer,
+                  '*, 42, 2, 1) .
+
+red metaSmtSearch(['ITEST],
+                  upTerm(f(J)),
+                  upTerm(f(K)),
+                  'J:Integer = 'K:Integer,
+                  '*, 42, 2, 2) .
+
+red metaSmtSearch(['ITEST],
+                  upTerm(f(J)),
+                  upTerm(f(K)),
+                  'J:Integer = 'K:Integer,
+                  '*, 42, 2, 3) .
+
+red in TEST2 : metaSmtSearch(['ITEST],
+                  upTerm(f(J)),
+                  upTerm(f(K)),
+                  'J:Integer = 'K:Integer,
+                  '*, 42, unbounded, 3) .

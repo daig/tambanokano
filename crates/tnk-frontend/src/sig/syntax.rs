@@ -3,7 +3,7 @@
 
 use crate::lex::{Frag, Token};
 use crate::surface::ast::{GatherElem, IdSide, Statement};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tnk_core::engine::Engine;
 use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
@@ -154,6 +154,12 @@ pub struct BuiltModule {
     /// is unknown); [`OVL_RANGE`] = another shares its name *and* range kind. Absent = unique (no
     /// disambiguation).
     pub overload: HashMap<SymbolId, u8>,
+    /// Distinct kinds whose built-in values use positive decimal syntax (`SuccSymbol` naturals plus SMT
+    /// integers). Maude qualifies a numeral in an unknown-range context only when this exceeds one.
+    pub(crate) integer_literal_kind_count: usize,
+    /// Canonical positive decimal spellings also declared as nullary user operators. These collide with
+    /// built-in natural pseudo-literals even when there is only one numeral kind.
+    pub(crate) overloaded_naturals: HashSet<String>,
     /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
     /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
     pub strat_defs: Vec<crate::surface::ast::StratDef>,

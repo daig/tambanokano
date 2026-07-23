@@ -5,11 +5,12 @@
 //! built-in anchors (succ/zero/string/float/qid) once all names resolve → **pass B** attach
 //! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
 
-use crate::lex::{Frag, Interner, Token, is_punct, split_mixfix};
+use crate::lex::{Frag, Interner, Sym, Token, is_punct, split_mixfix};
 use crate::sig::syntax::{BuiltModule, IdentitySpec, SymbolSyntax};
-use crate::surface::ast::{Attrs, PreModule, SpecialSpec};
+use crate::surface::ast::{Attrs, IdSide, PreModule, SpecialSpec};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
+use tnk_core::smt::{SmtOp, SmtType};
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
     BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp,
@@ -17,6 +18,32 @@ use tnk_core::symbol::{
 };
 
 type R<T> = Result<T, String>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct ConstructorAxiomProfile {
+    assoc: bool,
+    comm: bool,
+    idem: bool,
+    iter: bool,
+    identity: Option<(IdSide, Vec<Sym>)>,
+}
+
+impl ConstructorAxiomProfile {
+    fn from_attrs(attrs: &Attrs) -> Self {
+        Self {
+            assoc: attrs.assoc,
+            comm: attrs.comm,
+            idem: attrs.idem,
+            iter: attrs.iter,
+            identity: attrs.id.as_ref().map(|tokens| {
+                (
+                    attrs.id_side,
+                    tokens.iter().map(|token| token.sym).collect(),
+                )
+            }),
+        }
+    }
+}
 
 /// The canonical mixfix name of an op (its name tokens concatenated): `[s_]`→`"s_"`, `[<_, ,, _>]`→`"<_,_>"`.
 /// An operator name may be **parenthesized to quote** a name that would otherwise clash with a keyword or
@@ -153,6 +180,10 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut op_syms: Vec<Vec<SymbolId>> = vec![Vec::new(); pm.ops.len()];
     // Identity bubbles are parsed only after the per-module grammar exists.
     let mut identity_specs: Vec<IdentitySpec> = Vec::new();
+    // Structural constructor axioms belong to each source overload, while the kernel executes one
+    // folded Symbol theory. Retain the first profile long enough to mark disagreements before folding.
+    let mut constructor_axiom_profiles: HashMap<SymbolId, ConstructorAxiomProfile> = HashMap::new();
+    let mut constructor_flags: HashMap<SymbolId, bool> = HashMap::new();
 
     // Pass A: declare every op (theory-dispatched), record name→id + syntax. A `poly` op is expanded
     // here — necessarily after `close_sorts`, which is what creates the kinds/error sorts. Each
@@ -227,10 +258,28 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             let profile = (cname.clone(), dom_kinds, engine.sorts().kind_of(range));
 
             let sym = if let Some(&existing) = sym_by_profile.get(&profile) {
-                engine.add_op_decl(existing, domain.clone(), range); // subsort overload / `ditto` (same kinds)
+                let inherited = od.attrs.ditto;
+                let ctor = if inherited {
+                    constructor_flags.get(&existing).copied().unwrap_or(false)
+                } else {
+                    od.attrs.ctor
+                };
+                let incoming = ConstructorAxiomProfile::from_attrs(&od.attrs);
+                if !inherited
+                    && constructor_axiom_profiles
+                        .get(&existing)
+                        .is_some_and(|first| first != &incoming)
+                {
+                    engine.mark_inconsistent_constructor_axioms(existing);
+                }
+                engine.add_op_decl_with_ctor(existing, domain.clone(), range, ctor);
+                constructor_flags.insert(existing, ctor);
                 existing
             } else {
                 let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range);
+                constructor_axiom_profiles
+                    .insert(sym, ConstructorAxiomProfile::from_attrs(&od.attrs));
+                constructor_flags.insert(sym, od.attrs.ctor);
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
                 name_to_sym.entry(cname.clone()).or_insert(sym);
@@ -311,7 +360,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let Some(spec) = &od.attrs.special else {
             continue;
         };
-        let Some((class, _)) = &spec.id_hook else {
+        let Some((class, data)) = &spec.id_hook else {
             continue;
         };
         let sym = op_syms[idx][0]; // anchors are concrete (non-poly) ⇒ exactly one instance
@@ -331,6 +380,15 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             "DivisionSymbol" => division_sym = Some(sym),
             "SystemTrue" => true_sym = Some(sym),
             "SystemFalse" => false_sym = Some(sym),
+            "SMT_NumberSymbol" => {
+                let kind = match data.first().map(String::as_str) {
+                    Some("integers") => SmtType::Integer,
+                    Some("reals") => SmtType::Real,
+                    _ => return Err("SMT_NumberSymbol needs `integers` or `reals`".into()),
+                };
+                let range = resolve_sort(&engine, &sorts, &od.range)?;
+                engine.register_smt_number(sym, range, kind);
+            }
             _ => {}
         }
     }
@@ -404,9 +462,6 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             if marker {
                 engine.set_symbol_class(sym, tnk_core::symbol::SymbolClass::Marker);
             }
-            if od.attrs.ctor {
-                engine.set_ctor(sym);
-            }
             if let Some(strat) = &od.attrs.strat {
                 engine.set_strategy(sym, strat);
             }
@@ -427,6 +482,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             }
             if let Some(op) = &special {
                 engine.set_special(sym, op.clone());
+                if let SpecialOp::Smt { op } = op {
+                    engine.register_smt_operator(sym, *op);
+                }
             }
         }
     }
@@ -445,6 +503,18 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             vars.push((name.clone(), sort));
         }
     }
+
+    let integer_literal_kind_count = engine.integer_literal_kind_count();
+    let overloaded_naturals = ops
+        .keys()
+        .filter_map(|(name, arity)| {
+            if *arity != 0 || name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let canonical = name.trim_start_matches('0');
+            (!canonical.is_empty()).then(|| canonical.to_string())
+        })
+        .collect();
 
     Ok(BuiltModule {
         engine,
@@ -467,6 +537,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         true_sym,
         false_sym,
         overload,
+        integer_literal_kind_count,
+        overloaded_naturals,
         strat_defs: pm.strat_defs.clone(),
         identity_specs,
     })
@@ -531,7 +603,7 @@ fn declare_op(
     domain: &[SortId],
     range: SortId,
 ) -> SymbolId {
-    if attrs.iter {
+    let symbol = if attrs.iter {
         engine.add_op_iter(name.to_string(), domain.to_vec(), range)
     } else if attrs.assoc && attrs.comm {
         engine.add_op_ac(name.to_string(), domain.to_vec(), range, None)
@@ -548,7 +620,11 @@ fn declare_op(
         )
     } else {
         engine.add_op(name.to_string(), domain.to_vec(), range)
+    };
+    if attrs.ctor {
+        engine.set_ctor(symbol);
     }
+    symbol
 }
 
 // ---- hook resolution ----
@@ -637,7 +713,8 @@ fn special_op(
         | "FloatSymbol"
         | "QuotedIdentifierSymbol"
         | "SystemTrue"
-        | "SystemFalse" => return Ok(None),
+        | "SystemFalse"
+        | "SMT_NumberSymbol" => return Ok(None),
         // `<_:_|_>` (CONFIGURATION's `ObjectConstructorSymbol`, Pillar 2.5). A marker: the object
         // constructor is an ordinary free symbol for reduction/rewriting (its third argument is the
         // ACU `AttributeSet`, matched by the existing engine). The C++ symbol adds object-pattern
@@ -649,6 +726,9 @@ fn special_op(
         },
         "DivisionSymbol" => SpecialOp::Division {
             nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
+        },
+        "SMT_Symbol" => SpecialOp::Smt {
+            op: smt_op(code.ok_or("SMT_Symbol code")?, arity)?,
         },
         // `_==_`/`_=/=_`: structural equality of the two reduced arguments (ground or not — Maude
         // decides `X == Y` as `false` for distinct variables too).
@@ -751,25 +831,20 @@ fn special_op(
                 bool_: bool_hooks(spec, name_to_sym, i),
             },
         },
-        // META-LEVEL descent functions (`metaReduce`/`metaApply`/…). Every descent op shares one
-        // meta-representation hook set: `metaReduce` carries the full `op-hook` list and the rest declare
-        // only `op-hook shareWith (metaReduce …)`. So the canonical set is resolved once (pre-scan, below)
-        // and shared here — resolving each op's own `shareWith`-only spec would leave the constructors
-        // (`qidSymbol`/`resultPairSymbol`/…) the down/up maps need unresolved.
-        "MetaLevelOpSymbol" => SpecialOp::Meta {
-            op: meta_op(code.ok_or("MetaLevelOpSymbol code")?),
-            hooks: match canonical_meta {
-                Some(h) => h.clone(),
-                // No `shareWith` source in this module (a descent op standing alone) — resolve its own.
-                None => std::rc::Rc::new(resolve_meta_hooks(
-                    spec,
-                    sym_by_profile,
-                    sorts,
-                    sort_table,
-                    i,
-                )),
-            },
-        },
+        // META-LEVEL descent functions share metaReduce's representation hooks. A standalone
+        // extension may add operation-specific structural hooks; merge those over the canonical
+        // table instead of discarding them merely because META-LEVEL is imported.
+        "MetaLevelOpSymbol" => {
+            let code = code.ok_or("MetaLevelOpSymbol code")?;
+            let mut hooks = canonical_meta.as_deref().cloned().unwrap_or_default();
+            let own = resolve_meta_hooks(spec, sym_by_profile, sorts, sort_table, i);
+            hooks.ops.extend(own.ops);
+            hooks.terms.extend(own.terms);
+            SpecialOp::Meta {
+                op: meta_op(code),
+                hooks: std::rc::Rc::new(hooks),
+            }
+        }
         // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
         // standard-stream external-object manager. The id-hook data selects the stream; the op-hooks name
         // the `write`/`wrote` (and `getLine`/`gotLine`) message symbols the manager consumes/produces.
@@ -796,9 +871,42 @@ fn special_op(
     Ok(Some(op))
 }
 
-/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. Reflection and symbolic
-/// variant/narrowing functions have dedicated variants; SMT and strategy descent map to
-/// [`MetaOp::Deferred`] (declared, inert — Phase 3.3+).
+/// Map Maude's `SMT_Symbol` data attachment to the exact C++ operator enum. The `-` spelling is
+/// overloaded and therefore resolved by arity.
+fn smt_op(code: &str, arity: usize) -> R<SmtOp> {
+    Ok(match (code, arity) {
+        ("true", 0) => SmtOp::True,
+        ("false", 0) => SmtOp::False,
+        ("not", 1) => SmtOp::Not,
+        ("and", 2) => SmtOp::And,
+        ("or", 2) => SmtOp::Or,
+        ("xor", 2) => SmtOp::Xor,
+        ("implies", 2) => SmtOp::Implies,
+        ("===", 2) => SmtOp::Equals,
+        ("=/==", 2) => SmtOp::NotEquals,
+        ("ite", 3) => SmtOp::Ite,
+        ("-", 1) => SmtOp::UnaryMinus,
+        ("-", 2) => SmtOp::Minus,
+        ("+", 2) => SmtOp::Plus,
+        ("*", 2) => SmtOp::Multiply,
+        ("div", 2) => SmtOp::Divide,
+        ("mod", 2) => SmtOp::Modulo,
+        ("<", 2) => SmtOp::Less,
+        ("<=", 2) => SmtOp::LessEqual,
+        (">", 2) => SmtOp::Greater,
+        (">=", 2) => SmtOp::GreaterEqual,
+        ("divisible", 2) => SmtOp::Divisible,
+        ("/", 2) => SmtOp::RealDivide,
+        ("toReal", 1) => SmtOp::ToReal,
+        ("toInteger", 1) => SmtOp::ToInteger,
+        ("isInteger", 1) => SmtOp::IsInteger,
+        _ => return Err(format!("unsupported SMT operator `{code}`/{arity}")),
+    })
+}
+
+/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. Reflection, SMT,
+/// and symbolic variant/narrowing functions have dedicated variants; strategy descent maps to
+/// [`MetaOp::Deferred`] (declared, inert).
 fn meta_op(code: &str) -> MetaOp {
     match code {
         "metaReduce" => MetaOp::Reduce,
@@ -811,6 +919,25 @@ fn meta_op(code: &str) -> MetaOp {
         "metaXmatch" => MetaOp::Xmatch,
         "metaSearch" => MetaOp::Search,
         "metaSearchPath" => MetaOp::SearchPath,
+        "metaCheck" => MetaOp::Check,
+        "metaSmtSearch" => MetaOp::SmtSearch,
+        "variantSat" => MetaOp::VariantSat {
+            validity: false,
+            explicit_sorts: false,
+        },
+        "variantSatWithSorts" => MetaOp::VariantSat {
+            validity: false,
+            explicit_sorts: true,
+        },
+        "variantValid" => MetaOp::VariantSat {
+            validity: true,
+            explicit_sorts: false,
+        },
+        "variantValidWithSorts" => MetaOp::VariantSat {
+            validity: true,
+            explicit_sorts: true,
+        },
+        "variantSatWellFormed" => MetaOp::VariantSatWellFormed,
         "metaSortLeq" => MetaOp::SortLeq,
         "metaSameKind" => MetaOp::SameKind,
         "metaLesserSorts" => MetaOp::LesserSorts,
@@ -912,7 +1039,7 @@ fn meta_op(code: &str) -> MetaOp {
         "metaNarrowingApply" => MetaOp::NarrowingApply,
         "metaNarrowingSearch" => MetaOp::NarrowingSearch { path: false },
         "metaNarrowingSearchPath" => MetaOp::NarrowingSearch { path: true },
-        // Remaining symbolic (SMT and strategy) descent — Phase 3.3+.
+        // Remaining strategy descent is declared but inert.
         _ => MetaOp::Deferred,
     }
 }
@@ -931,8 +1058,8 @@ fn find_canonical_meta_hooks(
 ) -> Option<std::rc::Rc<MetaHooks>> {
     pm.ops.iter().find_map(|od| {
         let spec = od.attrs.special.as_ref()?;
-        let (class, _) = spec.id_hook.as_ref()?;
-        if class == "MetaLevelOpSymbol" && !spec.op_hooks.iter().any(|(p, _)| p == "shareWith") {
+        let (class, data) = spec.id_hook.as_ref()?;
+        if class == "MetaLevelOpSymbol" && data.first().is_some_and(|code| code == "metaReduce") {
             Some(std::rc::Rc::new(resolve_meta_hooks(
                 spec,
                 sym_by_profile,
@@ -1140,6 +1267,7 @@ mod tests {
     use super::*;
     use crate::lex::tokenize;
     use crate::surface::parser::Parser;
+    use tnk_core::variant_sat::{ConstructorAnalysis, EligibilityRejection, SortOverrides};
 
     fn build(src: &str) -> BuiltModule {
         let mut i = Interner::new();
@@ -1199,5 +1327,33 @@ endfm
         let tt = m.ops[&("tt".to_string(), 0)];
         let tt_node = m.engine.make_const(tt);
         assert!(m.engine.deep_equal(r, tt_node), "2 < 3 = tt");
+    }
+
+    #[test]
+    fn constructor_analysis_rejects_mixed_overload_axioms() {
+        let mut module = build(
+            "\
+fmod BAD-CTOR-OVERLOAD is
+  sorts A B K .
+  subsorts A B < K .
+  ops a : -> A [ctor] .
+  ops b : -> B [ctor] .
+  op _*_ : A A -> A [ctor comm] .
+  op _*_ : B B -> B [ctor assoc comm] .
+endfm
+",
+        );
+        let rejection = match ConstructorAnalysis::build(
+            &mut module.engine,
+            &SortOverrides::default(),
+            false,
+        ) {
+            Ok(_) => panic!("mixed constructor axiom profiles must be rejected"),
+            Err(rejection) => rejection,
+        };
+        assert!(matches!(
+            rejection,
+            EligibilityRejection::InconsistentOverloadedConstructorAxioms { .. }
+        ));
     }
 }

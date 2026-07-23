@@ -218,17 +218,22 @@ Ordered by (dependency, size); references are the kept deep-dives.
   21/21 and 289; the live S3 gate is 16/16 (15 completion fixtures plus one post-close regression),
   with all 169 primary commands passing independently. The implementation record and binding decisions
   are in `remaining-plans/03-narrowing.md`.
-- **G3. SMT — next:** T0 bound D7 on `z3` 0.20.2; T0a must now seed/freeze the non-debug
-  `smtTest` + manual fixture manifest before production code. T1–T5 deliver the 25 hooks, exact SMT
-  number leaves, shipped `smt.maude`, `check`, root-only constraint-bearing `smt-search`, and mandatory
-  `metaCheck`/`metaSmtSearch`. z3 is feature-gated; the default build remains pure Rust and
-  parse/load/degrades the surface. T6 is independent of the solver core and uses completed G2: the
-  official 2016 variant-satisfiability package is now checksum-pinned as an executable oracle, while
-  production is a new native Rust constructor-variant/OS-compact decision procedure behind a thin
-  `VAR-SAT-TOOL` Maude facade. No unlicensed prototype source is copied, and T6 does not wait on z3
-  or model checking. Contract: `subsystems-goal.md` §2; implementation plan:
+- **G3. SMT — complete (2026-07-23):** T0 bound optional z3 0.20.2; T0a froze all non-debug
+  `smtTest`, manual §16.5, bignum/rational, and fresh-name behavior. T1–T5 now provide all 25 typed
+  SMT hooks, exact number leaves, per-signature metadata, byte-identical shipped `smt.maude`,
+  query-local incremental solving, object `check`, root-only constraint-bearing `smt-search`,
+  `continue`, and cached `metaCheck`/`metaSmtSearch`. T01–T10 pass the Maude-3.5/Yices2 byte contract:
+  **10 fixtures / 118 commands**; exactly eight debugger commands remain owned by F4. z3 stays
+  feature-gated, while the default pure-Rust build parses the same surface and degrades to
+  `undecided`/no solutions.
+  T6 ships a native FVP/OS-compact constructor-variant decision procedure and compatible
+  `VAR-SAT-TOOL` facade, independent of z3 and model checking. The untouched checksum-pinned
+  Maude-2.7 package and the native implementation each pass their 27-result lanes; the checked-in
+  contract explicitly corrects membership eligibility and both empty-domain quantifier defects and
+  records the reflective rewrite-count boundary. No prototype source is copied. The complete
+  Phase-T scoreboard is **11/11 PASS**. Contract: `subsystems-goal.md` §2; implementation record:
   `remaining-plans/04-smt.md`.
-- **G4. Model checking — planned after G3 (independent, so parallel-safe):** M0 first seeds/freeze the
+- **G4. Model checking — next serial phase (independent, so parallel-safe):** M0 first seeds/freezes the
   reference/manual manifest. Then port the exact Gastin–Oddoux automata + nested DFS, refactor the
   conformance-verified rewrite successor core into a shared `StateGraph`, bind
   `SatSolverSymbol`/`ModelCheckerSymbol`, and finish byte-exact counterexample lassos plus

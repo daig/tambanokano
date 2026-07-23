@@ -106,7 +106,7 @@ normalize() {
       }
       # a block runs until the next recognizable real-output line
       if ($0 ~ /^=+$/ || $0 ~ /^Bye\.$/ ||
-          $0 ~ /^(reduce|rewrite|frewrite|erewrite|search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|irredundant unify|variant) / ||
+          $0 ~ /^(reduce|rewrite|frewrite|erewrite|search|smt-search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|irredundant unify|variant) / ||
           $0 ~ /^(\{v?fold\} )?(f?vu-narrow|narrow) / ||
           $0 ~ /^(rewrites:|states:|Decision time:|result |Solution |Unifier [0-9]+|Matcher [0-9]+|Variant [0-9]+|No solution|No more solutions|No unifier|No more unifiers|No match|empty substitution)/ ||
           $0 ~ /^(state [0-9]|arc [0-9]|Narrowing solution [0-9]+)/ || $0 ~ /^\*\*\*\*/ ||
@@ -163,7 +163,7 @@ else
     tnk_input=$tmpdir/tnk-input.maude
   fi
 fi
-( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+( cd "$fixdir" && MAUDE_LIB="$ROOT:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
     "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$tnk_input" </dev/null ) \
     >"$tmpdir/tnk.raw" 2>&1
 rc=$?

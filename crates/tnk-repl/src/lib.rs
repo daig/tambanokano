@@ -14,15 +14,17 @@ use std::collections::{HashMap, HashSet};
 use tnk_core::dag::DagId;
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::Search;
+use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtResult};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{Interner, TokKind, Token, tokenize};
 use tnk_frontend::load::{
-    InternerNames, LoadedModule, build_command_dag, command_echo, command_variable_display_name,
-    erewrite_command, format_matchers, frewrite_command, match_command, maude_variable_name_rank,
-    narrow_command, render_unifier, rewrite_command, search_command, unify_command,
-    variant_command, variant_match_command, variant_unify_command,
+    InternerNames, LoadedModule, build_command_dag, build_logic_command_dag, command_echo,
+    command_variable_display_name, erewrite_command, format_matchers, frewrite_command,
+    match_command, maude_variable_name_rank, narrow_command, render_unifier, rewrite_command,
+    search_command, smt_search_command, unify_command, variant_command, variant_match_command,
+    variant_unify_command,
 };
-use tnk_frontend::pretty::print_pretty;
+use tnk_frontend::pretty::{print_pretty, print_pretty_with_variables};
 use tnk_frontend::surface::ast::{
     Command, ModuleExpr, NarrowDisplay, OpMap, PreModule, SearchArrow, TopItem, ViewDecl,
 };
@@ -102,6 +104,8 @@ enum Continuation {
     /// A `search` session (the state graph + the goal's variable index for rendering). Boxed: the search
     /// state graph is much larger than a `Rewriting`, so this keeps the enum (and the `last` slot) small.
     Search(Box<SearchSession>),
+    /// An SMT rewrite-sequence search with accumulated constraints.
+    SmtSearch(Box<SmtSearchSession>),
     /// A folding-variant enumeration, including its external numbering and output mode.
     Variants(Box<VariantSession>),
     /// A plain/filtered variant-unification enumeration.
@@ -114,6 +118,13 @@ struct SearchSession {
     search: Search,
     /// The goal pattern's variables (for the `X:Sort --> value` solution lines).
     vars: VarIndex,
+}
+
+struct SmtSearchSession {
+    search: tnk_core::smt_search::SmtSearch,
+    goal_variables: VarIndex,
+    target_variable_count: u32,
+    shown_total: u32,
 }
 
 /// A `get variants` session plus the source names needed for substitution rendering.
@@ -460,6 +471,11 @@ impl Repl {
                 max_solutions,
                 max_depth,
                 ..
+            }
+            | Command::SmtSearch {
+                max_solutions,
+                max_depth,
+                ..
             } => *max_solutions == Some(0) || *max_depth == Some(0),
             Command::GetVariants { bound, .. }
             | Command::VariantUnify { bound, .. }
@@ -481,11 +497,13 @@ impl Repl {
         // `red in NAT : t .`); without it, the current module is used.
         let m_override = match &c {
             Command::Reduce { module, .. }
+            | Command::Check { module, .. }
             | Command::Match { module, .. }
             | Command::Rewrite { module, .. }
             | Command::Frewrite { module, .. }
             | Command::ERewrite { module, .. }
             | Command::Search { module, .. }
+            | Command::SmtSearch { module, .. }
             | Command::Unify { module, .. }
             | Command::GetVariants { module, .. }
             | Command::VariantUnify { module, .. }
@@ -539,6 +557,32 @@ impl Repl {
                              rewrites: {rw} in 0ms cpu (0ms real) (~ rewrites/second)\n\
                              result {sort}: {value}\n"
                         ));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::Check { term, .. } => {
+                self.last = None;
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                let echo = command_echo(lm, &self.interner, &term, self.color)
+                    .unwrap_or_else(|_| join_tokens(&term, &self.interner));
+                match build_logic_command_dag(lm, &self.interner, &term) {
+                    Ok(dag) => {
+                        let mut solver = ConfiguredSmtEngine::default();
+                        let result = solver.check_dag(&lm.built.engine, dag);
+                        out.push_str(&format!("check in {cur} : {echo} .\n"));
+                        match result {
+                            SmtResult::Sat => {
+                                out.push_str("Result from sat solver is: sat\n");
+                            }
+                            SmtResult::Unsat => {
+                                out.push_str("Result from sat solver is: unsat\n");
+                            }
+                            SmtResult::Unknown => {
+                                out.push_str("Result from sat solver is: undecided\n");
+                            }
+                            SmtResult::BadDag => {}
+                        }
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
@@ -655,6 +699,70 @@ impl Repl {
                         self.last = Some((cur.clone(), Continuation::Search(Box::new(session))));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+            }
+            Command::SmtSearch {
+                max_solutions,
+                max_depth,
+                subject,
+                arrow,
+                pattern,
+                such_that,
+                ..
+            } => {
+                self.last = None;
+                if matches!(arrow, SearchArrow::Bang) {
+                    return;
+                }
+                let lm = self.modules.get_mut(&cur).expect("current module is built");
+                lm.built.engine.set_trace(false);
+                lm.built.engine.set_record_whole(false);
+                let header = search_header(
+                    lm,
+                    &self.interner,
+                    &subject,
+                    arrow,
+                    &pattern,
+                    such_that.as_deref(),
+                    self.color,
+                );
+                let bound_str = match (max_solutions, max_depth) {
+                    (None, None) => String::new(),
+                    (Some(n), None) => format!(" [{n}]"),
+                    (Some(n), Some(m)) => format!(" [{n}, {m}]"),
+                    (None, Some(m)) => format!(" [, {m}]"),
+                };
+                match smt_search_command(
+                    lm,
+                    &mut self.interner,
+                    &subject,
+                    arrow,
+                    &pattern,
+                    such_that.as_deref(),
+                    max_depth,
+                ) {
+                    Ok(command) => {
+                        let mut session = SmtSearchSession {
+                            search: command.search,
+                            goal_variables: command.goal_variables,
+                            target_variable_count: command.target_variable_count,
+                            shown_total: 0,
+                        };
+                        let body = render_smt_search(
+                            &mut session,
+                            lm,
+                            &self.interner,
+                            self.color,
+                            self.show_timing,
+                            max_solutions,
+                        );
+                        out.push_str(&format!(
+                            "smt-search{bound_str} in {cur} : {header} .\n{body}"
+                        ));
+                        self.last =
+                            Some((cur.clone(), Continuation::SmtSearch(Box::new(session))));
+                    }
+                    Err(_) => {}
                 }
             }
             Command::Srewrite { depth_first, term, strategy, .. } => {
@@ -1016,6 +1124,20 @@ impl Repl {
                     out.push_str(&body);
                     self.last = Some((m, Continuation::Search(session)));
                 }
+                Some((m, Continuation::SmtSearch(mut session))) if m == cur => {
+                    let lm = self.modules.get_mut(&cur).expect("current module is built");
+                    lm.built.engine.reset_rewrites();
+                    let body = render_smt_search(
+                        &mut session,
+                        lm,
+                        &self.interner,
+                        self.color,
+                        self.show_timing,
+                        bound,
+                    );
+                    out.push_str(&body);
+                    self.last = Some((m, Continuation::SmtSearch(session)));
+                }
                 Some((m, Continuation::Variants(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.reset_rewrites();
@@ -1365,6 +1487,7 @@ impl Repl {
                     | "erewrite"
                     | "erew"
                     | "search"
+                    | "smt-search"
                     | "match"
                     | "xmatch"
                     | "continue"
@@ -1571,6 +1694,79 @@ fn render_search(
                 return out;
             }
         }
+    }
+}
+
+/// Pull object-level SMT-search results. SMT-sorted goal variables are represented by equalities in
+/// the final `where` constraint; only non-SMT goal variables appear as substitution lines.
+fn render_smt_search(
+    session: &mut SmtSearchSession,
+    lm: &mut LoadedModule,
+    i: &Interner,
+    color: bool,
+    show_timing: bool,
+    limit: Option<u64>,
+) -> String {
+    let mut out = String::new();
+    let mut shown = 0u64;
+    loop {
+        if limit == Some(shown) {
+            return out;
+        }
+        let Some(solution) = session.search.next_solution(&mut lm.built.engine) else {
+            let message = if session.shown_total == 0 {
+                "No solution."
+            } else {
+                "No more solutions."
+            };
+            out.push_str(&format!(
+                "\n{message}\n{}\n",
+                narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing)
+            ));
+            return out;
+        };
+        shown += 1;
+        session.shown_total += 1;
+        let names = session.search.variable_names();
+        let state = session
+            .search
+            .state_term(solution.state)
+            .expect("SMT solution references a live state");
+        let state = print_pretty_with_variables(&lm.built, i, state, names, color);
+        let constraint =
+            print_pretty_with_variables(&lm.built, i, solution.constraint, names, color);
+        out.push_str(&format!(
+            "\nSolution {}\n{}\nstate: {state}\n",
+            solution.number,
+            narrowing_rewrite_line(solution.rewrites, show_timing)
+        ));
+        let mut rendered_binding = false;
+        for slot in 0..session.target_variable_count {
+            if lm
+                .built
+                .engine
+                .smt_type(session.goal_variables.sort(slot))
+                .is_some()
+            {
+                continue;
+            }
+            rendered_binding = true;
+            let value = print_pretty_with_variables(
+                &lm.built,
+                i,
+                solution.bindings[slot as usize],
+                names,
+                color,
+            );
+            out.push_str(&format!(
+                "{} --> {value}\n",
+                session.goal_variables.name(slot)
+            ));
+        }
+        if !rendered_binding {
+            out.push_str("empty substitution\n");
+        }
+        out.push_str(&format!("where {constraint}\n"));
     }
 }
 

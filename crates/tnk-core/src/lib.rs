@@ -23,8 +23,11 @@ pub mod narrow;
 pub mod rewrite;
 // Pillar A-iv: the reachable-state graph + breadth-first `search`.
 pub mod search;
+pub mod smt;
 pub mod sort;
 pub mod symbol;
+// T4: symbolic root rewriting with accumulated SMT constraints.
+pub mod smt_search;
 pub mod term;
 // The matcher seam (A3) and the ACU theory (B1) are engine-internal for now — no public API surface
 // yet (review: keep the closed LhsAutomaton/Subproblem enums crate-private until a cross-crate
@@ -53,3 +56,5 @@ pub(crate) mod theory;
 pub mod unify;
 // S2: folding variant narrowing and its resumable breadth-first search.
 pub mod variant;
+// T6: native variant satisfiability over FVP/OS-compact constructor decompositions.
+pub mod variant_sat;

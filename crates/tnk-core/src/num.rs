@@ -191,6 +191,21 @@ impl Int {
         Int(!&self.0)
     }
 }
+/// A canonical exact rational behind the kernel's numeric-backend boundary. SMT leaves use this
+/// wrapper so their equality/order/hash semantics are mathematical while `malachite` remains private
+/// to this module.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ExactRational(Rational);
+
+impl ExactRational {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        text.parse::<Rational>().ok().map(Self)
+    }
+
+    pub(crate) fn to_decimal_ratio(&self) -> String {
+        self.0.to_string()
+    }
+}
 
 /// The exact rational value of a finite `f64` as `(signed numerator, positive denominator)` — Maude's
 /// `rat(FiniteFloat)` (`mpq_set_d`: a double is `m · 2^e` exactly). `None` for NaN / infinite. The result

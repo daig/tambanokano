@@ -329,7 +329,8 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        let delimiter = delimiter.ok_or_else(|| "operator declaration is missing `:`".to_string())?;
+        let delimiter =
+            delimiter.ok_or_else(|| "operator declaration is missing `:`".to_string())?;
         let names = self.toks[self.pos..delimiter].to_vec();
         self.pos = delimiter + 1;
         Ok(names)
@@ -407,12 +408,7 @@ impl<'a> Parser<'a> {
         Ok((fold, vfold, path))
     }
 
-    fn narrowing_command(
-        &mut self,
-        mut fold: bool,
-        vfold: bool,
-        path: bool,
-    ) -> PResult<Command> {
+    fn narrowing_command(&mut self, mut fold: bool, vfold: bool, path: bool) -> PResult<Command> {
         let fvu = self.at("fvu-narrow");
         if !fvu && !self.at("vu-narrow") {
             return Err("expected `vu-narrow` or `fvu-narrow`".into());
@@ -568,6 +564,13 @@ impl<'a> Parser<'a> {
                 let term = self.collect_until(&[]);
                 self.eat_dot()?;
                 TopItem::Command(Command::Reduce { module, term })
+            }
+            "check" => {
+                self.advance();
+                let module = self.opt_in_module()?;
+                let term = self.collect_to_dot();
+                self.eat_dot()?;
+                TopItem::Command(Command::Check { module, term })
             }
             "get" => {
                 self.advance();
@@ -743,6 +746,43 @@ impl<'a> Parser<'a> {
                 };
                 self.eat_dot()?;
                 TopItem::Command(Command::Search {
+                    module,
+                    max_solutions,
+                    max_depth,
+                    subject,
+                    arrow,
+                    pattern,
+                    such_that,
+                })
+            }
+            "smt-search" => {
+                self.advance();
+                let (max_solutions, max_depth) = self.opt_search_bound()?;
+                let module = self.opt_in_module()?;
+                // The arrows `=>1`/`=>+`/`=>*`/`=>!` lex as single tokens (runs of non-punctuation).
+                let subject = self.collect_until(&["=>1", "=>+", "=>*", "=>!"]);
+                let arrow = match self.peek_text() {
+                    Some("=>1") => SearchArrow::One,
+                    Some("=>+") => SearchArrow::Plus,
+                    Some("=>*") => SearchArrow::Star,
+                    Some("=>!") => SearchArrow::Bang,
+                    other => {
+                        return Err(format!(
+                            "smt-search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                        ));
+                    }
+                };
+                self.advance(); // the arrow
+                let pattern = self.collect_until(&["such"]);
+                let such_that = if self.at("such") {
+                    self.advance();
+                    self.eat("that")?;
+                    Some(self.collect_until(&[]))
+                } else {
+                    None
+                };
+                self.eat_dot()?;
+                TopItem::Command(Command::SmtSearch {
                     module,
                     max_solutions,
                     max_depth,

@@ -10,6 +10,7 @@
 //! Fields are `pub(crate)`; read access is through getters (review R3 H4).
 
 use crate::id::Id;
+use crate::smt::SmtOp;
 use crate::sort::SortId;
 use crate::term::Term;
 
@@ -85,6 +86,10 @@ pub struct Symbol {
     pub(crate) decls: Vec<OpDeclaration>,
     /// The structural axioms this operator is declared with.
     pub(crate) axioms: Axioms,
+    /// Sticky signature-build diagnostic: constructor overload declarations in this symbol did not
+    /// agree on their structural axiom/identity profile. The runtime keeps the first declaration's
+    /// executable theory; semantic clients must reject the inconsistent constructor family.
+    pub(crate) inconsistent_constructor_axioms: bool,
     /// The operator's two-sided identity (`id: <term>`), if any. The referenced signature entry owns
     /// the general ground term; the runtime caches its normalized DAG as a permanent GC root.
     pub(crate) identity: Option<IdentityId>,
@@ -145,6 +150,9 @@ pub enum SymbolClass {
     /// Maude's `SymbolType`, hence never equationally stable (verified: NAT's builtin `s X .=. s Y`
     /// stays unreduced in the oracle while a user `[iter ctor]` op decomposes).
     Marker,
+    /// An `SMT_NumberSymbol` pseudo-constructor. It is an NA marker rather than an inert ordinary
+    /// constant; the frontend gives it integer/rational literal productions.
+    SmtNumber,
 }
 
 /// The object-system role of an operator — Maude's `SymbolType` `CONFIG`/`OBJECT`/`MESSAGE`/`PORTAL`
@@ -173,6 +181,10 @@ impl Symbol {
             Some(v) if v.is_empty() => true, // `[frozen]` = every argument
             Some(v) => v.contains(&(arg as u32)),
         }
+    }
+
+    pub fn is_smt_number(&self) -> bool {
+        self.class == SymbolClass::SmtNumber
     }
 }
 
@@ -276,11 +288,14 @@ pub enum SpecialOp {
     /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
     /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
     Division { nat: NatHooks },
+    /// A solver-language operator recognized from `SMT_Symbol`. T1 deliberately leaves it
+    /// reduction-inert; T2's DAG translator consumes the typed operator.
+    Smt { op: SmtOp },
     /// An **upper-layer descent hook**. META-LEVEL's `metaReduce`/`metaApply`/… use it to down-translate,
     /// compute in an object module, and up-translate; LEXICAL's `tokenize`/`printTokens` use the same seam
     /// because token interning lives above the kernel. Hook symbols are resolved from the operator's
-    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Only SMT and strategy-meta descent
-    /// remain declared-but-inert through [`MetaOp::Deferred`].
+    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Strategy-meta descent remains
+    /// declared-but-inert through [`MetaOp::Deferred`].
     Meta {
         op: MetaOp,
         hooks: std::rc::Rc<MetaHooks>,
@@ -311,8 +326,8 @@ pub enum StdStream {
 }
 
 /// Which upper-layer operation a [`SpecialOp::Meta`] performs: META-LEVEL descent functions, symbolic
-/// variant/narrowing functions, and LEXICAL's two token conversion hooks. SMT and strategy descent
-/// remain [`MetaOp::Deferred`] until their backends land.
+/// variant/narrowing functions, SMT operations, and LEXICAL's two token conversion hooks. Strategy
+/// descent remains [`MetaOp::Deferred`] until its backend lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaOp {
     Reduce,
@@ -325,6 +340,15 @@ pub enum MetaOp {
     Xmatch,
     Search,
     SearchPath,
+    Check,
+    SmtSearch,
+    /// Native variant satisfiability over a reflected FVP/OS-compact constructor theory.
+    VariantSat {
+        validity: bool,
+        explicit_sorts: bool,
+    },
+    /// Advisory syntactic eligibility check for the variant-satisfiability procedure.
+    VariantSatWellFormed,
     SortLeq,
     SameKind,
     LesserSorts,
@@ -392,7 +416,7 @@ pub enum MetaOp {
     NarrowingSearch {
         path: bool,
     },
-    /// SMT / strategy descent — declared so the tower loads, but inert (kind-level).
+    /// Strategy descent — declared so the tower loads, but inert (kind-level).
     Deferred,
 }
 
@@ -592,6 +616,10 @@ impl Symbol {
         &self.decls
     }
 
+    pub(crate) fn has_inconsistent_constructor_axioms(&self) -> bool {
+        self.inconsistent_constructor_axioms
+    }
+
     /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
     /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm`, `id:`, or
     /// `idem` (any subset, non-assoc) → [`Cui`](Theory::Cui) — Maude's CUI_Theory covers all {C,U,I}
@@ -646,6 +674,13 @@ impl Symbol {
     /// The operator's built-in reduction rule (`special (id-hook …)`), if any (B3).
     pub(crate) fn special(&self) -> Option<&SpecialOp> {
         self.special.as_ref()
+    }
+    /// Whether this symbol is an upper-layer META-LEVEL/LEXICAL descent operation.
+    pub fn is_meta_operation(&self) -> bool {
+        matches!(self.special, Some(SpecialOp::Meta { .. }))
+    }
+    pub(crate) fn class(&self) -> SymbolClass {
+        self.class
     }
 
     /// Whether every declaration of this operator is a constructor (`[ctor]`). Metadata — it does not

@@ -1,13 +1,18 @@
 # Phase T — SMT (`check`, `smt-search`) + variant satisfiability — implementation plan
 
-**Status: NEXT (2026-07-21).** No production SMT code exists: `smt.maude` and
-`model-checker.maude` load because unknown id-hooks degrade, but `check true .` is silently unparsed
-and the solver hooks remain inert. D7 is bound by the T0 gate spike (`spikes/smt-spike/`,
-`reports/T0-smt-spike.md`): `z3` 0.20.2 is the feature-gated backend behind `trait SmtEngine`; the
-default build stays pure Rust. The previously missing variant-satisfiability research package has
-now been recovered and studied (§4.7), removing the source-discovery blocker but exposing a license
-gate and substantial Maude-2.7 API drift. This is the phase-T build plan under
-`subsystems-goal.md` §2 and roadmap §G3; §8 records the bound implementation choices.
+**Status: COMPLETE (2026-07-23); T0a–T6 DONE.** The default build remains pure Rust, recognizes the
+complete SMT language, and degrades solver queries to `undecided`/no solutions; the optional `smt-z3`
+lane translates typed DAGs through a query-local incremental backend. `check`, root-only
+constraint-bearing `smt-search`, `metaCheck`, and cached `metaSmtSearch` are byte-conformant across
+the frozen T01–T10 Maude-3.5/Yices2 contract: 10 fixtures and 118 commands. Native variant
+satisfiability ships as `tnk-core::variant_sat` plus the compatible `VAR-SAT-TOOL` facade; T11 passes
+all 27 native semantic checks, and the untouched checksum-pinned Maude-2.7 package passes its 27
+recorded oracle results. Three prototype defects are deliberately corrected and explicit in the
+contract: membership eligibility and existential/universal behavior over an empty constructor
+domain. The complete `smt-z3` Phase-T scoreboard is **11/11 PASS**.
+
+This is the completed Phase-T implementation record under `subsystems-goal.md` §2 and roadmap §G3;
+§8 records the bound choices and the narrow T6 parity boundary.
 
 This plan cites both trees: **tnk** = `crates/…`, **ref** = `~/code/maude-lang/maude/src/…`. The oracle
 is the **Yices2-enabled** rebuild (`~/.local/bin/maude`); run
@@ -211,7 +216,10 @@ problem (the D6/BDD analogue) has no counterpart here. This is the single most d
 
 ---
 
-## 3. What tnk already has to build on
+## 3. Baseline tnk had at plan start
+
+This section is retained as the pre-T implementation baseline that motivated the design. The closure
+record and current gates are in §6–§7.
 
 - **The `SpecialOp` seam** (tnk `symbol.rs:181–285`, resolved in `sig/build_sig.rs:585–723`). SMT
   symbols currently fall through the id-hook dispatch to `_other => return Ok(None)`
@@ -555,13 +563,13 @@ Keep the algorithm in `tnk-core` and the reflected-module adapter in `tnk-module
   observable contract is no result line.
 - **`undecided` mapping — low.** z3 `Unknown` and the null backend map to `undecided`; QF
   LIA/LRA/Boolean cases should decide.
-- **Unseeded fixtures — immediate next work.** `tests/Misc/smtTest.maude` bundles all object/meta
-  surfaces and restriction failures. Split it before code. Its `[4, 0]` command is an intentional
-  parse rejection, not a `[:` token. Its `debug smt-search`/`step`/`resume` blocks belong to roadmap
-  F4 and are an enumerated T exclusion; all non-debug `metaCheck`/`metaSmtSearch` blocks are required.
+- **Fixture contract — CLOSED.** `T01`–`T07` preserve all 106 non-debug commands from
+  `tests/Misc/smtTest.maude`; `T08` freezes manual §16.5, `T09` bignum/rational/coercion behavior,
+  and `T10` fresh source-base names and numbering. The 10-fixture/118-command manifest passed a
+  10/10 Yices2 oracle/self-diff run. Exactly eight debugger commands remain the roadmap-F4 exclusion.
 - **Validity fidelity — medium.** The gate includes the range-sort and rule-LHS restrictions omitted
   by the earlier plan (§2.5), plus different handling for unsupported command versus rule condition
-  fragments. Seed every bottom-of-`smtTest` rejection case.
+  fragments. Frozen `T05` includes every bottom-of-`smtTest` rejection case.
 - **Variant-satisfiability provenance/domain — medium/high.** The official archive and algorithm are
   now pinned (§4.7), so source discovery is resolved. The prototype has no explicit license, targets
   Maude 2.7, omits a constructor-freeness check, and assumes FVP/OS-compactness. The bound native
@@ -574,14 +582,38 @@ Keep the algorithm in `tnk-core` and the reflected-module adapter in `tnk-module
 
 Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 green (working-rules §4).
 
+### 6.1 Binding six-step execution spine
+
+This is the compact operational sequence; the detailed stage gates below remain authoritative.
+
+1. **T0a — freeze fixtures (DONE 2026-07-21).** The full object/meta/manual oracle contract was
+   frozen before production SMT implementation.
+2. **T1 — install language objects (DONE 2026-07-21).** Recognize hooks/numbers/metadata and ship
+   `smt.maude`, initially solver-inert.
+3. **T2–T3 — implement `check` (DONE 2026-07-21).** Land the engine seam/backends and close every
+   theory and error case.
+4. **T4 — implement `smt-search` (DONE 2026-07-23).** Use the dedicated rule view and
+   constraint-bearing state machine rather than ordinary search semantics.
+5. **T5 — implement the meta surfaces (DONE 2026-07-23).** `metaCheck` and `metaSmtSearch` are live,
+   including persistent continuation caches.
+6. **T6 — implement variant satisfiability (DONE 2026-07-23).** T6a–T6g landed with the pinned old
+   oracle, native Rust core, compatible facade, and declared semantic/count boundary.
+
+**Cursor: Phase T complete.** The next serial subsystem is Phase M, beginning with M0 fixture
+seeding; Phase-T code and gates remain frozen.
+
+### 6.2 Detailed stage gates
+
 - **T0 — spike + oracle (DONE).** z3 0.20.2 confirmed and the Yices2 oracle rebuilt
   (`reports/T0-smt-spike.md`).
 
-- **T0a — fixture seeding (NEXT, before production code).** Split all non-debug SMT semantics from
-  `tests/Misc/smtTest.maude`, add manual ch. 16 and bignum/rational probes, enumerate the F4 debugger
-  exclusion, oracle-run every command, and freeze the T manifest in `subsystems-goal.md`.
+- **T0a — fixture seeding (DONE 2026-07-21).** `T01`–`T07` contain all 106 non-debug commands
+  from `tests/Misc/smtTest.maude`; `T08` adds all four manual §16.5 commands, `T09` adds six
+  bignum/rational/coercion probes, and `T10` adds two fresh-name probes. The frozen manifest is
+  10 fixtures/118 commands; every fixture passed against the Yices2 oracle. The only exclusion is
+  the eight-command F4 debugger block at source lines 230–234 and 237–239.
 
-- **T1 — SMT theory recognition + shipped `smt.maude`.** (Pure Rust; no solver yet.)
+- **T1 — SMT theory recognition + shipped `smt.maude` (DONE 2026-07-21).** (Pure Rust; no solver yet.)
   1. `SpecialOp::Smt { op: SmtOp }` for the **25** C++ `OPERATORS`, including the arity-sensitive
      `"-"` split; marker-class `SMT_NumberSymbol` constructors for integers/reals.
   2. `NaValue::SmtNum(Rc<SmtNumber>)`, grammar actions, exact sorting/hashing, and printing (§4.2).
@@ -589,29 +621,38 @@ Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 gree
   4. Check in and pin `smt.maude`. **Gate:** shipped-copy load smoke; all hooks recognized but
      intentionally reduction-inert; SMT leaf parse/print and ordinary `reduce` match the oracle;
      default F1–F4 green.
+  Shipped-copy SHA-256: `c711af83c8eeb29498b7885fb50cfafe95f33900659bf8405bd8d4bca63d561f`;
+  `cmp` against `Main/smt.maude` is exact. A no-prelude run with the repository copy parsed and
+  round-tripped a 39-digit Integer, canonical negative Real rational, and `toReal` application.
+  Default gate: audit 77/77 and `cargo test --release` 399/399. An overlapping legacy sweep became
+  incomplete; its first reported fixture passed on an immediate isolated retry.
 
-- **T2 — `SmtEngine` + z3 backend + `check`.**
+- **T2 — `SmtEngine` + z3 backend + `check` (DONE 2026-07-21).**
   1. Pure trait/`SmtResult`/`NullSmtEngine`; cfg-gated `Z3Engine` and DAG translator in
      `tnk-core::smt`; workspace feature forwarding.
   2. Parse/dispatch/render `check` without equationally reducing its subject. BAD_DAG emits no result;
      null emits `undecided`.
   3. **Gate:** T01 Boolean byte-exact in the z3 lane; default command parses and degrades; both builds.
+  `T01` is byte-exact in the z3 lane (12/12 checks); the default lane parses the same commands and
+  returns 12 `undecided` verdicts. Default and `smt-z3` workspace builds both pass.
 
-- **T3 — full `check` conformance.** TEST-B/I/R/RI, BAD_DAG, bignum coefficients, exact rationals,
-  mixed coercions, and manual examples.
+- **T3 — full `check` conformance (DONE 2026-07-21).** TEST-B/I/R/RI, BAD_DAG, bignum
+  coefficients, exact rationals, mixed coercions, and manual examples.
+  `T01`–`T04`, `T08`, and `T09` are byte-exact: 6 fixtures / 71 object checks. A focused free-sort
+  constant and NAT constant probe confirms BAD_DAG prints the command echo and no solver-result line.
 
-- **T4 — `smt-search`.** Add the dedicated source-ordered `smt_rules` descriptor table for all rules
-  in SMT-aware modules, including nonexec/extra-RHS-variable rules, while leaving ordinary
-  `CompiledRule` executable-only. Add the root/non-extension/no-reduction candidate seam, then the
-  incremental state machine, rule/command constraint construction, goal match constraints,
-  counters/rendering, restriction gate, and `continue`. **Gate:** all object search and rejection
-  fixtures, exact order/counts/`#n-Base`/parentheses, plus default Null degradation.
+- **T4 — `smt-search` (DONE 2026-07-23).** The dedicated source-ordered `smt_rules` descriptor
+  retains all rules in SMT-aware modules, including nonexec/extra-RHS-variable rules, without
+  widening ordinary executable `CompiledRule`. The root/non-extension/no-reduction candidate seam,
+  incremental state machine, rule/command and goal-match constraints, counters/rendering,
+  restriction gate, and `continue` are live. **Gate:** T05 is byte-exact over all 27 object search,
+  continuation, and rejection commands; the default Null lane degrades to no solutions.
 
-- **T5 — mandatory meta surfaces.** Implement `metaCheck` and cached `metaSmtSearch`, including input
-  and returned fresh counters, bounded/unbounded search, `SmtResult`/`failure`, and equal/forward/
-  backward cache requests. **Gate:** every non-debug meta block from `smtTest`.
+- **T5 — mandatory meta surfaces (DONE 2026-07-23).** `metaCheck` and cached `metaSmtSearch` implement
+  input/returned fresh counters, bounded/unbounded search, `SmtResult`/`failure`, and equal/forward/
+  backward cache requests. **Gate:** T06/T07 are byte-exact over all 18 non-debug reflected commands.
 
-- **T6 — native variant-satisfiability + Maude facade (independent of T1–T5/M).**
+- **T6 — native variant-satisfiability + Maude facade (DONE 2026-07-23; independent of T1–T5/M).**
   1. **T6a — provenance + executable oracle.** Pin the official URL/checksum above. In an x86-64
      Linux sandbox, run the untouched archive with its bundled interpreter from the documented
      working directory; freeze version, every command from the 12 example drivers, exit status, and
@@ -650,16 +691,23 @@ Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 gree
      shipped facade, then both evaluate the same fixture body. **Gate:** all T6 values, result sorts,
      termination, helper sets, and declared ordering match; default `cargo build/test --release`
      remains independent of z3, Full Maude, model checking, and the downloaded archive.
+  **Closure gate:** the shipped T11 fixture passes `VAR-SAT NATIVE 27/27`; the untouched
+  checksum-pinned archive passes `VAR-SAT ORACLE 27/27`. `T11-variant-satisfiability.expected`
+  records both result columns and the three intentional correctness differences. The implementation
+  links neither z3 nor model checking and contains no prototype source.
 
 ---
 
 ## 7. Verification
 
-- **Fixture seeding.** Split `tests/Misc/smtTest.maude` into `T01…` check-Boolean, `T02…`
-  check-Integer, `T03…` check-Real, `T04…` check-RealInteger, `T05…` object search/restrictions,
-  `T06…` metaCheck, and `T07…` metaSmtSearch, plus manual/fresh probes. T06/T07 are mandatory.
-  Enumerate only the debugger block as an F4-owned exclusion. Oracle-verify each command against the
-  Yices2 build before freezing the manifest.
+- **Fixture contract.** `T01` check-Boolean (12 commands), `T02` check-Integer (19), `T03`
+  check-Real (19), `T04` check-RealInteger (11), `T05` object search/restrictions/continuations
+  (27), `T06` metaCheck (8), `T07` metaSmtSearch (10), `T08` manual §16.5 (4), `T09`
+  bignum/rational/coercion (6), and `T10` fresh names (2) form the frozen **10-fixture,
+  118-command** Maude-3.5/Yices2 byte contract. `T11` adds 27 native variant-satisfiability
+  value/sort checks against the separately pinned Maude-2.7 contract. The production scoreboard is
+  **11/11 PASS**. T01–T07 still exactly cover all 106 non-debug commands in `smtTest`; only its eight
+  debugger commands remain the enumerated F4 exclusion.
 - **Harness.** The z3 lane uses the existing `TNK_BIN` override—no fixture tags and no silent skips:
   `CARGO_TARGET_DIR=target/smt-z3 cargo build --release -p tnk-repl --features smt-z3` with
   `Z3_SYS_Z3_HEADER=/opt/homebrew/opt/z3/include/z3.h` and
@@ -674,11 +722,12 @@ Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 gree
   key `(sort,name)`; `#n-Base` naming with bignum counters and `u32::MAX` non-slot index;
   retained-nonexec isolation; root-only rewrite; unsupported condition handling; balanced push/pop;
   cache forward/equal/backward/exhausted.
-- **T6 oracle contract.** The 2016 executable is a semantic oracle, not a Maude-3.5 byte oracle:
-  require exact Bool value, result sort, termination, canonical helper sets, and documented
-  enumeration order. A native hook cannot reproduce the prototype's thousands of Maude-level
-  rewrites; keep global normalization unchanged and record a narrow T6-only accepted difference for
-  rewrite counts and old-version command wrapping. Never weaken the U/V/N/T1–T5 count contract.
+- **T6 oracle contract.** The 2016 executable is a recorded semantic oracle, not a Maude-3.5 byte
+  oracle. `tools/variant-sat-oracle.sh` verifies its 27-result column without vendoring the archive;
+  `tools/variant-sat-check.sh` verifies the native 27-result column. The columns intentionally differ
+  for membership eligibility and the two empty-domain quantifier cases, where the native contract
+  fixes prototype defects. Native hooks also cannot reproduce the prototype's reflective rewrite
+  counts; global normalization remains strict and no U/V/N/T1–T5 count contract is weakened.
 - **T6 stress contracts.** Stream finite assignments and disjunction branches; prove bounded live
   roots on a large finite product with an early witness, no stale cache after module replacement,
   deterministic repeat output, and no z3/model-checker/Full-Maude linkage.
@@ -689,7 +738,7 @@ Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 gree
 
 ---
 
-## 8. Bound decisions and remaining prerequisite
+## 8. Bound decisions
 
 1. **Trait/placement — bound.** Solver operations only; fresh naming stays pure. The z3 backend is a
    cfg-gated `tnk-core` submodule and `tnk-repl` forwards the feature.
@@ -712,6 +761,6 @@ Ordered; each stage lands with its now-passing fixture(s) and keeps F1–F4 gree
 9. **Variant-satisfiability provenance — bound conservatively.** No explicit license was found for
    the prototype-owned files. Do not vendor or adapt them unless the owner separately records
    acceptable provenance. Published algorithm + observed behavior are the implementation inputs.
-10. **Variant-satisfiability parity — bound.** Exact semantic values/sorts/sets/order; a narrow,
-    explicit accepted difference for native-vs-reflective rewrite counts and Maude-2.7 wrapping.
-    Global harness normalization remains strict.
+10. **Variant-satisfiability parity — bound.** Exact native values/sorts/termination and deterministic
+    helper sets/order, with three explicit prototype-semantic corrections plus the narrow native-vs-
+    reflective rewrite-count and Maude-2.7 wrapping boundary. Global harness normalization stays strict.

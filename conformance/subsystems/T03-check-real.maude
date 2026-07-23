@@ -1,0 +1,30 @@
+*** T03-check-real — rational-linear-arithmetic SMT checks lifted from the reference suite (Misc/smtTest.maude)
+set show timing off .
+load smt
+
+fmod TEST-R is
+  pr REAL .
+  vars W X Y Z : Boolean .
+  vars P Q R S : Real .
+endfm
+
+check P > Q and Q > R .
+check P > Q and Q > R and R > P .
+check P < Q and Q < R .
+check P < Q and Q < R and R < P .
+check P >= Q and Q >= P .
+check P >= Q and Q >= P and P =/== Q .
+check P <= Q and Q <= P .
+check P <= Q and Q <= P and P =/== Q .
+
+check P === Q + R and P > Q and P > R .
+check P === Q + R and P > Q + R .
+check P === Q + R and P > Q + R + S .
+check P === Q - R and P > Q + R .
+check - P === Q - R and P > Q + R .
+check P =/== Q + R and P > Q + R .
+check (P > Q ? P : Q) >= P and (P > Q ? P : Q) >= Q .
+check (P > Q ? P : Q) < P .
+check (P > Q ? P : Q) === P or (P > Q ? P : Q) === Q .
+check not((P > Q ? P : Q) === P or (P > Q ? P : Q) === Q) .
+check (P > Q ? P : Q) =/== P and (P > Q ? P : Q) =/== Q .

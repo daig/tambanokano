@@ -8,6 +8,7 @@
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::num::Nat;
+use crate::smt::SmtNumber;
 use crate::sort::SortId;
 use crate::symbol::{SymbolId, Theory};
 use std::collections::HashMap;
@@ -122,6 +123,13 @@ impl Term {
         Term::Na {
             symbol,
             value: NaValue::Qid(Rc::from(value)),
+        }
+    }
+    /// An exact SMT integer/rational literal.
+    pub fn smt_number(symbol: SymbolId, value: SmtNumber) -> Self {
+        Term::Na {
+            symbol,
+            value: NaValue::SmtNum(Rc::new(value)),
         }
     }
 

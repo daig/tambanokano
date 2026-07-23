@@ -151,26 +151,73 @@ it grew the live denominator without changing the frozen S3 completion contract.
   prose-only (no runnable command/output pair); ch. 13 §13.4.6 verbose diagnostics and the
   381-unifier dump are representative examples.
 
-### Phase T — SMT (next; core independent of M; T6 variant satisfiability uses completed S2)
+### Phase T — SMT (complete 2026-07-23; core independent of M; T6 uses completed S2)
 
-- **T0 gate is done; T fixtures are not yet seeded.** The first phase-T change is the fixture-only T0a
-  split of `tests/Misc/smtTest.maude` plus manual probes. All non-debug object `check`/`smt-search`,
-  `metaCheck`, and `metaSmtSearch` semantics are in scope; only its `debug`/`step`/`resume` block is an
-  enumerated roadmap-F4 exclusion.
-- **T1–T5 core:** recognize the 25 SMT hooks and number leaves; ship a byte-identical `smt.maude`;
-  implement `check` and `smt-search` through the D7 `SmtEngine` seam; then the mandatory meta
-  surfaces. The `z3` 0.20.2 backend is behind `smt-z3`; the default remains pure Rust, loads/parses
-  the surface, and degrades to `undecided`/no solutions without linking a solver. The z3 lane owns
-  the T fixture denominator. Output is verdict/state/substitution/constraint only—the reference SMT
-  APIs do **not** print solver models.
-- **T6 variant satisfiability:** the official 2016 `var-sat-rel3.tgz` package and paper are recovered
-  and pinned. The package targets Maude 2.7, its prototype-owned files have no explicit license, its
-  finite-sort check depends on model checking, and its old three-field variant API no longer computes
-  on Maude 3.5. It is therefore an executable semantic oracle only. Production is a new native Rust
-  FVP/OS-compact constructor-variant decision procedure using S2, exposed through a thin compatible
-  `VAR-SAT-TOOL` Maude facade. It has no z3, T1–T5, M, or Full-Maude dependency and copies no
-  prototype source. Full algorithm, provenance, old-oracle lane, fixtures, accepted count boundary,
-  and T6a–T6g gates: `remaining-plans/04-smt.md` §4.7/§6.
+#### Binding six-step execution sequence
+
+For one serial workstream, stay on the earliest incomplete step; a later step never justifies weakening
+an earlier gate. T6 is technically parallel-safe, but the recorded serial order remains:
+
+1. **Freeze the Phase-T contract (T0a — DONE 2026-07-21).** Split and oracle-run every
+   in-scope non-debug `smtTest`/manual command, enumerate the debugger exclusion, and freeze the
+   manifest before any production SMT code.
+2. **Install the SMT language substrate (T1 — DONE 2026-07-21).** All 25 hooks, exact SMT number
+   leaves, per-module metadata, and the pinned `smt.maude` are live.
+3. **Implement and close `check` (T2–T3 — DONE 2026-07-21).** The pure `SmtEngine` seam, Null
+   backend, feature-gated z3 translator/backend, and every theory/error fixture pass.
+4. **Implement and close `smt-search` (T4 — DONE 2026-07-23).** The dedicated source-ordered rule
+   view, root-only/no-reduction state machine, constraints, exact output, restrictions, and
+   `continue` pass.
+5. **Finish the reflected SMT surface (T5 — DONE 2026-07-23).** Cached `metaCheck` and
+   `metaSmtSearch`, counters, bounds, failure, and continuation behavior pass.
+6. **Deliver native variant satisfiability (T6 — DONE 2026-07-23).** T6a–T6g landed: pinned old
+   Linux oracle, independent contract, eligibility/constructor/finite-sort/formula core, compatible
+   `VAR-SAT-TOOL` facade, and both differential lanes.
+
+#### Phase-T manifest (frozen 2026-07-21)
+
+**T01–T10 — 10 fixtures; 118 substantive commands; 10/10 Yices2 oracle/self-diff PASS.**
+This frozen oracle contract remains the T1–T5 byte boundary; the production closure adds T11 below.
+
+- `T01-check-boolean` (12), `T02-check-integer` (19), `T03-check-real` (19), and
+  `T04-check-real-integer` (11): the four solver theories from `tests/Misc/smtTest.maude`.
+- `T05-smt-search` (27): every non-debug object search, continuation, invalid-bound, and
+  restriction case, including the ordinary setup search preceding the second debugger block.
+- `T06-meta-check` (8) and `T07-meta-smt-search` (10): every non-debug reflected SMT command;
+  both are mandatory T5 scope.
+- `T08-manual-ch16` (4): every executable `check` example in manual §16.5.
+- `T09-bignum-rational` (6): arbitrary-precision integer coefficients, exact rational
+  canonicalization/signs, and integer-to-real coercion.
+- `T10-fresh-names` (2): two-step source-base-name allocation (`#1-X`, `#2-Y`), numbering,
+  ordering, and accumulated constraints.
+- `T11-variant-satisfiability` (27): native FVP/OS-compact constructor satisfiability and validity,
+  including eligibility, finite/empty domains, AC/C/CUI/ACU/AU constructors, variants, and overloads.
+  Its expected file records both the native contract and the pinned Maude-2.7 prototype results.
+
+`T01`–`T07` contain all **106** non-debug command occurrences in the reference `smtTest`; the sole
+F4-owned exclusion is exactly eight debugger commands at source lines 230–234 and 237–239
+(`debug smt-search`, `debug cont`, four `step`s, and two `resume`s). The four manual commands and
+eight independent number/fresh probes bring the denominator to 118. Every fixture was run through
+the Yices2 rebuild; `TNK_BIN=~/.local/bin/maude tools/subsystems-scoreboard.sh -p T` reported 10/10.
+
+**Cursor: Phase T complete (2026-07-23); next serial cursor is M0.** Detailed design, implementation
+record, gates, and the T6 parity boundary are frozen in `remaining-plans/04-smt.md` §§4–8.
+
+- **T0a–T5 closed:** the optional z3 0.20.2 lane passes T01–T10—10 fixtures / 118 byte-exact
+  commands—covering all non-debug object `check`/`smt-search`, `metaCheck`, and `metaSmtSearch`
+  semantics plus manual, number, and fresh-name probes. The eight debugger commands remain the sole
+  explicit F4 exclusion. The default build is still pure Rust, parses the same surface, and degrades
+  to `undecided`/no solutions without linking z3.
+- **T6 closed:** production is a native Rust FVP/OS-compact constructor-variant decision procedure
+  using S2, exposed through the source-compatible `VAR-SAT-TOOL` facade. The untouched official
+  archive is checksum-gated external reference material and passes its 27-result lane; the native
+  lane passes 27/27. The checked-in contract explicitly corrects three prototype defects
+  (membership eligibility and existential/universal empty-domain semantics) and accepts only the
+  recorded reflective rewrite-count/old-wrapper boundary. No prototype source is copied; T6 links
+  neither z3 nor model checking.
+- **Phase gate:** `TNK_BIN=target/smt-z3/release/tnk-repl
+  tools/subsystems-scoreboard.sh -p T` reports **11/11 PASS**. The retained audit, legacy, U, V, and
+  N gates remain green.
 
 ### Phase M — model checker (independent; selected after T for serial work, parallel-safe)
 
@@ -258,9 +305,17 @@ it grew the live denominator without changing the frozen S3 completion contract.
   commit hash to append when committed)
 - [x] T0 z3/Yices2 spike + D7 resolution — refreshed working tree 2026-07-21 (`z3` 0.20.2;
   894-node incremental≡fresh gate; `reports/T0-smt-spike.md`)
-- [ ] T0a SMT fixture manifest —
-- [ ] T1–T5 SMT theory, object commands, and mandatory meta surfaces —
-- [ ] T6 variant-satisfiability library —
+- [x] T0a SMT fixture manifest — working tree 2026-07-21 (10 fixtures, 118 commands;
+  Yices2 oracle/self-diff 10/10; eight debugger commands are the sole F4 exclusion; commit hash
+  to append when committed)
+- [x] T1 SMT language substrate — working tree 2026-07-21 (25 operators, exact SMT number leaves,
+  per-signature metadata, byte-identical shipped `smt.maude`; default audit 77/77 and cargo 399/399)
+- [x] T2–T3 SMT backend + object `check` — working tree 2026-07-21 (default Null degradation;
+  optional z3 0.20.2; 6 fixtures / 71 checks byte-exact, plus BAD_DAG probe)
+- [x] T4–T5 SMT search and mandatory meta surfaces — working tree 2026-07-23 (T05–T07:
+  3/3 fixtures, 45 byte-exact object/meta commands; default Null degradation retained)
+- [x] T6 variant-satisfiability library — working tree 2026-07-23 (native and external-oracle lanes
+  27/27 each; complete Phase-T scoreboard 11/11; three prototype corrections recorded in T11)
 - [ ] M model checker —
 - [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
 - [ ] I1 session extraction —

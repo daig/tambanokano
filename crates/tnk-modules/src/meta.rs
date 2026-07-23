@@ -31,10 +31,10 @@
 //!   and `metaWellFormed{Module,Term,Substitution}` (structural checks → `Bool`).
 //!
 //! Every implemented descent function conforms on **value, sort, rewrite count, *and* layout** (Stage 3.5
-//! taught `print_pretty` the `format` attribute). Base unification, variants, and narrowing have dedicated
-//! `MetaOp` variants; **SMT** and **strategy-meta** descent remain in `MetaOp::Deferred`. Those deferred
-//! operations parse and load but reduce to the kind level; exhaustive dispatch still forces an explicit
-//! choice whenever a new descent operation is added. The strategy
+//! taught `print_pretty` the `format` attribute). Base unification, variants, narrowing, and SMT checking
+//! have dedicated `MetaOp` variants; **SMT search** and **strategy-meta** descent remain in
+//! `MetaOp::Deferred`. Those deferred operations parse and load but reduce to the kind level; exhaustive
+//! dispatch still forces an explicit choice whenever a new descent operation is added. The strategy
 //! *language* itself
 //! (`srewrite`/`dsrewrite`, the full
 //! combinator + matchrew + conditional-rule surface) is **complete and conformant** in `tnk-frontend::strategy`
@@ -51,14 +51,20 @@
 //! retained (parsed on demand — build installs no trace; see [`parse_statement_trace`](tnk_frontend::load)).
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::descent::{DescentOps, MetaCtx};
 use tnk_core::engine::Engine;
 use tnk_core::search::Arrow;
+use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtNumber, SmtResult};
 use tnk_core::sort::SortId;
 use tnk_core::symbol::{MetaHooks, MetaOp, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
+use tnk_core::variant_sat::{
+    ConstructorAnalysis, Decision as VariantSatDecision, EligibilityRejection, Formula,
+    Literal as VariantSatLiteral, SortOverrides, VariantSatQuery, decide as decide_variant_sat,
+};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{Interner, Sym, tokenize};
 use tnk_frontend::load::{
@@ -167,6 +173,31 @@ impl MetaState {
         (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
     }
 
+    fn take_smt_search(
+        &mut self,
+        key: &MetaSmtSearchCacheKey,
+        ctx: &MetaCtx,
+        requested: usize,
+    ) -> Option<MetaSmtSearchCache> {
+        let index = self.caches.iter().position(
+            |entry| matches!(entry, MetaCache::SmtSearch(cache) if cache.key.matches(key, ctx)),
+        )?;
+        let MetaCache::SmtSearch(cache) = self.caches.remove(index) else {
+            unreachable!("cache kind checked above")
+        };
+        (!cache
+            .last_solution_index
+            .is_some_and(|last| last > requested))
+        .then_some(cache)
+    }
+
+    fn variant_sat_result(&self, key: &MetaVariantSatCacheKey, ctx: &MetaCtx) -> Option<bool> {
+        self.caches.iter().find_map(|entry| match entry {
+            MetaCache::VariantSat(cache) if cache.key.matches(key, ctx) => Some(cache.result),
+            _ => None,
+        })
+    }
+
     fn insert(&mut self, cache: MetaCache) {
         if self.caches.len() == META_CACHE_CAPACITY {
             self.caches.remove(0);
@@ -181,6 +212,75 @@ enum MetaCache {
     NarrowApply(MetaNarrowApplyCache),
     NarrowSearch(MetaNarrowSearchCache),
     LegacyNarrow(MetaLegacyNarrowCache),
+    SmtSearch(MetaSmtSearchCache),
+    VariantSat(MetaVariantSatCache),
+}
+
+#[derive(Clone)]
+struct MetaVariantSatCacheKey {
+    module: DagId,
+    formula: DagId,
+    finite_sorts: Option<DagId>,
+    infinite_sorts: Option<DagId>,
+    validity: bool,
+}
+
+impl MetaVariantSatCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.validity == other.validity
+            && ctx.deep_equal(self.module, other.module)
+            && ctx.deep_equal(self.formula, other.formula)
+            && match (self.finite_sorts, other.finite_sorts) {
+                (Some(lhs), Some(rhs)) => ctx.deep_equal(lhs, rhs),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (self.infinite_sorts, other.infinite_sorts) {
+                (Some(lhs), Some(rhs)) => ctx.deep_equal(lhs, rhs),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+struct MetaVariantSatCache {
+    key: MetaVariantSatCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    result: bool,
+}
+
+#[derive(Clone)]
+struct MetaSmtSearchCacheKey {
+    module: DagId,
+    initial: DagId,
+    goal: DagId,
+    condition: DagId,
+    arrow: Arrow,
+    fresh_base: String,
+    max_depth: Option<u32>,
+}
+
+impl MetaSmtSearchCacheKey {
+    fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
+        self.arrow == other.arrow
+            && self.fresh_base == other.fresh_base
+            && self.max_depth == other.max_depth
+            && ctx.deep_equal(self.module, other.module)
+            && ctx.deep_equal(self.initial, other.initial)
+            && ctx.deep_equal(self.goal, other.goal)
+            && ctx.deep_equal(self.condition, other.condition)
+    }
+}
+
+struct MetaSmtSearchCache {
+    key: MetaSmtSearchCacheKey,
+    _key_roots: Vec<tnk_core::root::RootGuard>,
+    loaded: LoadedModule,
+    search: tnk_core::smt_search::SmtSearch,
+    goal_variables: VarIndex,
+    target_variable_count: u32,
+    last_solution_index: Option<usize>,
+    last_solution: Option<tnk_core::smt_search::SmtSolution>,
 }
 
 #[derive(Clone)]
@@ -604,6 +704,15 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Xmatch => self.meta_xmatch(ctx, hooks, redex),
             MetaOp::Xapply => self.meta_xapply(ctx, hooks, redex),
             MetaOp::SearchPath => self.meta_search_path(ctx, hooks, redex),
+            // SMT check only translates the decoded Boolean formula and asks the configured backend;
+            // unlike object reduction/search it contributes no inner rewrite count.
+            MetaOp::Check => self.meta_check(ctx, hooks, redex),
+            MetaOp::SmtSearch => self.meta_smt_search(ctx, hooks, redex),
+            MetaOp::VariantSat {
+                validity,
+                explicit_sorts,
+            } => self.meta_variant_sat(ctx, hooks, redex, validity, explicit_sorts),
+            MetaOp::VariantSatWellFormed => self.meta_variant_sat_well_formed(ctx, hooks, redex),
             // Stage 4 — the sort/kind queries (down the module, read the sort lattice).
             MetaOp::SortLeq => self.meta_sort_leq(ctx, hooks, redex),
             MetaOp::SameKind => self.meta_same_kind(ctx, hooks, redex),
@@ -648,10 +757,9 @@ impl DescentOps for MetaDescent<'_> {
             // interner, while their inputs/results remain ordinary String/Qid NA nodes in this engine.
             MetaOp::Tokenize => self.lexical_tokenize(ctx, hooks, redex),
             MetaOp::PrintTokens => self.lexical_print_tokens(ctx, hooks, redex),
-            // Stage 5 — declared but **inert**: SMT and strategy descent. Symbolic narrowing has
-            // explicit arms below; `MetaOp::Deferred` now contains only `metaSmtSearch`/`metaCheck`
-            // and strategy-meta operations. Those surfaces parse and load but reduce to the kind
-            // level until their backends land. Exhaustive dispatch forces a choice for every new op.
+            // Stage 5 — declared but **inert**: strategy descent. Symbolic narrowing has explicit arms
+            // below; `MetaOp::Deferred` contains only strategy-meta operations. Those surfaces parse and
+            // load but reduce to the kind level until their backends land.
             // Strategy-meta up maps are structurally deferred (G1, §3.9.8) — but the EMPTY sets
             // need none of G1's prerequisites: a module with no strat declarations/definitions
             // up-translates to the empty-set constant ((none).StratDeclSet, 1 rewrite), as Maude
@@ -698,6 +806,188 @@ impl DescentOps for MetaDescent<'_> {
 }
 
 impl MetaDescent<'_> {
+    /// `metaCheck(M, T)` → `(true).Bool` when the decoded Boolean SMT formula is satisfiable and
+    /// `(false).Bool` when it is unsatisfiable. An unavailable solver, an indeterminate answer, or a
+    /// non-SMT Boolean DAG leaves the descent redex unreduced, matching Maude's undecided/error path.
+    ///
+    /// Solver translation and checking do not perform object rewrites. The successful descent itself is
+    /// therefore the only rewrite charged by `try_special`; reductions of the two meta arguments have
+    /// already been counted in the outer engine.
+    fn meta_check(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        if kids.len() != 2 {
+            return None;
+        }
+        let mut loaded = self.down_module(ctx, hooks, kids[0])?;
+        let mut variables = VarIndex::new();
+        let formula = down_term_to_term(ctx, hooks, kids[1], &loaded.built, &mut variables)?;
+        let bindings: Vec<DagId> = (0..variables.count())
+            .map(|slot| {
+                let source = variables.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                let name = self.interner.intern(base).index();
+                loaded
+                    .built
+                    .engine
+                    .make_var(variables.sort(slot), name, slot)
+            })
+            .collect();
+        let formula = loaded
+            .built
+            .engine
+            .instantiate_bindings(&formula, &bindings);
+        let mut solver = ConfiguredSmtEngine::default();
+        let result = solver.check_dag(&loaded.built.engine, formula);
+        match result {
+            SmtResult::Sat => up_bool(ctx, true),
+            SmtResult::Unsat => up_bool(ctx, false),
+            SmtResult::Unknown | SmtResult::BadDag => None,
+        }
+    }
+
+    fn meta_variant_sat(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+        validity: bool,
+        explicit_sorts: bool,
+    ) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let (module, finite_arg, infinite_arg, formula_arg) =
+            match (explicit_sorts, kids.as_slice()) {
+                (false, [module, formula]) => (*module, None, None, *formula),
+                (true, [module, finite, infinite, formula]) => {
+                    (*module, Some(*finite), Some(*infinite), *formula)
+                }
+                _ => return None,
+            };
+        let key = MetaVariantSatCacheKey {
+            module,
+            formula: formula_arg,
+            finite_sorts: finite_arg,
+            infinite_sorts: infinite_arg,
+            validity,
+        };
+        if let Some(result) = self.state.variant_sat_result(&key, ctx) {
+            return up_bool(ctx, result);
+        }
+
+        let mut loaded = self.down_variant_sat_module(ctx, hooks, module)?;
+        let finite = match finite_arg {
+            Some(sorts) => down_variant_sort_set(ctx, hooks, sorts, &loaded.built)?,
+            None => Vec::new(),
+        };
+        let infinite = match infinite_arg {
+            Some(sorts) => down_variant_sort_set(ctx, hooks, sorts, &loaded.built)?,
+            None => Vec::new(),
+        };
+        let mut vars = VarIndex::new();
+        let formula = down_variant_sat_formula(ctx, hooks, formula_arg, &loaded.built, &mut vars)?;
+        let formula = if validity { formula.negated() } else { formula };
+        let variables = (0..vars.count())
+            .map(|slot| {
+                let source = vars.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                let code = self.interner.intern(base).index();
+                tnk_core::unify::problem::VarSpec {
+                    sort: vars.sort(slot),
+                    name: maude_variable_name_rank(base, code),
+                }
+            })
+            .collect();
+        let variant_equations = executable_variant_equations(&mut loaded.built, self.interner);
+        let has_memberships = !loaded.built.mb_traces.is_empty()
+            || loaded
+                .built
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::Mb { .. }));
+        let query = VariantSatQuery {
+            formula,
+            variables,
+            variant_equations,
+            overrides: SortOverrides {
+                finite,
+                infinite,
+                explicit: explicit_sorts,
+            },
+            has_memberships,
+        };
+        let decision = {
+            let mut names = InternerNames(self.interner);
+            decide_variant_sat(&mut loaded.built.engine, &mut names, query)
+        };
+        let result = match (validity, decision) {
+            (false, VariantSatDecision::Sat) | (true, VariantSatDecision::Unsat) => true,
+            (false, VariantSatDecision::Unsat) | (true, VariantSatDecision::Sat) => false,
+            (_, VariantSatDecision::Rejected(_)) => return None,
+        };
+        let key_roots = std::iter::once(module)
+            .chain(std::iter::once(formula_arg))
+            .chain(finite_arg)
+            .chain(infinite_arg)
+            .map(|dag| ctx.root(dag))
+            .collect();
+        self.state
+            .insert(MetaCache::VariantSat(MetaVariantSatCache {
+                key,
+                _key_roots: key_roots,
+                result,
+            }));
+        up_bool(ctx, result)
+    }
+
+    fn meta_variant_sat_well_formed(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let [module] = kids.as_slice() else {
+            return None;
+        };
+        let mut loaded = self.down_variant_sat_module(ctx, hooks, *module)?;
+        let has_memberships = !loaded.built.mb_traces.is_empty()
+            || loaded
+                .built
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::Mb { .. }));
+        let result = match ConstructorAnalysis::build(
+            &mut loaded.built.engine,
+            &SortOverrides::default(),
+            has_memberships,
+        ) {
+            Ok(_) | Err(EligibilityRejection::IdentityClassificationRequiresOverride { .. }) => {
+                true
+            }
+            Err(_) => false,
+        };
+        up_bool(ctx, result)
+    }
+
+    /// The stock facade passes named modules as `upModule('M, true)`. The general up-map cannot
+    /// materialize a flat module containing builtin `special`/`poly` declarations, so that child
+    /// deliberately stays unreduced. Consume the named request directly here; ordinary reflected
+    /// module constructors and `[M]` import expressions still use the general down-map.
+    fn down_variant_sat_module(
+        &mut self,
+        ctx: &MetaCtx,
+        hooks: &MetaHooks,
+        module: DagId,
+    ) -> Option<LoadedModule> {
+        if ctx.name(ctx.top(module)) == "upModule" {
+            let kids = ctx.children(module);
+            let name = qid_text(ctx, *kids.first()?)?;
+            down_bool(ctx, *kids.get(1)?)?;
+            let flat = flatten(&name, self.db, self.views, self.interner).ok()?;
+            return build_loaded_module(&flat, self.interner).ok();
+        }
+        self.down_module(ctx, hooks, module)
+    }
+
     /// `metaReduce(M, T)` → `{up(t'), up(leastSort(t'))}` where `t'` is `down(T)` reduced in `down(M)`.
     /// The object reduction's rewrite count is folded into the current command's total (Maude's count).
     fn meta_reduce(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
@@ -2849,6 +3139,214 @@ impl MetaDescent<'_> {
         Some(result_dag)
     }
 
+    /// `metaSmtSearch(M, S, P, C, kind, fresh, B, n)` performs resumable symbolic rewriting modulo SMT.
+    /// The cache key intentionally excludes only the requested solution number, matching Maude's
+    /// `MetaOpCache`; each newly consumed solution charges one outer rewrite.
+    fn meta_smt_search(
+        &mut self,
+        ctx: &mut MetaCtx,
+        hooks: &MetaHooks,
+        redex: DagId,
+    ) -> Option<DagId> {
+        let kids = ctx.children(redex);
+        let [
+            module_arg,
+            initial_arg,
+            goal_arg,
+            condition_arg,
+            arrow_arg,
+            fresh_arg,
+            bound_arg,
+            solution_arg,
+        ] = kids.as_slice()
+        else {
+            return None;
+        };
+        let module_arg = *module_arg;
+        let initial_arg = *initial_arg;
+        let goal_arg = *goal_arg;
+        let condition_arg = *condition_arg;
+        let arrow = down_arrow(ctx, *arrow_arg)?;
+        if arrow == Arrow::Bang {
+            return None;
+        }
+        let fresh_base = down_nat_decimal(ctx, *fresh_arg)?;
+        let max_depth = if Some(ctx.top(*bound_arg)) == hooks.ops.get("unboundedSymbol").copied() {
+            None
+        } else {
+            Some(u32::try_from(down_nat64(ctx, *bound_arg)?).ok()?)
+        };
+        let solution_number = usize::try_from(down_nat64(ctx, *solution_arg)?).ok()?;
+        let key = MetaSmtSearchCacheKey {
+            module: module_arg,
+            initial: initial_arg,
+            goal: goal_arg,
+            condition: condition_arg,
+            arrow,
+            fresh_base: fresh_base.clone(),
+            max_depth,
+        };
+
+        let mut cache = if let Some(cache) = self.state.take_smt_search(&key, ctx, solution_number)
+        {
+            cache
+        } else {
+            let mut loaded = self.down_module(ctx, hooks, module_arg)?;
+            if !loaded.smt_rewrite_valid {
+                return None;
+            }
+
+            let mut subject_variables = VarIndex::new();
+            let initial = down_term_inner(
+                ctx,
+                hooks,
+                initial_arg,
+                &mut loaded.built,
+                &mut subject_variables,
+                self.interner,
+            )?;
+            let mut goal_variables = VarIndex::new();
+            let goal = down_term_to_term(ctx, hooks, goal_arg, &loaded.built, &mut goal_variables)?;
+            let initial_kind = loaded
+                .built
+                .engine
+                .sorts()
+                .kind_of(loaded.built.engine.sort_of(initial));
+            let goal_kind = loaded
+                .built
+                .engine
+                .sorts()
+                .kind_of(loaded.built.engine.term_sort(&goal));
+            if initial_kind != goal_kind || !loaded.built.engine.valid_smt_goal(&goal) {
+                return None;
+            }
+
+            let target_variable_count = goal_variables.count();
+            let mut bound_set: BTreeSet<u32> = (0..target_variable_count).collect();
+            let condition = down_condition(
+                ctx,
+                hooks,
+                condition_arg,
+                &loaded.built,
+                &mut goal_variables,
+                &mut bound_set,
+            )?;
+
+            let subject_variable_count = subject_variables.count();
+            let mut variable_names = var_names(&subject_variables);
+            let mut goal_variable_dags = Vec::with_capacity(goal_variables.count() as usize);
+            for slot in 0..goal_variables.count() {
+                let source = goal_variables.name(slot);
+                let base = source.split_once(':').map_or(source, |(base, _)| base);
+                let name = self.interner.intern(base).index();
+                let global_slot = subject_variable_count + slot;
+                goal_variable_dags.push(loaded.built.engine.make_var(
+                    goal_variables.sort(slot),
+                    name,
+                    global_slot,
+                ));
+                variable_names.push(source.to_string());
+            }
+            let initial_constraint = loaded
+                .built
+                .engine
+                .make_smt_constraint(&condition, &goal_variable_dags)
+                .ok()?;
+            let goal_smt_variables = (0..target_variable_count)
+                .filter(|&slot| {
+                    loaded
+                        .built
+                        .engine
+                        .smt_type(goal_variables.sort(slot))
+                        .is_some()
+                })
+                .map(|slot| (slot, goal_variable_dags[slot as usize]))
+                .collect();
+            loaded.built.engine.reset_rewrites();
+            let search = loaded.built.engine.smt_search_with_fresh_base(
+                initial,
+                initial_constraint,
+                goal,
+                target_variable_count,
+                goal_smt_variables,
+                arrow,
+                max_depth,
+                variable_names,
+                &fresh_base,
+            )?;
+            let key_roots = [module_arg, initial_arg, goal_arg, condition_arg]
+                .into_iter()
+                .map(|dag| ctx.root(dag))
+                .collect();
+            MetaSmtSearchCache {
+                key: key.clone(),
+                _key_roots: key_roots,
+                loaded,
+                search,
+                goal_variables,
+                target_variable_count,
+                last_solution_index: None,
+                last_solution: None,
+            }
+        };
+
+        let next_solution = cache
+            .last_solution_index
+            .map_or(0, |last| last.saturating_add(1));
+        for current in next_solution..=solution_number {
+            let Some(solution) = cache.search.next_solution(&mut cache.loaded.built.engine) else {
+                return Some(ctx.app(*hooks.ops.get("smtFailureSymbol")?, Vec::new()));
+            };
+            ctx.add_rewrites(1);
+            cache.last_solution_index = Some(current);
+            cache.last_solution = Some(solution);
+        }
+
+        let solution = cache.last_solution.as_ref()?;
+        let state = cache.search.state_term(solution.state)?;
+        let variable_names = cache.search.variable_names().to_vec();
+        let up_state = up_smt_term(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &variable_names,
+            state,
+        );
+        let up_substitution = up_smt_substitution(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &cache.goal_variables,
+            cache.target_variable_count,
+            &variable_names,
+            &solution.bindings,
+        );
+        let up_constraint = up_smt_term(
+            ctx,
+            hooks,
+            &cache.loaded.built,
+            self.interner,
+            &variable_names,
+            solution.constraint,
+        );
+        let max_fresh = solution.max_variable_number.to_decimal();
+        let succ = *hooks.ops.get("succSymbol")?;
+        let zero = ctx.iter_zero(succ)?;
+        let up_max_fresh = if max_fresh == "0" {
+            zero
+        } else {
+            ctx.make_iter_decimal(succ, &max_fresh, zero)?
+        };
+        let result = ctx.app(
+            *hooks.ops.get("smtResultSymbol")?,
+            vec![up_state, up_substitution, up_constraint, up_max_fresh],
+        );
+        self.state.insert(MetaCache::SmtSearch(cache));
+        Some(result)
+    }
+
     /// `metaSearch(M, S, P, C, kind, B, n)` → the `(n+1)`-th solution `{up(state), up(type), subst}` of
     /// searching from `S` for a state matching `P` (such that `C`) under reachability `kind` (`'*`/`'+`/
     /// `'!`/`'1`) within depth bound `B`, or `failure` (`ResultTriple?`). The object search's rewrite count
@@ -3881,6 +4379,9 @@ impl MetaDescent<'_> {
         if kind == ModuleKind::System {
             install_rules(ctx, hooks, *kids.get(7)?, &mut loaded.built, self.interner)?;
         }
+        // `build_loaded_module` saw an intentionally statement-free shell. Inline meta statements
+        // are installed above, so refresh the restriction bit only after the final engine exists.
+        loaded.refresh_smt_rewrite_valid(&pm);
         Some(loaded)
     }
 }
@@ -4510,6 +5011,15 @@ fn install_rules(
                 }
             })
             .collect();
+        // Reflected modules install statements after `build_loaded_module`; retain the same
+        // dedicated SMT descriptor as the source loader, including `[nonexec]` rules.
+        m.engine.add_smt_rule(
+            lhs.clone(),
+            rhs.clone(),
+            (0..nr).map(|slot| vars.sort(slot)).collect(),
+            var_names.clone(),
+            condition.clone(),
+        );
         if narrowing {
             m.engine.add_narrowing_rule(
                 lhs.clone(),
@@ -4605,6 +5115,85 @@ fn down_condition(
     Some(out)
 }
 
+fn down_variant_sat_formula(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    d: DagId,
+    target: &BuiltModule,
+    vars: &mut VarIndex,
+) -> Option<Formula> {
+    let symbol = ctx.top(d);
+    let kids = ctx.children(d);
+    let has_hook = |purpose: &str| hooks.ops.get(purpose).copied() == Some(symbol);
+    if has_hook("eqFormulaSymbol") || has_hook("neqFormulaSymbol") {
+        if kids.len() != 2 {
+            return None;
+        }
+        return Some(Formula::Literal(VariantSatLiteral {
+            lhs: down_term_to_term(ctx, hooks, kids[0], target, vars)?,
+            rhs: down_term_to_term(ctx, hooks, kids[1], target, vars)?,
+            positive: has_hook("eqFormulaSymbol"),
+        }));
+    }
+    let is_and = [
+        "formulaAndPosSymbol",
+        "formulaAndNegSymbol",
+        "formulaAndConjSymbol",
+        "formulaAndFormSymbol",
+    ]
+    .iter()
+    .any(|purpose| has_hook(purpose));
+    if is_and {
+        return kids
+            .into_iter()
+            .map(|kid| down_variant_sat_formula(ctx, hooks, kid, target, vars))
+            .collect::<Option<Vec<_>>>()
+            .map(Formula::And);
+    }
+    let is_or = ["formulaOrDnfSymbol", "formulaOrFormSymbol"]
+        .iter()
+        .any(|purpose| has_hook(purpose));
+    if is_or {
+        return kids
+            .into_iter()
+            .map(|kid| down_variant_sat_formula(ctx, hooks, kid, target, vars))
+            .collect::<Option<Vec<_>>>()
+            .map(Formula::Or);
+    }
+    if kids.len() == 1 && has_hook("formulaNotSymbol") {
+        return Some(Formula::Not(Box::new(down_variant_sat_formula(
+            ctx, hooks, kids[0], target, vars,
+        )?)));
+    }
+    if kids.len() == 2 && has_hook("formulaImpliesSymbol") {
+        return Some(Formula::Implies(
+            Box::new(down_variant_sat_formula(ctx, hooks, kids[0], target, vars)?),
+            Box::new(down_variant_sat_formula(ctx, hooks, kids[1], target, vars)?),
+        ));
+    }
+    if kids.len() == 2 && has_hook("formulaIffSymbol") {
+        return Some(Formula::Iff(
+            Box::new(down_variant_sat_formula(ctx, hooks, kids[0], target, vars)?),
+            Box::new(down_variant_sat_formula(ctx, hooks, kids[1], target, vars)?),
+        ));
+    }
+    None
+}
+
+fn down_variant_sort_set(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    d: DagId,
+    target: &BuiltModule,
+) -> Option<Vec<SortId>> {
+    let empty = hooks.ops.get("emptySortSetSymbol").copied();
+    let join = hooks.ops.get("sortSetSymbol").copied();
+    flatten_set(ctx, d, empty, join)
+        .into_iter()
+        .map(|item| target.sorts.get(&qid_text(ctx, item)?).copied())
+        .collect()
+}
+
 /// The pattern's variable indices not already in `bound` (the fresh ones a `:=`/`=>` fragment binds);
 /// extends `bound` with all of them.
 fn fresh_vars(pat: &Term, bound: &mut BTreeSet<u32>) -> Vec<u32> {
@@ -4665,8 +5254,19 @@ fn down_leaf_to_term(text: &str, target: &BuiltModule, vars: &mut VarIndex) -> O
         let sort = resolve_meta_sort_name(target, &text[colon + 1..])?;
         Some(Term::var(vars.index_of(text, sort), sort))
     } else if let Some(dot) = text.rfind('.') {
-        // Constant `name.Sort`: look up the arity-0 operator (literal NA constants are a follow-up).
-        let sym = *target.ops.get(&(strip_op_blanks(&text[..dot]), 0))?;
+        let name = strip_op_blanks(&text[..dot]);
+        let sort = resolve_meta_sort_name(target, &text[dot + 1..])?;
+        if let Some(kind) = target.engine.smt_type(sort)
+            && let Some(number) = SmtNumber::parse(&name, kind)
+        {
+            let component = target.engine.sorts().kind_of(sort);
+            let symbol = target.engine.smt_info().number_symbol(component)?;
+            return Some(Term::Na {
+                symbol,
+                value: NaValue::SmtNum(Rc::new(number)),
+            });
+        }
+        let sym = target.engine.resolve_constant_at_sort(&name, sort)?;
         Some(Term::constant(sym))
     } else {
         None
@@ -4736,7 +5336,14 @@ fn build_app_term(head: &str, args: Vec<Term>, target: &BuiltModule) -> Option<T
         }
         return Term::iter_decimal(sym, count, args.into_iter().next()?);
     }
-    let sym = resolve_flat_assoc(&head, args.len(), target)?;
+    let argument_sorts: Vec<SortId> = args
+        .iter()
+        .map(|argument| target.engine.term_sort(argument))
+        .collect();
+    let sym = target
+        .engine
+        .resolve_operator_for_sorts(&head, &argument_sorts)
+        .or_else(|| resolve_flat_assoc(&head, args.len(), target))?;
     Some(Term::op(sym, args))
 }
 
@@ -4872,9 +5479,18 @@ fn down_leaf_to_dag(
 }
 /// Build a constant from a meta `'name.sort` (a `Qid` leaf): look up the arity-0 operator `name`.
 fn down_constant(text: &str, target: &mut BuiltModule) -> Option<DagId> {
-    let (name, _sort) = text.rsplit_once('.')?;
-    let sym = *target.ops.get(&(name.to_string(), 0))?;
-    Some(target.engine.make_const(sym))
+    let (name, sort_name) = text.rsplit_once('.')?;
+    let name = strip_op_blanks(name);
+    let sort = resolve_meta_sort_name(target, sort_name)?;
+    if let Some(kind) = target.engine.smt_type(sort)
+        && let Some(number) = SmtNumber::parse(&name, kind)
+    {
+        let component = target.engine.sorts().kind_of(sort);
+        let symbol = target.engine.smt_info().number_symbol(component)?;
+        return Some(target.engine.make_smt_number(symbol, number));
+    }
+    let symbol = target.engine.resolve_constant_at_sort(&name, sort)?;
+    Some(target.engine.make_const(symbol))
 }
 
 /// Build an application from a meta op-name + down-translated args. An iterated name `base^n` builds the
@@ -4957,7 +5573,7 @@ fn strip_op_blanks(name: &str) -> String {
 
 /// Up-translate an object DAG `t` (in `source`) into a meta-term built in `ctx`.
 fn up_term(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: DagId) -> DagId {
-    up_term_inner(ctx, hooks, source, None, t)
+    up_term_inner(ctx, hooks, source, None, None, t)
 }
 
 /// Up-translate a `metaParse` result, preserving the symbolic DAG's variable leaves as typed variable
@@ -4969,7 +5585,20 @@ fn up_parsed_term(
     interner: &Interner,
     t: DagId,
 ) -> DagId {
-    up_term_inner(ctx, hooks, source, Some(interner), t)
+    up_term_inner(ctx, hooks, source, Some(interner), None, t)
+}
+
+/// Up-translate an SMT-search DAG using the search session's slot-indexed display names. Fresh
+/// variables use synthetic kernel name codes, so consulting the ordinary interner would misname them.
+fn up_smt_term(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: &Interner,
+    variable_names: &[String],
+    t: DagId,
+) -> DagId {
+    up_term_inner(ctx, hooks, source, Some(interner), Some(variable_names), t)
 }
 
 fn up_term_inner(
@@ -4977,6 +5606,7 @@ fn up_term_inner(
     hooks: &MetaHooks,
     source: &BuiltModule,
     interner: Option<&Interner>,
+    variable_names: Option<&[String]>,
     t: DagId,
 ) -> DagId {
     let qid = hooks.ops["qidSymbol"];
@@ -4996,7 +5626,7 @@ fn up_term_inner(
             } else {
                 let up_args: Vec<DagId> = kids
                     .iter()
-                    .map(|&k| up_term_inner(ctx, hooks, source, interner, k))
+                    .map(|&k| up_term_inner(ctx, hooks, source, interner, variable_names, k))
                     .collect();
                 let arglist = up_arglist(ctx, hooks, up_args);
                 let opqid = ctx.make_na(qid, NaValue::Qid(name.into()));
@@ -5011,12 +5641,22 @@ fn up_term_inner(
             } else {
                 format!("{base}^{count}")
             };
-            let up_arg = up_term_inner(ctx, hooks, source, interner, arg);
+            let up_arg = up_term_inner(ctx, hooks, source, interner, variable_names, arg);
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_arg])
         }
         // String/float constants up to `'"s".String` / `'f.Float`; bare qids to `''q.Sort` — these need
         // the value-dependent classification and are not reached by NAT/BOOL reduction (a follow-on).
+        NodeRepr::SmtNum(number) => {
+            let sort = source.engine.sort_of(t);
+            let kind = source
+                .engine
+                .smt_type(sort)
+                .expect("SMT number without sort metadata");
+            let text = number.to_maude(kind);
+            let sort = source.engine.sorts().name(sort);
+            ctx.make_na(qid, NaValue::Qid(format!("{text}.{sort}").into()))
+        }
         NodeRepr::Str(_) | NodeRepr::Qid(_) | NodeRepr::Float(_) => {
             let sort = source
                 .engine
@@ -5026,8 +5666,17 @@ fn up_term_inner(
             ctx.make_na(qid, NaValue::Qid(format!("?.{sort}").into()))
         }
         NodeRepr::Var { name } => {
-            let interner = interner.expect("symbolic DAG reached ordinary up_term");
-            let text = interner.resolve(Sym::from_raw(name));
+            let text = source
+                .engine
+                .node(t)
+                .variable_index()
+                .and_then(|slot| variable_names.and_then(|names| names.get(slot as usize)))
+                .map(String::as_str)
+                .unwrap_or_else(|| {
+                    interner
+                        .expect("symbolic DAG reached ordinary up_term")
+                        .resolve(Sym::from_raw(name))
+                });
             let sort = source.engine.sorts().name(source.engine.sort_of(t));
             let typed = match text.rsplit_once(':') {
                 Some((base, declared)) if !base.is_empty() && declared == sort => text.to_string(),
@@ -5068,6 +5717,7 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
     let shape = match ctx.repr(t) {
         NodeRepr::App => {
             let raw = ctx.name(ctx.top(t));
+            let command_variable = ctx.symbol_is_command_variable(ctx.top(t));
             let kids = ctx.children(t);
             let variable_base = raw
                 .rsplit_once(':')
@@ -5090,7 +5740,8 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
                             byte.is_ascii_uppercase() || matches!(*byte, b'#' | b'%' | b'@')
                         }))
                     .then_some(raw)
-                });
+                })
+                .or_else(|| command_variable.then_some(raw));
             if kids.is_empty()
                 && let Some(base) = variable_base
             {
@@ -5118,6 +5769,12 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
         NodeRepr::Str(s) => NodeShape::Leaf(format!("{:?}.{sort}", String::from_utf8_lossy(s))),
         NodeRepr::Qid(q) => NodeShape::Leaf(format!("'{q}.{sort}")),
         NodeRepr::Float(f) => NodeShape::Leaf(format!("{f}.{sort}")),
+        NodeRepr::SmtNum(number) => {
+            let kind = ctx
+                .smt_type(ctx.sort_of(t))
+                .expect("SMT number without sort metadata");
+            NodeShape::Leaf(format!("{}.{sort}", number.to_maude(kind)))
+        }
         // upTerm's argument is an eagerly-reduced object DAG of the current module — genuine
         // variable leaves exist only inside symbolic-engine problems (see `up_term`'s Var arm).
         NodeRepr::Var { .. } => {
@@ -6102,6 +6759,39 @@ fn up_substitution(
     }
 }
 
+/// SMT-search substitutions contain only non-SMT variables from the target pattern. SMT target
+/// variables are represented by equalities in the final constraint instead.
+fn up_smt_substitution(
+    ctx: &mut MetaCtx,
+    hooks: &MetaHooks,
+    source: &BuiltModule,
+    interner: &Interner,
+    variables: &VarIndex,
+    target_variable_count: u32,
+    variable_names: &[String],
+    bindings: &[DagId],
+) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    let assign = hooks.ops["assignmentSymbol"];
+    let mut assigns = Vec::new();
+    for slot in 0..target_variable_count {
+        if source.engine.smt_type(variables.sort(slot)).is_some() {
+            continue;
+        }
+        let Some(&value) = bindings.get(slot as usize) else {
+            continue;
+        };
+        let variable = ctx.make_na(qid, NaValue::Qid(variables.name(slot).to_string().into()));
+        let value = up_smt_term(ctx, hooks, source, interner, variable_names, value);
+        assigns.push(ctx.app(assign, vec![variable, value]));
+    }
+    match assigns.len() {
+        0 => ctx.app(hooks.ops["emptySubstitutionSymbol"], vec![]),
+        1 => assigns.into_iter().next().unwrap(),
+        _ => ctx.app(hooks.ops["substitutionSymbol"], assigns),
+    }
+}
+
 /// The `VarIndex`'s variable names as the `&[String]` [`up_substitution`] expects.
 fn var_names(vars: &VarIndex) -> Vec<String> {
     (0..vars.count())
@@ -6340,6 +7030,16 @@ fn up_meta_term_sym(
             let opqid = ctx.make_na(qid, NaValue::Qid(head.into()));
             ctx.app(hooks.ops["metaTermSymbol"], vec![opqid, up_arg])
         }
+        NodeRepr::SmtNum(number) => {
+            let sort = source.engine.sort_of(t);
+            let kind = source
+                .engine
+                .smt_type(sort)
+                .expect("SMT number without sort metadata");
+            let text = number.to_maude(kind);
+            let sort = source.engine.sorts().name(sort);
+            ctx.make_na(qid, NaValue::Qid(format!("{text}.{sort}").into()))
+        }
         NodeRepr::Str(_) | NodeRepr::Qid(_) | NodeRepr::Float(_) => {
             let sort = source.engine.sorts().name(source.engine.sort_of(t));
             ctx.make_na(qid, NaValue::Qid(format!("?.{sort}").into()))
@@ -6422,6 +7122,13 @@ fn up_pattern(
                 NaValue::Str(s) => format!("{:?}", String::from_utf8_lossy(s)),
                 NaValue::Qid(q) => format!("'{q}"),
                 NaValue::Float(b) => format!("{}", f64::from_bits(*b)),
+                NaValue::SmtNum(number) => {
+                    let kind = source
+                        .engine
+                        .smt_type(source.syntax[symbol].range)
+                        .expect("SMT number without sort metadata");
+                    number.to_maude(kind)
+                }
             };
             ctx.make_na(
                 qid,

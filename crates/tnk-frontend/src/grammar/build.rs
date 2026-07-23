@@ -211,6 +211,57 @@ fn symbol_productions(
     let nr_args = syn.domain.len();
     let range_nt = Nt::Comp(sorts.kind_of(syn.range), NtType::Term);
     let arg_nt = |k: usize| GSym::N(Nt::Comp(sorts.kind_of(syn.domain[k]), NtType::Term));
+    // `SMT_NumberSymbol` is a pseudo-constructor, not a literal named `<Integers>`/`<Reals>`.
+    // Its productions are lexical number classes exactly as in `makeGrammar.cc`.
+    if m.engine.symbol(sym).is_smt_number() {
+        debug_assert_eq!(nr_args, 0);
+        let kind = m
+            .engine
+            .smt_type(syn.range)
+            .expect("SMT number symbol without SMT range metadata");
+        let action = Action::MakeSmtNumber { symbol: sym, kind };
+        match kind {
+            tnk_core::smt::SmtType::Integer => {
+                push(
+                    g,
+                    range_nt,
+                    vec![GSym::T(Terminal::Tok(interner.intern("0")))],
+                    0,
+                    vec![],
+                    action,
+                );
+                push(
+                    g,
+                    range_nt,
+                    vec![GSym::T(Terminal::SmallNat)],
+                    0,
+                    vec![],
+                    action,
+                );
+                push(
+                    g,
+                    range_nt,
+                    vec![GSym::T(Terminal::SmallNeg)],
+                    0,
+                    vec![],
+                    action,
+                );
+            }
+            tnk_core::smt::SmtType::Real => push(
+                g,
+                range_nt,
+                vec![GSym::T(Terminal::Rational)],
+                0,
+                vec![],
+                action,
+            ),
+            tnk_core::smt::SmtType::Boolean => {
+                unreachable!("Boolean cannot have an SMT number constructor")
+            }
+        }
+        return;
+    }
+
     let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
 
     if has_hole {

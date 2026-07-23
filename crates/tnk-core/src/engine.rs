@@ -18,6 +18,8 @@ use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
 use crate::search::{Arrow, Search};
+use crate::smt::{SmtInfo, SmtNumber, SmtOp, SmtType};
+use crate::smt_search::SmtSearch;
 use crate::sort::{KindId, SortId, Sorts};
 use crate::symbol::{
     Axioms, Identity, IdentityId, IdentitySide, OoFlags, OpDeclaration, SpecialOp, StdStream,
@@ -84,6 +86,54 @@ fn term_variable_indices(term: &Term) -> HashSet<u32> {
         }
     }
     variables
+}
+
+fn term_is_linear(term: &Term) -> bool {
+    let mut variables = HashSet::new();
+    let mut work = vec![term];
+    while let Some(term) = work.pop() {
+        match term {
+            Term::Var(variable) => {
+                if !variables.insert(variable.index) {
+                    return false;
+                }
+            }
+            Term::Op { args, .. } => work.extend(args),
+            Term::Iter { arg, .. } => work.push(arg),
+            Term::Na { .. } => {}
+        }
+    }
+    true
+}
+
+fn term_contains_smt(sig: &Signature, term: &Term) -> bool {
+    let mut work = vec![term];
+    while let Some(term) = work.pop() {
+        match term {
+            Term::Var(_) => {}
+            Term::Op { symbol, args } => {
+                let symbol = sig.symbol(*symbol);
+                if matches!(symbol.special(), Some(SpecialOp::Smt { .. }))
+                    || symbol.class() == SymbolClass::SmtNumber
+                {
+                    return true;
+                }
+                work.extend(args);
+            }
+            Term::Iter { symbol, arg, .. } => {
+                if matches!(sig.symbol(*symbol).special(), Some(SpecialOp::Smt { .. })) {
+                    return true;
+                }
+                work.push(arg);
+            }
+            Term::Na { symbol, .. } => {
+                if sig.symbol(*symbol).class() == SymbolClass::SmtNumber {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Variables mentioned by a statement condition. ACU's specialized sole nonlinear-variable
@@ -245,6 +295,34 @@ struct CompiledRule {
     rhs_shares: bool,
 }
 
+/// A source-ordered rule compiled for rewriting modulo SMT. Unlike [`CompiledRule`], this table also
+/// retains `[nonexec]` rules: SMT search supplies fresh values for variables not bound by the lhs and
+/// treats equality conditions as solver constraints rather than reducing them.
+struct CompiledSmtRule {
+    variable_sorts: Vec<SortId>,
+    lhs: LhsAutomaton,
+    rhs: Term,
+    nr_vars: u32,
+    condition: Vec<ConditionFragment>,
+    variable_names: Vec<String>,
+}
+
+/// One satisfiability-unchecked symbolic transition. The SMT search state machine owns solver
+/// push/pop and accepts only transitions whose `local_constraint` is satisfiable with the parent.
+pub(crate) struct RawSmtSuccessor {
+    pub term: DagId,
+    pub local_constraint: Option<DagId>,
+    pub avoid_variable_number: Nat,
+    pub fresh_names: Vec<(u32, String)>,
+}
+
+/// One structural goal match before its SMT-variable equalities are checked against the state
+/// constraint.
+pub(crate) struct RawSmtGoalMatch {
+    pub bindings: Vec<DagId>,
+    pub match_constraint: Option<DagId>,
+}
+
 /// A condition fragment compiled for evaluation: like the public [`ConditionFragment`] but with the
 /// matching fragment's pattern compiled to an [`LhsAutomaton`]. Built by
 /// [`Signature::compile_condition`]. The `fresh_vars` of a matching fragment are unbound before each
@@ -390,6 +468,12 @@ pub(crate) struct Signature {
     /// (Pillar A) — never by [`reduce`](Engine::reduce), so equational normal forms never apply a rule.
     /// Adding a rule does not bump `eq_epoch` (rules don't change any equational normal form).
     rules: HashMap<SymbolId, Vec<CompiledRule>>,
+    /// Source-form rules used only by `smt-search`, indexed by lhs top symbol. This deliberately
+    /// includes `[nonexec]` rules, which are proof obligations for ordinary rewriting but executable
+    /// symbolic transitions modulo SMT.
+    smt_rules: HashMap<SymbolId, Vec<CompiledSmtRule>>,
+    /// Whether every retained SMT rule satisfies Maude's static lhs restrictions.
+    smt_rules_valid: bool,
     /// Source-form `[narrowing]` rules in flattened module order. This includes nonexec rules that are
     /// deliberately absent from `rules`; symbolic unification needs their lhs/rhs and variable layout.
     narrowing_rules: Vec<crate::narrow::NarrowingRule>,
@@ -410,6 +494,8 @@ pub(crate) struct Signature {
     /// least sort is text-dependent (`'X:S` → `Variable`, `'c.S` → `Constant`, `'[K]` → `Kind`, plain `'S`
     /// → `Sort`); empty elsewhere, where every `Qid` is just a `Qid`.
     qid_class: QidClass,
+    /// SMT sort/operator bindings assembled from `SMT_Symbol`/`SMT_NumberSymbol` hooks.
+    smt_info: SmtInfo,
     /// Per-sort variable symbols for genuine `Var` leaves (Maude's `Module::instantiateVariable`
     /// cache), created lazily by [`Engine::variable_symbol`] in demand order — the creation order is
     /// observable through `dag_compare`'s SymbolId ordering, exactly like Maude's symbol indices.
@@ -689,12 +775,15 @@ impl Default for Signature {
             equations: HashMap::default(),
             memberships: HashMap::default(),
             rules: HashMap::default(),
+            smt_rules: HashMap::default(),
+            smt_rules_valid: true,
             narrowing_rules: Vec::default(),
             eq_epoch: 1, // 0 is the "never reduced" sentinel stored on nodes
             next_eq_id: 0,
             next_mb_id: 0,
             next_rule_id: 0,
             qid_class: QidClass::default(),
+            smt_info: SmtInfo::default(),
             var_symbols: HashMap::default(),
             succ_zeros: HashMap::default(),
             minimum_substitution_size: 1,
@@ -749,6 +838,9 @@ impl Signature {
     }
     pub(crate) fn sorts(&self) -> &Sorts {
         &self.sorts
+    }
+    pub(crate) fn smt_info(&self) -> &SmtInfo {
+        &self.smt_info
     }
     /// Iterate every symbol (id + data). Used by the order-sorted-unification `SortBdds` to size
     /// its domain-bit block to the widest operator in the module.
@@ -903,7 +995,13 @@ impl Signature {
             Term::Op { symbol, args } if args.is_empty() => self.symbol(*symbol).decls()[0].range,
             Term::Op { symbol, args } => {
                 let arg_sorts: Vec<SortId> = args.iter().map(|arg| self.term_sort(arg)).collect();
-                self.compute_sort(*symbol, &arg_sorts)
+                if matches!(self.symbol(*symbol).theory(), Theory::Acu | Theory::Au) {
+                    // The parser and META down-translation flatten associative applications, so a
+                    // binary declaration may legitimately own three or more `Term` children.
+                    self.compute_sort_fold(*symbol, &arg_sorts)
+                } else {
+                    self.compute_sort(*symbol, &arg_sorts)
+                }
             }
         }
     }
@@ -922,6 +1020,7 @@ impl Signature {
                 ctor: false,
             }],
             axioms: Axioms::default(),
+            inconsistent_constructor_axioms: false,
             identity: None,
             one_sided_id: None,
             strategy: None,
@@ -958,6 +1057,7 @@ impl Signature {
                 idem: false,
                 iter: false,
             },
+            inconsistent_constructor_axioms: false,
             identity,
             one_sided_id: None,
             strategy: None,
@@ -995,6 +1095,7 @@ impl Signature {
                 idem: false,
                 iter: false,
             },
+            inconsistent_constructor_axioms: false,
             identity,
             one_sided_id: None,
             strategy: None,
@@ -1032,6 +1133,7 @@ impl Signature {
                 idem,
                 iter: false,
             },
+            inconsistent_constructor_axioms: false,
             identity,
             one_sided_id: None,
             strategy: None,
@@ -1065,6 +1167,7 @@ impl Signature {
                 iter: true,
                 ..Default::default()
             },
+            inconsistent_constructor_axioms: false,
             identity: None,
             one_sided_id: None,
             strategy: None,
@@ -1106,6 +1209,16 @@ impl Signature {
     /// called before any node of `sym` is built (sorts are cached at construction). The parser (B4) is
     /// the eventual real source; this is the hand-built-module entry point.
     pub(crate) fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
+        self.add_op_decl_with_ctor(sym, domain, range, false);
+    }
+
+    pub(crate) fn add_op_decl_with_ctor(
+        &mut self,
+        sym: SymbolId,
+        domain: Vec<SortId>,
+        range: SortId,
+        ctor: bool,
+    ) {
         {
             let s = self.symbols.get_mut(sym);
             assert_eq!(
@@ -1117,12 +1230,16 @@ impl Signature {
             s.decls.push(OpDeclaration {
                 domain,
                 range,
-                ctor: false,
+                ctor,
             });
         }
         // Keep a commutative operator's declaration set complete under argument swap (no-op for free
         // and AU operators, whose declarations stay positional).
         self.commutative_sort_completion(sym);
+    }
+
+    pub(crate) fn mark_inconsistent_constructor_axioms(&mut self, sym: SymbolId) {
+        self.symbols.get_mut(sym).inconsistent_constructor_axioms = true;
     }
 
     /// Maude's `BinarySymbol::commutativeSortCompletion` (`Interface/binarySymbol.cc`): a commutative
@@ -1303,6 +1420,7 @@ impl Signature {
             NaValue::Str(s) => s.len() == 1,
             NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
             NaValue::Qid(_) => true,
+            NaValue::SmtNum(_) => true,
         };
         if special { min } else { max }
     }
@@ -1824,6 +1942,35 @@ impl Signature {
         };
         self.rules.entry(top).or_default().push(compiled);
         id
+    }
+
+    /// Retain one source rule for root rewriting modulo SMT. This table is independent of the ordinary
+    /// executable-rule table, so `[nonexec]` rules participate without changing `rewrite`/`search`.
+    fn add_smt_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        variable_sorts: Vec<SortId>,
+        variable_names: Vec<String>,
+        condition: Vec<ConditionFragment>,
+    ) {
+        self.smt_rules_valid &= term_is_linear(&lhs) && !term_contains_smt(self, &lhs);
+        let Some(top) = lhs.top_symbol() else {
+            return;
+        };
+        let condition_variables = condition_variable_indices(&condition);
+        let lhs = LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables);
+        self.smt_rules
+            .entry(top)
+            .or_default()
+            .push(CompiledSmtRule {
+                lhs,
+                rhs,
+                nr_vars: variable_sorts.len() as u32,
+                condition,
+                variable_sorts,
+                variable_names,
+            });
     }
 
     /// Classify a rule's lhs for the `erewrite` scheduler (Maude's `ConfigSymbol::checkArgs`). An
@@ -3748,6 +3895,176 @@ impl Runtime {
         None
     }
 
+    fn smt_conjoin(
+        &mut self,
+        sig: &Signature,
+        left: Option<DagId>,
+        right: DagId,
+    ) -> Result<Option<DagId>, ()> {
+        let Some(left) = left else {
+            return Ok(Some(right));
+        };
+        let conjunction = sig.smt_info.conjunction().ok_or(())?;
+        Ok(Some(self.make_free(sig, conjunction, vec![left, right])))
+    }
+
+    /// Instantiate equality condition fragments into one SMT conjunction. `None` is the optimized
+    /// representation of `true`; non-equality fragments or missing equality metadata reject the rule.
+    fn smt_condition_constraint(
+        &mut self,
+        sig: &Signature,
+        condition: &[ConditionFragment],
+        subst: &Subst,
+    ) -> Result<Option<DagId>, ()> {
+        let true_symbol = sig.smt_info.true_symbol().ok_or(())?;
+        let mut constraint = None;
+        for fragment in condition {
+            let ConditionFragment::Equality { lhs, rhs } = fragment else {
+                return Err(());
+            };
+            let lhs = self.instantiate(sig, lhs, subst);
+            let rhs = self.instantiate(sig, rhs, subst);
+            if self.deep_equal(lhs, rhs) {
+                continue;
+            }
+            let clause = if self.node(rhs).symbol() == true_symbol {
+                lhs
+            } else if self.node(lhs).symbol() == true_symbol {
+                rhs
+            } else {
+                let lhs_kind = sig.sorts.kind_of(self.node(lhs).sort);
+                let rhs_kind = sig.sorts.kind_of(self.node(rhs).sort);
+                if lhs_kind != rhs_kind {
+                    return Err(());
+                }
+                let equality = sig.smt_info.equality(lhs_kind).ok_or(())?;
+                self.make_free(sig, equality, vec![lhs, rhs])
+            };
+            constraint = self.smt_conjoin(sig, constraint, clause)?;
+        }
+        Ok(constraint)
+    }
+
+    /// Enumerate every non-extension root rewrite modulo SMT in source rule/matcher order. Unbound rule
+    /// variables are replaced by fresh `#n-source` variables; numbering starts above the parent state's
+    /// `avoid_variable_number`, independently on each branch.
+    fn smt_state_successors(
+        &mut self,
+        sig: &Signature,
+        state: DagId,
+        avoid_variable_number: &Nat,
+        next_variable_slot: &mut u32,
+    ) -> Vec<RawSmtSuccessor> {
+        let symbol = self.node(state).symbol();
+        let Some(rules) = sig.smt_rules.get(&symbol) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut subst = Subst::new();
+        for rule in rules {
+            subst.reset(rule.nr_vars);
+            let Some(mut matching) = rule.lhs.match_(self, sig, state, &mut subst, false, false)
+            else {
+                continue;
+            };
+            while matching.next(self, sig, &mut subst) {
+                let mut fresh_number = avoid_variable_number.clone();
+                let mut fresh_slots = Vec::new();
+                let mut fresh_names = Vec::new();
+                for slot in 0..rule.nr_vars {
+                    if subst.get(slot).is_some() {
+                        continue;
+                    }
+                    fresh_number = fresh_number.add(&Nat::one());
+                    let sort = rule.variable_sorts[slot as usize];
+                    let variable_symbol = sig.var_symbols[&sort];
+                    let dag_slot = *next_variable_slot;
+                    *next_variable_slot = next_variable_slot
+                        .checked_add(1)
+                        .expect("SMT-search variable slot overflow");
+                    let name_code = 0x8000_0000u32
+                        .checked_add(dag_slot)
+                        .expect("SMT-search variable name overflow");
+                    let variable = self.make_var(sig, variable_symbol, name_code, dag_slot);
+                    subst.bind(slot, variable);
+                    fresh_slots.push(slot);
+                    let source = rule.variable_names[slot as usize]
+                        .split_once(':')
+                        .map_or(rule.variable_names[slot as usize].as_str(), |(base, _)| {
+                            base
+                        });
+                    fresh_names
+                        .push((dag_slot, format!("#{}-{source}", fresh_number.to_decimal())));
+                }
+
+                if let Ok(local_constraint) =
+                    self.smt_condition_constraint(sig, &rule.condition, &subst)
+                {
+                    let term = self.instantiate(sig, &rule.rhs, &subst);
+                    out.push(RawSmtSuccessor {
+                        term,
+                        local_constraint,
+                        avoid_variable_number: fresh_number,
+                        fresh_names,
+                    });
+                }
+                for slot in fresh_slots {
+                    subst.unbind(slot);
+                }
+            }
+        }
+        out
+    }
+
+    fn smt_goal_matches(
+        &mut self,
+        sig: &Signature,
+        goal: &LhsAutomaton,
+        nr_vars: u32,
+        smt_variables: &[(u32, DagId)],
+        state: DagId,
+    ) -> Vec<RawSmtGoalMatch> {
+        let mut subst = Subst::new();
+        subst.reset(nr_vars);
+        let Some(mut matching) = goal.match_(self, sig, state, &mut subst, false, false) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while matching.next(self, sig, &mut subst) {
+            let Some(bindings) = (0..nr_vars)
+                .map(|slot| subst.get(slot))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let mut match_constraint = None;
+            let mut valid = true;
+            for &(slot, variable) in smt_variables {
+                let value = bindings[slot as usize];
+                let kind = sig.sorts.kind_of(self.node(variable).sort);
+                let Some(equality) = sig.smt_info.equality(kind) else {
+                    valid = false;
+                    break;
+                };
+                let clause = self.make_free(sig, equality, vec![variable, value]);
+                match self.smt_conjoin(sig, match_constraint, clause) {
+                    Ok(next) => match_constraint = next,
+                    Err(()) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                out.push(RawSmtGoalMatch {
+                    bindings,
+                    match_constraint,
+                });
+            }
+        }
+        out
+    }
+
     /// Apply the first applicable rule at `node` (Pillar A): round-robin over the node's symbol's rules
     /// from `cursors`, returning `(rule_id, result)` — the rewritten node — or `None` if no rule applies.
     /// Round-robin fairness (Maude's `RuleTable::applyRules`/`nextRule`): the cursor advances **past** the
@@ -4029,6 +4346,7 @@ impl Runtime {
                     NodeRepr::Str(s) => s.hash(&mut h),
                     NodeRepr::Qid(q) => q.hash(&mut h),
                     NodeRepr::Float(f) => f.to_bits().hash(&mut h),
+                    NodeRepr::SmtNum(number) => number.hash(&mut h),
                     NodeRepr::Var { name } => name.hash(&mut h),
                 }
                 for c in node.children() {
@@ -4528,6 +4846,89 @@ impl Engine {
         self.sig.sorts()
     }
 
+    pub fn smt_info(&self) -> &SmtInfo {
+        &self.sig.smt_info
+    }
+
+    pub fn smt_type(&self, sort: SortId) -> Option<SmtType> {
+        self.sig.smt_info.sort_type(sort)
+    }
+
+    /// Number of distinct kinds whose values use unsigned decimal integer syntax.
+    ///
+    /// Maude's pretty-printer treats both algebraic `SuccSymbol` naturals and SMT integer constants as
+    /// competing numeral families. A numeral in an unknown-range context needs a sort qualifier only
+    /// when more than one such kind is present (or when a user constant has the same spelling, tracked by
+    /// the frontend).
+    pub fn integer_literal_kind_count(&self) -> usize {
+        let mut kinds = HashSet::new();
+        for &symbol in self.sig.succ_zeros.keys() {
+            for decl in self.sig.symbol(symbol).decls() {
+                kinds.insert(self.sig.sorts.kind_of(decl.range));
+            }
+        }
+        for index in 0..self.sig.sorts.num_sorts() {
+            let sort = SortId::from_raw(index as u32);
+            if self.sig.smt_info.sort_type(sort) == Some(SmtType::Integer) {
+                kinds.insert(self.sig.sorts.kind_of(sort));
+            }
+        }
+        kinds.len()
+    }
+    pub fn smt_operator(&self, symbol: SymbolId) -> Option<SmtOp> {
+        match self.sig.symbol(symbol).special() {
+            Some(SpecialOp::Smt { op }) => Some(*op),
+            _ => None,
+        }
+    }
+    /// Static part of Maude's `validForSMT_Rewriting` gate. The frontend adds the one distinction
+    /// unavailable in the kernel: collapse axioms on ordinary operators versus polymorph instances.
+    pub fn valid_for_smt_rewriting(&self) -> bool {
+        self.sig.smt_info.conjunction().is_some()
+            && !self.sig.smt_rules.is_empty()
+            && self.sig.smt_rules_valid
+            && self.sig.equations.is_empty()
+            && self.sig.memberships.is_empty()
+    }
+
+    pub fn valid_smt_goal(&self, goal: &Term) -> bool {
+        term_is_linear(goal) && !term_contains_smt(&self.sig, goal)
+    }
+
+    /// Register an `SMT_NumberSymbol` constructor and the SMT type of its range sort.
+    pub fn register_smt_number(&mut self, symbol: SymbolId, sort: SortId, kind: SmtType) {
+        let component = self.sig.sorts.kind_of(sort);
+        self.sig.smt_info.set_sort_type(sort, kind);
+        self.sig.smt_info.set_number_symbol(component, symbol);
+        self.set_symbol_class(symbol, SymbolClass::SmtNumber);
+    }
+
+    /// Populate the non-behavioral `SMT_Info` bindings contributed by an `SMT_Symbol`. All overload
+    /// declarations participate, so equality is available in each operand kind.
+    pub fn register_smt_operator(&mut self, symbol: SymbolId, op: SmtOp) {
+        let decls = self.symbol_declarations(symbol);
+        match op {
+            SmtOp::True | SmtOp::False => {
+                for (_, range) in decls {
+                    self.sig.smt_info.set_sort_type(range, SmtType::Boolean);
+                }
+                if op == SmtOp::True {
+                    self.sig.smt_info.set_true_symbol(symbol);
+                }
+            }
+            SmtOp::And => self.sig.smt_info.set_conjunction(symbol),
+            SmtOp::Equals => {
+                for (domain, _) in decls {
+                    if let Some(&sort) = domain.first() {
+                        let kind = self.sig.sorts.kind_of(sort);
+                        self.sig.smt_info.set_equality(kind, symbol);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ---- symbols ----
 
     pub fn add_op(
@@ -4546,6 +4947,23 @@ impl Engine {
     /// construction).
     pub fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
         self.sig.add_op_decl(sym, domain, range);
+    }
+
+    /// Frontend declaration path: preserve this overload's own constructor bit instead of applying
+    /// `[ctor]` retroactively to every declaration folded into the symbol.
+    pub fn add_op_decl_with_ctor(
+        &mut self,
+        sym: SymbolId,
+        domain: Vec<SortId>,
+        range: SortId,
+        ctor: bool,
+    ) {
+        self.sig.add_op_decl_with_ctor(sym, domain, range, ctor);
+    }
+
+    /// Record that folded overload declarations disagree on their structural constructor axioms.
+    pub fn mark_inconsistent_constructor_axioms(&mut self, sym: SymbolId) {
+        self.sig.mark_inconsistent_constructor_axioms(sym);
     }
 
     /// Mark an operator as a constructor (`[ctor]`, B2.4) — metadata that does not affect reduction.
@@ -5024,6 +5442,42 @@ impl Engine {
         self.sig.symbol(id)
     }
 
+    /// Resolve a source operator among same-name/arity symbols using the argument sorts. META terms
+    /// carry the operator name but not its overload id, so their down-translation needs the same
+    /// applicability test as ordinary parsing.
+    pub fn resolve_operator_for_sorts(
+        &self,
+        name: &str,
+        argument_sorts: &[SortId],
+    ) -> Option<SymbolId> {
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name
+                && symbol.arity() == argument_sorts.len()
+                && symbol.decls().iter().any(|decl| {
+                    argument_sorts
+                        .iter()
+                        .zip(&decl.domain)
+                        .all(|(&actual, &declared)| self.sig.sorts.leq(actual, declared))
+                }))
+            .then_some(id)
+        })
+    }
+
+    pub fn resolve_constant_at_sort(&self, name: &str, sort: SortId) -> Option<SymbolId> {
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name
+                && symbol
+                    .decls()
+                    .iter()
+                    .any(|decl| decl.domain.is_empty() && decl.range == sort))
+            .then_some(id)
+        })
+    }
+
+    pub fn term_sort(&self, term: &Term) -> SortId {
+        self.sig.term_sort(term)
+    }
+
     /// The `(domain, range)` of each of `sym`'s operator declarations (one per ad-hoc/subsort overload).
     /// The META-LEVEL `maximalAritySet` descent reads these to find an operator's maximal argument sorts.
     pub fn symbol_declarations(&self, id: SymbolId) -> Vec<(Vec<SortId>, SortId)> {
@@ -5152,6 +5606,11 @@ impl Engine {
     pub fn make_float(&mut self, symbol: SymbolId, value: f64) -> DagId {
         self.rt
             .make_na(&self.sig, symbol, NaValue::Float(value.to_bits()))
+    }
+    /// Build an exact SMT integer/rational NA node (`SMT_NumberSymbol`).
+    pub fn make_smt_number(&mut self, symbol: SymbolId, value: SmtNumber) -> DagId {
+        self.rt
+            .make_na(&self.sig, symbol, NaValue::SmtNum(std::rc::Rc::new(value)))
     }
 
     pub fn node(&self, id: DagId) -> &DagNode {
@@ -5371,6 +5830,27 @@ impl Engine {
         self.sig.add_conditional_rule(lhs, rhs, nr_vars, condition)
     }
 
+    /// Retain a rule for `smt-search`, including `[nonexec]` rules. Equality conditions become solver
+    /// constraints; this registration does not make the rule executable by ordinary rewriting.
+    pub fn add_smt_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        variable_sorts: Vec<SortId>,
+        variable_names: Vec<String>,
+        condition: Vec<ConditionFragment>,
+    ) {
+        if self.sig.smt_info.conjunction().is_none() {
+            return;
+        }
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        for &sort in &variable_sorts {
+            self.variable_symbol(sort);
+        }
+        self.sig
+            .add_smt_rule(lhs, rhs, variable_sorts, variable_names, condition);
+    }
+
     /// Retain an unconditional `[narrowing]` rule for symbolic search. Registration is independent of
     /// ordinary rule compilation, so `[nonexec narrowing]` and bare-variable lhs rules remain usable.
     #[allow(clippy::too_many_arguments)]
@@ -5490,6 +5970,181 @@ impl Engine {
         let reduced = self.reduce(initial);
         let root = self.root(reduced);
         Search::new(root, reduced, goal, nr_vars, such_that, arrow, max_depth)
+    }
+
+    /// Turn `smt-search`'s `such that` equality fragments into the initial accumulated constraint.
+    /// The supplied DAGs are the symbolic values of the condition's variable slots.
+    pub fn make_smt_constraint(
+        &mut self,
+        condition: &[ConditionFragment],
+        variables: &[DagId],
+    ) -> Result<DagId, String> {
+        let mut subst = Subst::new();
+        subst.reset(variables.len() as u32);
+        for (slot, &variable) in variables.iter().enumerate() {
+            subst.bind(slot as u32, variable);
+        }
+        let constraint = self
+            .rt
+            .smt_condition_constraint(&self.sig, condition, &subst)
+            .map_err(|()| "unsupported SMT-search condition".to_string())?;
+        match constraint {
+            Some(constraint) => Ok(constraint),
+            None => {
+                let true_symbol = self
+                    .sig
+                    .smt_info
+                    .true_symbol()
+                    .ok_or_else(|| "module has no SMT true operator".to_string())?;
+                Ok(self.rt.make_free(&self.sig, true_symbol, Vec::new()))
+            }
+        }
+    }
+
+    /// Begin a breadth-first symbolic rewrite search modulo SMT. States and constraints are not reduced;
+    /// the module restriction gate guarantees there are no equations or memberships.
+    #[allow(clippy::too_many_arguments)]
+    pub fn smt_search(
+        &mut self,
+        initial: DagId,
+        initial_constraint: DagId,
+        goal: Term,
+        goal_nr_vars: u32,
+        goal_smt_variables: Vec<(u32, DagId)>,
+        arrow: Arrow,
+        max_depth: Option<u32>,
+        variable_names: Vec<String>,
+    ) -> SmtSearch {
+        self.smt_search_from_fresh_base(
+            initial,
+            initial_constraint,
+            goal,
+            goal_nr_vars,
+            goal_smt_variables,
+            arrow,
+            max_depth,
+            variable_names,
+            Nat::zero(),
+        )
+    }
+
+    /// Begin an SMT search whose fresh rule variables are numbered strictly above the supplied
+    /// arbitrary-precision decimal base. This is the META-LEVEL entry point; object commands retain
+    /// Maude's default base of zero through [`Self::smt_search`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn smt_search_with_fresh_base(
+        &mut self,
+        initial: DagId,
+        initial_constraint: DagId,
+        goal: Term,
+        goal_nr_vars: u32,
+        goal_smt_variables: Vec<(u32, DagId)>,
+        arrow: Arrow,
+        max_depth: Option<u32>,
+        variable_names: Vec<String>,
+        fresh_base_decimal: &str,
+    ) -> Option<SmtSearch> {
+        let fresh_base = Nat::from_decimal(fresh_base_decimal)?;
+        Some(self.smt_search_from_fresh_base(
+            initial,
+            initial_constraint,
+            goal,
+            goal_nr_vars,
+            goal_smt_variables,
+            arrow,
+            max_depth,
+            variable_names,
+            fresh_base,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn smt_search_from_fresh_base(
+        &mut self,
+        initial: DagId,
+        initial_constraint: DagId,
+        goal: Term,
+        goal_nr_vars: u32,
+        goal_smt_variables: Vec<(u32, DagId)>,
+        arrow: Arrow,
+        max_depth: Option<u32>,
+        variable_names: Vec<String>,
+        fresh_base: Nat,
+    ) -> SmtSearch {
+        let goal = LhsAutomaton::compile(goal, &self.sig);
+        SmtSearch::new(
+            self,
+            initial,
+            initial_constraint,
+            goal,
+            goal_nr_vars,
+            goal_smt_variables,
+            arrow,
+            max_depth,
+            variable_names,
+            fresh_base,
+        )
+    }
+
+    pub(crate) fn smt_state_successors(
+        &mut self,
+        state: DagId,
+        avoid_variable_number: &Nat,
+        next_variable_slot: &mut u32,
+    ) -> Vec<RawSmtSuccessor> {
+        self.rt
+            .smt_state_successors(&self.sig, state, avoid_variable_number, next_variable_slot)
+    }
+
+    pub(crate) fn smt_goal_matches(
+        &mut self,
+        goal: &LhsAutomaton,
+        nr_vars: u32,
+        smt_variables: &[(u32, DagId)],
+        state: DagId,
+    ) -> Vec<RawSmtGoalMatch> {
+        self.rt
+            .smt_goal_matches(&self.sig, goal, nr_vars, smt_variables, state)
+    }
+
+    pub(crate) fn smt_conjoin_constraints(
+        &mut self,
+        accumulated: DagId,
+        local: Option<DagId>,
+    ) -> DagId {
+        let Some(local) = local else {
+            return accumulated;
+        };
+        if self
+            .sig
+            .smt_info
+            .true_symbol()
+            .is_some_and(|true_symbol| self.rt.node(accumulated).symbol() == true_symbol)
+        {
+            return local;
+        }
+        self.rt
+            .smt_conjoin(&self.sig, Some(accumulated), local)
+            .expect("SMT conjunction metadata checked by the module gate")
+            .expect("conjoining two constraints is non-empty")
+    }
+
+    pub(crate) fn smt_conjoin_goal_constraints(
+        &mut self,
+        accumulated: DagId,
+        matched: Option<DagId>,
+    ) -> DagId {
+        let Some(matched) = matched else {
+            return accumulated;
+        };
+        self.rt
+            .smt_conjoin(&self.sig, Some(accumulated), matched)
+            .expect("SMT conjunction metadata checked by the module gate")
+            .expect("conjoining two constraints is non-empty")
+    }
+
+    pub(crate) fn count_smt_rewrite(&mut self) {
+        self.rt.rewrite_count += 1;
     }
 
     /// Structural hash of the DAG at `id`, consistent with [`deep_equal`](Self::deep_equal) — the `search`

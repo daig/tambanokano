@@ -7,6 +7,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+[features]
+default = []
+smt-z3 = ["dep:z3"]
+
 
 [dependencies]
 # D4: arbitrary-precision integers/rationals (pure Rust). Wrapped behind `crate::num` so the kernel
@@ -20,6 +24,9 @@ stacker = "0.1"
 # S0 spike (docs/migration/reports/S0-bdd-spike.md, GO). Pure Rust — the default build stays
 # pure-Rust and green without any native BDD library. Replaces Maude's BuDDy.
 biodivine-lib-bdd = "0.5.27"
+# D7: optional native SMT backend. All SMT metadata and command plumbing remain in the default
+# pure-Rust build; only DAG-to-z3 translation and solving are gated.
+z3 = { version = "0.20.2", optional = true, default-features = false }
 
 [dev-dependencies]
 # Only for a SortBdds test cross-check: biodivine's `Bdd::exact_cardinality` returns a

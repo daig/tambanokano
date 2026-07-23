@@ -175,11 +175,13 @@ fn is_top_level_keyword(w: &str) -> bool {
             | "crl"
             | "red"
             | "reduce"
+            | "check"
             | "match"
             | "xmatch"
             | "rew"
             | "rewrite"
             | "search"
+            | "smt-search"
     )
 }
 

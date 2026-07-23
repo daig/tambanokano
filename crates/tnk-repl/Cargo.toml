@@ -7,6 +7,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+[features]
+default = []
+smt-z3 = ["tnk-core/smt-z3"]
+
 
 [dependencies]
 tnk-core = { path = "../tnk-core" }

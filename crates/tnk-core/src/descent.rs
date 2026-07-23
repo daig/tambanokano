@@ -18,8 +18,9 @@
 
 use crate::dag::{DagId, NaValue, NodeRepr};
 use crate::engine::{Runtime, Signature};
+use crate::smt::SmtType;
 use crate::sort::SortId;
-use crate::symbol::{MetaHooks, MetaOp, SymbolId, Theory};
+use crate::symbol::{MetaHooks, MetaOp, SymbolClass, SymbolId, Theory};
 
 /// The current engine seen by a descent handler: reading the redex's meta-term arguments and building the
 /// up-translated result, both in the engine that is reducing. A thin public facade over `&mut Runtime` +
@@ -53,6 +54,10 @@ impl MetaCtx<'_> {
     /// The name of sort `s`.
     pub fn sort_name(&self, s: SortId) -> &str {
         self.sig.sorts().name(s)
+    }
+    /// SMT classification of a sort in the current signature.
+    pub fn smt_type(&self, sort: SortId) -> Option<SmtType> {
+        self.sig.smt_info().sort_type(sort)
     }
     /// Structural equality in the current meta-module engine. DAG ids from separately parsed commands
     /// need not be pointer-equal even when they denote the same reflected term.
@@ -137,6 +142,9 @@ impl MetaCtx<'_> {
     /// The arity (declared domain length) of symbol `sym`.
     pub fn arity(&self, sym: SymbolId) -> usize {
         self.sig.symbol(sym).arity()
+    }
+    pub fn symbol_is_command_variable(&self, sym: SymbolId) -> bool {
+        matches!(self.sig.symbol(sym).class(), SymbolClass::Variable { .. })
     }
     /// Add `n` to this engine's rewrite counter — a descent function reports the object-level reduction's
     /// rewrites as part of its own (Maude's `metaReduce` count = the object rewrites + 1 for the descent

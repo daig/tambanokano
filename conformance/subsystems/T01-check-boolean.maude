@@ -1,0 +1,21 @@
+*** T01-check-boolean — Boolean SMT checks lifted from the reference suite (Misc/smtTest.maude)
+set show timing off .
+load smt
+
+fmod TEST-B is
+  pr BOOLEAN .
+  vars W X Y Z : Boolean .
+endfm
+
+check W =/== X and Y .
+check W === X and Y .
+check X =/== true and X =/== Y and Y =/== true .
+check X =/== true and X =/== Y and Y =/== false .
+check (X xor true) and (X xor Y) and (Y xor true) .
+check (X xor true) and (X xor Y) and (Y xor false) .
+check not (X or not X) .
+check not(X implies Y implies X) .
+check (X ? Y : Z) and (Y implies X) and (Z implies X) .
+check (X ? Y : Z) and (Y implies not X) and (Z implies X) .
+check X === Y and Y === Z .
+check X === Y and Y === Z and Z =/== X .

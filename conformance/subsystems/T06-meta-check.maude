@@ -1,0 +1,24 @@
+*** T06-meta-check — all metaCheck cases lifted from the reference suite (Misc/smtTest.maude)
+*** PRELUDE
+set show timing off .
+load smt
+
+select META-LEVEL .
+
+red metaCheck(['REAL-INTEGER], '_=_['_+_['1.Integer, '1.Integer], '2.Integer]) .
+red metaCheck(['REAL-INTEGER], '_=_['_+_['1.Integer, '1.Integer], '3.Integer]) .
+
+fmod META-CHECK is
+  pr META-LEVEL .
+  pr REAL-INTEGER .
+  vars W X Y Z : Boolean .
+  vars I J K L : Integer .
+  vars P Q R S : Real .
+endfm
+
+red metaCheck(['META-CHECK], upTerm((I > J ? I : J) < I)) .
+red metaCheck(['META-CHECK], upTerm((I > J ? I : J) > I)) .
+red metaCheck(['META-CHECK], upTerm( (I > J ? I : J) === I or (I > J ? I : J) === J  )) .
+red metaCheck(['META-CHECK], upTerm( not((I > J ? I : J) === I or (I > J ? I : J) === J ) )) .
+red metaCheck(['META-CHECK], upTerm( (I > J ? I : J) =/== I and (I > J ? I : J) =/== J )) .
+red metaCheck(['META-CHECK], upTerm( (I > J ? I : J) =/== I or (I > J ? I : J) =/== J )) .

@@ -1,0 +1,136 @@
+*** T11-variant-satisfiability — native FVP/OS-compact constructor satisfiability
+load variant-satisfiability
+set show timing off .
+
+fmod VS-NAT is
+  sort Nat .
+  op 0 : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+endfm
+
+fmod VS-BOOL is
+  sort BoolV .
+  ops tt ff : -> BoolV [ctor] .
+endfm
+
+fmod VS-EMPTY is
+  sort Empty .
+endfm
+
+fmod VS-AC is
+  sort E .
+  ops a b c : -> E [ctor] .
+  op _+_ : E E -> E [ctor assoc comm] .
+endfm
+
+fmod VS-C is
+  sort C .
+  ops a b : -> C [ctor] .
+  op _*_ : C C -> C [ctor comm] .
+endfm
+
+fmod VS-IDEM is
+  sort I .
+  ops a b : -> I [ctor] .
+  op _*_ : I I -> I [ctor comm idem] .
+endfm
+
+fmod VS-ACU is
+  sort Bag .
+  ops mt a b : -> Bag [ctor] .
+  op _+_ : Bag Bag -> Bag [ctor assoc comm id: mt] .
+endfm
+
+fmod VS-LEFT-ID is
+  sort L .
+  ops e a b : -> L [ctor] .
+  op _._ : L L -> L [ctor left id: e] .
+endfm
+
+fmod VS-EQ is
+  sort S .
+  ops a b : -> S [ctor] .
+  op f : S -> S .
+  var X : S .
+  eq f(a) = b [variant] .
+endfm
+
+fmod VS-VARIANT-COVER is
+  sorts Nat Val .
+  op 0 : -> Nat [ctor] .
+  op s_ : Nat -> Nat [ctor] .
+  op a : -> Val [ctor] .
+  op f : Nat -> Val .
+  var N : Nat .
+  eq f(0) = a [variant] .
+  eq f(s N) = a [variant] .
+endfm
+
+fmod VS-OVERLOAD is
+  sorts A B K .
+  subsorts A B < K .
+  op ca : -> A [ctor] .
+  op cb : -> B [ctor] .
+  op f : A -> A [ctor] .
+  op f : B -> B [ctor] .
+endfm
+
+fmod VS-BAD-A is
+  sort S .
+  op a : -> S [ctor] .
+  op __ : S S -> S [ctor assoc] .
+endfm
+
+fmod VS-BAD-MB is
+  sort S .
+  op a : -> S [ctor] .
+  mb a : S .
+endfm
+
+fmod VS-BAD-OVERLOAD is
+  sorts A B K .
+  subsorts A B < K .
+  ops a : -> A [ctor] .
+  ops b : -> B [ctor] .
+  op _*_ : A A -> A [ctor comm] .
+  op _*_ : B B -> B [ctor assoc comm] .
+endfm
+
+select VAR-SAT-TOOL .
+
+*** advisory eligibility
+red vswf-check(upModule('VS-NAT, true)) .
+red vswf-check(upModule('VS-ACU, true)) .
+red vswf-check(upModule('VS-BAD-A, true)) .
+red vswf-check(upModule('VS-BAD-MB, true)) .
+
+*** free constructors, DNF order, finite disequality enumeration, validity
+red var-sat(upModule('VS-NAT, true), 'X:Nat ==? '0.Nat) .
+red var-sat(upModule('VS-NAT, true), 'X:Nat ==? '0.Nat /\ 'X:Nat =!? '0.Nat) .
+red var-sat(upModule('VS-NAT, true), ('X:Nat ==? '0.Nat /\ 'X:Nat =!? '0.Nat) \/ 'X:Nat ==? 's_['0.Nat]) .
+red var-sat(upModule('VS-NAT, true), 'X:Nat ==? '0.Nat /\ 'Y:Nat ==? 's_['0.Nat]) .
+red var-sat(upModule('VS-NAT, true), 'X:Nat ==? '0.Nat /\ 'X:Nat ==? 's_['0.Nat]) .
+red var-sat(upModule('VS-BOOL, true), 'BoolV, none, 'X:BoolV =!? 'Y:BoolV) .
+red var-sat(upModule('VS-BOOL, true), 'X:BoolV =!? 'tt.BoolV /\ 'X:BoolV =!? 'ff.BoolV) .
+red var-valid(upModule('VS-BOOL, true), 'X:BoolV ==? 'tt.BoolV \/ 'X:BoolV ==? 'ff.BoolV) .
+red var-sat(upModule('VS-BOOL, true), ~ ('X:BoolV ==? 'tt.BoolV)) .
+red var-valid(upModule('VS-BOOL, true), ('X:BoolV ==? 'tt.BoolV) => ('X:BoolV =!? 'ff.BoolV)) .
+red var-valid(upModule('VS-BOOL, true), ('X:BoolV ==? 'tt.BoolV) <=> ('X:BoolV =!? 'ff.BoolV)) .
+
+*** empty constructor domain
+red var-sat(upModule('VS-EMPTY, true), 'X:Empty ==? 'X:Empty) .
+red var-valid(upModule('VS-EMPTY, true), 'X:Empty =!? 'X:Empty) .
+
+*** AC/C/ACU/CUI constructor unification and constructor variants
+red var-sat(upModule('VS-AC, true), '_+_['X:E, 'Y:E] ==? '_+_['a.E, 'b.E] /\ 'X:E =!? 'a.E) .
+red var-sat(upModule('VS-C, true), '_*_['X:C, 'b.C] ==? '_*_['a.C, 'b.C]) .
+red var-sat(upModule('VS-IDEM, true), '_*_['X:I, 'X:I] ==? 'a.I) .
+red var-sat(upModule('VS-ACU, true), none, 'Bag, '_+_['X:Bag, 'mt.Bag] ==? 'a.Bag) .
+red var-sat(upModule('VS-LEFT-ID, true), none, 'L, '_._['e.L, 'X:L] ==? 'a.L) .
+red var-sat(upModule('VS-EQ, true), 'f['X:S] ==? 'b.S) .
+red var-sat(upModule('VS-EQ, true), 'f['X:S] ==? 'a.S) .
+red var-sat(upModule('VS-VARIANT-COVER, true), 'f['X:Nat] =!? 'a.Val) .
+
+*** overloaded constructors
+red var-sat(upModule('VS-OVERLOAD, true), 'f['ca.A] ==? 'f['ca.A]) .
+red var-sat(upModule('VS-OVERLOAD, true), 'f['ca.A] =!? 'f['cb.B]) .

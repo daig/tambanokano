@@ -395,13 +395,19 @@ pub enum StratExpr {
     Call { name: String, args: Vec<Vec<Token>> },
 }
 
-/// A top-level command (functional fragment): `reduce`/`red`, `match`/`xmatch`, the rewriting commands
-/// `rewrite`/`rew` + `continue` (Pillar A), and the strategy commands `srewrite`/`dsrewrite` (Pillar 2.4).
+/// A top-level command (functional fragment): `reduce`/`red`, object-level SMT `check`/`smt-search`,
+/// `match`/`xmatch`, the rewriting commands `rewrite`/`rew` + `continue` (Pillar A), and the strategy
+/// commands `srewrite`/`dsrewrite` (Pillar 2.4).
 #[derive(Debug)]
 pub enum Command {
     /// `reduce [in M :] term .`. The optional `module` is Maude's `in <MODULE> :` qualifier — reduce in
     /// that module instead of the current one (a one-shot override; the current module is unchanged).
     Reduce {
+        module: Option<String>,
+        term: Vec<Token>,
+    },
+    /// `check [in M :] formula .` — object-level SMT query over the given formula.
+    Check {
         module: Option<String>,
         term: Vec<Token>,
     },
@@ -437,6 +443,20 @@ pub enum Command {
     /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
     /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
     Search {
+        module: Option<String>,
+        max_solutions: Option<u64>,
+        max_depth: Option<u64>,
+        subject: Vec<Token>,
+        arrow: SearchArrow,
+        pattern: Vec<Token>,
+        such_that: Option<Vec<Token>>,
+    },
+    /// `smt-search [n,m] [in M :] subject =>arrow pattern [such that cond] .`: object-level SMT search
+    /// syntax. It preserves the same surface contract as `search` while remaining a distinct command
+    /// variant for later SMT-specific execution; `=>1`/`=>+`/`=>*`/`=>!` are accepted here and runtime
+    /// decides which arrows are supported.
+    /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
+    SmtSearch {
         module: Option<String>,
         max_solutions: Option<u64>,
         max_depth: Option<u64>,

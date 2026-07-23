@@ -1,0 +1,30 @@
+*** T02-check-integer — integer SMT checks lifted from the reference suite (Misc/smtTest.maude)
+set show timing off .
+load smt
+
+fmod TEST-I is
+  pr INTEGER .
+  vars W X Y Z : Boolean .
+  vars I J K L : Integer .
+endfm
+
+check I > J and J > K .
+check I > J and J > K and K > I .
+check I < J and J < K .
+check I < J and J < K and K < I .
+check I >= J and J >= I .
+check I >= J and J >= I and I =/== J .
+check I <= J and J <= I .
+check I <= J and J <= I and I =/== J .
+
+check I === J + K and I > J and I > K .
+check I === J + K and I > J + K .
+check I === J + K and I > J + K + L .
+check I === J - K and I > J + K .
+check - I === J - K and I > J + K .
+check I =/== J + K and I > J + K .
+check (I > J ? I : J) >= I and (I > J ? I : J) >= J .
+check (I > J ? I : J) < I .
+check (I > J ? I : J) === I or (I > J ? I : J) === J .
+check not((I > J ? I : J) === I or (I > J ? I : J) === J) .
+check (I > J ? I : J) =/== I and (I > J ? I : J) =/== J .
