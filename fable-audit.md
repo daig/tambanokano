@@ -101,6 +101,11 @@ Everything in this list was re-verified against the live oracle this session (no
   build has solver-free Null semantics. Native constructor-variant satisfiability and validity,
   finite/empty-sort analysis, formula DNF, and the `VAR-SAT-TOOL` facade pass T11's 27-result
   contract. Durable Phase-T gate: 11/11 fixtures.
+- **LTL model checking and SAT/tautology.** The temporal DAG, pure-Rust BDD facade,
+  Gastin–Oddoux VWAA/GBA/Büchi pipeline, nested DFS, shared lazy state graph,
+  `ModelCheckerSymbol`, and `SatSolverSymbol` are live. All counterexample lassos, models,
+  prime implicants, verbose statistics, result sorts, and rewrite counts pass the frozen
+  10-fixture / 50-command Maude-3.5.1 contract. Durable Phase-M gate: 10/10 fixtures.
 - **Objects**: `omod` desugaring, class completion, plain and object-message-fair `erewrite` on the
   bank/ping-pong shapes, STD-STREAM scripted IO.
 - **Robustness beyond Maude in two spots** (divergence in tnk's favor): a 300k-deep term reduce+print works
@@ -114,9 +119,6 @@ Everything in this list was re-verified against the live oracle this session (no
 
 Whole subsystems still planned in `roadmap.md`:
 
-- **Model checker** (`model-checker.maude`: `SatSolverSymbol`/`ModelCheckerSymbol`) production
-  remains unbuilt. M0 is complete: 10 fixtures / 50 commands are frozen and oracle-verified;
-  the exact implementation cursor is M1 (`LogicFormula` + temporal descent).
 - **Meta-interpreters** (`metaInterpreter.maude`: `InterpreterManagerSymbol`).
 - **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Per revised D5 these
   are intentionally out of scope for the engine (host-embedding model); existing Maude IO programs do not

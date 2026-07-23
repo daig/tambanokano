@@ -6,12 +6,12 @@ state-transition system is searched for an accepting cycle by nested DFS, and a
 **counterexample lasso** (lead-in prefix + cycle) is returned. Plus the sibling LTL
 satisfiability/tautology solver (`satSolve`/`tautCheck`).
 
-**Status: IN PROGRESS (2026-07-23); M0 COMPLETE, implementation cursor M1.** The frozen
-manifest is 10 fixtures / 50 commands. An oracle-vs-oracle run reports `SUBSYSTEMS 10/10 PASS`;
-the production binary accepts every fixture but reports `0/10`, as expected, because
-`SatSolverSymbol` and `ModelCheckerSymbol` remain declared-inert and their applications stay
-unreduced. M0 changed no production code. Phase M is independent of S and T
-(`subsystems-goal.md` §2); T is complete, so M1 is now the selected serial step.
+**Status: COMPLETE (2026-07-23); M1–M7 implemented and the Phase-M gate is closed.**
+The frozen manifest remains 10 fixtures / 50 commands. Both `ModelCheckerSymbol` and
+`SatSolverSymbol` are kernel-direct; every result value, sort, rewrite count, verbose
+line, counterexample lasso, SAT model, and prime implicant is byte-exact. The current
+default pure-Rust release reports **M01–M10 10/10 PASS**. Phase M remains independent of
+completed S and T (`subsystems-goal.md` §2).
 
 **Pass criterion (the hard part).** Per `subsystems-goal.md` §2, counterexample
 output must be **byte-exact** to the reference — *"paths are deterministic; they are the
@@ -271,64 +271,35 @@ M7's `SpecialOp::SatSolve` is likewise kernel-direct and needs no rewriting. Bot
 carry dedicated typed hook structs resolved from `model-checker.maude:186–203,239–261`;
 do not reuse the semantically unrelated meta hook map at runtime.
 
-### 3.2 The state-graph / search machinery (the reused state-transition system)
+### 3.2 The shared state graph / search machinery — implemented
 
-tnk's `crates/tnk-core/src/search.rs` already reimplements Maude's
-`StateTransitionGraph` as the `Search` struct (`search.rs:80–98`) — the module doc says it
-"builds Maude's `StateTransitionGraph` on the fly." The state node (`State`,
-`search.rs:32–47`) has exactly the fields the checker needs:
+`crates/tnk-core/src/search.rs` now factors the reachable-state machinery into
+`StateGraph`; ordinary `Search` retains only BFS, goal matching, bounds, and continuation,
+while model checking implements the same crate-private `GraphContext` over the active
+`Runtime`/`Signature` reduction view. Dispatch is static—there is no trait object per edge
+and no second successor implementation.
 
-```rust
-struct State {
-    term: DagId,                         // reduced, canonical term (arena handle)
-    _root: RootGuard,                    // pins `term` against GC
-    parent: Option<usize>,               // BFS-tree predecessor  ← lead-in reconstruction
-    via: Option<u32>,                    // rule id on the arc from parent
-    fwd: BTreeMap<usize, BTreeSet<u32>>, // successor idx -> rule id(s)  ← Maude's ArcMap
-    depth: u32,
-    expanded: bool,
-}
-```
+Each canonical state owns its `RootGuard`, BFS predecessor/rule, deterministic
+`BTreeMap<state, BTreeSet<rule>>` arcs, and first-result successor order. Raw rewrite
+results are materialized as a rooted `VecDeque<RawSuccessor>` because the matcher cannot
+retain borrows across checker calls. `Runtime::state_successors_deferred` timestamps the
+equational work at each accepted matcher result, restores the live rewrite counter, and
+records the final exhaustion tail. `StateGraph::get_next_state` replays only the prefix it
+actually consumes, then counts and normalizes that rule result. Asking beyond the final
+ordinal replays the tail. This reproduces Maude's lazy `findNextRewrite` accounting while
+keeping every pending DAG live across proposition reductions and GC safe points.
 
-Reusable engine seams: `state_successors(root)` — every `(rule_id, successor)` one step
-from root, all rules × positions (`engine.rs:4241+`, public wrapper `:6156+`);
-`reduce_successor` — counts one rewrite and reduces (`:6167+`); `dag_hash` +
-`deep_equal` for canonical hash-cons dedup. Lazy successor generation is in
-`Search::step` (`search.rs:163–227`); an `Expanding` cursor (`search.rs:70–78`) already
-yields successors one index at a time, matching Maude's
-`getNextState(stateNr, index)` access pattern. During M5, put these operations behind one
-crate-private, statically dispatched graph context implemented by both `Engine` (ordinary
-search) and the active `Runtime`/`Signature` reduction view (model checking); do not copy
-successor logic or allocate a trait object per edge.
+Duplicate raw rewrites still count and add their rule ids to the shared arc, but only a new
+canonical target advances the ordinal successor view. `dag_hash` plus `deep_equal`
+provides hash-consing; `RootGuard` pins both canonical states and pending raw results.
+Ordinary bounded search and `continue` use the same incremental commit path, so the
+model-checking fix did not create a second counting convention.
 
-**GC discipline (roadmap risk #9).** Each state pins its `DagId` with a per-state
-`RootGuard` (`search.rs:35`, `206–211`; RAII registry `crates/tnk-core/src/root.rs:60–86`),
-so the whole graph survives any collection while the session lives; and the REPL runs with
-in-reduction GC off by default (`gc_interval: None`, `engine.rs:408–411`;
-`lib.rs:65–68`). This is exactly "the same GC discipline the re-entrant reducer got" that
-risk #9 asks the state graph to have. The model checker reuses it unchanged.
-
-**Rule labels for `{state, ruleName}`.** The kernel currently stores only a dense `u32`
-rule id (`CompiledRule`, `engine.rs:284–296); the textual label lives frontend-side as
-`RlTrace.label: Option<String>`, indexed by rule id
-(`crates/tnk-frontend/src/sig/syntax.rs:83–99`; invariant `load.rs:763–768`). M5 changes
-that ownership once: convert the parsed label to `Option<Rc<str>>`, share it between
-`CompiledRule` and `RlTrace`, and construct either the Qid or `unlabeled` directly in the
-kernel. Existing trace/show-path rendering keeps reading `RlTrace`; no label lookup
-callback and no duplicate string allocation remain.
-
-**Three gaps in the current `Search` (all additive, none blocking):**
-1. **No cycle in path reconstruction.** `Search::path` (`search.rs:282–300`) rebuilds the
-   BFS-tree lead-in only; there is no cycle component. The model checker needs its own
-   lasso reconstruction (§2.4) — the raw back-edges are already in `fwd`/`graph()`.
-2. **No `deadlock` self-loop.** Successor-less states are just empty-`fwd` normal forms
-   (`search.rs:177–180`, `243–248`); the checker must synthesize the deadlock self-loop
-   itself (Maude's `getNextState` fake, §2.1) and the `deadlock` label.
-3. **`Search` is BFS-/goal-oriented, the checker wants index access.** `Search::step`
-   interleaves goal-testing and BFS ordering; the checker wants raw
-   `get_next_state(state, index)`. See §6.4 for the recommended small refactor that lets
-   both share one successor-generation code path (which is what *guarantees* the
-   checker's system graph matches the conformance-verified `search` graph).
+Rule labels are shared `Rc<str>` metadata between `CompiledRule` and frontend `RlTrace`.
+The kernel therefore constructs Qid labels or `unlabeled` directly without a frontend
+callback or duplicate label allocation. The checker supplies the two model-specific
+operations on top of the shared graph: deterministic lasso reconstruction and the
+synthetic `deadlock` self-loop.
 
 ### 3.3 The BDD facade (D6 — already GO/binding)
 
@@ -341,8 +312,8 @@ needs a *separate, small* BDD context (one `BddVariableSet` sized to the proposi
 variable index = proposition index) and a handful of ops the sort facade does not yet
 expose: `ithvar`/`nithvar`, `and`/`or`/`not`, structural `==`, and **root-variable +
 low/high cofactor navigation** for `satisfiesPropositionalFormula`'s walk. All are directly
-available on biodivine's `Bdd`/`BddNode` API; the plan is to expose them as a thin
-`ltl::bdd` helper rather than force them into `SortBdds`.
+available on biodivine's `Bdd`/`BddNode` API; M2 exposes them through the dedicated
+`ltl::bdd` helper rather than coupling temporal code to `SortBdds`.
 
 ### 3.4 The fixture harness and frozen baseline
 
@@ -351,9 +322,9 @@ available on biodivine's `Bdd`/`BddNode` API; the plan is to expose them as a th
 **M01–M10: 10 fixtures / 50 commands** on 2026-07-23; the exact manifest and source
 enumeration are in §7 and `subsystems-goal.md` §2. Every fixture carries `*** PRELUDE`, so
 the oracle and tnk both load the standing prelude plus `model-checker.maude`. The oracle
-self-diff is 10/10; the inert-hook tnk baseline is intentionally 0/10 without load, parse,
-or command-dispatch errors. F1 (`SCOREBOARD 77/77`) and F2 (`LEGACY 87/87`) continue to
-gate every implementation commit.
+self-diff and current production release are now 10/10. M0's historical inert-hook
+production baseline was 0/10 without load, parse, or command-dispatch errors. F1
+(`SCOREBOARD 77/77`) and F2 (`LEGACY 87/87`) gated every implementation commit.
 
 ---
 
@@ -503,10 +474,10 @@ four model-checker-gated reference-suite sources. They cover every LTL connectiv
 `LTL-SIMPLIFIER`, true/counterexample/nil-lead-in/deadlock/Qid/unlabeled output,
 duplicate-rule arcs, LTL+, Dekker, both dining-philosophers encodings,
 `satSolve`/`tautCheck` model/false/prime-implicant output, and the SatSolver verbose
-statistics. The oracle self-diff is 10/10. The production baseline is 0/10: the two
-applications remain inert, and M10 additionally lacks the hook-owned verbose event plus
-the identity-collapse lines exposed by `set verbose on`. The manifest is frozen in
-`subsystems-goal.md` §2. **Next: M1 only.**
+statistics. The oracle self-diff is 10/10. At the M0 checkpoint the production baseline was
+0/10: both applications were inert, and M10 lacked the hook-owned verbose event and
+identity-collapse lines. That historical baseline is superseded by the status at the top of this
+plan; the frozen manifest remains unchanged.
 
 #### Post-M0 serial cursor (binding)
 
@@ -520,15 +491,13 @@ the identity-collapse lines exposed by `set verbose on`. The manifest is frozen 
 | **M6** | determinism closure, LTL+ path, large reference systems, typed verbose-stat event | M01–M09 byte-exact target |
 | **M7** | GBA SAT BFS, prime implicants, `SatSolverSymbol`; pure `tautCheck` equations | M01–M10 10/10 plus frozen invariants |
 
-Do not start M2 before M1's indexing contract, M3 before M2's BDD gate, or M5 before the
-synthetic M4 checker is exact. M5 is the first stage allowed to change the production
-M-scoreboard.
+The stages were executed in this order: M1's indexing contract before M2, M2's BDD gate
+before M3, and the exact synthetic M4 checker before the production M5 hook. The table and
+stage prose below preserve those implementation contracts and historical checkpoint gates;
+references to 0/10 describe that stage's observed baseline, not the completed subsystem.
+Every stage is implemented, verified, committed, and recorded in the Phase-M ledger.
 
-Each stage is implemented, verified, committed, and recorded with its commit hash in the
-Phase-M ledger before the next starts. A stage boundary is a checkpoint, never a stopping
-condition for the encompassing M1–M7 `/goal`.
-
-### Stage M1 — LogicFormula + `build` (determinism root #2)
+### Stage M1 — LogicFormula + `build` (determinism root #2) — **DONE 26f4089**
 
 Create `tnk-core/src/ltl/{mod.rs,formula.rs}`. Port `LogicFormula`
 (`logicFormula.{hh,cc}`) as an append-only `Vec<FormulaNode>` plus a lookup-only structural
@@ -557,7 +526,7 @@ unknown-subtree atomicity, and each malformed/rejected case.
 hooks and M10's hook-owned verbose output remain absent. No BDD code and no production hook
 in M1.
 
-### Stage M2 — the `ltl::bdd` helper (facade extension)
+### Stage M2 — the `ltl::bdd` helper (facade extension) — **DONE 20f9bde**
 
 Add `ltl/bdd.rs`, owning a local `BddVariableSet` whose variable index is the proposition
 index. Its crate-private API covers `true`/`false` (including zero variables),
@@ -568,7 +537,7 @@ canonicity, implication, and multi-level low/high walks against biodivine direct
 
 **Gate:** the focused BDD tests pass; M remains 0/10 and no production hook is bound.
 
-### Stage M3 — the LTL→Büchi pipeline (determinism root #3)
+### Stage M3 — the LTL→Büchi pipeline (determinism root #3) — **DONE 0b02e00**
 
 Port, in order, each unit-tested against `dump()`-diffs of `TDEBUG` reference builds:
 1. `TransitionSet` (`transitionSet.{hh,cc}`) — `BTreeMap<NatSet,Bdd>` with the subsumption-
@@ -591,7 +560,7 @@ Do not leave instrumentation or binaries in this repository.
 **Gate:** every layer's focused tests and intermediate dumps match; M remains 0/10 and no
 production hook is bound.
 
-### Stage M4 — the nested DFS + `System` trait (determinism root #4)
+### Stage M4 — the nested DFS + `System` trait (determinism root #4) — **DONE c4a14a2**
 
 Port `ModelChecker2` (`modelChecker2.{cc,hh}`) into `ltl/model_check.rs`: product-state
 interning, DFS1/DFS2, `satisfiesPropositionalFormula` (lazy root/low/high walk plus
@@ -605,7 +574,7 @@ hook participates in M4.
 **Gate:** all synthetic-system lassos and proposition-call counts are exact; M remains
 0/10.
 
-### Stage M5 — first vertical slice: shared graph + hooks + M01/M03
+### Stage M5 — first vertical slice: shared graph + hooks + M01/M03 — **DONE 6afb47d**
 
 1. Extract `Search`'s graph fields and successor quantum into `StateGraph`
    (`get_next_state`, `state_dag`, `fwd_arcs`); `Search` retains only BFS/goal logic.
@@ -625,38 +594,37 @@ hook participates in M4.
 5. Build `counterexample`/transition/list/Qid/unlabeled/deadlock terms from the resolved
    hooks, or return `trueTerm`.
 6. Record typed `(property_automaton_states, examined_system_states)` events during every
-   check. M6 teaches the REPL's existing `set verbose` path to render the exact two
+   check. M6 taught the REPL's existing `set verbose` path to render the exact two
    `ModelChecker:` lines; core code does not print.
 
 **Gate:** M01 and M03 byte-exact, including rewrite counts, deadlock, unlabeled/Qid labels,
 nil/nonempty lead-ins, and the deterministic shared-label duplicate-rule arc. Retained
 search fixtures must remain unchanged.
 
-### Stage M6 — close `modelCheck` / `modelCheck+` (M01–M09)
+### Stage M6 — close `modelCheck` / `modelCheck+` (M01–M09) — **DONE 119c3a0**
 
-Turn on M02 and M04–M09 one at a time; diff determinism against instrumented reference
-automata. This includes all LTL operators and simplifier equations, MUTEX, round-robin,
-LTL+ witness inversion, Dekker's 9+2 lasso, both 459-state dining counterexamples, exact
-48,194 rewrite counts, and the verbose property/system-state statistics in M05/M08/M09.
-**Gate:** M01–M09 pass together; M10 remains the only expected failure.
+M01–M09 now pass together. The closure preserved reduced compound RHS subterms for
+Maude-equivalent sharing/counts, completed the source-form object-completion diagnostic
+path (including suppression for statements already complete), and made state-successor
+enumeration lazily charge matcher-condition reductions and exhaustion work. M05's verbose
+round-robin diagnostics and 52-state lasso are byte-exact. M08 and M09 each report the
+reference 459 examined states, exactly 48,194 rewrites, and the frozen dining-philosophers
+counterexample.
 
-### Stage M7 — `satSolve` / `tautCheck` (sibling; separate risk)
+**Gate:** closed; M01–M09 pass together, and M10 also passes.
 
-Reuse `GenBuchiAutomaton` (do not degeneralize); port `GenBuchiAutomaton::satSolve`
-(`satSolve.cc`) — all three ordered BFS passes and lead-in rolling. Port
-`Bdd::extractPrimeImplicant` verbatim from `Utility/bdd.cc:31–49`, then render its cube in
-root-variable order exactly as `SatSolverSymbol::makeFormula` does. Add typed `SatHooks`,
-bind `"SatSolverSymbol"` in `special_op`, and keep execution kernel-direct.
-`tautCheck` is a pure prelude equation over `satSolve`; verify rather than reimplement it.
-Record a typed SatSolver statistics event and render it through the REPL's existing
-`set verbose` path; core code does not print. Reuse/refactor the existing per-module
-identity-collapse reporter so the verbose pair emits the two frozen `_ ; _` lines once;
-do not hard-code those lines in the SatSolver hook.
+### Stage M7 — `satSolve` / `tautCheck` (sibling; separate risk) — **DONE 119c3a0**
 
-**Gate:** M10's eight commands are byte-exact, including SatSolver singular/plural/zero
-verbose statistics, the two identity-collapse lines, `model` conjunction ordering and
-polarity, result sorts/rewrites, `false`, and tautology counterexamples. The complete
-M01–M10 scoreboard is 10/10 and the stopping gate in §7 holds.
+`GenBuchiAutomaton::sat_solve` implements the reference's three ordered BFS passes and
+lead-in rolling. The BDD facade extracts prime implicants in root-variable order; typed
+`SatHooks` build `model`/`false`/counterexample terms, while the prelude continues to
+define `tautCheck` as a pure equation over `satSolve`. Typed statistics flow through the
+existing REPL verbose-event path, and the identity-collapse reporter emits the two frozen
+diagnostics without hook-specific strings.
+
+**Gate:** closed; all eight M10 commands are byte-exact, including singular/plural/zero
+statistics, conjunction order and polarity, result sorts/counts, `false`, and tautology
+counterexamples.
 
 ### 6.3 Why there is no new upper call
 
@@ -668,18 +636,15 @@ checker and pass its existing `DescentOps` argument through nested reductions; e
 semantic reason. `satSolve` is simpler still: it consumes only its formula DAG and result
 hooks.
 
-### 6.4 The `Search` refactor (called out, not deferred)
+### 6.4 The `Search` refactor — completed
 
-To *guarantee* the checker's system graph matches the conformance-verified `search` graph
-(and to avoid a second, drifting copy of successor generation), extract the common core
-from `Search` — expand-state → enumerate (`state_successors`) → reduce (`reduce_successor`)
-→ hash-cons (`dag_hash`/`deep_equal`) → record `fwd`/`parent` + `RootGuard` — into a shared
-`StateGraph` exposing `get_next_state(state, index) -> Option<usize>`, `state_dag`,
-`fwd_arcs`. `Search` becomes `StateGraph` + goal/BFS/`such_that` logic; the checker uses
-`StateGraph` directly with the deadlock self-loop added. This is a mechanical, test-covered
-refactor (the `search` fixtures regression-guard it).
-
----
+`StateGraph` owns expansion, deferred matcher accounting, successor normalization,
+hash-consing, deterministic arcs/order, parent links, and roots. `Search` composes it with
+BFS/goal logic; the checker composes it with ordinal access, proposition memoization,
+deadlock completion, and lasso recovery. Both call the same `GraphContext` methods.
+Pending results are rooted at matcher acceptance and after path rebuilding, so eager
+materialization cannot expose an unrooted DAG between reductions. The retained search
+fixtures and full audit/legacy gates show no observational drift.
 
 ## 7. Verification
 
@@ -704,11 +669,11 @@ hard requirement — **byte-for-byte** the `counterexample`/`model` text.
 | `M09-reference-dining-philosophers6` | 3 | alternate Oid encoding of the same complete reference test and exact counterexample |
 | `M10-sat-taut` | 8 | `model(nil,True)`, `model(b,True)`, `false`, four tautology outcomes, manual prime implicant `model(a ; b,(~ c) ; c)`, exact tautology counterexample, and verbose 1-state/0-fairness + 2-state/1-fairness statistics |
 
-Total: **10 fixtures / 50 commands**. `TNK_BIN=~/.local/bin/maude
-tools/subsystems-scoreboard.sh -p M` reports **10/10 PASS**. The production release
-reports **0/10**, with every file accepted and the two special-hook applications left
-unreduced as expected before M1–M7. M10 also lacks the hook-owned verbose event and the
-identity-collapse lines bound by its `set verbose on` pair.
+Total: **10 fixtures / 50 commands**. Both
+`TNK_BIN=~/.local/bin/maude tools/subsystems-scoreboard.sh -p M` (oracle self-diff) and the
+current default production release report **10/10 PASS**. M01–M10 conform together:
+model-checking lassos/statistics, SAT/tautology output, identity diagnostics, result sorts,
+and rewrite counts are all byte-exact.
 
 **Source enumeration and exclusions.** The reference-suite model-checker denominator is
 `Misc/dekker` plus `ObjectOriented/rrobin`, `dining-philosophers5`, and
@@ -748,6 +713,11 @@ M1–M7 is complete only when **all** of the following hold on the same final tr
 7. This plan, `subsystems-goal.md`, `roadmap.md`, `README.md`, and `fable-audit.md` state
    observed completion; the Phase-M ledger records commit hashes for M1–M7. All intended
    work is committed and the working tree is clean.
+
+**Observed close evidence (2026-07-23, implementation commit `119c3a0`):** M 10/10,
+U 27/27, V 21/21, N 16/16, optional-z3 T 11/11, audit 77/77, legacy 87/87, and
+`cargo test --release --workspace` 438/438. The three stock load probes are clean and the
+shipped `model-checker.maude` checksum is the value pinned above.
 
 Do not mark the `/goal` complete for a plausible subset, a logically valid but different
 lasso/model, one narrowed test command, or a stage checkpoint.

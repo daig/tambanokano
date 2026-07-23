@@ -233,15 +233,15 @@ Ordered by (dependency, size); references are the kept deep-dives.
   records the reflective rewrite-count boundary. No prototype source is copied. The complete
   Phase-T scoreboard is **11/11 PASS**. Contract: `subsystems-goal.md` §2; implementation record:
   `remaining-plans/04-smt.md`.
-- **G4. Model checking — active; M0 complete (2026-07-23), cursor M1:** the frozen
-  Maude-3.5.1 contract is 10 fixtures / 50 commands spanning every LTL connective,
-  true/counterexample/nil/deadlock/unlabeled/Qid behavior, all terminating manual Chapter 12
-  families, every gated reference-suite source, `satSolve`/`tautCheck` prime implicants,
-  and SatSolver singular/plural/zero verbose statistics. Oracle self-diff is 10/10; the
-  accepted inert-hook production baseline is 0/10. M1 next
-  ports `LogicFormula` and temporal descent, followed by the BDD facade, exact Gastin–Oddoux
-  automata, nested DFS, shared `StateGraph`/hooks, full model-check fixture closure, and the
-  SAT/tautology sibling. Plan: `remaining-plans/05-model-checking.md`; reference:
+- **G4. Model checking — complete (2026-07-23):** M0–M7 implement the temporal
+  DAG/BDD/Gastin–Oddoux pipeline, nested DFS, the shared lazily-accounted `StateGraph`,
+  typed `ModelCheckerSymbol`/`SatSolverSymbol` hooks, deadlock completion, exact lasso
+  construction, and generalized-Büchi `satSolve` with ordered prime implicants. The frozen
+  Maude-3.5.1 contract is **10 fixtures / 50 commands, 10/10 PASS**: every LTL connective;
+  true/counterexample/nil/deadlock/unlabeled/Qid behavior; all terminating manual Chapter
+  12 families; every gated reference-suite source; verbose model/SAT statistics; and
+  byte-exact result values, sorts, rewrite counts, lassos, and SAT models. Plan/record:
+  `remaining-plans/05-model-checking.md`; reference:
   `reports/A8-symbolic-smt-ltl.md`.
 - **G5. Meta-interpreters** (`metaInterpreter.maude`): separate `Engine` instances communicating by
   term translation, per **D1**. Reference: `reports/A7`.

@@ -5,11 +5,11 @@ gates, decision points, and completion criteria for the subsystem program chosen
 the correctness goal closed (2026-07-05). It contains historical completed phases as well
 as future Phase I.
 
-**Current selected `/goal` slice (2026-07-23): Phase M only, M1→M7.** For this goal,
-`remaining-plans/05-model-checking.md` is the Rust implementation authority and its §7.1
-is the stopping gate. The umbrella completion criteria in §1.4 include Phase I and do
-**not** extend the Phase-M goal into sessions, meta-interpreters, or async work. Current
-behavior/status comes from the code and harness, not an older plan's cursor.
+**Completed selected `/goal` slice (2026-07-23): Phase M, M1→M7.**
+`remaining-plans/05-model-checking.md` is the implementation record; its §7.1 stopping
+gate is closed. The umbrella completion criteria in §1.4 still include Phase I and do
+**not** extend the completed Phase-M slice into sessions, meta-interpreters, or async work.
+Current behavior/status comes from the code and harness, not an older plan cursor.
 
 **Goal statement.** Implement, in order: (S) the symbolic engine (order-sorted unification → variants →
 narrowing), then (T) SMT integration and (M) the LTL model checker (independent of each other, either
@@ -222,7 +222,7 @@ The Phase-T record remains frozen in `remaining-plans/04-smt.md` §§4–8.
   tools/subsystems-scoreboard.sh -p T` reports **11/11 PASS**. The retained audit, legacy, U, V, and
   N gates remain green.
 
-### Phase M — model checker (independent; selected after T for serial work, parallel-safe)
+### Phase M — model checker (complete 2026-07-23; independent of S/T)
 
 #### Phase-M manifest (frozen 2026-07-23)
 
@@ -252,26 +252,21 @@ mismatches in a 12-pair oracle self-diff). The stable fixture uses duplicate rul
 tnk determinizes the otherwise-unstable case by lowest source rule id. Every other label, lasso,
 result term/sort, and rewrite count remains byte-exact.
 
-**M0 is complete; M1 is next.** No production model-checker code landed with the manifest.
-The current binary accepts all 50 commands but leaves `SatSolverSymbol`/`ModelCheckerSymbol`
-applications unreduced, so `tools/subsystems-scoreboard.sh -p M` is intentionally 0/10.
-M1–M7 must port the exact Gastin–Oddoux pipeline + nested DFS, share `Search`'s successor core,
-bind both hooks, and close all 10 fixtures. Detailed cursor: `remaining-plans/05-model-checking.md`.
+**M0–M7 are complete.** The default pure-Rust production release passes all 10 fixtures /
+50 commands. The shipped implementation contains the exact Gastin–Oddoux temporal
+pipeline, nested DFS, shared and lazily-accounted `StateGraph`, typed model/SAT hooks,
+deadlock completion, byte-exact lasso/model construction, verbose statistics, and prime
+implicants. M05/M08/M09 closed the final M6 gaps; no fixture, timeout, or accepted diff was
+weakened.
 
-#### Current Phase-M `/goal` contract
+#### Closed Phase-M `/goal` contract
 
-Continue without stopping at commits or stage boundaries until M1–M7 are complete. Follow
-the stage order, Rust decisions, authority hierarchy, and exact per-stage gates in
-`remaining-plans/05-model-checking.md`. The Maude 3.5.1 source and frozen oracle output
-define behavior; a different valid automaton, lasso, SAT cube, output, or rewrite count is
-not conformant. Do not weaken M01–M10, add an accepted diff, switch BDD backends, duplicate
-the search graph, route the checker through `MetaDescent`, or begin Phase I.
-
-The only completion condition is all of `remaining-plans/05-model-checking.md` §7.1 on one
-final committed tree, including M 10/10, retained F1–F4 and subsystem gates, live shipped
-hooks, updated documentation/ledger hashes, removed instrumentation, and a clean working
-tree. A discovered defect is part of the goal unless it is demonstrably outside Phase M;
-fix and regression-cover it rather than defer it.
+The Maude 3.5.1 source and frozen oracle output remain the behavioral authority. On
+implementation commit `119c3a0`, the retained gates report M 10/10, U 27/27, V 21/21,
+N 16/16, optional-z3 T 11/11, audit 77/77, legacy 87/87, and 438 release tests. The
+shipped `model-checker.maude` checksum and root-first load path are unchanged; all four
+entry points—`modelCheck`, `modelCheck+`, `satSolve`, and `tautCheck`—compute. Phase I was
+not started.
 
 ### Phase I — sessions & meta-interpreters (last; internal order I0→I1→I2→I3→I4)
 
@@ -373,8 +368,10 @@ fix and regression-cover it rather than defer it.
 - [x] M5 shared StateGraph + hooks + toggle slice — 6afb47d (M01/M03 byte-exact;
   shared graph/search fixture and typed-stats tests pass; shipped library checksum pinned; M 5/10
   with M02/M04/M06 also conforming; cargo 437/437, audit 77/77, legacy 87/87)
-- [ ] M6 complete modelCheck fixture closure —
-- [ ] M7 satSolve/tautCheck fixture closure —
+- [x] M6 complete modelCheck fixture closure — 119c3a0 (M01–M09 byte-exact; M05 verbose
+  object-completion/count closure; M08/M09 each 459 examined states and 48,194 rewrites)
+- [x] M7 satSolve/tautCheck implementation slice — 119c3a0 (M10 8/8 commands byte-exact;
+  complete Phase-M gate M 10/10, cargo 438/438, audit 77/77, legacy 87/87)
 - [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
 - [ ] I1 session extraction —
 - [ ] I2 local meta-interpreters —
