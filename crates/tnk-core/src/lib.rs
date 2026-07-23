@@ -16,6 +16,7 @@ pub mod descent;
 pub mod engine;
 pub mod fresh;
 pub mod id;
+pub mod ltl;
 pub mod root;
 // S3: variant-based narrowing rule descriptors and symbolic state search.
 pub mod narrow;

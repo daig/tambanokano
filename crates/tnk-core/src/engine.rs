@@ -4319,7 +4319,7 @@ impl Runtime {
     /// memo (so shared subterms hash once and deep terms don't overflow). Mixes the symbol, the scalar
     /// payload `deep_equal` special-cases (S `count` / NA `value`, via [`DagNode::repr`]), and the child
     /// hashes in canonical order.
-    fn dag_hash(&self, id: DagId) -> u64 {
+    pub(crate) fn dag_hash(&self, id: DagId) -> u64 {
         use crate::dag::NodeRepr;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
