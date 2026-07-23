@@ -1,5 +1,12 @@
 # A8 — Symbolic reasoning, SMT, LTL, Full Maude/OO (deep-dive report)
 
+> **Authority note (2026-07-23):** this is a historical C++ deep-dive, not a current Rust
+> implementation plan. For Phase M use `../remaining-plans/05-model-checking.md` and the
+> Phase-M section of `../subsystems-goal.md`. In particular, D6 now binds mandatory
+> `biodivine-lib-bdd`, the live workspace is `tnk-core` rather than the proposed
+> `crates/symbolic` layout below, and `ltl::NatSet` must preserve the reference word-order
+> comparison rather than use a generic set.
+
 This subsystem sits *on top of* the kernel (A1), matching/unification primitives (A2)
 and the sort lattice (A3). It consumes the per-theory `computeSolvedForm` /
 `UnificationSubproblem` machinery and the `SortBdds` and turns them into user-facing
@@ -143,12 +150,11 @@ automaton (`veryWeakAlternatingAutomaton`) → generalized Büchi (`genBuchiAuto
 (Somenzi–Bloem; `sccAnalysis`/`sccOptimizations`). `satSolverSymbol`/`satSolve.cc` reuse the GBA for
 LTL satisfiability/tautology (`satSolverSymbol.hh`).
 
-**Rust migration** — PORT the algorithms (they are self-contained graph/automata code, the *least*
-pointer-heavy part of Maude). The `System` interface → a Rust trait, decoupling the checker from the
-rewrite engine cleanly. BDD label encoding again needs `biodivine-lib-bdd` or BuDDy-FFI. Nested DFS and
-SCC analysis are textbook ports using `NatSet`→`FixedBitSet`/`HashSet`, `IndexedSet`→an interning
-`Vec`+`HashMap`. *Rationale: this subsystem is algorithm-dense but data-structure-light, so it ports
-almost verbatim and is good early Rust practice.*
+**Rust migration (historical sketch)** — PORT the algorithms; the current binding design is
+in `remaining-plans/05-model-checking.md`. Its `System` interface is a statically dispatched
+Rust trait, BDD labels use mandatory `biodivine-lib-bdd` 0.5.27, and the Temporal
+`NatSet` is a dedicated packed-word port with the C++ ordering. Nested DFS and SCC analysis
+remain direct algorithm ports.
 
 ---
 
@@ -204,7 +210,7 @@ codegen or a Cranelift/LLVM JIT over the A1 stack-machine — not a port of this
 
 ---
 
-## 9. Proposed Rust module layout
+## 9. Proposed Rust module layout (historical; superseded by the live workspace and remaining plans)
 
 ```
 crates/symbolic/

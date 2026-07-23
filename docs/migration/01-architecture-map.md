@@ -116,12 +116,13 @@ language → reflect it → add symbolic reasoning (unification/variants/narrowi
 6. **The `special(id-hook…)` seam = typed `enum SpecialOp`** resolved at module-build time; built-ins
    become arms of symbol reduction, not attached C function pointers.
 7. **Bignums** → **`malachite`** (pure Rust) behind a `tnk-core::num` wrapper; `rug` (GMP) as a benchmarked escape hatch (decision **D4**).
-8. **BDDs are cross-cutting** (order-sorted unifier filtering, ACU Diophantine selection, LTL Büchi
-   labels) → pure-Rust **`biodivine-lib-bdd`** behind a `bdd` facade, feature-gated; BuDDy FFI as fallback (decision **D6**).
+8. **BDDs are cross-cutting** (order-sorted unifier filtering and LTL Büchi labels) →
+   mandatory pure-Rust **`biodivine-lib-bdd`** 0.5.27 in `tnk-core`, with engine-local
+   facades and no feature gate or BuDDy fallback in the active design (binding decision **D6**).
 9. **SMT backend** → optional **`z3` 0.20.2** in `tnk-core::smt::z3`, behind a pure-core
    `trait SmtEngine`; the default selects `NullSmtEngine` and links no solver (decision **D7**).
-10. **External IO/concurrency** → an owned **`mio`** reactor + `signal-hook` (single-threaded deterministic
-    interleave), replacing the global poll-reactor + signal plumbing; `tokio` only for a future networked direction (decision **D5**).
+10. **External IO/concurrency** → host-owned IO through the embedding boundary; the old
+    in-engine `mio` reactor plan is shelved (superseding decision **D5**).
 
 ## 5. Keep-as-data / drop list (no backward compat)
 - **Keep as data, port ~verbatim:** the `.maude` **prelude/library** (only wire the hooks); the Full

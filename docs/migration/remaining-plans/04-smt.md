@@ -599,8 +599,8 @@ This is the compact operational sequence; the detailed stage gates below remain 
 6. **T6 — implement variant satisfiability (DONE 2026-07-23).** T6a–T6g landed with the pinned old
    oracle, native Rust core, compatible facade, and declared semantic/count boundary.
 
-**Cursor: Phase T complete.** The next serial subsystem is Phase M, beginning with M0 fixture
-seeding; Phase-T code and gates remain frozen.
+**Cursor: Phase T complete.** Phase M's M0 manifest is frozen in `d57b645` + `3c89fe3`; the
+current serial cursor is M1. Phase-T code and gates remain frozen.
 
 ### 6.2 Detailed stage gates
 
