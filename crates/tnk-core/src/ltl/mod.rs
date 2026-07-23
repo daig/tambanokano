@@ -4,5 +4,7 @@
 //! active engine's DAGs directly, while frontend-resolved hook symbols remain typed values.
 
 mod formula;
+pub(crate) mod bdd;
+
 
 pub use formula::TemporalHooks;
