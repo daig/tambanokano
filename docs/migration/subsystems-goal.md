@@ -361,7 +361,8 @@ fix and regression-cover it rather than defer it.
 - [x] M0 model-checker fixture manifest — d57b645 + 3c89fe3
   (2026-07-23; 10 fixtures / 50 commands; oracle self-diff 10/10, inert-hook production
   baseline 0/10; no production code)
-- [ ] M1 LogicFormula DAG + temporal descent —
+- [x] M1 LogicFormula DAG + temporal descent — 26f4089 (6 focused tests; M 0/10 inert;
+  audit 77/77 and legacy 87/87 retained)
 - [ ] M2 local LTL BDD facade —
 - [ ] M3 VWAA → GBA → Büchi pipeline —
 - [ ] M4 nested DFS + synthetic System gate —
