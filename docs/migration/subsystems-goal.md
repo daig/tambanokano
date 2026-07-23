@@ -363,7 +363,8 @@ fix and regression-cover it rather than defer it.
   baseline 0/10; no production code)
 - [x] M1 LogicFormula DAG + temporal descent — 26f4089 (6 focused tests; M 0/10 inert;
   audit 77/77 and legacy 87/87 retained)
-- [ ] M2 local LTL BDD facade —
+- [x] M2 local LTL BDD facade — 20f9bde (4 focused tests; M 0/10 inert;
+  audit 77/77 and legacy 87/87 retained)
 - [ ] M3 VWAA → GBA → Büchi pipeline —
 - [ ] M4 nested DFS + synthetic System gate —
 - [ ] M5 shared StateGraph + hooks + toggle slice —
