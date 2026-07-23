@@ -358,7 +358,7 @@ fix and regression-cover it rather than defer it.
   3/3 fixtures, 45 byte-exact object/meta commands; default Null degradation retained)
 - [x] T6 variant-satisfiability library — working tree 2026-07-23 (native and external-oracle lanes
   27/27 each; complete Phase-T scoreboard 11/11; three prototype corrections recorded in T11)
-- [x] M0 model-checker fixture manifest — d57b645 plus the pre-M1 verbose-contract amendment
+- [x] M0 model-checker fixture manifest — d57b645 + 3c89fe3
   (2026-07-23; 10 fixtures / 50 commands; oracle self-diff 10/10, inert-hook production
   baseline 0/10; no production code)
 - [ ] M1 LogicFormula DAG + temporal descent —
