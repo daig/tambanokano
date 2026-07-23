@@ -200,8 +200,8 @@ F4-owned exclusion is exactly eight debugger commands at source lines 230–234 
 eight independent number/fresh probes bring the denominator to 118. Every fixture was run through
 the Yices2 rebuild; `TNK_BIN=~/.local/bin/maude tools/subsystems-scoreboard.sh -p T` reported 10/10.
 
-**Cursor: Phase T complete (2026-07-23); next serial cursor is M0.** Detailed design, implementation
-record, gates, and the T6 parity boundary are frozen in `remaining-plans/04-smt.md` §§4–8.
+**Cursor: Phase T complete (2026-07-23); M0 fixture seeding is complete; next serial cursor is M1.**
+The Phase-T record remains frozen in `remaining-plans/04-smt.md` §§4–8.
 
 - **T0a–T5 closed:** the optional z3 0.20.2 lane passes T01–T10—10 fixtures / 118 byte-exact
   commands—covering all non-debug object `check`/`smt-search`, `metaCheck`, and `metaSmtSearch`
@@ -221,15 +221,38 @@ record, gates, and the T6 parity boundary are frozen in `remaining-plans/04-smt.
 
 ### Phase M — model checker (independent; selected after T for serial work, parallel-safe)
 
-- **M0 fixtures are not yet seeded** and must precede production code. Freeze minimal
-  true/counterexample/nil-lead-in/deadlock/multi-label cases, manual ch. 12, `dekker`,
-  dining-philosophers, LTL-simplifier, and `satSolve`/`tautCheck` prime-implicant cases.
-- Port the exact Gastin–Oddoux automata + nested DFS; alternative valid automata/lassos do not satisfy
-  the byte-exact counterexample contract. Extract the rewrite successor core from the existing
-  `Search` into a shared `StateGraph` rather than duplicating it. Bind
-  `SatSolverSymbol`/`ModelCheckerSymbol`, preserve exact rewrites/order/labels/lassos, and complete
-  the sibling satisfiability/tautology surface before M closes. Plan:
-  `remaining-plans/05-model-checking.md`.
+#### Phase-M manifest (frozen 2026-07-23)
+
+**M01–M10 — 10 fixtures; 49 commands; Maude-3.5.1 oracle/self-diff 10/10 PASS.**
+
+- `M01-toggle` (3): smallest true, Qid-labelled lead-in/cycle, and nil-lead-in results.
+- `M02-ltl-operators` (17): all primitive/derived LTL connectives, unlabeled arcs, and
+  `LTL-SIMPLIFIER`.
+- `M03-deadlock-multi-rule` (2): synthesized deadlock self-loop and a two-rules/one-target arc
+  with a stable shared label.
+- `M04-manual-mutex` (7), `M05-manual-rrobin` (3), `M06-manual-ltl-plus` (1), and
+  `M10-sat-taut` (7): every terminating executable command family in manual Chapter 12,
+  including exact counterexample/witness/model/false/prime-implicant output.
+- `M07-reference-dekker` (3), `M08-reference-dining-philosophers5` (3), and
+  `M09-reference-dining-philosophers6` (3): exact remaining model-checker-gated reference
+  sources. M05 simultaneously covers the fourth source, `ObjectOriented/rrobin`.
+
+The reference-suite denominator is therefore complete: `Misc/dekker` and
+`ObjectOriented/{rrobin,dining-philosophers5,dining-philosophers6}`; no suite file is excluded.
+The sole manual exclusion is `MODEL-CHECK-BAD-EX`, whose purpose is to demonstrate nontermination
+on an infinite reachable-state set and which cannot meet the 60-second harness bound.
+
+M03 deliberately does not freeze which of two *differently-labelled* rules names a shared arc:
+Maude's pointer-ordered `set<Rule*>` alternated the representative across process runs (two
+mismatches in a 12-pair oracle self-diff). The stable fixture uses duplicate rules with one label;
+tnk determinizes the otherwise-unstable case by lowest source rule id. Every other label, lasso,
+result term/sort, and rewrite count remains byte-exact.
+
+**M0 is complete; M1 is next.** No production model-checker code landed with the manifest.
+The current binary accepts all 49 commands but leaves `SatSolverSymbol`/`ModelCheckerSymbol`
+applications unreduced, so `tools/subsystems-scoreboard.sh -p M` is intentionally 0/10.
+M1–M7 must port the exact Gastin–Oddoux pipeline + nested DFS, share `Search`'s successor core,
+bind both hooks, and close all 10 fixtures. Detailed cursor: `remaining-plans/05-model-checking.md`.
 
 ### Phase I — sessions & meta-interpreters (last; internal order I0→I1→I2→I3→I4)
 
@@ -316,7 +339,15 @@ record, gates, and the T6 parity boundary are frozen in `remaining-plans/04-smt.
   3/3 fixtures, 45 byte-exact object/meta commands; default Null degradation retained)
 - [x] T6 variant-satisfiability library — working tree 2026-07-23 (native and external-oracle lanes
   27/27 each; complete Phase-T scoreboard 11/11; three prototype corrections recorded in T11)
-- [ ] M model checker —
+- [x] M0 model-checker fixture manifest — working tree 2026-07-23 (10 fixtures / 49 commands;
+  oracle self-diff 10/10, inert-hook production baseline 0/10; no production code)
+- [ ] M1 LogicFormula DAG + temporal descent —
+- [ ] M2 local LTL BDD facade —
+- [ ] M3 VWAA → GBA → Büchi pipeline —
+- [ ] M4 nested DFS + synthetic System gate —
+- [ ] M5 shared StateGraph + hooks + toggle slice —
+- [ ] M6 complete modelCheck fixture closure —
+- [ ] M7 satSolve/tautCheck fixture closure —
 - [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
 - [ ] I1 session extraction —
 - [ ] I2 local meta-interpreters —

@@ -49,8 +49,9 @@ language, exact number leaves, query-local incremental `check`, root-only constr
 `undecided`/no solutions. Native FVP/OS-compact variant satisfiability and the source-compatible
 `VAR-SAT-TOOL` facade pass 27/27 contract results without z3, model checking, or copied prototype
 source; the untouched pinned Maude-2.7 oracle also passes its separately recorded 27 results.
-The complete Phase-T scoreboard is **11/11 PASS**. **Next serial phase: M0 model-checker fixture
-seeding.**
+The complete Phase-T scoreboard is **11/11 PASS**. **Phase M is active: M0 froze 10
+model-checker fixtures / 49 oracle-verified commands; next serial cursor is M1
+(`LogicFormula` + temporal descent).**
 
 **The verified current state—including every known deviation—is `../../fable-audit.md`** (status
 refreshed 2026-07-23); the forward plan is `roadmap.md`.

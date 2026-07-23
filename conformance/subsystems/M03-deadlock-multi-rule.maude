@@ -1,0 +1,41 @@
+*** M03-deadlock-multi-rule — synthesized deadlock loops and duplicate-rule arc storage
+*** Fresh probes; oracle-verified against Maude 3.5.1.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+mod M-DEADLOCK is
+  sort DState .
+  ops live stop : -> DState [ctor] .
+  rl [halt] : live => stop .
+endm
+
+mod M-DEADLOCK-CHECK is
+  protecting M-DEADLOCK .
+  including MODEL-CHECKER .
+  subsort DState < State .
+  op alive : -> Prop [ctor] .
+  eq live |= alive = true .
+endm
+
+*** Terminal stop is completed by a synthetic self-loop labelled deadlock.
+red in M-DEADLOCK-CHECK : modelCheck(live, []<> alive) .
+
+mod M-MULTILABEL is
+  sort MLState .
+  ops ma mb : -> MLState [ctor] .
+  rl [shared-label] : ma => mb .
+  rl [shared-label] : ma => mb .
+  rl mb => ma .
+endm
+
+mod M-MULTILABEL-CHECK is
+  protecting M-MULTILABEL .
+  including MODEL-CHECKER .
+  subsort MLState < State .
+  op atMA : -> Prop [ctor] .
+  eq ma |= atMA = true .
+endm
+
+*** The ma -> mb arc has two rules with one stable rendered label; mb -> ma is unlabeled.
+red in M-MULTILABEL-CHECK : modelCheck(ma, [] atMA) .

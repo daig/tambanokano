@@ -1,0 +1,29 @@
+*** M01-toggle — smallest model-checker vertical slice: true, lead-in/cycle, and nil lead-in
+*** Fresh probe; oracle-verified against Maude 3.5.1.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+mod M-TOGGLE is
+  sorts Bit ToggleState .
+  ops zero one : -> Bit [ctor] .
+  op {_} : Bit -> ToggleState [ctor] .
+  rl [flip0] : {zero} => {one} .
+  rl [flip1] : {one} => {zero} .
+endm
+
+mod M-TOGGLE-CHECK is
+  protecting M-TOGGLE .
+  including MODEL-CHECKER .
+  subsort ToggleState < State .
+  ops p0 p1 : -> Prop [ctor] .
+  eq {zero} |= p0 = true .
+  eq {one} |= p1 = true .
+endm
+
+*** true; rewrites 10
+red in M-TOGGLE-CHECK : modelCheck({zero}, []<> p0) .
+*** nonempty lead-in and Qid-labelled cycle; rewrites 7
+red in M-TOGGLE-CHECK : modelCheck({zero}, [] p0) .
+*** nil lead-in; rewrites 10
+red in M-TOGGLE-CHECK : modelCheck({zero}, <> [] p1) .

@@ -1,0 +1,79 @@
+*** M06-manual-ltl-plus — Maude manual §12.6 existential-path witness
+*** Source: Maude-3.5.1-manual-book-examples.zip, comm-protocol.maude; made runnable.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+fmod ANOTHER-NAT-LIST is
+  protecting NAT .
+  sort List .
+  subsorts Nat < List .
+  op nil : -> List .
+  op _;_ : List List -> List [assoc id: nil] .
+  op |_| : List -> Nat .
+  var N : Nat .
+  var L : List .
+  eq | nil | = 0 .
+  eq | N ; L | = s(| L |) .
+endfm
+
+omod COMM-PROTOCOL is
+  protecting ANOTHER-NAT-LIST .
+  protecting QID .
+  subsort Qid < Oid .
+  class Sender | buff : List, rec : Oid, cnt : Nat, ack-w : Bool .
+  class Receiver | buff : List, snd : Oid, cnt : Nat .
+  msg to_from_val_cnt_ : Oid Oid Nat Nat -> Msg .
+  msg to_from_ack_ : Oid Oid Nat -> Msg .
+  op init : Oid Oid List -> Configuration .
+
+  vars N M : Nat .
+  vars L Q : List .
+  vars A B : Oid .
+  var TV : Bool .
+
+  eq init(A, B, L)
+    = < A : Sender | buff : L, rec : B, cnt : 0, ack-w : false >
+      < B : Receiver | buff : nil, snd : A, cnt : 0 > .
+
+  rl [snd] :
+    < A : Sender | buff : (N ; L), rec : B, cnt : M, ack-w : false >
+    => (to B from A val N cnt M)
+       < A : Sender | buff : L, cnt : M, ack-w : true > .
+
+  rl [rec] :
+    < B : Receiver | buff : L, snd : A, cnt : M >
+    (to B from A val N cnt M)
+    => (to A from B ack M)
+       < B : Receiver | buff : (L ; N), snd : A, cnt : s(M) > .
+
+  rl [ack-rec] :
+    (to A from B ack M)
+    < A : Sender | buff : L, rec : B, cnt : M, ack-w : true >
+    => < A : Sender | buff : L, rec : B, cnt : s(M), ack-w : false > .
+endom
+
+omod COMM-PROTOCOL-PREDS is
+  protecting COMM-PROTOCOL .
+  including SATISFACTION .
+  subsort Configuration < State .
+  op same.cnts : Oid Oid -> Prop .
+
+  vars N M : Nat .
+  vars L1 L2 : List .
+  vars A B : Oid .
+  var TV : Bool .
+  var C : Configuration .
+
+  eq < A : Sender | buff : L2, rec : B, cnt : N, ack-w : TV >
+     < B : Receiver | buff : L1, snd : A, cnt : M > C |= same.cnts(A, B)
+    = N == M .
+endom
+
+omod COMM-PROTOCOL-CHECK is
+  protecting COMM-PROTOCOL-PREDS .
+  including MODEL-CHECKER+ .
+endom
+
+red in COMM-PROTOCOL-CHECK :
+  modelCheck+(init('a, 'b, (1 ; 2 ; 3)), E (<> ~ same.cnts('a, 'b))) .

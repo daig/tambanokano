@@ -1,0 +1,51 @@
+*** M04-manual-mutex — all seven executable Maude manual §12.3 MUTEX checks
+*** Source: Maude-3.5.1-manual-book-examples.zip, mutex*.maude; made self-contained.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+mod MUTEX is
+  sorts Name Mode Proc Token Conf .
+  subsorts Token Proc < Conf .
+  op none : -> Conf [ctor] .
+  op __ : Conf Conf -> Conf [ctor assoc comm id: none] .
+  ops a b : -> Name [ctor] .
+  ops wait critical : -> Mode [ctor] .
+  op [_,_] : Name Mode -> Proc [ctor] .
+  ops * $ : -> Token [ctor] .
+  rl [a-enter] : $ [a, wait] => [a, critical] .
+  rl [b-enter] : * [b, wait] => [b, critical] .
+  rl [a-exit] : [a, critical] => [a, wait] * .
+  rl [b-exit] : [b, critical] => [b, wait] $ .
+endm
+
+mod MUTEX-PREDS is
+  protecting MUTEX .
+  including SATISFACTION .
+  subsort Conf < State .
+  op crit : Name -> Prop .
+  op wait : Name -> Prop .
+  var N : Name .
+  var C : Conf .
+  var P : Prop .
+  eq [N, critical] C |= crit(N) = true .
+  eq [N, wait] C |= wait(N) = true .
+  eq C |= P = false [owise] .
+endm
+
+mod MUTEX-CHECK is
+  protecting MUTEX-PREDS .
+  including MODEL-CHECKER .
+  including LTL-SIMPLIFIER .
+  ops initial1 initial2 : -> Conf .
+  eq initial1 = $ [a, wait] [b, wait] .
+  eq initial2 = * [a, wait] [b, wait] .
+endm
+
+red in MUTEX-CHECK : modelCheck(initial1, [] ~(crit(a) /\ crit(b))) .
+red in MUTEX-CHECK : modelCheck(initial2, [] ~(crit(a) /\ crit(b))) .
+red in MUTEX-CHECK : modelCheck(initial1, ([]<> wait(a)) -> ([]<> crit(a))) .
+red in MUTEX-CHECK : modelCheck(initial1, ([]<> wait(b)) -> ([]<> crit(b))) .
+red in MUTEX-CHECK : modelCheck(initial2, ([]<> wait(a)) -> ([]<> crit(a))) .
+red in MUTEX-CHECK : modelCheck(initial2, ([]<> wait(b)) -> ([]<> crit(b))) .
+red in MUTEX-CHECK : modelCheck(initial1, [] wait(b)) .

@@ -6,13 +6,12 @@ state-transition system is searched for an accepting cycle by nested DFS, and a
 **counterexample lasso** (lead-in prefix + cycle) is returned. Plus the sibling LTL
 satisfiability/tautology solver (`satSolve`/`tautCheck`).
 
-**Status: PLANNED (2026-07-21); sequence after phase T unless run as an independent parallel
-track.** No temporal/model-checking production code or frozen `M*` manifest exists. The
-`MODEL-CHECKER` prelude's two special operators remain declared-inert: unknown id-hooks fall through
-`build_sig.rs`'s graceful-degrade arm, so `load model-checker` succeeds but
-`reduce in SAT-SOLVER : satSolve(True) .` returns the unreduced term and `modelCheck(...)` likewise
-cannot compute. Stage M0 fixture seeding is therefore the first change. M is independent of S and T
-(`subsystems-goal.md` §2), but T is the selected next serial phase.
+**Status: IN PROGRESS (2026-07-23); M0 COMPLETE, implementation cursor M1.** The frozen
+manifest is 10 fixtures / 49 commands. An oracle-vs-oracle run reports `SUBSYSTEMS 10/10 PASS`;
+the production binary accepts every fixture but reports `0/10`, as expected, because
+`SatSolverSymbol` and `ModelCheckerSymbol` remain declared-inert and their applications stay
+unreduced. M0 changed no production code. Phase M is independent of S and T
+(`subsystems-goal.md` §2); T is complete, so M1 is now the selected serial step.
 
 **Pass criterion (the hard part).** Per `subsystems-goal.md` §2, counterexample
 output must be **byte-exact** to the reference — *"paths are deterministic; they are the
@@ -229,32 +228,32 @@ determinism-critical work. See §4.
 
 ### 3.1 The special-op / id-hook seam (for `SatSolverSymbol` / `ModelCheckerSymbol`)
 
-tnk models Maude's `special (id-hook …)` as a typed enum `SpecialOp`
-(`crates/tnk-core/src/symbol.rs:180–285`), stored as `Symbol.special: Option<SpecialOp>`
-(`symbol.rs:99`), dispatched by `match` in `Runtime::try_special`
-(`crates/tnk-core/src/builtin.rs:21–68`), which is called from `Engine::try_rewrite_top`
-before user equations (`crates/tnk-core/src/engine.rs:2631–2659`) — this is Maude's
-`eqRewrite`. Binding happens at signature-build time in `special_op`
-(`crates/tnk-frontend/src/sig/build_sig.rs:585–723`), a `match` on the id-hook class name;
-unrecognized classes hit the graceful-degrade `_other => return Ok(None)` at
-**`build_sig.rs:720`** (its comment at `:716` already names `SatSolverSymbol`). Op-hook /
-term-hook symbols are resolved by helpers `op_hook_sym` (`:534–547`), `term_hook_sym`
-(`:549–557`), and — for the many-hook case — the `MetaHooks` map pattern
-(`symbol.rs:354–358`, populated by `resolve_meta_hooks` `:813–828`; shared across ops via
-`find_canonical_meta_hooks` `:790–806`). Binding is finalized by
-`engine.set_special(sym, op)` (`build_sig.rs:392` → `Signature::set_special`
-`engine.rs:781`).
+tnk models Maude's `special (id-hook …)` as `SpecialOp`
+(`crates/tnk-core/src/symbol.rs:197–318`), dispatched by
+`Runtime::try_special` (`builtin.rs:21–105`) before user equations
+(`engine.rs:3706–3708`). Signature-time binding is `special_op`
+(`crates/tnk-frontend/src/sig/build_sig.rs:690–872`); the current inert behavior is the
+unknown-class fallback at `:864–869`, whose comment names `SatSolverSymbol`.
+`op_hook_sym`/`term_hook_sym` are at `:632–663`; the many-hook precedent is
+`MetaHooks` (`symbol.rs:423–431`) populated by `resolve_meta_hooks`
+(`build_sig.rs:1081+`). This is the current post-Phase-T layout; M1–M4 do not touch it.
 
-The `Theory` enum (`symbol.rs:35–51`) is **orthogonal**: it classifies equational axioms
-(Free/Acu/Au/Cui/S) to pick DAG rep + matcher. A `modelCheck` op is a `Free` operator that
-additionally carries a `SpecialOp` — the `Theory` enum is untouched.
+The `Theory` enum remains orthogonal: `modelCheck`/`satSolve` are free operators with an
+additional special reduction, not new equational theories.
 
-**Crucially, the up-call seam already exists.** `SpecialOp::Meta` (META-LEVEL descent) does
-not compute in the kernel — it up-calls through `trait DescentOps`
-(`crates/tnk-core/src/descent.rs:102–113`) implemented in the frontend, handed a `MetaCtx`
-façade (`descent.rs:27–98`) over `(&Signature, &mut Runtime)`. Model checking is the same
-shape (it must drive the rewrite engine to build the state graph), so it follows the
-`Meta` precedent (§6.3), not the pure-kernel `NumberOp` precedent.
+**M5 integration decision (post-M0 reorientation): both hooks stay kernel-direct.**
+`modelCheck` operates on the current engine's rules, equations, DAG arena, and signature;
+it does not need the module database that justifies the `DescentOps` up-call. Add
+`SpecialOp::ModelCheck` and run it directly from `Runtime::try_special`, passing the
+already-available `DescentOps` through any nested reductions. The one missing datum is a
+rule's source label: share one `Rc<str>` between `CompiledRule` and `RlTrace` at
+registration (an explicit labelled-rule API, while tests may retain the unlabelled
+convenience API). This fixes the ownership boundary instead of routing the whole checker
+through the meta-interpreter seam or duplicating label strings.
+
+M7's `SpecialOp::SatSolve` is likewise kernel-direct and needs no rewriting. Both variants
+carry dedicated typed hook structs resolved from `model-checker.maude:186–203,239–261`;
+do not reuse the semantically unrelated meta hook map at runtime.
 
 ### 3.2 The state-graph / search machinery (the reused state-transition system)
 
@@ -275,14 +274,16 @@ struct State {
 }
 ```
 
-Reusable engine seams (all public on `Engine`): `state_successors(root)` — every
-`(rule_id, successor)` one step from root, all rules × positions
-(`engine.rs:3978–3982`, internal `2965–3023`); `reduce_successor` — counts one rewrite and
-reduces (`engine.rs:3987–3990`); `dag_hash` (`:3971`, `:3030–3066`) + `deep_equal`
-(`:4443`, `term.rs:322–376`) — canonical hash-cons dedup. Lazy successor generation is in
-`Search::step` (`search.rs:163–219`); an `Expanding` cursor (`search.rs:70–78`) already
-yields successors one index at a time, which is exactly Maude's
-`getNextState(stateNr, index)` access pattern.
+Reusable engine seams: `state_successors(root)` — every `(rule_id, successor)` one step
+from root, all rules × positions (`engine.rs:4241+`, public wrapper `:6156+`);
+`reduce_successor` — counts one rewrite and reduces (`:6167+`); `dag_hash` +
+`deep_equal` for canonical hash-cons dedup. Lazy successor generation is in
+`Search::step` (`search.rs:163–227`); an `Expanding` cursor (`search.rs:70–78`) already
+yields successors one index at a time, matching Maude's
+`getNextState(stateNr, index)` access pattern. During M5, put these operations behind one
+crate-private, statically dispatched graph context implemented by both `Engine` (ordinary
+search) and the active `Runtime`/`Signature` reduction view (model checking); do not copy
+successor logic or allocate a trait object per edge.
 
 **GC discipline (roadmap risk #9).** Each state pins its `DagId` with a per-state
 `RootGuard` (`search.rs:35`, `206–211`; RAII registry `crates/tnk-core/src/root.rs:60–86`),
@@ -291,12 +292,14 @@ in-reduction GC off by default (`gc_interval: None`, `engine.rs:408–411`;
 `lib.rs:65–68`). This is exactly "the same GC discipline the re-entrant reducer got" that
 risk #9 asks the state graph to have. The model checker reuses it unchanged.
 
-**Rule labels for `{state, ruleName}`.** The kernel stores only a dense `u32` rule id
-(`CompiledRule.id`, `engine.rs:95–107`); the textual label lives frontend-side as
+**Rule labels for `{state, ruleName}`.** The kernel currently stores only a dense `u32`
+rule id (`CompiledRule`, `engine.rs:284–296); the textual label lives frontend-side as
 `RlTrace.label: Option<String>`, indexed by rule id
-(`crates/tnk-frontend/src/sig/syntax.rs:85–95`; invariant `load.rs:375–376`). So
-`rl_traces[id].label` gives `Some(qid)` (a `Qid`) or `None` (`unlabeled`). Rendering
-precedent: `trace::rule_body`/`rl_body` (`crates/tnk-repl/src/trace.rs:131–142`, `410–427`).
+(`crates/tnk-frontend/src/sig/syntax.rs:83–99`; invariant `load.rs:763–768`). M5 changes
+that ownership once: convert the parsed label to `Option<Rc<str>>`, share it between
+`CompiledRule` and `RlTrace`, and construct either the Qid or `unlabeled` directly in the
+kernel. Existing trace/show-path rendering keeps reading `RlTrace`; no label lookup
+callback and no duplicate string allocation remain.
 
 **Three gaps in the current `Search` (all additive, none blocking):**
 1. **No cycle in path reconstruction.** `Search::path` (`search.rs:282–300`) rebuilds the
@@ -325,15 +328,16 @@ low/high cofactor navigation** for `satisfiesPropositionalFormula`'s walk. All a
 available on biodivine's `Bdd`/`BddNode` API; the plan is to expose them as a thin
 `ltl::bdd` helper rather than force them into `SortBdds`.
 
-### 3.4 The fixture harness
+### 3.4 The fixture harness and frozen baseline
 
-`conformance/subsystems/*.maude` run by `tools/subsystems-scoreboard.sh` (same
-`diffmaude.sh` harness/normalization, 60s/fixture, prints `SUBSYSTEMS n/m PASS`, exit 0 iff
-n=m). ID prefix for model checking is **`M*`**. Naming follows the phase-S convention:
-manual-chapter fixtures `M-ch12-NN-slug`, fresh probes `M-probe-NN-slug`, plus `dekker`.
-The §5 ledger line `- [ ] M model checker —` (subsystems-goal:232) gets a commit hash when
-done. The always-green invariants F1 (`SCOREBOARD 77/77`) and F2 (`LEGACY 87/87`) gate
-every commit.
+`conformance/subsystems/M*.maude` run under `tools/subsystems-scoreboard.sh` (the same
+`diffmaude.sh` normalization, 60s per side, `SUBSYSTEMS n/m PASS`). M0 froze
+**M01–M10: 10 fixtures / 49 commands** on 2026-07-23; the exact manifest and source
+enumeration are in §7 and `subsystems-goal.md` §2. Every fixture carries `*** PRELUDE`, so
+the oracle and tnk both load the standing prelude plus `model-checker.maude`. The oracle
+self-diff is 10/10; the inert-hook tnk baseline is intentionally 0/10 without load, parse,
+or command-dispatch errors. F1 (`SCOREBOARD 77/77`) and F2 (`LEGACY 87/87`) continue to
+gate every implementation commit.
 
 ---
 
@@ -381,11 +385,13 @@ honestly below.
 1. **System state-graph enumeration order** — the order `getNextState(s,0), (s,1), …`
    yields successors, plus hash-cons dedup and parent back-links. **Already solved**:
    reused from the conformance-verified `search` machinery (§3.2, §4.2). One item to port:
-   the **deadlock self-loop** (§3.2 gap 2). One edge case: `makeTransition` takes the label
-   of the *first rule* in the arc's rule-set; Maude's `set<Rule*>` orders by pointer
-   (≈ declaration order ≈ id order), tnk's `BTreeSet<u32>` orders by id — these agree
-   except in the rare case where one target state is reached by two **differently-labeled**
-   rules; flag as a known edge case (dekker: all unlabeled; toggle: one rule per arc).
+   the **deadlock self-loop** (§3.2 gap 2). M0 also corrected a stale assumption here:
+   `makeTransition` takes the first element of C++ `set<Rule*>`, whose pointer order is
+   not process-stable for two differently-labelled rules reaching one target. A 12-pair
+   Maude-3.5.1 oracle self-diff produced two first-label/second-label mismatches. M03
+   therefore drives two rules into one arc with a shared visible label; differently-labelled
+   arcs use tnk's deterministic lowest-source-rule-id representative and are not claimed as
+   a byte-stable oracle surface (§8.4).
 2. **Proposition → BDD-variable index map** — first-encounter order in `build`'s recursive
    descent (§2.1 step 2). **Easy and fully deterministic**: port the exact descent
    (`temporalSymbol.cc:126–196`); index a proposition on first sight; make BDD variable
@@ -453,9 +459,9 @@ transitionSet 167, collapseStates 122, satSolve 271, logicFormula 261) plus ~0.9
   **distinct, arguably harder** rendering match than `modelCheck` (which needs no prime
   implicants). Recommend sequencing `satSolve` *after* `modelCheck` and treating its
   rendering as its own risk item / open question (§8).
-- **Unseeded fixtures.** Phase M's manifest does not exist yet (subsystems-goal §2 has
-  prose but no `M*` list; only phase S is frozen). Seeding is **step 0** of the work and
-  is itself load-bearing: the fixtures define "done," and each must be oracle-verified.
+- **The manifest is now seeded.** M0 retired the unseeded-contract risk with 10 fixtures /
+  49 commands and exposed one real oracle limitation: a differently-labelled multi-rule
+  arc has a process-dependent representative. The stable boundary is recorded in §7/§8.4.
 - **BDD facade extension.** `SortBdds` doesn't expose the ops LTL needs; a small
   `ltl::bdd` helper (ithvar/nithvar/navigation) must be added and validated against
   biodivine's canonicity.
@@ -473,23 +479,59 @@ with hook binding in the frontend and an up-call seam mirroring `descent.rs`. **
 deferred**; sub-issues (facade ops, the `Search` refactor, deadlock self-loop) are called
 out in the stage where they arise.
 
-### Stage M0 — seed the fixture manifest (phase M step 0; do first)
+### Stage M0 — seed the fixture manifest — **DONE 2026-07-23**
 
-Enumerate, oracle-verify (expect FAIL initially), and **freeze into subsystems-goal §2 in
-the same commit as the fixtures** (per the goal's discipline, §1.2). Sources: the toggle
-probes from §1.3; `tests/Misc/dekker`; `tests/ObjectOriented/dining-philosophers5`; the
-Maude manual ch.12 worked examples; fresh minimal probes covering each LTL operator,
-`true`/`counterexample`, `nil` lead-in, `deadlock`, `unlabeled` vs `Qid`, and (for later)
-`satSolve`/`tautCheck`/`model`/`false`. See §7 for the concrete list. The `M*` denominator
-in `subsystems-scoreboard.sh` grows accordingly.
+M01–M10 enumerate the fresh probes, all terminating manual Chapter 12 examples, and all
+four model-checker-gated reference-suite sources. They cover every LTL connective,
+`LTL-SIMPLIFIER`, true/counterexample/nil-lead-in/deadlock/Qid/unlabeled output,
+duplicate-rule arcs, LTL+, Dekker, both dining-philosophers encodings, and
+`satSolve`/`tautCheck` model/false/prime-implicant output. The oracle self-diff is 10/10;
+the production baseline is 0/10 solely at the two inert hooks. The manifest is frozen in
+`subsystems-goal.md` §2 in the same commit as the fixtures. **Next: M1 only.**
+
+#### Post-M0 serial cursor (binding)
+
+| next | implementation slice | objective gate |
+|---|---|---|
+| **M1** | `LogicFormula` DAG, structural interning, exact `TemporalSymbol::build` descent and proposition indexing | source-verified unit cases; no production hook and no M fixture expected green |
+| **M2** | local `ltl::bdd` facade: variables, Boolean ops, equality, root/low/high navigation | biodivine canonicity/navigation tests |
+| **M3** | `TransitionSet`/raw product → VWAA → GBA/SCC/collapse → degeneralized Büchi | intermediate dump parity with an instrumented reference |
+| **M4** | `ModelChecker2` nested DFS, lazy BDD proposition walk/memo, lasso split, `System` trait | known lassos over a synthetic system; still no production hook |
+| **M5** | shared `StateGraph`, deadlock completion, typed hooks/up-call, result construction | M01 + M03 byte-exact target |
+| **M6** | determinism closure, LTL+ path, large reference systems, typed verbose-stat event | M01–M09 byte-exact target |
+| **M7** | GBA SAT BFS, prime implicants, `SatSolverSymbol`; pure `tautCheck` equations | M01–M10 10/10 plus frozen invariants |
+
+Do not start M2 before M1's indexing contract, M3 before M2's BDD gate, or M5 before the
+synthetic M4 checker is exact. M5 is the first stage allowed to change the production
+M-scoreboard.
 
 ### Stage M1 — LogicFormula + `build` (determinism root #2)
 
-Port `LogicFormula` (`logicFormula.{hh,cc}`: the node DAG with `makeProp`/`makeOp` +
-propositional flag + structural sharing) and `TemporalSymbol::build`
-(`temporalSymbol.cc:126–196`) as a function `DagId → (LogicFormula, PropTable)` given the
-resolved LTL op-hook symbols. Unit-test the descent + proposition indexing on hand-written
-formulas. No BDDs yet.
+Create `tnk-core/src/ltl/{mod.rs,formula.rs}`. Port `LogicFormula`
+(`logicFormula.{hh,cc}`) as an append-only `Vec<FormulaNode>` plus a lookup-only structural
+interner: a node id is still its first DFS insertion index, while repeated
+`(op,arg0,arg1)` nodes reuse that id without the C++ linear scan. Return
+`BuiltFormula { formula, root, propositions }`; omitting the root id from the API would
+lose the value returned by `TemporalSymbol::build`.
+
+Port `TemporalSymbol::build` (`temporalSymbol.cc:126–196`) exactly:
+
+- `True`/`False` are propositional constants; unknown top symbols are whole atomic
+  propositions and their children are **not** traversed.
+- propositions are structurally interned by `dag_hash` + `deep_equal`, pinned by
+  `RootGuard`, and numbered in first DFS encounter order;
+- flattened associative `and`/`or` children are left-folded in stored argument order;
+- `not` succeeds only when its built child is a `PROPOSITION`; `next`, `until`, and
+  `release` are non-propositional; `and`/`or` are propositional iff both children are;
+- malformed recognized operators return `None`, not a partial formula or atomic fallback.
+
+Define the shared eight-symbol `TemporalHooks` value here but bind no production special
+op. Unit tests must cover repeated/deep-equal proposition collapse, first-encounter
+numbering, repeated formula-node sharing, n-ary left folding, every propositional flag,
+unknown-subtree atomicity, and each malformed/rejected case.
+
+**Gate:** focused tnk-core tests pass and the frozen M-scoreboard remains 0/10 for the same
+inert-hook reason. No BDD code and no production hook in M1.
 
 ### Stage M2 — the `ltl::bdd` helper (facade extension)
 
@@ -518,28 +560,35 @@ and lasso recovery (`path`/`cycle` + `swap`). Define `trait System`. **Unit-test
 synthetic `System`** (a fixed tiny transition graph + a proposition oracle) with
 known-answer automata, independent of the rewrite engine.
 
-### Stage M5 — first vertical slice: wire to the state graph + hooks; byte-exact toggle
+### Stage M5 — first vertical slice: shared graph + hooks + M01/M03
 
-1. **Refactor `Search`** (§6.4) to expose a shared `get_next_state(state, index)` +
-   `state_dag` + `fwd_arcs` core; add the **deadlock self-loop**.
-2. Implement `System` for the tnk state graph (the `SystemAutomaton` analogue): `next_state`
-   via the shared core; `check_proposition` reduces `satisfies_sym(stateDag, propDag)` in a
-   sub-context and compares to the `true` term (counting rewrites like Maude).
-3. Add `SpecialOp::ModelCheck { hooks: Rc<McHooks> }` (`symbol.rs`), the `try_special`
-   up-call arm (`builtin.rs`), and the `"ModelCheckerSymbol"` id-hook arm in `special_op`
-   just above `build_sig.rs:720`; resolve the op/term hooks with the `resolve_meta_hooks`
-   pattern. Drive it through a new `DescentOps`-style trait (or an extension) implemented in
-   the frontend, since it must build the state graph (§6.3).
-4. `make_counterexample`: build the `counterexample`/`transition`/`transitionList`/`qid`/
-   `unlabeled`/`deadlock` terms from the resolved hooks; return `true` term otherwise.
-   **Target: byte-exact on the toggle fixtures** (§1.3) — the smallest end-to-end slice.
+1. Extract `Search`'s graph fields and successor quantum into `StateGraph`
+   (`get_next_state`, `state_dag`, `fwd_arcs`); `Search` retains only BFS/goal logic.
+   The checker wrapper adds the **deadlock self-loop** without changing ordinary search.
+2. Implement `System` over that graph. `check_proposition` reduces
+   `satisfies(state, proposition)` through `MetaCtx`, compares with `trueTerm`, and charges
+   the subcontext rewrites exactly once.
+3. Add typed `ModelCheckerHooks` and `SpecialOp::ModelCheck`, bind
+   `"ModelCheckerSymbol"` immediately before the unknown-class fallback at
+   `build_sig.rs:864`, and run it directly in `Runtime::try_special`. Introduce the
+   labelled-rule registration path and shared `Rc<str>` ownership described in §3.2.
+4. Build `counterexample`/transition/list/Qid/unlabeled/deadlock terms from the resolved
+   hooks, or return `trueTerm`.
+5. Record typed `(property_automaton_states, examined_system_states)` events during every
+   check. M6 teaches the REPL's existing `set verbose` path to render the exact two
+   `ModelChecker:` lines; core code does not print.
 
-### Stage M6 — scale to dekker + the manual examples
+**Gate:** M01 and M03 byte-exact, including rewrite counts, deadlock, unlabeled/Qid labels,
+nil/nonempty lead-ins, and the deterministic shared-label duplicate-rule arc. Retained
+search fixtures must remain unchanged.
 
-Turn on the seeded `M*` fixtures one at a time; diff and fix determinism tie-breaks
-(§4.3 #3) against `dump()`-instrumented reference automata. dekker's liveness case has a
-9-state lead-in + 2-state cycle (`dekker.maude:199`) — a real stress of the lasso recovery
-and label rendering.
+### Stage M6 — close `modelCheck` / `modelCheck+` (M01–M09)
+
+Turn on M02 and M04–M09 one at a time; diff determinism against instrumented reference
+automata. This includes all LTL operators and simplifier equations, MUTEX, round-robin,
+LTL+ witness inversion, Dekker's 9+2 lasso, both 459-state dining counterexamples, exact
+48,194 rewrite counts, and the verbose property/system-state statistics in M05/M08/M09.
+**Gate:** M01–M09 pass together; M10 remains the only expected failure.
 
 ### Stage M7 — `satSolve` / `tautCheck` (sibling; separate risk)
 
@@ -550,14 +599,15 @@ Reuse `GenBuchiAutomaton` (do not degeneralize); port `GenBuchiAutomaton::satSol
 (§8). `tautCheck` and `LTL+`/`MODEL-CHECKER+` are **pure prelude equations** — they work
 automatically once `satSolve`/`modelCheck` do; just verify.
 
-### 6.3 Why the up-call (not pure-kernel) shape
+### 6.3 Why there is no new upper call
 
-`modelCheck` must build the state-transition graph by *rewriting*, so it cannot compute
-from the redex alone (unlike `NumberOp`). It follows the `SpecialOp::Meta` precedent
-(`builtin.rs:60–63` → `descent.rs`): the resolved LTL op-hook symbols ride in an
-`Rc<McHooks>` on the variant (like `Rc<MetaHooks>`), and the kernel up-calls a
-frontend-implemented trait handed a `MetaCtx`-style façade. This keeps the automata code in
-tnk-core while the engine-driving glue sits where the module DB / search bridge already live.
+`modelCheck` uses only the current engine: its rewrite rules, equational reducer, DAG
+arena, and the symbols/terms resolved by its own hook attachment. Rule labels become
+shared kernel metadata at registration. Therefore `Runtime::try_special` can run the
+checker and pass its existing `DescentOps` argument through nested reductions; extending
+`MetaCtx` or `MetaDescent` would couple an ordinary built-in to the module database for no
+semantic reason. `satSolve` is simpler still: it consumes only its formula DAG and result
+hooks.
 
 ### 6.4 The `Search` refactor (called out, not deferred)
 
@@ -580,25 +630,37 @@ refactor (the `search` fixtures regression-guard it).
 Diff result value, **result sort**, **rewrite count**, termination, and — the phase-M
 hard requirement — **byte-for-byte** the `counterexample`/`model` text.
 
-**Fixtures to seed (Stage M0)** — proposed `M*` manifest:
-- `M-probe-01-toggle-true` — `modelCheck({zero},[]<> p0)` ⇒ `true` (smallest true case).
-- `M-probe-02-toggle-ce` — `modelCheck({zero},[] p0)` ⇒ `counterexample({{zero},'flip0}, …)`
-  (smallest counterexample; exercises `Qid` labels + lead-in + cycle).
-- `M-probe-03-toggle-nil-leadin` — `modelCheck({zero},<> [] p1)` ⇒ `counterexample(nil, …)`.
-- `M-probe-04-deadlock` — a machine with a terminal state under a liveness formula ⇒
-  `deadlock` transition (exercises the self-loop synthesis).
-- `M-probe-05..NN` — one per LTL operator (`U`,`R`,`O`,`<>`,`[]`,`W`,`|->`,`=>`,`<->`) as
-  small `modelCheck` cases, including `unlabeled` rules.
-- `M-ch12-01..NN` — the Maude 3.5.1 manual ch.12 worked model-checking examples.
-- `M-dekker` — `tests/Misc/dekker` (safety `true`, liveness 9+2 counterexample, fairness `true`).
-- `M-dining-philosophers5` — `tests/ObjectOriented/dining-philosophers5` (OO + `modelCheck`).
-- `M-sat-01..NN` / `M-taut-01..NN` (Stage M7) — `satSolve`/`tautCheck` cases:
-  `satSolve(a U b)⇒model(b,True)`, `satSolve(a/\~a)⇒false`, `tautCheck(a->a)⇒true`,
-  `tautCheck([]a->a)⇒true`, plus `LTL+`/`MODEL-CHECKER+` `E_`/`A_`/`witness` cases.
+**Frozen M0 manifest (2026-07-23):**
 
-Every seeded fixture is oracle-verified at authoring and **expected to FAIL initially**;
-the manifest is frozen by appending the `M*` list to subsystems-goal §2 in the same commit
-as the fixtures (denominator may grow later, never shrink/weaken without a recorded decision).
+| fixture | commands | frozen contract |
+|---|---:|---|
+| `M01-toggle` | 3 | smallest `true`, Qid-labelled lead-in/cycle, and `nil` lead-in cases (`10/7/10` rewrites) |
+| `M02-ltl-operators` | 17 | all eight primitive and eight derived LTL connectives, unlabeled arcs, plus an `LTL-SIMPLIFIER` rule entering the checker |
+| `M03-deadlock-multi-rule` | 2 | synthesized `deadlock` self-loop and two rules reaching one arc with a stable shared label |
+| `M04-manual-mutex` | 7 | every executable manual §12.3 MUTEX check: six `true`, one exact counterexample |
+| `M05-manual-rrobin` | 3 | manual §12.5 and reference `ObjectOriented/rrobin`: two `true`, one long exact lasso, including verbose checker statistics |
+| `M06-manual-ltl-plus` | 1 | manual §12.6 existential `modelCheck+` result: exact 9-transition lead-in plus deadlock witness |
+| `M07-reference-dekker` | 3 | exact `tests/Misc/dekker`: safety `true`, 9+2 unlabeled lasso, fairness `true` |
+| `M08-reference-dining-philosophers5` | 3 | exact source, including setup reduce/search and the 459-state, 48,194-rewrite counterexample |
+| `M09-reference-dining-philosophers6` | 3 | alternate Oid encoding of the same complete reference test and exact counterexample |
+| `M10-sat-taut` | 7 | `model(b,True)`, `false`, four tautology outcomes, manual prime implicant `model(a ; b,(~ c) ; c)`, and exact tautology counterexample |
+
+Total: **10 fixtures / 49 commands**. `TNK_BIN=~/.local/bin/maude
+tools/subsystems-scoreboard.sh -p M` reports **10/10 PASS**. The production release
+reports **0/10**, with every file accepted and the two special-hook applications left
+unreduced as expected before M1–M7.
+
+**Source enumeration and exclusions.** The reference-suite model-checker denominator is
+`Misc/dekker` plus `ObjectOriented/rrobin`, `dining-philosophers5`, and
+`dining-philosophers6`; all four are included. The terminating manual Chapter 12 command
+families are MUTEX (§12.3), SAT/tautology (§12.4), round-robin (§12.5), and LTL+ (§12.6);
+all are included. The manual's `MODEL-CHECK-BAD-EX` is the sole exclusion: it intentionally
+demonstrates nontermination on an infinite reachable-state set, so it cannot satisfy the
+60-second per-side harness contract. No reference-suite model-checker file is excluded.
+
+The denominator may grow but may not shrink or weaken without a recorded user decision.
+For the differently-labelled multi-rule-arc limitation discovered while freezing M03,
+see §8.4.
 
 **Unit tests (below the oracle, for the determinism-critical internals):**
 - `build`/`LogicFormula`: descent order + proposition indexing on hand-written formulas.
@@ -630,9 +692,12 @@ oracle that catches "wrong-but-plausible" lassos distinct from the byte diff. (M
 3. **`satSolve`/`tautCheck` ordering — bound.** Implement after `modelCheck` (M7), but it may not lag the
    completed M denominator. Its BuDDy prime-implicant polarity/order is a byte-visible contract; seed
    it separately and finish exact `model(...)` rendering before phase M closes.
-4. **Multi-rule arc labels.** Seed the two-rules/one-target case in M0. If tnk's current min-rule-id
-   representative differs from the live oracle, preserve the reference's actual insertion/selection
-   order in the shared graph; a different but logically valid label is not acceptable output.
+4. **Multi-rule arc labels — determinized boundary.** M03 seeds two rules/one target with a
+   shared visible label. A probe with different labels proved Maude 3.5.1's `set<Rule*>`
+   representative process-dependent (two mismatches in 12 oracle self-diffs), so no
+   byte-exact fixture may depend on which label wins. Keep tnk deterministic by selecting
+   the lowest source rule id, retain every rule in `fwd_arcs`, and unit-test that set
+   internally when the shared `StateGraph` lands.
 5. **Shared `StateGraph` refactor — bound yes.** Extract successor generation from the already
    conformance-verified `Search`; do not build a second rewrite graph for the checker. Existing search
    fixtures guard the mechanical refactor, and M0 adds deadlock/self-loop coverage.

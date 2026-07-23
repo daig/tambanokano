@@ -1,0 +1,22 @@
+*** M10-sat-taut — model/false/true/counterexample and prime-implicant rendering
+*** Includes all three executable Maude manual §12.4 examples plus four minimal probes.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+fmod M-SAT-CHECK is
+  extending SAT-SOLVER .
+  extending LTL .
+  ops a b c d e p q r : -> Formula [ctor] .
+endfm
+
+*** Minimal sibling-surface probes from the Phase-M plan.
+red in M-SAT-CHECK : satSolve(a U b) .
+red in M-SAT-CHECK : satSolve(a /\ ~ a) .
+red in M-SAT-CHECK : tautCheck(a -> a) .
+red in M-SAT-CHECK : tautCheck([] a -> a) .
+
+*** Maude manual §12.4: nontrivial model and both tautology outcomes.
+red in M-SAT-CHECK : satSolve(a /\ (O b) /\ (O O ((~ c) /\ [](c \/ (O c))))) .
+red in M-SAT-CHECK : tautCheck((a => (O a)) <-> (a => ([] a))) .
+red in M-SAT-CHECK : tautCheck((a -> (O a)) <-> (a -> ([] a))) .

@@ -1,0 +1,45 @@
+*** M02-ltl-operators — every primitive and derived LTL connective plus LTL-SIMPLIFIER
+*** Fresh unlabeled two-state probe; oracle-verified against Maude 3.5.1.
+*** PRELUDE
+set show timing off .
+load model-checker
+
+mod M-UNLABELED is
+  sort UState .
+  ops ua ub : -> UState [ctor] .
+  rl ua => ub .
+  rl ub => ua .
+endm
+
+mod M-UNLABELED-CHECK is
+  protecting M-UNLABELED .
+  including MODEL-CHECKER .
+  including LTL-SIMPLIFIER .
+  subsort UState < State .
+  ops atA atB : -> Prop [ctor] .
+  eq ua |= atA = true .
+  eq ub |= atB = true .
+endm
+
+*** Primitive constructors: True, False, ~_, _/\_, _\/_, O_, _U_, and _R_.
+red in M-UNLABELED-CHECK : modelCheck(ua, True) .
+red in M-UNLABELED-CHECK : modelCheck(ua, False) .
+red in M-UNLABELED-CHECK : modelCheck(ua, ~ atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA /\ ~ atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA \/ atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, O atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA U atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA R (atA \/ atB)) .
+
+*** Derived connectives: ->, <->, <>, [], W, |->, =>, and <=>.
+red in M-UNLABELED-CHECK : modelCheck(ua, atA -> ~ atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA <-> ~ atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, <> atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, [] (atA \/ atB)) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA W atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA |-> atB) .
+red in M-UNLABELED-CHECK : modelCheck(ua, atA => (atA \/ atB)) .
+red in M-UNLABELED-CHECK : modelCheck(ua, (atA \/ atB) <=> (atB \/ atA)) .
+
+*** Etessami-Holzmann rule O p /\ O q = O (p /\ q); fails with an unlabeled lasso.
+red in M-UNLABELED-CHECK : modelCheck(ua, O atA /\ O atB) .
