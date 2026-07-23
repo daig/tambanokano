@@ -1,6 +1,9 @@
 // M2 lands the BDD facade before M3-M7 consume it; keep the staged module warning-free.
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
+use std::fmt;
+
 use biodivine_lib_bdd::{Bdd as RawBdd, BddPointer, BddVariable, BddVariableSet};
 
 /// Engine-local BDD variable context. Variable `i` is proposition `i` throughout Phase M.
@@ -23,10 +26,7 @@ pub(crate) struct BddNode {
 impl BddContext {
     pub(crate) fn new(variable_count: usize) -> Self {
         let variable_count = u16::try_from(variable_count).expect("too many LTL propositions");
-        assert!(
-            variable_count < u16::MAX - 1,
-            "too many LTL propositions"
-        );
+        assert!(variable_count < u16::MAX - 1, "too many LTL propositions");
         Self {
             variables: BddVariableSet::new_anonymous(variable_count),
         }
@@ -78,6 +78,12 @@ impl BddContext {
         self.assert_pair(lhs, rhs);
         Bdd {
             raw: lhs.raw.or(&rhs.raw),
+        }
+    }
+    pub(crate) fn and_not(&self, lhs: &Bdd, rhs: &Bdd) -> Bdd {
+        self.assert_pair(lhs, rhs);
+        Bdd {
+            raw: lhs.raw.and_not(&rhs.raw),
         }
     }
 
@@ -136,8 +142,7 @@ impl Bdd {
     }
 
     pub(crate) fn variable(&self, node: BddNode) -> Option<usize> {
-        (!node.raw.is_zero() && !node.raw.is_one())
-            .then(|| self.raw.var_of(node.raw).to_index())
+        (!node.raw.is_zero() && !node.raw.is_one()).then(|| self.raw.var_of(node.raw).to_index())
     }
 
     pub(crate) fn low(&self, node: BddNode) -> Option<BddNode> {
@@ -150,6 +155,81 @@ impl Bdd {
         self.variable(node).map(|_| BddNode {
             raw: self.raw.high_link_of(node.raw),
         })
+    }
+}
+
+impl Ord for Bdd {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.raw.size().cmp(&other.raw.size()).then_with(|| {
+            for index in 0..self.raw.size() {
+                let here = BddPointer::from_index(index);
+                let lhs = (
+                    self.raw.var_of(here).to_index(),
+                    self.raw.low_link_of(here).to_index(),
+                    self.raw.high_link_of(here).to_index(),
+                );
+                let rhs = (
+                    other.raw.var_of(here).to_index(),
+                    other.raw.low_link_of(here).to_index(),
+                    other.raw.high_link_of(here).to_index(),
+                );
+                match lhs.cmp(&rhs) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+            Ordering::Equal
+        })
+    }
+}
+
+impl PartialOrd for Bdd {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for Bdd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for Bdd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn dump(formula: &Bdd, node: BddNode, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if formula.is_zero(node) {
+                return out.write_str("false");
+            }
+            if formula.is_one(node) {
+                return out.write_str("true");
+            }
+            let variable = formula.variable(node).expect("nonterminal BDD node");
+            let low = formula.low(node).expect("nonterminal BDD node");
+            if !formula.is_zero(low) {
+                write!(out, "~x{variable}")?;
+                if !formula.is_one(low) {
+                    out.write_str(".(")?;
+                    dump(formula, low, out)?;
+                    out.write_str(")")?;
+                }
+            }
+            let high = formula.high(node).expect("nonterminal BDD node");
+            if !formula.is_zero(high) {
+                if !formula.is_zero(low) {
+                    out.write_str(" + ")?;
+                }
+                write!(out, "x{variable}")?;
+                if !formula.is_one(high) {
+                    out.write_str(".(")?;
+                    dump(formula, high, out)?;
+                    out.write_str(")")?;
+                }
+            }
+            Ok(())
+        }
+
+        dump(self, self.root(), formatter)
     }
 }
 
@@ -198,7 +278,10 @@ mod tests {
         let not_x = context.not(&x);
         let lhs = context.not(&context.and(&x, &y));
         let rhs = context.or(&not_x, &context.not(&y));
-        assert!(context.equivalent(&lhs, &rhs), "De Morgan must be canonical");
+        assert!(
+            context.equivalent(&lhs, &rhs),
+            "De Morgan must be canonical"
+        );
 
         let direct = BddVariableSet::new_anonymous(2);
         let direct_x = direct.mk_var(BddVariable::from_index(0));
