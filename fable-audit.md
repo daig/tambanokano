@@ -115,7 +115,7 @@ Everything in this list was re-verified against the live oracle this session (no
 Whole subsystems still planned in `roadmap.md`:
 
 - **Model checker** (`model-checker.maude`: `SatSolverSymbol`/`ModelCheckerSymbol`) production
-  remains unbuilt. M0 is complete: 10 fixtures / 49 commands are frozen and oracle-verified;
+  remains unbuilt. M0 is complete: 10 fixtures / 50 commands are frozen and oracle-verified;
   the exact implementation cursor is M1 (`LogicFormula` + temporal descent).
 - **Meta-interpreters** (`metaInterpreter.maude`: `InterpreterManagerSymbol`).
 - **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Per revised D5 these

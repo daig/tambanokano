@@ -11,7 +11,11 @@ fmod M-SAT-CHECK is
 endfm
 
 *** Minimal sibling-surface probes from the Phase-M plan.
+*** Freeze SatSolverSymbol's own verbose statistics, including singular/plural/zero forms.
+set verbose on .
+red in M-SAT-CHECK : satSolve(True) .
 red in M-SAT-CHECK : satSolve(a U b) .
+set verbose off .
 red in M-SAT-CHECK : satSolve(a /\ ~ a) .
 red in M-SAT-CHECK : tautCheck(a -> a) .
 red in M-SAT-CHECK : tautCheck([] a -> a) .

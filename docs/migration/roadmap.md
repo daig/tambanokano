@@ -234,10 +234,11 @@ Ordered by (dependency, size); references are the kept deep-dives.
   Phase-T scoreboard is **11/11 PASS**. Contract: `subsystems-goal.md` §2; implementation record:
   `remaining-plans/04-smt.md`.
 - **G4. Model checking — active; M0 complete (2026-07-23), cursor M1:** the frozen
-  Maude-3.5.1 contract is 10 fixtures / 49 commands spanning every LTL connective,
+  Maude-3.5.1 contract is 10 fixtures / 50 commands spanning every LTL connective,
   true/counterexample/nil/deadlock/unlabeled/Qid behavior, all terminating manual Chapter 12
-  families, every gated reference-suite source, and `satSolve`/`tautCheck` prime implicants.
-  Oracle self-diff is 10/10; the accepted inert-hook production baseline is 0/10. M1 next
+  families, every gated reference-suite source, `satSolve`/`tautCheck` prime implicants,
+  and SatSolver singular/plural/zero verbose statistics. Oracle self-diff is 10/10; the
+  accepted inert-hook production baseline is 0/10. M1 next
   ports `LogicFormula` and temporal descent, followed by the BDD facade, exact Gastin–Oddoux
   automata, nested DFS, shared `StateGraph`/hooks, full model-check fixture closure, and the
   SAT/tautology sibling. Plan: `remaining-plans/05-model-checking.md`; reference:

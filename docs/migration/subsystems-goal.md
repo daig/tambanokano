@@ -1,12 +1,15 @@
 # Subsystems goal — symbolic engine, SMT & model checking, meta-interpreters (the `/goal` contract)
 
-This document is the **contract for the next goal**: scope, phase ordering, objective gates, decision
-points, and completion criteria for the three subsystems chosen after the correctness goal closed
-(2026-07-05, `correctness-goal.md` — all five criteria hold; see the ledger header in `fable-audit.md`).
-The goal driver re-reads THIS file each session. Feature background: `fable-audit.md` §2 and
-`roadmap.md` phases G2–G5. Method: the same oracle-in-the-loop discipline that closed the correctness
-goal — this document deliberately specifies *what must be true*, not *how to build it*; implementation
-shape is the implementer's call within the recorded decisions.
+This document is the **umbrella subsystem contract**: scope, phase ordering, objective
+gates, decision points, and completion criteria for the subsystem program chosen after
+the correctness goal closed (2026-07-05). It contains historical completed phases as well
+as future Phase I.
+
+**Current selected `/goal` slice (2026-07-23): Phase M only, M1→M7.** For this goal,
+`remaining-plans/05-model-checking.md` is the Rust implementation authority and its §7.1
+is the stopping gate. The umbrella completion criteria in §1.4 include Phase I and do
+**not** extend the Phase-M goal into sessions, meta-interpreters, or async work. Current
+behavior/status comes from the code and harness, not an older plan's cursor.
 
 **Goal statement.** Implement, in order: (S) the symbolic engine (order-sorted unification → variants →
 narrowing), then (T) SMT integration and (M) the LTL model checker (independent of each other, either
@@ -223,7 +226,7 @@ The Phase-T record remains frozen in `remaining-plans/04-smt.md` §§4–8.
 
 #### Phase-M manifest (frozen 2026-07-23)
 
-**M01–M10 — 10 fixtures; 49 commands; Maude-3.5.1 oracle/self-diff 10/10 PASS.**
+**M01–M10 — 10 fixtures; 50 commands; Maude-3.5.1 oracle/self-diff 10/10 PASS.**
 
 - `M01-toggle` (3): smallest true, Qid-labelled lead-in/cycle, and nil-lead-in results.
 - `M02-ltl-operators` (17): all primitive/derived LTL connectives, unlabeled arcs, and
@@ -231,8 +234,9 @@ The Phase-T record remains frozen in `remaining-plans/04-smt.md` §§4–8.
 - `M03-deadlock-multi-rule` (2): synthesized deadlock self-loop and a two-rules/one-target arc
   with a stable shared label.
 - `M04-manual-mutex` (7), `M05-manual-rrobin` (3), `M06-manual-ltl-plus` (1), and
-  `M10-sat-taut` (7): every terminating executable command family in manual Chapter 12,
-  including exact counterexample/witness/model/false/prime-implicant output.
+  `M10-sat-taut` (8): every terminating executable command family in manual Chapter 12,
+  including exact counterexample/witness/model/false/prime-implicant output and
+  `SatSolverSymbol` singular/plural/zero verbose statistics.
 - `M07-reference-dekker` (3), `M08-reference-dining-philosophers5` (3), and
   `M09-reference-dining-philosophers6` (3): exact remaining model-checker-gated reference
   sources. M05 simultaneously covers the fourth source, `ObjectOriented/rrobin`.
@@ -249,10 +253,25 @@ tnk determinizes the otherwise-unstable case by lowest source rule id. Every oth
 result term/sort, and rewrite count remains byte-exact.
 
 **M0 is complete; M1 is next.** No production model-checker code landed with the manifest.
-The current binary accepts all 49 commands but leaves `SatSolverSymbol`/`ModelCheckerSymbol`
+The current binary accepts all 50 commands but leaves `SatSolverSymbol`/`ModelCheckerSymbol`
 applications unreduced, so `tools/subsystems-scoreboard.sh -p M` is intentionally 0/10.
 M1–M7 must port the exact Gastin–Oddoux pipeline + nested DFS, share `Search`'s successor core,
 bind both hooks, and close all 10 fixtures. Detailed cursor: `remaining-plans/05-model-checking.md`.
+
+#### Current Phase-M `/goal` contract
+
+Continue without stopping at commits or stage boundaries until M1–M7 are complete. Follow
+the stage order, Rust decisions, authority hierarchy, and exact per-stage gates in
+`remaining-plans/05-model-checking.md`. The Maude 3.5.1 source and frozen oracle output
+define behavior; a different valid automaton, lasso, SAT cube, output, or rewrite count is
+not conformant. Do not weaken M01–M10, add an accepted diff, switch BDD backends, duplicate
+the search graph, route the checker through `MetaDescent`, or begin Phase I.
+
+The only completion condition is all of `remaining-plans/05-model-checking.md` §7.1 on one
+final committed tree, including M 10/10, retained F1–F4 and subsystem gates, live shipped
+hooks, updated documentation/ledger hashes, removed instrumentation, and a clean working
+tree. A discovered defect is part of the goal unless it is demonstrably outside Phase M;
+fix and regression-cover it rather than defer it.
 
 ### Phase I — sessions & meta-interpreters (last; internal order I0→I1→I2→I3→I4)
 
@@ -339,8 +358,9 @@ bind both hooks, and close all 10 fixtures. Detailed cursor: `remaining-plans/05
   3/3 fixtures, 45 byte-exact object/meta commands; default Null degradation retained)
 - [x] T6 variant-satisfiability library — working tree 2026-07-23 (native and external-oracle lanes
   27/27 each; complete Phase-T scoreboard 11/11; three prototype corrections recorded in T11)
-- [x] M0 model-checker fixture manifest — working tree 2026-07-23 (10 fixtures / 49 commands;
-  oracle self-diff 10/10, inert-hook production baseline 0/10; no production code)
+- [x] M0 model-checker fixture manifest — d57b645 plus the pre-M1 verbose-contract amendment
+  (2026-07-23; 10 fixtures / 50 commands; oracle self-diff 10/10, inert-hook production
+  baseline 0/10; no production code)
 - [ ] M1 LogicFormula DAG + temporal descent —
 - [ ] M2 local LTL BDD facade —
 - [ ] M3 VWAA → GBA → Büchi pipeline —

@@ -7,7 +7,7 @@ state-transition system is searched for an accepting cycle by nested DFS, and a
 satisfiability/tautology solver (`satSolve`/`tautCheck`).
 
 **Status: IN PROGRESS (2026-07-23); M0 COMPLETE, implementation cursor M1.** The frozen
-manifest is 10 fixtures / 49 commands. An oracle-vs-oracle run reports `SUBSYSTEMS 10/10 PASS`;
+manifest is 10 fixtures / 50 commands. An oracle-vs-oracle run reports `SUBSYSTEMS 10/10 PASS`;
 the production binary accepts every fixture but reports `0/10`, as expected, because
 `SatSolverSymbol` and `ModelCheckerSymbol` remain declared-inert and their applications stay
 unreduced. M0 changed no production code. Phase M is independent of S and T
@@ -18,6 +18,22 @@ output must be **byte-exact** to the reference — *"paths are deterministic; th
 pass criterion, not just the verdict."* This elevates the README's "(where it matters)
 byte-for-byte output" to a hard requirement for phase M. A logically-correct but
 *different* lasso is a FAIL.
+
+**Authority and conflict rule for the Phase-M `/goal`.**
+
+- **Behavioral truth:** the frozen `conformance/subsystems/M*.maude` bytes and live Maude
+  3.5.1 oracle, then the C++ sources under `~/code/maude-lang/Maude/src/{Temporal,Higher,Utility}`.
+- **Rust design and scope:** this file, the Phase-M subsection of `subsystems-goal.md`, and
+  binding decisions D1/D6 in `03-open-decisions.md`.
+- **Current status:** the code and harness results, then the Phase-M ledger in
+  `subsystems-goal.md`.
+- `reports/A8-symbolic-smt-ltl.md`, `01-architecture-map.md`, completed plans 01–04, and
+  closed goal documents are historical background only. Their proposed layouts, fallback
+  choices, or old cursors never override this plan.
+
+If a historical document conflicts, follow the authority above and correct the stale
+summary in the same stage. **The active goal is exactly M1–M7; stop before Phase I,
+meta-interpreters, external IO, or unrelated roadmap work.**
 
 ---
 
@@ -332,7 +348,7 @@ available on biodivine's `Bdd`/`BddNode` API; the plan is to expose them as a th
 
 `conformance/subsystems/M*.maude` run under `tools/subsystems-scoreboard.sh` (the same
 `diffmaude.sh` normalization, 60s per side, `SUBSYSTEMS n/m PASS`). M0 froze
-**M01–M10: 10 fixtures / 49 commands** on 2026-07-23; the exact manifest and source
+**M01–M10: 10 fixtures / 50 commands** on 2026-07-23; the exact manifest and source
 enumeration are in §7 and `subsystems-goal.md` §2. Every fixture carries `*** PRELUDE`, so
 the oracle and tnk both load the standing prelude plus `model-checker.maude`. The oracle
 self-diff is 10/10; the inert-hook tnk baseline is intentionally 0/10 without load, parse,
@@ -351,10 +367,10 @@ gate every implementation commit.
 | `RewriteSearchState::findNextRewrite` | `Engine::state_successors` + `reduce_successor` (`engine.rs:2965–3023`, `3987`) |
 | `HashConsSet` dedup | `dag_hash` + `deep_equal` + per-`Search` `index` (`engine.rs:3030`, `term.rs:322`, `search.rs:84`) |
 | `ArcMap = map<int, set<Rule*>>` | `fwd: BTreeMap<usize, BTreeSet<u32>>` (`search.rs:42`) |
-| `ModelChecker2::System` (virtual) | a Rust `trait System { fn next_state; fn check_proposition }` — the D3 "`dyn` at an open seam" idiom, or a concrete struct since there is exactly one impl |
+| `ModelChecker2::System` (virtual) | `trait System`, consumed through a generic parameter (`S: System`); no `Box<dyn System>` or per-edge virtual allocation |
 | `LogicFormula`, VWAA, GBA, Büchi2, ModelChecker2 | new `crates/tnk-core/src/ltl/` module (self-contained; §6) |
-| BuDDy `Bdd` | `biodivine-lib-bdd` (D6) |
-| `NatSet` | a sorted-bitset newtype (or `BTreeSet<u32>`) with matching `Ord` |
+| BuDDy `Bdd` | `biodivine-lib-bdd` 0.5.27, engine-local and mandatory (D6) |
+| `NatSet` | `ltl::NatSet`: inline `u64` first word + normalized `Vec<u64>`, with the reference's exact length/word `Ord`; **not** `BTreeSet` ordering |
 | `IndexedSet<T>` | a `Vec<T>` + `HashMap<T,usize>` interner (equality by value incl. canonical BDDs) |
 | `map<Key, …>` (ordered) | `BTreeMap<Key, …>` (Ord matching C++'s `<`) |
 
@@ -453,14 +469,14 @@ transitionSet 167, collapseStates 122, satSolve 271, logicFormula 261) plus ~0.9
   `TDEBUG`-instrumented reference builds, not just the final bytes.
 - **Rewrite-count exactness (#5)** requires porting the lazy BDD-walk + per-state memo, not
   a shortcut evaluation. Needs facade ROBDD navigation.
-- **`satSolve`/`tautCheck` prime-implicant rendering** uses BuDDy `extractPrimeImplicant`
-  (`satSolverSymbol.cc:242`); biodivine's clause/valuation extraction must reproduce the
-  same conjunction (variable order + polarity) byte-for-byte in `model(...)`. This is a
-  **distinct, arguably harder** rendering match than `modelCheck` (which needs no prime
-  implicants). Recommend sequencing `satSolve` *after* `modelCheck` and treating its
-  rendering as its own risk item / open question (§8).
+- **`satSolve`/`tautCheck` prime-implicant rendering** uses the recursive algorithm in
+  `Utility/bdd.cc:31–49`, followed by the variable-order walk in
+  `Higher/satSolverSymbol.cc:231–265`. Port those operations exactly over biodivine;
+  an arbitrary satisfying valuation or library convenience clause is not conformant.
+  This is a distinct bound M7 risk, sequenced after `modelCheck`, not an open design
+  question.
 - **The manifest is now seeded.** M0 retired the unseeded-contract risk with 10 fixtures /
-  49 commands and exposed one real oracle limitation: a differently-labelled multi-rule
+  50 commands and exposed one real oracle limitation: a differently-labelled multi-rule
   arc has a process-dependent representative. The stable boundary is recorded in §7/§8.4.
 - **BDD facade extension.** `SortBdds` doesn't expose the ops LTL needs; a small
   `ltl::bdd` helper (ithvar/nithvar/navigation) must be added and validated against
@@ -474,20 +490,23 @@ term printer).
 
 ## 6. Implementation plan (staged)
 
-New code lives in `crates/tnk-core/src/ltl/` (self-contained automata pipeline + checker),
-with hook binding in the frontend and an up-call seam mirroring `descent.rs`. **Nothing is
-deferred**; sub-issues (facade ops, the `Search` refactor, deadlock self-loop) are called
-out in the stage where they arise.
+New code lives in `crates/tnk-core/src/ltl/` (self-contained automata pipeline + checker);
+the frontend resolves typed hooks and both special reductions execute kernel-direct in
+`Runtime::try_special` (§3.1). There is no new upper-call seam. **Nothing is deferred**;
+facade ops, exact set ordering, the `Search` refactor, deadlock self-loop, verbose events,
+and prime-implicant extraction land in their named stages.
 
 ### Stage M0 — seed the fixture manifest — **DONE 2026-07-23**
 
 M01–M10 enumerate the fresh probes, all terminating manual Chapter 12 examples, and all
 four model-checker-gated reference-suite sources. They cover every LTL connective,
 `LTL-SIMPLIFIER`, true/counterexample/nil-lead-in/deadlock/Qid/unlabeled output,
-duplicate-rule arcs, LTL+, Dekker, both dining-philosophers encodings, and
-`satSolve`/`tautCheck` model/false/prime-implicant output. The oracle self-diff is 10/10;
-the production baseline is 0/10 solely at the two inert hooks. The manifest is frozen in
-`subsystems-goal.md` §2 in the same commit as the fixtures. **Next: M1 only.**
+duplicate-rule arcs, LTL+, Dekker, both dining-philosophers encodings,
+`satSolve`/`tautCheck` model/false/prime-implicant output, and the SatSolver verbose
+statistics. The oracle self-diff is 10/10. The production baseline is 0/10: the two
+applications remain inert, and M10 additionally lacks the hook-owned verbose event plus
+the identity-collapse lines exposed by `set verbose on`. The manifest is frozen in
+`subsystems-goal.md` §2. **Next: M1 only.**
 
 #### Post-M0 serial cursor (binding)
 
@@ -497,13 +516,17 @@ the production baseline is 0/10 solely at the two inert hooks. The manifest is f
 | **M2** | local `ltl::bdd` facade: variables, Boolean ops, equality, root/low/high navigation | biodivine canonicity/navigation tests |
 | **M3** | `TransitionSet`/raw product → VWAA → GBA/SCC/collapse → degeneralized Büchi | intermediate dump parity with an instrumented reference |
 | **M4** | `ModelChecker2` nested DFS, lazy BDD proposition walk/memo, lasso split, `System` trait | known lassos over a synthetic system; still no production hook |
-| **M5** | shared `StateGraph`, deadlock completion, typed hooks/up-call, result construction | M01 + M03 byte-exact target |
+| **M5** | shared `StateGraph`, deadlock completion, kernel-direct typed hooks, result construction | M01 + M03 byte-exact target |
 | **M6** | determinism closure, LTL+ path, large reference systems, typed verbose-stat event | M01–M09 byte-exact target |
 | **M7** | GBA SAT BFS, prime implicants, `SatSolverSymbol`; pure `tautCheck` equations | M01–M10 10/10 plus frozen invariants |
 
 Do not start M2 before M1's indexing contract, M3 before M2's BDD gate, or M5 before the
 synthetic M4 checker is exact. M5 is the first stage allowed to change the production
 M-scoreboard.
+
+Each stage is implemented, verified, committed, and recorded with its commit hash in the
+Phase-M ledger before the next starts. A stage boundary is a checkpoint, never a stopping
+condition for the encompassing M1–M7 `/goal`.
 
 ### Stage M1 — LogicFormula + `build` (determinism root #2)
 
@@ -530,15 +553,20 @@ op. Unit tests must cover repeated/deep-equal proposition collapse, first-encoun
 numbering, repeated formula-node sharing, n-ary left folding, every propositional flag,
 unknown-subtree atomicity, and each malformed/rejected case.
 
-**Gate:** focused tnk-core tests pass and the frozen M-scoreboard remains 0/10 for the same
-inert-hook reason. No BDD code and no production hook in M1.
+**Gate:** focused tnk-core tests pass and the frozen M-scoreboard remains 0/10; production
+hooks and M10's hook-owned verbose output remain absent. No BDD code and no production hook
+in M1.
 
 ### Stage M2 — the `ltl::bdd` helper (facade extension)
 
-Add ithvar/nithvar, and/or/not, `==`, and root-var/low/high navigation over a local
-`BddVariableSet` sized to the proposition count (variable index = proposition index).
-Validate canonicity against biodivine directly. This is the only new external-facing BDD
-surface; keep it out of `SortBdds`.
+Add `ltl/bdd.rs`, owning a local `BddVariableSet` whose variable index is the proposition
+index. Its crate-private API covers `true`/`false` (including zero variables),
+`ithvar`/`nithvar`, `and`/`or`/`not`, equality, implication, and root/variable/low/high
+navigation; backend pointers do not escape the helper. Keep it separate from `SortBdds`.
+Tests cover terminal navigation, literal polarity/order, truth tables, De Morgan,
+canonicity, implication, and multi-level low/high walks against biodivine directly.
+
+**Gate:** the focused BDD tests pass; M remains 0/10 and no production hook is bound.
 
 ### Stage M3 — the LTL→Büchi pipeline (determinism root #3)
 
@@ -552,22 +580,40 @@ Port, in order, each unit-tested against `dump()`-diffs of `TDEBUG` reference bu
    `generateState`, `insertFairTransition`, Tarjan SCC, `simplify`.
 4. `BuchiAutomaton2` (`buchiAutomaton2.{hh,cc}`) — degeneralization + `collapseStates`.
 
+Add `ltl/nat_set.rs`, `transition.rs`, `vwaa.rs`, `buchi.rs`, and `scc.rs`. `NatSet`
+ports `Utility/natSet` with normalized trailing words and its exact comparison: word-vector
+length, then first word, then remaining words low-to-high. This ordering is observable in
+`BTreeMap<NatSet, _>` and must not be replaced by element-lexicographic `BTreeSet`.
+Test-only dump adapters compare a fixed battery (constants, atom/negated atom, n-ary
+Boolean, `NEXT`, nested `UNTIL`/`RELEASE`) against temporary `TDEBUG` reference builds.
+Do not leave instrumentation or binaries in this repository.
+
+**Gate:** every layer's focused tests and intermediate dumps match; M remains 0/10 and no
+production hook is bound.
+
 ### Stage M4 — the nested DFS + `System` trait (determinism root #4)
 
-Port `ModelChecker2` (`modelChecker2.{cc,hh}`): the product `intersectionStates`, DFS1/DFS2,
-`satisfiesPropositionalFormula` (the lazy BDD walk + per-state memo — determinism root #5),
-and lasso recovery (`path`/`cycle` + `swap`). Define `trait System`. **Unit-test against a
-synthetic `System`** (a fixed tiny transition graph + a proposition oracle) with
-known-answer automata, independent of the rewrite engine.
+Port `ModelChecker2` (`modelChecker2.{cc,hh}`) into `ltl/model_check.rs`: product-state
+interning, DFS1/DFS2, `satisfiesPropositionalFormula` (lazy root/low/high walk plus
+per-system-state tested/true proposition sets), and exact `path`/`cycle`/`swap` recovery.
+Define `trait System` with ordinal successor access and proposition testing; make the
+checker generic over `S: System`, not a trait object. Unit-test fixed tiny systems for no
+counterexample, nonempty/nil lead-ins, self-cycle, multi-state cycles, lazy proposition
+memoization/call counts, and deterministic traversal. No rewrite engine or production
+hook participates in M4.
+
+**Gate:** all synthetic-system lassos and proposition-call counts are exact; M remains
+0/10.
 
 ### Stage M5 — first vertical slice: shared graph + hooks + M01/M03
 
 1. Extract `Search`'s graph fields and successor quantum into `StateGraph`
    (`get_next_state`, `state_dag`, `fwd_arcs`); `Search` retains only BFS/goal logic.
    The checker wrapper adds the **deadlock self-loop** without changing ordinary search.
-2. Implement `System` over that graph. `check_proposition` reduces
-   `satisfies(state, proposition)` through `MetaCtx`, compares with `trueTerm`, and charges
-   the subcontext rewrites exactly once.
+2. Implement `System` over that graph. `check_proposition` constructs and reduces
+   `satisfies(state, proposition)` in the active `Runtime`/`Signature` context, passes the
+   existing `DescentOps` through nested reduction, compares with `trueTerm`, and charges
+   the nested rewrites exactly once. It does not use `MetaCtx`.
 3. Add typed `ModelCheckerHooks` and `SpecialOp::ModelCheck`, bind
    `"ModelCheckerSymbol"` immediately before the unknown-class fallback at
    `build_sig.rs:864`, and run it directly in `Runtime::try_special`. Introduce the
@@ -593,11 +639,20 @@ LTL+ witness inversion, Dekker's 9+2 lasso, both 459-state dining counterexample
 ### Stage M7 — `satSolve` / `tautCheck` (sibling; separate risk)
 
 Reuse `GenBuchiAutomaton` (do not degeneralize); port `GenBuchiAutomaton::satSolve`
-(`satSolve.cc`) — the three BFS passes + lead-in rolling — and `SatSolverSymbol`'s
-`makeModel`/`makeFormula` prime-implicant rendering. Bind `"SatSolverSymbol"` in
-`special_op`. This is where the BuDDy-vs-biodivine prime-implicant match must be nailed
-(§8). `tautCheck` and `LTL+`/`MODEL-CHECKER+` are **pure prelude equations** — they work
-automatically once `satSolve`/`modelCheck` do; just verify.
+(`satSolve.cc`) — all three ordered BFS passes and lead-in rolling. Port
+`Bdd::extractPrimeImplicant` verbatim from `Utility/bdd.cc:31–49`, then render its cube in
+root-variable order exactly as `SatSolverSymbol::makeFormula` does. Add typed `SatHooks`,
+bind `"SatSolverSymbol"` in `special_op`, and keep execution kernel-direct.
+`tautCheck` is a pure prelude equation over `satSolve`; verify rather than reimplement it.
+Record a typed SatSolver statistics event and render it through the REPL's existing
+`set verbose` path; core code does not print. Reuse/refactor the existing per-module
+identity-collapse reporter so the verbose pair emits the two frozen `_ ; _` lines once;
+do not hard-code those lines in the SatSolver hook.
+
+**Gate:** M10's eight commands are byte-exact, including SatSolver singular/plural/zero
+verbose statistics, the two identity-collapse lines, `model` conjunction ordering and
+polarity, result sorts/rewrites, `false`, and tautology counterexamples. The complete
+M01–M10 scoreboard is 10/10 and the stopping gate in §7 holds.
 
 ### 6.3 Why there is no new upper call
 
@@ -643,12 +698,13 @@ hard requirement — **byte-for-byte** the `counterexample`/`model` text.
 | `M07-reference-dekker` | 3 | exact `tests/Misc/dekker`: safety `true`, 9+2 unlabeled lasso, fairness `true` |
 | `M08-reference-dining-philosophers5` | 3 | exact source, including setup reduce/search and the 459-state, 48,194-rewrite counterexample |
 | `M09-reference-dining-philosophers6` | 3 | alternate Oid encoding of the same complete reference test and exact counterexample |
-| `M10-sat-taut` | 7 | `model(b,True)`, `false`, four tautology outcomes, manual prime implicant `model(a ; b,(~ c) ; c)`, and exact tautology counterexample |
+| `M10-sat-taut` | 8 | `model(nil,True)`, `model(b,True)`, `false`, four tautology outcomes, manual prime implicant `model(a ; b,(~ c) ; c)`, exact tautology counterexample, and verbose 1-state/0-fairness + 2-state/1-fairness statistics |
 
-Total: **10 fixtures / 49 commands**. `TNK_BIN=~/.local/bin/maude
+Total: **10 fixtures / 50 commands**. `TNK_BIN=~/.local/bin/maude
 tools/subsystems-scoreboard.sh -p M` reports **10/10 PASS**. The production release
 reports **0/10**, with every file accepted and the two special-hook applications left
-unreduced as expected before M1–M7.
+unreduced as expected before M1–M7. M10 also lacks the hook-owned verbose event and the
+identity-collapse lines bound by its `set verbose on` pair.
 
 **Source enumeration and exclusions.** The reference-suite model-checker denominator is
 `Misc/dekker` plus `ObjectOriented/rrobin`, `dining-philosophers5`, and
@@ -661,6 +717,34 @@ demonstrates nontermination on an infinite reachable-state set, so it cannot sat
 The denominator may grow but may not shrink or weaken without a recorded user decision.
 For the differently-labelled multi-rule-arc limitation discovered while freezing M03,
 see §8.4.
+
+### 7.1 Phase-M `/goal` stopping gate
+
+M1–M7 is complete only when **all** of the following hold on the same final tree:
+
+1. A default pure-Rust release build reports `SUBSYSTEMS 10/10 PASS` for `-p M`; all 50
+   result values, sorts, rewrite counts, verbose lines, and printed lassos/models are
+   byte-exact. The oracle self-run remains 10/10.
+2. F1–F4 hold: `SCOREBOARD 77/77 PASS`, `LEGACY 87/87 CLEAN`,
+   `cargo test --release` fully green, and stock `term-order.maude`,
+   `machine-int.maude`, and `linear.maude` load clean.
+3. Retained subsystem gates pass: U 27/27, V 21/21, and N 16/16 on the default release;
+   T 11/11 on a fresh `smt-z3` release; the default release remains solver-free. T11's
+   native lane passes. Re-run the checksum-pinned external T11 oracle only if its fixture
+   or expected contract changed (Phase M must not change either).
+4. `model-checker.maude` loads from the shipped library and `modelCheck`, `modelCheck+`,
+   `satSolve`, and `tautCheck` all compute; neither special hook remains inert.
+5. The M manifest has not shrunk or weakened, no accepted diff masks an M failure, and no
+   timeout/exclusion was added. New defects found during implementation are fixed and
+   regression-covered rather than deferred.
+6. All temporary reference instrumentation and generated artifacts are removed. No Phase-I
+   or unrelated feature code landed.
+7. This plan, `subsystems-goal.md`, `roadmap.md`, `README.md`, and `fable-audit.md` state
+   observed completion; the Phase-M ledger records commit hashes for M1–M7. All intended
+   work is committed and the working tree is clean.
+
+Do not mark the `/goal` complete for a plausible subset, a logically valid but different
+lasso/model, one narrowed test command, or a stage checkpoint.
 
 **Unit tests (below the oracle, for the determinism-critical internals):**
 - `build`/`LogicFormula`: descent order + proposition indexing on hand-written formulas.
@@ -685,13 +769,15 @@ oracle that catches "wrong-but-plausible" lassos distinct from the byte diff. (M
 1. **LTL→Büchi algorithm — bound.** Port the reference Gastin–Oddoux pipeline exactly (VWAA → GBA →
    degeneralized Büchi, plus the Somenzi–Bloem SCC optimization). Byte-exact counterexamples make the
    automaton and traversal order part of the spec; an alternative valid construction is not conformant.
-2. **BDD backend gate.** Before the full port, diff intermediate automaton dumps for a formula battery
-   using proposition-index variable order. If `biodivine-lib-bdd` does not reproduce the reference
-   structure/order through the facade, use D6's recorded BuDDy-FFI escape hatch. Do not discover this
-   only at final lasso rendering.
-3. **`satSolve`/`tautCheck` ordering — bound.** Implement after `modelCheck` (M7), but it may not lag the
-   completed M denominator. Its BuDDy prime-implicant polarity/order is a byte-visible contract; seed
-   it separately and finish exact `model(...)` rendering before phase M closes.
+2. **BDD backend — bound.** D6 binds normal-dependency `biodivine-lib-bdd` 0.5.27. Diff
+   intermediate automaton dumps early using proposition-index variable order. Any drift
+   is a facade/ordering bug to diagnose and fix; do not switch to BuDDy FFI without a new,
+   explicit user decision amending D6.
+3. **`satSolve`/`tautCheck` ordering — bound.** Implement after `modelCheck` (M7). M10 is
+   already frozen with eight commands. Port `Utility/bdd.cc:31-49` rather than choosing a
+   different satisfying cube, and finish exact `model(...)` rendering before Phase M
+   closes. Its verbose pair also binds SatSolverSymbol's state/fairness statistics and the
+   identity-collapse lines exposed by `set verbose on`.
 4. **Multi-rule arc labels — determinized boundary.** M03 seeds two rules/one target with a
    shared visible label. A probe with different labels proved Maude 3.5.1's `set<Rule*>`
    representative process-dependent (two mismatches in 12 oracle self-diffs), so no
