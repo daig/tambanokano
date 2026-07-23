@@ -91,7 +91,7 @@ pub fn complete_statement(
     lhs: &mut Term,
     rhs: Option<&mut Term>,
     cond: &mut [ConditionFragment],
-) {
+) -> bool {
     // --- Gather (immutable walk over lhs / rhs / condition). ---
     let mut objs: Vec<ObjInfo> = Vec::new();
     let mut ignore = false;
@@ -103,10 +103,30 @@ pub fn complete_statement(
         gather_condition(frag, info, m, &mut objs, &mut ignore);
     }
     if ignore || objs.is_empty() {
-        return;
+        return false;
     }
     if !check_variables(&objs, lhs, rhs.as_deref(), cond) {
-        return;
+        return false;
+    }
+    // `ObjectSystemRewritingContext::objectMessage` is emitted only when completion changes the
+    // statement. An already class-polymorphic object carrying the shared attribute-set variable, with
+    // identical attribute keys in every occurrence, is already complete.
+    let needs_completion = objs.iter().any(|obj| {
+        obj.class_var.is_none()
+            || obj.pattern.set_var.is_none()
+            || obj.subjects.iter().any(|subject| {
+                obj.pattern
+                    .attrs
+                    .iter()
+                    .any(|(symbol, _)| !subject.attrs.iter().any(|(other, _)| other == symbol))
+                    || subject
+                        .attrs
+                        .iter()
+                        .any(|(symbol, _)| !obj.pattern.attrs.iter().any(|(other, _)| other == symbol))
+            })
+    });
+    if !needs_completion {
+        return false;
     }
 
     // --- Plan (allocate fresh variables per object: V, then Atts, then kind-var A's). ---
@@ -160,6 +180,7 @@ pub fn complete_statement(
     for frag in cond.iter_mut() {
         transform_condition(frag, &plans, info, m);
     }
+    true
 }
 
 /// Recursively collect object occurrences from `term` under `mode`.
@@ -470,27 +491,8 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
         atts
     } else {
         elems.push(atts);
-        canonicalize_attr_set(&mut elems);
         Term::op(info.attr_set_sym, elems)
     };
-}
-
-/// Order the elements of a rebuilt attribute set as Maude's ACU `makeTerm` does — by `Term::compare`
-/// (`orderInt = arity<<24 | creation`): the arity-0 `Atts` variable sorts before the arity-1 attribute
-/// operators, which sort among themselves by symbol creation order (`SymbolId`). ACU matching is order-
-/// independent, so this changes only the stored/meta-printed form (matching `upModule`/`show`), not any
-/// rewrite. (A single set variable and distinct attribute symbols mean no variable-vs-variable tie arises.)
-fn canonicalize_attr_set(elems: &mut [Term]) {
-    fn key(t: &Term) -> (usize, bool, Option<SymbolId>) {
-        match t {
-            // (arity, is-variable, symbol): arity first; at equal arity a constant precedes a variable.
-            Term::Op { symbol, args } => (args.len(), false, Some(*symbol)),
-            Term::Na { symbol, .. } => (0, false, Some(*symbol)),
-            Term::Iter { symbol, .. } => (1, false, Some(*symbol)),
-            Term::Var(_) => (0, true, None),
-        }
-    }
-    elems.sort_by_key(key);
 }
 
 /// The kind (top/error sort) of an attribute operator's argument, for a fresh kind-variable attribute

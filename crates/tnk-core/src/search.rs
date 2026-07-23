@@ -43,10 +43,13 @@ struct State {
     /// Distinct successor states in first-rewrite-result order. Model checking consumes this ordinal
     /// view; `fwd` retains every rule that produced each arc.
     successor_order: Vec<usize>,
-    /// Raw, uncounted rewrite results and the next result to commit. Generated once, then consumed
-    /// lazily so search bounds and model-checker DFS charge only transitions they inspect.
-    raw: Option<Vec<(u32, DagId)>>,
-    raw_cursor: usize,
+    /// Pending rewrite results and the equation work needed to enumerate each one. Generation is eager,
+    /// but the work is charged lazily as the model checker/search consumes the stream. Every pending
+    /// term is rooted because proposition checks and other reductions can collect between graph calls.
+    raw: Option<VecDeque<RawSuccessor>>,
+    /// Equation work needed to prove the raw stream exhausted, charged only when the caller asks past
+    /// its final result.
+    raw_tail_rewrites: u64,
     /// BFS depth (0 = initial).
     depth: u32,
     /// Whether every raw successor has been committed.
@@ -74,10 +77,24 @@ pub struct PathStep {
 /// the rules reaching it)`).
 pub type GraphState = (usize, DagId, Vec<(usize, Vec<u32>)>);
 
+pub(crate) struct RawSuccessor {
+    pub(crate) rule_id: u32,
+    pub(crate) term: DagId,
+    pub(crate) enumeration_rewrites: u64,
+    pub(crate) _root: RootGuard,
+}
+
+pub(crate) struct RawSuccessors {
+    pub(crate) entries: Vec<RawSuccessor>,
+    pub(crate) tail_rewrites: u64,
+}
+
+
 /// The rewrite-engine operations needed by [`StateGraph`]. Implementations are statically dispatched:
 /// ordinary search uses [`Engine`], while model checking supplies the active `Runtime`/`Signature` view.
 pub(crate) trait GraphContext {
-    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)>;
+    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors;
+    fn graph_replay_rewrites(&mut self, rewrites: u64);
     fn graph_reduce_successor(&mut self, successor: DagId) -> DagId;
     fn graph_dag_hash(&self, id: DagId) -> u64;
     fn graph_deep_equal(&self, lhs: DagId, rhs: DagId) -> bool;
@@ -85,8 +102,12 @@ pub(crate) trait GraphContext {
 }
 
 impl GraphContext for Engine {
-    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
+    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors {
         self.state_successors(root)
+    }
+
+    fn graph_replay_rewrites(&mut self, rewrites: u64) {
+        self.replay_graph_rewrites(rewrites);
     }
 
     fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {
@@ -131,7 +152,7 @@ impl StateGraph {
                 fwd: BTreeMap::new(),
                 successor_order: Vec::new(),
                 raw: None,
-                raw_cursor: 0,
+                raw_tail_rewrites: 0,
                 depth: 0,
                 expanded: false,
             }],
@@ -160,24 +181,29 @@ impl StateGraph {
             }
             if self.states[state].raw.is_none() {
                 let term = self.states[state].term;
-                self.states[state].raw = Some(context.graph_state_successors(term));
-            }
-            let next = {
+                let batch = context.graph_state_successors(term);
                 let source = &mut self.states[state];
-                let raw = source.raw.as_ref().expect("raw successors initialized");
-                if source.raw_cursor == raw.len() {
+                source.raw = Some(batch.entries.into());
+                source.raw_tail_rewrites = batch.tail_rewrites;
+            }
+            let (next, tail_rewrites) = {
+                let source = &mut self.states[state];
+                let raw = source.raw.as_mut().expect("raw successors initialized");
+                if let Some(next) = raw.pop_front() {
+                    (Some(next), 0)
+                } else {
                     source.raw = None;
                     source.expanded = true;
-                    None
-                } else {
-                    let next = raw[source.raw_cursor];
-                    source.raw_cursor += 1;
-                    Some(next)
+                    let tail = std::mem::take(&mut source.raw_tail_rewrites);
+                    (None, tail)
                 }
             };
-            let Some((rule_id, successor)) = next else {
+            context.graph_replay_rewrites(tail_rewrites);
+            let Some(next) = next else {
                 return None;
             };
+            context.graph_replay_rewrites(next.enumeration_rewrites);
+            let (rule_id, successor) = (next.rule_id, next.term);
 
             let reduced = context.graph_reduce_successor(successor);
             let hash = context.graph_dag_hash(reduced);
@@ -196,7 +222,7 @@ impl StateGraph {
                         fwd: BTreeMap::new(),
                         successor_order: Vec::new(),
                         raw: None,
-                        raw_cursor: 0,
+                        raw_tail_rewrites: 0,
                         depth,
                         expanded: false,
                     });

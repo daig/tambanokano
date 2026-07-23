@@ -85,6 +85,7 @@ impl Runtime {
             SpecialOp::ModelCheck { hooks } => {
                 crate::ltl::model_check::check_rewrite_system(self, sig, descent, id, hooks)
             }
+            SpecialOp::SatSolve { hooks } => crate::ltl::sat_solve::solve(self, sig, id, hooks),
             // T1 recognizes solver-language operators but deliberately leaves them inert. T2 translates
             // these typed hooks into the selected `SmtEngine`; ordinary `reduce` must not evaluate them.
             SpecialOp::Smt { .. } => None,

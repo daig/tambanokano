@@ -15,7 +15,7 @@ use tnk_core::smt::{SmtOp, SmtType};
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
     BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, ModelCheckerHooks, NatHooks, NumOp,
-    QidOp, SpecialOp, StdStream, StrOp, SymbolId,
+    QidOp, SatSolverHooks, SpecialOp, StdStream, StrOp, SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -528,6 +528,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         eq_traces: Vec::new(),  // populated by load_statements (full-trace metadata)
         mb_traces: Vec::new(),
         rl_traces: Vec::new(),
+        oo_completion_diagnostics: Vec::new(),
         nat_succ,
         nat_zero,
         string_sym,
@@ -881,6 +882,36 @@ fn special_op(
                 }),
             }
         }
+        "SatSolverSymbol" => {
+            let op_hook = |purpose: &str| -> R<SymbolId> {
+                let (_, signature) = spec
+                    .op_hooks
+                    .iter()
+                    .find(|(candidate, _)| candidate == purpose)
+                    .ok_or_else(|| format!("SatSolverSymbol missing op-hook {purpose}"))?;
+                resolve_op_hook_sig(signature, sym_by_profile, sorts, sort_table, i)
+                    .ok_or_else(|| format!("SatSolverSymbol cannot resolve op-hook {purpose}"))
+            };
+            SpecialOp::SatSolve {
+                hooks: std::rc::Rc::new(SatSolverHooks {
+                    temporal: TemporalHooks {
+                        true_symbol: op_hook("trueSymbol")?,
+                        false_symbol: op_hook("falseSymbol")?,
+                        not_symbol: op_hook("notSymbol")?,
+                        next_symbol: op_hook("nextSymbol")?,
+                        and_symbol: op_hook("andSymbol")?,
+                        or_symbol: op_hook("orSymbol")?,
+                        until_symbol: op_hook("untilSymbol")?,
+                        release_symbol: op_hook("releaseSymbol")?,
+                    },
+                    formula_list_symbol: op_hook("formulaListSymbol")?,
+                    nil_formula_list_symbol: op_hook("nilFormulaListSymbol")?,
+                    model_symbol: op_hook("modelSymbol")?,
+                    false_term: term_hook_sym(spec, "falseTerm", name_to_sym, i)
+                        .ok_or("SatSolverSymbol cannot resolve term-hook falseTerm")?,
+                }),
+            }
+        }
         // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
         // standard-stream external-object manager. The id-hook data selects the stream; the op-hooks name
         // the `write`/`wrote` (and `getLine`/`gotLine`) message symbols the manager consumes/produces.
@@ -898,10 +929,10 @@ fn special_op(
             got_line_msg: op_hook_sym(spec, "gotLineMsg", name_to_sym, i),
         },
         // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol,
-        // SatSolverSymbol, InterpreterManagerSymbol, …): declare the operator WITHOUT a special
-        // binding — the module loads and everything else in it works; the op itself is inert
-        // (never reduces). This is the §2 graceful-degrade stance (stock linear.maude's
-        // DIOPHANTINE, the prelude's LOOP-MODE/LEXICAL); the advisory text is phase E.
+        // InterpreterManagerSymbol, …): declare the operator WITHOUT a special binding — the module
+        // loads and everything else in it works; the op itself is inert (never reduces). This is the
+        // §2 graceful-degrade stance (stock linear.maude's DIOPHANTINE, the prelude's
+        // LOOP-MODE/LEXICAL); the advisory text is phase E.
         _other => return Ok(None),
     };
     Ok(Some(op))

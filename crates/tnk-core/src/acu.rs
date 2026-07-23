@@ -549,6 +549,7 @@ struct RecordedSolution {
     residue: Vec<(DagId, u32)>,
 }
 
+
 impl AcuSubproblem {
     /// Advance to the next solution, binding its variables into `subst` and recording its residue;
     /// `false` when exhausted. Builds binding nodes (so it needs `&mut Runtime`); a candidate whose

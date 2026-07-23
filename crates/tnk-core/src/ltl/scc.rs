@@ -1,5 +1,7 @@
+use super::bdd::Bdd;
 use super::buchi::{FairTransitionSet, GenBuchiAutomaton, IndexedSet};
 use super::nat_set::NatSet;
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy)]
 struct StateInfo {
@@ -23,6 +25,13 @@ struct Analysis {
     states: Vec<StateInfo>,
     components: Vec<ComponentInfo>,
     essential: NatSet,
+}
+
+#[derive(Clone, Default)]
+struct SatStep {
+    /// `None` = unseen, `Some(None)` = BFS root, `Some(Some(p))` = reached from `p`.
+    parent: Option<Option<usize>>,
+    formula: Option<Bdd>,
 }
 
 impl GenBuchiAutomaton<'_> {
@@ -265,5 +274,168 @@ impl GenBuchiAutomaton<'_> {
             self.insert_fair_transition2(&mut transformed, (target, fairness), formula.clone());
         }
         transformed
+    }
+
+    /// Find the reference solver's shortest accepting lasso, returning transition predicates for its
+    /// lead-in and cycle. This is a line-for-line structural port of `Temporal/satSolve.cc`: collapse,
+    /// SCC fairness analysis, three ordered BFS passes, then the lead-in roll optimization.
+    pub(crate) fn sat_solve(&mut self) -> Option<(Vec<Bdd>, Vec<Bdd>)> {
+        self.maximally_collapse_states();
+        let analysis = self.scc_analysis();
+        for component in &analysis.components {
+            if component.status != ComponentStatus::Fair {
+                continue;
+            }
+
+            let (fair_state, mut lead_in) = self.bfs_to_fair_component(&analysis);
+            let mut cycle = Vec::new();
+            let mut current_state = fair_state;
+            let component = analysis.states[fair_state].component;
+            let mut fairness = analysis.components[component].redundant.clone();
+            while fairness != self.all_fair {
+                let (state, path) =
+                    self.bfs_to_more_fairness(&analysis, &mut fairness, current_state);
+                current_state = state;
+                cycle.extend(path);
+            }
+            if current_state != fair_state || cycle.is_empty() {
+                cycle.extend(self.bfs_to_target(&analysis, current_state, fair_state));
+            }
+
+            while !lead_in.is_empty()
+                && self
+                    .context
+                    .implies(
+                        cycle.last().expect("satisfying lasso has a cycle"),
+                        lead_in.last().expect("nonempty lead-in"),
+                    )
+                    .is_true()
+            {
+                cycle.rotate_right(1);
+                lead_in.pop();
+            }
+            return Some((lead_in, cycle));
+        }
+        None
+    }
+
+    fn bfs_to_fair_component(&self, analysis: &Analysis) -> (usize, Vec<Bdd>) {
+        let mut steps = vec![SatStep::default(); self.states.len()];
+        let mut queue = VecDeque::new();
+        for state in self.initial_states.iter() {
+            if analysis.components[analysis.states[state].component].status == ComponentStatus::Fair
+            {
+                return (state, Vec::new());
+            }
+            queue.push_back(state);
+            steps[state].parent = Some(None);
+        }
+
+        loop {
+            let state = queue
+                .pop_front()
+                .expect("live Büchi automaton must reach a fair component");
+            for (&(target, _), formula) in self.transitions(state) {
+                if analysis.components[analysis.states[target].component].status
+                    == ComponentStatus::Fair
+                {
+                    return (
+                        target,
+                        Self::reconstruct_sat_path(&steps, state, formula.clone()),
+                    );
+                }
+                if steps[target].parent.is_none() {
+                    steps[target].parent = Some(Some(state));
+                    steps[target].formula = Some(formula.clone());
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
+
+    fn bfs_to_more_fairness(
+        &self,
+        analysis: &Analysis,
+        fairness: &mut NatSet,
+        start: usize,
+    ) -> (usize, Vec<Bdd>) {
+        let component = analysis.states[start].component;
+        let mut steps = vec![SatStep::default(); self.states.len()];
+        let mut queue = VecDeque::from([start]);
+        steps[start].parent = Some(None);
+
+        loop {
+            let state = queue
+                .pop_front()
+                .expect("fair component must provide remaining fairness");
+            for (&(target, fairness_index), formula) in self.transitions(state) {
+                if analysis.states[target].component != component {
+                    continue;
+                }
+                let arc_fairness = self.fairness_conditions.get(fairness_index);
+                if !fairness.contains_set(arc_fairness) {
+                    fairness.union_with(arc_fairness);
+                    return (
+                        target,
+                        Self::reconstruct_sat_path(&steps, state, formula.clone()),
+                    );
+                }
+                if steps[target].parent.is_none() {
+                    steps[target].parent = Some(Some(state));
+                    steps[target].formula = Some(formula.clone());
+                    queue.push_back(target);
+                }
+            }
+        }
+    }
+
+    fn bfs_to_target(&self, analysis: &Analysis, start: usize, target: usize) -> Vec<Bdd> {
+        let component = analysis.states[start].component;
+        let mut steps = vec![SatStep::default(); self.states.len()];
+        let mut queue = VecDeque::from([start]);
+        steps[start].parent = Some(None);
+
+        loop {
+            let state = queue
+                .pop_front()
+                .expect("fair component target must be reachable");
+            for (&(next, _), formula) in self.transitions(state) {
+                if analysis.states[next].component != component {
+                    continue;
+                }
+                if next == target {
+                    return Self::reconstruct_sat_path(&steps, state, formula.clone());
+                }
+                if steps[next].parent.is_none() {
+                    steps[next].parent = Some(Some(state));
+                    steps[next].formula = Some(formula.clone());
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+
+    fn reconstruct_sat_path(steps: &[SatStep], mut state: usize, final_formula: Bdd) -> Vec<Bdd> {
+        let mut reverse = vec![final_formula];
+        loop {
+            match steps[state]
+                .parent
+                .expect("path reconstruction reached an unseen state")
+            {
+                None => break,
+                Some(parent) => {
+                    reverse.push(
+                        steps[state]
+                            .formula
+                            .as_ref()
+                            .expect("reached state lacks its transition")
+                            .clone(),
+                    );
+                    state = parent;
+                }
+            }
+        }
+        reverse.reverse();
+        reverse
     }
 }

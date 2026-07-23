@@ -424,26 +424,7 @@ fn identity_top_symbol(e: &Engine, symbol: SymbolId) -> Option<SymbolId> {
 /// `BinarySymbol::hasUnequal{Left,Right}IdentityCollapse`: whether collapsing the identity on the
 /// selected side can change the other argument's sort.
 fn unequal_identity_collapse(e: &Engine, symbol: SymbolId, identity_on_left: bool) -> bool {
-    let Some(identity) = e.symbol(symbol).identity() else {
-        return false;
-    };
-    let signature = e.signature();
-    let identity_sort = signature.identity_sort(identity);
-    let kind = signature.sorts().kind_of(range_sort(e, symbol));
-    signature
-        .sorts()
-        .kind(kind)
-        .members
-        .iter()
-        .copied()
-        .any(|sort| {
-            let args = if identity_on_left {
-                [identity_sort, sort]
-            } else {
-                [sort, identity_sort]
-            };
-            signature.compute_sort(symbol, &args) != sort
-        })
+    super::unequal_identity_collapse(e, symbol, identity_on_left).is_some()
 }
 
 #[cfg(test)]

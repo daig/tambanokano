@@ -130,6 +130,9 @@ pub struct BuiltModule {
     /// Per-rule trace metadata, indexed by the kernel's dense rule id (populated by `load_statements`).
     /// See [`RlTrace`].
     pub rl_traces: Vec<RlTrace>,
+    /// Verbose `omod` object-completion notices for statements defined by this module. Each entry is
+    /// preformatted but unwrapped; the REPL emits it once when the defining module is entered.
+    pub oo_completion_diagnostics: Vec<String>,
     /// Built-in literal anchors (for the grammar's literal productions + `make_*` in build_term).
     pub nat_succ: Option<SymbolId>,
     pub nat_zero: Option<SymbolId>,

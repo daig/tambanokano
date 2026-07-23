@@ -623,6 +623,19 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
         // The name's tokens, however, get concatenated into the canonical string (`[bal][:_]` → `bal:_`),
         // gluing the `:` to `bal`; splitting it back out here makes the grammar terminal `:` match the
         // term's standalone `:` (object/message attribute ops `bal :_`/`turns :_`, Pillar 2.5).
+        // The lexer reserves `:=` as one token (matching conditions, strategy definitions, and ordinary
+        // user mixfix operators such as assignment). Keep the operator grammar on the same tokenization;
+        // the generic colon branch below would otherwise split `_:=_` into the unmatchable `:` + `=`.
+        if ch == ':' && chars.peek() == Some(&'=') {
+            if !pending.is_empty() {
+                frags.push(Frag::Tok(interner.intern(&pending)));
+                pending.clear();
+            }
+            chars.next();
+            frags.push(Frag::Tok(interner.intern(":=")));
+            continue;
+        }
+
         if ch == '_' || ch == ':' || is_punct(ch) {
             if !pending.is_empty() {
                 frags.push(Frag::Tok(interner.intern(&pending)));
@@ -970,6 +983,7 @@ mod tests {
         assert_eq!(frag("s_", &mut i), ["s", "_"]);
         assert_eq!(frag("-_", &mut i), ["-", "_"]);
         assert_eq!(frag("_<=_", &mut i), ["_", "<=", "_"]);
+        assert_eq!(frag("_:=_", &mut i), ["_", ":=", "_"]);
         assert_eq!(
             frag("if_then_else_fi", &mut i),
             ["if", "_", "then", "_", "else", "_", "fi"]

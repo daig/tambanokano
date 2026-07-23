@@ -254,7 +254,7 @@ impl<'a> GenBuchiAutomaton<'a> {
         self.maximally_collapse_states();
     }
 
-    fn maximally_collapse_states(&mut self) {
+    pub(super) fn maximally_collapse_states(&mut self) {
         while self.fair_transition_sets.len() < self.states.len() {
             self.collapse_states();
         }

@@ -14,13 +14,14 @@ use crate::cfparser::forest::PTree;
 use crate::cfparser::{earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt, NtType, Terminal};
-use crate::lex::{Frag, Interner, Token, tokenize};
+use crate::lex::{Frag, Interner, TokKind, Token, tokenize};
 use crate::oo_complete;
 use crate::pretty::{print_pretty, print_pretty_with_variables, print_term};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use tnk_core::dag::DagId;
 use tnk_core::engine::MatchedPortion;
@@ -308,19 +309,23 @@ pub fn load_statements_homed<'m>(
                 home_grammars.insert(home.to_string(), remapped);
             }
             if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref)
-                && load_one_stmt(stmt, m, hg, true, &oo, i).is_ok()
+                && load_one_stmt(stmt, m, hg, true, false, &oo, i).is_ok()
             {
                 continue;
             }
         }
+        let own_statement = homes
+            .get(idx)
+            .and_then(|home| home.as_deref())
+            .is_some_and(|home| home == m.name);
         // Home parsing was not applicable or failed. A statement whose flattened parse/build fails is
         // dropped (Maude warns per statement and keeps the module). `load_one_stmt` registers nothing
         // before its fallible parsing finishes, so either attempt leaves the dense trace indices intact.
-        let flat_err = match load_one_stmt(stmt, m, g, false, &oo, i) {
+        let flat_err = match load_one_stmt(stmt, m, g, false, own_statement, &oo, i) {
             Ok(()) => continue,
             Err(e) => e,
         };
-        if std::env::var("TNK_DEBUG_DROP").is_ok() {
+        if std::env::var("TNK_DEBUG_DROP").is_ok_and(|filter| filter == "1" || filter == m.name) {
             eprintln!("DROP[{}]: {flat_err}", m.name);
         }
         // Drop this statement and keep building the module (the diagnostic is phase E).
@@ -522,6 +527,7 @@ fn load_one_stmt(
     m: &mut BuiltModule,
     g: &CompiledGrammar,
     home: bool,
+    record_oo_diagnostic: bool,
     oo: &Option<tnk_core::engine::OoInfo>,
     i: &Interner,
 ) -> Result<(), String> {
@@ -554,7 +560,17 @@ fn load_one_stmt(
                 None => Vec::new(),
             };
             let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
-            if let Some(info) = oo {
+            let oo_source = (record_oo_diagnostic && oo.is_some()).then(|| {
+                let source_count = vars.count();
+                let names = oo_variable_names(m, &vars, source_count);
+                (
+                    render_oo_equation(
+                        m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label,
+                    ),
+                    source_count,
+                )
+            });
+            let oo_completed = oo.as_ref().is_some_and(|info| {
                 oo_complete::complete_statement(
                     info,
                     m,
@@ -562,7 +578,14 @@ fn load_one_stmt(
                     &mut lhs_t,
                     Some(&mut rhs_t),
                     &mut condition,
+                )
+            });
+            if oo_completed && let Some((source, source_count)) = oo_source {
+                let names = oo_variable_names(m, &vars, source_count);
+                let transformed = render_oo_equation(
+                    m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label,
                 );
+                push_oo_diagnostic(m, "equation", source, transformed);
             }
             let nr = vars.count();
             // Capture the source-form trace metadata before the Terms are moved into the kernel; the
@@ -618,7 +641,15 @@ fn load_one_stmt(
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
-            if let Some(info) = oo {
+            let oo_source = (record_oo_diagnostic && oo.is_some()).then(|| {
+                let source_count = vars.count();
+                let names = oo_variable_names(m, &vars, source_count);
+                (
+                    render_oo_membership(m, i, &lhs_t, sort_id, &condition, &names, label),
+                    source_count,
+                )
+            });
+            let oo_completed = oo.as_ref().is_some_and(|info| {
                 oo_complete::complete_statement(
                     info,
                     m,
@@ -626,7 +657,13 @@ fn load_one_stmt(
                     &mut lhs_t,
                     None,
                     &mut condition,
-                );
+                )
+            });
+            if oo_completed && let Some((source, source_count)) = oo_source {
+                let names = oo_variable_names(m, &vars, source_count);
+                let transformed =
+                    render_oo_membership(m, i, &lhs_t, sort_id, &condition, &names, label);
+                push_oo_diagnostic(m, "membership axiom", source, transformed);
             }
             let nr = vars.count();
             reject_rewrite_fragment(&condition, "membership")?;
@@ -679,7 +716,17 @@ fn load_one_stmt(
                 None => Vec::new(),
             };
             let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
-            if let Some(info) = oo {
+            let oo_source = (record_oo_diagnostic && oo.is_some()).then(|| {
+                let source_count = vars.count();
+                let names = oo_variable_names(m, &vars, source_count);
+                (
+                    render_oo_rule(
+                        m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing,
+                    ),
+                    source_count,
+                )
+            });
+            let oo_completed = oo.as_ref().is_some_and(|info| {
                 oo_complete::complete_statement(
                     info,
                     m,
@@ -687,7 +734,14 @@ fn load_one_stmt(
                     &mut lhs_t,
                     Some(&mut rhs_t),
                     &mut condition,
+                )
+            });
+            if oo_completed && let Some((source, source_count)) = oo_source {
+                let names = oo_variable_names(m, &vars, source_count);
+                let transformed = render_oo_rule(
+                    m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing,
                 );
+                push_oo_diagnostic(m, "rule", source, transformed);
             }
             let nr = vars.count();
             let variable_names: Vec<String> =
@@ -771,6 +825,162 @@ fn load_one_stmt(
         }
     }
     Ok(())
+}
+
+fn push_oo_diagnostic(
+    m: &mut BuiltModule,
+    kind: &str,
+    source: String,
+    transformed: String,
+) {
+    m.oo_completion_diagnostics.push(format!(
+        "Considering object completion on:\n  {source}\n\
+         Transformed {kind}:\n  {transformed}"
+    ));
+}
+
+fn oo_keyword(keyword: &str, label: &Option<String>) -> String {
+    label
+        .as_deref()
+        .map_or_else(|| keyword.to_string(), |label| format!("{keyword} [{label}] :"))
+}
+
+fn oo_variable_names(m: &BuiltModule, vars: &VarIndex, source_count: u32) -> Vec<String> {
+    (0..vars.count())
+        .map(|slot| {
+            let raw = vars.name(slot);
+            let base = raw.split_once(':').map_or(raw, |(base, _)| base);
+            let sort = vars.sort(slot);
+            let declared = m
+                .vars
+                .iter()
+                .any(|(name, declared_sort)| name == base && *declared_sort == sort);
+            if declared {
+                base.to_string()
+            } else if slot >= source_count {
+                format!("{base}:{}", m.engine.sorts().name(sort))
+            } else {
+                raw.to_string()
+            }
+        })
+        .collect()
+}
+
+fn print_oo_term(m: &BuiltModule, i: &Interner, term: &Term, names: &[String]) -> String {
+    print_term(m, i, term, names, false)
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn render_oo_equation(
+    m: &BuiltModule,
+    i: &Interner,
+    lhs: &Term,
+    rhs: &Term,
+    condition: &[ConditionFragment],
+    names: &[String],
+    owise: bool,
+    label: &Option<String>,
+) -> String {
+    let keyword = oo_keyword(if condition.is_empty() { "eq" } else { "ceq" }, label);
+    let mut body = format!(
+        "{keyword} {} = {}",
+        print_oo_term(m, i, lhs, names),
+        print_oo_term(m, i, rhs, names)
+    );
+    append_oo_condition(m, i, &mut body, condition, names);
+    if owise {
+        body.push_str(" [owise]");
+    }
+    body.push_str(" .");
+    body
+}
+
+fn render_oo_membership(
+    m: &BuiltModule,
+    i: &Interner,
+    lhs: &Term,
+    sort: SortId,
+    condition: &[ConditionFragment],
+    names: &[String],
+    label: &Option<String>,
+) -> String {
+    let keyword = oo_keyword(if condition.is_empty() { "mb" } else { "cmb" }, label);
+    let mut body = format!(
+        "{keyword} {} : {}",
+        print_oo_term(m, i, lhs, names),
+        m.engine.sorts().name(sort)
+    );
+    append_oo_condition(m, i, &mut body, condition, names);
+    body.push_str(" .");
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_oo_rule(
+    m: &BuiltModule,
+    i: &Interner,
+    lhs: &Term,
+    rhs: &Term,
+    condition: &[ConditionFragment],
+    names: &[String],
+    label: &Option<String>,
+    narrowing: bool,
+) -> String {
+    let keyword = oo_keyword(if condition.is_empty() { "rl" } else { "crl" }, label);
+    let mut body = format!(
+        "{keyword} {} => {}",
+        print_oo_term(m, i, lhs, names),
+        print_oo_term(m, i, rhs, names)
+    );
+    append_oo_condition(m, i, &mut body, condition, names);
+    if narrowing {
+        body.push_str(" [narrowing]");
+    }
+    body.push_str(" .");
+    body
+}
+
+fn append_oo_condition(
+    m: &BuiltModule,
+    i: &Interner,
+    body: &mut String,
+    condition: &[ConditionFragment],
+    names: &[String],
+) {
+    if condition.is_empty() {
+        return;
+    }
+    body.push_str(" if ");
+    for (position, fragment) in condition.iter().enumerate() {
+        if position != 0 {
+            body.push_str(" /\\ ");
+        }
+        match fragment {
+            ConditionFragment::Equality { lhs, rhs } => {
+                body.push_str(&print_oo_term(m, i, lhs, names));
+                body.push_str(" = ");
+                body.push_str(&print_oo_term(m, i, rhs, names));
+            }
+            ConditionFragment::SortTest { term, sort } => {
+                body.push_str(&print_oo_term(m, i, term, names));
+                body.push_str(" : ");
+                body.push_str(m.engine.sorts().name(*sort));
+            }
+            ConditionFragment::Matching {
+                pattern, subject, ..
+            } => {
+                body.push_str(&print_oo_term(m, i, pattern, names));
+                body.push_str(" := ");
+                body.push_str(&print_oo_term(m, i, subject, names));
+            }
+            ConditionFragment::Rewrite { lhs, pattern, .. } => {
+                body.push_str(&print_oo_term(m, i, lhs, names));
+                body.push_str(" => ");
+                body.push_str(&print_oo_term(m, i, pattern, names));
+            }
+        }
+    }
 }
 
 /// One statement parsed into its trace form (the sum of the three engine-trace kinds). Produced by
@@ -1147,7 +1357,57 @@ fn parse_forest_any(
             .join(" ")
     };
     let chart = earley::parse(g, tokens, Nt::Term, i);
+    if !chart.recognized(g, Nt::Term) {
+        let at = chart.furthest();
+        let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
+        return Err(format!(
+            "no parse at token {at} (`{token}`): `{}`",
+            rendered()
+        ));
+    }
     forest::extract(g, &chart, tokens.len(), Nt::Term).map_err(|e| format!("{e}: `{}`", rendered()))
+}
+
+/// Maude accepts an omitted third argument in object syntax (`< O : C | >`) as the empty
+/// `AttributeSet`. The mixfix grammar still sees `<_:_|_>` as an ordinary three-hole operator, so
+/// materialize its identity token before parsing. The borrowed common path keeps non-object terms free
+/// of token copies.
+fn fill_empty_object_attributes<'a>(
+    tokens: &'a [Token],
+    m: &BuiltModule,
+    i: &Interner,
+) -> Cow<'a, [Token]> {
+    let Some(none) = m
+        .engine
+        .oo_info()
+        .and_then(|info| info.none_sym)
+        .and_then(|symbol| i.get(m.engine.symbol(symbol).name()))
+    else {
+        return Cow::Borrowed(tokens);
+    };
+    if !tokens
+        .windows(2)
+        .any(|pair| pair[0].text(i) == "|" && pair[1].text(i) == ">")
+    {
+        return Cow::Borrowed(tokens);
+    }
+
+    let mut filled = Vec::with_capacity(tokens.len() + 1);
+    for (index, token) in tokens.iter().copied().enumerate() {
+        filled.push(token);
+        if token.text(i) == "|"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| next.text(i) == ">")
+        {
+            filled.push(Token {
+                sym: none,
+                line: token.line,
+                kind: TokKind::Ident,
+            });
+        }
+    }
+    Cow::Owned(filled)
 }
 
 /// Parse a term token bubble and build its kernel [`Term`] (the statement/pattern path).
@@ -1158,7 +1418,8 @@ pub(crate) fn parse_build(
     i: &Interner,
     vars: &mut VarIndex,
 ) -> Result<Term, String> {
-    build_term(&parse_forest(tokens, g, i)?, g, m, tokens, i, vars)
+    let tokens = fill_empty_object_attributes(tokens, m, i);
+    build_term(&parse_forest(&tokens, g, i)?, g, m, &tokens, i, vars)
 }
 
 /// The kind of a built term's top — its top symbol's range, or `None` for a bare variable (whose kind we
@@ -1180,13 +1441,14 @@ fn parse_build_rhs(
     i: &Interner,
     vars: &mut VarIndex,
 ) -> Result<Term, String> {
+    let rhs = fill_empty_object_attributes(rhs, m, i);
     if let Some(k) = term_kind(lhs, m) {
         let start = Nt::Comp(k, NtType::Term);
-        if let Ok(tree) = parse_forest_at(rhs, g, i, start) {
-            return build_term(&tree, g, m, rhs, i, vars);
+        if let Ok(tree) = parse_forest_at(&rhs, g, i, start) {
+            return build_term(&tree, g, m, &rhs, i, vars);
         }
     }
-    parse_build(rhs, g, m, i, vars)
+    parse_build(&rhs, g, m, i, vars)
 }
 
 /// Like [`parse_forest`] but starting at an arbitrary nonterminal (a per-kind term nonterminal), to parse
@@ -1201,6 +1463,11 @@ fn parse_forest_at(
         return Err("empty term".into());
     }
     let chart = earley::parse(g, tokens, start, i);
+    if !chart.recognized(g, start) {
+        let at = chart.furthest();
+        let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
+        return Err(format!("no parse at token {at} (`{token}`)"));
+    }
     let parsed = forest::extract(g, &chart, tokens.len(), start).map_err(|e| format!("{e}"))?;
     if parsed.ambiguous {
         return Err("ambiguous parse".into());

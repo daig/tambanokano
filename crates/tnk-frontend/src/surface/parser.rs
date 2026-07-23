@@ -31,9 +31,8 @@ pub struct Parser<'a> {
     i: &'a Interner,
 }
 
-/// The index of a top-level token (depth 0 over `()`/`[]`/`{}`) whose text is `kw` — the `last`
-/// occurrence (the equation separator `=`, *past* the `=[` of a `_=[_]_` in the lhs) or the first (the
-/// `ceq` `if`). Used to split a [`Parser::collect_to_dot`] statement body.
+/// The index of the first or last top-level token (depth 0 over `()`/`[]`/`{}`) whose text is `kw`.
+/// Used to split a [`Parser::collect_to_dot`] statement body.
 fn top_level_find(toks: &[Token], i: &Interner, kw: &str, last: bool) -> Option<usize> {
     let mut depth = 0i32;
     let mut found = None;
@@ -53,7 +52,22 @@ fn top_level_find(toks: &[Token], i: &Interner, kw: &str, last: bool) -> Option<
     found
 }
 
-/// Peel a trailing top-level statement-attribute group `[ owise | nonexec | metadata … ]` off `body`,
+/// Locate the statement-level `=` in an equation bubble. It is normally the first top-level `=`;
+/// choosing the last one misclassifies unparenthesized mixfix operators in the right-hand side (for
+/// example `eq p = while Q = 0 do … od`). The one exceptional shape needed by Maude's built-in syntax
+/// is `_=[_]_` on the left: when the first `=` opens a bracketed argument and another separator follows
+/// that argument, use the latter. If no later `=` exists, the bracket starts an ordinary right-hand side.
+fn equation_separator(toks: &[Token], i: &Interner) -> Option<usize> {
+    let first = top_level_find(toks, i, "=", false)?;
+    if toks.get(first + 1).map(|token| token.text(i)) == Some("[")
+        && let Some(later) = top_level_find(&toks[first + 1..], i, "=", false)
+    {
+        return Some(first + 1 + later);
+    }
+    Some(first)
+}
+
+/// Peel a trailing top-level statement-attribute group `[ owise | nonexec | dnt | metadata … ]` off `body`,
 /// returning the execution-relevant flags. A trailing `[ … ]` is attributes **only** when its first
 /// inner token is a statement-attribute keyword — otherwise it is a `[_]`-list / `{_}`-set *term* (e.g.
 /// the rhs of `eq reverse([E P]) = [$reverse(P, E)] .`), which is left in `body`.
@@ -90,6 +104,7 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
                 | "format"
                 | "variant"
                 | "narrowing"
+                | "dnt"
         )
     };
     if !body
@@ -1288,9 +1303,8 @@ impl<'a> Parser<'a> {
                 let leading = self.peel_leading_label()?;
                 // Collect the whole statement body (depth-aware over `()[]{}`) and split it, rather than
                 // streaming to the first `=`/`[`: a `[_]`-list term (`eq reverse([]) = [] .`) has top-level
-                // brackets in the rhs, and the `_=[_]_` operator (`eq X =[Z] Y = … .`) puts a top-level `=`
-                // in the lhs. So: peel a trailing `[attrs]` (only when it really is attributes, not a list),
-                // split a `ceq` at the top-level `if`, and split lhs/rhs at the **last** top-level `=`.
+                // brackets in the rhs. Peel a trailing `[attrs]` only when it really is attributes, then
+                // let `equation_separator` distinguish the statement delimiter from `_=[_]_` on the lhs.
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
@@ -1308,8 +1322,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let eq =
-                    top_level_find(&body, self.i, "=", true).ok_or("equation is missing `=`")?;
+                let eq = equation_separator(&body, self.i).ok_or("equation is missing `=`")?;
                 let rhs = body.split_off(eq + 1);
                 body.pop(); // the `=`
                 m.statements.push(Statement::Eq {
@@ -1992,8 +2005,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Optional trailing statement attributes `[ … ]` on an `eq`/`mb`/`rl`. `owise`, `nonexec`,
-    /// equation `variant`, rule `narrowing`, and the `label` name are retained; `metadata` and
-    /// presentation-only attributes (`format`, …) are parsed and ignored. Absent `[` ⇒ defaults.
+    /// equation `variant`, rule `narrowing`, and the `label` name are retained; `dnt`, `metadata`, and
+    /// presentation-only attributes (`format`, …) are parsed but ignored. Absent `[` ⇒ defaults.
     fn stmt_attrs(&mut self) -> PResult<StmtAttrs> {
         let mut sa = StmtAttrs::default();
         if !self.at("[") {
@@ -2053,6 +2066,7 @@ impl<'a> Parser<'a> {
                                 | "format"
                                 | "variant"
                                 | "narrowing"
+                                | "dnt"
                         );
                         if t.kind != TokKind::Str && is_attr_kw {
                             break;

@@ -94,7 +94,7 @@ pub struct Repl {
     verbose: bool,
     /// Unequal identity-collapse notices already emitted by a lazy symbolic command. Maude
     /// computes this property once per operator, so `set verbose on` prints each notice once.
-    reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId)>,
+    reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId, bool)>,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -325,8 +325,13 @@ impl Repl {
                 TopItem::Command(c) => self.run_command(c, &mut output),
             }
         }
+        let output = if output.ends_with("\n\n") {
+            output
+        } else {
+            output.trim_end().to_string()
+        };
         Eval {
-            output: output.trim_end().to_string(),
+            output,
             exit: false,
         }
     }
@@ -369,11 +374,15 @@ impl Repl {
         };
         match built {
             Ok(lm) => {
+                if self.verbose && !lm.built.oo_completion_diagnostics.is_empty() {
+                    out.push_str(&lm.built.oo_completion_diagnostics.join("\n\n"));
+                    out.push_str("\n\n");
+                }
                 if !self.modules.contains_key(&name) {
                     self.order.push(name.clone());
                 }
                 self.reported_identity_collapses
-                    .retain(|(module, _)| module != &name);
+                    .retain(|(module, _, _)| module != &name);
                 self.modules.insert(name.clone(), lm);
                 self.current = Some(name.clone());
             }
@@ -442,7 +451,7 @@ impl Repl {
             match built {
                 Ok(lm) => {
                     self.reported_identity_collapses
-                        .retain(|(module, _)| module != &name);
+                        .retain(|(module, _, _)| module != &name);
                     self.modules.insert(name, lm);
                     rebuilt = true;
                 }
@@ -543,17 +552,51 @@ impl Repl {
                         &mut self.meta_state,
                     );
                     let result = lm.built.engine.reduce_with(dag, &mut descent);
-                    (result, lm.built.engine.rewrites())
+                    let rewrites = lm.built.engine.rewrites();
+                    let model_stats = lm.built.engine.take_model_check_stats();
+                    let sat_stats = lm.built.engine.take_sat_solve_stats();
+                    (result, rewrites, model_stats, sat_stats)
                 });
                 match reduced {
-                    Ok((dag, rw)) => {
+                    Ok((dag, rw, model_stats, sat_stats)) => {
+                        let mut identity_diagnostics = String::new();
+                        if self.verbose {
+                            append_verbose_identity_collapse_diagnostics(
+                                lm,
+                                &cur,
+                                &mut self.reported_identity_collapses,
+                                &mut identity_diagnostics,
+                            );
+                        }
+                        let mut verbose_stats = String::new();
+                        if self.verbose {
+                            for stats in model_stats {
+                                verbose_stats.push_str(&format!(
+                                    "ModelChecker: Property automaton has {} state{}.\n\
+                                     ModelCheckerSymbol: Examined {} system state{}.\n",
+                                    stats.property_automaton_states,
+                                    if stats.property_automaton_states == 1 { "" } else { "s" },
+                                    stats.examined_system_states,
+                                    if stats.examined_system_states == 1 { "" } else { "s" },
+                                ));
+                            }
+                            for stats in sat_stats {
+                                verbose_stats.push_str(&format!(
+                                    "SatSolverSymbol: Generalized Buchi automaton has {} state{} and {} fairness set{}.\n",
+                                    stats.generalized_buchi_states,
+                                    if stats.generalized_buchi_states == 1 { "" } else { "s" },
+                                    stats.fairness_sets,
+                                    if stats.fairness_sets == 1 { "" } else { "s" },
+                                ));
+                            }
+                        }
                         let events = lm.built.engine.take_trace();
                         let trace = render_trace(&lm.built, &self.interner, &events, self.trace, self.color);
                         let eng = &lm.built.engine;
                         let sort = eng.sorts().name(eng.sort_of(dag)).to_string();
                         let value = print_pretty(&lm.built, &self.interner, dag, self.color);
                         out.push_str(&format!(
-                            "reduce in {cur} : {echo} .\n{trace}\
+                            "{identity_diagnostics}reduce in {cur} : {echo} .\n{trace}{verbose_stats}\
                              rewrites: {rw} in 0ms cpu (0ms real) (~ rewrites/second)\n\
                              result {sort}: {value}\n"
                         ));
@@ -1550,27 +1593,38 @@ impl Repl {
 fn append_verbose_identity_collapse_diagnostics(
     lm: &LoadedModule,
     module: &str,
-    reported: &mut HashSet<(String, tnk_core::symbol::SymbolId)>,
+    reported: &mut HashSet<(String, tnk_core::symbol::SymbolId, bool)>,
     out: &mut String,
 ) {
-    let mut symbols: Vec<_> = lm.built.ops.values().copied().collect();
+    let mut symbols: Vec<_> = lm.built.syntax.keys().copied().collect();
     symbols.sort_unstable();
     symbols.dedup();
     for symbol in symbols {
-        let Some((result, collapsed)) =
-            tnk_core::unify::unequal_left_identity_collapse(&lm.built.engine, symbol)
-        else {
-            continue;
-        };
-        if !reported.insert((module.to_string(), symbol)) {
-            continue;
+        for (left, collapse) in [
+            (
+                true,
+                tnk_core::unify::unequal_left_identity_collapse(&lm.built.engine, symbol),
+            ),
+            (
+                false,
+                tnk_core::unify::unequal_right_identity_collapse(&lm.built.engine, symbol),
+            ),
+        ] {
+            let Some((result, collapsed)) = collapse else {
+                continue;
+            };
+            if !reported.insert((module.to_string(), symbol, left)) {
+                continue;
+            }
+            let name = lm.built.engine.symbol(symbol).name().replace(',', "`,");
+            out.push_str(&format!(
+                "op {} {}-identity collapse from {} to {} is unequal.\n",
+                name,
+                if left { "left" } else { "right" },
+                lm.built.engine.sorts().name(result),
+                lm.built.engine.sorts().name(collapsed),
+            ));
         }
-        out.push_str(&format!(
-            "op {} left-identity collapse from {} to {} is unequal.\n",
-            lm.built.engine.symbol(symbol).name(),
-            lm.built.engine.sorts().name(result),
-            lm.built.engine.sorts().name(collapsed),
-        ));
     }
 }
 
@@ -1578,7 +1632,7 @@ fn append_verbose_identity_collapse_diagnostics(
 /// consecutive blocks by a single newline.
 fn append_block(out: &mut String, block: &str) {
     if !block.is_empty() {
-        if !out.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
         out.push_str(block);

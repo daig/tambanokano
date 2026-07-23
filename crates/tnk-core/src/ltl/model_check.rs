@@ -6,7 +6,7 @@ use crate::dag::{DagId, NaValue};
 use crate::descent::DescentOps;
 use crate::engine::{ModelCheckStats, Runtime, Signature};
 use crate::root::RootGuard;
-use crate::search::{GraphContext, StateGraph};
+use crate::search::{GraphContext, RawSuccessors, StateGraph};
 use crate::symbol::ModelCheckerHooks;
 use std::collections::{BTreeSet, VecDeque};
 
@@ -72,11 +72,13 @@ struct ActiveGraphContext<'runtime, 'signature, 'descent> {
 }
 
 impl GraphContext for ActiveGraphContext<'_, '_, '_> {
-    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
-        let mut successors = Vec::new();
+    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors {
         self.runtime
-            .state_successors(self.signature, root, &mut successors);
-        successors
+            .state_successors_deferred(self.signature, root)
+    }
+
+    fn graph_replay_rewrites(&mut self, rewrites: u64) {
+        self.runtime.add_rewrites(rewrites);
     }
 
     fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {

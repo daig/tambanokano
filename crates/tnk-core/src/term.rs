@@ -22,6 +22,11 @@ pub struct Var {
     pub sort: SortId,
 }
 
+enum InstantiatedBase<'a> {
+    Term(&'a Term),
+    Dag(DagId),
+}
+
 /// A static term / pattern. `Eq`/`Hash` are **structural** (two syntactically-identical terms compare
 /// equal), used to detect a repeated subterm in an equation's rhs (the engine's `term_has_repeated_subterm`)
 /// so the C7 dedup memo is enabled only for rhs's that actually share — `fib`'s `s(N + M)` does not.
@@ -488,6 +493,134 @@ impl Runtime {
         true
     }
 
+    /// Resolve Maude `TermBag` left-to-right sharing candidates to already-reduced sub-DAGs of the
+    /// matched equation subject. Only reduced nodes are reusable: sharing a lazy lhs occurrence into
+    /// an eager rhs position would incorrectly skip its reduction.
+    pub(crate) fn find_reduced_instances<'t>(
+        &self,
+        sig: &Signature,
+        subject: DagId,
+        terms: &'t [Term],
+        subst: &Subst,
+    ) -> Vec<(&'t Term, DagId)> {
+        let mut found = Vec::with_capacity(terms.len());
+        for term in terms {
+            let mut stack = vec![subject];
+            while let Some(id) = stack.pop() {
+                let node = self.node(id);
+                let current = if node.reduced_epoch == sig.eq_epoch() {
+                    node.nf.unwrap_or(id)
+                } else {
+                    id
+                };
+                let current_node = self.node(current);
+                if current_node.reduced_epoch == sig.eq_epoch()
+                    && self.instantiated_term_equal(term, current, subst)
+                {
+                    found.push((term, current));
+                    break;
+                }
+                stack.extend(current_node.children());
+            }
+        }
+        found
+    }
+
+    fn instantiated_term_equal(&self, term: &Term, dag: DagId, subst: &Subst) -> bool {
+        if let NodeTerm::S {
+            symbol,
+            count,
+            arg,
+        } = &self.node(dag).term
+        {
+            let (instance_count, base) = self.instantiated_s_parts(term, *symbol, subst);
+            return instance_count == *count
+                && match base {
+                    InstantiatedBase::Term(base) => {
+                        self.instantiated_term_equal(base, *arg, subst)
+                    }
+                    InstantiatedBase::Dag(base) => self.deep_equal(base, *arg),
+                };
+        }
+
+        match term {
+            Term::Var(v) => subst
+                .get(v.index)
+                .is_some_and(|binding| self.deep_equal(binding, dag)),
+            Term::Na { symbol, value } => {
+                matches!(&self.node(dag).term,
+                    NodeTerm::Na { symbol: actual, value: actual_value }
+                        if actual == symbol && actual_value == value)
+            }
+            Term::Iter { .. } => false,
+            Term::Op { symbol, args } => {
+                let node = self.node(dag);
+                if node.symbol() != *symbol
+                    || matches!(node.term, NodeTerm::Na { .. } | NodeTerm::Var { .. })
+                {
+                    return false;
+                }
+                let mut children = node.children();
+                for arg in args {
+                    let Some(child) = children.next() else {
+                        return false;
+                    };
+                    if !self.instantiated_term_equal(arg, child, subst) {
+                        return false;
+                    }
+                }
+                children.next().is_none()
+            }
+        }
+    }
+
+    fn instantiated_s_parts<'t>(
+        &self,
+        mut term: &'t Term,
+        symbol: SymbolId,
+        subst: &Subst,
+    ) -> (Nat, InstantiatedBase<'t>) {
+        let mut count = Nat::zero();
+        loop {
+            match term {
+                Term::Op {
+                    symbol: current,
+                    args,
+                } if *current == symbol && args.len() == 1 => {
+                    count = count.add(&Nat::one());
+                    term = &args[0];
+                }
+                Term::Iter {
+                    symbol: current,
+                    count: current_count,
+                    arg,
+                } if *current == symbol => {
+                    count = count.add(current_count);
+                    term = arg;
+                }
+                Term::Var(var) => {
+                    let mut dag = subst
+                        .get(var.index)
+                        .expect("bound lhs variable missing during rhs sharing");
+                    loop {
+                        match &self.node(dag).term {
+                            NodeTerm::S {
+                                symbol: current,
+                                count: current_count,
+                                arg,
+                            } if *current == symbol => {
+                                count = count.add(current_count);
+                                dag = *arg;
+                            }
+                            _ => return (count, InstantiatedBase::Dag(dag)),
+                        }
+                    }
+                }
+                _ => return (count, InstantiatedBase::Term(term)),
+            }
+        }
+    }
+
     /// Build a DAG instance of `term` under `subst` (the rhs of a matched equation).
     ///
     /// Recurses on *rhs* depth only (author-controlled, small), so like [`Engine::match_pattern`] it
@@ -517,6 +650,38 @@ impl Runtime {
         }
     }
 
+    /// Instantiate an rhs while reusing exact, already-reduced lhs subterms saved by the equation
+    /// matcher, mirroring Maude's `TermBag`/protected-variable path.
+    pub(crate) fn instantiate_reusing(
+        &mut self,
+        sig: &Signature,
+        term: &Term,
+        subst: &Subst,
+        reuse: &[(&Term, DagId)],
+    ) -> DagId {
+        if let Some((_, dag)) = reuse.iter().find(|(candidate, _)| *candidate == term) {
+            return *dag;
+        }
+        match term {
+            Term::Var(v) => subst
+                .get(v.index)
+                .expect("unbound variable in instantiation"),
+            Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
+            Term::Iter { symbol, count, arg } => {
+                let arg = self.instantiate_reusing(sig, arg, subst, reuse);
+                self.make_s(sig, *symbol, count.clone(), arg)
+            }
+            Term::Op { symbol, args } => {
+                let arg_ids = args
+                    .iter()
+                    .map(|arg| self.instantiate_reusing(sig, arg, subst, reuse))
+                    .collect();
+                self.rebuild(sig, *symbol, arg_ids)
+            }
+        }
+    }
+
+
     /// [`instantiate`](Self::instantiate) with Maude's `RhsBuilder` CSE: each **textually repeated**
     /// compound subterm of the rhs is built once and reused (so it reduces once and counts once —
     /// §3.9.5, the `< g(X), g(X) >` case), while *distinct* rhs subterms that merely instantiate to
@@ -524,6 +689,26 @@ impl Runtime {
     /// `(I * M + J * N) / (N * M)` on `1/6 + 1/6` reduces `1 * 6` twice, exactly like Maude (a
     /// value-keyed dedup window here undercounted by one).
     pub(crate) fn instantiate_cse(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
+        self.instantiate_cse_with_reuse(sig, term, subst, &[])
+    }
+
+    pub(crate) fn instantiate_cse_reusing(
+        &mut self,
+        sig: &Signature,
+        term: &Term,
+        subst: &Subst,
+        reuse: &[(&Term, DagId)],
+    ) -> DagId {
+        self.instantiate_cse_with_reuse(sig, term, subst, reuse)
+    }
+
+    fn instantiate_cse_with_reuse(
+        &mut self,
+        sig: &Signature,
+        term: &Term,
+        subst: &Subst,
+        reuse: &[(&Term, DagId)],
+    ) -> DagId {
         let mut counts: HashMap<&Term, u32> = HashMap::new();
         let mut stack = vec![term];
         while let Some(cur) = stack.pop() {
@@ -551,7 +736,7 @@ impl Runtime {
             .map(|(&t, _)| t)
             .collect();
         let mut memo: Vec<(&Term, DagId)> = Vec::new();
-        self.instantiate_cse_rec(sig, term, subst, &repeated, &mut memo)
+        self.instantiate_cse_rec(sig, term, subst, &repeated, &mut memo, reuse)
     }
 
     fn instantiate_cse_rec<'t>(
@@ -561,7 +746,11 @@ impl Runtime {
         subst: &Subst,
         repeated: &[&'t Term],
         memo: &mut Vec<(&'t Term, DagId)>,
+        reuse: &[(&Term, DagId)],
     ) -> DagId {
+        if let Some((_, dag)) = reuse.iter().find(|(candidate, _)| *candidate == term) {
+            return *dag;
+        }
         let shared = matches!(term, Term::Op { .. } | Term::Iter { .. })
             && repeated.iter().any(|r| *r == term);
         if shared && let Some(&(_, d)) = memo.iter().find(|(k, _)| *k == term) {
@@ -573,13 +762,13 @@ impl Runtime {
                 .expect("unbound variable in instantiation"),
             Term::Na { symbol, value } => self.make_na(sig, *symbol, value.clone()),
             Term::Iter { symbol, count, arg } => {
-                let arg = self.instantiate_cse_rec(sig, arg, subst, repeated, memo);
+                let arg = self.instantiate_cse_rec(sig, arg, subst, repeated, memo, reuse);
                 self.make_s(sig, *symbol, count.clone(), arg)
             }
             Term::Op { symbol, args } => {
                 let arg_ids: Vec<DagId> = args
                     .iter()
-                    .map(|a| self.instantiate_cse_rec(sig, a, subst, repeated, memo))
+                    .map(|a| self.instantiate_cse_rec(sig, a, subst, repeated, memo, reuse))
                     .collect();
                 self.rebuild(sig, *symbol, arg_ids)
             }

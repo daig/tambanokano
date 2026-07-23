@@ -42,6 +42,48 @@ use crate::symbol::{IdentityId, SymbolId, Theory};
 use crate::term::Term;
 use std::collections::BTreeSet;
 
+/// Maude's deferred `BinarySymbol::hasUnequal{Left,Right}IdentityCollapse` sort check. Returns the
+/// first `(computed result, collapsed argument)` pair whose sorts differ. `identity_on_left` selects
+/// `f(identity, x)` rather than `f(x, identity)`.
+pub fn unequal_identity_collapse(
+    e: &Engine,
+    symbol: SymbolId,
+    identity_on_left: bool,
+) -> Option<(SortId, SortId)> {
+    let identity = if identity_on_left {
+        e.symbol(symbol).left_identity()
+    } else {
+        e.symbol(symbol).right_identity()
+    }?;
+    let signature = e.signature();
+    let identity_sort = signature.identity_sort(identity);
+    let range = e.symbol(symbol).decls()[0].range;
+    let kind = signature.sorts().kind_of(range);
+    signature
+        .sorts()
+        .kind(kind)
+        .index_order
+        .iter()
+        .copied()
+        .find_map(|sort| {
+            let args = if identity_on_left {
+                [identity_sort, sort]
+            } else {
+                [sort, identity_sort]
+            };
+            let result = signature.compute_sort(symbol, &args);
+            (result != sort).then_some((result, sort))
+        })
+}
+
+/// Right-collapse counterpart used by Maude's lazy verbose sort diagnostic. Commutative operators
+/// perform only the left check because the two collapse positions are equivalent.
+pub fn unequal_right_identity_collapse(e: &Engine, symbol: SymbolId) -> Option<(SortId, SortId)> {
+    (!e.symbol(symbol).is_commutative())
+        .then(|| unequal_identity_collapse(e, symbol, false))
+        .flatten()
+}
+
 /// Session name-code source: interns a fresh-variable name (`#1`, `%2`, …) and returns its code —
 /// the same code space user variables' base names were interned into (the frontend's `Interner`),
 /// so variable ordering (`dag_compare` on name codes) mirrors Maude's token-code order.

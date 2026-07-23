@@ -17,7 +17,7 @@ use crate::descent::{DescentOps, NullDescent};
 use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
-use crate::search::{Arrow, Search};
+use crate::search::{Arrow, RawSuccessor, RawSuccessors, Search};
 use crate::smt::{SmtInfo, SmtNumber, SmtOp, SmtType};
 use crate::smt_search::SmtSearch;
 use crate::sort::{KindId, SortId, Sorts};
@@ -238,6 +238,10 @@ struct CompiledEquation {
     /// CSE), which `reduce` then normalizes once. `false` (the common case — e.g. `fib`'s `s(N + M)`,
     /// which shares nothing) takes the plain instantiate path with zero dedup overhead.
     rhs_shares: bool,
+    /// Non-ground compound rhs subterms that also occur below the equation lhs root. Maude's
+    /// `TermBag`/`RhsBuilder` reuses those already-reduced matched DAGs instead of constructing fresh
+    /// copies; the reuse is byte-visible in rewrite counts.
+    lhs_reuse: Vec<Term>,
 }
 
 /// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
@@ -683,6 +687,13 @@ pub struct ModelCheckStats {
     pub examined_system_states: usize,
 }
 
+/// One completed LTL satisfiability operation's deterministic automaton statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SatSolveStats {
+    pub generalized_buchi_states: usize,
+    pub fairness_sets: usize,
+}
+
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
 /// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
 /// `&Signature`; everything else is pure arena work.
@@ -715,6 +726,8 @@ pub(crate) struct Runtime {
     narrowing_count: u64,
     /// Completed model-check statistics waiting for the command layer to consume them.
     model_check_stats: Vec<ModelCheckStats>,
+    /// Completed satisfiability statistics waiting for the command layer to consume them.
+    sat_solve_stats: Vec<SatSolveStats>,
     /// Next value for the `counter` built-in (Maude's `CounterSymbol`): each `rewrite`/`frewrite` step
     /// that fires a `counter` redex yields this and increments it. Reset to 0 at the start of each
     /// top-level rewriting command (not on `continue`). Inert under equational `reduce`.
@@ -832,6 +845,48 @@ fn term_has_repeated_subterm(t: &Term) -> bool {
         }
     }
     false
+}
+
+/// Textually equal, non-ground compound terms available for Maude's equation left-to-right sharing.
+/// The lhs root itself is not inserted by `findAvailableTerms(..., atTop = true)`; variables already
+/// share through the substitution and need no entry.
+fn lhs_rhs_shared_subterms(lhs: &Term, rhs: &Term) -> Vec<Term> {
+    fn has_variable(term: &Term) -> bool {
+        match term {
+            Term::Var(_) => true,
+            Term::Op { args, .. } => args.iter().any(has_variable),
+            Term::Iter { arg, .. } => has_variable(arg),
+            Term::Na { .. } => false,
+        }
+    }
+
+    fn push_children<'a>(term: &'a Term, stack: &mut Vec<&'a Term>) {
+        match term {
+            Term::Op { args, .. } => stack.extend(args),
+            Term::Iter { arg, .. } => stack.push(arg),
+            Term::Var(_) | Term::Na { .. } => {}
+        }
+    }
+
+    let mut available: HashSet<&Term> = HashSet::new();
+    let mut stack = Vec::new();
+    push_children(lhs, &mut stack);
+    while let Some(term) = stack.pop() {
+        if matches!(term, Term::Op { .. } | Term::Iter { .. }) && has_variable(term) {
+            available.insert(term);
+        }
+        push_children(term, &mut stack);
+    }
+
+    let mut shared = Vec::new();
+    stack.push(rhs);
+    while let Some(term) = stack.pop() {
+        if available.contains(term) && !shared.iter().any(|prior| prior == term) {
+            shared.push(term.clone());
+        }
+        push_children(term, &mut stack);
+    }
+    shared
 }
 
 // ======================================================================================
@@ -1743,6 +1798,7 @@ impl Signature {
         let id = self.next_eq_id;
         self.next_eq_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
+        let lhs_reuse = lhs_rhs_shared_subterms(&lhs, &rhs);
         // Collapse indexing (Maude's Module::indexEquation): an equation whose lhs can COLLAPSE —
         // its top operator's identity/idem axioms can erase it, leaving a term rooted elsewhere —
         // must also be offered to the symbols it can collapse to, so `eq a + X = c` (id: e) is tried
@@ -1757,6 +1813,7 @@ impl Signature {
             condition: self.compile_condition(condition, CondOwner::EqOrMb),
             owise,
             rhs_shares,
+            lhs_reuse,
         };
         for t in extra_targets {
             self.equations.entry(t).or_default().push(compiled.clone());
@@ -3422,6 +3479,8 @@ impl Runtime {
         self.rewrite_count = 0;
         self.variant_narrowing_count = 0;
         self.narrowing_count = 0;
+        self.model_check_stats.clear();
+        self.sat_solve_stats.clear();
     }
     /// Add `n` to the rewrite counter (a META-LEVEL descent function folding the object-level
     /// reduction's rewrites into the current command's total).
@@ -3429,8 +3488,13 @@ impl Runtime {
         self.rewrite_count += n;
     }
 
+
     pub(crate) fn record_model_check_stats(&mut self, stats: ModelCheckStats) {
         self.model_check_stats.push(stats);
+    }
+
+    pub(crate) fn record_sat_solve_stats(&mut self, stats: SatSolveStats) {
+        self.sat_solve_stats.push(stats);
     }
 
     // ---- reduction ----
@@ -3819,6 +3883,7 @@ impl Runtime {
                 &eq.condition,
                 &eq.rhs,
                 eq.rhs_shares,
+                &eq.lhs_reuse,
                 ext_allowed,
                 &mut subst,
                 StmtCtx {
@@ -3861,6 +3926,7 @@ impl Runtime {
         condition: &[CompiledFragment],
         rhs: &Term,
         rhs_shares: bool,
+        lhs_reuse: &[Term],
         ext_allowed: bool,
         subst: &mut Subst,
         ctx: StmtCtx<'_>,
@@ -3914,10 +3980,12 @@ impl Runtime {
             // to equal values (RAT's `I * M` vs `J * N` on `1/6 + 1/6`) stay separate nodes and count
             // separately, exactly like Maude. The flag keeps the non-sharing common case (`fib`) on
             // the plain path.
-            let built = if rhs_shares {
-                self.instantiate_cse(sig, rhs, subst)
-            } else {
-                self.instantiate(sig, rhs, subst)
+            let reuse = self.find_reduced_instances(sig, subject, lhs_reuse, subst);
+            let built = match (rhs_shares, reuse.is_empty()) {
+                (true, true) => self.instantiate_cse(sig, rhs, subst),
+                (false, true) => self.instantiate(sig, rhs, subst),
+                (true, false) => self.instantiate_cse_reusing(sig, rhs, subst, &reuse),
+                (false, false) => self.instantiate_reusing(sig, rhs, subst, &reuse),
             };
             let result = sp.build_result(self, sig, built);
             if self.tracing() {
@@ -4176,6 +4244,7 @@ impl Runtime {
                 &rule.condition,
                 &rule.rhs,
                 rule.rhs_shares,
+                &[],
                 ext_allowed,
                 &mut subst,
                 StmtCtx {
@@ -4291,6 +4360,27 @@ impl Runtime {
         root: DagId,
         out: &mut Vec<(u32, DagId)>,
     ) {
+        let batch = self.state_successors_deferred(sig, root);
+        for successor in batch.entries {
+            self.rewrite_count += successor.enumeration_rewrites;
+            out.push((successor.rule_id, successor.term));
+        }
+        self.rewrite_count += batch.tail_rewrites;
+    }
+
+    /// Eagerly materialize one state's raw rule results while deferring the equational work spent
+    /// finding them. `StateGraph` replays each prefix only when its corresponding result is consumed,
+    /// and replays the tail only when the caller asks to prove the stream exhausted. This matches
+    /// Maude's lazy `findNextRewrite` accounting without retaining matcher borrows across graph calls.
+    pub(crate) fn state_successors_deferred(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+    ) -> RawSuccessors {
+        let count_start = self.rewrite_count;
+        let mut last_count = count_start;
+        let mut entries = Vec::new();
+
         // Enumerate all non-frozen positions (a flattened parent/arg-index list for the path rebuild).
         let mut positions = vec![RedexPos {
             node: root,
@@ -4313,15 +4403,29 @@ impl Runtime {
             }
             i += 1;
         }
+
         // At each position, collect every (rule, result), splicing the result back to the root.
         for pos_idx in 0..positions.len() {
             let node = positions[pos_idx].node;
-            let mut local: Vec<(u32, DagId)> = Vec::new();
+            let mut local: Vec<(u32, DagId, u64, RootGuard)> = Vec::new();
             self.all_successors_at(sig, node, &mut local);
-            for (rule_id, result) in local {
+            for (rule_id, result, count_after_match, _result_root) in local {
                 let spliced = self.rebuild_path(sig, &positions, pos_idx, result);
-                out.push((rule_id, spliced));
+                entries.push(RawSuccessor {
+                    rule_id,
+                    term: spliced,
+                    enumeration_rewrites: count_after_match - last_count,
+                    _root: self.root(spliced),
+                });
+                last_count = count_after_match;
             }
+        }
+
+        let tail_rewrites = self.rewrite_count - last_count;
+        self.rewrite_count = count_start;
+        RawSuccessors {
+            entries,
+            tail_rewrites,
         }
     }
 
@@ -4335,10 +4439,16 @@ impl Runtime {
         self.reduce(sig, successor, descent)
     }
 
-    /// Every `(rule_id, result)` of applying any of `node`'s symbol's rules (every matcher solution) at
-    /// `node` itself — the per-node enumerator behind [`state_successors`](Self::state_successors). Each
-    /// accepted result bumps the rewrite count.
-    fn all_successors_at(&mut self, sig: &Signature, node: DagId, out: &mut Vec<(u32, DagId)>) {
+    /// Every `(rule_id, result, enumeration_rewrite_count, root)` from applying any of `node`'s rules
+    /// (every matcher solution) at `node` itself. The count snapshot lets the state graph defer
+    /// condition reductions until it consumes that result; the root keeps earlier results alive while
+    /// the matcher continues enumerating.
+    fn all_successors_at(
+        &mut self,
+        sig: &Signature,
+        node: DagId,
+        out: &mut Vec<(u32, DagId, u64, RootGuard)>,
+    ) {
         let symbol = self.node(node).symbol();
         let Some(rules) = sig.rules.get(&symbol) else {
             return;
@@ -4358,6 +4468,7 @@ impl Runtime {
                 &rule.condition,
                 &rule.rhs,
                 rule.rhs_shares,
+                &[],
                 ext_allowed,
                 &mut subst,
                 StmtCtx {
@@ -4366,10 +4477,10 @@ impl Runtime {
                     frames: &[],
                     redex: node,
                 },
-                &mut |_rt, result| {
-                    // The rewrite is counted (and the state reduced) by `reduce_successor` when the
-                    // search commits this successor — so the per-state count snapshot stays interleaved.
-                    out.push((rid, result));
+                &mut |rt, result| {
+                    // The rule itself is counted when the graph commits this result. Preserve the
+                    // equation work spent finding it as an absolute snapshot for prefix differencing.
+                    out.push((rid, result, rt.rewrite_count, rt.root(result)));
                     Flow::Continue
                 },
             );
@@ -6241,13 +6352,14 @@ impl Engine {
         self.rt.dag_hash(id)
     }
 
-    /// Every `(rule_id, successor)` one rule step from `root` (all rules × positions) — the `search`
-    /// state-expansion primitive. Successors are uncounted/unreduced; [`reduce_successor`](Self::reduce_successor)
-    /// counts and canonicalizes each as the search commits it (so per-state rewrite snapshots interleave).
-    pub(crate) fn state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
-        let mut out = Vec::new();
-        self.rt.state_successors(&self.sig, root, &mut out);
-        out
+    /// Every raw rule result one step from `root`, with equation-enumeration work deferred until the
+    /// graph consumes the corresponding result.
+    pub(crate) fn state_successors(&mut self, root: DagId) -> RawSuccessors {
+        self.rt.state_successors_deferred(&self.sig, root)
+    }
+
+    pub(crate) fn replay_graph_rewrites(&mut self, rewrites: u64) {
+        self.rt.add_rewrites(rewrites);
     }
 
     /// Count one rule application (the search successor `succ` was just produced) and reduce it to the
@@ -6730,6 +6842,11 @@ impl Engine {
     /// Take model-check statistics recorded since the previous call.
     pub fn take_model_check_stats(&mut self) -> Vec<ModelCheckStats> {
         std::mem::take(&mut self.rt.model_check_stats)
+    }
+
+    /// Take LTL satisfiability statistics recorded since the previous call.
+    pub fn take_sat_solve_stats(&mut self) -> Vec<SatSolveStats> {
+        std::mem::take(&mut self.rt.sat_solve_stats)
     }
 
     /// Open a construction-time structural-dedup window (C7): until [`end_dedup`](Self::end_dedup), DAG

@@ -11,6 +11,7 @@ mod buchi;
 mod formula;
 pub(crate) mod model_check;
 mod nat_set;
+pub(crate) mod sat_solve;
 mod scc;
 mod transition;
 mod vwaa;

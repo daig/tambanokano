@@ -158,6 +158,92 @@ impl Bdd {
     }
 }
 
+impl Bdd {
+    /// Extract the same high-first prime implicant as Maude's `Bdd::extractPrimeImplicant`
+    /// (`Utility/bdd.cc`). `None` denotes false; an empty vector denotes true. Literals are returned in
+    /// increasing proposition order as `(variable, positive)`.
+    pub(crate) fn prime_implicant_literals(&self) -> Option<Vec<(usize, bool)>> {
+        if self.is_false() {
+            return None;
+        }
+        Some(self.prime_implicant_at(self.root()))
+    }
+
+    fn prime_implicant_at(&self, node: BddNode) -> Vec<(usize, bool)> {
+        if self.is_one(node) {
+            return Vec::new();
+        }
+        debug_assert!(
+            !self.is_zero(node),
+            "cannot extract an implicant from false"
+        );
+
+        let variable = self.variable(node).expect("nonterminal BDD node");
+        let low = self.low(node).expect("nonterminal BDD node");
+        let high = self.high(node).expect("nonterminal BDD node");
+        if self.is_zero(high) {
+            let tail = self.prime_implicant_at(low);
+            let mut result = Vec::with_capacity(tail.len() + 1);
+            result.push((variable, false));
+            result.extend(tail);
+            return result;
+        }
+
+        let implicant = self.prime_implicant_at(high);
+        if self.restricted_is_true(low, &implicant, 0) {
+            return implicant;
+        }
+        let mut result = Vec::with_capacity(implicant.len() + 1);
+        result.push((variable, true));
+        result.extend(implicant);
+        result
+    }
+
+    /// Whether the subfunction rooted at `node`, restricted by the given cube, is identically true.
+    /// This is the exact predicate used by the reference's `bdd_restrict(lo, pi) == bdd_true()`.
+    fn restricted_is_true(
+        &self,
+        node: BddNode,
+        literals: &[(usize, bool)],
+        mut literal: usize,
+    ) -> bool {
+        if self.is_one(node) {
+            return true;
+        }
+        if self.is_zero(node) {
+            return false;
+        }
+        let variable = self.variable(node).expect("nonterminal BDD node");
+        while literals
+            .get(literal)
+            .is_some_and(|&(candidate, _)| candidate < variable)
+        {
+            literal += 1;
+        }
+        if let Some(&(_, positive)) = literals
+            .get(literal)
+            .filter(|&&(candidate, _)| candidate == variable)
+        {
+            let child = if positive {
+                self.high(node).expect("nonterminal BDD node")
+            } else {
+                self.low(node).expect("nonterminal BDD node")
+            };
+            self.restricted_is_true(child, literals, literal + 1)
+        } else {
+            self.restricted_is_true(
+                self.low(node).expect("nonterminal BDD node"),
+                literals,
+                literal,
+            ) && self.restricted_is_true(
+                self.high(node).expect("nonterminal BDD node"),
+                literals,
+                literal,
+            )
+        }
+    }
+}
+
 impl Ord for Bdd {
     fn cmp(&self, other: &Self) -> Ordering {
         self.raw.size().cmp(&other.raw.size()).then_with(|| {
@@ -326,5 +412,29 @@ mod tests {
             formula.high(root).unwrap().raw,
             formula.raw.high_link_of(direct_root)
         );
+    }
+
+    #[test]
+    fn prime_implicant_matches_reference_high_first_restriction() {
+        let context = BddContext::new(3);
+        let x = context.ithvar(0);
+        let y = context.ithvar(1);
+        let z = context.ithvar(2);
+        let not_x = context.not(&x);
+        // x ? y : (y | z). The high branch yields `y`; restricting the low branch by `y`
+        // makes it true, so the reference omits x from the prime implicant.
+        let formula = context.or(
+            &context.and(&x, &y),
+            &context.and(&not_x, &context.or(&y, &z)),
+        );
+        assert_eq!(formula.prime_implicant_literals(), Some(vec![(1, true)]));
+
+        let negative = context.and(&not_x, &y);
+        assert_eq!(
+            negative.prime_implicant_literals(),
+            Some(vec![(0, false), (1, true)])
+        );
+        assert_eq!(context.true_bdd().prime_implicant_literals(), Some(vec![]));
+        assert_eq!(context.false_bdd().prime_implicant_literals(), None);
     }
 }

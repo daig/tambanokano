@@ -204,6 +204,17 @@ pub struct ModelCheckerHooks {
     pub true_term: SymbolId,
 }
 
+/// Symbols attached to Maude's `SatSolverSymbol`. The temporal hooks recognize negative-normal-form
+/// formulae; the remaining hooks construct `model(lead-in, cycle)` or the attached `false` result.
+#[derive(Debug, Clone)]
+pub struct SatSolverHooks {
+    pub temporal: crate::ltl::TemporalHooks,
+    pub formula_list_symbol: SymbolId,
+    pub nil_formula_list_symbol: SymbolId,
+    pub model_symbol: SymbolId,
+    pub false_term: SymbolId,
+}
+
 /// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam
 /// as a typed enum resolved at module-build time and dispatched by `match` in symbol reduction — not
 /// C++'s attached member-function pointers. `term-hook`/`op-hook` references are resolved to
@@ -309,6 +320,8 @@ pub enum SpecialOp {
     ModelCheck {
         hooks: std::rc::Rc<ModelCheckerHooks>,
     },
+    /// Native LTL satisfiability solving over the generalized Büchi automaton.
+    SatSolve { hooks: std::rc::Rc<SatSolverHooks> },
     /// A solver-language operator recognized from `SMT_Symbol`. T1 deliberately leaves it
     /// reduction-inert; T2's DAG translator consumes the typed operator.
     Smt { op: SmtOp },
@@ -630,6 +643,9 @@ impl Symbol {
     }
     pub fn arity(&self) -> usize {
         self.decls[0].domain.len()
+    }
+    pub(crate) fn is_commutative(&self) -> bool {
+        self.axioms.comm
     }
 
     /// The operator's declarations (≥ 1); least-sort resolution walks them in declaration order.

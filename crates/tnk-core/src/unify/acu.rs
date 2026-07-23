@@ -701,19 +701,7 @@ pub fn unequal_left_identity_collapse(
     e: &Engine,
     top: SymbolId,
 ) -> Option<(crate::sort::SortId, crate::sort::SortId)> {
-    let identity = e.symbol(top).identity()?;
-    let sig = e.signature();
-    let id_sort = sig.identity_sort(identity);
-    let kind = sig.sorts().kind_of(range_sort(e, top));
-    sig.sorts()
-        .kind(kind)
-        .members
-        .clone()
-        .into_iter()
-        .find_map(|sort| {
-            let result = sig.compute_sort(top, &[id_sort, sort]);
-            (result != sort).then_some((result, sort))
-        })
+    super::unequal_identity_collapse(e, top, true)
 }
 
 /// The operator's two-sided identity DAG (`getIdentityDag`).
