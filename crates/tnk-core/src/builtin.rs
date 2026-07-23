@@ -82,6 +82,9 @@ impl Runtime {
             // `counter` is inert under equational reduction — it only advances under `rewrite`/`frewrite`
             // (see `try_counter`), so a `reduce` leaves it as the kind constant `[Nat]: counter`.
             SpecialOp::Counter { .. } => None,
+            SpecialOp::ModelCheck { hooks } => {
+                crate::ltl::model_check::check_rewrite_system(self, sig, descent, id, hooks)
+            }
             // T1 recognizes solver-language operators but deliberately leaves them inert. T2 translates
             // these typed hooks into the selected `SmtEngine`; ordinary `reduce` must not evaluate them.
             SpecialOp::Smt { .. } => None,

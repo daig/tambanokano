@@ -5034,19 +5034,21 @@ fn install_rules(
         if nonexec || lhs.top_symbol().is_none() {
             continue;
         }
+        let shared_label = label.as_deref().map(std::rc::Rc::<str>::from);
         let trace = RlTrace {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
             condition: condition.clone(),
             var_names,
-            label,
+            label: shared_label.clone(),
             nonexec: false,
             narrowing,
         };
         let id = if condition.is_empty() {
-            m.engine.add_rule(lhs, rhs, nr)
+            m.engine.add_labelled_rule(lhs, rhs, nr, shared_label)
         } else {
-            m.engine.add_conditional_rule(lhs, rhs, nr, condition)
+            m.engine
+                .add_labelled_conditional_rule(lhs, rhs, nr, condition, shared_label)
         };
         assert_eq!(
             id as usize,

@@ -1,8 +1,14 @@
 use super::bdd::{Bdd, BddContext};
 use super::buchi::BuchiAutomaton;
-use super::formula::{FormulaId, LogicFormula};
+use super::formula::{BuiltFormula, FormulaId, LogicFormula, build_formula};
 use super::nat_set::NatSet;
-use std::collections::VecDeque;
+use crate::dag::{DagId, NaValue};
+use crate::descent::DescentOps;
+use crate::engine::{ModelCheckStats, Runtime, Signature};
+use crate::root::RootGuard;
+use crate::search::{GraphContext, StateGraph};
+use crate::symbol::ModelCheckerHooks;
+use std::collections::{BTreeSet, VecDeque};
 
 /// Ordinal successor and proposition access for the synchronous product checker.
 pub(crate) trait System {
@@ -57,6 +63,213 @@ impl<'a, S: System> ModelChecker<'a, S> {
             cycle: search.cycle.into_iter().collect(),
         })
     }
+}
+
+struct ActiveGraphContext<'runtime, 'signature, 'descent> {
+    runtime: &'runtime mut Runtime,
+    signature: &'signature Signature,
+    descent: &'descent mut dyn DescentOps,
+}
+
+impl GraphContext for ActiveGraphContext<'_, '_, '_> {
+    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
+        let mut successors = Vec::new();
+        self.runtime
+            .state_successors(self.signature, root, &mut successors);
+        successors
+    }
+
+    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {
+        self.runtime
+            .reduce_graph_successor(self.signature, successor, self.descent)
+    }
+
+    fn graph_dag_hash(&self, id: DagId) -> u64 {
+        self.runtime.dag_hash(id)
+    }
+
+    fn graph_deep_equal(&self, lhs: DagId, rhs: DagId) -> bool {
+        self.runtime.deep_equal(lhs, rhs)
+    }
+
+    fn graph_root(&self, id: DagId) -> RootGuard {
+        self.runtime.root(id)
+    }
+}
+
+/// Rewrite-system adapter for the generic nested DFS. Deadlock self-loops are deliberately local to
+/// this wrapper; ordinary search continues to expose a terminal state with no successors.
+struct RewriteSystem<'runtime, 'signature, 'descent, 'formula, 'hooks> {
+    graph: StateGraph,
+    runtime: &'runtime mut Runtime,
+    signature: &'signature Signature,
+    descent: &'descent mut dyn DescentOps,
+    formula: &'formula BuiltFormula,
+    hooks: &'hooks ModelCheckerHooks,
+    deadlocks: BTreeSet<usize>,
+}
+
+impl System for RewriteSystem<'_, '_, '_, '_, '_> {
+    fn get_next_state(&mut self, state: usize, transition: usize) -> Option<usize> {
+        let successor = {
+            let mut context = ActiveGraphContext {
+                runtime: &mut *self.runtime,
+                signature: self.signature,
+                descent: &mut *self.descent,
+            };
+            self.graph.get_next_state(&mut context, state, transition)
+        };
+        if let Some(successor) = successor {
+            return Some(successor.state);
+        }
+        if transition == 0
+            && self
+                .graph
+                .fwd_arcs(state)
+                .is_some_and(|arcs| arcs.is_empty())
+        {
+            self.deadlocks.insert(state);
+            return Some(state);
+        }
+        None
+    }
+
+    fn check_proposition(&mut self, state: usize, proposition: usize) -> bool {
+        let state = self.graph.state_dag(state).expect("checker state exists");
+        let proposition = self.formula.proposition(proposition);
+        let test = self.runtime.make_free(
+            self.signature,
+            self.hooks.satisfies_symbol,
+            vec![state, proposition],
+        );
+        let result = self
+            .runtime
+            .reduce(self.signature, test, &mut *self.descent);
+        self.runtime.node(result).symbol() == self.hooks.true_term
+    }
+}
+
+impl RewriteSystem<'_, '_, '_, '_, '_> {
+    fn label_dag(&mut self, source: usize, target: usize) -> DagId {
+        if source == target
+            && self.deadlocks.contains(&source)
+            && self
+                .graph
+                .fwd_arcs(source)
+                .is_some_and(|arcs| arcs.is_empty())
+        {
+            return self
+                .runtime
+                .make_free(self.signature, self.hooks.deadlock_symbol, Vec::new());
+        }
+
+        let rule = self
+            .graph
+            .arc_rules(source, target)
+            .and_then(|rules| rules.first())
+            .copied()
+            .expect("lasso transition must be a recorded state-graph arc");
+        match self.signature.rule_label(rule).cloned() {
+            Some(label) => {
+                self.runtime
+                    .make_na(self.signature, self.hooks.qid_symbol, NaValue::Qid(label))
+            }
+            None => self
+                .runtime
+                .make_free(self.signature, self.hooks.unlabeled_symbol, Vec::new()),
+        }
+    }
+
+    fn transition_dag(&mut self, source: usize, target: usize) -> DagId {
+        let state = self.graph.state_dag(source).expect("lasso state exists");
+        let label = self.label_dag(source, target);
+        self.runtime.make_free(
+            self.signature,
+            self.hooks.transition_symbol,
+            vec![state, label],
+        )
+    }
+
+    fn transition_list(&mut self, states: &[usize], final_target: usize) -> DagId {
+        if states.is_empty() {
+            return self.runtime.make_free(
+                self.signature,
+                self.hooks.nil_transition_list_symbol,
+                Vec::new(),
+            );
+        }
+        let mut transitions = Vec::with_capacity(states.len());
+        for (index, &source) in states.iter().enumerate() {
+            let target = states.get(index + 1).copied().unwrap_or(final_target);
+            transitions.push(self.transition_dag(source, target));
+        }
+        self.runtime.rebuild(
+            self.signature,
+            self.hooks.transition_list_symbol,
+            transitions,
+        )
+    }
+
+    fn result(&mut self, counterexample: Option<Counterexample>) -> DagId {
+        let Some(counterexample) = counterexample else {
+            return self
+                .runtime
+                .make_free(self.signature, self.hooks.true_term, Vec::new());
+        };
+        let cycle_start = *counterexample
+            .cycle
+            .first()
+            .expect("nested DFS counterexample has a nonempty cycle");
+        let lead_in = self.transition_list(&counterexample.lead_in, cycle_start);
+        let cycle = self.transition_list(&counterexample.cycle, cycle_start);
+        self.runtime.make_free(
+            self.signature,
+            self.hooks.counterexample_symbol,
+            vec![lead_in, cycle],
+        )
+    }
+}
+
+/// Execute one `ModelCheckerSymbol` redex directly in the active reduction context.
+pub(crate) fn check_rewrite_system(
+    runtime: &mut Runtime,
+    signature: &Signature,
+    descent: &mut dyn DescentOps,
+    redex: DagId,
+    hooks: &ModelCheckerHooks,
+) -> Option<DagId> {
+    let arguments: Vec<DagId> = runtime.node(redex).children().collect();
+    let [initial, property] = arguments.as_slice() else {
+        return None;
+    };
+
+    // The model checker searches for a behavior satisfying the negated property. Reduction through the
+    // shipped LTL equations both charges the exact rewrites and puts the formula in negative normal form.
+    let initial_root = runtime.root(*initial);
+    let negated = runtime.make_free(signature, hooks.temporal.not_symbol, vec![*property]);
+    let negated = runtime.reduce(signature, negated, descent);
+    let formula = build_formula(&*runtime, &hooks.temporal, negated)?;
+    let bdd = BddContext::new(formula.propositions_len());
+    let graph = StateGraph::new(initial_root, *initial);
+    let mut system = RewriteSystem {
+        graph,
+        runtime,
+        signature,
+        descent,
+        formula: &formula,
+        hooks,
+        deadlocks: BTreeSet::new(),
+    };
+    let mut checker = ModelChecker::new(&mut system, &bdd, &formula.formula, formula.root);
+    let property_automaton_states = checker.property_state_count();
+    let counterexample = checker.find_counterexample();
+    drop(checker);
+    let examined_system_states = system.graph.len();
+    system.runtime.record_model_check_stats(ModelCheckStats {
+        property_automaton_states,
+        examined_system_states,
+    });
+    Some(system.result(counterexample))
 }
 
 #[derive(Default)]
@@ -357,5 +570,88 @@ mod tests {
         let (_, counterexample) = check(&mut both_true, &formula, top, 2);
         assert!(counterexample.is_some());
         assert_eq!(both_true.proposition_calls, vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn production_hook_records_typed_statistics() {
+        use crate::engine::Engine;
+        use crate::symbol::{ModelCheckerHooks, SpecialOp};
+        use crate::term::{Equation, Term};
+        use std::rc::Rc;
+
+        let mut engine = Engine::new();
+        let any = engine.add_sort("Any");
+        engine.close_sorts();
+
+        let state = engine.add_op("state", vec![], any);
+        let formula_true = engine.add_op("True", vec![], any);
+        let formula_false = engine.add_op("False", vec![], any);
+        let not = engine.add_op("not", vec![any], any);
+        let next = engine.add_op("next", vec![any], any);
+        let and = engine.add_op("and", vec![any, any], any);
+        let or = engine.add_op("or", vec![any, any], any);
+        let until = engine.add_op("until", vec![any, any], any);
+        let release = engine.add_op("release", vec![any, any], any);
+        let satisfies = engine.add_op("satisfies", vec![any, any], any);
+        let qid = engine.add_op("qid", vec![], any);
+        let unlabeled = engine.add_op("unlabeled", vec![], any);
+        let deadlock = engine.add_op("deadlock", vec![], any);
+        let transition = engine.add_op("transition", vec![any, any], any);
+        let nil = engine.add_op("nil", vec![], any);
+        let transition_list = engine.add_op_au("list", vec![any, any], any, Some(nil));
+        let counterexample = engine.add_op("counterexample", vec![any, any], any);
+        let bool_true = engine.add_op("true", vec![], any);
+        let model_check = engine.add_op("modelCheck", vec![any, any], any);
+
+        engine.add_equation(Equation {
+            lhs: Term::op(not, vec![Term::constant(formula_false)]),
+            rhs: Term::constant(formula_true),
+            nr_vars: 0,
+        });
+        engine.add_labelled_rule(
+            Term::constant(state),
+            Term::constant(state),
+            0,
+            Some(Rc::from("loop")),
+        );
+        engine.set_special(
+            model_check,
+            SpecialOp::ModelCheck {
+                hooks: Rc::new(ModelCheckerHooks {
+                    temporal: crate::ltl::TemporalHooks {
+                        true_symbol: formula_true,
+                        false_symbol: formula_false,
+                        not_symbol: not,
+                        next_symbol: next,
+                        and_symbol: and,
+                        or_symbol: or,
+                        until_symbol: until,
+                        release_symbol: release,
+                    },
+                    satisfies_symbol: satisfies,
+                    qid_symbol: qid,
+                    unlabeled_symbol: unlabeled,
+                    deadlock_symbol: deadlock,
+                    transition_symbol: transition,
+                    transition_list_symbol: transition_list,
+                    nil_transition_list_symbol: nil,
+                    counterexample_symbol: counterexample,
+                    true_term: bool_true,
+                }),
+            },
+        );
+
+        let initial = engine.make_const(state);
+        let property = engine.make_const(formula_false);
+        let redex = engine.make_free(model_check, vec![initial, property]);
+        let result = engine.reduce(redex);
+        assert_eq!(engine.node(result).symbol(), counterexample);
+        assert_eq!(
+            engine.take_model_check_stats(),
+            vec![ModelCheckStats {
+                property_automaton_states: 1,
+                examined_system_states: 1,
+            }]
+        );
     }
 }

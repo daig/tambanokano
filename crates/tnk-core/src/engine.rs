@@ -283,6 +283,8 @@ enum RuleFilter {
 
 struct CompiledRule {
     id: u32,
+    /// Source rule label shared with the frontend's trace metadata; `None` for an unlabeled rule.
+    label: Option<std::rc::Rc<str>>,
     lhs: LhsAutomaton,
     rhs: Term,
     nr_vars: u32,
@@ -673,6 +675,14 @@ pub enum StmtKind {
     Rule,
 }
 
+/// One completed model-check operation's deterministic statistics. The kernel records typed data;
+/// the REPL's verbose path owns presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCheckStats {
+    pub property_automaton_states: usize,
+    pub examined_system_states: usize,
+}
+
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
 /// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
 /// `&Signature`; everything else is pure arena work.
@@ -703,6 +713,8 @@ pub(crate) struct Runtime {
     pub(crate) rewrite_count: u64,
     variant_narrowing_count: u64,
     narrowing_count: u64,
+    /// Completed model-check statistics waiting for the command layer to consume them.
+    model_check_stats: Vec<ModelCheckStats>,
     /// Next value for the `counter` built-in (Maude's `CounterSymbol`): each `rewrite`/`frewrite` step
     /// that fires a `counter` redex yields this and increments it. Reset to 0 at the start of each
     /// top-level rewriting command (not on `continue`). Inert under equational `reduce`.
@@ -1896,7 +1908,17 @@ impl Signature {
     /// [`LhsAutomaton`] through the same A3 seam as an equation, and stores it in the [`rules`](Self::rules)
     /// table — never consulted by [`reduce`](Engine::reduce), so equational reduction can never apply it.
     pub(crate) fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
-        self.push_rule(lhs, rhs, nr_vars, Vec::new())
+        self.push_rule(lhs, rhs, nr_vars, Vec::new(), None)
+    }
+
+    pub(crate) fn add_labelled_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        label: Option<std::rc::Rc<str>>,
+    ) -> u32 {
+        self.push_rule(lhs, rhs, nr_vars, Vec::new(), label)
     }
 
     /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v): the condition is the
@@ -1910,7 +1932,18 @@ impl Signature {
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
     ) -> u32 {
-        self.push_rule(lhs, rhs, nr_vars, condition)
+        self.push_rule(lhs, rhs, nr_vars, condition, None)
+    }
+
+    pub(crate) fn add_labelled_conditional_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+        label: Option<std::rc::Rc<str>>,
+    ) -> u32 {
+        self.push_rule(lhs, rhs, nr_vars, condition, label)
     }
 
     /// Compile and register a rule, returning its dense per-module **id** (the index the frontend keys
@@ -1923,6 +1956,7 @@ impl Signature {
         rhs: Term,
         nr_vars: u32,
         condition: Vec<ConditionFragment>,
+        label: Option<std::rc::Rc<str>>,
     ) -> u32 {
         self.note_substitution_layout(&lhs, nr_vars, Some(&rhs), &condition);
         let top = lhs.top_symbol().expect("rule lhs must be an application");
@@ -1933,6 +1967,7 @@ impl Signature {
         let oo = self.classify_oo_rule(&lhs);
         let compiled = CompiledRule {
             id,
+            label,
             lhs: LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables),
             rhs,
             nr_vars,
@@ -1942,6 +1977,14 @@ impl Signature {
         };
         self.rules.entry(top).or_default().push(compiled);
         id
+    }
+
+    pub(crate) fn rule_label(&self, id: u32) -> Option<&std::rc::Rc<str>> {
+        self.rules
+            .values()
+            .flatten()
+            .find(|rule| rule.id == id)
+            .and_then(|rule| rule.label.as_ref())
     }
 
     /// Retain one source rule for root rewriting modulo SMT. This table is independent of the ordinary
@@ -3386,6 +3429,10 @@ impl Runtime {
         self.rewrite_count += n;
     }
 
+    pub(crate) fn record_model_check_stats(&mut self, stats: ModelCheckStats) {
+        self.model_check_stats.push(stats);
+    }
+
     // ---- reduction ----
 
     /// The reduction core; see [`Engine::reduce`] for the contract and the iterative-vs-recursive
@@ -4238,7 +4285,12 @@ impl Runtime {
     /// some rule, at some non-frozen position, rewrites `root` to `term` (path rebuilt to the root). Every
     /// successor counts as one rewrite (Maude's search statistic). Unlike [`rewrite_step`](Self::rewrite_step)
     /// (first applicable), this enumerates all rules × all matcher solutions at all positions.
-    fn state_successors(&mut self, sig: &Signature, root: DagId, out: &mut Vec<(u32, DagId)>) {
+    pub(crate) fn state_successors(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+        out: &mut Vec<(u32, DagId)>,
+    ) {
         // Enumerate all non-frozen positions (a flattened parent/arg-index list for the path rebuild).
         let mut positions = vec![RedexPos {
             node: root,
@@ -4271,6 +4323,16 @@ impl Runtime {
                 out.push((rule_id, spliced));
             }
         }
+    }
+
+    pub(crate) fn reduce_graph_successor(
+        &mut self,
+        sig: &Signature,
+        successor: DagId,
+        descent: &mut dyn DescentOps,
+    ) -> DagId {
+        self.rewrite_count += 1;
+        self.reduce(sig, successor, descent)
     }
 
     /// Every `(rule_id, result)` of applying any of `node`'s symbol's rules (every matcher solution) at
@@ -5816,6 +5878,18 @@ impl Engine {
         self.sig.add_rule(lhs, rhs, nr_vars)
     }
 
+    /// Register an executable rule while sharing its source label with frontend trace metadata.
+    pub fn add_labelled_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        label: Option<std::rc::Rc<str>>,
+    ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        self.sig.add_labelled_rule(lhs, rhs, nr_vars, label)
+    }
+
     /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v). The condition is the
     /// same [`ConditionFragment`](crate::term::ConditionFragment) list as `ceq`, and a rule condition may
     /// additionally contain a **rewrite** fragment `t => p` (A-v).
@@ -5828,6 +5902,20 @@ impl Engine {
     ) -> u32 {
         self.rank_term_variable_sorts(&[&lhs, &rhs]);
         self.sig.add_conditional_rule(lhs, rhs, nr_vars, condition)
+    }
+
+    /// Conditional counterpart of [`add_labelled_rule`](Self::add_labelled_rule).
+    pub fn add_labelled_conditional_rule(
+        &mut self,
+        lhs: Term,
+        rhs: Term,
+        nr_vars: u32,
+        condition: Vec<ConditionFragment>,
+        label: Option<std::rc::Rc<str>>,
+    ) -> u32 {
+        self.rank_term_variable_sorts(&[&lhs, &rhs]);
+        self.sig
+            .add_labelled_conditional_rule(lhs, rhs, nr_vars, condition, label)
     }
 
     /// Retain a rule for `smt-search`, including `[nonexec]` rules. Equality conditions become solver
@@ -6166,8 +6254,8 @@ impl Engine {
     /// canonical state form. Bumping here, interleaved with the reduce, keeps each discovered state's
     /// rewrite-count snapshot faithful to Maude's incremental accounting.
     pub(crate) fn reduce_successor(&mut self, succ: DagId) -> DagId {
-        self.rt.rewrite_count += 1;
-        self.reduce(succ)
+        self.rt
+            .reduce_graph_successor(&self.sig, succ, &mut NullDescent)
     }
 
     /// Match the compiled `goal` (filtered by `such_that`) against `state`, returning `(bindings,
@@ -6637,6 +6725,11 @@ impl Engine {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
+    }
+
+    /// Take model-check statistics recorded since the previous call.
+    pub fn take_model_check_stats(&mut self) -> Vec<ModelCheckStats> {
+        std::mem::take(&mut self.rt.model_check_stats)
     }
 
     /// Open a construction-time structural-dedup window (C7): until [`end_dedup`](Self::end_dedup), DAG

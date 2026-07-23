@@ -268,10 +268,7 @@ impl<D: FormulaDag> Builder<'_, D> {
         let hash = self.dag.formula_hash(dag);
         if let Some(indices) = self.proposition_buckets.get(&hash) {
             for &index in indices {
-                if self
-                    .dag
-                    .formula_equal(self.propositions[index].dag, dag)
-                {
+                if self.dag.formula_equal(self.propositions[index].dag, dag) {
                     return self.formula.make_proposition(index);
                 }
             }
@@ -392,10 +389,7 @@ mod tests {
         let q = engine.make_const(symbols.q);
         let conjunction1 = engine.make_au(symbols.hooks.and_symbol, vec![p, q]);
         let conjunction2 = engine.make_au(symbols.hooks.and_symbol, vec![p, q]);
-        let root = engine.make_au(
-            symbols.hooks.or_symbol,
-            vec![conjunction1, conjunction2, p],
-        );
+        let root = engine.make_au(symbols.hooks.or_symbol, vec![conjunction1, conjunction2, p]);
 
         let built = build_formula(&engine, &symbols.hooks, root).unwrap();
         assert_eq!(built.formula.node(0).kind, FormulaKind::Proposition(0));
@@ -435,9 +429,15 @@ mod tests {
         let false_dag = engine.make_const(symbols.hooks.false_symbol);
         let true_formula = build_formula(&engine, &symbols.hooks, true_dag).unwrap();
         let false_formula = build_formula(&engine, &symbols.hooks, false_dag).unwrap();
-        assert_eq!(true_formula.formula.node(true_formula.root).kind, FormulaKind::True);
+        assert_eq!(
+            true_formula.formula.node(true_formula.root).kind,
+            FormulaKind::True
+        );
         assert!(true_formula.formula.node(true_formula.root).propositional);
-        assert_eq!(false_formula.formula.node(false_formula.root).kind, FormulaKind::False);
+        assert_eq!(
+            false_formula.formula.node(false_formula.root).kind,
+            FormulaKind::False
+        );
         assert!(false_formula.formula.node(false_formula.root).propositional);
 
         let p = engine.make_const(symbols.p);
@@ -461,7 +461,10 @@ mod tests {
         let unknown = engine.make_free(symbols.atom, vec![next_p]);
         let built = build_formula(&engine, &symbols.hooks, unknown).unwrap();
         assert_eq!(built.formula.len(), 1);
-        assert_eq!(built.formula.node(built.root).kind, FormulaKind::Proposition(0));
+        assert_eq!(
+            built.formula.node(built.root).kind,
+            FormulaKind::Proposition(0)
+        );
         assert_eq!(built.propositions_len(), 1);
         assert_eq!(built.proposition(0), unknown);
 

@@ -188,6 +188,22 @@ impl Symbol {
     }
 }
 
+/// Symbols attached to Maude's `ModelCheckerSymbol`. Temporal connectives are grouped in the shared
+/// formula-descent contract; the remaining hooks construct satisfaction tests and lasso results.
+#[derive(Debug, Clone)]
+pub struct ModelCheckerHooks {
+    pub temporal: crate::ltl::TemporalHooks,
+    pub satisfies_symbol: SymbolId,
+    pub qid_symbol: SymbolId,
+    pub unlabeled_symbol: SymbolId,
+    pub deadlock_symbol: SymbolId,
+    pub transition_symbol: SymbolId,
+    pub transition_list_symbol: SymbolId,
+    pub nil_transition_list_symbol: SymbolId,
+    pub counterexample_symbol: SymbolId,
+    pub true_term: SymbolId,
+}
+
 /// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam
 /// as a typed enum resolved at module-build time and dispatched by `match` in symbol reduction — not
 /// C++'s attached member-function pointers. `term-hook`/`op-hook` references are resolved to
@@ -288,6 +304,11 @@ pub enum SpecialOp {
     /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
     /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
     Division { nat: NatHooks },
+
+    /// Native LTL model checking over the module's ordinary rewrite state graph.
+    ModelCheck {
+        hooks: std::rc::Rc<ModelCheckerHooks>,
+    },
     /// A solver-language operator recognized from `SMT_Symbol`. T1 deliberately leaves it
     /// reduction-inert; T2's DAG translator consumes the typed operator.
     Smt { op: SmtOp },

@@ -9,7 +9,7 @@
 pub(crate) mod bdd;
 mod buchi;
 mod formula;
-mod model_check;
+pub(crate) mod model_check;
 mod nat_set;
 mod scc;
 mod transition;

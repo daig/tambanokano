@@ -746,19 +746,21 @@ fn load_one_stmt(
             } else {
                 (lhs_t.clone(), rhs_t.clone())
             };
+            let shared_label = label.as_deref().map(std::rc::Rc::<str>::from);
             let trace = RlTrace {
                 lhs: trace_lhs,
                 rhs: trace_rhs,
                 condition: condition.clone(),
                 var_names: variable_names,
-                label: label.clone(),
+                label: shared_label.clone(),
                 nonexec: false, // engine-registered ⇒ executable
                 narrowing: *narrowing,
             };
             let id = if condition.is_empty() {
-                m.engine.add_rule(lhs_t, rhs_t, nr)
+                m.engine.add_labelled_rule(lhs_t, rhs_t, nr, shared_label)
             } else {
-                m.engine.add_conditional_rule(lhs_t, rhs_t, nr, condition)
+                m.engine
+                    .add_labelled_conditional_rule(lhs_t, rhs_t, nr, condition, shared_label)
             };
             assert_eq!(
                 id as usize,
@@ -872,7 +874,7 @@ pub fn parse_statement_trace(
                 rhs: rhs_t,
                 condition,
                 var_names: (0..nr).map(|k| vars.name(k).to_string()).collect(),
-                label: label.clone(),
+                label: label.as_deref().map(std::rc::Rc::<str>::from),
                 nonexec: *nonexec,
                 narrowing: *narrowing,
             }))

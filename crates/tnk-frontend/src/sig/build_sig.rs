@@ -10,11 +10,12 @@ use crate::sig::syntax::{BuiltModule, IdentitySpec, SymbolSyntax};
 use crate::surface::ast::{Attrs, IdSide, PreModule, SpecialSpec};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
+use tnk_core::ltl::TemporalHooks;
 use tnk_core::smt::{SmtOp, SmtType};
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::{
-    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, NatHooks, NumOp, QidOp, SpecialOp,
-    StdStream, StrOp, SymbolId,
+    BoolHooks, CharClass, ConvOp, FltOp, MetaHooks, MetaOp, ModelCheckerHooks, NatHooks, NumOp,
+    QidOp, SpecialOp, StdStream, StrOp, SymbolId,
 };
 
 type R<T> = Result<T, String>;
@@ -843,6 +844,41 @@ fn special_op(
             SpecialOp::Meta {
                 op: meta_op(code),
                 hooks: std::rc::Rc::new(hooks),
+            }
+        }
+        "ModelCheckerSymbol" => {
+            let op_hook = |purpose: &str| -> R<SymbolId> {
+                let (_, signature) = spec
+                    .op_hooks
+                    .iter()
+                    .find(|(candidate, _)| candidate == purpose)
+                    .ok_or_else(|| format!("ModelCheckerSymbol missing op-hook {purpose}"))?;
+                resolve_op_hook_sig(signature, sym_by_profile, sorts, sort_table, i)
+                    .ok_or_else(|| format!("ModelCheckerSymbol cannot resolve op-hook {purpose}"))
+            };
+            SpecialOp::ModelCheck {
+                hooks: std::rc::Rc::new(ModelCheckerHooks {
+                    temporal: TemporalHooks {
+                        true_symbol: op_hook("trueSymbol")?,
+                        false_symbol: op_hook("falseSymbol")?,
+                        not_symbol: op_hook("notSymbol")?,
+                        next_symbol: op_hook("nextSymbol")?,
+                        and_symbol: op_hook("andSymbol")?,
+                        or_symbol: op_hook("orSymbol")?,
+                        until_symbol: op_hook("untilSymbol")?,
+                        release_symbol: op_hook("releaseSymbol")?,
+                    },
+                    satisfies_symbol: op_hook("satisfiesSymbol")?,
+                    qid_symbol: op_hook("qidSymbol")?,
+                    unlabeled_symbol: op_hook("unlabeledSymbol")?,
+                    deadlock_symbol: op_hook("deadlockSymbol")?,
+                    transition_symbol: op_hook("transitionSymbol")?,
+                    transition_list_symbol: op_hook("transitionListSymbol")?,
+                    nil_transition_list_symbol: op_hook("nilTransitionListSymbol")?,
+                    counterexample_symbol: op_hook("counterexampleSymbol")?,
+                    true_term: term_hook_sym(spec, "trueTerm", name_to_sym, i)
+                        .ok_or("ModelCheckerSymbol cannot resolve term-hook trueTerm")?,
+                }),
             }
         }
         // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a

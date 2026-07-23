@@ -91,7 +91,7 @@ pub struct RlTrace {
     pub var_names: Vec<String>,
     /// The `[label]` of a labelled rule (`rl [foo] : …`), if any — rendered in the body and on the
     /// `show path` arc.
-    pub label: Option<String>,
+    pub label: Option<std::rc::Rc<str>>,
     /// A `[nonexec]` rule — see [`EqTrace::nonexec`].
     pub nonexec: bool,
     /// A `[narrowing]` rule. It remains available to symbolic narrowing even when `nonexec` is set.

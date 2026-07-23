@@ -40,9 +40,16 @@ struct State {
     /// All forward arcs: successor state index → the rule(s) producing it (for `show search graph`,
     /// ordered for determinism).
     fwd: BTreeMap<usize, BTreeSet<u32>>,
+    /// Distinct successor states in first-rewrite-result order. Model checking consumes this ordinal
+    /// view; `fwd` retains every rule that produced each arc.
+    successor_order: Vec<usize>,
+    /// Raw, uncounted rewrite results and the next result to commit. Generated once, then consumed
+    /// lazily so search bounds and model-checker DFS charge only transitions they inspect.
+    raw: Option<Vec<(u32, DagId)>>,
+    raw_cursor: usize,
     /// BFS depth (0 = initial).
     depth: u32,
-    /// Whether this state's successors have been generated.
+    /// Whether every raw successor has been committed.
     expanded: bool,
 }
 
@@ -67,20 +74,233 @@ pub struct PathStep {
 /// the rules reaching it)`).
 pub type GraphState = (usize, DagId, Vec<(usize, Vec<u32>)>);
 
+/// The rewrite-engine operations needed by [`StateGraph`]. Implementations are statically dispatched:
+/// ordinary search uses [`Engine`], while model checking supplies the active `Runtime`/`Signature` view.
+pub(crate) trait GraphContext {
+    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)>;
+    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId;
+    fn graph_dag_hash(&self, id: DagId) -> u64;
+    fn graph_deep_equal(&self, lhs: DagId, rhs: DagId) -> bool;
+    fn graph_root(&self, id: DagId) -> RootGuard;
+}
+
+impl GraphContext for Engine {
+    fn graph_state_successors(&mut self, root: DagId) -> Vec<(u32, DagId)> {
+        self.state_successors(root)
+    }
+
+    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {
+        self.reduce_successor(successor)
+    }
+
+    fn graph_dag_hash(&self, id: DagId) -> u64 {
+        self.dag_hash(id)
+    }
+
+    fn graph_deep_equal(&self, lhs: DagId, rhs: DagId) -> bool {
+        self.deep_equal(lhs, rhs)
+    }
+
+    fn graph_root(&self, id: DagId) -> RootGuard {
+        self.root(id)
+    }
+}
+
+/// One ordinal successor returned by [`StateGraph::get_next_state`].
+pub(crate) struct GraphSuccessor {
+    pub(crate) state: usize,
+    /// True only when committing this rewrite result inserted a new canonical state.
+    pub(crate) discovered: bool,
+}
+
+/// Shared, lazily expanded reachable-state graph used by ordinary search and LTL model checking.
+pub(crate) struct StateGraph {
+    states: Vec<State>,
+    /// Hash-cons index: `dag_hash` → candidate state indices (resolved by `deep_equal`).
+    index: HashMap<u64, Vec<usize>>,
+}
+
+impl StateGraph {
+    pub(crate) fn new(root: RootGuard, term: DagId) -> Self {
+        Self {
+            states: vec![State {
+                term,
+                _root: root,
+                parent: None,
+                via: None,
+                fwd: BTreeMap::new(),
+                successor_order: Vec::new(),
+                raw: None,
+                raw_cursor: 0,
+                depth: 0,
+                expanded: false,
+            }],
+            index: HashMap::new(),
+        }
+    }
+
+    /// Return distinct successor `transition` in first-result order, lazily committing raw rule
+    /// applications until that ordinal exists or the source is exhausted. Duplicate rewrites still
+    /// count and add their rule ids to the shared forward arc.
+    pub(crate) fn get_next_state<C: GraphContext>(
+        &mut self,
+        context: &mut C,
+        state: usize,
+        transition: usize,
+    ) -> Option<GraphSuccessor> {
+        if let Some(&target) = self.states.get(state)?.successor_order.get(transition) {
+            return Some(GraphSuccessor {
+                state: target,
+                discovered: false,
+            });
+        }
+        loop {
+            if self.states[state].expanded {
+                return None;
+            }
+            if self.states[state].raw.is_none() {
+                let term = self.states[state].term;
+                self.states[state].raw = Some(context.graph_state_successors(term));
+            }
+            let next = {
+                let source = &mut self.states[state];
+                let raw = source.raw.as_ref().expect("raw successors initialized");
+                if source.raw_cursor == raw.len() {
+                    source.raw = None;
+                    source.expanded = true;
+                    None
+                } else {
+                    let next = raw[source.raw_cursor];
+                    source.raw_cursor += 1;
+                    Some(next)
+                }
+            };
+            let Some((rule_id, successor)) = next else {
+                return None;
+            };
+
+            let reduced = context.graph_reduce_successor(successor);
+            let hash = context.graph_dag_hash(reduced);
+            let existing = self.lookup(context, hash, reduced);
+            let (target, discovered) = match existing {
+                Some(target) => (target, false),
+                None => {
+                    let target = self.states.len();
+                    let depth = self.states[state].depth + 1;
+                    let root = context.graph_root(reduced);
+                    self.states.push(State {
+                        term: reduced,
+                        _root: root,
+                        parent: Some(state),
+                        via: Some(rule_id),
+                        fwd: BTreeMap::new(),
+                        successor_order: Vec::new(),
+                        raw: None,
+                        raw_cursor: 0,
+                        depth,
+                        expanded: false,
+                    });
+                    self.index.entry(hash).or_default().push(target);
+                    (target, true)
+                }
+            };
+            let distinct = !self.states[state].fwd.contains_key(&target);
+            self.states[state]
+                .fwd
+                .entry(target)
+                .or_default()
+                .insert(rule_id);
+            if !distinct {
+                continue;
+            }
+            self.states[state].successor_order.push(target);
+            debug_assert_eq!(self.states[state].successor_order.len() - 1, transition);
+            return Some(GraphSuccessor {
+                state: target,
+                discovered,
+            });
+        }
+    }
+
+    fn lookup<C: GraphContext>(&self, context: &C, hash: u64, term: DagId) -> Option<usize> {
+        for &index in self.index.get(&hash).into_iter().flatten() {
+            if context.graph_deep_equal(self.states[index].term, term) {
+                return Some(index);
+            }
+        }
+        // State 0 is seeded without its hash in `index`; check it explicitly.
+        context
+            .graph_deep_equal(self.states[0].term, term)
+            .then_some(0)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    pub(crate) fn state_dag(&self, state: usize) -> Option<DagId> {
+        self.states.get(state).map(|entry| entry.term)
+    }
+
+    pub(crate) fn state_depth(&self, state: usize) -> u32 {
+        self.states[state].depth
+    }
+
+    pub(crate) fn fwd_arcs(&self, state: usize) -> Option<&BTreeMap<usize, BTreeSet<u32>>> {
+        self.states.get(state).map(|entry| &entry.fwd)
+    }
+
+    pub(crate) fn arc_rules(&self, source: usize, target: usize) -> Option<&BTreeSet<u32>> {
+        self.states.get(source)?.fwd.get(&target)
+    }
+
+    pub(crate) fn path(&self, state: usize) -> Vec<PathStep> {
+        let mut steps = Vec::new();
+        let mut current = state;
+        if current >= self.states.len() {
+            return steps;
+        }
+        loop {
+            let entry = &self.states[current];
+            steps.push(PathStep {
+                state: current,
+                term: entry.term,
+                via: entry.via,
+            });
+            match entry.parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        steps.reverse();
+        steps
+    }
+
+    pub(crate) fn view(&self) -> Vec<GraphState> {
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| {
+                let arcs = state
+                    .fwd
+                    .iter()
+                    .map(|(&target, rules)| (target, rules.iter().copied().collect()))
+                    .collect();
+                (index, state.term, arcs)
+            })
+            .collect()
+    }
+}
+
 /// The state currently being expanded, one successor at a time (lazy generation — so a bounded
 /// `search [n]` generates only as many successors as it needs, and `continue` resumes mid-expansion).
 struct Expanding {
     state: usize,
-    depth: u32,
-    /// The raw (uncounted, unreduced) successors of `state`, generated once when expansion begins.
-    raw: Vec<(u32, DagId)>,
     cursor: usize,
 }
 
 pub struct Search {
-    states: Vec<State>,
-    /// Hash-cons index: `dag_hash` → candidate state indices (resolved by `deep_equal`).
-    index: HashMap<u64, Vec<usize>>,
+    graph: StateGraph,
     arrow: Arrow,
     goal: LhsAutomaton,
     goal_nr_vars: u32,
@@ -110,18 +330,8 @@ impl Search {
         arrow: Arrow,
         max_depth: Option<u32>,
     ) -> Self {
-        let state0 = State {
-            term,
-            _root: root,
-            parent: None,
-            via: None,
-            fwd: BTreeMap::new(),
-            depth: 0,
-            expanded: false,
-        };
         Search {
-            states: vec![state0],
-            index: HashMap::new(),
+            graph: StateGraph::new(root, term),
             arrow,
             goal,
             goal_nr_vars,
@@ -135,9 +345,8 @@ impl Search {
         }
     }
 
-    /// Total distinct states discovered so far (the `states:` statistic).
     pub fn states(&self) -> usize {
-        self.states.len()
+        self.graph.len()
     }
 
     /// The next solution, lazily generating just enough of the BFS, or `None` when the (bounded)
@@ -166,62 +375,31 @@ impl Search {
         if self.expanding.is_none() {
             // Take the next frontier state to expand. Handle one state per call (returning `true` for
             // progress) so a queued solution is never lost to an exhaustion `false` in the same call.
-            let Some(s) = self.frontier.pop_front() else {
-                return false; // nothing left to expand
+            let Some(state) = self.frontier.pop_front() else {
+                return false;
             };
-            self.states[s].expanded = true;
-            if !self.may_expand(s) {
-                return true; // depth-capped (`=>1` / `max_depth`): generate no successors
-            }
-            let raw = engine.state_successors(self.states[s].term);
-            if raw.is_empty() {
-                self.test_normal_form(engine, s); // no successors → a normal form (`=>!` candidate)
+            if !self.may_expand(state) {
                 return true;
             }
-            let depth = self.states[s].depth;
-            self.expanding = Some(Expanding {
-                state: s,
-                depth,
-                raw,
-                cursor: 0,
-            });
+            self.expanding = Some(Expanding { state, cursor: 0 });
         }
-        let exp = self.expanding.as_mut().unwrap();
-        if exp.cursor >= exp.raw.len() {
-            self.expanding = None; // finished — it had successors, so not a `=>!` normal form
-            return true;
-        }
-        let (rule_id, succ) = exp.raw[exp.cursor];
-        exp.cursor += 1;
-        let src = exp.state;
-        let succ_depth = exp.depth + 1;
-        // Count this rule application and reduce the successor to its canonical state form.
-        let reduced = engine.reduce_successor(succ);
-        let h = engine.dag_hash(reduced);
-        match self.lookup(engine, h, reduced) {
-            Some(t) => {
-                self.states[src].fwd.entry(t).or_default().insert(rule_id);
-            }
+
+        let expanding = self.expanding.as_mut().expect("expansion initialized");
+        let source = expanding.state;
+        let transition = expanding.cursor;
+        match self.graph.get_next_state(engine, source, transition) {
             None => {
-                let new_idx = self.states.len();
-                let root = engine.root(reduced);
-                self.states.push(State {
-                    term: reduced,
-                    _root: root,
-                    parent: Some(src),
-                    via: Some(rule_id),
-                    fwd: BTreeMap::new(),
-                    depth: succ_depth,
-                    expanded: false,
-                });
-                self.index.entry(h).or_default().push(new_idx);
-                self.states[src]
-                    .fwd
-                    .entry(new_idx)
-                    .or_default()
-                    .insert(rule_id);
-                self.frontier.push_back(new_idx);
-                self.test_discovered(engine, new_idx); // `=>1`/`=>+`/`=>*` test on discovery
+                self.expanding = None;
+                if transition == 0 {
+                    self.test_normal_form(engine, source);
+                }
+            }
+            Some(successor) => {
+                expanding.cursor += 1;
+                if successor.discovered {
+                    self.frontier.push_back(successor.state);
+                    self.test_discovered(engine, successor.state);
+                }
             }
         }
         true
@@ -229,7 +407,7 @@ impl Search {
 
     /// Whether state `s` may generate successors (the depth caps of `=>1` and the `[_, max_depth]` bound).
     fn may_expand(&self, s: usize) -> bool {
-        let depth = self.states[s].depth;
+        let depth = self.graph.state_depth(s);
         if self.arrow == Arrow::One && depth >= 1 {
             return false;
         }
@@ -239,8 +417,8 @@ impl Search {
     /// `=>1`/`=>+`/`=>*`: if state `s` is at a qualifying depth, match the goal and queue solutions.
     fn test_discovered(&mut self, engine: &mut Engine, s: usize) {
         let ok = match self.arrow {
-            Arrow::One => self.states[s].depth == 1,
-            Arrow::Plus => self.states[s].depth >= 1,
+            Arrow::One => self.graph.state_depth(s) == 1,
+            Arrow::Plus => self.graph.state_depth(s) >= 1,
             Arrow::Star => true,
             Arrow::Bang => false, // a `=>!` solution is a normal form (see `test_normal_form`)
         };
@@ -266,8 +444,8 @@ impl Search {
     /// reductions, which `eval_goal` snapshots per binding (§3.3 B2a). For the plain `=>1`/`=>+`/`=>*`
     /// cases the solution is found at discovery, so the live counts equal the old discovery snapshot.
     fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
-        let term = self.states[s].term;
-        let states = self.states.len();
+        let term = self.graph.state_dag(s).expect("search state exists");
+        let states = self.graph.len();
         for (bindings, rewrites) in
             engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term)
         {
@@ -282,63 +460,20 @@ impl Search {
         }
     }
 
-    /// Resolve a hash-cons hit: an existing state structurally equal to `term`.
-    fn lookup(&self, engine: &Engine, h: u64, term: DagId) -> Option<usize> {
-        for &idx in self.index.get(&h).into_iter().flatten() {
-            if engine.deep_equal(self.states[idx].term, term) {
-                return Some(idx);
-            }
-        }
-        // State 0 was seeded without its hash in `index`; check it explicitly.
-        if engine.deep_equal(self.states[0].term, term) {
-            return Some(0);
-        }
-        None
-    }
-
     /// The path from the initial state (state 0) to state `n`, following BFS-tree `parent` links — the
     /// `show path n` reconstruction. Empty if `n` is out of range.
     pub fn path(&self, n: usize) -> Vec<PathStep> {
-        let mut steps = Vec::new();
-        let mut cur = n;
-        if cur >= self.states.len() {
-            return steps;
-        }
-        loop {
-            let st = &self.states[cur];
-            steps.push(PathStep {
-                state: cur,
-                term: st.term,
-                via: st.via,
-            });
-            match st.parent {
-                Some(p) => cur = p,
-                None => break,
-            }
-        }
-        steps.reverse();
-        steps
+        self.graph.path(n)
     }
 
     /// The whole graph for `show search graph`: each state's term and its forward arcs (successor index →
     /// the rules reaching it), in state-index order.
     pub fn graph(&self) -> Vec<GraphState> {
-        self.states
-            .iter()
-            .enumerate()
-            .map(|(i, st)| {
-                let arcs = st
-                    .fwd
-                    .iter()
-                    .map(|(&t, rules)| (t, rules.iter().copied().collect()))
-                    .collect();
-                (i, st.term, arcs)
-            })
-            .collect()
+        self.graph.view()
     }
 
     /// The term at state `n` (for `show path`/`show graph` rendering).
     pub fn state_term(&self, n: usize) -> Option<DagId> {
-        self.states.get(n).map(|s| s.term)
+        self.graph.state_dag(n)
     }
 }
