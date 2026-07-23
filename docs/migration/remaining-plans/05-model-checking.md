@@ -516,7 +516,7 @@ the identity-collapse lines exposed by `set verbose on`. The manifest is frozen 
 | **M2** | local `ltl::bdd` facade: variables, Boolean ops, equality, root/low/high navigation | biodivine canonicity/navigation tests |
 | **M3** | `TransitionSet`/raw product → VWAA → GBA/SCC/collapse → degeneralized Büchi | intermediate dump parity with an instrumented reference |
 | **M4** | `ModelChecker2` nested DFS, lazy BDD proposition walk/memo, lasso split, `System` trait | known lassos over a synthetic system; still no production hook |
-| **M5** | shared `StateGraph`, deadlock completion, kernel-direct typed hooks, result construction | M01 + M03 byte-exact target |
+| **M5** | shipped `model-checker.maude`, shared `StateGraph`, deadlock completion, kernel-direct typed hooks, result construction | M01 + M03 byte-exact target |
 | **M6** | determinism closure, LTL+ path, large reference systems, typed verbose-stat event | M01–M09 byte-exact target |
 | **M7** | GBA SAT BFS, prime implicants, `SatSolverSymbol`; pure `tautCheck` equations | M01–M10 10/10 plus frozen invariants |
 
@@ -614,13 +614,17 @@ hook participates in M4.
    `satisfies(state, proposition)` in the active `Runtime`/`Signature` context, passes the
    existing `DescentOps` through nested reduction, compares with `trueTerm`, and charges
    the nested rewrites exactly once. It does not use `MetaCtx`.
-3. Add typed `ModelCheckerHooks` and `SpecialOp::ModelCheck`, bind
+3. Add the repository-root `model-checker.maude` as an exact copy of the Maude 3.5.1
+   source (`sha256 be53123786b18da5a91ac0fa0436e1d72ec87fc76076c1a12398d4d8166948d0`).
+   From this point, the root-first harness path must exercise the shipped copy rather than
+   fall through to the reference library.
+4. Add typed `ModelCheckerHooks` and `SpecialOp::ModelCheck`, bind
    `"ModelCheckerSymbol"` immediately before the unknown-class fallback at
    `build_sig.rs:864`, and run it directly in `Runtime::try_special`. Introduce the
    labelled-rule registration path and shared `Rc<str>` ownership described in §3.2.
-4. Build `counterexample`/transition/list/Qid/unlabeled/deadlock terms from the resolved
+5. Build `counterexample`/transition/list/Qid/unlabeled/deadlock terms from the resolved
    hooks, or return `trueTerm`.
-5. Record typed `(property_automaton_states, examined_system_states)` events during every
+6. Record typed `(property_automaton_states, examined_system_states)` events during every
    check. M6 teaches the REPL's existing `set verbose` path to render the exact two
    `ModelChecker:` lines; core code does not print.
 
@@ -732,7 +736,9 @@ M1–M7 is complete only when **all** of the following hold on the same final tr
    T 11/11 on a fresh `smt-z3` release; the default release remains solver-free. T11's
    native lane passes. Re-run the checksum-pinned external T11 oracle only if its fixture
    or expected contract changed (Phase M must not change either).
-4. `model-checker.maude` loads from the shipped library and `modelCheck`, `modelCheck+`,
+4. The checked-in `model-checker.maude` has SHA-256
+   `be53123786b18da5a91ac0fa0436e1d72ec87fc76076c1a12398d4d8166948d0`, loads with
+   `MAUDE_LIB=$PWD` (no reference-library fallback), and `modelCheck`, `modelCheck+`,
    `satSolve`, and `tautCheck` all compute; neither special hook remains inert.
 5. The M manifest has not shrunk or weakened, no accepted diff masks an M failure, and no
    timeout/exclusion was added. New defects found during implementation are fixed and

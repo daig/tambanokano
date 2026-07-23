@@ -1,5 +1,5 @@
 *** M10-sat-taut — model/false/true/counterexample and prime-implicant rendering
-*** Includes all three executable Maude manual §12.4 examples plus four minimal probes.
+*** Includes all three executable Maude manual §12.4 examples plus five minimal probes.
 *** PRELUDE
 set show timing off .
 load model-checker
