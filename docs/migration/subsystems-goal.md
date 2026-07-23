@@ -367,7 +367,9 @@ fix and regression-cover it rather than defer it.
   audit 77/77 and legacy 87/87 retained)
 - [x] M3 VWAA → GBA → Büchi pipeline — 0b02e00 (11 focused M3 tests, including
   instrumented-C++ stage dumps; M 0/10 inert; cargo 431/431, audit 77/77, legacy 87/87)
-- [ ] M4 nested DFS + synthetic System gate —
+- [x] M4 nested DFS + synthetic System gate — c4a14a2 (5 focused exact-lasso,
+  proposition-memo, and successor-order tests; M 0/10 inert; cargo 436/436, audit 77/77,
+  legacy 87/87)
 - [ ] M5 shared StateGraph + hooks + toggle slice —
 - [ ] M6 complete modelCheck fixture closure —
 - [ ] M7 satSolve/tautCheck fixture closure —
