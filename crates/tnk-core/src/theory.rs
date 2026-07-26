@@ -325,7 +325,6 @@ impl Subproblem {
         }
     }
 
-
     /// Extension-match status of the *current* solution, for the `xmatch` command's display. `None`
     /// means the match carried no extension info (a free-theory subject, or a non-extension match) — so
     /// no `Matched portion` line is printed; `Some(true)` is `(whole)`; `Some(false)` a genuine

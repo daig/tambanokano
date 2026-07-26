@@ -1,7 +1,6 @@
-*** B2.4 evaluation-strategy (strat) conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/strat.maude < /dev/null
-*** strat (1 0) on if_then_else_fi reduces the condition, then the top — the unused branch is NOT
-*** reduced. Mirrors the engine.rs B2.4 tests.
+*** Operator evaluation-strategy (`strat`) conformance vs the reference binary.
+*** Covers lazy final-top strategies and TNK-001's general instruction stream: intermediate top
+*** attempts, final-only `owise`, missing final zero normalization, and permutative semi-eagerness.
 
 fmod STRAT is
   sorts Nat Truth .
@@ -19,3 +18,67 @@ red big .                          *** s s z (1 rewrite — sanity)
 red if tt then z else big fi .     *** z, 1 rewrite: the else branch `big` is never reduced
 red if ff then big else z fi .     *** z, 1 rewrite: the then branch `big` is never reduced
 red if tt then big else z fi .     *** s s z, 2 rewrites: the chosen branch `big` IS reduced
+
+fmod GENERAL-STRAT is
+  sort S .
+  ops a b c d e : -> S .
+  vars X Y : S .
+  eq c = a .
+  eq d = e .
+
+  op f : S -> S [strat (0 1 0)] .
+  eq f(a) = b .
+
+  op discard : S -> S [strat (0 1 0)] .
+  eq discard(X) = b .
+
+  op choose : S -> S [strat (0 1 0)] .
+  eq choose(a) = b .
+  eq choose(X) = e [owise] .
+
+  op g : S S -> S [strat (1 0 2 0)] .
+  eq g(a, X) = b .
+
+  op h : S S -> S [strat (1 0 2 0)] .
+  eq h(a, e) = b .
+
+  op missing-final : S -> S [strat (0 1)] .
+  eq missing-final(a) = b .
+
+  op only-arg : S -> S [strat (1)] .
+  eq only-arg(a) = b .
+
+  op normalized : S -> S [strat (0 0 1 1 0)] .
+  eq normalized(a) = b .
+  op pair : S S -> S [strat (0 1 2 0)] .
+  op box : S -> S .
+endfm
+red in GENERAL-STRAT : f(a) .                *** first top succeeds: 1
+red in GENERAL-STRAT : f(c) .                *** first top fails, c -> a, final top succeeds: 2
+red in GENERAL-STRAT : discard(c) .          *** first top succeeds without reducing c: 1
+red in GENERAL-STRAT : choose(c) .           *** intermediate top must not take owise: b, 2
+red in GENERAL-STRAT : g(c, d) .             *** arg 1 enables intermediate top; arg 2 stays lazy: 2
+red in GENERAL-STRAT : h(c, d) .             *** both staged arguments needed before final top: 3
+red in GENERAL-STRAT : missing-final(c) .     *** Maude appends the omitted final zero: 2
+red in GENERAL-STRAT : only-arg(c) .          *** likewise for a strategy containing no zero: 2
+red in GENERAL-STRAT : normalized(c) .        *** adjacent zeroes/duplicate positions normalize: 2
+red in GENERAL-STRAT : pair(c, c) .          *** post-top shared redexes are copied per occurrence: 2
+red in GENERAL-STRAT : pair(box(c), box(c)) . *** eager descendants are copied with each occurrence: 2
+
+fmod AC-STRAT is
+  sort S .
+  ops a b c d : -> S .
+  eq c = a .
+  eq d = b .
+  op _m_ : S S -> S [assoc comm strat (0 1 0)] .
+endfm
+red in AC-STRAT : c m d m c .                *** semi-eager AC reduces every physical argument: 2
+
+fmod AU-STRAT is
+  sort S .
+  ops a b c d : -> S .
+  eq c = a .
+  eq d = b .
+  op _;_ : S S -> S [assoc strat (0 1 0)] .
+endfm
+red in AU-STRAT : c ; d ; c .                *** semi-eager AU reduces each ordered occurrence: 3

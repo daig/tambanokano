@@ -1376,9 +1376,9 @@ fn apply_eager(
                             binding.expect("successful rule condition left an RHS variable unbound")
                         })
                         .collect();
-                    let result =
-                        cx.eng
-                            .instantiate_rewrite_result(&r.rhs, &bindings, &context);
+                    let result = cx
+                        .eng
+                        .instantiate_rewrite_result(&r.rhs, &bindings, &context);
                     let whole = replace_at(cx.eng, dag, path, result);
                     cx.eng.reset_rewrites();
                     let whole = cx.eng.reduce(whole);

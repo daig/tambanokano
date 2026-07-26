@@ -1896,8 +1896,7 @@ fn search_header(
         SearchArrow::Star => "=>*",
         SearchArrow::Bang => "=>!",
     };
-    let pattern =
-        command_echo(lm, i, pattern, color).unwrap_or_else(|_| join_tokens(pattern, i));
+    let pattern = command_echo(lm, i, pattern, color).unwrap_or_else(|_| join_tokens(pattern, i));
     let mut h = format!("{subj} {arrow_str} {pattern}");
     if let Some(c) = such_that {
         h.push_str(&format!(" such that {}", join_tokens(c, i)));

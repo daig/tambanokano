@@ -5052,8 +5052,7 @@ impl MetaDescent<'_> {
                         // carried by the reflected value. Rebuild from the original declarations in
                         // that order rather than down-translating statement bodies (which loses
                         // source compilation metadata and changes rewrite accounting).
-                        let reflected_ops =
-                            down_ops(ctx, hooks, *kids.get(4)?, self.interner)?;
+                        let reflected_ops = down_ops(ctx, hooks, *kids.get(4)?, self.interner)?;
                         let op_order: HashMap<(String, Vec<String>, String), usize> = reflected_ops
                             .iter()
                             .enumerate()
@@ -5106,13 +5105,9 @@ impl MetaDescent<'_> {
                         // root entry is the canonically reordered retained source.
                         let mut reordered_db = self.db.clone();
                         reordered_db.insert(source.clone());
-                        let (flattened, statement_homes) = flatten_with_homes(
-                            &name,
-                            &reordered_db,
-                            self.views,
-                            self.interner,
-                        )
-                        .ok()?;
+                        let (flattened, statement_homes) =
+                            flatten_with_homes(&name, &reordered_db, self.views, self.interner)
+                                .ok()?;
                         let mut home_modules = HashMap::<String, LoadedModule>::new();
                         for home in statement_homes.iter().flatten() {
                             if home_modules.contains_key(home) {

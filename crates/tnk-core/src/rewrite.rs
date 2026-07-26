@@ -428,11 +428,7 @@ mod tests {
         engine.set_oo_flags(portal, false, false, false, true);
         let target = engine.add_op("child", vec![], configuration);
         let requester = engine.add_op("requester", vec![], configuration);
-        let request = engine.add_op(
-            "request",
-            vec![configuration, configuration],
-            configuration,
-        );
+        let request = engine.add_op("request", vec![configuration, configuration], configuration);
         engine.set_oo_flags(request, false, false, true, false);
         let meta_hook = engine.add_op("%meta-hook", vec![], configuration);
         engine.set_special(
@@ -459,14 +455,11 @@ mod tests {
         let mut rewriting = engine.erewrite(initial, 1);
         let mut descent = NullDescent;
 
-        let (token, captured) = match rewriting.run_with_external(
-            &mut engine,
-            Some(1),
-            &mut descent,
-        ) {
-            ExternalRun::Suspended { token, request } => (token, request),
-            ExternalRun::Complete(_) => panic!("registered target must suspend"),
-        };
+        let (token, captured) =
+            match rewriting.run_with_external(&mut engine, Some(1), &mut descent) {
+                ExternalRun::Suspended { token, request } => (token, request),
+                ExternalRun::Complete(_) => panic!("registered target must suspend"),
+            };
         assert_eq!(captured.root_count(), 2);
 
         engine.gc([]);

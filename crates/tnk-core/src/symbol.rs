@@ -77,6 +77,28 @@ pub(crate) struct OpDeclaration {
     pub ctor: bool,
 }
 
+/// One normalized instruction in an operator's equational evaluation strategy.
+///
+/// Maude's source `strat` uses 1-based argument numbers and `0` for an attempt at the
+/// application root. The signature normalizes that surface list once, so the reduction hot path
+/// never has to reinterpret magic integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvalStep {
+    Argument(u32),
+    Top,
+}
+
+/// Runtime form of a nonstandard operator evaluation strategy.
+#[derive(Debug, Clone)]
+pub(crate) enum EvalStrategy {
+    /// An ordinary fixed-arity strategy, including its final [`EvalStep::Top`].
+    Sequence(Vec<EvalStep>),
+    /// Associative operators cannot distinguish their two declared positions after flattening.
+    /// Maude therefore normalizes every top-first/non-lazy strategy on A/AC symbols to
+    /// `0, <all physical arguments>, 0`; the argument portion is expanded by the frame accessor.
+    PermutativeSemiEager,
+}
+
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub(crate) name: String,
@@ -96,10 +118,12 @@ pub struct Symbol {
     /// A **one-sided** identity (`left id:` / `right id:`), recorded for construction and symbolic
     /// collapse with the same general identity-term representation.
     pub(crate) one_sided_id: Option<(IdentitySide, IdentityId)>,
-    /// Evaluation strategy `strat (…)` (B2.4): the 0-based argument positions to reduce, in order,
-    /// before a top rewrite. `None` is the standard strategy (reduce every argument left-to-right); a
-    /// custom strategy may leave arguments unreduced (lazy) — e.g. `if_then_else_fi` with `strat (1 0)`.
-    pub(crate) strategy: Option<Vec<u32>>,
+    /// Normalized nonstandard equational evaluation strategy (`strat (…)`). `None` is Maude's
+    /// standard strategy: reduce every physical argument left-to-right, then try at the root.
+    /// A custom sequence retains interleaved root attempts; associative semi-eager strategies use a
+    /// dynamic form because a flattened runtime node can have more arguments than its binary
+    /// declaration.
+    pub(crate) strategy: Option<EvalStrategy>,
     /// Frozen arguments (`frozen` / `frozen (…)`, Pillar A): the 0-based argument positions that
     /// `rewrite`/`frewrite`/`search` must **not** rewrite within. `None` = no frozen args; `Some([])` =
     /// all arguments frozen (`[frozen]`); `Some([0,2])` = those positions. Inert for equational `reduce`.

@@ -23,8 +23,8 @@ use crate::smt::{SmtInfo, SmtNumber, SmtOp, SmtType};
 use crate::smt_search::SmtSearch;
 use crate::sort::{KindId, SortId, Sorts};
 use crate::symbol::{
-    Axioms, Identity, IdentityId, IdentitySide, OoFlags, OpDeclaration, SpecialOp, StdStream,
-    Symbol, SymbolClass, SymbolId, Theory,
+    Axioms, EvalStep, EvalStrategy, Identity, IdentityId, IdentitySide, OoFlags, OpDeclaration,
+    SpecialOp, StdStream, Symbol, SymbolClass, SymbolId, Theory,
 };
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, RewriteMatchContext, Subproblem};
@@ -397,12 +397,17 @@ struct RedexPos {
     arg_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalAction {
+    Argument(usize),
+    Top { final_step: bool },
+}
+
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
 ///
-/// A frame mirrors one activation of the old recursive `reduce`/`reduce_args` pair: it reduces the
-/// arguments selected by the operator's evaluation strategy (the standard one is every argument
-/// left-to-right; `cursor` walks the strategy via [`Signature::strat_position`]), replacing each in
-/// `args`, then drives the top-rewrite fixpoint by *reusing its own slot* for each rewritten term.
+/// A frame mirrors one activation of the old recursive `reduce`/`reduce_args` pair. `cursor` executes
+/// the operator's normalized argument/top instruction stream; reduced children replace their positions
+/// in `args`, while a successful Top instruction reuses the frame slot for the replacement term.
 ///
 /// **A2 safe-point-GC contract** (the reason this is an explicit heap stack). The frames hold most
 /// in-flight `DagId`s of an in-progress reduction — but *not all*: at the [`Engine::reduce`] loop
@@ -413,8 +418,8 @@ struct RedexPos {
 /// locals (`instantiate`'s `arg_ids`, the `Subst` bindings, the `rebuilt` node mid-rewrite) and are
 /// *not* discoverable by a stack walk, so they must not be safe points.
 struct ReduceFrame {
-    /// The node this frame was **first** pushed for — preserved across the Phase-2 rewrite-replace
-    /// (which overwrites `original` with each successive redex). When the frame reaches a normal form,
+    /// The node this frame was **first** pushed for — preserved when a top rewrite replaces the frame
+    /// (and overwrites `original` with each successive redex). When the frame reaches a normal form,
     /// that form is recorded as `start`'s [`nf`](crate::dag::DagNode::nf) so a *shared* reference to
     /// `start` forwards to the result instead of re-reducing it (C7). For the initial frame `start ==
     /// original`; they diverge only once the node rewrites.
@@ -430,9 +435,12 @@ struct ReduceFrame {
     /// positions the strategy leaves unreduced keep their `orig` value (lazy). The node is rebuilt from
     /// this.
     args: Vec<DagId>,
-    /// Strategy steps taken so far — the cursor into the operator's strategy (or `0..arity` for the
-    /// standard strategy); [`Signature::strat_position`] maps it to the argument position to reduce.
+    /// Instructions completed so far; [`Signature::strat_action`] synthesizes the standard and
+    /// permutative strategies or indexes the symbol's normalized sequence.
     cursor: usize,
+    /// Whether this application has reached its first `0`/top instruction. Maude computes the true
+    /// sorts of every argument exactly there, including arguments the strategy never reduces.
+    seen_top: bool,
 }
 
 /// One symbolic alien that may need a protected abstraction slot while matching a statement LHS.
@@ -1554,27 +1562,74 @@ impl Signature {
         }
     }
 
-    /// Set an evaluation strategy `strat (raw…)` on `sym` (B2.4). `raw` is the user sequence of 1-based
-    /// argument positions ending in a single trailing `0` (reduce at top) — e.g. `[1, 0]` for a lazy
-    /// `if_then_else_fi`. Stored as the 0-based positions to reduce, in order; arguments not listed are
-    /// left unreduced. The general strategy (interleaved or absent `0`) is a follow-up — loud-assert.
+    /// Install and normalize an operator evaluation strategy (`strat (…)`, B2.4).
+    ///
+    /// Source positions are 1-based and `0` means "try at the root." As in Maude's
+    /// `Strategy::setStrategy`, duplicate argument positions and adjacent zeroes are discarded and a
+    /// missing final zero is appended. An empty list denotes the standard strategy. Associative
+    /// symbols use Maude's three meaningful permutative classes: eager, lazy, or semi-eager.
     pub(crate) fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
-        let arity = self.symbols.get(sym).arity();
-        assert_eq!(
-            raw.last(),
-            Some(&0),
-            "evaluation strategy {raw:?} for `{}` must end in a single trailing 0 (reduce at top); \
-             interleaved or absent top rewrites are a B-follow-up",
-            self.symbols.get(sym).name()
-        );
-        let positions = &raw[..raw.len() - 1];
+        let symbol = self.symbols.get(sym);
+        let arity = symbol.arity();
         assert!(
-            positions.iter().all(|&p| p >= 1 && p as usize <= arity),
-            "evaluation strategy {raw:?} for `{}` references an argument outside 1..={arity} (or has a \
-             non-trailing 0)",
-            self.symbols.get(sym).name()
+            raw.iter().all(|&p| p as usize <= arity),
+            "evaluation strategy {raw:?} for `{}` references an argument outside 0..={arity}",
+            symbol.name()
         );
-        self.symbols.get_mut(sym).strategy = Some(positions.iter().map(|&p| p - 1).collect());
+
+        let strategy = if raw.is_empty() {
+            None
+        } else if matches!(symbol.theory(), Theory::Acu | Theory::Au) {
+            // Maude's BinarySymbol::setPermuteStrategy: flattened associative applications cannot
+            // distinguish their two declared argument positions. Any argument before the first top
+            // makes the strategy eager; an argument first seen after a top makes it semi-eager; no
+            // argument at all is lazy.
+            let mut seen_top = false;
+            let mut classified = None;
+            for &step in raw {
+                if step == 0 {
+                    seen_top = true;
+                } else {
+                    classified = Some(seen_top);
+                    break;
+                }
+            }
+            match classified {
+                Some(false) => None,
+                Some(true) => Some(EvalStrategy::PermutativeSemiEager),
+                None => Some(EvalStrategy::Sequence(vec![EvalStep::Top])),
+            }
+        } else {
+            let mut steps = Vec::with_capacity(raw.len() + 1);
+            let mut evaluated = vec![false; arity];
+            let mut last_was_top = false;
+            for &step in raw {
+                if step == 0 {
+                    if !last_was_top {
+                        steps.push(EvalStep::Top);
+                        last_was_top = true;
+                    }
+                } else {
+                    let position = (step - 1) as usize;
+                    if !evaluated[position] {
+                        steps.push(EvalStep::Argument(position as u32));
+                        evaluated[position] = true;
+                        last_was_top = false;
+                    }
+                }
+            }
+            if !last_was_top {
+                steps.push(EvalStep::Top);
+            }
+            let standard = steps.len() == arity + 1
+                && steps[..arity]
+                    .iter()
+                    .enumerate()
+                    .all(|(position, step)| *step == EvalStep::Argument(position as u32))
+                && steps[arity] == EvalStep::Top;
+            (!standard).then_some(EvalStrategy::Sequence(steps))
+        };
+        self.symbols.get_mut(sym).strategy = strategy;
     }
 
     /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`, Pillar A). `raw` is the 1-based
@@ -1631,18 +1686,41 @@ impl Signature {
         self.symbols.get_mut(sym).special = Some(op);
     }
 
-    /// The argument position to reduce at strategy step `cursor` for `symbol` (B2.4), or `None` once the
-    /// strategy is exhausted (→ attempt the top rewrite). The standard strategy reduces every argument
-    /// left-to-right; a custom strategy reduces only its listed positions, in order.
-    pub(crate) fn strat_position(
-        &self,
-        symbol: SymbolId,
-        cursor: usize,
-        arity: usize,
-    ) -> Option<usize> {
+    /// The next normalized instruction for an application frame. The standard strategy is synthesized
+    /// without allocating: every physical argument left-to-right, then one final top attempt. A
+    /// permutative semi-eager strategy similarly expands over every physical argument of the flattened
+    /// A/AC node.
+    fn strat_action(&self, symbol: SymbolId, cursor: usize, arity: usize) -> Option<EvalAction> {
         match &self.symbols.get(symbol).strategy {
-            None => (cursor < arity).then_some(cursor),
-            Some(positions) => positions.get(cursor).map(|&p| p as usize),
+            None => {
+                if cursor < arity {
+                    Some(EvalAction::Argument(cursor))
+                } else if cursor == arity {
+                    Some(EvalAction::Top { final_step: true })
+                } else {
+                    None
+                }
+            }
+            Some(EvalStrategy::Sequence(steps)) => {
+                let step = *steps.get(cursor)?;
+                Some(match step {
+                    EvalStep::Argument(position) => EvalAction::Argument(position as usize),
+                    EvalStep::Top => EvalAction::Top {
+                        final_step: cursor + 1 == steps.len(),
+                    },
+                })
+            }
+            Some(EvalStrategy::PermutativeSemiEager) => {
+                if cursor == 0 {
+                    Some(EvalAction::Top { final_step: false })
+                } else if cursor <= arity {
+                    Some(EvalAction::Argument(cursor - 1))
+                } else if cursor == arity + 1 {
+                    Some(EvalAction::Top { final_step: true })
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -2719,6 +2797,83 @@ impl Runtime {
         }
     }
 
+    /// Make a fresh reducible occurrence of `id` for an argument evaluated after a strategy `0`.
+    ///
+    /// Maude's `copyReducible` copies the unreduced root and recursively copies only the argument
+    /// positions that are eager for that root's own strategy. A fresh copy matters even for a leaf:
+    /// two subject positions may share one hash-consed redex, but `copyAndReduce` after a top attempt
+    /// reduces each physical occurrence independently. `copies` preserves sharing *within* one copied
+    /// occurrence; it is deliberately new for each strategy argument.
+    fn copy_reducible(&mut self, sig: &Signature, id: DagId) -> DagId {
+        self.copy_eager_upto_reduced(sig, id, &mut HashMap::new())
+    }
+
+    fn copy_eager_upto_reduced(
+        &mut self,
+        sig: &Signature,
+        id: DagId,
+        copies: &mut HashMap<DagId, DagId>,
+    ) -> DagId {
+        let node = self.node(id);
+        if node.reduced_epoch == sig.eq_epoch() {
+            return node.nf.unwrap_or(id);
+        }
+        if let Some(&copy) = copies.get(&id) {
+            return copy;
+        }
+
+        let mut term = node.term.clone();
+        match &mut term {
+            NodeTerm::Free { symbol, args } | NodeTerm::Cui { symbol, args } => {
+                let strategy = &sig.symbol(*symbol).strategy;
+                for (position, arg) in args.iter_mut().enumerate() {
+                    let eager = match strategy {
+                        None => true,
+                        Some(EvalStrategy::Sequence(steps)) => steps
+                            .iter()
+                            .take_while(|step| **step != EvalStep::Top)
+                            .any(|step| *step == EvalStep::Argument(position as u32)),
+                        Some(EvalStrategy::PermutativeSemiEager) => false,
+                    };
+                    if eager {
+                        *arg = self.copy_eager_upto_reduced(sig, *arg, copies);
+                    }
+                }
+            }
+            NodeTerm::Acu { symbol, args } => {
+                if sig.symbol(*symbol).strategy.is_none() {
+                    for (arg, _) in args {
+                        *arg = self.copy_eager_upto_reduced(sig, *arg, copies);
+                    }
+                }
+            }
+            NodeTerm::Au { symbol, args } => {
+                if sig.symbol(*symbol).strategy.is_none() {
+                    for arg in args {
+                        *arg = self.copy_eager_upto_reduced(sig, *arg, copies);
+                    }
+                }
+            }
+            NodeTerm::S { symbol, arg, .. } => {
+                let eager = match &sig.symbol(*symbol).strategy {
+                    None => true,
+                    Some(EvalStrategy::Sequence(steps)) => steps
+                        .iter()
+                        .take_while(|step| **step != EvalStep::Top)
+                        .any(|step| *step == EvalStep::Argument(0)),
+                    Some(EvalStrategy::PermutativeSemiEager) => false,
+                };
+                if eager {
+                    *arg = self.copy_eager_upto_reduced(sig, *arg, copies);
+                }
+            }
+            NodeTerm::Na { .. } | NodeTerm::Var { .. } => {}
+        }
+        let copy = self.make_preserving_representation(sig, term);
+        copies.insert(id, copy);
+        copy
+    }
+
     /// Refine `id`'s sort — and recursively its subterms' — to their **true sorts** without applying any
     /// equations: Maude's `DagNode::computeTrueSort`. The C1 seam-3 counterpart to the reduce normal-form
     /// step, for **strat-skipped** args: a custom evaluation strategy (`strat`) never reduces them, so
@@ -2868,82 +3023,100 @@ impl Runtime {
         symbol: SymbolId,
         raw_args: Vec<(DagId, u32)>,
     ) -> DagId {
+        self.make_acu_normalized(sig, symbol, raw_args, false)
+    }
+
+    /// Maude normalizes a fresh non-eager ACU application before its first top attempt, so nested
+    /// same-symbol nodes and equal unreduced entries must be combined before semi-eager arguments run.
+    fn make_acu_at_top(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        raw_args: Vec<DagId>,
+    ) -> DagId {
+        self.make_acu_normalized(
+            sig,
+            symbol,
+            raw_args.into_iter().map(|arg| (arg, 1)).collect(),
+            true,
+        )
+    }
+
+    fn make_acu_normalized(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        raw_args: Vec<(DagId, u32)>,
+        normalize_unreduced: bool,
+    ) -> DagId {
         debug_assert_eq!(
             sig.symbol(symbol).theory(),
             Theory::Acu,
             "make_acu on a non-ACU symbol"
         );
         let identity = sig.symbol(symbol).identity();
-
-        // (1) flatten nested same-symbol nodes + (2) drop identity elements.
-        // The SPLICE is lazy, like the merge below (and like Maude's on-demand ACU
-        // normalization): an UNREDUCED nested same-symbol argument stays nested, so the reduce
-        // loop's bottom-up Phase 1 reduces it — counting its own builtin fold — before the
-        // parent's rebuild (whose children are then reduced) splices it flat. This makes the
-        // infix chain `2 + 3 + 4` count 2 rewrites (`3 + 4 ---> 7`, then `2 + 7 ---> 9`, the
-        // oracle's trace) while a prefix n-ary `gcd(12, 18, 8)` — born flat, never nested —
-        // still folds once (§3.9.3). Matching only ever sees the post-rebuild canonical form.
         let epoch = sig.eq_epoch();
-        let mut flat: Vec<(DagId, u32)> = Vec::with_capacity(raw_args.len());
-        for (arg, mult) in raw_args {
+
+        // Normal construction defers an unreduced nested application so bottom-up reduction retains
+        // its rewrite count. A strategy Top is Maude's explicit normalizeAtTop boundary and recursively
+        // flattens those nodes immediately.
+        let mut pending = raw_args;
+        let mut flat: Vec<(DagId, u32)> = Vec::with_capacity(pending.len());
+        while let Some((arg, mult)) = pending.pop() {
             if mult == 0 {
                 continue;
             }
             if identity.is_some_and(|id| self.is_identity(sig, id, arg)) {
-                continue; // an identity argument vanishes
+                continue;
             }
             match &self.dags.get(arg).term {
                 NodeTerm::Acu {
                     symbol: inner,
                     args,
-                } if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch => {
-                    for &(e, m) in args {
-                        flat.push((e, m * mult));
+                } if *inner == symbol
+                    && (normalize_unreduced || self.dags.get(arg).reduced_epoch == epoch) =>
+                {
+                    for &(element, inner_mult) in args {
+                        pending.push((element, inner_mult * mult));
                     }
                 }
                 _ => flat.push((arg, mult)),
             }
         }
 
-        // (3) sort by the total order, then merge structurally-equal neighbours (summing mults).
-        // Two DISTINCT nodes merge only when both are already reduced: Maude normalizes ACU dags
-        // lazily, so value-equal-but-distinct UNREDUCED arguments (RAT's `I * M` / `J * N` both
-        // instantiating `1 * 6`; BOOL's `X == Y and Y == X`) are each reduced — and counted —
-        // before the merge happens at the parent's rebuild. Eagerly merging them here silently
-        // dropped one reduction (§3.3-adjacent undercount). The unmerged form is transient: the
-        // reduce loop's Phase-1 rebuild re-canonicalizes with reduced (mergeable) arguments, so
-        // matching only ever sees the merged canonical node.
+        // Ordinary construction merges distinct equal entries only after reduction; the explicit
+        // top-normalization path merges them immediately, as ACU_DagNode::normalizeAtTop does.
         flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
         let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
-        for (e, m) in flat {
+        for (element, mult) in flat {
             match args.last_mut() {
                 Some(last)
-                    if last.0 == e
-                        || (self.dag_compare(last.0, e) == Ordering::Equal
-                            && self.dags.get(last.0).reduced_epoch == epoch
-                            && self.dags.get(e).reduced_epoch == epoch) =>
+                    if last.0 == element
+                        || (self.dag_compare(last.0, element) == Ordering::Equal
+                            && (normalize_unreduced
+                                || (self.dags.get(last.0).reduced_epoch == epoch
+                                    && self.dags.get(element).reduced_epoch == epoch))) =>
                 {
-                    last.1 += m
+                    last.1 += mult;
                 }
-                _ => args.push((e, m)),
+                _ => args.push((element, mult)),
             }
         }
 
-        // (4) collapse to the canonical representative.
-        let total: u64 = args.iter().map(|&(_, m)| u64::from(m)).sum();
+        let total: u64 = args.iter().map(|&(_, mult)| u64::from(mult)).sum();
         match total {
             0 => {
                 let identity =
                     identity.expect("an empty ACU multiset requires an identity element");
                 self.identity_dag(sig, identity)
             }
-            1 => args[0].0, // exactly one element, multiplicity 1 — never wrap a lone argument
+            1 => args[0].0,
             _ => {
-                // Fold the binary least-sort over the multiset elements (with multiplicity repeats),
-                // mirroring Maude's `traverse(traverse(0, i1), i2)` over the flattened arguments.
                 let elem_sorts: Vec<SortId> = args
                     .iter()
-                    .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
+                    .flat_map(|&(element, mult)| {
+                        std::iter::repeat_n(self.dags.get(element).sort, mult as usize)
+                    })
                     .collect();
                 let sort = sig.compute_sort_fold(symbol, &elem_sorts);
                 self.alloc_node(sort, NodeTerm::Acu { symbol, args })
@@ -3113,6 +3286,20 @@ impl Runtime {
         symbol: SymbolId,
         raw_args: Vec<DagId>,
     ) -> DagId {
+        self.make_au_normalized(sig, symbol, raw_args, false)
+    }
+
+    fn make_au_at_top(&mut self, sig: &Signature, symbol: SymbolId, raw_args: Vec<DagId>) -> DagId {
+        self.make_au_normalized(sig, symbol, raw_args, true)
+    }
+
+    fn make_au_normalized(
+        &mut self,
+        sig: &Signature,
+        symbol: SymbolId,
+        raw_args: Vec<DagId>,
+        normalize_unreduced: bool,
+    ) -> DagId {
         debug_assert_eq!(
             sig.symbol(symbol).theory(),
             Theory::Au,
@@ -3123,8 +3310,12 @@ impl Runtime {
         let left_identity = sym.left_identity();
         let right_identity = sym.right_identity();
         let epoch = sig.eq_epoch();
-        let mut args: Vec<DagId> = Vec::with_capacity(raw_args.len());
-        for arg in raw_args {
+
+        // A stack in reverse source order preserves AU ordering while recursively flattening at an
+        // explicit Top boundary. Ordinary construction still defers unreduced nested applications.
+        let mut pending: Vec<DagId> = raw_args.into_iter().rev().collect();
+        let mut args = Vec::with_capacity(pending.len());
+        while let Some(arg) = pending.pop() {
             if identity.is_some_and(|id| self.is_identity(sig, id, arg)) {
                 continue;
             }
@@ -3132,8 +3323,12 @@ impl Runtime {
                 NodeTerm::Au {
                     symbol: inner,
                     args: inner_args,
-                } if *inner == symbol && self.dags.get(arg).reduced_epoch == epoch => {
-                    args.extend_from_slice(inner_args);
+                } if *inner == symbol
+                    && (normalize_unreduced || self.dags.get(arg).reduced_epoch == epoch) =>
+                {
+                    for &element in inner_args.iter().rev() {
+                        pending.push(element);
+                    }
                 }
                 _ => args.push(arg),
             }
@@ -3767,51 +3962,85 @@ impl Runtime {
                 self.allocs_since_gc = 0;
             }
 
-            // Deliver a completed child into its strategy position and advance the strategy cursor.
-            if let Some(r) = child_result.take() {
-                let f = stack
+            // Deliver a completed child into the Argument instruction that pushed it.
+            if let Some(result) = child_result.take() {
+                let frame = stack
                     .last_mut()
                     .expect("child result with empty reduce stack");
-                let pos = sig
-                    .strat_position(f.symbol, f.cursor, f.orig.len())
-                    .expect("delivering a child means a strategy step was in progress");
-                f.args[pos] = r;
-                f.cursor += 1;
+                let action = sig
+                    .strat_action(frame.symbol, frame.cursor, frame.orig.len())
+                    .expect("delivering a child means a strategy instruction is in progress");
+                let EvalAction::Argument(position) = action else {
+                    unreachable!("only an Argument strategy instruction can push a child frame");
+                };
+                frame.args[position] = result;
+                frame.cursor += 1;
             }
 
-            // Phase 1: reduce the next argument the strategy selects (the standard strategy walks them
-            // left-to-right; a custom strategy reduces only its listed positions). Already-reduced
-            // children (shared subterms, cached by epoch) are delivered without pushing a frame.
-            {
-                let f = stack.last().expect("empty reduce stack");
-                if let Some(pos) = sig.strat_position(f.symbol, f.cursor, f.orig.len()) {
-                    let child = f.args[pos];
-                    if self.node(child).reduced_epoch == sig.eq_epoch() {
-                        // Already-reduced (a shared subterm, cached by epoch): deliver its normal form
-                        // without pushing a frame. Forward through `nf` (C7) so a shared redex that
-                        // rewrote out of place delivers its result, not its stale content (`None` ⇒ self).
-                        child_result = Some(self.node(child).nf.unwrap_or(child));
-                    } else {
-                        let frame = self.new_reduce_frame(child);
-                        stack.push(frame);
+            let action = {
+                let frame = stack.last().expect("empty reduce stack");
+                sig.strat_action(frame.symbol, frame.cursor, frame.orig.len())
+                    .expect("a normalized evaluation strategy always ends in Top")
+            };
+
+            // Reduce one selected argument. After a Top instruction Maude first makes a reducible
+            // per-occurrence copy; without it, two physical slots sharing one hash-consed redex would
+            // incorrectly normalize once. Before the first Top, already-reduced shared subterms retain
+            // the ordinary forwarding fast path.
+            if let EvalAction::Argument(position) = action {
+                let (mut child, after_top) = {
+                    let frame = stack.last().expect("empty reduce stack");
+                    (frame.args[position], frame.seen_top)
+                };
+                if after_top
+                    && matches!(
+                        sig.symbol(stack.last().unwrap().symbol).theory(),
+                        Theory::Acu
+                    )
+                {
+                    // An ACU node stores one argument per distinct element plus a multiplicity. The
+                    // generic frame expands that representation for rebuilding, but Maude's
+                    // copyAndReduceSubterms copies/reduces each distinct entry only once.
+                    let repeated_result = {
+                        let frame = stack.last().unwrap();
+                        let original = frame.orig[position];
+                        frame.orig[..position]
+                            .iter()
+                            .position(|&earlier| earlier == original)
+                            .map(|earlier| frame.args[earlier])
+                    };
+                    if let Some(result) = repeated_result {
+                        child_result = Some(result);
+                        continue;
                     }
-                    continue;
                 }
+                if after_top {
+                    child = self.copy_reducible(sig, child);
+                    stack.last_mut().expect("empty reduce stack").args[position] = child;
+                }
+                if self.node(child).reduced_epoch == sig.eq_epoch() {
+                    child_result = Some(self.node(child).nf.unwrap_or(child));
+                } else {
+                    stack.push(self.new_reduce_frame(child));
+                }
+                continue;
             }
 
-            // C1 seam 3 — a custom evaluation strategy (`strat`) leaves some args unreduced, so they
-            // never reach a reduce normal-form point; Maude's `complexStrategy` still computes their true
-            // sort at the strat `0` step. Refine the (skipped) args' sorts here — no equations — so the
-            // rebuild's base-sort recompute and the top-rewrite matching below see the same sorts Maude
-            // does. Gated on a custom strat + the module having memberships: the standard strategy reduces
-            // every arg (each refined at its own normal-form point), and a membership-free module never
-            // changes a sort, so both keep the unchanged hot path. Already-reduced args no-op (guarded).
-            if !sig.memberships.is_empty()
-                && sig
-                    .symbol(stack.last().expect("empty reduce stack").symbol)
-                    .strategy
-                    .is_some()
-            {
+            let EvalAction::Top { final_step } = action else {
+                unreachable!("Argument handled above");
+            };
+
+            // Maude's complexStrategy computes every argument's true sort exactly at the first `0`,
+            // including lazy arguments that this strategy never reduces. Standard strategy arguments
+            // have already reached their own normal-form points, so retain the membership-free and
+            // standard-strategy hot paths.
+            let (first_top, custom_strategy) = {
+                let frame = stack.last_mut().expect("empty reduce stack");
+                let first = !frame.seen_top;
+                frame.seen_top = true;
+                (first, sig.symbol(frame.symbol).strategy.is_some())
+            };
+            if first_top && custom_strategy && !sig.memberships.is_empty() {
                 let args = stack.last().expect("empty reduce stack").args.clone();
                 let mut seen = HashSet::new();
                 for arg in args {
@@ -3819,31 +4048,52 @@ impl Runtime {
                 }
             }
 
-            // Phase 1 complete (strategy exhausted): rebuild iff some argument changed — or the node
-            // is an ACU node still holding a same-symbol child (the lazy splice deferred its
-            // flattening to exactly this rebuild; without forcing it, a pure-constructor nested
-            // chain whose child IDS never change would be stamped normal in NESTED form and AC
-            // matching over it would silently fail).
-            let (symbol, original, args, changed) = {
-                let f = stack.last_mut().expect("empty reduce stack");
-                let mut changed = f.args != f.orig;
+            // Materialize the application as it exists at this Top instruction. An intermediate Top
+            // must retain the frame's argument vector so a failed attempt can continue with later
+            // instructions; at the final Top the vector can move into the rebuild.
+            let (symbol, original, args, changed, normalize_associative_at_top) = {
+                let frame = stack.last_mut().expect("empty reduce stack");
+                let theory = sig.symbol(frame.symbol).theory();
+                let normalize_at_top =
+                    first_top && custom_strategy && matches!(theory, Theory::Acu | Theory::Au);
+                let mut changed = frame.args != frame.orig || normalize_at_top;
                 if !changed
-                    && matches!(sig.symbol(f.symbol).theory(), Theory::Acu | Theory::Au)
-                    && f.args.iter().any(|&c| self.node(c).symbol() == f.symbol)
+                    && matches!(theory, Theory::Acu | Theory::Au)
+                    && frame
+                        .args
+                        .iter()
+                        .any(|&child| self.node(child).symbol() == frame.symbol)
                 {
-                    changed = true; // force the deferred splice/merge renormalization
+                    // Force the deferred associative splice/merge before attempting equations.
+                    changed = true;
                 }
-                // `mem::take` moves the args out (no clone) — the frame is about to be reused or popped,
-                // so its `args` is no longer needed.
                 let args = if changed {
-                    std::mem::take(&mut f.args)
+                    if final_step {
+                        std::mem::take(&mut frame.args)
+                    } else {
+                        frame.args.clone()
+                    }
                 } else {
                     Vec::new()
                 };
-                (f.symbol, f.original, args, changed)
+                (
+                    frame.symbol,
+                    frame.original,
+                    args,
+                    changed,
+                    normalize_at_top,
+                )
             };
             let rebuilt = if !changed {
                 original
+            } else if normalize_associative_at_top
+                && matches!(sig.symbol(symbol).theory(), Theory::Acu)
+            {
+                self.make_acu_at_top(sig, symbol, args)
+            } else if normalize_associative_at_top
+                && matches!(sig.symbol(symbol).theory(), Theory::Au)
+            {
+                self.make_au_at_top(sig, symbol, args)
             } else if matches!(sig.symbol(symbol).theory(), Theory::S) {
                 // An S node's `count` is non-child state `rebuild` cannot recover (it would re-wrap as
                 // `s^1`); preserve the original count and re-seat it over the reduced argument.
@@ -3856,9 +4106,9 @@ impl Runtime {
                 self.rebuild(sig, symbol, args)
             };
 
-            // Phase 2: rewrite the top while an equation applies, re-reducing each result by reusing
-            // this frame's slot for the rewritten term.
-            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent) {
+            // Intermediate Top instructions exclude `[owise]`; the final Top includes it. A successful
+            // attempt abandons the old strategy and starts the replacement term's strategy from step 0.
+            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent, final_step) {
                 self.rewrite_count += 1;
                 // Maude's `while (!isReduced())` exit: a rewrite whose result is ALREADY reduced (a
                 // bare-variable rhs bound to the cached identity dag — the collapse one-shot, §3.9.4)
@@ -3873,9 +4123,9 @@ impl Runtime {
                     }
                     let start = stack.last().expect("empty reduce stack").start;
                     if start != done {
-                        let n = self.dags.get_mut(start);
-                        n.nf = Some(done);
-                        n.reduced_epoch = sig.eq_epoch();
+                        let node = self.dags.get_mut(start);
+                        node.nf = Some(done);
+                        node.reduced_epoch = sig.eq_epoch();
                     }
                     stack.pop();
                     if stack.is_empty() {
@@ -3894,8 +4144,7 @@ impl Runtime {
                     self.patch_whole(before, after);
                 }
                 // Reuse this frame's slot for the rewritten term, but carry `start` over: this frame's
-                // forwarding target is still the node it was originally pushed for, not the intermediate
-                // redex `rebuilt` (which is abandoned and, being unshared, needs no memo of its own).
+                // forwarding target is still the node it was originally pushed for.
                 let start = stack.last().expect("empty reduce stack").start;
                 let mut frame = self.new_reduce_frame(next);
                 frame.start = start;
@@ -3903,39 +4152,49 @@ impl Runtime {
                 continue;
             }
 
-            // C1 normal-form point (Maude's `DagNode::reduce` → `fastComputeTrueSort`): `rebuilt`'s
-            // equations are exhausted, so now — and only now — refine its true sort by the memberships.
-            // Recompute the base sort first: a child refined in place at *its* normal-form point does
-            // not propagate to this node when it was not rebuilt (`args == orig` kept `original`), so we
-            // must recompute from the now-refined children before constraining. Gated on the module
-            // having any `mb`/`cmb` — else the base sort never changes and `fib`/the prelude keep exactly
-            // today's hot path (base sort at construction, no normal-form step, no per-rewrite cost).
+            if !final_step {
+                // The provisional top attempt failed. Continue the same strategy over the canonical
+                // partially-reduced application. A theory collapse changes the root symbol, in which
+                // case the collapsed term starts its own strategy instead.
+                let rebuilt_symbol = self.node(rebuilt).symbol();
+                let start = stack.last().expect("empty reduce stack").start;
+                if rebuilt_symbol != symbol {
+                    let mut frame = self.new_reduce_frame(rebuilt);
+                    frame.start = start;
+                    *stack.last_mut().expect("empty reduce stack") = frame;
+                } else {
+                    let children: Vec<DagId> = self.node(rebuilt).children().collect();
+                    let frame = stack.last_mut().expect("empty reduce stack");
+                    frame.original = rebuilt;
+                    frame.symbol = rebuilt_symbol;
+                    frame.orig = children.clone();
+                    frame.args = children;
+                    frame.cursor += 1;
+                }
+                continue;
+            }
+
+            // The final Top failed: this is the normal-form point. Recompute the base sort before
+            // applying memberships because in-place child refinements do not propagate automatically.
             if !sig.memberships.is_empty() {
                 let base = self.compute_base_sort(sig, rebuilt);
                 self.dags.get_mut(rebuilt).sort = base;
-                // For `set trace whole`: snapshot the whole root with `rebuilt` threaded up the ancestor
-                // frames (a membership changes only its sort, not the structure) so each application can
-                // render Maude's `Whole:` line. Gated — allocates O(depth) only when whole-tracing.
                 let whole = (self.record_whole && self.tracing())
                     .then(|| self.reconstruct_whole(sig, &stack, rebuilt));
                 self.constrain_to_smaller_sort(sig, rebuilt, whole, &stack);
             }
-            // `rebuilt` is a normal form: stamp it canonical (its own nf) and hand it up. If the frame's
-            // `start` node differs — it rewrote and/or its children changed — record `rebuilt` as
-            // `start`'s normal form too, so a *shared* reference to `start` (under C7 construction dedup)
-            // forwards straight to `rebuilt` instead of re-reducing it. Always clearing `rebuilt.nf` (not
-            // just on a fresh node) guards against a stale `Some` from an earlier epoch: `start == rebuilt`
-            // (a self-normal node, e.g. a constant refined by a membership) leaves `nf = None`.
+
+            // Stamp the canonical result and forward the frame's original `start` node to it.
             let start = stack.last().expect("empty reduce stack").start;
             {
-                let n = self.dags.get_mut(rebuilt);
-                n.nf = None;
-                n.reduced_epoch = sig.eq_epoch();
+                let node = self.dags.get_mut(rebuilt);
+                node.nf = None;
+                node.reduced_epoch = sig.eq_epoch();
             }
             if start != rebuilt {
-                let n = self.dags.get_mut(start);
-                n.nf = Some(rebuilt);
-                n.reduced_epoch = sig.eq_epoch();
+                let node = self.dags.get_mut(start);
+                node.nf = Some(rebuilt);
+                node.reduced_epoch = sig.eq_epoch();
             }
             stack.pop();
             if stack.is_empty() {
@@ -3958,22 +4217,24 @@ impl Runtime {
             args: orig.clone(),
             orig,
             cursor: 0,
+            seen_top: false,
         }
     }
 
     /// Reconstruct the whole root term with `leaf` threaded up through the ancestor reduce frames — the
-    /// in-progress whole term Maude's `root()` would show for `set trace whole`. The deepest frame
-    /// (`stack.last`) is the one being rewritten (its node is `leaf`); each shallower frame contributes
-    /// its symbol + current `args`, with the position it is mid-reducing (`strat_position`) replaced by
-    /// the threaded child. Already-reduced siblings sit in `args`; not-yet-visited ones keep their
-    /// originals — exactly the partially-normalized whole term. Allocates O(depth) nodes, so it is only
-    /// called when whole-tracing is on.
+    /// in-progress whole term Maude's `root()` would show for `set trace whole`. Every ancestor exists
+    /// because it is waiting on an Argument instruction; Top instructions never push a child frame.
+    /// Already-reduced siblings sit in `args`; not-yet-visited ones keep their originals. Allocates
+    /// O(depth) nodes, so it is only called when whole-tracing is on.
     fn reconstruct_whole(&mut self, sig: &Signature, stack: &[ReduceFrame], leaf: DagId) -> DagId {
         let mut node = leaf;
         for frame in stack[..stack.len() - 1].iter().rev() {
-            let pos = sig
-                .strat_position(frame.symbol, frame.cursor, frame.orig.len())
-                .expect("an ancestor reduce frame is mid-strategy");
+            let action = sig
+                .strat_action(frame.symbol, frame.cursor, frame.orig.len())
+                .expect("an ancestor reduce frame has an active strategy instruction");
+            let EvalAction::Argument(pos) = action else {
+                unreachable!("only an Argument instruction can have a descendant frame");
+            };
             let mut args = frame.args.clone();
             args[pos] = node;
             // Preserve an S node's `count` (as the reduce loop does), else `rebuild` would re-wrap `s^1`.
@@ -4041,6 +4302,7 @@ impl Runtime {
         id: DagId,
         frames: &[ReduceFrame],
         descent: &mut dyn DescentOps,
+        include_owise: bool,
     ) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
@@ -4073,15 +4335,14 @@ impl Runtime {
             Theory::Acu | Theory::Au | Theory::S | Theory::Cui
         );
         let eqs = sig.equations.get(&symbol)?;
-        // Non-owise equations first; an `[owise]` equation applies only if no non-owise one does
-        // (Maude's two-phase `applyReplaceNoOwise` / `applyReplace`, B2.3b). The second pass is reached
-        // only when the first found nothing — for a node with no equations the early `?` above skips both.
-        // Equation rewrites (and the conditional trial/fragment events) are recorded inside
-        // `try_equations`, where the eq id + substitution are in scope.
-        if let Some(r) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
-            return Some(r);
+        // Intermediate `0` instructions try only ordinary equations; the final `0` adds the `[owise]`
+        // fallback after every ordinary equation fails (Maude's `applyReplaceNoOwise` / `applyReplace`).
+        if let Some(result) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
+            return Some(result);
         }
-        self.try_equations(sig, id, eqs, ext_allowed, true, frames)
+        include_owise
+            .then(|| self.try_equations(sig, id, eqs, ext_allowed, true, frames))
+            .flatten()
     }
 
     /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
@@ -5398,9 +5659,9 @@ impl Engine {
         self.sig.symbol(sym).is_constructor()
     }
 
-    /// Set an evaluation strategy `strat (raw…)` on `sym` (B2.4): `raw` is the 1-based argument
-    /// positions to reduce, in order, ending in a single `0` (reduce at top). Arguments not listed are
-    /// left unreduced (lazy) — e.g. `if_then_else_fi` with `[1, 0]`.
+    /// Install an operator evaluation strategy (B2.4): positive entries are 1-based argument
+    /// positions and `0` is a top-rewrite attempt. The complete instruction stream is normalized by
+    /// [`Signature::set_strategy`]; an empty slice selects the standard eager strategy.
     pub fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
         self.sig.set_strategy(sym, raw);
     }
@@ -7540,7 +7801,6 @@ impl Engine {
         context.build_result(runtime, signature, built)
     }
 
-
     /// Begin enumerating *every* match of `pattern` (with `nr_vars` distinct variables, indexed
     /// `0..nr_vars`) against `subject` — the public face of the A3 matcher seam's multi-solution
     /// [`Subproblem`] stream, which [`match_pattern`](Self::match_pattern) (a single yes/no) cannot
@@ -7670,7 +7930,6 @@ impl Solutions<'_> {
             .expect("rewrite_context requires a live match")
             .rewrite_context()
     }
-
 
     /// The unmatched ordered prefix and suffix for the current AU extension match.
     /// Other theories either have order-free residue or no two-sided ordered context.

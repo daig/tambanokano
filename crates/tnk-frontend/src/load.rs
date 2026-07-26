@@ -3661,6 +3661,19 @@ mod tests {
                 e("Nat", "z", 1),
                 e("Nat", "z", 1),
                 e("Nat", "s s z", 2),
+                e("S", "b", 1),                    // (0 1 0): first top succeeds
+                e("S", "b", 2),                    // first top misses; argument then final top
+                e("S", "b", 1),                    // first top skips a reducible argument
+                e("S", "b", 2),                    // intermediate top excludes owise
+                e("S", "b", 2),                    // (1 0 2 0): intermediate top skips arg 2
+                e("S", "b", 3),                    // both staged arguments, then final top
+                e("S", "b", 2),                    // missing final zero is appended
+                e("S", "b", 2),                    // a strategy with no zero gets a final one
+                e("S", "b", 2),                    // duplicate arguments/adjacent zeroes normalize
+                e("S", "pair(a, a)", 2), // shared post-top redexes are copied per occurrence
+                e("S", "pair(box(a), box(a))", 2), // eager descendants are copied too
+                e("S", "a m a m b", 2),  // semi-eager AC reduces every physical argument
+                e("S", "a ; b ; a", 3),  // semi-eager AU preserves per-occurrence accounting
             ],
         );
     }

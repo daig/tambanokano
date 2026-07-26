@@ -693,8 +693,7 @@ impl<'a> Printer<'a> {
                         cat: Cat::Op,
                         text: Cow::Borrowed(text),
                     });
-                    no_space =
-                        special || ((object_colons || spaced_label_colons) && text == ":");
+                    no_space = special || ((object_colons || spaced_label_colons) && text == ":");
                 }
                 Frag::Hole => {
                     let after_object_colon = (object_colons || spaced_label_colons)
