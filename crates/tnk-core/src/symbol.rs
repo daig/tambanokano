@@ -263,10 +263,10 @@ pub enum SpecialOp {
         disj: Option<SymbolId>,
         siblings: std::rc::Rc<[Option<SymbolId>]>,
     },
-    /// `if_then_else_fi` (Maude's `BranchSymbol`): with the condition reduced (the seam installs a lazy
-    /// `strat (1 0)`), select the branch whose position matches the condition among `tests` (the
-    /// `term-hook` constants, e.g. `[true, false]`), returning it **unreduced** — the dead branch is
-    /// never reduced.
+    /// `if_then_else_fi` (Maude's `BranchSymbol`): reduce the condition and select the branch whose
+    /// position matches it among `tests` (the `term-hook` constants, e.g. `[true, false]`). A selected
+    /// branch is returned unreduced and the dead branches are never visited. If no test matches, every
+    /// branch is normalized before user equations are tried on the rebuilt conditional.
     Branch { tests: Vec<SymbolId> },
     /// `_+_` / `_*_` / `gcd` / `lcm` / `min` / `max` / `_xor_` / `_&_` / `_|_` (Maude's
     /// `ACU_NumberOpSymbol`): fold the **numeric** operands of the ACU multiset (with multiplicity),

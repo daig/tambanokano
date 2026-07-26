@@ -1,6 +1,6 @@
-*** M0 milestone — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL), copied
-*** verbatim from ~/Downloads/Maude-3/prelude.maude (lines 33-82). Exercises the poly/Universal
-*** expansion (`_==_`/`_=/=_`/`if_then_else_fi`) and the SystemTrue/SystemFalse anchors.
+*** M0 milestone plus TNK-004 — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL),
+*** copied verbatim from ~/Downloads/Maude-3/prelude.maude (lines 33-82). Exercises poly/Universal
+*** expansion, equality hooks, and both the decided and stuck paths of `if_then_else_fi`.
 ***
 *** Oracle: the reduces below run byte-identically against Maude's BUILT-IN BOOL — i.e.
 ***   ~/Downloads/Maude-3/maude -no-banner   with   `red in BOOL : <term> .`
@@ -62,4 +62,5 @@ red true and false .
 red true == true .
 red true =/= false .
 red if true then false else true fi .
+red in BOOL : if X:Bool then (true and false) else (false or true) fi .
 red false or true and not false .

@@ -1658,17 +1658,17 @@ impl Signature {
         self.symbols.get_mut(sym).oo = oo;
     }
 
-    /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym`. The op-hook/term-hook
+    /// Set a built-in reduction rule (`special (id-hook …)`, B3) on `sym`. The op-hook/term-hook
     /// references are passed already resolved to [`SymbolId`]s (the future parser does the resolution;
-    /// for now the hand-built module supplies them). A [`SpecialOp::Branch`] is intrinsically lazy, so
-    /// this installs its `strat (1 0)` (condition eager, branches lazy) — the real `if_then_else_fi`
-    /// carries no user `strat`, so the seam wires it here (cf. the B2.4 lazy-strat mechanism).
+    /// hand-built modules supply them directly). A [`SpecialOp::Branch`] has an intrinsic dynamic
+    /// strategy: reduce its condition, attempt selection, and only if selection fails reduce every
+    /// branch before the final user-equation attempt (cf. Maude's `BranchSymbol::eqRewrite`).
     pub(crate) fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         if let SpecialOp::Branch { .. } = op {
             // Re-attaching a Branch (the same op reached via two import paths — e.g. `if_then_else_fi`
             // from a parameter theory's `protecting BOOL` and a regular `BOOL` import) is a no-op: the
-            // seam already installed `strat (1 0)`. The "no user strat" check therefore guards only the
-            // *first* attach — a genuine user `strat` on `if_then_else_fi` still trips it.
+            // seam already installed its intrinsic strategy. The "no user strat" check therefore
+            // guards only the *first* attach — a genuine user strategy still trips it.
             if matches!(
                 self.symbols.get(sym).special,
                 Some(SpecialOp::Branch { .. })
@@ -1681,7 +1681,41 @@ impl Signature {
                  carry a user strat",
                 self.symbols.get(sym).name()
             );
-            self.set_strategy(sym, &[1, 0]); // reduce the condition (arg 1) only, then the top rewrite
+            // BranchSymbol's result sort follows the common sort of its branch arguments. Maude
+            // encodes this by adding one synthetic declaration per proper sort in the branch kind:
+            // condition sort × branch sort^n -> branch sort.
+            let (arity, condition_sort, branch_sorts) = {
+                let symbol = self.symbols.get(sym);
+                let base = &symbol.decls()[0];
+                let arity = base.domain.len();
+                assert!(
+                    arity >= 2,
+                    "a Branch operator needs a condition and a branch"
+                );
+                let branch_kind = self.sorts.kind_of(base.domain[1]);
+                debug_assert!(
+                    base.domain[1..]
+                        .iter()
+                        .all(|&sort| self.sorts.kind_of(sort) == branch_kind),
+                    "all Branch arguments must belong to one kind"
+                );
+                (
+                    arity,
+                    base.domain[0],
+                    self.sorts.kind(branch_kind).index_order[1..].to_vec(),
+                )
+            };
+            for branch_sort in branch_sorts {
+                let mut domain = Vec::with_capacity(arity);
+                domain.push(condition_sort);
+                domain.resize(arity, branch_sort);
+                self.add_op_decl_with_ctor(sym, domain, branch_sort, false);
+            }
+            let mut strategy = Vec::with_capacity(arity + 2);
+            strategy.extend([1, 0]); // condition, then branch selection
+            strategy.extend(2..=arity as u32); // remaining branches, only after failed selection
+            strategy.push(0); // user equations over the normalized, still-stuck conditional
+            self.set_strategy(sym, &strategy);
         }
         self.symbols.get_mut(sym).special = Some(op);
     }
@@ -4302,29 +4336,34 @@ impl Runtime {
         id: DagId,
         frames: &[ReduceFrame],
         descent: &mut dyn DescentOps,
-        include_owise: bool,
+        final_step: bool,
     ) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
         // they are tried before user equations and fall through (`None`) on no-match. The `&SpecialOp`
         // borrowed from `sig` coexists with `&mut self` (the A4 split).
-        if let Some(op) = sig.symbol(symbol).special()
-            && let Some(r) = self.try_special(sig, id, op, descent)
-        {
-            if self.tracing() {
-                let depth = self.condition_depth;
-                self.record(TraceEvent::Rewrite {
-                    kind: RewriteKind::BuiltIn,
-                    eq_id: None,
-                    depth,
-                    redex: id,
-                    result: r,
-                    bindings: Vec::new(),
-                    whole_before: None,
-                    whole_after: None,
-                });
+        if let Some(op) = sig.symbol(symbol).special() {
+            if let Some(r) = self.try_special(sig, id, op, descent) {
+                if self.tracing() {
+                    let depth = self.condition_depth;
+                    self.record(TraceEvent::Rewrite {
+                        kind: RewriteKind::BuiltIn,
+                        eq_id: None,
+                        depth,
+                        redex: id,
+                        result: r,
+                        bindings: Vec::new(),
+                        whole_before: None,
+                        whole_after: None,
+                    });
+                }
+                return Some(r);
             }
-            return Some(r);
+            // BranchSymbol's first Top is selection-only. Maude reduces every remaining branch before
+            // trying user equations when the condition matches no hooked test.
+            if !final_step && matches!(op, SpecialOp::Branch { .. }) {
+                return None;
+            }
         }
         // ACU/AU/S/CUI rewriting matches *modulo* the axioms with extension: a pattern may match a
         // sub-multiset (ACU), a contiguous sub-sequence (AU), a successor prefix `s^k` of an `s^n`
@@ -4337,10 +4376,11 @@ impl Runtime {
         let eqs = sig.equations.get(&symbol)?;
         // Intermediate `0` instructions try only ordinary equations; the final `0` adds the `[owise]`
         // fallback after every ordinary equation fails (Maude's `applyReplaceNoOwise` / `applyReplace`).
+        // BranchSymbol's selection-only intermediate Top returned above without trying either class.
         if let Some(result) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
             return Some(result);
         }
-        include_owise
+        final_step
             .then(|| self.try_equations(sig, id, eqs, ext_allowed, true, frames))
             .flatten()
     }
@@ -5705,8 +5745,9 @@ impl Engine {
 
     /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user
     /// equations. Hook references are passed already resolved to [`SymbolId`]s (the future parser does
-    /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]). A
-    /// [`SpecialOp::Branch`](crate::symbol::SpecialOp) auto-installs its lazy `strat (1 0)`.
+    /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]).
+    /// [`SpecialOp::Branch`](crate::symbol::SpecialOp) installs its intrinsic dynamic strategy and
+    /// sort-refining synthetic declarations.
     /// Classify `sym` for the decompose-equality stability analysis (see [`SymbolClass`]): the
     /// frontend marks builtin marker-class symbols at module build, and command evaluation marks the
     /// pseudo-variable constants it realizes for a non-ground subject.
@@ -10224,10 +10265,10 @@ mod tests {
         assert!(e.deep_equal(r2, s1b));
     }
 
-    /// B3.3 built-in seam (== reference binary, `conformance/bool.maude`): `EqualitySymbol` (`_~_`)
-    /// reduces to `tt`/`ff` by structural equality (1 rewrite); the lazy `BranchSymbol` (`myif`) selects
-    /// a branch and leaves the dead branch **unreduced** (`myif(tt,0,big)` = 0 in 1 rewrite, while
-    /// `myif(tt,big,0)` reduces the chosen `big` = `s s 0` for 2). Attached via `set_special`.
+    /// B3.3 built-in seam (== reference binary, `conformance/prelude-bool.maude`): `EqualitySymbol`
+    /// (`_~_`) reduces to `tt`/`ff` by structural equality (1 rewrite). A decided `BranchSymbol`
+    /// (`myif`) selects one branch without touching the dead branch; an undecidable condition instead
+    /// normalizes every branch before trying user equations. Attached via `set_special`.
     #[test]
     fn builtin_equality_and_branch_over_bool() {
         use crate::symbol::SpecialOp;
@@ -10241,6 +10282,7 @@ mod tests {
         e.close_sorts();
         let tt = e.add_op("tt", vec![], truth);
         let ff = e.add_op("ff", vec![], truth);
+        let unknown = e.add_op("unknown", vec![], truth);
         let z = e.add_op("0", vec![], zero);
         let s = e.add_op_iter("s", vec![nat], nznat);
         let big = e.add_op("big", vec![], nat);
@@ -10307,6 +10349,51 @@ mod tests {
         let r = e.reduce(q);
         assert_eq!(e.node(r).symbol(), z, "myif(ff, big, 0) = 0");
         assert_eq!(e.rewrites(), 1, "else branch — big unreduced");
+
+        // An unhooked condition leaves the BranchSymbol in place but normalizes every physical branch
+        // occurrence. The shared input node must still account for `big` twice.
+        e.reset_rewrites();
+        let condition = e.make_const(unknown);
+        let shared = e.make_const(big);
+        let q = e.make_free(myif, vec![condition, shared, shared]);
+        let r = e.reduce(q);
+        assert_eq!(e.node(r).symbol(), myif);
+        assert_eq!(e.rewrites(), 2, "each stuck branch occurrence reduces");
+        assert_eq!(
+            e.sort_of(r),
+            nznat,
+            "result sort follows normalized branches"
+        );
+        let children: Vec<DagId> = e.node(r).children().collect();
+        let s2 = iter_num(&mut e, z, s, 2);
+        assert_eq!(e.node(children[0]).symbol(), unknown);
+        assert!(e.deep_equal(children[1], s2));
+        assert!(e.deep_equal(children[2], s2));
+
+        // User equations are deferred until after stuck branches normalize. `hold` is top-only, making
+        // an incorrect early equation observable as the unreduced child `big`.
+        let hold = e.add_op("hold", vec![nat, nat], nat);
+        e.set_strategy(hold, &[0]);
+        e.add_equation(Equation {
+            lhs: Term::op(
+                myif,
+                vec![Term::var(0, truth), Term::var(1, nat), Term::var(2, nat)],
+            ),
+            rhs: Term::op(hold, vec![Term::var(1, nat), Term::var(2, nat)]),
+            nr_vars: 3,
+        });
+        e.reset_rewrites();
+        let condition = e.make_const(unknown);
+        let big_arg = e.make_const(big);
+        let zero_arg = iter_num(&mut e, z, s, 0);
+        let q = e.make_free(myif, vec![condition, big_arg, zero_arg]);
+        let r = e.reduce(q);
+        assert_eq!(e.node(r).symbol(), hold);
+        assert_eq!(e.rewrites(), 2, "big reduction, then the user equation");
+        let children: Vec<DagId> = e.node(r).children().collect();
+        let s2 = iter_num(&mut e, z, s, 2);
+        assert!(e.deep_equal(children[0], s2));
+        assert_eq!(e.node(children[1]).symbol(), z);
     }
 
     /// B3.4 NAT built-in number ops (== reference binary, `conformance/nat.maude`): `_+_`/`_*_`/`gcd`

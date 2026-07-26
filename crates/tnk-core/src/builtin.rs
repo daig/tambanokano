@@ -834,11 +834,11 @@ impl Runtime {
         false
     }
 
-    /// `if_then_else_fi` (Maude's `BranchSymbol`): the condition (arg 0) is reduced (the seam's lazy
-    /// `strat (1 0)`); match it against the `tests` constants and return the corresponding branch
-    /// **unreduced** — the outer reduce loop normalizes only it, so the dead branch is never reduced. A
-    /// condition matching no test falls through (→ user equations; the reduce-the-branches-first
-    /// fidelity for a stuck condition is a follow-up).
+    /// `if_then_else_fi` (Maude's `BranchSymbol`) selector: with the condition already reduced by the
+    /// intrinsic strategy, return the branch matching a hooked `tests` constant. The outer reduce loop
+    /// then abandons the old frame and normalizes only that selected result. If no test matches, this
+    /// returns `None`; BranchSymbol's strategy continues through every branch before its final
+    /// user-equation attempt.
     fn reduce_branch(&self, id: DagId, tests: &[SymbolId]) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
         let cond_sym = self.node(kids[0]).symbol();

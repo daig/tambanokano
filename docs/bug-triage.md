@@ -38,7 +38,7 @@ Severity is impact, not implementation order:
 | TNK-001 | Critical | Bug | Legal interleaved operator evaluation strategy panics | **Resolved 2026-07-26**; oracle-differential fixture retained |
 | TNK-002 | Critical | Bug | Out-of-range `frozen` attribute panics instead of recovering | **Resolved 2026-07-26**; oracle-differential fixture retained |
 | TNK-003 | Critical | Bug | Nonbinary `assoc` declaration panics instead of recovering | **Resolved 2026-07-26**; oracle-differential fixture retained |
-| TNK-004 | High | Bug | Stuck conditional prevents required branch normalization | Confirmed by direct oracle/tnk probe |
+| TNK-004 | High | Bug | Stuck conditional prevents required branch normalization | **Resolved 2026-07-26**; oracle-differential fixtures retained |
 | TNK-005 | High | Compatibility rejection | Imported strategy declarations/definitions disappear during flattening | Confirmed by direct oracle/tnk probe |
 | TNK-006 | Medium | Compatibility rejection | `top` on a non-application strategy errors instead of being ignored | Confirmed by direct oracle/tnk probe |
 | TNK-007 | Medium | Bug | Exact `decFloat(_, 0)` fails for extreme subnormals | Confirmed by direct oracle/tnk probe |
@@ -217,17 +217,18 @@ Warning emission is still deferred with the broader diagnostics surface. This re
 
 ---
 
-### TNK-004 — Stuck conditional leaves reducible branches untouched
+### TNK-004 — Stuck conditional leaves reducible branches untouched — RESOLVED
 
 - **Severity:** High
 - **Classification:** Bug; wrong normal form, count, and sort
-- **Confidence:** Confirmed by direct comparison
+- **Resolved:** 2026-07-26
+- **Evidence:** oracle-differential fixtures retained
 - **Primary area:** built-in conditional evaluation
-- **Likely implementation touchpoint:** `tnk-core/src/builtin.rs`, branch reduction
+- **Implementation path:** `tnk-core/src/engine.rs`
 
 #### Summary
 
-When the condition of `if_then_else_fi` is symbolic and cannot select a branch, Maude still reduces the then- and else-branches. tnk currently falls through without reducing either branch.
+When the condition of `if_then_else_fi` is symbolic and cannot select a branch, Maude still reduces every branch before trying user equations. tnk formerly modeled BranchSymbol as only `strat (1 0)`, so a failed selection incorrectly reached the normal-form point with both branches untouched.
 
 #### Reproduction used
 
@@ -245,29 +246,27 @@ Maude normalizes both branches and returns:
 result Bool: if X:Bool then false else true fi
 ```
 
-The observed command performs five rewrites.
+The command performs five rewrites.
 
-#### Actual behavior
+#### Resolution
 
-tnk performs zero rewrites, retains both reducible branch expressions, and reports the result at kind `[Bool]` rather than sort `Bool`.
+BranchSymbol now installs the intrinsic dynamic strategy `1, 0, 2, 3, ..., n, 0`. It reduces the condition and attempts selection at the first top instruction. A successful selection abandons the old frame, preserving decided-condition laziness. A failed selection suppresses user equations at that intermediate top, continues through fresh per-occurrence reductions of every branch, rebuilds the conditional, and tries ordinary plus `owise` equations only at the final top.
 
-#### Impact
+Signature construction also mirrors Maude's BranchSymbol sort completion: for each proper sort `S` in the branch kind it adds a synthetic `condition-sort S ... S -> S` declaration. The rebuilt open conditional therefore acquires `Bool`, not merely kind `[Bool]`, after both Boolean branches normalize.
 
-- Open-term reduction returns a non-normal form.
-- Rewrite accounting is wrong.
-- The least sort is wrong.
-- Meta-level clients that rely on normalized open Boolean terms can observe the error transitively.
+#### Retained coverage
 
-#### Current understanding
-
-The built-in branch reducer currently recognizes true/false conditions and otherwise returns no built-in result. The missing path must normalize branch arguments even when the condition remains stuck, then rebuild the conditional.
+- `engine::tests::builtin_equality_and_branch_over_bool` covers decided-condition laziness, two independently counted copies of a shared stuck branch, least-sort refinement, and deferred user-equation ordering through a deliberately lazy result operator.
+- `conformance/audit/A3e-branch-stuck.maude` pins the live-prelude value, five-rewrite count, and `Bool` result sort against Maude 3.5.1.
+- `conformance/prelude-bool.maude` exercises the same contract through the prelude bootstrap and legacy differential path.
 
 #### Acceptance contract
 
-- Both branches reduce when the condition is undecidable.
-- The rebuilt conditional contains `false` and `true` in the demonstrated case.
-- Result sort and rewrite count match the oracle.
-- Chosen-condition behavior remains lazy: the unselected branch must not be reduced when the condition decides.
+- [x] Both branches reduce when the condition is undecidable.
+- [x] The rebuilt conditional contains `false` and `true` in the demonstrated case.
+- [x] Result sort `Bool` and rewrite count 5 match the oracle.
+- [x] Chosen-condition behavior remains lazy: the unselected branch is not reduced when the condition decides.
+- [x] User equations are deferred until after every branch of a stuck conditional has normalized.
 
 ---
 
@@ -733,7 +732,7 @@ TNK-001, TNK-002, and TNK-003 are resolved with retained fixtures. No confirmed 
 
 ### 8.2 Semantic-correctness group
 
-TNK-004 is the broadest confirmed wrong-computation issue because it affects normal forms, counts, and sorts for ordinary open Boolean terms. TNK-007 and TNK-008 are genuine but sharply bounded numeric/nonconfluent corners.
+TNK-004 is resolved with retained value, count, sort, laziness, and equation-ordering coverage. TNK-007 and TNK-008 remain genuine but sharply bounded numeric/nonconfluent wrong-computation corners.
 
 ### 8.3 Strategy composition group
 
@@ -758,14 +757,14 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, the TNK-002 probes in `conformance/audit/A3a-rewrite-frozen.maude`, and the TNK-003 probes in `conformance/audit/A1b-opdecl-arity.maude`; the other direct survey probes have not yet been added to the permanent corpus.
+The TNK-001 probes are retained in `conformance/strat.maude`, the TNK-002 probes in `conformance/audit/A3a-rewrite-frozen.maude`, the TNK-003 probes in `conformance/audit/A1b-opdecl-arity.maude`, and the TNK-004 probes in `conformance/audit/A3e-branch-stuck.maude` plus `conformance/prelude-bool.maude`; the other direct survey probes have not yet been added to the permanent corpus.
 
 ## 9. Prototype/v0 decision view
 
 This document does not set release priority. It exposes the decisions:
 
 - **How much sibling declaration-recovery validation is required for v0?** The confirmed TNK-002 and TNK-003 panics are resolved; adjacent theory-attribute cases remain unverified risk candidates rather than confirmed defects.
-- **Can v0 claim open-term functional reduction?** If so, TNK-004 needs resolution or a prominent limitation.
+- **Can v0 claim open-term functional reduction?** TNK-004 no longer blocks this claim for BranchSymbol: its symbolic-condition value, count, and sort contract is retained against the oracle.
 - **Can v0 claim compositional strategy modules?** If so, TNK-005 needs resolution.
 - **Are narrow numeric/nonconfluent/reflection corners acceptable as documented limitations?** This governs TNK-007–009.
 - **Is the 60-second I-S gate binding?** This governs TNK-010.

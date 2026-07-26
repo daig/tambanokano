@@ -800,10 +800,10 @@ fn theory_module_sorts_through_repl() {
     );
 }
 
-/// M0 milestone — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL, verbatim)
-/// loads and reduces byte-identically to Maude's built-in BOOL. Proves the poly/Universal expansion
-/// (`_==_`/`_=/=_`/`if_then_else_fi` instantiated over the Bool kind) and the SystemTrue/SystemFalse
-/// anchors. Each value + count is the reference binary's (`red in BOOL : …`).
+/// M0/TNK-004 — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL, verbatim)
+/// loads and reduces byte-identically to Maude's built-in BOOL. Proves poly/Universal expansion,
+/// equality and BranchSymbol hooks, decided-condition laziness, stuck-branch normalization, and
+/// SystemTrue/SystemFalse anchors. Each value + count is the reference binary's.
 #[test]
 fn prelude_bool_m0_through_repl() {
     let out = repl().eval(conformance_file!("prelude-bool.maude")).output;
@@ -816,26 +816,36 @@ fn prelude_bool_m0_through_repl() {
         out.contains("reduce in BOOL : if true then false else true fi ."),
         "if header: {out}"
     );
+    assert!(
+        out.contains("reduce in BOOL : if X:Bool then true and false else true or false fi ."),
+        "stuck if header: {out}"
+    );
     // Result value + sort, in order.
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
         results,
         vec![
-            "result Bool: false", // true and false
-            "result Bool: true",  // true == true
-            "result Bool: true",  // true =/= false
-            "result Bool: false", // if true then false else true fi
-            "result Bool: true",  // false or true and not false
+            "result Bool: false",                             // true and false
+            "result Bool: true",                              // true == true
+            "result Bool: true",                              // true =/= false
+            "result Bool: false",                             // if true then false else true fi
+            "result Bool: if X:Bool then false else true fi", // stuck if normalizes both branches
+            "result Bool: true",                              // false or true and not false
         ],
         "values: {out}"
     );
-    // Distinctive rewrite counts: four single-rewrite reduces + the 7-rewrite xor expansion.
+    // Distinctive rewrite counts: four single-rewrite reduces, the 5-rewrite stuck conditional, and
+    // the 7-rewrite xor expansion.
     assert_eq!(
         out.matches("rewrites: 1 ").count(),
         4,
         "1-rewrite reduces: {out}"
     );
     assert!(out.contains("rewrites: 7 "), "xor-expansion count: {out}");
+    assert!(
+        out.contains("rewrites: 5 "),
+        "stuck-branch normalization count: {out}"
+    );
 }
 
 /// Increment-3 core: poly/Universal expansion over TWO kinds (Bool + an unrelated Color). `_==_` and

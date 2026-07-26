@@ -6,7 +6,7 @@
 
 ## 1. Executive findings
 
-1. **The implementation is substantially ahead of its planning documents.** The current checkout passes the 77/77 audit corpus, the 87/87 legacy sweep, and 446 release tests. Every U/V/N/T/M subsystem fixture passes. The I-S meta-interpreter fixtures remain semantically conformant, but two large Russian-dolls fixtures are now at or beyond the retained 60-second gate: the all-subsystem run was 110/112, I19 passed alone in 59.77 seconds, and I20 passed only after raising the timeout to 180 seconds (82.01 seconds). The documentation's unconditional “27/27 gate green” statement is therefore not true under the recorded 60-second gate on this checkout/machine.
+1. **The implementation is substantially ahead of its planning documents.** The current checkout passes the 78/78 audit corpus, the 87/87 legacy sweep, and 446 release tests. Every U/V/N/T/M subsystem fixture passes. The I-S meta-interpreter fixtures remain semantically conformant, but two large Russian-dolls fixtures are now at or beyond the retained 60-second gate: the all-subsystem run was 110/112, I19 passed alone in 59.77 seconds, and I20 passed only after raising the timeout to 180 seconds (82.01 seconds). The documentation's unconditional “27/27 gate green” statement is therefore not true under the recorded 60-second gate on this checkout/machine.
 2. **There is no reliable single source of current truth.** `docs/migration/README.md` and `01-architecture-map.md` point to `fable-audit.md` as the complete current ledger, but that file now mixes four things: a valuable historical differential audit, resolved findings, still-live limitations, and descriptions made false by later implementation. Its status heading was refreshed without refreshing several substantive sections.
 3. **The raw material for an actually-working feature list exists, but is scattered.** The best starting points are `fable-audit.md` §1, the command enum and `Session` dispatch, the completion headers in `remaining-plans/`, the subsystem fixtures, and crate-level code. None is sufficient alone. The feature inventory in `01-architecture-map.md` is explicitly a Maude parity-target list, not a tnk support matrix.
 4. **Future work is interleaved with history.** `roadmap.md`, `subsystems-goal.md`, `objects-io-plan.md`, the six `remaining-plans`, and source comments all contain future-looking statements. Many are completed or stale; others are real but differ in confidence. They should not be retained as one linear roadmap. They should be extracted into independent issue/proposal records with explicit dependency edges and acceptance evidence.
@@ -20,19 +20,20 @@
 
 | Check | Observed result | What it establishes |
 |---|---:|---|
-| `cargo test --release --workspace --features smt-z3` | **446 passed**, 12 suites; warnings only | Current Rust tests pass in the optional-solver configuration after the TNK-003 repair. |
-| `tools/audit-scoreboard.sh` | **77/77 PASS** | Every retained post-audit correctness fixture matches the Maude 3.5.1 oracle under the harness contract. |
+| `cargo test --release --workspace --features smt-z3` | **446 passed**, 12 suites; warnings only | Current Rust tests pass in the optional-solver configuration after the TNK-004 repair. |
+| `tools/audit-scoreboard.sh` | **78/78 PASS** | Every retained post-audit correctness fixture, including TNK-004's open conditional, matches the Maude 3.5.1 oracle under the harness contract. |
 | `tools/legacy-sweep.sh` | **87/87 CLEAN** | Legacy fixtures either match exactly or reproduce their recorded accepted diff. |
 | `tools/subsystems-scoreboard.sh` with the current `smt-z3` release binary | **110/112 PASS** at the default 60-second timeout | U/V/N/T/M all pass; I19 and I20 hit the timeout in the combined run. |
 | Isolated I19 | **PASS**, 59.77 s | Semantics match; this fixture is on the gate boundary and is timing-sensitive. |
 | Isolated I20, default timeout | **timeout**, 60.32 s | The recorded I-S 60-second gate is currently red. |
 | Isolated I20, `TIMEOUT_SECS=180` | **PASS**, 82.01 s | The failure is a performance/gate failure, not an observed output divergence. |
+| `TIMEOUT_SECS=180 tools/subsystems-scoreboard.sh` with the current `smt-z3` release binary | **112/112 PASS** | Every retained subsystem fixture remains conformant under the extended gate used for the known I19/I20 performance residual. |
 | `B1b-collapse-counts.maude` direct oracle diff | **PASS** | The audit's still-unresolved-looking collapse-count bullet and related fixture comments are stale. |
 | Incomparable-membership probe | Oracle chooses sort `D`; tnk chooses `B` | The component-index tiebreak remains a real wrong-sort result on contradictory membership specifications. |
 | Strategy-module reflection probe | `upModule`, `upStratDecls`, and `upSds` compute; one diff: reflected implicit BOOL import is `protecting` instead of the oracle's `including` | The old “strategy reflection is inert” claim is stale, but the newly observed import-mode divergence needs its own issue/fixture. |
 | General evaluation-strategy probe | Oracle and tnk match on retained interleaved/multiple-top, `owise`, shared-redex, and AC/AU semi-eager cases | TNK-001 is resolved; `conformance/strat.maude` preserves value, sort, and rewrite-count coverage. |
 | Strategy import/modifier probes | Imported `sd` executes in Maude but tnk rejects it; Maude ignores `top(idle)` with a warning while tnk errors | Strategy flattening and generalized `top` behavior are incomplete. |
-| Stuck conditional-branch probe | Oracle reduces both branches and reports `Bool`; tnk performs 0 rewrites and leaves the term at kind `[Bool]` | A stuck condition prevents required branch normalization. |
+| Stuck conditional-branch probe | Maude and tnk both normalize the branches to `false` and `true`, perform 5 rewrites, and report result sort `Bool` | TNK-004 is resolved; decided conditions remain lazy and user equations are tried only after stuck branches normalize. |
 | Declaration-recovery probes | Maude warns and recovers from out-of-range `frozen` and nonbinary `assoc`; tnk now matches both semantic recovery paths, with warning text still normalized away | TNK-002 and TNK-003 are resolved with retained oracle-differential fixtures. |
 | Extreme-subnormal `decFloat(_, 0)` probe | Oracle returns a 783-byte exact `DecFloat`; tnk leaves the application unreduced | The bounded numeric residual is confirmed directly. |
 | Candidate-control probes | Basic cross-kind overloading, CUI collapse matching, and iter-membership matching compute correctly | Several broad source “follow-up” comments are stale; only narrower untested corners should remain candidates. |
@@ -210,7 +211,6 @@ These have current implementation evidence, a retained audit record, or a direct
 - Garbage-term Earley explosion on a large grammar; current protection removes a common trigger but not the underlying case.
 - Incomparable membership-target tie-breaking; the kind-label component-index repair should not be conflated with this remaining semantic corner.
 - Strategy-module `upModule` reflects the automatic BOOL import with the wrong mode (`protecting` versus oracle `including`); add the survey probe as a retained fixture before treating strategy reflection as closed.
-- A stuck `if_then_else_fi` condition prevents branch normalization: on a direct BOOL probe Maude reduces both branches (5 rewrites, result sort `Bool`), while tnk performs 0 rewrites, leaves both reducible branches, and reports kind `[Bool]`.
 - I19/I20 performance relative to the retained 60-second I-S gate.
 
 ### 5.2 Source-admitted candidates that need a minimal oracle fixture
