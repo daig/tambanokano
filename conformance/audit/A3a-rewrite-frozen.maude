@@ -1,4 +1,4 @@
-*** A3a-rewrite-frozen — rewrite ignores frozen (full + partial frozen(2)); eqs still reduce inside frozen args (fable-audit.md §3.2, §3.9.2)
+*** A3a-rewrite-frozen — valid frozen traversal plus atomic recovery from invalid positions (fable-audit.md §3.2, §3.9.2)
 mod FROZ is
   sort S .
   ops a b c d : -> S .
@@ -10,3 +10,20 @@ endm
 rewrite in FROZ : g(a) .
 rewrite in FROZ : h(a, a) .
 rewrite in FROZ : g(c) .
+
+mod BAD-FROZEN is
+  sort S .
+  ops a b : -> S .
+  op f : S -> S [frozen (2)] .
+  rl a => b .
+endm
+rewrite in BAD-FROZEN : f(a) .
+
+mod BAD-FROZEN-ATOMIC is
+  sort S .
+  ops a b c d : -> S .
+  op f : S S -> S [frozen (1 3)] .
+  rl a => b .
+  rl c => d .
+endm
+rewrite in BAD-FROZEN-ATOMIC : f(a, c) .

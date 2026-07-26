@@ -1579,14 +1579,22 @@ impl Signature {
 
     /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`, Pillar A). `raw` is the 1-based
     /// positions from the source — empty for a bare `[frozen]` (all arguments); stored 0-based.
-    pub(crate) fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) {
+    ///
+    /// Returns `false` without changing the symbol when any position is outside the operator's arity,
+    /// or when a constant is given a bare `frozen` attribute. This is Maude's atomic
+    /// warning-and-ignore recovery semantics; source diagnostics belong to the frontend.
+    #[must_use]
+    pub(crate) fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) -> bool {
         let arity = self.symbols.get(sym).arity();
-        assert!(
-            raw.iter().all(|&p| p >= 1 && p as usize <= arity),
-            "frozen positions {raw:?} for `{}` reference an argument outside 1..={arity}",
-            self.symbols.get(sym).name()
-        );
-        self.symbols.get_mut(sym).frozen = Some(raw.iter().map(|&p| p - 1).collect());
+        if (arity == 0 && raw.is_empty())
+            || raw
+                .iter()
+                .any(|&position| position == 0 || position as usize > arity)
+        {
+            return false;
+        }
+        self.symbols.get_mut(sym).frozen = Some(raw.iter().map(|&position| position - 1).collect());
+        true
     }
 
     /// Set the object-system role flags (`config`/`obj`/`msg`/`portal`) on `sym` (Pillar 2.5). Inert
@@ -5400,8 +5408,12 @@ impl Engine {
     /// Mark `sym`'s frozen arguments (`frozen` / `frozen (raw…)`, Pillar A): `raw` is the 1-based frozen
     /// argument positions — pass an empty slice for a bare `[frozen]` (all arguments). A frozen argument
     /// is never rewritten by `rewrite`/`frewrite`/`search`; equational `reduce` is unaffected.
-    pub fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) {
-        self.sig.set_frozen(sym, raw);
+    ///
+    /// Returns `false` and leaves the symbol unchanged when the attribute references an invalid
+    /// position. This makes declaration input recoverable without weakening the signature invariant.
+    #[must_use]
+    pub fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) -> bool {
+        self.sig.set_frozen(sym, raw)
     }
 
     pub(crate) fn is_frozen_arg(&self, sym: SymbolId, arg: usize) -> bool {
@@ -7742,6 +7754,28 @@ mod tests {
             out.sort();
             out
         }
+    }
+
+    /// Invalid declaration positions are user input, not kernel invariants. Recovery ignores the
+    /// complete attribute atomically and preserves any frozen metadata already installed on a symbol.
+    #[test]
+    fn invalid_frozen_positions_are_recoverable_and_atomic() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let constant = e.add_op("c", vec![], s);
+        let fresh = e.add_op("fresh", vec![s, s], s);
+        let configured = e.add_op("configured", vec![s, s], s);
+
+        assert!(!e.set_frozen(constant, &[]));
+        assert!(!e.set_frozen(fresh, &[1, 3]));
+        assert!(!e.is_frozen_arg(fresh, 0));
+        assert!(!e.is_frozen_arg(fresh, 1));
+
+        assert!(e.set_frozen(configured, &[2]));
+        assert!(!e.set_frozen(configured, &[1, 3]));
+        assert!(!e.is_frozen_arg(configured, 0));
+        assert!(e.is_frozen_arg(configured, 1));
     }
 
     /// Genuine variable leaves (`make_var` / `variable_symbol`): per-sort symbol caching in demand

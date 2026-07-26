@@ -471,7 +471,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 engine.set_strategy(sym, strat);
             }
             if let Some(frozen) = &od.attrs.frozen {
-                engine.set_frozen(sym, frozen);
+                // Maude keeps the declaration but atomically ignores an invalid `frozen` attribute.
+                // Its warning text remains part of the deferred diagnostics surface.
+                let _ = engine.set_frozen(sym, frozen);
             }
             // Object-system role flags (`config`/`obj`/`msg`/`portal`, Pillar 2.5). Mirror Maude's
             // `SymbolType` CONFIG/OBJECT/MESSAGE/PORTAL bits onto the kernel symbol. Inert for the
