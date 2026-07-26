@@ -1,7 +1,7 @@
-*** A1b-opdecl-arity — op-decl underscore/arity mismatch: oracle disables, tnk crashes (fable-audit.md §3.1)
-*** Case 1: 2-hole name declared with 3 argument sorts. Oracle warns + disables the op; a use no longer
-*** parses and the session survives (the later `red a .` still computes). tnk loads it silently then panics
-*** at the engine.rs arity assert on the first use.
+*** A1b-opdecl-arity — declaration arity recovery: invalid mixfix arity and nonbinary assoc
+*** Cases 1 and 2 preserve Maude's warning-and-recovery behavior for a mismatch between an operator
+*** name's holes and its declared arity. Warnings are normalized by the differential harness; the
+*** retained commands prove that the invalid syntax cannot terminate the session.
 fmod OPARITY is
   sort A .
   ops a b : -> A [ctor] .
@@ -10,11 +10,21 @@ endfm
 red in OPARITY : a + b .
 red in OPARITY : a .
 
-*** Case 2 (LAST): 3-hole name declared unary. Oracle warns + disables; tnk panics at module BUILD
-*** in grammar/build.rs, so this module must come last or its pre-fix crash masks case 1.
+*** Case 2: 3-hole name declared unary. Maude disables the mixfix syntax while retaining the prefix
+*** declaration; tnk follows the same semantic recovery.
 fmod OPUNARY is
   sort A .
   op a : -> A [ctor] .
   op _;_;_ : A -> A .
 endfm
 red in OPUNARY : a .
+
+*** Case 3 (TNK-003): assoc is meaningful only for a binary declaration. Maude clears the compiled
+*** attribute and retains a free ternary operator; the nested command proves it is not AU-flattened.
+fmod BAD-ASSOC is
+  sort S .
+  op a : -> S .
+  op f : S S S -> S [assoc] .
+endfm
+red in BAD-ASSOC : f(a, a, a) .
+red in BAD-ASSOC : f(a, a, f(a, a, a)) .

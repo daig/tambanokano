@@ -30,9 +30,9 @@ struct ConstructorAxiomProfile {
 }
 
 impl ConstructorAxiomProfile {
-    fn from_attrs(attrs: &Attrs) -> Self {
+    fn from_attrs(attrs: &Attrs, effective_assoc: bool) -> Self {
         Self {
-            assoc: attrs.assoc,
+            assoc: effective_assoc,
             comm: attrs.comm,
             idem: attrs.idem,
             iter: attrs.iter,
@@ -199,6 +199,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let od = &pm.ops[idx];
         let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
+        // Maude validates semantic attributes before choosing a theory-specific symbol. A nonbinary
+        // declaration keeps its raw `[assoc]` spelling for source display, but its compiled attribute
+        // is cleared and the operator falls back to the remaining effective theory (free in TNK-003).
+        // Warning delivery remains part of the deferred diagnostics surface.
+        let effective_assoc = od.attrs.assoc && arity == 2;
 
         // The (domain, range) profile(s) this declaration expands to.
         let mut profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
@@ -265,7 +270,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 } else {
                     od.attrs.ctor
                 };
-                let incoming = ConstructorAxiomProfile::from_attrs(&od.attrs);
+                let incoming = ConstructorAxiomProfile::from_attrs(&od.attrs, effective_assoc);
                 if !inherited
                     && constructor_axiom_profiles
                         .get(&existing)
@@ -277,9 +282,18 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 constructor_flags.insert(existing, ctor);
                 existing
             } else {
-                let sym = declare_op(&mut engine, &cname, &od.attrs, &domain, range);
-                constructor_axiom_profiles
-                    .insert(sym, ConstructorAxiomProfile::from_attrs(&od.attrs));
+                let sym = declare_op(
+                    &mut engine,
+                    &cname,
+                    &od.attrs,
+                    effective_assoc,
+                    &domain,
+                    range,
+                );
+                constructor_axiom_profiles.insert(
+                    sym,
+                    ConstructorAxiomProfile::from_attrs(&od.attrs, effective_assoc),
+                );
                 constructor_flags.insert(sym, od.attrs.ctor);
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
@@ -312,7 +326,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                         gather,
                         object_attribute,
                         spaced_label_colon: object_attribute && od.name.len() > 1,
-                        assoc: od.attrs.assoc,
+                        assoc: effective_assoc,
                         iter: od.attrs.iter,
                         format,
                     },
@@ -608,14 +622,15 @@ fn declare_op(
     engine: &mut Engine,
     name: &str,
     attrs: &Attrs,
+    effective_assoc: bool,
     domain: &[SortId],
     range: SortId,
 ) -> SymbolId {
     let symbol = if attrs.iter {
         engine.add_op_iter(name.to_string(), domain.to_vec(), range)
-    } else if attrs.assoc && attrs.comm {
+    } else if effective_assoc && attrs.comm {
         engine.add_op_ac(name.to_string(), domain.to_vec(), range, None)
-    } else if attrs.assoc {
+    } else if effective_assoc {
         engine.add_op_au(name.to_string(), domain.to_vec(), range, None)
     } else if attrs.comm || attrs.idem || attrs.id.is_some() {
         engine.add_op_cui(
@@ -1398,6 +1413,50 @@ endfm
         let tt = m.ops[&("tt".to_string(), 0)];
         let tt_node = m.engine.make_const(tt);
         assert!(m.engine.deep_equal(r, tt_node), "2 < 3 = tt");
+    }
+
+    /// Maude clears a nonbinary `assoc` flag before theory selection, retaining a free operator. The
+    /// compiled syntax must use that same effective flag or the grammar would still accept a flattened
+    /// associative argument list for a free ternary application.
+    #[test]
+    fn nonbinary_assoc_compiles_as_free_theory() {
+        let mut module = build(
+            "\
+fmod BAD-ASSOC is
+  sort S .
+  op a : -> S .
+  op f : S S S -> S [assoc] .
+endfm
+",
+        );
+        let f = module.ops[&("f".to_string(), 3)];
+        let a = module.ops[&("a".to_string(), 0)];
+        assert!(
+            !module.syntax[&f].assoc,
+            "compiled syntax must clear the invalid assoc attribute"
+        );
+
+        let a0 = module.engine.make_const(a);
+        let inner = module.engine.make_free(f, vec![a0, a0, a0]);
+        let root = module.engine.make_free(f, vec![a0, a0, inner]);
+        assert!(matches!(
+            module.engine.node(root).repr(),
+            tnk_core::dag::NodeRepr::App
+        ));
+        assert_eq!(
+            module.engine.node(root).children().collect::<Vec<_>>(),
+            vec![a0, a0, inner],
+            "free fallback preserves the ternary application rather than flattening it"
+        );
+
+        module.engine.reset_rewrites();
+        let result = module.engine.reduce(root);
+        assert_eq!(result, root);
+        assert_eq!(module.engine.rewrites(), 0);
+        assert_eq!(
+            module.engine.sorts().name(module.engine.sort_of(result)),
+            "S"
+        );
     }
 
     #[test]
