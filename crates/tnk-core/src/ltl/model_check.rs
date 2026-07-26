@@ -73,8 +73,7 @@ struct ActiveGraphContext<'runtime, 'signature, 'descent> {
 
 impl GraphContext for ActiveGraphContext<'_, '_, '_> {
     fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors {
-        self.runtime
-            .state_successors_deferred(self.signature, root)
+        self.runtime.state_successors_deferred(self.signature, root)
     }
 
     fn graph_replay_rewrites(&mut self, rewrites: u64) {

@@ -1,0 +1,44 @@
+*** I22-local-interpreter-walking-skeleton — Phase I-S0 reference probe.
+*** Oracle verified against Maude 3.5.1 on 2026-07-23.
+*** PRELUDE
+set show timing off .
+set show advisories off .
+
+*** Phase I-S0 walking skeleton: local create/insert/select-reduce/reply/delete.
+
+load metaInterpreter
+set include BOOL off .
+
+fmod I-WALK-CHILD is
+  sort Nat .
+  ops zero one : -> Nat [ctor] .
+  op plus : Nat Nat -> Nat .
+  eq plus(zero, one) = one .
+endfm
+
+mod I-WALK is
+  pr META-INTERPRETER .
+
+  op me : -> Oid .
+  op User : -> Cid .
+  op result:_ : Msg -> Attribute .
+
+  vars X Y Z : Oid .
+  var AS : AttributeSet .
+  var N : RewriteCount .
+  var T : Term .
+  var TY : Type .
+
+  rl < X : User | AS > createdInterpreter(X, Y, Z) =>
+     < X : User | AS > insertModule(Z, X, upModule('I-WALK-CHILD, true)) .
+
+  rl < X : User | AS > insertedModule(X, Y) =>
+     < X : User | AS > reduceTerm(Y, X, 'I-WALK-CHILD, 'plus['zero.Nat, 'one.Nat]) .
+
+  rl < X : User | AS > reducedTerm(X, Y, N, T, TY) =>
+     < X : User | AS, result: reducedTerm(X, Y, N, T, TY) > quit(Y, X) .
+endm
+
+erew in I-WALK : <>
+  < me : User | none >
+  createInterpreter(interpreterManager, me, none) .

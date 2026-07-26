@@ -22,7 +22,7 @@ use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
-use crate::theory::LhsAutomaton;
+use crate::theory::{LhsAutomaton, RewriteMatchContext};
 
 /// A compiled AU left-hand side: the flattened pattern as an ordered list of elements.
 #[derive(Clone)]
@@ -192,6 +192,18 @@ impl AuLhs {
             candidates.sort_by_key(|c| std::cmp::Reverse(c.matched()));
             candidates
         };
+        // Rewrite-mode ground AU matching is greedy: the compiled ground automaton reports its first
+        // contiguous occurrence and has no subproblem to enumerate. Interactive `xmatch` still exposes
+        // every occurrence, while variable-bearing rewrite patterns retain their solution stream.
+        let mut candidates = candidates;
+        if !command
+            && self
+                .elements
+                .iter()
+                .all(|element| matches!(element, AuElem::Ground(_)))
+        {
+            candidates.truncate(1);
+        }
 
         let var_at: Vec<Option<(u32, SortId)>> = self
             .elements
@@ -637,6 +649,10 @@ impl AuSubproblem {
         self.ext_allowed.then_some(self.matched_whole)
     }
 
+    pub(crate) fn ordered_context_parts(&self) -> (&[DagId], &[DagId]) {
+        (&self.prefix, &self.suffix)
+    }
+
     /// Advance to the next solution, binding its variables (each to the AU node of its run) and
     /// recording the prefix/suffix residue; `false` when exhausted. A candidate whose binding violates
     /// a variable's sort is skipped.
@@ -856,6 +872,14 @@ impl AuSubproblem {
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn rewrite_context(&self) -> RewriteMatchContext {
+        if self.matched_whole {
+            RewriteMatchContext::whole()
+        } else {
+            RewriteMatchContext::au(self.symbol, self.prefix.clone(), self.suffix.clone())
         }
     }
 

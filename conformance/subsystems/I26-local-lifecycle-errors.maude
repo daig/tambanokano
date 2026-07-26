@@ -1,0 +1,55 @@
+*** I26-local-lifecycle-errors — fresh Maude 3.5.1 local-manager probe.
+*** Pins supported-target errors, deletion, stale IDs, and slot reuse.
+*** PRELUDE
+set show timing off .
+set show advisories off .
+
+load metaInterpreter
+
+omod I-LIFECYCLE-ERRORS is
+  pr META-INTERPRETER .
+
+  op me : -> Oid .
+  ops ErrorUser ReuseUser : -> Cid .
+  op phase:_ : Nat -> Attribute .
+  op first-error:_ : String -> Attribute .
+  op second-error:_ : String -> Attribute .
+  op first-child:_ : Oid -> Attribute .
+  op second-child:_ : Oid -> Attribute .
+  msg bogus : Oid Oid -> Msg .
+
+  vars W X Y Z : Oid .
+  vars S S' : String .
+
+  rl < X : ErrorUser | phase: 0 > createdInterpreter(X, Y, Z) =>
+     < X : ErrorUser | phase: 1 > bogus(Z, X) .
+
+  rl < X : ErrorUser | phase: 1 > interpreterError(X, Y, S) =>
+     < X : ErrorUser | phase: 2, first-error: S >
+       reduceTerm(Y, X, 'NO-SUCH-MODULE, 'zero.Nat) .
+
+  rl < X : ErrorUser | phase: 2, first-error: S > interpreterError(X, Y, S') =>
+     < X : ErrorUser | phase: 3, first-error: S, second-error: S' > quit(Y, X) .
+
+  rl < X : ErrorUser | phase: 3, first-error: S, second-error: S' > bye(X, Y) =>
+     < X : ErrorUser | phase: 4, first-error: S, second-error: S' >
+       reduceTerm(Y, X, 'NO-SUCH-MODULE, 'zero.Nat) .
+
+  rl < X : ReuseUser | phase: 0 > createdInterpreter(X, Y, Z) =>
+     < X : ReuseUser | phase: 1, first-child: Z > quit(Z, X) .
+
+  rl < X : ReuseUser | phase: 1, first-child: Z > bye(X, Z) =>
+     < X : ReuseUser | phase: 2, first-child: Z >
+       createInterpreter(interpreterManager, X, none) .
+
+  rl < X : ReuseUser | phase: 2, first-child: Y > createdInterpreter(X, W, Z) =>
+     < X : ReuseUser | phase: 3, first-child: Y, second-child: Z > quit(Z, X) .
+endom
+
+erew in I-LIFECYCLE-ERRORS : <>
+  < me : ErrorUser | phase: 0 >
+  createInterpreter(interpreterManager, me, none) .
+
+erew in I-LIFECYCLE-ERRORS : <>
+  < me : ReuseUser | phase: 0 >
+  createInterpreter(interpreterManager, me, none) .

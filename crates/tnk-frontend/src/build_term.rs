@@ -535,7 +535,7 @@ fn flatten_dag_assoc(
 /// the named control escapes `\a`(7) `\b`(8) `\f`(12) `\n \r \t` `\v`(11), `\"`, `\\`, a 1–3 digit
 /// octal escape (value truncated to a byte, C semantics), and any other `\c` → the bare byte `c`
 /// (e.g. `\q` → `q`, verified against the oracle).
-fn unquote_string(tok: &str) -> Vec<u8> {
+pub fn unquote_string(tok: &str) -> Vec<u8> {
     let inner = tok
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))

@@ -9,11 +9,9 @@ publish.workspace = true
 workspace = true
 [features]
 default = []
-smt-z3 = ["tnk-core/smt-z3"]
+smt-z3 = ["tnk-session/smt-z3"]
 
 
 [dependencies]
-tnk-core = { path = "../tnk-core" }
-tnk-frontend = { path = "../tnk-frontend" }
-tnk-modules = { path = "../tnk-modules" }
+tnk-session = { path = "../tnk-session" }
 rustyline = "14"               # interactive line editing + history (binary only)

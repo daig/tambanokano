@@ -249,38 +249,38 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A synthetic name-fragment token carrying the (already-interned) text `frag` — used only by the
-    /// `omod` class-attribute desugaring to append the `:`/`_` mixfix fragments to an attribute name.
-    /// [`tokenize`](crate::lex::tokenize) guarantees `:`/`_` are interned, so the lookup never fails; only
-    /// the token *text* is load-bearing downstream (`canonical_name` concatenates it, `split_mixfix`
-    /// re-splits), so the kind is a plain `Ident`.
-    fn frag_token(&self, frag: &str, line: u32) -> Token {
-        let sym = self
-            .i
-            .get(frag)
-            .expect("`:`/`_` mixfix fragment must be pre-interned by tokenize");
-        Token {
-            sym,
+    /// The two synthetic tokens for Maude's class-attribute suffix `` `:_ ``.
+    /// [`tokenize`](crate::lex::tokenize) pre-interns both fragments because the surface parser holds
+    /// only `&Interner`.
+    fn attribute_suffix(&self, line: u32) -> [Token; 2] {
+        let fragment = |text| Token {
+            sym: self
+                .i
+                .get(text)
+                .expect("attribute suffix fragment must be pre-interned by tokenize"),
             line,
             kind: TokKind::Ident,
-        }
+        };
+        [fragment(":"), fragment("_")]
     }
 
     /// Desugar `class C` into a sort `C`, a subsort `C < Cid`, and the honorary class constant
-    /// `op C : -> C [ctor]` (Maude's `processClassSorts`/`processClassOps`). `ctok` is `C`'s own token
-    /// (reused as the constant's mixfix name).
-    fn desugar_class(&self, m: &mut PreModule, ctok: Token, cname: &str) {
+    /// `op C : -> C [ctor]` (Maude's `processClassSorts`/`processClassOps`). In a theory the class constant
+    /// is implicitly a parameter constant, so a parameter copy renames it `C` → `X$C`. `ctoks` is the
+    /// complete structured class name (for example `List { X }`), reused as the constant's mixfix name.
+    fn desugar_class(&self, m: &mut PreModule, ctoks: Vec<Token>, cname: &str) {
         m.sorts.push(cname.to_string());
         // `C < Cid`: a two-group chain (`[[C], [Cid]]`), as the `subsort` parser builds it.
         m.subsorts
             .push(vec![vec![cname.to_string()], vec!["Cid".to_string()]]);
         m.ops.push(OpDecl {
-            name: vec![ctok],
+            name: ctoks,
             domain: Vec::new(),
             range: cname.to_string(),
             partial: false,
             attrs: Attrs {
                 ctor: true,
+                pconst: m.is_theory,
                 ..Attrs::default()
             },
         });
@@ -290,11 +290,8 @@ impl<'a> Parser<'a> {
     /// `processClassOps`: the `attributeSuffix` ``"`:_"``, range `Attribute`, `gather (&)`). `atok` is the
     /// attribute name's own token; the mixfix name is `[a, :, _]` (canonical `a:_`, re-split to `a :_`).
     fn desugar_attribute(&self, m: &mut PreModule, atok: Token, asort: String) {
-        let name = vec![
-            atok,
-            self.frag_token(":", atok.line),
-            self.frag_token("_", atok.line),
-        ];
+        let mut name = vec![atok];
+        name.extend(self.attribute_suffix(atok.line));
         m.ops.push(OpDecl {
             name,
             domain: vec![asort],
@@ -351,20 +348,30 @@ impl<'a> Parser<'a> {
         Ok(names)
     }
 
-    /// Collect a whole statement body up to the top-level terminator `.` (left unconsumed), tracking
-    /// `()`/`[]`/`{}` depth so a bracketed sub-term — a `[_]`-list rhs, a `{_}` set, a structured sort —
-    /// does not look like a delimiter. The caller then splits the body (separator `=`, `if`, attributes)
-    /// with [`top_level_find`] / [`peel_stmt_attrs`].
+    /// Collect a whole statement body up to the top-level terminator `.` (left unconsumed). Besides
+    /// ordinary delimiters, account for reflected module constructors: a meta-level term can contain
+    /// `fmod ... sorts ... . ... endfm` at top level, and those internal dots are data, not the enclosing
+    /// equation's terminator.
     fn collect_to_dot(&mut self) -> Vec<Token> {
-        let mut depth = 0i32;
+        let mut delimiter_depth = 0i32;
+        let mut reflected_module_depth = 0i32;
         let mut out = Vec::new();
         while let Some(t) = self.peek() {
-            if depth == 0 && t.kind == TokKind::Dot {
+            let text = self.i.resolve(t.sym);
+            if delimiter_depth == 0 && reflected_module_depth == 0 && t.kind == TokKind::Dot {
                 break;
             }
-            match self.i.resolve(t.sym) {
-                "(" | "[" | "{" => depth += 1,
-                ")" | "]" | "}" => depth -= 1,
+            match text {
+                "(" | "[" | "{" => delimiter_depth += 1,
+                ")" | "]" | "}" => delimiter_depth -= 1,
+                "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
+                    reflected_module_depth += 1;
+                }
+                "endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth" | "endom" | "endoth"
+                    if reflected_module_depth > 0 =>
+                {
+                    reflected_module_depth -= 1;
+                }
                 _ => {}
             }
             out.push(t);
@@ -1026,6 +1033,7 @@ impl<'a> Parser<'a> {
 
         let mut sort_maps = Vec::new();
         let mut op_maps = Vec::new();
+        let mut vars = Vec::new();
         while !self.at("endv") {
             match self.peek_text().ok_or("unexpected end of input in view")? {
                 "sort" => {
@@ -1036,6 +1044,17 @@ impl<'a> Parser<'a> {
                     let to_s = self.sort_name()?;
                     self.eat_dot()?;
                     sort_maps.push((from_s, to_s));
+                }
+                "var" | "vars" => {
+                    self.advance();
+                    let mut names = Vec::new();
+                    while !self.at(":") {
+                        names.push(self.name()?);
+                    }
+                    self.eat(":")?;
+                    let sort = self.sort_name()?;
+                    self.eat_dot()?;
+                    vars.push(VarDecl { names, sort });
                 }
                 "op" => {
                     self.advance();
@@ -1057,10 +1076,64 @@ impl<'a> Parser<'a> {
                         op_maps.push(OpMap::Op { from, to });
                     }
                 }
+                "class" => {
+                    self.advance();
+                    let from_start = self.pos;
+                    let from_s = self.sort_name()?;
+                    let from = self.toks[from_start..self.pos].to_vec();
+                    self.eat("to")?;
+                    let to_start = self.pos;
+                    let to_s = self.sort_name()?;
+                    let to = self.toks[to_start..self.pos].to_vec();
+                    self.eat_dot()?;
+                    // OO class maps are the sort map plus the honorary class-constant operator map
+                    // created by `desugar_class`.
+                    sort_maps.push((from_s, to_s));
+                    op_maps.push(OpMap::Op { from, to });
+                }
+                "attr" => {
+                    self.advance();
+                    let from_token = self.peek().ok_or("expected an attribute name")?;
+                    let from_name = self.name()?;
+                    if self.at_dot() {
+                        self.eat_dot()?;
+                        let _class = self.sort_name()?;
+                    }
+                    self.eat("to")?;
+                    let to_token = self.peek().ok_or("expected a target attribute name")?;
+                    let to_name = self.name()?;
+                    self.eat_dot()?;
+                    if from_name.contains('_') || to_name.contains('_') {
+                        return Err("underscore not allowed in an attribute name".into());
+                    }
+                    let mut from = vec![from_token];
+                    from.extend(self.attribute_suffix(from_token.line));
+                    let mut to = vec![to_token];
+                    to.extend(self.attribute_suffix(to_token.line));
+                    op_maps.push(OpMap::Op { from, to });
+                }
+                "msg" => {
+                    self.advance();
+                    let body = self.collect_until(&[]);
+                    self.eat_dot()?;
+                    let split = body
+                        .windows(2)
+                        .position(|pair| {
+                            self.i.resolve(pair[0].sym) == "to"
+                                && self.i.resolve(pair[1].sym) == "term"
+                        })
+                        .ok_or("message view map must use `msg … to term …`")?;
+                    let from = body[..split].to_vec();
+                    let to = body[split + 2..].to_vec();
+                    if from.is_empty() || to.is_empty() {
+                        return Err("message view map has an empty source or target term".into());
+                    }
+                    op_maps.push(OpMap::Term { from, to });
+                }
                 other => {
                     return Err(format!(
-                        "view map must be `sort … to …` or `op … to …`, found `{other}` \
-                         (strat/var/class maps are a follow-up)"
+                        "view map must be `sort … to …`, `op … to …`, `class … to …`, \
+                         `attr … to …`, `msg … to term …`, or a variable declaration, found `{other}`"
                     ));
                 }
             }
@@ -1071,6 +1144,7 @@ impl<'a> Parser<'a> {
             params,
             from,
             to,
+            vars,
             sort_maps,
             op_maps,
         })
@@ -1134,8 +1208,8 @@ impl<'a> Parser<'a> {
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
                 }
-                // `~>` is the partial (kind-level) arrow (`op modExp : Nat Nat NzNat ~> Nat`): its range
-                // is the kind, so an unreduced application sits at the kind level (recorded in `partial`).
+                // `~>` is the partial (kind-level) arrow: all domain/range sorts are lifted to their kinds
+                // by signature construction (recorded here so the compiled declaration preserves it).
                 let partial = self.at("~>");
                 if partial {
                     self.advance();
@@ -1192,18 +1266,19 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 self.advance();
-                // `class C [| a1 : S1, a2 : S2] .` — a class name, then an optional `|`-separated list of
-                // `attr : sort` pairs. `C` becomes a sort `C`, a subsort `C < Cid`, and an honorary class
-                // *constant* `op C : -> C [ctor]`; each attribute `a : S` becomes `op a`:_ : S -> Attribute
-                // [ctor gather (&)]` (the `a :_` mixfix form).
-                let ctok = self.peek().ok_or("expected a class name after `class`")?;
-                let cname = self.name()?;
+                // `class C [| a1 : S1, a2 : S2] .` — a possibly structured class name, then an optional
+                // `|`-separated list of `attr : sort` pairs. `C` becomes a sort `C`, a subsort `C < Cid`,
+                // and an honorary class *constant* `op C : -> C [ctor]`; each attribute `a : S` becomes
+                // `op a`:_ : S -> Attribute [ctor gather (&)]` (the `a :_` mixfix form).
+                let class_start = self.pos;
+                let cname = self.sort_name()?;
+                let ctoks = self.toks[class_start..self.pos].to_vec();
                 // A class name becomes a sort *and* a same-named constant operator; an underscore would
                 // make that operator a mixfix form with a hole (Maude rejects it — `ooProcess.cc`).
                 if cname.contains('_') {
                     return Err(format!("underscore not allowed in class name `{cname}`"));
                 }
-                self.desugar_class(m, ctok, &cname);
+                self.desugar_class(m, ctoks, &cname);
                 if self.at("|") {
                     self.advance();
                     loop {
@@ -1428,15 +1503,18 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 self.advance();
-                // `strat[s] n1 … : <domain sorts> @ Sort .`
+                // `strat[s] n1 … : <domain sorts> @ Sort .`; Maude omits the colon when the
+                // strategy has no call parameters (`strats n1 n2 @ Sort .`).
                 let mut names = Vec::new();
-                while !self.at(":") {
+                while !self.at(":") && !self.at("@") {
                     names.push(self.name()?);
                 }
-                self.eat(":")?;
                 let mut domain = Vec::new();
-                while !self.at("@") {
-                    domain.push(self.sort_name()?);
+                if self.at(":") {
+                    self.advance();
+                    while !self.at("@") {
+                        domain.push(self.sort_name()?);
+                    }
                 }
                 self.eat("@")?;
                 let subject = self.sort_name()?;

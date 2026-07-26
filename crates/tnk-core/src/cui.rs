@@ -18,7 +18,7 @@ use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
-use crate::theory::enumerate_alien_solutions;
+use crate::theory::{RewriteMatchContext, enumerate_alien_solutions};
 
 /// A compiled CUI left-hand side: the binary pattern `f(p1, p2)` plus the variable indices it binds.
 #[derive(Clone)]
@@ -258,6 +258,13 @@ impl CuiSubproblem {
         }
         self.residue = residue;
         true
+    }
+
+    pub(crate) fn rewrite_context(&self) -> RewriteMatchContext {
+        match self.residue {
+            Some(residue) => RewriteMatchContext::cui(self.symbol, residue),
+            None => RewriteMatchContext::whole(),
+        }
     }
 
     /// A whole match is just the instantiated rhs; a collapse-extension match re-seats the rhs

@@ -143,8 +143,7 @@ struct AppState {
 
 struct OneMatch {
     path: Vec<usize>,
-    rhs: Term,
-    bindings: Vec<Option<DagId>>,
+    result: DagId,
 }
 
 /// A task — a sub-computation whose solutions feed a continuation. `slaves` counts the live processes + live
@@ -189,12 +188,25 @@ pub fn srewrite_command(
     strat: &StratExpr,
     depth_first: bool,
 ) -> Result<(Vec<StratSolution>, u64), String> {
-    let rstrat = resolve(strat, lm, i, 0)?;
     let mut vars = VarIndex::new();
     let subj_term = parse_build(term, &lm.grammar, &lm.built, i, &mut vars)?;
     if vars.count() != 0 {
         return Err("srewrite subject must be a ground term".to_string());
     }
+    let subj = lm.built.engine.instantiate_bindings(&subj_term, &[]);
+    srewrite_dag(lm, i, subj, strat, depth_first)
+}
+
+/// Run a strategy over an already-built ground subject. META-INTERPRETER uses this entry point after
+/// down-translating its reflected `Term`, avoiding a print-and-reparse round trip.
+pub fn srewrite_dag(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    subj: DagId,
+    strat: &StratExpr,
+    depth_first: bool,
+) -> Result<(Vec<StratSolution>, u64), String> {
+    let rstrat = resolve(strat, lm, i, 0)?;
     let mut defs = HashMap::new();
     for d in &lm.built.strat_defs {
         if d.cond.is_none()
@@ -204,7 +216,6 @@ pub fn srewrite_command(
             defs.insert(d.name.clone(), body);
         }
     }
-    let subj = lm.built.engine.instantiate_bindings(&subj_term, &[]);
     let mut cx = Cx {
         eng: &mut lm.built.engine,
         defs: &defs,
@@ -939,13 +950,17 @@ impl Search {
                 had_success,
                 ..
             } => {
-                *had_success = true;
-                vec![Process {
-                    dag,
-                    pending: push(rest, success.clone()),
-                    app: None,
-                    task: parent,
-                }]
+                if *had_success {
+                    Vec::new()
+                } else {
+                    *had_success = true;
+                    vec![Process {
+                        dag,
+                        pending: push(rest, success.clone()),
+                        app: None,
+                        task: parent,
+                    }]
+                }
             }
             TaskKind::One { rest, taken } => {
                 if *taken {
@@ -975,10 +990,13 @@ impl Search {
                 }]
             }
         };
-        let one = matches!(self.tasks[task].kind, TaskKind::One { .. });
+        let commit = matches!(
+            self.tasks[task].kind,
+            TaskKind::One { .. } | TaskKind::Branch { .. }
+        );
         self.schedule(succ);
-        // `one` discards the rest of its sub-search: kill the task so its queued processes are dropped.
-        if one {
+        // `one` and conditional branching commit to the first successful sub-search result.
+        if commit {
             self.kill(task);
         }
     }
@@ -1006,8 +1024,7 @@ impl Search {
         // A resumable rule application: fire one match, spawn its result + survive, else die.
         if let Some(mut app) = p.app.take() {
             if let Some(m) = app.matches.pop_front() {
-                let new_sub = inst(cx, &m.rhs, &m.bindings);
-                let whole = replace_at(cx.eng, p.dag, &m.path, new_sub);
+                let whole = replace_at(cx.eng, p.dag, &m.path, m.result);
                 cx.eng.reset_rewrites();
                 let whole = cx.eng.reduce(whole);
                 cx.count += 1 + cx.eng.rewrites();
@@ -1280,41 +1297,41 @@ fn precompute_matches(
     for path in &positions {
         let sub = subterm_at(cx.eng, dag, path);
         for r in rules {
-            let base = vec![None; r.nr_vars as usize];
-            for mut b in match_extend(cx.eng, &r.lhs, &base, sub, false) {
-                if apply_subst(cx, r, subst, &mut b) {
-                    out.push_back(OneMatch {
-                        path: path.clone(),
-                        rhs: r.rhs.clone(),
-                        bindings: b,
-                    });
-                }
+            let Some(initial) = initial_bindings(cx, r, subst) else {
+                continue;
+            };
+            let mut matching = cx.eng.rewrite_match_solutions_with_bindings(
+                r.lhs.clone(),
+                r.nr_vars,
+                sub,
+                &initial,
+            );
+            while matching.advance() {
+                let result = matching.rewrite_result(&r.rhs);
+                out.push_back(OneMatch {
+                    path: path.clone(),
+                    result,
+                });
             }
         }
     }
     out
 }
 
-/// Apply the initial substitution to a match's bindings (check if bound, bind if not). `false` on conflict.
-fn apply_subst(cx: &mut Cx, r: &RRule, subst: &[(String, Term)], b: &mut [Option<DagId>]) -> bool {
-    for (name, t) in subst {
-        let Some(vi) = r.var_names.iter().position(|n| n == name) else {
-            return false;
-        };
-        let val = {
-            let d = inst(cx, t, &[]);
-            cx.eng.reduce(d)
-        };
-        match b[vi] {
-            Some(existing) => {
-                if !cx.eng.deep_equal(existing, val) {
-                    return false;
-                }
-            }
-            None => b[vi] = Some(val),
-        }
+/// Build the caller-supplied bindings for a rule application. The matcher enforces these bindings
+/// while enumerating, avoiding a second filter pass and retaining its theory-extension residue.
+fn initial_bindings(
+    cx: &mut Cx,
+    r: &RRule,
+    subst: &[(String, Term)],
+) -> Option<Vec<Option<DagId>>> {
+    let mut initial = vec![None; r.nr_vars as usize];
+    for (name, term) in subst {
+        let slot = r.var_names.iter().position(|candidate| candidate == name)?;
+        let dag = inst(cx, term, &[]);
+        initial[slot] = Some(cx.eng.reduce(dag));
     }
-    true
+    Some(initial)
 }
 
 /// Apply rules whose conditions / rewrite-condition substrategies must be solved (the eager path).
@@ -1336,14 +1353,33 @@ fn apply_eager(
     for path in &positions {
         let sub = subterm_at(cx.eng, dag, path);
         for r in rules {
-            let base = vec![None; r.nr_vars as usize];
-            for mut b in match_extend(cx.eng, &r.lhs, &base, sub, false) {
-                if !apply_subst(cx, r, subst, &mut b) {
-                    continue;
-                }
-                for fb in solve_frags(cx, &r.condition, 0, b, substrats, 0, fifo) {
-                    let new_sub = inst(cx, &r.rhs, &fb);
-                    let whole = replace_at(cx.eng, dag, path, new_sub);
+            let Some(initial) = initial_bindings(cx, r, subst) else {
+                continue;
+            };
+            let mut matching = cx.eng.rewrite_match_solutions_with_bindings(
+                r.lhs.clone(),
+                r.nr_vars,
+                sub,
+                &initial,
+            );
+            let mut candidates = Vec::new();
+            while matching.advance() {
+                let bindings = (0..r.nr_vars).map(|slot| matching.binding(slot)).collect();
+                let context = matching.rewrite_context();
+                candidates.push((bindings, context));
+            }
+            for (bindings, context) in candidates {
+                for bindings in solve_frags(cx, &r.condition, 0, bindings, substrats, 0, fifo) {
+                    let bindings: Vec<DagId> = bindings
+                        .into_iter()
+                        .map(|binding| {
+                            binding.expect("successful rule condition left an RHS variable unbound")
+                        })
+                        .collect();
+                    let result =
+                        cx.eng
+                            .instantiate_rewrite_result(&r.rhs, &bindings, &context);
+                    let whole = replace_at(cx.eng, dag, path, result);
                     cx.eng.reset_rewrites();
                     let whole = cx.eng.reduce(whole);
                     cx.count += 1 + cx.eng.rewrites();

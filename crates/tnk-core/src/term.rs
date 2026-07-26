@@ -527,18 +527,11 @@ impl Runtime {
     }
 
     fn instantiated_term_equal(&self, term: &Term, dag: DagId, subst: &Subst) -> bool {
-        if let NodeTerm::S {
-            symbol,
-            count,
-            arg,
-        } = &self.node(dag).term
-        {
+        if let NodeTerm::S { symbol, count, arg } = &self.node(dag).term {
             let (instance_count, base) = self.instantiated_s_parts(term, *symbol, subst);
             return instance_count == *count
                 && match base {
-                    InstantiatedBase::Term(base) => {
-                        self.instantiated_term_equal(base, *arg, subst)
-                    }
+                    InstantiatedBase::Term(base) => self.instantiated_term_equal(base, *arg, subst),
                     InstantiatedBase::Dag(base) => self.deep_equal(base, *arg),
                 };
         }
@@ -680,7 +673,6 @@ impl Runtime {
             }
         }
     }
-
 
     /// [`instantiate`](Self::instantiate) with Maude's `RhsBuilder` CSE: each **textually repeated**
     /// compound subterm of the rhs is built once and reused (so it reduces once and counts once —

@@ -117,11 +117,19 @@ pub fn apply_renaming(
                     .as_ref()
                     .is_none_or(|(d, r)| *d == orig_domain && *r == orig_range)
         }) {
-            // Replace the op's name wholesale with the target's token vector. `tokenize` reproduces the
-            // canonical spelling — one token for a hole-bearing name with no lexer-punctuation (`_plus_`,
-            // `_;_`), split tokens for a punctuation name (`_,_` → `_ , _`) — so the rebuilt op keeps the
-            // target's mixfix shape (holes preserved) rather than collapsing to a prefix op.
+            // Preserve the OO declaration's separated attribute suffix. `class C | a : S` desugars to
+            // `[a, :, _]`; rebuilding `b:_` with `tokenize` alone collapses that source distinction and
+            // Maude then prints renamed attributes as `b: value` instead of `b : value`.
+            let spaced_attribute_suffix = op.name.len() > 1 && canon.ends_with(":_");
+            let suffix = spaced_attribute_suffix.then(|| {
+                let n = op.name.len();
+                [op.name[n - 2], op.name[n - 1]]
+            });
             op.name = tokenize(&spec.to, interner);
+            if let (Some(suffix), Some(label)) = (suffix, spec.to.strip_suffix(":_")) {
+                op.name = tokenize(label, interner);
+                op.name.extend(suffix);
+            }
             apply_attr_override(&mut op.attrs, &spec.attrs);
         }
         // Identity attributes are arbitrary ground terms: rewrite their operator occurrences through
@@ -497,6 +505,17 @@ fn subst_sort_tokens(
 
     let mut index = 0;
     while index < bubble.len() {
+        // The lexer keeps an on-the-fly variable with a structured sort as one identifier token
+        // (`L:List{Nat}`), while `tokenize("List{Nat}")` below necessarily yields several tokens.
+        // Handle that exact suffix before the token-sequence matcher.
+        if let Some((name, sort)) = interner.resolve(bubble[index].sym).rsplit_once(':')
+            && !name.is_empty()
+            && let Some(target) = map.get(sort)
+        {
+            bubble[index].sym = interner.intern(&format!("{name}:{target}"));
+            index += 1;
+            continue;
+        }
         let exact = mappings.iter().find(|mapping| {
             index + mapping.source.len() <= bubble.len()
                 && bubble[index..index + mapping.source.len()]
@@ -590,6 +609,19 @@ mod tests {
         )
         .expect("rename");
         assert_eq!(renamed.sorts, ["Item"]);
+    }
+
+    #[test]
+    fn sort_rename_rewrites_structured_colon_variable() {
+        let mut i = Interner::new();
+        let mut bubble = tokenize("L:List{Nat}", &mut i);
+        assert_eq!(bubble.len(), 1, "colon variable is one lexer token");
+        subst_sort_tokens(
+            &mut bubble,
+            &HashMap::from([("List{Nat}".to_string(), "NatList".to_string())]),
+            &mut i,
+        );
+        assert_eq!(i.resolve(bubble[0].sym), "L:NatList");
     }
 
     #[test]

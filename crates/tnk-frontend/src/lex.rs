@@ -18,7 +18,7 @@ use std::collections::HashMap;
 pub struct Sym(u32);
 
 /// String interner: text ↔ [`Sym`]. Token equality is `Sym` equality.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Interner {
     strings: Vec<String>,
     lookup: HashMap<String, Sym>,
@@ -122,12 +122,14 @@ pub(crate) fn is_punct(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
 }
 
-/// Whether the maudeId built so far is the prefix of a colon variable `name:base` — a non-empty variable
-/// name and a non-empty sort base after the last `:`. When it is, a following `{ … }` is part of the
-/// (structured) sort name, so the lexer keeps `L:List{Nat}` one token rather than splitting `L:List` off
-/// from `{ Nat }`. (A plain sort `List{Nat}` has no `:`, so it still tokenizes as `List { Nat }`.)
+/// Whether the maudeId built so far is a colon variable prefix `name:base`. `base` may still be empty
+/// while scanning the opening `[` of a kind-qualified variable (`A:[Maybe{Oid}]`). Quoted identifiers
+/// are operator names, never variables; punctuation following a Qid must remain syntax.
 fn colon_var_shape(text: &str) -> bool {
-    matches!(text.rsplit_once(':'), Some((name, base)) if !name.is_empty() && !base.is_empty())
+    matches!(
+        text.rsplit_once(':'),
+        Some((name, _base)) if !name.is_empty() && !name.starts_with('\'')
+    )
 }
 
 /// A line comment `***`/`---` begins at `chars[j]`.
@@ -241,7 +243,7 @@ fn classify(text: &str) -> TokKind {
     if is_string_literal(text) {
         return TokKind::Str;
     }
-    if text.starts_with('\'') && text.len() > 1 {
+    if text.starts_with('\'') {
         return TokKind::Qid;
     }
     if is_iter_token(text) {
@@ -357,11 +359,8 @@ fn is_float_literal(text: &str) -> bool {
 /// `---` line comments, the splitting punctuation, string literals, the terminator `.`, and maudeIds with
 /// backquote escaping.
 pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
-    // Guarantee the two mixfix fragment chars the `omod` class-desugaring splices into synthesized
-    // attribute-operator names (`bal` + `:` + `_` → `bal :_`) are interned, so the surface parser (which
-    // holds only `&Interner`) can look them up via `Interner::get`. The `:` separator is present in any
-    // real module (every op/var declaration), but the `_` hole may legitimately be absent from an object
-    // module's source — its objects are written `< O : C | ... >`, never a bare `_`.
+    // Guarantee the two mixfix fragment chars the `omod` class desugaring splices into synthesized
+    // attribute names are interned. The surface parser only holds `&Interner`.
     interner.intern(":");
     interner.intern("_");
 
@@ -493,6 +492,14 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                     }
                     break;
                 }
+                // A kind-qualified variable starts `A:[…]`; unlike an ordinary punctuation boundary,
+                // this colon belongs to the variable token so the balanced-bracket branch below can
+                // consume the whole kind name.
+                if chars.get(i + 1) == Some(&'[') && !text.starts_with('\'') {
+                    text.push(':');
+                    i += 1;
+                    continue;
+                }
                 let next_is_boundary = chars
                     .get(i + 1)
                     .is_none_or(|next| next.is_whitespace() || is_punct(*next));
@@ -529,6 +536,35 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                 }
                 continue;
             }
+            // A colon variable may name its connected-component kind directly: `A:[Maybe{Oid}]`.
+            // Only a bracket immediately after the colon belongs to that variable. In
+            // `Q:Qid[TL:NeTermList]`, `Q:Qid` is complete and `[` starts the meta-term application.
+            // Keep the direct kind's balanced brackets (and structured sorts inside them) in one token;
+            // whitespace inside a kind name is presentation only.
+            if ch == '[' && text.ends_with(':') {
+                let mut depth = 0u32;
+                while i < n {
+                    let cj = chars[i];
+                    if cj == '\n' {
+                        line += 1;
+                    }
+                    if !cj.is_whitespace() {
+                        text.push(cj);
+                    }
+                    i += 1;
+                    match cj {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             if ch.is_whitespace() || is_punct(ch) {
                 break;
             }
@@ -537,10 +573,16 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             }
             if ch == '`' && i + 1 < n {
                 let next = chars[i + 1];
-                // A backquote before a *split* char (`_`/`:`/punct) escapes it: the char joins this token
-                // as a literal (a `` `[ `` bracket, a `` `, `` comma), so drop the backquote — its only role
-                // was to suppress the split.
+                // A backquote before a *split* char (`_`/`:`/punct) escapes it: the char joins this token.
+                // Token names normally discard that lexical escape. The one exception is Maude's
+                // object-attribute suffix `` `:_ ``: its backquote is part of the reflected operator Qid.
                 if next == '_' || next == ':' || is_punct(next) {
+                    if text.starts_with('\'')
+                        && next == ':'
+                        && chars.get(i + 2).is_some_and(|following| *following == '_')
+                    {
+                        text.push('`');
+                    }
                     text.push(next);
                     i += 2;
                     continue;
@@ -591,14 +633,13 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
     let mut pending = String::new();
     let mut chars = name.chars().peekable();
     while let Some(ch) = chars.next() {
-        // A backquote before a *split* char (`_`/`:`/punct) escapes it — a *literal* part of the
-        // surrounding token, so `` _`[_ `` is one bracket op, not a structural `[`. A backquote before a
-        // *normal* char is an inter-token blank (Maude's op-name spacing, `` c`d_ ``): it ends the current
-        // literal fragment, and the next char starts a fresh one — this is what recovers a multi-token name
-        // like `c d_` → `c`, `d`, `_` (rather than merging to the single literal `cd_`).
+        // A backquote before a *split* char (`_`/punct) escapes it — a *literal* part of the surrounding
+        // token, so `` _`[_ `` is one bracket op, not a structural `[`. A backquote before a normal char
+        // (including `:`) is an inter-token blank (Maude's op-name spacing, `` c`d_ `` / `` bal`:_ ``):
+        // it ends the current literal fragment, and the next char starts a fresh one.
         if ch == '`' {
             match chars.peek() {
-                Some(&next) if next == '_' || next == ':' || is_punct(next) => {
+                Some(&next) if next == '_' || is_punct(next) => {
                     chars.next();
                     pending.push(next);
                 }
@@ -784,6 +825,18 @@ mod tests {
         use TokKind::*;
         assert_eq!(kinds, [Number, Number, Float, Str, Qid, Ident]);
         assert_eq!(t[3].0, "\"abc\"", "the string keeps its quotes");
+    }
+
+    #[test]
+    fn quoted_identifier_preserves_split_character_escapes() {
+        let (_i, tokens) = lex("'first`:_ 'X:Foo");
+        assert_eq!(
+            tokens,
+            [
+                ("'first`:_".to_string(), TokKind::Qid),
+                ("'X:Foo".to_string(), TokKind::Qid),
+            ]
+        );
     }
 
     /// Maude's grammar admits a string literal as a `normal` char (`lexer.ll`: `normal = […|{string}]`),

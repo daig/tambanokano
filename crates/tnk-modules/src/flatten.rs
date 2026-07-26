@@ -204,21 +204,30 @@ pub fn flatten_with_homes(
         .unwrap_or_default();
     let homes = std::mem::take(&mut acc.statement_homes);
     let mut d = acc.into_decls();
-    // Variable aliases are module-local in Maude: a command in module M parses with M's OWN `var`
-    // declarations taking priority, never an import's (prelude BOOL-OPS's `vars A B C : Bool` must
-    // not shadow the root's `vars A B C D : Nat` — the oracle parses `red c(A, B) ...` at Nat).
-    // The merge above kept the FIRST (import) declaration of each name; repair the root's names
-    // authoritatively. Statements are unaffected: imported ones parse against their home grammars
-    // (D1a) and the root's own collisions were already inlined to colon variables
-    // (`inline_shadowed_vars`), so only the command/grammar view changes.
+    // Imported variable aliases participate in the root grammar only when no visible nullary operator
+    // redeclares the same token. Root-owned variables are then restored authoritatively. This mirrors
+    // Maude's declaration priority for META-INTERPRETER clients importing constants `M : -> Module` and
+    // `V : -> View` over older aliases with those names.
     if let Some(pm) = root {
         let own_var_names: HashSet<String> = pm
             .vars
             .iter()
             .flat_map(|v| v.names.iter().cloned())
             .collect();
+        let constant_names: HashSet<String> = d
+            .ops
+            .iter()
+            .filter(|op| op.domain.is_empty())
+            .map(|op| {
+                op.name
+                    .iter()
+                    .map(|token| interner.resolve(token.sym))
+                    .collect()
+            })
+            .collect();
         for vd in &mut d.vars {
-            vd.names.retain(|n| !own_var_names.contains(n));
+            vd.names
+                .retain(|name| !own_var_names.contains(name) && !constant_names.contains(name));
         }
         d.vars.retain(|vd| !vd.names.is_empty());
         d.vars.extend(pm.vars.iter().cloned());
@@ -896,10 +905,8 @@ fn instantiate(
     }
     // Instantiated donation: variables/sorts inlined into the bubbles, so parse against the flattened
     // grammar (no distinct home) — D1a is scoped to plain named imports.
-    acc.add(
-        instantiate_decls(decls, &bindings, &op_subst, interner),
-        None,
-    );
+    let instantiated = instantiate_decls(decls, &bindings, &op_subst, interner);
+    acc.add(instantiated, None);
     Ok(())
 }
 
@@ -1120,12 +1127,11 @@ fn resolve_arg(
 ///   so these route through [`ViewOpSubst`], which parses the bubble in the source grammar and re-emits the
 ///   application in the target's syntax.
 ///
-/// - **term template** (`ReconTarget::Term`): an op→term map with *variable arguments* (`op lt(A, B) to term
-///   A < B`), the main use of op→term. The from-pattern's argument variables become the template's formal
-///   parameters; each `lt(e1, e2)` occurrence re-emits the template with the arguments substituted.
-///
-/// An op→term map whose source is *mixfix* (argument holes in the operator name itself) is still a follow-up
-/// (rejected): it needs the pattern's holes matched positionally against the source operator's own fixity.
+/// - **term template** (`ReconTarget::Term`): an op→term map with variable arguments (`op lt(A, B) to term
+///   A < B` or `msg to O from O' get to term to O get from O'`). The from-pattern's argument variables
+///   become the template's formal parameters; each occurrence re-emits the template with actual arguments
+///   substituted. Prefix patterns use their ordinary application syntax; mixfix patterns derive the
+///   canonical source name by replacing each declared view variable with an underscore.
 #[allow(clippy::type_complexity)]
 fn op_maps_of(
     v: &ViewDecl,
@@ -1153,12 +1159,14 @@ fn op_maps_of(
                 }
                 // `op f(A, B, …) to term <template>`: a prefix source applied to argument variables.
                 _ => {
-                    let (name, formals) = op_pattern_formals(from, i).ok_or_else(|| {
-                        format!(
-                            "view `{}`: a mixfix operator→term map is a follow-up",
-                            v.name
-                        )
-                    })?;
+                    let (name, formals) = op_pattern_formals(from, i)
+                        .or_else(|| mixfix_pattern_formals(from, &v.vars, i))
+                        .ok_or_else(|| {
+                            format!(
+                                "view `{}`: malformed operator-to-term source pattern",
+                                v.name
+                            )
+                        })?;
                     op_recon.push((
                         name,
                         ReconTarget::Term {
@@ -1208,7 +1216,7 @@ fn op_pattern_formals(from: &[Token], i: &Interner) -> Option<(String, Vec<Strin
 }
 
 /// The base variable name of a single-token argument segment `A:Elt` → `"A"`. `None` if the segment is not
-/// exactly one token (a compound argument is not a plain formal — the follow-up case).
+/// exactly one token.
 fn seg_base_name(seg: &[&Token], i: &Interner) -> Option<String> {
     match seg {
         [t] => {
@@ -1217,6 +1225,37 @@ fn seg_base_name(seg: &[&Token], i: &Interner) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Derive a mixfix operator's canonical name and formal order from a view's source pattern. Source views
+/// identify variables through their declarations; reflected views have no declaration list, but their
+/// meta-term variables round-trip as explicit `name:Sort` tokens. Thus `to O from O' answer(X)` and its
+/// qualified form both become `("to_from_answer(_)", ["O", "O'", "X"])`.
+fn mixfix_pattern_formals(
+    from: &[Token],
+    vars: &[VarDecl],
+    i: &Interner,
+) -> Option<(String, Vec<String>)> {
+    let declared: HashSet<&str> = vars
+        .iter()
+        .flat_map(|declaration| declaration.names.iter().map(String::as_str))
+        .collect();
+    let mut name = String::new();
+    let mut formals = Vec::new();
+    for token in from {
+        let text = i.resolve(token.sym);
+        let base = text.split(':').next().unwrap_or(text);
+        let qualified = text
+            .rsplit_once(':')
+            .is_some_and(|(name, sort)| !name.is_empty() && !sort.is_empty());
+        if declared.contains(base) || qualified {
+            name.push('_');
+            formals.push(base.to_string());
+        } else {
+            name.push_str(text);
+        }
+    }
+    (!formals.is_empty() && name.contains('_')).then_some((name, formals))
 }
 
 /// Substitute view parameters into a module expression (a parameterized view's `to` target): replace each
@@ -1376,6 +1415,11 @@ fn instantiate_decls(
         }
     }
     for op in &mut d.ops {
+        let name: String = op.name.iter().map(|token| i.resolve(token.sym)).collect();
+        let instantiated_name = inst_sort(&name, bindings);
+        if instantiated_name != name {
+            op.name = tokenize(&instantiated_name, i);
+        }
         for s in &mut op.domain {
             *s = inst_sort(s, bindings);
         }
@@ -1470,30 +1514,82 @@ fn subst_bubble(
     i: &mut Interner,
 ) -> Vec<Token> {
     let mut out = Vec::with_capacity(bubble.len());
-    for (idx, t) in bubble.iter().enumerate() {
+    let mut idx = 0;
+    while idx < bubble.len() {
+        let t = bubble[idx];
         let text = i.resolve(t.sym).to_string();
-        let qualified_sort = text
+        let attached_sort = text
             .strip_prefix('.')
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                (idx > 0 && i.resolve(bubble[idx - 1].sym) == ".").then_some(text.as_str())
-            });
-        if let Some(sort) = qualified_sort {
-            let mapped_sort = inst_sort(sort, bindings);
+            .filter(|sort| !sort.is_empty())
+            .map(str::to_string);
+        let separate_sort =
+            (idx > 0 && i.resolve(bubble[idx - 1].sym) == ".").then(|| text.clone());
+        if let Some(mut sort) = attached_sort.as_ref().or(separate_sort.as_ref()).cloned() {
+            let mut end = idx + 1;
+            if sort == "[" {
+                let mut depth = 1usize;
+                while end < bubble.len() && depth != 0 {
+                    let fragment = i.resolve(bubble[end].sym);
+                    sort.push_str(fragment);
+                    depth += usize::from(fragment == "[");
+                    depth = depth.saturating_sub(usize::from(fragment == "]"));
+                    end += 1;
+                }
+            } else {
+                while end < bubble.len() && i.resolve(bubble[end].sym) == "{" {
+                    let mut depth = 0usize;
+                    while end < bubble.len() {
+                        let fragment = i.resolve(bubble[end].sym);
+                        sort.push_str(fragment);
+                        depth += usize::from(fragment == "{");
+                        depth = depth.saturating_sub(usize::from(fragment == "}"));
+                        end += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mapped_sort = inst_sort(&sort, bindings);
             if mapped_sort != sort {
-                let mapped = if text.starts_with('.') {
+                let mapped = if attached_sort.is_some() {
                     format!(".{mapped_sort}")
                 } else {
                     mapped_sort
                 };
-                let mut nt = *t;
-                nt.sym = i.intern(&mapped);
-                out.push(nt);
+                out.extend(tokenize(&mapped, i));
+                idx = end;
+                continue;
+            }
+        }
+        // Structured operator/class names are tokenized as `Base { Args } ...`; instantiate every chained
+        // brace group just like the corresponding sort declaration (`SortedList{X}` → `SortedList{NatW}`).
+        if idx + 1 < bubble.len() && i.resolve(bubble[idx + 1].sym) == "{" {
+            let mut name = text.clone();
+            let mut end = idx + 1;
+            while end < bubble.len() && i.resolve(bubble[end].sym) == "{" {
+                let mut depth = 0usize;
+                while end < bubble.len() {
+                    let fragment = i.resolve(bubble[end].sym);
+                    name.push_str(fragment);
+                    depth += usize::from(fragment == "{");
+                    depth = depth.saturating_sub(usize::from(fragment == "}"));
+                    end += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            let mapped = inst_sort(&name, bindings);
+            if mapped != name {
+                out.extend(tokenize(&mapped, i));
+                idx = end;
                 continue;
             }
         }
         if let Some(repl) = op_subst.get(&text) {
             out.extend(repl.iter().copied());
+            idx += 1;
             continue;
         }
         if let Some((base, count)) = text.rsplit_once('^')
@@ -1505,16 +1601,18 @@ fn subst_bubble(
         {
             // Compact iter syntax glues the scalar count to the source operator (`g^N`). A view maps
             // operator identity, so re-root the token at its one-token target while retaining `N`.
-            let mut nt = *t;
             let mapped = format!("{}^{count}", i.resolve(target.sym));
+            let mut nt = t;
             nt.sym = i.intern(&mapped);
             out.push(nt);
+            idx += 1;
             continue;
         }
         if let Some(sort) = var_inline.get(&text) {
-            let mut nt = *t;
+            let mut nt = t;
             nt.sym = i.intern(&format!("{text}:{sort}"));
             out.push(nt);
+            idx += 1;
             continue;
         }
         if let Some((name, sort)) = text.rsplit_once(':')
@@ -1523,13 +1621,15 @@ fn subst_bubble(
         {
             let new_sort = inst_sort(sort, bindings);
             if new_sort.as_str() != sort {
-                let mut nt = *t;
+                let mut nt = t;
                 nt.sym = i.intern(&format!("{name}:{new_sort}"));
                 out.push(nt);
+                idx += 1;
                 continue;
             }
         }
-        out.push(*t);
+        out.push(t);
+        idx += 1;
     }
     out
 }
@@ -1542,15 +1642,21 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         return format!("[{}]", inst_sort(inner, bindings));
     }
-    if let Some((base, args)) = split_structured(name) {
-        let new_args: Vec<String> = args
-            .iter()
-            .map(|a| match bindings.get(a.as_str()) {
-                Some(b) => b.view_name.clone(), // a bare parameter name → the view / argument name
-                None => inst_sort(a, bindings), // nested structured / parameter sort
-            })
-            .collect();
-        return format!("{base}{{{}}}", new_args.join(","));
+    if let Some((base, groups)) = split_structured(name) {
+        let mut instantiated = base.to_string();
+        for args in groups {
+            let new_args: Vec<String> = args
+                .iter()
+                .map(|a| match bindings.get(a.as_str()) {
+                    Some(b) => b.view_name.clone(), // a bare parameter name → the view / argument name
+                    None => inst_sort(a, bindings), // nested structured / parameter sort
+                })
+                .collect();
+            instantiated.push('{');
+            instantiated.push_str(&new_args.join(","));
+            instantiated.push('}');
+        }
+        return instantiated;
     }
     if let Some((param, s)) = name.split_once('$')
         && let Some(b) = bindings.get(param)
@@ -1578,30 +1684,47 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     name.to_string()
 }
 
-/// Split a structured sort name `Base{arg, …}` into its base and top-level (comma-separated, brace-balanced)
-/// arguments; `None` if it is not structured.
-fn split_structured(name: &str) -> Option<(&str, Vec<String>)> {
+/// Split a structured sort name into its base and chained top-level argument groups:
+/// `Base{A,B}{X}` becomes `("Base", [["A", "B"], ["X"]])`. Nested structured arguments stay intact.
+fn split_structured(name: &str) -> Option<(&str, Vec<Vec<String>>)> {
     let open = name.find('{')?;
-    if !name.ends_with('}') {
-        return None;
-    }
     let base = &name[..open];
-    let inner = &name[open + 1..name.len() - 1];
-    let mut args = Vec::new();
-    let (mut depth, mut start) = (0i32, 0usize);
-    for (k, c) in inner.char_indices() {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut end = open;
+
+    for (idx, c) in name.char_indices().skip_while(|(idx, _)| *idx < open) {
         match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            ',' if depth == 0 => {
-                args.push(inner[start..k].to_string());
-                start = k + 1;
+            '{' => {
+                if depth == 0 {
+                    if idx != open && idx != end {
+                        return None;
+                    }
+                    current.clear();
+                    start = idx + 1;
+                }
+                depth += 1;
             }
+            ',' if depth == 1 => {
+                current.push(name[start..idx].to_string());
+                start = idx + 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    current.push(name[start..idx].to_string());
+                    groups.push(std::mem::take(&mut current));
+                    end = idx + 1;
+                }
+            }
+            _ if depth == 0 => return None,
             _ => {}
         }
     }
-    args.push(inner[start..].to_string());
-    Some((base, args))
+    (depth == 0 && end == name.len() && groups.iter().all(|group| !group.is_empty()))
+        .then_some((base, groups))
 }
 
 /// A canonical string for a module expression, used as the `visited` dedup key.

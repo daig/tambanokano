@@ -89,7 +89,6 @@ pub(crate) struct RawSuccessors {
     pub(crate) tail_rewrites: u64,
 }
 
-
 /// The rewrite-engine operations needed by [`StateGraph`]. Implementations are statically dispatched:
 /// ordinary search uses [`Engine`], while model checking supplies the active `Runtime`/`Signature` view.
 pub(crate) trait GraphContext {

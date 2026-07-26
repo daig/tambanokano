@@ -136,6 +136,9 @@ pub struct ViewDecl {
     pub params: Vec<Parameter>,
     pub from: ModuleExpr,
     pub to: ModuleExpr,
+    /// Variables declared in the view body. They scope operator-to-term mappings but are not part of the
+    /// reflected `View` value.
+    pub vars: Vec<VarDecl>,
     /// `sort A to B .` — map a (theory-declared) sort `A` to a sort `B` of the target. Unmapped theory
     /// sorts default to identity (must exist in the target).
     pub sort_maps: Vec<(String, String)>,
@@ -160,9 +163,9 @@ pub struct OpDecl {
     pub name: Vec<Token>,
     pub domain: Vec<String>,
     pub range: String,
-    /// Whether the declaration used the **partial** arrow `~>` (`op _/_ : Float Float ~> Float`). A
-    /// partial op's range is the *kind* (error sort): an application that does not reduce sits at the
-    /// kind level (`1.0 / 0.0` is `[Float]`), and the built-in/equational result refines it when defined.
+    /// Whether the declaration used the **partial** arrow `~>` (`op _/_ : Float Float ~> Float`).
+    /// Maude lifts every domain and range sort of a partial declaration to its kind (error sort), so
+    /// kind-level arguments are accepted and an unreduced application remains at the result kind.
     pub partial: bool,
     pub attrs: Attrs,
 }

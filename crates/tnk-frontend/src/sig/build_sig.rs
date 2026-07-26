@@ -46,32 +46,29 @@ impl ConstructorAxiomProfile {
     }
 }
 
-/// The canonical mixfix name of an op (its name tokens concatenated): `[s_]`→`"s_"`, `[<_, ,, _>]`→`"<_,_>"`.
+/// The canonical mixfix name of an op. Source blanks between name tokens become Maude backquotes:
+/// `[s_]`→`"s_"`, `[c, d_]`→``"c`d_"``, `[<_, ,, _>]`→`"<_,_>"`.
 /// An operator name may be **parenthesized to quote** a name that would otherwise clash with a keyword or
 /// the terminator `.` — Maude's `op (op_:_->_[_].) : …` (the META-MODULE constructor whose name starts with
 /// the `op` keyword and ends in `.`). The outer parens are a quoting wrapper, not part of the name, so they
 /// are stripped: the canonical name (and thus its grammar production and `sym_by_profile` key) is
-/// `op_:_->_[_].`, matching the unparenthesized `op-hook` references.
 pub fn canonical_name(name: &[Token], i: &Interner) -> String {
-    // Two adjacent name tokens whose boundary chars are both *non-split* (not `_`/`:`/punct) were
-    // space-separated in the source — two maudeIds only ever tokenize apart on whitespace — so the blank
-    // between them is load-bearing: `op c d_` is the mixfix `c`, `d`, `_`, not the single literal `cd_`.
-    // Keep it as a backtick (Maude's op-name spacing convention, `` c`d_ ``), which [`split_mixfix`] reads
-    // back as a fragment boundary. A boundary touching a split char (`bal :_` → `bal:_`, `<_,_>`, `[]`)
-    // needs no marker — split_mixfix already breaks there — so those canonical names are unchanged.
-    let is_split = |c: char| c == '_' || c == ':' || is_punct(c);
     let mut out = String::new();
-    let mut prev_last: Option<char> = None;
-    for t in strip_outer_parens(name, i) {
-        let s = i.resolve(t.sym);
-        if let (Some(pl), Some(fc)) = (prev_last, s.chars().next())
-            && !is_split(pl)
-            && !is_split(fc)
-        {
+    let mut previous = None;
+    for token in strip_outer_parens(name, i) {
+        let text = i.resolve(token.sym);
+        if previous.is_some_and(|left: &str| {
+            let left = left.chars().next_back().expect("non-empty token");
+            let right = text.chars().next().expect("non-empty token");
+            !matches!(left, '_' | ':')
+                && !is_punct(left)
+                && !matches!(right, '_' | ':')
+                && !is_punct(right)
+        }) {
             out.push('`');
         }
-        out.push_str(s);
-        prev_last = s.chars().last().or(prev_last);
+        out.push_str(text);
+        previous = Some(text);
     }
     out
 }
@@ -243,11 +240,14 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             }
         };
 
-        // A partial (`~>`) op ranges over the **kind** (error sort): an unreduced application is
-        // kind-level, the built-in/equational result refining it when defined. (kind_of(range) is the
-        // same component whether or not we already lifted it, so this is idempotent.)
+        // A partial (`~>`) declaration is kind-level in every position: Maude's parser replaces each
+        // domain and range sort by its connected component's error sort. This is what lets a partial
+        // operator consume kind-level arguments as well as leave an undefined result at the result kind.
         if od.partial {
-            for (_, range) in profiles.iter_mut() {
+            for (domain, range) in profiles.iter_mut() {
+                for sort in domain {
+                    *sort = engine.sorts().error_sort(engine.sorts().kind_of(*sort));
+                }
                 *range = engine.sorts().error_sort(engine.sorts().kind_of(*range));
             }
         }
@@ -299,6 +299,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                     gather = None;
                     format = None;
                 }
+                let object_attribute = cname.ends_with(":_")
+                    && engine.sorts().name(range) == "Attribute"
+                    && od.attrs.ctor;
                 syntax.insert(
                     sym,
                     SymbolSyntax {
@@ -307,6 +310,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                         range,
                         prec,
                         gather,
+                        object_attribute,
+                        spaced_label_colon: object_attribute && od.name.len() > 1,
                         assoc: od.attrs.assoc,
                         iter: od.attrs.iter,
                         format,
@@ -441,10 +446,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         if let Some(spec) = &od.attrs.special
             && let Some((class, data)) = &spec.id_hook
             && class == "QuotedIdentifierSymbol"
-            && let Some(code) = data.first()
         {
             let range = resolve_sort(&engine, &sorts, &od.range)?;
-            engine.set_qid_class(code, range);
+            engine.set_qid_class(data.first().map(String::as_str), range);
         }
         // Marker-class builtins (id-hooks that attach no SpecialOp: `s_`, `<Floats>`/`<Strings>`/
         // `<Qids>`, `true`/`false`, the object constructor) are non-`STANDARD` in Maude's SymbolType,
@@ -638,14 +642,10 @@ fn op_hook_sym(
     i: &Interner,
 ) -> Option<SymbolId> {
     let (_, sig) = spec.op_hooks.iter().find(|(p, _)| p == purpose)?;
-    // The operator name is the run of tokens before the `:` of `(name : domain ~> range)`. A *mixfix*
-    // name can be several tokens — `<_,_,_>` lexes as `<_ , _ , _>` — so join them (canonical form), not
-    // just the first (which sufficed for the single-token names `_and_`/`_/_`/`<Strings>`).
-    let name: String = sig
-        .iter()
-        .take_while(|t| i.resolve(t.sym) != ":")
-        .map(|t| i.resolve(t.sym))
-        .collect();
+    // Use the same canonicalization as an operator declaration. A backquoted blank in a hook signature
+    // (`op_to`term_.`) tokenizes as two adjacent maudeIds and must retain that boundary in the symbol key.
+    let colon = sig.iter().position(|t| i.resolve(t.sym) == ":")?;
+    let name = canonical_name(&sig[..colon], i);
     name_to_sym.get(&name).copied()
 }
 
@@ -912,6 +912,10 @@ fn special_op(
                 }),
             }
         }
+        // META-INTERPRETER's local synchronous external-object manager. Protocol decoding belongs to
+        // tnk-session; the kernel binding only makes the no-local-object scheduler branch offer messages
+        // to the host-owned ExternalManager seam.
+        "InterpreterManagerSymbol" => SpecialOp::InterpreterManager,
         // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
         // standard-stream external-object manager. The id-hook data selects the stream; the op-hooks name
         // the `write`/`wrote` (and `getLine`/`gotLine`) message symbols the manager consumes/produces.
@@ -928,11 +932,9 @@ fn special_op(
             get_line_msg: op_hook_sym(spec, "getLineMsg", name_to_sym, i),
             got_line_msg: op_hook_sym(spec, "gotLineMsg", name_to_sym, i),
         },
-        // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol,
-        // InterpreterManagerSymbol, …): declare the operator WITHOUT a special binding — the module
-        // loads and everything else in it works; the op itself is inert (never reduces). This is the
-        // §2 graceful-degrade stance (stock linear.maude's DIOPHANTINE, the prelude's
-        // LOOP-MODE/LEXICAL); the advisory text is phase E.
+        // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol, ...): declare the
+        // operator WITHOUT a special binding. The module loads and everything else in it works; the op
+        // itself stays inert (§2 graceful-degrade stance).
         _other => return Ok(None),
     };
     Ok(Some(op))
@@ -1178,7 +1180,7 @@ fn resolve_op_hook_sig(
     let texts: Vec<&str> = sig.iter().map(|t| i.resolve(t.sym)).collect();
     let colon = texts.iter().position(|&t| t == ":")?;
     let arrow = texts.iter().position(|&t| t == "~>" || t == "->")?;
-    let name: String = texts[..colon].concat();
+    let name = canonical_name(&sig[..colon], i);
     let kind_of_sort = |s: &str| sorts.get(s).map(|&sid| sort_table.kind_of(sid));
     let dom_kinds: Vec<KindId> = texts[colon + 1..arrow]
         .iter()

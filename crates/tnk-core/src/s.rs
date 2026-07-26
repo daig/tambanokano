@@ -23,7 +23,7 @@ use crate::num::Nat;
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
 use crate::term::{Subst, Term};
-use crate::theory::enumerate_alien_solutions;
+use crate::theory::{RewriteMatchContext, enumerate_alien_solutions};
 
 /// A compiled S left-hand side `s^count(sub)`: the peeled successor `count` (≥ 1) and the residual
 /// sub-pattern.
@@ -330,6 +330,14 @@ impl SSubproblem {
             self.residue = residue;
             self.matched_whole = self.residue.is_zero();
             return true;
+        }
+    }
+
+    pub(crate) fn rewrite_context(&self) -> RewriteMatchContext {
+        if self.matched_whole {
+            RewriteMatchContext::whole()
+        } else {
+            RewriteMatchContext::successor(self.symbol, self.residue.clone())
         }
     }
 

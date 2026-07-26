@@ -1,10 +1,10 @@
-# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-23)
+# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-24)
 
-> **Current ledger (2026-07-23):** the correctness corpus and symbolic phases S1–S3 remain closed.
+> **Current ledger (2026-07-24):** the correctness corpus and symbolic phases S1–S3 remain closed.
 > `tools/subsystems-scoreboard.sh -p U` is **27/27 PASS** over 676 commands, `-p V` is **21/21
 > PASS** over 289, and `-p N` is **16/16 PASS**; all 169 N primary commands also pass independently.
-> The retained audit is **77/77 PASS**, legacy is **87/87 CLEAN**, and `cargo test --release`
-> passes all **410** tests across nine suites.
+> The retained audit is **77/77 PASS**, legacy is **87/87 CLEAN**, and
+> `cargo test --release --workspace` passes **444/444** tests across 12 suites.
 >
 > **Phase T is complete.** T01–T10 pass the frozen Maude-3.5/Yices2 byte contract—10 fixtures /
 > 118 commands—covering typed SMT values, `check`, root-only constraint-bearing `smt-search`,
@@ -12,10 +12,15 @@
 > query-local and feature-gated; the default build remains pure Rust with Null degradation.
 > T11's native FVP/OS-compact variant-satisfiability core and `VAR-SAT-TOOL` facade pass **27/27**;
 > the untouched checksum-pinned Maude-2.7 prototype passes its separately recorded **27/27** oracle
-> lane. The native contract explicitly fixes membership eligibility and both empty-constructor-domain
-> quantifier defects. The complete Phase-T scoreboard is **11/11 PASS**.
+> lane. The complete Phase-T scoreboard is **11/11 PASS**. **Phase M is complete** at
+> **10/10 fixtures / 50 commands PASS**.
 >
-> Uncommitted identifiers in prose below are explicitly marked as 2026-07-23 working-tree results.
+> **Phase I-S is complete in the 2026-07-24 working tree.** Reusable
+> `tnk-session::Session`, the production external-message seam, and local synchronous
+> `InterpreterManagerSymbol` protocols pass the frozen **I 27/27** live-oracle gate.
+> Walking-skeleton, direct/manager, pass-boundary, lifecycle/error, continuation,
+> multi-child isolation, and GC/root probes are included. Phase I-C cancellation and
+> thread/`newProcess` coordination have not begun.
 >
 > The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close;
 > §3.10's post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two
@@ -106,6 +111,14 @@ Everything in this list was re-verified against the live oracle this session (no
   `ModelCheckerSymbol`, and `SatSolverSymbol` are live. All counterexample lassos, models,
   prime implicants, verbose statistics, result sorts, and rewrite counts pass the frozen
   10-fixture / 50-command Maude-3.5.1 contract. Durable Phase-M gate: 10/10 fixtures.
+- **Host-owned sessions and local synchronous meta-interpreters.** `tnk-session::Session`
+  owns persistent modules, views, continuations, reflection caches, and isolated local
+  child Sessions. The production object-message seam yields opaque continuation tokens,
+  translates requests/replies through owned engine-neutral data, and preserves
+  pass-boundary/count/GC semantics. Lifecycle, module/view, evaluation, search, symbolic,
+  continuation, malformed/exhaustion, stale-ID, and multi-child paths pass the frozen
+  27-fixture live-oracle gate. Remote/thread-backed `newProcess` remains deliberately
+  outside this completed local slice.
 - **Objects**: `omod` desugaring, class completion, plain and object-message-fair `erewrite` on the
   bank/ping-pong shapes, STD-STREAM scripted IO.
 - **Robustness beyond Maude in two spots** (divergence in tnk's favor): a 300k-deep term reduce+print works
@@ -117,9 +130,10 @@ Everything in this list was re-verified against the live oracle this session (no
 
 ## 2. Intended features not built yet
 
-Whole subsystems still planned in `roadmap.md`:
+Remaining planned or deliberately excluded surfaces:
 
-- **Meta-interpreters** (`metaInterpreter.maude`: `InterpreterManagerSymbol`).
+- **Phase I-C concurrency** — cooperative cancellation and thread-confined `newProcess`
+  coordination. It is a separate later goal; permanent local mode is its semantic oracle.
 - **External IO beyond STD-STREAM** — `file`/`socket`/`process`/`time`/`prng` managers. Per revised D5 these
   are intentionally out of scope for the engine (host-embedding model); existing Maude IO programs do not
   run unmodified, and `process.maude` additionally requires `sload`.

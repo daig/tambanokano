@@ -1,0 +1,18 @@
+[package]
+name = "tnk-session"
+description = "tambanokano reusable host-owned session: persistent modules, views, evaluation, and continuations"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+smt-z3 = ["tnk-core/smt-z3"]
+
+[dependencies]
+tnk-core = { path = "../tnk-core" }
+tnk-frontend = { path = "../tnk-frontend" }
+tnk-modules = { path = "../tnk-modules" }

@@ -3,27 +3,29 @@
 This document is the **umbrella subsystem contract**: scope, phase ordering, objective
 gates, decision points, and completion criteria for the subsystem program chosen after
 the correctness goal closed (2026-07-05). It contains historical completed phases as well
-as future Phase I.
+as completed S/T/M/I-S phases and the future Phase I-C slice.
 
-**Completed selected `/goal` slice (2026-07-23): Phase M, M1→M7.**
-`remaining-plans/05-model-checking.md` is the implementation record; its §7.1 stopping
-gate is closed. The umbrella completion criteria in §1.4 still include Phase I and do
-**not** extend the completed Phase-M slice into sessions, meta-interpreters, or async work.
-Current behavior/status comes from the code and harness, not an older plan cursor.
+**Completed selected `/goal` slice (working tree 2026-07-24): Phase I-S, I-S0→I-S3.**
+`remaining-plans/06-sessions-meta-interpreters.md` is the binding implementation record;
+its I-S stopping gate is closed at **I 27/27 PASS** with every retained gate green.
+The mandatory boundary is in force: no next slice has been opened. Phase I-C
+(cancellation and thread-backed coordination) is a separate later goal requiring review
+and selection; no I-C implementation is present. Current behavior/status comes from the
+code and harness, not an older plan cursor.
 
 **Goal statement.** Implement, in order: (S) the symbolic engine (order-sorted unification → variants →
 narrowing), then (T) SMT integration and (M) the LTL model checker (independent of each other, either
-order or interleaved), then (I) the session layer and meta-interpreters (local synchronous mode, then
-the async/thread mode — the project's first deliberate behavioral divergence from the reference,
-deliberately sequenced **last** so the byte-comparable baseline stays frozen while all
-byte-comparable features land).
+order or interleaved), then two separately closed Phase-I slices: **I-S**, the session layer and local
+synchronous meta-interpreters, followed only after review by **I-C**, cooperative cancellation and
+thread-backed coordination. I-S is oracle-diffable; I-C is the project's deliberate behavioral
+divergence from reference process/scheduling infrastructure.
 
 **Ordering rationale (recorded, do not relitigate):** S/T/M are engine-internal and validated through
-the existing synchronous, oracle-diffable surfaces. Phase I contains the two baseline-disturbing
-items (the session-extraction refactor of the command plumbing, and implementation-defined async
-scheduling). Sequencing them last keeps every diff during S/T/M attributable, lets the
-meta-interpreter protocol wire against real capabilities instead of stubs, and confines the
-divergence question to one phase with its own containment machinery.
+the existing synchronous, oracle-diffable surfaces. I-S first establishes and freezes the complete
+semantic implementation—Session extraction plus local interpreter protocols—against Maude 3.5.1.
+I-C then wraps that implementation; it may not duplicate or alter interpreter semantics. This keeps
+reference-parity failures separate from cancellation/threading failures and leaves a durable,
+shippable synchronous boundary if concurrent coordination is postponed.
 
 ---
 
@@ -44,7 +46,7 @@ divergence question to one phase with its own containment machinery.
   **`tools/subsystems-scoreboard.sh`** (same `diffmaude.sh` harness and normalization; 60s/fixture;
   `-p PREFIX` selects one frozen sub-phase, e.g. `-p U`; prints `SUBSYSTEMS <n>/<m> PASS`, exit 0 iff
   n = m). ID prefixes: `U*` unification, `V*` variants, `N*` narrowing, `T*` SMT, `M*` model checker,
-  `I*` meta-interpreters (local mode only — async mode is not oracle-diffable and gates via §1.3).
+  `I*` meta-interpreters (I-S local mode only—thread mode is not oracle-diffable and gates in I-C via §1.3).
 - **Per-phase seeding (each phase's step 0, committed before its first feature commit):** enumerate
   the fixture sources — the reference suite (`~/code/maude-lang/maude/tests/`: the directories gated
   on that subsystem per the audit's §3.8 tally), the Maude 3.5.1 manual's worked examples for the
@@ -58,26 +60,32 @@ divergence question to one phase with its own containment machinery.
 - **Secondary indicator (report, don't gate):** the reference-suite clean-pass count
   (`fable-audit.md` §3.8 baseline: 8 of 231; ~100 gated on these subsystems).
 
-### 1.3 The async-mode gate (phase I only)
+### 1.3 The Phase-I-C concurrent-mode gate
 
-Async mode is validated by **differential self-check**, not oracle diff: cargo tests drive identical
-request scripts through local-synchronous mode (the oracle-anchored reference) and async mode under
-the **deterministic test schedule** (replies injected only at rewrite-quantum boundaries, arrival
-order) and assert identical reply sets and per-request counts. Timing/interleaving is
-implementation-defined per the conformance-boundary statement in D12.
+I-C is validated by **differential self-check**, not oracle diff, and may not begin until
+the I-S local scoreboard and retained gates have closed on one recorded commit. Cargo
+tests drive identical request scripts through local synchronous mode (the oracle-anchored
+semantic implementation) and thread mode under a **deterministic test schedule** (replies
+injected only at rewrite-quantum boundaries, arrival order), then assert identical reply
+sets, values, sorts, state transitions, and per-request counts. Timing/interleaving is
+implementation-defined per D12.
 
-### 1.4 Completion criteria (all six; then the goal is done)
+### 1.4 Umbrella completion criteria
+
+The full subsystem umbrella is complete only when all six hold:
 
 1. `tools/subsystems-scoreboard.sh` exits 0 over the frozen per-phase manifests.
 2. Frozen invariants F1–F4 hold simultaneously with (1).
-3. The async differential self-check suite is green.
+3. The Phase-I-C deterministic local-vs-thread differential suite is green.
 4. `metaInterpreter.maude`, `smt.maude`, and `model-checker.maude` load through the binary and their
    documented entry points compute (no inert-op regressions on the surfaces this goal claims).
-5. Decision records updated: **D12 written before phase-I code**; D6 and D7 carry binding
-   resolutions (or recorded fallback switches) from their gate spikes.
+5. Decision records carry the binding D6/D7/D12 resolutions and D12's I-S/I-C boundary.
 6. This document's §5 status ledger carries a commit hash per completed phase item.
 
----
+The selected **I-S goal has its own earlier, valid stopping gate**: its frozen local
+`I*` scoreboard, direct-vs-manager checks, and every retained gate must pass together,
+with no cancellation/thread/channel implementation present. Close and yield at that
+boundary; I-C is opened as a new goal rather than silently continuing the same session.
 
 ## 2. Phase manifests
 
@@ -268,36 +276,62 @@ shipped `model-checker.maude` checksum and root-first load path are unchanged; a
 entry points—`modelCheck`, `modelCheck+`, `satSolve`, and `tautCheck`—compute. Phase I was
 not started.
 
-### Phase I — sessions & meta-interpreters (last; internal order I0→I1→I2→I3→I4)
+### Phase I — sessions & meta-interpreters (two separately closed slices)
 
-- **I0 — decision record D12, before code.** Must state: async is *coordination only* — evaluation is
-  blocking CPU work on thread-confined engines (engines are created on their thread and never move;
-  their non-`Send` internals are a deliberate compile-time guarantee, not a defect); the core
-  session API is **runtime-agnostic** (plain threads + channels; any async-executor integration is a
-  thin adapter, never a `tnk-core`/session dependency); the **conformance boundary**: message
-  protocols, per-request results, and counts are conformance targets — inter-message scheduling is
-  implementation-defined; the sole recorded trigger for a future *process* backend (a sandboxing
-  requirement: memory/crash isolation or per-child resource limits), which would arrive as an
-  embedding-host service per D5, never engine code.
-- **I1 — session extraction.** A library `Session` (module/view databases, dependency invalidation,
-  command evaluation, include/load semantics — everything currently in the REPL that is not
-  line-editing or terminal concerns) with the REPL rebuilt as its thinnest consumer. Gate: F1–F4
-  green with **zero fixture drift** — this refactor must be observationally invisible.
-- **I2 — local synchronous meta-interpreters.** The interpreter-manager external object on the
-  existing message seam (the standard-stream precedent); children are Sessions; requests/replies
-  cross as serialized meta-terms. `metaInterpreter.maude` loads; the reference's *local-mode*
-  examples are oracle-diffable and become `I*` fixtures. Protocol verbs for capabilities this goal
-  ships (unify/variants/SMT) are live; anything beyond stays declared-but-inert, never misfiring.
-- **I3 — cancellation at safe points.** A cooperative cancellation token checked at the engine's
-  amortized safe points (reduce loop head, search loop, matcher enumeration, condition evaluation).
-  Shared infrastructure with the future Ctrl-C item. Gate: the D2-era throughput benchmarks
-  (`examples/peano`, fib) within noise (bar: ≤ 2% on reduce throughput).
-- **I4 — async/thread mode.** The `newProcess`-flag semantics on the thread backend with the
-  documented deltas from D12 (no memory/abort isolation; cooperative abandonment; panic containment
-  — pin the unwinding-panic build setting as part of this item). Deterministic test schedule
-  mandatory (§1.3); the differential self-check suite is this item's definition of done.
+Detailed binding plan: `remaining-plans/06-sessions-meta-interpreters.md`.
 
----
+- **I0 — D12, complete.** Async is coordination only: evaluation is blocking CPU work
+  on thread-confined engines; the core Session API is runtime-agnostic; local protocol
+  behavior is the semantic conformance target; inter-message scheduling is
+  implementation-defined; an OS-process backend requires a future sandboxing need and
+  would be an embedding-host service per D5.
+
+#### Phase I-S — Session + local synchronous parity (complete 2026-07-24)
+
+- **I-S0 — characterize and freeze, complete 2026-07-23.** The source-derived
+  40-row local protocol ledger, all 22 applicable upstream sources, five fresh
+  live-oracle probes, 21 named `newProcess` exclusions, manual-example decision,
+  and external-message seam contract are frozen in
+  `remaining-plans/06-sessions-meta-interpreters.md` §9. Oracle self-check:
+  `SUBSYSTEMS 27/27 PASS`.
+- **I-S1 — session extraction, complete 2026-07-23.** Module/view databases,
+  dependency invalidation, command evaluation, load/include state, and continuations
+  moved into reusable `tnk-session::Session`; `tnk-repl` became its thin terminal
+  consumer without output drift.
+- **I-S2 — production local-manager slice, complete 2026-07-24.** The core external
+  request seam yields opaque continuation tokens; Session owns isolated child Sessions,
+  owned cross-engine decode/encode, reply injection, lifecycle, pass-boundary accounting,
+  and GC-safe teardown. I22 and I24 prove the walking skeleton and boundary.
+- **I-S3 — supported local protocol closure, complete 2026-07-24.** Lifecycle,
+  module/view, reduction/syntax, match/apply/search, unification/variant/narrowing,
+  continuation, malformed/exhaustion, isolation, and stale-ID paths are live and
+  oracle-diffable through the frozen 27-fixture manifest.
+
+**I-S stopping gate: CLOSED in the 2026-07-24 working tree.** The frozen local
+scoreboard is **27/27 PASS**; direct-Session, manager, multi-child, lifecycle, error,
+continuation, and GC/root probes pass. Release tests are **444/444** across 12 suites;
+audit is 77/77, legacy 87/87, U 27/27, V 21/21, N 16/16, optional-z3 T 11/11, and
+M 10/10. The default release remains solver-free and all stock-load probes are clean.
+No cancellation, worker-thread, channel, `newProcess`, or async-adapter implementation
+is present. Record the commit hash after commit and remain stopped before I-C.
+
+#### Phase I-C — cancellation + thread coordination (separate later goal)
+
+- **I-C1 (old I3) — cancellation at safe points.** Add a per-request cooperative token
+  at amortized evaluator safe points without exposing half-committed state. Gate normal
+  reduce throughput at the existing ≤2% bar and prove cancelled Sessions remain usable.
+- **I-C2 (old I4) — thread-confined workers.** Implement `newProcess` compatibility on
+  the D12 thread backend: each worker constructs and permanently owns one Session; only
+  owned engine-neutral requests/replies cross channels; lifecycle, abandonment, and
+  panic containment have explicit outcomes.
+- **I-C3 — differential closure.** Under deterministic barriers/quantum boundaries,
+  compare identical scripts through permanent local mode and thread mode. Assert
+  replies, values, sorts, state, cancellation, failures, and per-request counts—not
+  unspecified wall-clock completion order.
+
+**I-C stopping gate:** the differential suite, all I-S oracle fixtures, all retained
+gates, cancellation/performance checks, and panic/lifecycle probes pass unchanged.
+Only this later gate closes the Phase-I umbrella.
 
 ## 3. Decision points
 
@@ -372,11 +406,20 @@ not started.
   object-completion/count closure; M08/M09 each 459 examined states and 48,194 rewrites)
 - [x] M7 satSolve/tautCheck implementation slice — 119c3a0 (M10 8/8 commands byte-exact;
   complete Phase-M gate M 10/10, cargo 438/438, audit 77/77, legacy 87/87)
-- [x] I0 D12 recorded — 2026-07-05 (`03-open-decisions.md`)
-- [ ] I1 session extraction —
-- [ ] I2 local meta-interpreters —
-- [ ] I3 cancellation —
-- [ ] I4 async mode + differential suite —
+- [x] I0 D12 recorded — 2026-07-05; I-S/I-C boundary clarified 2026-07-23
+  (`03-open-decisions.md`)
+- [x] I-S0 protocol ledger + local manifest + seam spike — 2026-07-23
+  (I 27/27 live-oracle self-diff; §9 of the binding plan)
+- [x] I-S1 Session extraction + thin REPL — 2026-07-23 (`tnk-session`; release
+  439/439, audit 77/77, legacy 87/87, U/V/N/T/M gates green)
+- [x] I-S2 local manager walking skeleton — working tree 2026-07-24 (production
+  external-message boundary, local child registry, direct/manager and GC/isolation probes)
+- [x] I-S3 local protocol closure + I-S stopping gate — working tree 2026-07-24
+  (I 27/27; release 444/444; audit 77/77; legacy 87/87; U 27/27; V 21/21;
+  N 16/16; optional-z3 T 11/11; M 10/10; no I-C implementation)
+- [ ] I-C1 cancellation —
+- [ ] I-C2 thread-confined workers —
+- [ ] I-C3 deterministic differential closure —
 
 ## 6. Non-goals (explicit; do not drift into these)
 

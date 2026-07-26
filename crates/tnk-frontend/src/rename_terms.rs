@@ -183,11 +183,20 @@ pub enum ReconTarget {
     },
 }
 
+#[derive(Clone)]
+struct LexicalFallback {
+    source: Vec<Frag>,
+    target: ReconTarget,
+}
+
 pub struct ViewOpSubst {
     built: BuiltModule,
     grammar: CompiledGrammar,
-    /// source op canonical name (`f`, `_#_`, `lt`) → its reconstruction target.
+    /// Source op canonical name (`f`, `_#_`, `lt`) → its reconstruction target.
     targets: HashMap<String, ReconTarget>,
+    /// A token-local fallback for mixfix occurrences inside compound bubbles the standalone term parser
+    /// cannot accept (notably juxtaposed object configurations and `if` branches).
+    fallbacks: Vec<LexicalFallback>,
 }
 
 impl ViewOpSubst {
@@ -205,23 +214,76 @@ impl ViewOpSubst {
         let built = build_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
         let targets = maps.iter().cloned().collect();
+        let fallbacks = maps
+            .iter()
+            .filter_map(|(source, target)| {
+                let fragments = split_mixfix(source, interner);
+                let has_hole = fragments
+                    .iter()
+                    .any(|fragment| matches!(fragment, Frag::Hole));
+                let changes = !matches!(target, ReconTarget::Op(name) if name == source);
+                (has_hole && changes).then(|| LexicalFallback {
+                    source: fragments,
+                    target: target.clone(),
+                })
+            })
+            .collect();
         Ok(Some(Self {
             built,
             grammar,
             targets,
+            fallbacks,
         }))
     }
 
-    /// Rewrite one term bubble. A bubble that does not parse as a single term (e.g. a condition fragment
-    /// carrying `=`) is returned unchanged — operator identity is undefined there.
+    /// Rewrite one term bubble. Grammar reconstruction handles arbitrary argument terms. If the bubble is
+    /// not a standalone term (for example a juxtaposed object configuration), a conservative lexical path
+    /// still rewrites mixfix occurrences whose arguments are single tokens—the shape of flattened rule
+    /// patterns before variable inlining.
     pub fn rewrite(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
         if bubble.is_empty() {
             return bubble.to_vec();
         }
-        match parse_term(bubble, &self.grammar, interner) {
+        let rewritten = match parse_term(bubble, &self.grammar, interner) {
             Ok(tree) => self.emit(&tree, bubble, interner),
             Err(_) => bubble.to_vec(),
+        };
+        self.rewrite_lexical(&rewritten, interner)
+    }
+
+    fn rewrite_lexical(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
+        let mut out = Vec::with_capacity(bubble.len());
+        let mut cursor = 0;
+        while cursor < bubble.len() {
+            let matched = self.fallbacks.iter().find_map(|fallback| {
+                let end = cursor.checked_add(fallback.source.len())?;
+                let candidate = bubble.get(cursor..end)?;
+                let mut args = Vec::new();
+                for (fragment, token) in fallback.source.iter().zip(candidate) {
+                    match fragment {
+                        Frag::Tok(expected) if expected != &token.sym => return None,
+                        Frag::Tok(_) => {}
+                        Frag::Hole => args.push(vec![*token]),
+                    }
+                }
+                Some((end, fallback, args))
+            });
+            if let Some((end, fallback, args)) = matched {
+                match &fallback.target {
+                    ReconTarget::Op(name) => {
+                        out.extend(emit_application(name, &args, bubble, interner))
+                    }
+                    ReconTarget::Term { formals, template } => {
+                        out.extend(emit_template(formals, template, &args, bubble, interner))
+                    }
+                }
+                cursor = end;
+            } else {
+                out.push(bubble[cursor]);
+                cursor += 1;
+            }
         }
+        out
     }
 
     /// Re-serialize the parse tree `t`, substituting a mapped operator's application with the target

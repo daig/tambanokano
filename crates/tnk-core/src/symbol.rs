@@ -334,6 +334,10 @@ pub enum SpecialOp {
         op: MetaOp,
         hooks: std::rc::Rc<MetaHooks>,
     },
+    /// The local synchronous meta-interpreter manager. The kernel only recognizes the external target;
+    /// request decoding and child-session ownership stay behind [`ExternalManager`](crate::descent::ExternalManager)
+    /// in the host layer.
+    InterpreterManager,
     /// A standard-stream **external-object manager** (Maude's `StreamManagerSymbol`): the 0-ary `Oid`
     /// constant `stdin`/`stdout`/`stderr` (Pillar 2.5-C). In `erewrite`'s EXTERNAL mode, with a `<>`
     /// portal in the soup, a message targeting this constant is handled by the manager — `stdout`/`stderr`
@@ -449,6 +453,10 @@ pub enum MetaOp {
     /// Variant-based narrowing search, with either a solution or a full path result.
     NarrowingSearch {
         path: bool,
+    },
+    /// Strategy rewrite requested by the local META-INTERPRETER transport.
+    Srewrite {
+        depth_first: bool,
     },
     /// Strategy descent — declared so the tower loads, but inert (kind-level).
     Deferred,

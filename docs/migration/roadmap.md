@@ -4,6 +4,12 @@ Ground truth for current state: **`fable-audit.md`** (repo root) — the 2026-07
 against Maude 3.5.1. This roadmap sequences the remaining work; every "§" reference below is into the
 audit. The build history that used to live here (Phases 0–2, all landed) is in git history.
 
+**Current implementation cursor (2026-07-24):** S, T, M, and the local synchronous
+**Phase I-S** slice are closed. The reusable Session and local meta-interpreter protocol
+pass the 27-fixture live-oracle gate. The selected implementation goal has stopped at its
+mandatory boundary; **Phase I-C** cancellation/thread coordination has not been selected
+or started. Binding record: `remaining-plans/06-sessions-meta-interpreters.md`.
+
 **Ordering principle: correctness before new feature surface.** Nothing new gets built on top of a layer
 with known wrong values. Concretely: first make every *accepted* input compute what Maude computes and
 every panic impossible (A, B); then make tnk *accept* what Maude accepts (C); then the two architecture
@@ -243,8 +249,19 @@ Ordered by (dependency, size); references are the kept deep-dives.
   byte-exact result values, sorts, rewrite counts, lassos, and SAT models. Plan/record:
   `remaining-plans/05-model-checking.md`; reference:
   `reports/A8-symbolic-smt-ltl.md`.
-- **G5. Meta-interpreters** (`metaInterpreter.maude`): separate `Engine` instances communicating by
-  term translation, per **D1**. Reference: `reports/A7`.
+- **G5. Sessions + meta-interpreters — I-S complete (2026-07-24), I-C later.**
+  `tnk-session::Session` is host-owned and reusable; `tnk-repl` is its thin terminal
+  adapter. The production external-message seam, isolated local child registry, owned
+  cross-engine translation, and supported `metaInterpreter.maude` lifecycle/module/view/
+  evaluation/search/symbolic/continuation protocols pass the frozen **27/27** local
+  live-oracle gate, including count, pass-boundary, GC, stale-ID, and multi-child probes.
+  The I-S stopping gate is closed in the working tree with all retained gates green and
+  no cancellation, channel, worker, async adapter, or `newProcess` implementation.
+  **Phase I-C** remains a separate later goal: cooperative cancellation and
+  thread-confined `newProcess` coordination will be checked against permanent local mode
+  under a deterministic schedule, not reference interleaving. Plan/record:
+  `remaining-plans/06-sessions-meta-interpreters.md`; decisions: D1/D5/D12; reference:
+  `reports/A7`.
 - **G6. Prelude tail + IO stance.** The `LEXICAL` `printTokens`/`tokenize` hooks are implemented; remaining
   here is `LOOP-MODE` (`LoopSymbol`) so the prelude finally loads whole. External IO stays host-owned per
   revised **D5**: design the minimal embedding API when embedding is taken up; the shelved in-engine reactor

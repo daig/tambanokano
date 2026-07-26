@@ -58,6 +58,9 @@ pub fn print_raw(m: &BuiltModule, i: &Interner, d: DagId) -> String {
         i,
         faithful: false,
         color: false,
+        mixfix: true,
+        number: true,
+        rational: false,
         vars: &[],
     }
     .render(d)
@@ -72,6 +75,9 @@ pub fn print_pretty(m: &BuiltModule, i: &Interner, d: DagId, color: bool) -> Str
         i,
         faithful: true,
         color,
+        mixfix: true,
+        number: true,
+        rational: true,
         vars: &[],
     }
     .render(d)
@@ -91,6 +97,33 @@ pub fn print_pretty_with_variables(
         faithful: true,
         color,
         vars: variables,
+        mixfix: true,
+        number: true,
+        rational: true,
+    }
+    .render(d)
+}
+
+/// Render a DAG with META-LEVEL's independently selectable `mixfix`, `number`, and `rat` options.
+/// This is deliberately separate from [`print_pretty`]: omitted options expose the underlying
+/// successor/division constructors rather than silently inheriting the interactive defaults.
+pub fn print_with_options(
+    m: &BuiltModule,
+    i: &Interner,
+    d: DagId,
+    mixfix: bool,
+    number: bool,
+    rational: bool,
+) -> String {
+    Printer {
+        m,
+        i,
+        faithful: true,
+        color: false,
+        vars: &[],
+        mixfix,
+        number,
+        rational,
     }
     .render(d)
 }
@@ -106,6 +139,9 @@ pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], colo
         faithful: true,
         color,
         vars,
+        mixfix: true,
+        number: true,
+        rational: true,
     }
     .print_term_top(t)
 }
@@ -120,6 +156,9 @@ struct Printer<'a> {
     faithful: bool,
     color: bool,
     vars: &'a [String],
+    mixfix: bool,
+    number: bool,
+    rational: bool,
 }
 
 /// A child to lay out in either walk: a reduced DAG node, or a static [`Term`] (pattern) node. Unifies the
@@ -385,7 +424,7 @@ impl<'a> Printer<'a> {
                 // Maude-faithful rational: a `DivisionSymbol` node over integer numerals (Maude's `isRat`)
                 // → the compact `num/den`. A zero numerator is the `Zero` constant, not a numeral, so
                 // `0 / 5` falls through to the generic mixfix spacing — matching the reference binary.
-                if self.faithful
+                if self.rational
                     && self.m.division_sym == Some(symbol)
                     && children.len() == 2
                     && let Some(rat) = self.rational_text(children[0], children[1])
@@ -435,6 +474,20 @@ impl<'a> Printer<'a> {
         out: &mut Vec<Work<'a, 't>>,
     ) {
         let command_arguments = self.m.engine.symbol(symbol).is_meta_operation();
+        if !self.mixfix {
+            out.push(Work::Text {
+                cat: if children.is_empty() {
+                    Cat::Lit
+                } else {
+                    Cat::Op
+                },
+                text: Cow::Borrowed(self.m.engine.symbol(symbol).name()),
+            });
+            if !children.is_empty() {
+                self.layout_arg_list(children, arg_rk, command_arguments, out);
+            }
+            return;
+        }
         let Some(syn) = self.m.syntax.get(&symbol) else {
             // No recorded syntax (should not happen for a user op): prefix-print with the kernel name.
             out.push(Work::Text {
@@ -499,6 +552,7 @@ impl<'a> Printer<'a> {
             (lcap, rcap)
         };
         self.layout_mixfix(
+            symbol,
             syn,
             &pg,
             children,
@@ -522,6 +576,7 @@ impl<'a> Printer<'a> {
     #[allow(clippy::too_many_arguments)]
     fn layout_mixfix<'t>(
         &self,
+        symbol: SymbolId,
         syn: &SymbolSyntax,
         pg: &prec_gather::PrecGather,
         children: &[Item<'t>],
@@ -586,8 +641,10 @@ impl<'a> Printer<'a> {
         }
 
         // Maude's mixfix spacing (`prettyPrint.cc::printTokens`). Default (no `format` attribute): a space
-        // precedes each fragment EXCEPT at the very start, before a `,`, and around the brackets `()[]{}`
-        // (which also suppress the following space) — so `<_,_>` prints `< M, N >`, not `< M , N >`. With a
+        // precedes each fragment EXCEPT at the very start, before a `,`, around brackets `()[]{}`, and
+        // between an ordinary literal label and its following `:` (`result:_` prints `result: value`).
+        // Colons between holes remain spaced, so the type constructor `_ : _` is unaffected.
+        // Thus `<_,_>` prints `< M, N >`, not `< M , N >`. With a
         // `format` attribute (the META result/declaration constructors — `_<-_`, `rl_=>_[_].`, …): one
         // directive word per **gap** (before each fragment, plus a trailing one), where `d` is exactly that
         // default, `s`/`n`/`i`/`+`/`-` the explicit space/newline/indent/level. An op whose format uses a
@@ -603,6 +660,9 @@ impl<'a> Printer<'a> {
             .frags
             .iter()
             .any(|frag| matches!(frag, Frag::Tok(symbol) if self.i.resolve(*symbol) == "|"));
+        // Attribute constructors preserve whether their declaration spelled `label:_` compactly or
+        // separated the label from `:_`; object notation exposes that source-level distinction.
+        let spaced_label_colons = syn.spaced_label_colon;
         let mut k = 0;
         let mut no_space = true;
         for (pos, frag) in syn.frags.iter().enumerate() {
@@ -611,11 +671,20 @@ impl<'a> Printer<'a> {
                 Frag::Tok(s) => {
                     let text = self.i.resolve(*s);
                     let special = matches!(text, "(" | ")" | "[" | "]" | "{" | "}");
-                    let default_space = if object_colons && text == ":" {
+                    let label_colon = text == ":"
+                        && matches!(
+                            pos.checked_sub(1).and_then(|p| syn.frags.get(p)),
+                            Some(Frag::Tok(_))
+                        );
+                    let default_space = if spaced_label_colons && text == ":" {
+                        true
+                    } else if object_colons && text == ":" {
                         matches!(
                             pos.checked_sub(1).and_then(|p| syn.frags.get(p)),
                             Some(Frag::Hole)
                         )
+                    } else if label_colon {
+                        false
                     } else {
                         !(no_space || special || text == ",")
                     };
@@ -624,10 +693,11 @@ impl<'a> Printer<'a> {
                         cat: Cat::Op,
                         text: Cow::Borrowed(text),
                     });
-                    no_space = special || (object_colons && text == ":");
+                    no_space =
+                        special || ((object_colons || spaced_label_colons) && text == ":");
                 }
                 Frag::Hole => {
-                    let after_object_colon = object_colons
+                    let after_object_colon = (object_colons || spaced_label_colons)
                         && matches!(
                             pos.checked_sub(1).and_then(|p| syn.frags.get(p)),
                             Some(Frag::Tok(symbol)) if self.i.resolve(*symbol) == ":"
@@ -745,7 +815,7 @@ impl<'a> Printer<'a> {
         rcap: Cap,
         out: &mut Vec<Work<'a, 't>>,
     ) {
-        if self.m.nat_succ == Some(symbol) && self.is_zero_item(arg) {
+        if self.number && self.m.nat_succ == Some(symbol) && self.is_zero_item(arg) {
             out.push(Work::Text {
                 cat: Cat::Lit,
                 text: Cow::Owned(count.to_string()),
@@ -1028,22 +1098,37 @@ enum Leaf {
     Atom(String),
 }
 
-/// A quoted identifier rendered with its leading `'` and Maude's name escaping: a space becomes a lone
-/// backquote, and each of `( ) [ ] { } ,` is preceded by a backquote (Maude's `Token` name encoding);
-/// an existing backquote (canonical qid text, e.g. from `qid("a b")` → `` a`b ``) passes through
-/// verbatim; everything else (letters, digits, `_`, `.`, …) is verbatim. Kind qids built from raw
-/// bracket text (`[Nat]`) thus print `` '`[Nat`] `` exactly as Maude does.
+/// Render a quoted identifier with its leading `'` and Maude's token-name escapes. Raw punctuation
+/// gets a backtick; punctuation already carrying its canonical backtick is not escaped twice.
 fn render_qid(q: &str) -> String {
     let mut out = String::with_capacity(q.len() + 1);
     out.push('\'');
+    let mut escaped = false;
     for c in q.chars() {
         match c {
-            ' ' => out.push('`'),
-            '(' | ')' | '[' | ']' | '{' | '}' | ',' => {
-                out.push('`');
-                out.push(c);
+            '`' => {
+                if !escaped {
+                    out.push('`');
+                }
+                escaped = true;
             }
-            _ => out.push(c),
+            ' ' => {
+                if !escaped {
+                    out.push('`');
+                }
+                escaped = true;
+            }
+            '(' | ')' | '[' | ']' | '{' | '}' | ',' => {
+                if !escaped {
+                    out.push('`');
+                }
+                out.push(c);
+                escaped = false;
+            }
+            _ => {
+                out.push(c);
+                escaped = false;
+            }
         }
     }
     out
@@ -1053,7 +1138,7 @@ fn render_qid(q: &str) -> String {
 /// ropeToString`): a printable ASCII byte (0x20–0x7E) verbatim (with `"` and `\` backslash-escaped), the
 /// named control escapes `\a \b \f \n \r \t \v`, and EVERY other byte (0x00–0x06, 0x0E–0x1F, 0x7F, and
 /// all of 0x80–0xFF) as a 3-digit octal `\ooo`. The output is pure ASCII — no raw control/high bytes.
-fn render_string(s: &[u8]) -> String {
+pub fn render_string(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for &b in s {
@@ -1083,7 +1168,7 @@ fn render_string(s: &[u8]) -> String {
 
 /// Render a float exactly as Maude's `doubleToString` — delegated to the kernel so the pretty-printer and
 /// the `string(Float)` conversion render identically (see [`tnk_core::double_to_string`]).
-fn render_float(f: f64) -> String {
+pub fn render_float(f: f64) -> String {
     tnk_core::double_to_string(f)
 }
 

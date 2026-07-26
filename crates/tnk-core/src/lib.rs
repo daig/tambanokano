@@ -14,6 +14,7 @@ pub mod arena;
 pub mod dag;
 pub mod descent;
 pub mod engine;
+pub mod external;
 pub mod fresh;
 pub mod id;
 pub mod ltl;
@@ -51,6 +52,7 @@ pub(crate) mod s;
 // S1 (subsystems goal): the order-sorted-unification sort computation (SortBdds + AllSat).
 pub(crate) mod sort_bdds;
 pub(crate) mod theory;
+pub use theory::RewriteMatchContext;
 // S1 (subsystems goal): order-sorted unification — solved-form core, per-theory solvers, and the
 // enumeration driver. `pub` so the frontend can supply a `NameCodes` source for fresh variables;
 // the object-level `unify` command and `metaUnify` reach it through `Engine` methods.

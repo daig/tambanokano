@@ -19,6 +19,12 @@ pub struct SymbolSyntax {
     pub range: SortId,
     pub prec: Option<u32>,
     pub gather: Option<Vec<GatherElem>>,
+    /// A constructor of `Attribute` with the reserved canonical `name:_` shape. Retained
+    /// independently of the kernel's merged constructor flag for META Qid encoding.
+    pub object_attribute: bool,
+    /// Whether the source spelling separated the attribute label from `:_` (`bal :_` rather than
+    /// `state:_`). Maude preserves that distinction when pretty-printing object attributes.
+    pub spaced_label_colon: bool,
     /// Whether the operator carries the `assoc` axiom (ACU/AU). Recorded from the attributes (the kernel
     /// keeps the theory `pub(crate)`); the grammar builder uses it to choose the flattened assoc-list
     /// prefix form `f(<assocList>)` over the positional `f(a, …)` form, and the right-associating gather.

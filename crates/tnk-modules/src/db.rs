@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tnk_frontend::surface::ast::PreModule;
 
 /// A name → [`PreModule`] table. Names are the surface module names (`fmod NAME is …`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModuleDb {
     modules: HashMap<String, PreModule>,
 }

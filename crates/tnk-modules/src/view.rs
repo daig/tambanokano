@@ -18,7 +18,7 @@ use crate::db::ModuleDb;
 use crate::flatten::flatten;
 
 /// A name → [`ViewDecl`] table — the parsed, validated views of a program.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ViewDb {
     views: HashMap<String, ViewDecl>,
 }

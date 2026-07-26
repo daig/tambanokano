@@ -24,10 +24,110 @@ use crate::au::{AuLhs, AuSubproblem};
 use crate::cui::{CuiLhs, CuiSubproblem};
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
+use crate::num::Nat;
 use crate::s::{SLhs, SSubproblem};
-use crate::symbol::Theory;
+use crate::symbol::{SymbolId, Theory};
 use crate::term::{Subst, Term};
 use std::collections::HashSet;
+/// The theory residue of one rule-style match, detached from its resumable matcher. Conditional
+/// strategy application solves conditions after releasing the match stream, then uses this snapshot to
+/// splice the fully-instantiated right-hand side back into the unmatched subject portion.
+#[derive(Clone)]
+pub struct RewriteMatchContext {
+    kind: RewriteMatchContextKind,
+}
+
+#[derive(Clone)]
+enum RewriteMatchContextKind {
+    Whole,
+    Acu {
+        symbol: SymbolId,
+        residue: Vec<(DagId, u32)>,
+    },
+    Au {
+        symbol: SymbolId,
+        prefix: Vec<DagId>,
+        suffix: Vec<DagId>,
+    },
+    Cui {
+        symbol: SymbolId,
+        residue: DagId,
+    },
+    S {
+        symbol: SymbolId,
+        residue: Nat,
+    },
+}
+
+impl RewriteMatchContext {
+    pub(crate) fn whole() -> Self {
+        Self {
+            kind: RewriteMatchContextKind::Whole,
+        }
+    }
+
+    pub(crate) fn acu(symbol: SymbolId, residue: Vec<(DagId, u32)>) -> Self {
+        Self {
+            kind: RewriteMatchContextKind::Acu { symbol, residue },
+        }
+    }
+
+    pub(crate) fn au(symbol: SymbolId, prefix: Vec<DagId>, suffix: Vec<DagId>) -> Self {
+        Self {
+            kind: RewriteMatchContextKind::Au {
+                symbol,
+                prefix,
+                suffix,
+            },
+        }
+    }
+
+    pub(crate) fn cui(symbol: SymbolId, residue: DagId) -> Self {
+        Self {
+            kind: RewriteMatchContextKind::Cui { symbol, residue },
+        }
+    }
+
+    pub(crate) fn successor(symbol: SymbolId, residue: Nat) -> Self {
+        Self {
+            kind: RewriteMatchContextKind::S { symbol, residue },
+        }
+    }
+
+    pub(crate) fn build_result(
+        &self,
+        runtime: &mut Runtime,
+        signature: &Signature,
+        rhs: DagId,
+    ) -> DagId {
+        match &self.kind {
+            RewriteMatchContextKind::Whole => rhs,
+            RewriteMatchContextKind::Acu { symbol, residue } => {
+                let mut parts = Vec::with_capacity(residue.len() + 1);
+                parts.push((rhs, 1));
+                parts.extend_from_slice(residue);
+                runtime.make_acu(signature, *symbol, parts)
+            }
+            RewriteMatchContextKind::Au {
+                symbol,
+                prefix,
+                suffix,
+            } => {
+                let mut sequence = Vec::with_capacity(prefix.len() + 1 + suffix.len());
+                sequence.extend_from_slice(prefix);
+                sequence.push(rhs);
+                sequence.extend_from_slice(suffix);
+                runtime.make_au(signature, *symbol, sequence)
+            }
+            RewriteMatchContextKind::Cui { symbol, residue } => {
+                runtime.make_cui(signature, *symbol, rhs, *residue)
+            }
+            RewriteMatchContextKind::S { symbol, residue } => {
+                runtime.make_s(signature, *symbol, residue.clone(), rhs)
+            }
+        }
+    }
+}
 
 /// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); this slice has
 /// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
@@ -215,6 +315,16 @@ impl Subproblem {
             Subproblem::Sequence(sp) => sp.next(rt, sig, subst),
         }
     }
+    pub(crate) fn rewrite_context(&self) -> RewriteMatchContext {
+        match self {
+            Subproblem::FreeOnce { .. } | Subproblem::Sequence(_) => RewriteMatchContext::whole(),
+            Subproblem::Acu(subproblem) => subproblem.rewrite_context(),
+            Subproblem::Au(subproblem) => subproblem.rewrite_context(),
+            Subproblem::Cui(subproblem) => subproblem.rewrite_context(),
+            Subproblem::S(subproblem) => subproblem.rewrite_context(),
+        }
+    }
+
 
     /// Extension-match status of the *current* solution, for the `xmatch` command's display. `None`
     /// means the match carried no extension info (a free-theory subject, or a non-extension match) — so
@@ -229,6 +339,13 @@ impl Subproblem {
             // CUI extension display is unexercised by the audit; report no portion line.
             Subproblem::Cui(_) => None,
             Subproblem::S(sp) => sp.matched_status(),
+        }
+    }
+
+    pub(crate) fn ordered_context_parts(&self) -> Option<(&[DagId], &[DagId])> {
+        match self {
+            Subproblem::Au(subproblem) => Some(subproblem.ordered_context_parts()),
+            _ => None,
         }
     }
 

@@ -13,7 +13,8 @@
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
-use crate::descent::{DescentOps, NullDescent};
+use crate::descent::{DescentOps, MetaCtx, NullDescent};
+use crate::external::{ExternalRewriteBreakdown, ExternalTargetToken, MetaEnvelope};
 use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
@@ -26,7 +27,7 @@ use crate::symbol::{
     Symbol, SymbolClass, SymbolId, Theory,
 };
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
-use crate::theory::{LhsAutomaton, Subproblem};
+use crate::theory::{LhsAutomaton, RewriteMatchContext, Subproblem};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -521,10 +522,149 @@ pub(crate) struct Signature {
 /// `sortQid`/`kindQid`/`constantQid`/`variableQid`) — see [`Signature::qid_class`].
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct QidClass {
+    base: Option<SortId>,
     sort: Option<SortId>,
     kind: Option<SortId>,
     constant: Option<SortId>,
     variable: Option<SortId>,
+}
+
+#[derive(Clone, Copy)]
+enum QidAux {
+    Sort,
+    StructuredSort,
+    Variable,
+    Constant,
+    Kind,
+}
+
+/// Port of Maude's `Token::skipSortName`. Returns the byte index of the canonical terminator and
+/// whether the name contains a structured-sort parameter list.
+fn skip_qid_sort_name(text: &[u8], start: usize) -> Option<(usize, bool)> {
+    let mut parameterized = false;
+    let mut depth = 0_u32;
+    let mut seen_name = false;
+    let mut i = start;
+    loop {
+        let Some(&byte) = text.get(i) else {
+            return (seen_name && depth == 0).then_some((i, parameterized));
+        };
+        match byte {
+            b'`' => {
+                let escaped = *text.get(i + 1)?;
+                match escaped {
+                    b']' => {
+                        return (seen_name && depth == 0).then_some((i, parameterized));
+                    }
+                    b'{' if seen_name => {
+                        parameterized = true;
+                        depth += 1;
+                        seen_name = false;
+                    }
+                    b',' if seen_name => {
+                        if depth == 0 {
+                            return Some((i, parameterized));
+                        }
+                        seen_name = false;
+                    }
+                    b'}' if seen_name && depth > 0 => {
+                        depth -= 1;
+                    }
+                    b'[' | b'{' | b',' | b'}' => return None,
+                    _ => seen_name = true,
+                }
+                i += 2;
+            }
+            b'.' | b':' if depth == 0 => return None,
+            _ => {
+                seen_name = true;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Convert the Rust frontend's compact Qid text to Maude's canonical token-name spelling for
+/// auxiliary-property classification. The frontend may retain punctuation without its syntactic
+/// backticks; `Token::computeAuxProperty` sees those backticks.
+fn canonical_qid_token_name(text: &str) -> std::borrow::Cow<'_, str> {
+    let punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',');
+    let mut previous_backtick = false;
+    let needs_escape = text.chars().any(|c| {
+        let needed = punct(c) && !previous_backtick;
+        previous_backtick = c == '`';
+        needed
+    });
+    if !needs_escape {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len() + 4);
+    previous_backtick = false;
+    for c in text.chars() {
+        if punct(c) && !previous_backtick {
+            out.push('`');
+        }
+        out.push(c);
+        previous_backtick = c == '`';
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Port of Maude's `Token::computeAuxProperty`, applied to a quoted identifier's unquoted text.
+fn qid_aux_property(text: &str) -> Option<QidAux> {
+    let text = canonical_qid_token_name(text);
+    let bytes = text.as_bytes();
+
+    if bytes.starts_with(b"`[") {
+        // Maude starts `skipSortName` on the `[` byte, then accepts one or more names separated by
+        // canonical backtick-comma tokens and closed by a canonical backtick-right-bracket.
+        let mut start = 1;
+        loop {
+            let (end, _) = skip_qid_sort_name(bytes, start)?;
+            match (bytes.get(end), bytes.get(end + 1)) {
+                (Some(b'`'), Some(b']')) if end + 2 == bytes.len() => {
+                    return Some(QidAux::Kind);
+                }
+                (Some(b'`'), Some(b',')) => start = end + 2,
+                _ => break,
+            }
+        }
+    } else if let Some((end, parameterized)) = skip_qid_sort_name(bytes, 0)
+        && end == bytes.len()
+    {
+        return Some(if parameterized {
+            QidAux::StructuredSort
+        } else {
+            QidAux::Sort
+        });
+    }
+
+    // Constant and variable suffixes are recognized only when the suffix itself is a sort or kind.
+    // Separators inside a structured-sort `{...}` parameter list do not count.
+    let mut depth = 0_i32;
+    for i in (1..bytes.len()).rev() {
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' => depth -= 1,
+            b'.' | b':' if depth == 0 => {
+                let suffix = text.get(i + 1..)?;
+                if matches!(
+                    qid_aux_property(suffix),
+                    Some(QidAux::Sort | QidAux::StructuredSort | QidAux::Kind)
+                ) {
+                    return Some(if bytes[i] == b'.' {
+                        QidAux::Constant
+                    } else {
+                        QidAux::Variable
+                    });
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// One recorded reduction event (opt-in via [`Engine::set_trace`]) — the structured stream the REPL
@@ -694,6 +834,37 @@ pub struct SatSolveStats {
     pub fairness_sets: usize,
 }
 
+struct RootedDag {
+    node: DagId,
+    _root: RootGuard,
+}
+
+struct ERewriteObject {
+    name: DagId,
+    object: Option<DagId>,
+    messages: Vec<DagId>,
+    next_message: usize,
+    incoming_drained: bool,
+}
+
+/// Resumable state for one object-message scheduler pass. Every stored DAG is reachable either from
+/// `_roots` or from the parent rewriting session's current root.
+pub(crate) struct ERewritePass {
+    config_symbol: SymbolId,
+    portal_seen: bool,
+    objects: Vec<ERewriteObject>,
+    next_object: usize,
+    remainder: Vec<(DagId, u32)>,
+    progress: bool,
+    awaiting_external: bool,
+    _roots: Vec<RootGuard>,
+}
+
+pub(crate) enum ERewritePassStep {
+    Complete { term: DagId, progress: bool },
+    External { target: DagId, message: DagId },
+}
+
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
 /// rewrite statistics. Operations that consult the signature (sorts/symbols/equations) take a
 /// `&Signature`; everything else is pure arena work.
@@ -705,6 +876,10 @@ pub(crate) struct Runtime {
     /// (variableDagNode.cc), and [`dag_compare`](Self::dag_compare) mirrors that here. Empty unless a
     /// non-ground subject was built, so the ground hot path pays one `is_empty` check.
     var_ranks: HashMap<SymbolId, u32>,
+    /// Relative first-ascent ranks for quoted identifiers synthesized by META-level output. Maude
+    /// interns each complete payload (for example `X:Foo`) lazily; using the source variable's bare
+    /// token code gives the wrong order when fresh and rule variables share a reflected substitution.
+    qid_ranks: HashMap<String, u32>,
     /// Relative creation ranks of Maude's per-sort `VariableSymbol`s. Original command variables
     /// are parsed before their final theory-normalized slots are known, so the unification driver
     /// records the parser-equivalent first-demand order explicitly. Unranked mid-solve symbols keep
@@ -719,9 +894,11 @@ pub(crate) struct Runtime {
     identity_dags: HashMap<IdentityId, DagId>,
     /// Guards identity materialization against recursively identity-bearing terms.
     identity_building: HashSet<IdentityId>,
-    /// Count of equational rewrites applied (Maude's `rewrites` statistic). `pub(crate)` so the rewrite-
-    /// path `counter` special ([`Runtime::try_counter`]) can count its step like a rule application.
+    /// Aggregate command count. Breakdown categories below are subcounts of this value; equational
+    /// rewrites are the remainder, matching Maude's accounting for transferred meta-level work.
     pub(crate) rewrite_count: u64,
+    membership_count: u64,
+    rule_rewrite_count: u64,
     variant_narrowing_count: u64,
     narrowing_count: u64,
     /// Completed model-check statistics waiting for the command layer to consume them.
@@ -774,11 +951,14 @@ pub(crate) struct Runtime {
     /// surfaced by the REPL. Reset per `erewrite` command via [`reset_external`](Engine::reset_external).
     external_out: String,
     external_err: String,
-    /// Buffered reply messages from external managers (Maude's `incomingMessages` mailbox) — delivered
-    /// into the soup on the next `erewrite` pass (`getExternalMessages`). Reset per command. (REPL GC is
-    /// off during a command, so these survive between passes without an explicit root; the reactor phase
-    /// will GC-root the in-flight message when blocking spans a collection.)
-    incoming: Vec<DagId>,
+    /// Buffered, rooted reply messages from external managers (Maude's `incomingMessages` mailbox).
+    /// They are delivered into the soup on the next `erewrite` pass (`getExternalMessages`) and remain
+    /// live across a suspended parent pass and arbitrary child-engine work.
+    incoming: Vec<RootedDag>,
+    /// Capability registry for host-owned external targets. The rooted target DAGs persist across
+    /// commands until the host explicitly unregisters the corresponding opaque token.
+    external_targets: HashMap<u64, RootedDag>,
+    next_external_target: u64,
     /// Pending `stdin` input for `getLine` (Pillar 2.5-C): the raw not-yet-read bytes. A `getLine` reads up
     /// to and **including** the next `\n` (or the rest with no trailing `\n`); empty buffer = EOF → `""`.
     /// Threaded by the REPL across commands (NOT reset per command, unlike the output buffers).
@@ -1055,11 +1235,22 @@ impl Signature {
     fn term_sort(&self, term: &Term) -> SortId {
         match term {
             Term::Var(v) => v.sort,
-            Term::Na { symbol, .. } => self.symbol(*symbol).decls()[0].range,
+            Term::Na { symbol, value } => self.compute_na_sort(*symbol, value),
             Term::Iter { symbol, count, arg } => {
                 self.compute_s_sort(*symbol, self.term_sort(arg), count)
             }
-            Term::Op { symbol, args } if args.is_empty() => self.symbol(*symbol).decls()[0].range,
+            Term::Op { symbol, args } if args.is_empty() => {
+                let declarations = self.symbol(*symbol).decls();
+                declarations
+                    .iter()
+                    .find(|candidate| {
+                        declarations
+                            .iter()
+                            .all(|other| self.sorts.leq(candidate.range, other.range))
+                    })
+                    .unwrap_or(&declarations[0])
+                    .range
+            }
             Term::Op { symbol, args } => {
                 let arg_sorts: Vec<SortId> = args.iter().map(|arg| self.term_sort(arg)).collect();
                 if matches!(self.symbol(*symbol).theory(), Theory::Acu | Theory::Au) {
@@ -1459,11 +1650,10 @@ impl Signature {
     }
 
     /// The sort of a built-in **NA** constant — *value-dependent* (Maude's per-symbol NA sort
-    /// functions), not just the least declared range: a length-1 string is `Char` else `String`; a
-    /// finite float is `FiniteFloat` else `Float`; a quoted identifier is `Qid`. Concretely: among the
-    /// symbol's declared range sorts, the most specific (min) when the value is "special" (a one-char
-    /// string / a finite float), else the most general (max). A single-decl NA symbol (`Qid`) has
-    /// min == max, so the value does not matter.
+    /// functions), not just the least declared range. Strings and floats select their most-specific
+    /// declaration for a one-character/finite value and their most-general declaration otherwise.
+    /// Quoted identifiers use Maude's token auxiliary-property grammar; an unclassified token has the
+    /// base `Qid` sort (the most-general declaration).
     pub(crate) fn compute_na_sort(&self, symbol: SymbolId, value: &NaValue) -> SortId {
         let decls = self.symbols.get(symbol).decls();
         let (mut min, mut max) = (decls[0].range, decls[0].range);
@@ -1475,48 +1665,44 @@ impl Signature {
                 max = d.range;
             }
         }
-        // A quoted-identifier constant's least sort is text-dependent when the module declares META-TERM's
-        // `<Qids>` classification ops (`'X:S` → Variable, `'c.S` → Constant, `'[K]` → Kind, plain → Sort);
-        // without them (a plain `QID`) it falls through to the generic `Qid` (`min`).
-        if let NaValue::Qid(q) = value
-            && let Some(s) = self.classify_qid(q)
-        {
-            return s;
+        if let NaValue::Qid(q) = value {
+            // META-TERM extends `<Qids>` with Sort/Kind/Constant/Variable declarations. Maude's
+            // `QuotedIdentifierSymbol::determineSort` returns the base `Qid` for token text with no
+            // auxiliary property, rather than arbitrarily choosing one of those incomparable subsorts.
+            return self.classify_qid(q).or(self.qid_class.base).unwrap_or(max);
         }
         let special = match value {
             NaValue::Str(s) => s.len() == 1,
             NaValue::Float(bits) => f64::from_bits(*bits).is_finite(),
-            NaValue::Qid(_) => true,
             NaValue::SmtNum(_) => true,
+            NaValue::Qid(_) => unreachable!(),
         };
         if special { min } else { max }
     }
 
-    /// Classify a quoted-identifier's text into its META-TERM sort, or `None` if this module has no
-    /// classification ops (or the relevant code was not declared). Precedence: a `:` makes it a
-    /// `Variable`, else a `.` a `Constant`, else a leading `[` a `Kind`, else a `Sort`.
+    /// Classify quoted-identifier text exactly as Maude's `Token::computeAuxProperty`; return `None`
+    /// for ordinary operator-name Qids and for a classification code absent from this module.
     fn classify_qid(&self, text: &str) -> Option<SortId> {
         let qc = &self.qid_class;
-        if text.contains(':') {
-            qc.variable
-        } else if text.contains('.') {
-            qc.constant
-        } else if text.starts_with('[') {
-            qc.kind
-        } else {
-            qc.sort
+        match qid_aux_property(text)? {
+            QidAux::Sort | QidAux::StructuredSort => qc.sort,
+            QidAux::Kind => qc.kind,
+            QidAux::Constant => qc.constant,
+            QidAux::Variable => qc.variable,
         }
     }
 
-    /// Record a quoted-identifier classification sort for one `QuotedIdentifierSymbol` code (META-TERM's
-    /// `<Qids> : -> Sort/Kind/Constant/Variable` declarations).
-    pub(crate) fn set_qid_class(&mut self, code: &str, sort: SortId) {
+    /// Record the base sort or one classification sort from a `QuotedIdentifierSymbol` id-hook.
+    /// META-TERM's empty hook data identifies base `Qid`; nonempty codes identify its
+    /// Sort/Kind/Constant/Variable subsorts.
+    pub(crate) fn set_qid_class(&mut self, code: Option<&str>, sort: SortId) {
         match code {
-            "sortQid" => self.qid_class.sort = Some(sort),
-            "kindQid" => self.qid_class.kind = Some(sort),
-            "constantQid" => self.qid_class.constant = Some(sort),
-            "variableQid" => self.qid_class.variable = Some(sort),
-            _ => {}
+            None => self.qid_class.base = Some(sort),
+            Some("sortQid") => self.qid_class.sort = Some(sort),
+            Some("kindQid") => self.qid_class.kind = Some(sort),
+            Some("constantQid") => self.qid_class.constant = Some(sort),
+            Some("variableQid") => self.qid_class.variable = Some(sort),
+            Some(_) => {}
         }
     }
 
@@ -2332,6 +2518,7 @@ impl Runtime {
                     }
                     self.dags.get_mut(id).sort = sc.sort;
                     self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
+                    self.membership_count += 1;
                     lowered = true;
                     break; // restart the scan with the new, smaller sort
                 }
@@ -2632,9 +2819,17 @@ impl Runtime {
         // preserve observable rewrite statistics and discard any internal trace events. Keeping
         // the existing trace buffer installed during reduction still roots its DAGs across GC.
         let rewrite_count = self.rewrite_count;
+        let membership_count = self.membership_count;
+        let rule_rewrite_count = self.rule_rewrite_count;
+        let variant_narrowing_count = self.variant_narrowing_count;
+        let narrowing_count = self.narrowing_count;
         let trace_len = self.trace.as_ref().map(Vec::len);
         let normalized = self.reduce(sig, d, &mut NullDescent);
         self.rewrite_count = rewrite_count;
+        self.membership_count = membership_count;
+        self.rule_rewrite_count = rule_rewrite_count;
+        self.variant_narrowing_count = variant_narrowing_count;
+        self.narrowing_count = narrowing_count;
         if let (Some(trace), Some(len)) = (&mut self.trace, trace_len) {
             trace.truncate(len);
         }
@@ -3159,6 +3354,11 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn register_qid_rank(&mut self, text: &str) {
+        let next = self.qid_ranks.len() as u32;
+        self.qid_ranks.entry(text.to_string()).or_insert(next);
+    }
+
     pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
         self.dag_compare_inner(a, b, false)
     }
@@ -3177,10 +3377,7 @@ impl Runtime {
         // Maude builds each symbol's order key as `orderInt = symbolCount++ | (arity << 24)`
         // (`Interface/symbol.cc`), so the canonical symbol order is **arity-first** (the high bits),
         // then global creation index. A mixed-arity ACU soup therefore groups by arity before
-        // creation order — e.g. a configuration's arity-2 messages all sort before its arity-3
-        // objects, regardless of which was declared first. Mirror that: compare arity, then `SymbolId`
-        // (our per-build creation index, the `symbolCount` analog). Same-arity elements keep the
-        // existing index order, so NAT/SET/MAP conformance (uniform arity) is unchanged.
+        // creation order. Mirror that by comparing arity, then `SymbolId` below.
         match Self::node_arity(na).cmp(&Self::node_arity(nb)) {
             Ordering::Equal => {}
             ord => return ord,
@@ -3201,22 +3398,12 @@ impl Runtime {
             return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
         }
         // Genuine variables of different sorts have different per-sort VariableSymbols in Maude.
-        // Within one kind, proper-sort variables precede the synthesized kind-error variable;
-        // among proper sorts, the command driver records the parser-equivalent first-demand order.
-        // These keys keep canonical AC/ACU order stable across a sequence of commands that may have
-        // materialized a kind-error fresh variable before a later proper-sort variable.
+        // Their lazy creation order is recorded by `sort_var_ranks`; use it before the SymbolId
+        // fallback so statement/command traversal order remains stable across cached searches.
         if na.symbol() != nb.symbol()
             && matches!(na.term, NodeTerm::Var { .. })
             && matches!(nb.term, NodeTerm::Var { .. })
         {
-            if let (Some(&(ka, ea)), Some(&(kb, eb))) = (
-                self.sort_var_meta.get(&na.symbol()),
-                self.sort_var_meta.get(&nb.symbol()),
-            ) && ka == kb
-                && ea != eb
-            {
-                return ea.cmp(&eb).then_with(|| na.symbol().cmp(&nb.symbol()));
-            }
             if let (Some(&ra), Some(&rb)) = (
                 self.sort_var_ranks.get(&na.symbol()),
                 self.sort_var_ranks.get(&nb.symbol()),
@@ -3303,6 +3490,22 @@ impl Runtime {
                     ..
                 },
             ) => crate::dag::rope_cmp(xs, ys),
+            (
+                NodeTerm::Na {
+                    value: NaValue::Qid(xs),
+                    ..
+                },
+                NodeTerm::Na {
+                    value: NaValue::Qid(ys),
+                    ..
+                },
+            ) => match (
+                self.qid_ranks.get(xs.as_ref()),
+                self.qid_ranks.get(ys.as_ref()),
+            ) {
+                (Some(xr), Some(yr)) => xr.cmp(yr).then_with(|| xs.cmp(ys)),
+                _ => xs.cmp(ys),
+            },
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
             // `VariableTerm`/`VariableDagNode::compareArguments` uses the interned name id. During
             // ordinary DAG solving, slot order remains the established canonical approximation;
@@ -3345,6 +3548,12 @@ impl Runtime {
     }
 
     // ---- garbage collection (D2) ----
+
+    /// Stable identity of this runtime's DAG arena/root domain. Persistent descent caches use it to
+    /// discard engine-local DAG keys before servicing a different loaded module.
+    pub(crate) fn context_id(&self) -> usize {
+        std::rc::Rc::as_ptr(&self.roots) as usize
+    }
 
     /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (see [`Engine::root`]).
     pub(crate) fn root(&self, id: DagId) -> RootGuard {
@@ -3477,6 +3686,8 @@ impl Runtime {
     }
     pub(crate) fn reset_rewrites(&mut self) {
         self.rewrite_count = 0;
+        self.membership_count = 0;
+        self.rule_rewrite_count = 0;
         self.variant_narrowing_count = 0;
         self.narrowing_count = 0;
         self.model_check_stats.clear();
@@ -3487,7 +3698,20 @@ impl Runtime {
     pub(crate) fn add_rewrites(&mut self, n: u64) {
         self.rewrite_count += n;
     }
-
+    pub(crate) fn add_variant_narrowing_subcount(&mut self, n: u64) {
+        self.variant_narrowing_count += n;
+    }
+    pub(crate) fn add_narrowing_subcount(&mut self, n: u64) {
+        self.narrowing_count += n;
+    }
+    pub(crate) fn rewrite_breakdown(&self) -> (u64, u64, u64, u64) {
+        (
+            self.membership_count,
+            self.rule_rewrite_count,
+            self.variant_narrowing_count,
+            self.narrowing_count,
+        )
+    }
 
     pub(crate) fn record_model_check_stats(&mut self, stats: ModelCheckStats) {
         self.model_check_stats.push(stats);
@@ -4258,6 +4482,7 @@ impl Runtime {
             if let Some(result) = r {
                 let rule_id = rule.id;
                 self.rewrite_count += 1;
+                self.rule_rewrite_count += 1;
                 cursors.insert(symbol, ((idx + 1) % n) as u32);
                 return Some((rule_id, result));
             }
@@ -4436,6 +4661,7 @@ impl Runtime {
         descent: &mut dyn DescentOps,
     ) -> DagId {
         self.rewrite_count += 1;
+        self.rule_rewrite_count += 1;
         self.reduce(sig, successor, descent)
     }
 
@@ -4886,6 +5112,7 @@ impl Runtime {
             self.state_successors(sig, state, &mut succs);
             for (_rule_id, succ) in succs {
                 self.rewrite_count += 1;
+                self.rule_rewrite_count += 1;
                 self.condition_depth += 1;
                 let reduced = self.reduce(sig, succ, &mut NullDescent);
                 self.condition_depth -= 1;
@@ -4933,11 +5160,14 @@ pub struct OoInfo {
 }
 
 impl Engine {
-    /// Whether `sym` is **associative** (an ACU or AU operator). A nested application of such an operator
-    /// (`f(a, f(b, c))`) denotes the same flattened term `f(a, b, c)`; the META up-translation flattens it
-    /// to match Maude's `ACU/AU_Term::makeTerm` normal form.
+    /// Whether `sym` is **associative** (an ACU or AU operator).
     pub fn symbol_is_assoc(&self, sym: SymbolId) -> bool {
         matches!(self.sig.symbol(sym).theory(), Theory::Acu | Theory::Au)
+    }
+
+    /// Whether `sym` is commutative (ACU or commutative CUI).
+    pub fn symbol_is_commutative(&self, sym: SymbolId) -> bool {
+        self.sig.symbol(sym).is_commutative()
     }
 
     /// The object-oriented completion context (Pillar 2.5-E) — the CONFIGURATION symbols/sorts the
@@ -5001,6 +5231,17 @@ impl Engine {
     /// [`match_solutions`](Self::match_solutions) and its [`Solutions`] stream, and by the theory tests.
     pub(crate) fn parts_mut(&mut self) -> (&Signature, &mut Runtime) {
         (&self.sig, &mut self.rt)
+    }
+    /// Run one operation against the public, minimal META descent view of this engine.
+    ///
+    /// Kept crate-visible for engine-neutral external-message transport: no runtime or signature
+    /// reference can escape the callback.
+    pub(crate) fn with_meta_ctx<R>(&mut self, f: impl FnOnce(&mut MetaCtx) -> R) -> R {
+        let mut ctx = MetaCtx {
+            rt: &mut self.rt,
+            sig: &self.sig,
+        };
+        f(&mut ctx)
     }
 
     // ---- sort signature ----
@@ -5373,6 +5614,50 @@ impl Engine {
         self.rt.make_var(&self.sig, sym, name, index)
     }
 
+    /// Instantiate a static statement term with symbolic variables, then apply Maude's eager
+    /// `Term::normalize(true)` ordering. Reflection uses this because executable matching does not need
+    /// the source [`Term`] to retain its canonical AC/ACU argument order, while `upModule` exposes that
+    /// order and the enclosing meta-level statement sets are themselves order-sensitive.
+    pub fn normalize_pattern_for_reflection(
+        &mut self,
+        term: &Term,
+        variable_names: &[u32],
+    ) -> DagId {
+        let mut variable_sorts = Vec::<Option<SortId>>::new();
+        let mut variable_sort_order = Vec::new();
+        let mut work = vec![term];
+        while let Some(term) = work.pop() {
+            match term {
+                Term::Var(var) => {
+                    let slot = var.index as usize;
+                    if variable_sorts.len() <= slot {
+                        variable_sorts.resize(slot + 1, None);
+                    }
+                    variable_sorts[slot] = Some(var.sort);
+                    if !variable_sort_order.contains(&var.sort) {
+                        variable_sort_order.push(var.sort);
+                    }
+                }
+                Term::Op { args, .. } => work.extend(args),
+                Term::Iter { arg, .. } => work.push(arg),
+                Term::Na { .. } => {}
+            }
+        }
+        self.rank_variable_sorts(&mut variable_sort_order);
+
+        let mut subst = Subst::new();
+        subst.reset(variable_sorts.len() as u32);
+        for (slot, sort) in variable_sorts.into_iter().enumerate() {
+            if let Some(sort) = sort {
+                let name = variable_names.get(slot).copied().unwrap_or(slot as u32);
+                let variable = self.make_var(sort, name, slot as u32);
+                subst.bind(slot as u32, variable);
+            }
+        }
+        let dag = self.rt.instantiate(&self.sig, term, &subst);
+        self.normalize_for_unify(dag)
+    }
+
     /// Eagerly theory-normalize `dag` (flatten/merge ACU/AU) for the symbolic engine — the
     /// `Term::normalize(true)` the `unify` command applies to each unificand before solving.
     pub fn normalize_for_unify(&mut self, dag: DagId) -> DagId {
@@ -5615,15 +5900,16 @@ impl Engine {
         self.sig.symbol(id)
     }
 
-    /// Resolve a source operator among same-name/arity symbols using the argument sorts. META terms
-    /// carry the operator name but not its overload id, so their down-translation needs the same
-    /// applicability test as ordinary parsing.
+    /// Resolve a source operator among same-name symbols using the argument sorts. META terms carry the
+    /// operator name but not its overload id, so their down-translation needs the same applicability test
+    /// as ordinary parsing. A reflected associative application is flat: three or more arguments still
+    /// select a binary ACU/AU declaration, using its binary sort fold to disambiguate ad-hoc overloads.
     pub fn resolve_operator_for_sorts(
         &self,
         name: &str,
         argument_sorts: &[SortId],
     ) -> Option<SymbolId> {
-        self.sig.symbols_iter().find_map(|(id, symbol)| {
+        let exact = self.sig.symbols_iter().find_map(|(id, symbol)| {
             (symbol.name() == name
                 && symbol.arity() == argument_sorts.len()
                 && symbol.decls().iter().any(|decl| {
@@ -5633,16 +5919,105 @@ impl Engine {
                         .all(|(&actual, &declared)| self.sig.sorts.leq(actual, declared))
                 }))
             .then_some(id)
+        });
+        if exact.is_some() || argument_sorts.len() < 3 {
+            return exact;
+        }
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            if symbol.name() != name
+                || symbol.arity() != 2
+                || !matches!(symbol.theory(), Theory::Acu | Theory::Au)
+            {
+                return None;
+            }
+            let result = self.sig.compute_sort_fold(id, argument_sorts);
+            let range_kind = self.sig.sorts.kind_of(symbol.decls()[0].range);
+            (result != self.sig.sorts.error_sort(range_kind)).then_some(id)
         })
     }
 
-    pub fn resolve_constant_at_sort(&self, name: &str, sort: SortId) -> Option<SymbolId> {
+    /// Resolve a META application by connected-component profile when no sort-level declaration applies.
+    /// Reflected rule sides may contain special operations whose declared result is an error sort until
+    /// reduction (for example `upModule : [Qid] [Bool] -> [Module]` beneath
+    /// `insertModule : Oid Oid Module -> Msg`). Maude still constructs that kind-correct term and lets
+    /// inner reduction refine its sort. Selecting by name/arity alone is unsafe because names such as
+    /// `__` are overloaded across unrelated kinds.
+    pub fn resolve_operator_for_kinds(
+        &self,
+        name: &str,
+        argument_sorts: &[SortId],
+    ) -> Option<SymbolId> {
+        let same_kind =
+            |actual: SortId, declared: SortId| self.sig.sorts.same_kind(actual, declared);
+        let exact = self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name
+                && symbol.arity() == argument_sorts.len()
+                && symbol.decls().iter().any(|decl| {
+                    argument_sorts
+                        .iter()
+                        .zip(&decl.domain)
+                        .all(|(&actual, &declared)| same_kind(actual, declared))
+                }))
+            .then_some(id)
+        });
+        if exact.is_some() || argument_sorts.len() < 3 {
+            return exact;
+        }
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            if symbol.name() != name
+                || symbol.arity() != 2
+                || !matches!(symbol.theory(), Theory::Acu | Theory::Au)
+            {
+                return None;
+            }
+            symbol
+                .decls()
+                .iter()
+                .any(|decl| {
+                    same_kind(argument_sorts[0], decl.domain[0])
+                        && argument_sorts[1..]
+                            .iter()
+                            .all(|&actual| same_kind(actual, decl.domain[1]))
+                        && same_kind(decl.range, decl.domain[0])
+                })
+                .then_some(id)
+        })
+    }
+
+    /// Resolve an operator hook by its complete connected-component profile. Unlike ordinary META-term
+    /// descent, a hook signature supplies its result type as well as its argument types; including that
+    /// result kind is essential for overloaded constants such as `none`.
+    pub fn resolve_operator_for_kind_profile(
+        &self,
+        name: &str,
+        argument_sorts: &[SortId],
+        range_sort: SortId,
+    ) -> Option<SymbolId> {
+        let range_kind = self.sig.sorts.kind_of(range_sort);
         self.sig.symbols_iter().find_map(|(id, symbol)| {
             (symbol.name() == name
-                && symbol
-                    .decls()
-                    .iter()
-                    .any(|decl| decl.domain.is_empty() && decl.range == sort))
+                && symbol.arity() == argument_sorts.len()
+                && symbol.decls().iter().any(|decl| {
+                    self.sig.sorts.kind_of(decl.range) == range_kind
+                        && argument_sorts
+                            .iter()
+                            .zip(&decl.domain)
+                            .all(|(&actual, &declared)| self.sig.sorts.same_kind(actual, declared))
+                }))
+            .then_some(id)
+        })
+    }
+
+    /// Resolve a META constant in the connected component named by its annotation. Maude treats the
+    /// suffix as a kind/component discriminator, not an upper sort bound: `'a.Elem` may denote
+    /// `a : XOR` when `Elem` and `XOR` belong to the same component.
+    pub fn resolve_constant_at_sort(&self, name: &str, sort: SortId) -> Option<SymbolId> {
+        let kind = self.sig.sorts.kind_of(sort);
+        self.sig.symbols_iter().find_map(|(id, symbol)| {
+            (symbol.name() == name
+                && symbol.decls().iter().any(|decl| {
+                    decl.domain.is_empty() && self.sig.sorts.kind_of(decl.range) == kind
+                }))
             .then_some(id)
         })
     }
@@ -5662,6 +6037,19 @@ impl Engine {
             .collect()
     }
 
+    /// Materialize the normalized identity attached to `id`, including one-sided identities.
+    /// Reflection uses the compiled attachment rather than reparsing an ambiguous source token.
+    pub fn symbol_identity_dag(&mut self, id: SymbolId) -> Option<DagId> {
+        let identity = {
+            let symbol = self.sig.symbol(id);
+            symbol
+                .identity()
+                .or_else(|| symbol.left_identity())
+                .or_else(|| symbol.right_identity())
+        }?;
+        Some(self.rt.identity_dag(&self.sig, identity))
+    }
+
     /// The kind (connected component) of `sym`'s result — its first declaration's range kind. Used by the
     /// frontend to parse an equation's rhs in the same kind as its lhs (overloads that span kinds fall
     /// back to unconstrained parsing).
@@ -5669,9 +6057,9 @@ impl Engine {
         self.sig.symbol_range_kind(id)
     }
 
-    /// Record a quoted-identifier classification sort for a `QuotedIdentifierSymbol` code (META-TERM's
-    /// `<Qids> : -> Sort/Kind/Constant/Variable`), so a `Qid` constant's least sort becomes text-dependent.
-    pub fn set_qid_class(&mut self, code: &str, sort: SortId) {
+    /// Record the base sort (`code == None`) or a classification sort for a
+    /// `QuotedIdentifierSymbol` declaration.
+    pub fn set_qid_class(&mut self, code: Option<&str>, sort: SortId) {
         self.sig.set_qid_class(code, sort);
     }
 
@@ -5792,8 +6180,7 @@ impl Engine {
     pub fn sort_of(&self, id: DagId) -> SortId {
         self.rt.sort_of(id)
     }
-    /// The canonical total order on DAG nodes (`DagNode::compare`) — the key the CUI commutative
-    /// unification decision procedure compares arguments by.
+    /// The canonical total order on DAG nodes (`DagNode::compare`) used by theory normalization.
     pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
         self.rt.dag_compare(a, b)
     }
@@ -6082,6 +6469,21 @@ impl Engine {
 
     pub fn narrowing_rules(&self) -> &[crate::narrow::NarrowingRule] {
         &self.sig.narrowing_rules
+    }
+
+    /// Reorder executable rules by dense rule id without changing those ids or their trace metadata.
+    /// Reflection uses this after an `upModule` RuleSet has erased source declaration order: Maude
+    /// recompiles the AC-canonical RuleSet order, which is observable through conditional-rule counts.
+    pub fn reorder_rules(&mut self, ordered_ids: &[u32]) {
+        let mut ranks = vec![usize::MAX; self.sig.next_rule_id as usize];
+        for (rank, &id) in ordered_ids.iter().enumerate() {
+            if let Some(slot) = ranks.get_mut(id as usize) {
+                *slot = rank;
+            }
+        }
+        for rules in self.sig.rules.values_mut() {
+            rules.sort_by_key(|rule| ranks.get(rule.id as usize).copied().unwrap_or(usize::MAX));
+        }
     }
 
     /// Begin a `rewrite` session over `initial` (Pillar A): rule-fair, reduce-to-canonical then apply the
@@ -6474,163 +6876,275 @@ impl Engine {
     /// for the [`erewrite_pass`](Self::erewrite_pass) scheduler. Mirrors Maude dispatching the
     /// object-message machinery on `ConfigSymbol` (an ACU op carrying the `config` attribute).
     pub(crate) fn is_config_node(&self, id: DagId) -> bool {
-        matches!(self.node(id).term, NodeTerm::Acu { .. })
-            && self.symbol(self.node(id).symbol()).oo.config
+        let node = self.node(id);
+        let symbol = self.symbol(node.symbol());
+
+        matches!(node.term, NodeTerm::Acu { .. }) && symbol.oo.config
     }
 
-    /// One object-message-fair delivery pass over a `config` ACU soup — Maude's `ConfigSymbol::ruleRewrite`
-    /// in FAIR/EXTERNAL mode (`configSymbol.cc:221`). **Partition** the soup by the operator `OoFlags`:
-    /// object constructors (keyed by their name = arg0), messages (queued under their target = arg0), and
-    /// a remainder (portals + anything else). Then, **objects in name order** (`dag_compare`), deliver each
-    /// queued message — **in canonical queue order** — by applying the consuming rule to the *isolated*
-    /// two-element config `object message` (so the AC search can't pair the wrong elements). The object
-    /// **evolves** between its own deliveries (`retrieve_object` pulls the same-named object out of each
-    /// result); newly-produced messages/objects land in the remainder and are delivered on the **next**
-    /// pass (the message queues are fixed for this pass). **Each delivery is one rule rewrite**, so
-    /// `remaining` (the `[n]` bound) caps deliveries and may stop the pass mid-stream; `progress` records
-    /// whether anything was delivered (the driver repeats passes while it does, decrementing the `[n]`
-    /// bound **once per delivering pass** — one `ruleRewrite` call delivers *all* currently-queued
-    /// messages, so the bound counts passes, not individual deliveries: bank `erewrite [1]` delivers both
-    /// pending credits). The fast path covers a rule of shape `message + single object` (bank/ping-pong and
-    /// most systems). A message symbol is one carrying the **`msg` attribute** (`OoFlags::message`), not
-    /// merely one ranged in `Msg` — matching Maude's `messageSymbols`; an un-flagged `Msg`-sorted op is not
-    /// scheduled (it would take Maude's generic `leftOver` path). *Residuals* (errored or not yet exercised,
-    /// mirroring the strategy phase): a rule needing **two+ objects** (Maude's `leftOver`/generic path) and
-    /// **round-robin among multiple rules consuming one message symbol** (our cursor is per-config-symbol,
-    /// Maude's per-message-symbol) — fine while ≤1 rule matches a message.
+    /// Complete one object-message pass without offering host-owned external targets. This preserves the
+    /// ordinary kernel/test entry point; the resumable host path drives [`ERewritePass`] directly.
     pub(crate) fn erewrite_pass(
         &mut self,
         config: DagId,
         progress: &mut bool,
         cursors: &mut HashMap<SymbolId, u32>,
     ) -> DagId {
-        let config_sym = self.node(config).symbol();
+        let mut pass = self.begin_erewrite_pass(config);
+        let mut descent = NullDescent;
+        loop {
+            match self.advance_erewrite_pass(&mut pass, cursors, false, &mut descent) {
+                ERewritePassStep::Complete {
+                    term,
+                    progress: made_progress,
+                } => {
+                    *progress |= made_progress;
+                    return term;
+                }
+                ERewritePassStep::External { .. } => {
+                    unreachable!("external targets are disabled for erewrite_pass")
+                }
+            }
+        }
+    }
+
+    /// Partition a configuration and root all state needed to resume its delivery pass.
+    pub(crate) fn begin_erewrite_pass(&mut self, config: DagId) -> ERewritePass {
+        let config_symbol = self.node(config).symbol();
         let args: Vec<(DagId, u32)> = match &self.node(config).term {
             NodeTerm::Acu { args, .. } => args.clone(),
-            _ => return config,
+            _ => Vec::new(),
         };
-        // Partition into an object map (name → object?, message queue) + remainder. Messages whose target
-        // has no local object keep a map entry with object `None` (→ undelivered → remainder), as in C++.
-        let mut map: Vec<(DagId, Option<DagId>, Vec<DagId>)> = Vec::new();
-        let mut remainder: Vec<(DagId, u32)> = Vec::new();
-        // External IO is enabled only when a `<>` portal is in the soup (Maude's `portalSeen`); `erewrite`
-        // is always EXTERNAL mode, so `external == portal_seen`.
+        let mut objects: Vec<ERewriteObject> = Vec::new();
+        let mut remainder = Vec::new();
         let mut portal_seen = false;
-        for (elem, mult) in args {
-            let sym = self.node(elem).symbol();
-            let oo = self.symbol(sym).oo;
-            if oo.portal {
-                portal_seen = true;
-            }
-            if oo.object {
+        for (element, multiplicity) in args {
+            let symbol = self.node(element).symbol();
+            let flags = self.symbol(symbol).oo;
+            portal_seen |= flags.portal;
+            if flags.object {
                 let name = self
-                    .node(elem)
+                    .node(element)
                     .children()
                     .next()
-                    .expect("object constructor has a name arg");
-                match map
+                    .expect("object constructor has a name argument");
+                match objects
                     .iter_mut()
-                    .find(|(n, _, _)| self.rt.dag_compare(*n, name) == Ordering::Equal)
+                    .find(|entry| self.rt.dag_compare(entry.name, name) == Ordering::Equal)
                 {
-                    Some(entry) if entry.1.is_none() => entry.1 = Some(elem),
-                    Some(_) => remainder.push((elem, mult)), // duplicate-named object — leave it in the soup
-                    None => map.push((name, Some(elem), Vec::new())),
+                    Some(entry) if entry.object.is_none() => entry.object = Some(element),
+                    Some(_) => remainder.push((element, multiplicity)),
+                    None => objects.push(ERewriteObject {
+                        name,
+                        object: Some(element),
+                        messages: Vec::new(),
+                        next_message: 0,
+                        incoming_drained: false,
+                    }),
                 }
-                // A multiplicity > 1 means duplicate objects; the extras stay in the soup.
-                for _ in 1..mult {
-                    remainder.push((elem, 1));
+                for _ in 1..multiplicity {
+                    remainder.push((element, 1));
                 }
-            } else if oo.message {
+            } else if flags.message {
                 let target = self
-                    .node(elem)
+                    .node(element)
                     .children()
                     .next()
-                    .expect("message has a target arg");
-                match map
+                    .expect("message has a target argument");
+                match objects
                     .iter_mut()
-                    .find(|(n, _, _)| self.rt.dag_compare(*n, target) == Ordering::Equal)
+                    .find(|entry| self.rt.dag_compare(entry.name, target) == Ordering::Equal)
                 {
                     Some(entry) => {
-                        for _ in 0..mult {
-                            entry.2.push(elem);
+                        for _ in 0..multiplicity {
+                            entry.messages.push(element);
                         }
                     }
-                    None => map.push((target, None, vec![elem; mult as usize])),
+                    None => objects.push(ERewriteObject {
+                        name: target,
+                        object: None,
+                        messages: vec![element; multiplicity as usize],
+                        next_message: 0,
+                        incoming_drained: false,
+                    }),
                 }
             } else {
-                remainder.push((elem, mult)); // portal or non-object/message
+                remainder.push((element, multiplicity));
             }
         }
-        // Objects are processed in name order (Maude's `ObjectMap` is keyed/iterated by the name's order).
-        map.sort_by(|x, y| self.rt.dag_compare(x.0, y.0));
-        // One pass delivers *every* currently-queued message (the bound counts passes, not deliveries —
-        // enforced by the driver). Within the pass the message queues are fixed; a delivery's newly-produced
-        // messages land in `remainder` for the next pass.
-        for (name, mut obj, mut messages) in map {
-            // getExternalMessages: drain buffered replies addressed to this object into its queue (Maude's
-            // per-object external-reply pickup). Replies buffered during *this* pass wait for the next one.
-            if portal_seen {
+        objects.sort_by(|left, right| self.rt.dag_compare(left.name, right.name));
+        ERewritePass {
+            config_symbol,
+            portal_seen,
+            objects,
+            next_object: 0,
+            remainder,
+            progress: false,
+            awaiting_external: false,
+            _roots: vec![self.root(config)],
+        }
+    }
+
+    /// Advance a delivery pass until it completes or reaches one registered host target. A suspended
+    /// message remains at the current cursor; [`resolve_erewrite_external`](Self::resolve_erewrite_external)
+    /// consumes or restores it before the next advance.
+    pub(crate) fn advance_erewrite_pass(
+        &mut self,
+        pass: &mut ERewritePass,
+        cursors: &mut HashMap<SymbolId, u32>,
+        offer_external: bool,
+        descent: &mut dyn DescentOps,
+    ) -> ERewritePassStep {
+        assert!(
+            !pass.awaiting_external,
+            "external request must be resolved before resuming"
+        );
+        while pass.next_object < pass.objects.len() {
+            let object_index = pass.next_object;
+            let name = pass.objects[object_index].name;
+            if pass.portal_seen && !pass.objects[object_index].incoming_drained {
                 let pending = std::mem::take(&mut self.rt.incoming);
-                let (mine, rest): (Vec<DagId>, Vec<DagId>) = pending.into_iter().partition(|&r| {
-                    self.node(r)
+                let mut rest = Vec::new();
+                for incoming in pending {
+                    let addressed_here = self
+                        .node(incoming.node)
                         .children()
                         .next()
-                        .is_some_and(|a| self.rt.dag_compare(a, name) == Ordering::Equal)
-                });
-                messages.extend(mine);
-                self.rt.incoming = rest;
-            }
-            for msg in messages {
-                match obj {
-                    Some(o) => {
-                        let pair = self.make_acu(config_sym, vec![(o, 1), (msg, 1)]);
-                        // Fast path: only object-message rules may consume the isolated pair (a leftOver
-                        // rule — multi-object / no-message — is handled generically below, never here).
-                        match self
-                            .rewrite_at_filtered(pair, cursors, RuleFilter::ObjectMessage)
-                            .map(|r| self.reduce(r))
-                        {
-                            Some(r) => {
-                                let (new_obj, others) = self.retrieve_object(r, name);
-                                obj = new_obj;
-                                for e in others {
-                                    remainder.push((e, 1));
-                                }
-                                *progress = true;
-                            }
-                            None => remainder.push((msg, 1)), // undelivered
-                        }
-                    }
-                    // No local object for this target. If external IO is on and the target is a stream
-                    // manager (`stdout`/`stderr`), handle the message there (offerMessageExternally) — the
-                    // write happens and a reply is buffered; this counts as progress but not a rewrite.
-                    None => {
-                        if portal_seen && self.handle_stream_message(name, msg) {
-                            *progress = true;
-                        } else {
-                            remainder.push((msg, 1)); // undelivered (no object, not a manager)
-                        }
+                        .is_some_and(|target| self.rt.dag_compare(target, name) == Ordering::Equal);
+                    if addressed_here {
+                        pass.objects[object_index].messages.push(incoming.node);
+                        pass._roots.push(incoming._root);
+                    } else {
+                        rest.push(incoming);
                     }
                 }
+                self.rt.incoming = rest;
+                pass.objects[object_index].incoming_drained = true;
             }
-            if let Some(o) = obj {
-                remainder.push((o, 1)); // object survives the pass
+
+            while pass.objects[object_index].next_message
+                < pass.objects[object_index].messages.len()
+            {
+                let message_index = pass.objects[object_index].next_message;
+                let message = pass.objects[object_index].messages[message_index];
+                if let Some(object) = pass.objects[object_index].object {
+                    let pair = self.make_acu(pass.config_symbol, vec![(object, 1), (message, 1)]);
+                    match self
+                        .rewrite_at_filtered(pair, cursors, RuleFilter::ObjectMessage)
+                        .map(|result| self.reduce_with(result, descent))
+                    {
+                        Some(result) => {
+                            pass._roots.push(self.root(result));
+                            let (object, others) = self.retrieve_object(result, name);
+                            pass.objects[object_index].object = object;
+                            pass.remainder
+                                .extend(others.into_iter().map(|element| (element, 1)));
+                            pass.progress = true;
+                        }
+                        None => pass.remainder.push((message, 1)),
+                    }
+                    pass.objects[object_index].next_message += 1;
+                    continue;
+                }
+
+                if pass.portal_seen && self.handle_stream_message(name, message) {
+                    pass.progress = true;
+                    pass.objects[object_index].next_message += 1;
+                    continue;
+                }
+                if pass.portal_seen && offer_external && self.is_registered_external_target(name) {
+                    let message = self.reduce_external_message_payload(message, descent);
+                    pass.objects[object_index].messages[message_index] = message;
+                    pass._roots.push(self.root(message));
+                    pass.awaiting_external = true;
+                    return ERewritePassStep::External {
+                        target: name,
+                        message,
+                    };
+                }
+                pass.remainder.push((message, 1));
+                pass.objects[object_index].next_message += 1;
             }
+
+            if let Some(object) = pass.objects[object_index].object {
+                pass.remainder.push((object, 1));
+            }
+            pass.next_object += 1;
         }
-        let remainder = self.make_acu(config_sym, remainder);
-        // Generic `leftOver` path (Maude's `leftOverRewrite`): apply one non-object-message config rule to
-        // the (reduced) remainder via ACU extension matching — a multi-object rule, or a rule that rewrites
-        // an object without consuming a fast-path message. Gated on the module actually having leftOver
-        // rules, so a purely delivering system (bank/ping-pong/STD-STREAM) keeps its exact prior behavior.
-        if self.has_leftover_rules(config_sym) {
+
+        let remainder = self.make_acu(pass.config_symbol, std::mem::take(&mut pass.remainder));
+        pass._roots.push(self.root(remainder));
+        if self.has_leftover_rules(pass.config_symbol) {
             let reduced = self.reduce(remainder);
-            if let Some(r) = self.rewrite_at_filtered(reduced, cursors, RuleFilter::LeftOver) {
-                *progress = true;
-                return r;
+            pass._roots.push(self.root(reduced));
+            if let Some(result) = self.rewrite_at_filtered(reduced, cursors, RuleFilter::LeftOver) {
+                pass.progress = true;
+                pass._roots.push(self.root(result));
+                return ERewritePassStep::Complete {
+                    term: result,
+                    progress: true,
+                };
             }
-            return reduced;
+            return ERewritePassStep::Complete {
+                term: reduced,
+                progress: pass.progress,
+            };
         }
-        remainder
+        ERewritePassStep::Complete {
+            term: remainder,
+            progress: pass.progress,
+        }
+    }
+
+    /// Evaluate a manager request's payload while preserving its target and requester. Message arguments
+    /// are otherwise frozen while resident in a configuration; Maude evaluates these values at the
+    /// external-manager boundary (notably `upModule`/`upView`) before dispatch.
+    fn reduce_external_message_payload(
+        &mut self,
+        message: DagId,
+        descent: &mut dyn DescentOps,
+    ) -> DagId {
+        let symbol = self.node(message).symbol();
+        let mut args: Vec<_> = self.node(message).children().collect();
+        let mut payload_roots = Vec::with_capacity(args.len().saturating_sub(2));
+        for argument in args.iter_mut().skip(2) {
+            let reduced = self.reduce_with(*argument, descent);
+            let meta = match self.symbol(self.node(reduced).symbol()).special() {
+                Some(SpecialOp::Meta { op, hooks }) => Some((*op, hooks.clone())),
+                _ => None,
+            };
+            *argument = if let Some((op, hooks)) = meta {
+                match self.with_meta_ctx(|ctx| descent.descend(ctx, op, &hooks, reduced)) {
+                    Some(result) => {
+                        self.rt.add_rewrites(1);
+                        result
+                    }
+                    None => reduced,
+                }
+            } else {
+                reduced
+            };
+            payload_roots.push(self.root(*argument));
+        }
+
+        let message = self.make_node(symbol, args);
+        drop(payload_roots);
+        message
+    }
+
+    /// Resolve the message at a suspended pass cursor. Accepted requests are consumed; rejected requests
+    /// return to the configuration unchanged.
+    pub(crate) fn resolve_erewrite_external(&mut self, pass: &mut ERewritePass, accepted: bool) {
+        assert!(pass.awaiting_external, "no external request is pending");
+        let entry = &mut pass.objects[pass.next_object];
+        let message = entry.messages[entry.next_message];
+        if accepted {
+            pass.progress = true;
+        } else {
+            pass.remainder.push((message, 1));
+        }
+        entry.next_message += 1;
+        pass.awaiting_external = false;
     }
 
     /// Pull the object named `name` out of a delivery result `r` (Maude's `retrieveObject`): the result is
@@ -6688,25 +7202,35 @@ impl Engine {
         self.rt.narrowing_count += 1;
     }
 
-    pub fn narrowing_breakdown(&self) -> (u64, u64) {
-        (self.rt.variant_narrowing_count, self.rt.narrowing_count)
-    }
-
-    /// Snapshot and restore command-visible rewrite accounting around work performed by an
-    /// intentionally isolated Maude subcontext. Narrowing `vfold` keeps its variant subsumption
-    /// searches for reuse but never transfers their counts into the parent narrowing context.
-    pub(crate) fn rewrite_checkpoint(&self) -> (u64, u64, u64) {
+    /// `(membership, rule, variant-narrowing, narrowing)` subcounts of [`Self::rewrites`].
+    pub fn rewrite_breakdown(&self) -> (u64, u64, u64, u64) {
         (
-            self.rt.rewrite_count,
+            self.rt.membership_count,
+            self.rt.rule_rewrite_count,
             self.rt.variant_narrowing_count,
             self.rt.narrowing_count,
         )
     }
 
-    pub(crate) fn restore_rewrite_checkpoint(&mut self, checkpoint: (u64, u64, u64)) {
+    /// Snapshot and restore command-visible rewrite accounting around work performed by an
+    /// intentionally isolated Maude subcontext. Narrowing `vfold` keeps its variant subsumption
+    /// searches for reuse but never transfers their counts into the parent narrowing context.
+    pub(crate) fn rewrite_checkpoint(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.rt.rewrite_count,
+            self.rt.membership_count,
+            self.rt.rule_rewrite_count,
+            self.rt.variant_narrowing_count,
+            self.rt.narrowing_count,
+        )
+    }
+
+    pub(crate) fn restore_rewrite_checkpoint(&mut self, checkpoint: (u64, u64, u64, u64, u64)) {
         self.rt.rewrite_count = checkpoint.0;
-        self.rt.variant_narrowing_count = checkpoint.1;
-        self.rt.narrowing_count = checkpoint.2;
+        self.rt.membership_count = checkpoint.1;
+        self.rt.rule_rewrite_count = checkpoint.2;
+        self.rt.variant_narrowing_count = checkpoint.3;
+        self.rt.narrowing_count = checkpoint.4;
     }
 
     /// Reset the `counter` built-in (Maude's `CounterSymbol`) to 0 — call at the start of each top-level
@@ -6721,6 +7245,77 @@ impl Engine {
         self.rt.external_out.clear();
         self.rt.external_err.clear();
         self.rt.incoming.clear();
+    }
+    /// Register one host-owned external target in this engine. The target is rebuilt from an owned
+    /// envelope and rooted until [`unregister_external_target`](Self::unregister_external_target).
+    pub fn register_external_target(
+        &mut self,
+        target: &MetaEnvelope,
+    ) -> Option<ExternalTargetToken> {
+        let (roots, mut guards) = self.with_meta_ctx(|ctx| target.build_roots(ctx))?;
+        if roots.len() != 1 || guards.len() != 1 {
+            return None;
+        }
+        let node = roots[0];
+        let root = guards.pop().expect("one target root");
+        let token = self.rt.next_external_target;
+        self.rt.next_external_target = self
+            .rt
+            .next_external_target
+            .checked_add(1)
+            .expect("external target token space exhausted");
+        self.rt
+            .external_targets
+            .insert(token, RootedDag { node, _root: root });
+        Some(ExternalTargetToken(token))
+    }
+
+    /// Remove a previously registered host target. Stale tokens are harmless and return `false`.
+    pub fn unregister_external_target(&mut self, token: ExternalTargetToken) -> bool {
+        self.rt.external_targets.remove(&token.0).is_some()
+    }
+
+    fn is_registered_external_target(&self, target: DagId) -> bool {
+        matches!(
+            self.symbol(self.node(target).symbol()).special(),
+            Some(SpecialOp::InterpreterManager)
+        ) || self
+            .rt
+            .external_targets
+            .values()
+            .any(|registered| self.rt.dag_compare(registered.node, target) == Ordering::Equal)
+    }
+
+    fn queue_incoming(&mut self, node: DagId) {
+        let root = self.root(node);
+        self.rt.incoming.push(RootedDag { node, _root: root });
+    }
+
+    /// Transfer one accepted child result into the parent engine. Reply materialization and rewrite-count
+    /// transfer happen together; a malformed envelope changes neither.
+    pub(crate) fn accept_external_response(
+        &mut self,
+        reply: Option<&MetaEnvelope>,
+        rewrites: u64,
+        breakdown: ExternalRewriteBreakdown,
+    ) -> bool {
+        if let Some(reply) = reply {
+            let Some((roots, mut guards)) = self.with_meta_ctx(|ctx| reply.build_roots(ctx)) else {
+                return false;
+            };
+            if roots.len() != 1 || guards.len() != 1 {
+                return false;
+            }
+            let node = roots[0];
+            let root = guards.pop().expect("one reply root");
+            self.rt.incoming.push(RootedDag { node, _root: root });
+        }
+        self.rt.add_rewrites(rewrites);
+        self.rt.membership_count += breakdown.membership_applications;
+        self.rt.rule_rewrite_count += breakdown.rule_rewrites;
+        self.rt.variant_narrowing_count += breakdown.variant_narrowing_steps;
+        self.rt.narrowing_count += breakdown.narrowing_steps;
+        true
     }
 
     /// Take the captured `stdout` writes from the last `erewrite` run (the REPL surfaces them before the
@@ -6780,7 +7375,7 @@ impl Engine {
             }
             if let Some(wrote) = wrote_msg {
                 let reply = self.make_free(wrote, vec![me, target]); // wrote(me, self) — swap arg0/arg1
-                self.rt.incoming.push(reply);
+                self.queue_incoming(reply);
             }
             return true;
         }
@@ -6803,7 +7398,7 @@ impl Engine {
                     crate::dag::NaValue::Str(line.into_bytes().into()),
                 );
                 let reply = self.make_free(got, vec![me, target, line_dag]); // gotLine(me, self, line)
-                self.rt.incoming.push(reply);
+                self.queue_incoming(reply);
             }
             return true;
         }
@@ -6919,6 +7514,20 @@ impl Engine {
         }
         self.instantiate(term, &subst)
     }
+    /// Instantiate a rule RHS under explicit bindings and splice it through a detached match residue.
+    /// This is the post-condition counterpart of [`Solutions::rewrite_result`]: callers may release the
+    /// solution stream, extend its bindings while solving conditions, then construct the same result.
+    pub fn instantiate_rewrite_result(
+        &mut self,
+        rhs: &Term,
+        bindings: &[DagId],
+        context: &RewriteMatchContext,
+    ) -> DagId {
+        let built = self.instantiate_bindings(rhs, bindings);
+        let (signature, runtime) = self.parts_mut();
+        context.build_result(runtime, signature, built)
+    }
+
 
     /// Begin enumerating *every* match of `pattern` (with `nr_vars` distinct variables, indexed
     /// `0..nr_vars`) against `subject` — the public face of the A3 matcher seam's multi-solution
@@ -6936,17 +7545,62 @@ impl Engine {
         subject: DagId,
         extension: bool,
     ) -> Solutions<'_> {
+        self.match_solutions_with_bindings(pattern, nr_vars, subject, extension, &[])
+    }
+    /// Begin enumerating matches while preserving caller-supplied bindings for selected pattern
+    /// variables. `initial[k] == Some(d)` constrains variable slot `k` to `d`; missing trailing slots
+    /// and `None` entries remain unbound. This is the matcher contract used by META-LEVEL's partial
+    /// substitutions for `metaApply` and `metaXapply`.
+    pub fn match_solutions_with_bindings(
+        &mut self,
+        pattern: Term,
+        nr_vars: u32,
+        subject: DagId,
+        extension: bool,
+        initial: &[Option<DagId>],
+    ) -> Solutions<'_> {
+        self.match_solution_stream(pattern, nr_vars, subject, extension, initial, true)
+    }
+
+    /// Enumerate matches in rule-rewrite mode, including the subject theory's rewrite extension.
+    /// Unlike the interactive `xmatch` stream this uses the matcher order and extension floors consumed
+    /// by `apply_first_rule_at`; strategy-controlled rule application uses the same contract.
+    pub fn rewrite_match_solutions_with_bindings(
+        &mut self,
+        pattern: Term,
+        nr_vars: u32,
+        subject: DagId,
+        initial: &[Option<DagId>],
+    ) -> Solutions<'_> {
+        let extension = matches!(
+            self.sig.symbol(self.node(subject).symbol()).theory(),
+            Theory::Acu | Theory::Au | Theory::S
+        );
+        self.match_solution_stream(pattern, nr_vars, subject, extension, initial, false)
+    }
+
+    fn match_solution_stream(
+        &mut self,
+        pattern: Term,
+        nr_vars: u32,
+        subject: DagId,
+        extension: bool,
+        initial: &[Option<DagId>],
+        command: bool,
+    ) -> Solutions<'_> {
         // Compile and run the first (deterministic) match phase. The returned `Subproblem` owns its
-        // state (no borrow of the automaton or the engine), so the throwaway `automaton` can drop here
-        // while the stream lives on — exactly as `try_equations` consumes it per equation.
+        // state (no borrow of the automaton or the engine), so the throwaway `automaton` can drop here.
         let automaton = LhsAutomaton::compile(pattern.clone(), &self.sig);
         let mut subst = Subst::new();
         subst.reset(nr_vars);
+        for (slot, binding) in initial.iter().copied().enumerate().take(nr_vars as usize) {
+            if let Some(binding) = binding {
+                subst.bind(slot as u32, binding);
+            }
+        }
         let subproblem = {
             let (sig, rt) = self.parts_mut();
-            // `command = true`: the interactive `match`/`xmatch` seam (extension refinements the rewrite
-            // engine does not need — the AU `bigEnough` floor / partition order, bare-variable extension).
-            automaton.match_(rt, sig, subject, &mut subst, extension, true)
+            automaton.match_(rt, sig, subject, &mut subst, extension, command)
         };
         Solutions {
             engine: self,
@@ -6995,6 +7649,23 @@ impl Solutions<'_> {
     pub fn binding(&self, index: u32) -> Option<DagId> {
         self.subst.get(index)
     }
+    /// Snapshot the current solution's theory residue so result construction can happen after this
+    /// stream releases its mutable engine borrow (for example, after solving a rule condition).
+    #[must_use]
+    pub fn rewrite_context(&self) -> RewriteMatchContext {
+        self.subproblem
+            .as_ref()
+            .expect("rewrite_context requires a live match")
+            .rewrite_context()
+    }
+
+
+    /// The unmatched ordered prefix and suffix for the current AU extension match.
+    /// Other theories either have order-free residue or no two-sided ordered context.
+    #[must_use]
+    pub fn ordered_context_parts(&self) -> Option<(&[DagId], &[DagId])> {
+        self.subproblem.as_ref()?.ordered_context_parts()
+    }
 
     /// The matched portion of the subject under the current solution — the pattern instantiated with
     /// the current bindings. For a whole (`match`) match this equals the subject; for an extension
@@ -7002,6 +7673,18 @@ impl Solutions<'_> {
     /// node, so it takes `&mut self`; valid only after a successful [`advance`](Self::advance).
     pub fn matched_portion(&mut self) -> DagId {
         self.engine.instantiate(&self.pattern, &self.subst)
+    }
+
+    /// Instantiate `rhs` under the current match and splice it into the unmatched theory residue.
+    /// Valid only after a successful [`advance`](Self::advance).
+    pub fn rewrite_result(&mut self, rhs: &Term) -> DagId {
+        let built = self.engine.instantiate(rhs, &self.subst);
+        let subproblem = self
+            .subproblem
+            .as_ref()
+            .expect("rewrite_result requires a live match");
+        let (sig, runtime) = self.engine.parts_mut();
+        subproblem.build_result(runtime, sig, built)
     }
 
     /// The matched portion rendered for the `xmatch` **command** display — mirroring Maude's
@@ -7421,6 +8104,35 @@ mod tests {
             nznat,
             "s 0 + s 0 : NzNat (the one declaration applies)"
         );
+    }
+
+    /// Reflected rule sides are allowed to be well formed only at the kind level while an inner special
+    /// operation is waiting to reduce. The fallback must select the `Configuration` overload of `__`,
+    /// never an unrelated same-name `AttrSet` overload.
+    #[test]
+    fn kind_profile_resolution_disambiguates_error_sort_arguments() {
+        let mut e = Engine::new();
+        let attr = e.add_sort("Attr");
+        let attr_set = e.add_sort("AttrSet");
+        let object = e.add_sort("Object");
+        let message = e.add_sort("Msg");
+        let configuration = e.add_sort("Configuration");
+        e.add_subsort(attr, attr_set);
+        e.add_subsort(object, configuration);
+        e.add_subsort(message, configuration);
+        e.close_sorts();
+
+        let attr_join = e.add_op("__", vec![attr_set, attr_set], attr_set);
+        let config_join = e.add_op("__", vec![configuration, configuration], configuration);
+        let config_error = e.sorts().error_sort(e.sorts().kind_of(configuration));
+        let arguments = [object, config_error];
+
+        assert_eq!(e.resolve_operator_for_sorts("__", &arguments), None);
+        assert_eq!(
+            e.resolve_operator_for_kinds("__", &arguments),
+            Some(config_join)
+        );
+        assert_ne!(config_join, attr_join);
     }
 
     /// B2.1 (== reference binary, OVERLOAD-PREREG): a non-preregular operator (`f : A -> A` and

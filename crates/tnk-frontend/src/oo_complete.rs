@@ -119,10 +119,9 @@ pub fn complete_statement(
                     .attrs
                     .iter()
                     .any(|(symbol, _)| !subject.attrs.iter().any(|(other, _)| other == symbol))
-                    || subject
-                        .attrs
-                        .iter()
-                        .any(|(symbol, _)| !obj.pattern.attrs.iter().any(|(other, _)| other == symbol))
+                    || subject.attrs.iter().any(|(symbol, _)| {
+                        !obj.pattern.attrs.iter().any(|(other, _)| other == symbol)
+                    })
             })
     });
     if !needs_completion {

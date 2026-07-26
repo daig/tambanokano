@@ -1,0 +1,75 @@
+*** I25-local-protocol-gaps — fresh Maude 3.5.1 local-manager probe.
+*** Covers showModule, showView, printTermToString, and frewriteTerm.
+*** PRELUDE
+set show timing off .
+set show advisories off .
+
+load metaInterpreter
+set include BOOL off .
+
+fth I-SHOW-SRC is
+  sort Elt .
+endfth
+
+mod I-SHOW-CHILD is
+  sort Nat .
+  ops zero one : -> Nat [ctor] .
+  rl zero => one .
+endm
+
+view I-SHOW-V from I-SHOW-SRC to I-SHOW-CHILD is
+  sort Elt to Nat .
+endv
+
+mod I-PROTOCOL-GAPS is
+  pr META-INTERPRETER .
+
+  op me : -> Oid .
+  op User : -> Cid .
+  op phase:_ : Nat -> Attribute .
+  op shown-module:_ : Module -> Attribute .
+  op shown-view:_ : View -> Attribute .
+  op printed:_ : String -> Attribute .
+  op rewritten:_ : Msg -> Attribute .
+
+  vars X Y Z : Oid .
+  var M : Module .
+  var V : View .
+  var S : String .
+  var N : RewriteCount .
+  var T : Term .
+  var TY : Type .
+
+  rl < X : User | phase: 0 > createdInterpreter(X, Y, Z) =>
+     < X : User | phase: 1 > insertModule(Z, X, upModule('I-SHOW-SRC, true)) .
+
+  rl < X : User | phase: 1 > insertedModule(X, Y) =>
+     < X : User | phase: 2 > insertModule(Y, X, upModule('I-SHOW-CHILD, true)) .
+
+  rl < X : User | phase: 2 > insertedModule(X, Y) =>
+     < X : User | phase: 3 > insertView(Y, X, upView('I-SHOW-V)) .
+
+  rl < X : User | phase: 3 > insertedView(X, Y) =>
+     < X : User | phase: 4 > showModule(Y, X, 'I-SHOW-CHILD, false) .
+
+  rl < X : User | phase: 4 > showingModule(X, Y, M) =>
+     < X : User | phase: 5, shown-module: M > showView(Y, X, 'I-SHOW-V) .
+
+  rl < X : User | phase: 5, shown-module: M > showingView(X, Y, V) =>
+     < X : User | phase: 6, shown-module: M, shown-view: V >
+       printTermToString(Y, X, 'I-SHOW-CHILD, none, 'zero.Nat, mixfix, none) .
+
+  rl < X : User | phase: 6, shown-module: M, shown-view: V >
+     printedTermToString(X, Y, S) =>
+     < X : User | phase: 7, shown-module: M, shown-view: V, printed: S >
+       frewriteTerm(Y, X, unbounded, 1, 'I-SHOW-CHILD, 'zero.Nat) .
+
+  rl < X : User | phase: 7, shown-module: M, shown-view: V, printed: S >
+     frewroteTerm(X, Y, N, T, TY) =>
+     < X : User | phase: 8, shown-module: M, shown-view: V, printed: S,
+       rewritten: frewroteTerm(X, Y, N, T, TY) > quit(Y, X) .
+endm
+
+erew in I-PROTOCOL-GAPS : <>
+  < me : User | phase: 0 >
+  createInterpreter(interpreterManager, me, none) .

@@ -103,9 +103,9 @@ impl Runtime {
                 let mut ctx = crate::descent::MetaCtx { rt: self, sig };
                 descent.descend(&mut ctx, *op, hooks, id)
             }
-            // A standard-stream manager constant (`stdin`/`stdout`/`stderr`) has no equational reduction —
-            // it stands for itself. Its messages are handled by the `erewrite` EXTERNAL driver, not here.
-            SpecialOp::StreamManager { .. } => None,
+            // External target constants have no equational reduction. Their messages are handled by the
+            // resumable `erewrite` scheduler, not by ordinary reduction.
+            SpecialOp::StreamManager { .. } | SpecialOp::InterpreterManager => None,
         }
     }
 

@@ -1,0 +1,83 @@
+*** I27-local-child-isolation — fresh Maude 3.5.1 local-manager probe.
+*** Two children receive different definitions under the same module name.
+*** PRELUDE
+set show timing off .
+set show advisories off .
+
+load metaInterpreter
+set include BOOL off .
+
+fmod I-ISOLATE-A is
+  sort Nat .
+  ops zero one f : -> Nat [ctor] .
+  eq f = zero .
+endfm
+
+fmod I-ISOLATE-B is
+  sort Nat .
+  ops zero one f : -> Nat [ctor] .
+  eq f = one .
+endfm
+
+mod I-CHILD-ISOLATION is
+  pr META-INTERPRETER .
+
+  op me : -> Oid .
+  op User : -> Cid .
+  op phase:_ : Nat -> Attribute .
+  op child-a:_ : Oid -> Attribute .
+  op child-b:_ : Oid -> Attribute .
+  op result-a:_ : Msg -> Attribute .
+  op result-b:_ : Msg -> Attribute .
+
+  op withName : Module Qid -> Module .
+
+  var H : Header .
+  var Q' : Qid .
+  var IL : ImportList .
+  var SS : SortSet .
+  var SSD : SubsortDeclSet .
+  var ODS : OpDeclSet .
+  var MAS : MembAxSet .
+  var EQS : EquationSet .
+
+  eq withName(fmod H is IL sorts SS . SSD ODS MAS EQS endfm, Q') =
+     fmod Q' is IL sorts SS . SSD ODS MAS EQS endfm .
+
+  vars W X Y Z : Oid .
+  var R : Msg .
+  var N : RewriteCount .
+  var T : Term .
+  var TY : Type .
+
+  rl < X : User | phase: 0 > createdInterpreter(X, Y, Z) =>
+     < X : User | phase: 1, child-a: Z >
+       createInterpreter(interpreterManager, X, none) .
+
+  rl < X : User | phase: 1, child-a: Y > createdInterpreter(X, W, Z) =>
+     < X : User | phase: 2, child-a: Y, child-b: Z >
+       insertModule(Y, X, withName(upModule('I-ISOLATE-A, true), 'SHARED)) .
+
+  rl < X : User | phase: 2, child-a: Y, child-b: Z > insertedModule(X, Y) =>
+     < X : User | phase: 3, child-a: Y, child-b: Z >
+       insertModule(Z, X, withName(upModule('I-ISOLATE-B, true), 'SHARED)) .
+
+  rl < X : User | phase: 3, child-a: Y, child-b: Z > insertedModule(X, Z) =>
+     < X : User | phase: 4, child-a: Y, child-b: Z >
+       reduceTerm(Y, X, 'SHARED, 'f.Nat) .
+
+  rl < X : User | phase: 4, child-a: Y, child-b: Z >
+     reducedTerm(X, Y, N, T, TY) =>
+     < X : User | phase: 5, child-a: Y, child-b: Z,
+       result-a: reducedTerm(X, Y, N, T, TY) >
+       reduceTerm(Z, X, 'SHARED, 'f.Nat) .
+
+  rl < X : User | phase: 5, child-a: Y, child-b: Z, result-a: R >
+     reducedTerm(X, Z, N, T, TY) =>
+     < X : User | phase: 6, child-a: Y, child-b: Z, result-a: R,
+       result-b: reducedTerm(X, Z, N, T, TY) > .
+endm
+
+erew in I-CHILD-ISOLATION : <>
+  < me : User | phase: 0 >
+  createInterpreter(interpreterManager, me, none) .

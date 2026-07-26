@@ -55,19 +55,32 @@ typed model/SAT hooks, lassos, verbose statistics, and SAT prime implicants. The
 Maude-3.5.1 gate is **10/10 fixtures / 50 commands PASS**, including M05 round-robin,
 M08/M09 dining philosophers, and all eight M10 `satSolve`/`tautCheck` commands.
 
+**Phase I-S / local synchronous meta-interpreters is complete (2026-07-24).**
+`tnk-session::Session` is the reusable, host-owned semantic layer; `tnk-repl` is its thin
+terminal adapter. The production external-message seam suspends and resumes object-message
+passes without exposing engine-local handles, while Session owns isolated local child
+interpreters and the supported lifecycle, module/view, evaluation, search, symbolic, and
+continuation protocols. The frozen live-oracle gate is **27/27 fixtures PASS**, including
+walking-skeleton, pass-boundary, lifecycle/error, multi-child isolation, and GC probes.
+The retained release, audit, legacy, U/V/N/T/M gates remain green. The selected goal has
+stopped here: cancellation and thread-backed `newProcess` coordination remain the separate,
+unstarted Phase I-C.
+
 **The verified current state—including every known deviation—is `../../fable-audit.md`** (status
-refreshed 2026-07-23); the forward plan is `roadmap.md`.
+refreshed 2026-07-24); the forward plan is `roadmap.md`.
 
 ## Crate layout
 
 ```
 tnk-core      kernel: arena/GC, theories, matcher seam, sort system, reduce loop, built-ins, trace
    ↑
-tnk-frontend  lexer, mixfix grammar + parser, term builder, pretty-printer + output wrapper
+tnk-frontend  lexer, mixfix grammar + parser, term builder, pretty-printer
    ↑
 tnk-modules   module DB + flatten (a pure PreModule→PreModule transform), summation, renaming
    ↑
-tnk-repl      the interactive shell (lib + bin); reuses everything below
+tnk-session   persistent modules/views, command evaluation, reflection caches, continuations
+   ↑
+tnk-repl      thin terminal adapter: color/wrapping policy, line editing, prompts, CLI
 ```
 
 ## The living docs (and what each is for)
@@ -76,12 +89,12 @@ tnk-repl      the interactive shell (lib + bin); reuses everything below
 |---|---|---|
 | `README.md` (this) | orientation | what it is, status, crate map, doc index, the conformance discipline |
 | `architecture map`<br>(`01-architecture-map.md`) | current + reference | Maude's layered architecture, the feature inventory (with build status), and the cross-cutting C++→Rust strategy |
-| `decisions`<br>(`03-open-decisions.md`) | motivation | the foundational decisions **D1–D8** (engine model, GC, dispatch, bignum, IO, BDD, SMT, naming) + why |
+| `decisions`<br>(`03-open-decisions.md`) | motivation | binding decisions **D1–D12**: engine/GC/dispatch/data backends, host-owned IO, naming, correctness defaults, REPL identity, and Phase-I concurrency |
 | `../../fable-audit.md` | conformance ground truth | the 2026-07-01 differential audit vs Maude 3.5.1 — verified deviations, missing features, non-obvious fix constraints (supersedes the retired `gaps.md`) |
 | `roadmap.md` | remaining plan | correctness-first completion plan (post-audit): panics/wrong values → counts → input acceptance → the two architecture reworks → diagnostics/tool surface → new subsystems |
 | `correctness-goal.md` | goal contract | the frozen fixture manifest + scoreboard metric, decision defaults, and completion criteria driving the correctness goal (`/goal`) |
-| `subsystems-goal.md` | active goal contract | completed S ledger; T/M/I scope, invariants, manifests, and gates |
-| `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, and model checking |
+| `subsystems-goal.md` | subsystem contract | completed S/T/M/I-S ledger; future I-C scope, invariants, manifests, and gates |
+| `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, model checking, and the split synchronous/concurrent Phase I |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 
 The detailed **current behavior** lives in the code (the crates carry thorough module/function doc comments);

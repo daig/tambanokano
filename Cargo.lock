@@ -523,6 +523,13 @@ name = "tnk-repl"
 version = "0.0.0"
 dependencies = [
  "rustyline",
+ "tnk-session",
+]
+
+[[package]]
+name = "tnk-session"
+version = "0.0.0"
+dependencies = [
  "tnk-core",
  "tnk-frontend",
  "tnk-modules",

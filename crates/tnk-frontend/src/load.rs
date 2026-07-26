@@ -44,6 +44,15 @@ pub struct LoadedModule {
     pub smt_rewrite_valid: bool,
 }
 
+/// Dense engine-trace slot produced by one source statement. The surrounding `Option` used by the
+/// homed loader is `None` for a non-executable or rejected statement, preserving source alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementTraceRef {
+    Membership(usize),
+    Equation(usize),
+    Rule(usize),
+}
+
 impl LoadedModule {
     /// Recompute Maude's module-wide SMT-rewrite eligibility after callers install statements
     /// directly into the built engine (the reflected-module path does this post-build).
@@ -100,17 +109,32 @@ pub fn build_loaded_module_homed<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     interner: &mut Interner,
 ) -> Result<LoadedModule, String> {
+    build_loaded_module_homed_traced(pm, homes, home_mod, interner).map(|(loaded, _)| loaded)
+}
+
+/// The homed build plus a source-aligned map to the dense executable trace vectors. Reflection needs
+/// this map because Maude drops an individually rejected statement while keeping the surrounding module;
+/// indexing the dense vectors by source position would then shift every following axiom.
+pub fn build_loaded_module_homed_traced<'m>(
+    pm: &PreModule,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+) -> Result<(LoadedModule, Vec<Option<StatementTraceRef>>), String> {
     let mut built = build_module(pm, interner)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
-    load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
+    let trace_refs = load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
     let smt_rewrite_valid =
         built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
-    Ok(LoadedModule {
-        built,
-        grammar,
-        smt_rewrite_valid,
-    })
+    Ok((
+        LoadedModule {
+            built,
+            grammar,
+            smt_rewrite_valid,
+        },
+        trace_refs,
+    ))
 }
 
 fn install_identities(
@@ -265,7 +289,7 @@ fn load_statements(
     g: &CompiledGrammar,
     i: &Interner,
 ) -> Result<(), String> {
-    load_statements_homed(pm, m, g, &[], &|_| None, i)
+    load_statements_homed(pm, m, g, &[], &|_| None, i).map(|_| ())
 }
 
 /// Parse + build + add each statement in its defining module's grammar. Imported statements are parsed
@@ -282,7 +306,7 @@ pub fn load_statements_homed<'m>(
     homes: &[Option<String>],
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     i: &Interner,
-) -> Result<(), String> {
+) -> Result<Vec<Option<StatementTraceRef>>, String> {
     // Object-pattern completion context (Pillar 2.5-E): resolved once for an `omod`'s flattened module
     // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
     // module, or one with no object constructor in scope — completion then never runs.
@@ -290,14 +314,21 @@ pub fn load_statements_homed<'m>(
     // Cache home-module grammars remapped onto this flattened module's symbols. Imported statements use
     // these first; `None` means the home is unavailable or cannot be remapped, so the flat grammar is used.
     let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
+    let mut trace_refs = Vec::with_capacity(pm.statements.len());
 
     for (idx, stmt) in pm.statements.iter().enumerate() {
         // Ordinary nonexec equations/memberships are proof obligations. Rules still pass through:
         // `[nonexec narrowing]` feeds symbolic narrowing, and an SMT-capable module retains every rule
         // in its dedicated root-rewrite table without making it ordinarily executable.
         if stmt_is_nonexec(stmt) && !matches!(stmt, Statement::Rule { .. }) {
+            trace_refs.push(None);
             continue;
         }
+        let trace_ref = Some(match stmt {
+            Statement::Mb { .. } => StatementTraceRef::Membership(m.mb_traces.len()),
+            Statement::Eq { .. } => StatementTraceRef::Equation(m.eq_traces.len()),
+            Statement::Rule { .. } => StatementTraceRef::Rule(m.rl_traces.len()),
+        });
         // Imported statements belong to their defining grammar. Trying the flattened grammar first is
         // unsafe even when it parses: importer declarations can shadow a home variable name and change
         // its sort without producing an error.
@@ -311,6 +342,7 @@ pub fn load_statements_homed<'m>(
             if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref)
                 && load_one_stmt(stmt, m, hg, true, false, &oo, i).is_ok()
             {
+                trace_refs.push(trace_ref);
                 continue;
             }
         }
@@ -321,16 +353,17 @@ pub fn load_statements_homed<'m>(
         // Home parsing was not applicable or failed. A statement whose flattened parse/build fails is
         // dropped (Maude warns per statement and keeps the module). `load_one_stmt` registers nothing
         // before its fallible parsing finishes, so either attempt leaves the dense trace indices intact.
-        let flat_err = match load_one_stmt(stmt, m, g, false, own_statement, &oo, i) {
-            Ok(()) => continue,
-            Err(e) => e,
-        };
-        if std::env::var("TNK_DEBUG_DROP").is_ok_and(|filter| filter == "1" || filter == m.name) {
-            eprintln!("DROP[{}]: {flat_err}", m.name);
+        match load_one_stmt(stmt, m, g, false, own_statement, &oo, i) {
+            Ok(()) => {
+                trace_refs.push(trace_ref);
+                continue;
+            }
+            Err(_) => {}
         }
+        trace_refs.push(None);
         // Drop this statement and keep building the module (the diagnostic is phase E).
     }
-    Ok(())
+    Ok(trace_refs)
 }
 
 /// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover the
@@ -564,9 +597,7 @@ fn load_one_stmt(
                 let source_count = vars.count();
                 let names = oo_variable_names(m, &vars, source_count);
                 (
-                    render_oo_equation(
-                        m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label,
-                    ),
+                    render_oo_equation(m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label),
                     source_count,
                 )
             });
@@ -582,9 +613,8 @@ fn load_one_stmt(
             });
             if oo_completed && let Some((source, source_count)) = oo_source {
                 let names = oo_variable_names(m, &vars, source_count);
-                let transformed = render_oo_equation(
-                    m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label,
-                );
+                let transformed =
+                    render_oo_equation(m, i, &lhs_t, &rhs_t, &condition, &names, *owise, label);
                 push_oo_diagnostic(m, "equation", source, transformed);
             }
             let nr = vars.count();
@@ -720,9 +750,7 @@ fn load_one_stmt(
                 let source_count = vars.count();
                 let names = oo_variable_names(m, &vars, source_count);
                 (
-                    render_oo_rule(
-                        m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing,
-                    ),
+                    render_oo_rule(m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing),
                     source_count,
                 )
             });
@@ -738,9 +766,8 @@ fn load_one_stmt(
             });
             if oo_completed && let Some((source, source_count)) = oo_source {
                 let names = oo_variable_names(m, &vars, source_count);
-                let transformed = render_oo_rule(
-                    m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing,
-                );
+                let transformed =
+                    render_oo_rule(m, i, &lhs_t, &rhs_t, &condition, &names, label, *narrowing);
                 push_oo_diagnostic(m, "rule", source, transformed);
             }
             let nr = vars.count();
@@ -827,12 +854,7 @@ fn load_one_stmt(
     Ok(())
 }
 
-fn push_oo_diagnostic(
-    m: &mut BuiltModule,
-    kind: &str,
-    source: String,
-    transformed: String,
-) {
+fn push_oo_diagnostic(m: &mut BuiltModule, kind: &str, source: String, transformed: String) {
     m.oo_completion_diagnostics.push(format!(
         "Considering object completion on:\n  {source}\n\
          Transformed {kind}:\n  {transformed}"
@@ -840,9 +862,10 @@ fn push_oo_diagnostic(
 }
 
 fn oo_keyword(keyword: &str, label: &Option<String>) -> String {
-    label
-        .as_deref()
-        .map_or_else(|| keyword.to_string(), |label| format!("{keyword} [{label}] :"))
+    label.as_deref().map_or_else(
+        || keyword.to_string(),
+        |label| format!("{keyword} [{label}] :"),
+    )
 }
 
 fn oo_variable_names(m: &BuiltModule, vars: &VarIndex, source_count: u32) -> Vec<String> {
@@ -869,7 +892,6 @@ fn oo_variable_names(m: &BuiltModule, vars: &VarIndex, source_count: u32) -> Vec
 fn print_oo_term(m: &BuiltModule, i: &Interner, term: &Term, names: &[String]) -> String {
     print_term(m, i, term, names, false)
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn render_oo_equation(
@@ -1557,6 +1579,48 @@ pub fn build_command_dag(
     let dag = build_subject_dag(lm, &tree, term, i);
     lm.built.engine.end_dedup();
     dag
+}
+
+/// Parse a command-shaped term into the first one or two concrete parses needed by META-LEVEL's
+/// `metaParse`. Each tuple contains the source-order [`Term`] used for up-translation, its variable names,
+/// and the canonical symbolic DAG used to compute the least sort.
+pub fn build_logic_command_parses(
+    lm: &mut LoadedModule,
+    i: &Interner,
+    tokens: &[Token],
+) -> Result<Vec<(Term, VarIndex, DagId)>, String> {
+    let parsed = parse_forest_any(tokens, &lm.grammar, i)?;
+    let mut trees = vec![parsed.tree];
+    if let Some(alternative) = parsed.alternative {
+        trees.push(alternative);
+    }
+    let mut sources = Vec::with_capacity(trees.len());
+    for tree in trees {
+        let mut vars = VarIndex::new();
+        let term = build_term(&tree, &lm.grammar, &lm.built, tokens, i, &mut vars)?;
+        sources.push((tree, term, vars));
+    }
+
+    lm.built.engine.reset_rewrites();
+    lm.built.engine.begin_dedup();
+    let result = sources
+        .into_iter()
+        .map(|(tree, term, mut vars)| {
+            let dag = build_logic_dag(
+                &tree,
+                &lm.grammar,
+                &mut lm.built.engine,
+                lm.built.nat_zero,
+                lm.built.nat_succ,
+                tokens,
+                i,
+                &mut vars,
+            )?;
+            Ok((term, vars, dag))
+        })
+        .collect();
+    lm.built.engine.end_dedup();
+    result
 }
 
 /// Parse a command-shaped term into a genuine symbolic DAG. Unlike [`build_command_dag`], variables stay

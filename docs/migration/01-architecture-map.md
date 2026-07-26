@@ -5,29 +5,31 @@ manual. Per-subsystem deep-dives in `reports/A1`…`A8`.* This doubles as the **
 (§2) and feature inventory (§3) describe what Maude is; the cross-cutting decisions (§4) are our porting
 strategy (now largely realized — see `03-open-decisions.md`).
 
-> **Build status (refreshed 2026-07-21).** **L0 Kernel**, **L1 Sorts**, **L2 Theories+matching**, **L3
-> Built-ins** — DONE, including the Diophantine/bipartite AC matcher and sequence-verifying cross-check.
-> **L5 Frontend** (lexer incl. bracketed comments / structured colon-vars, mixfix grammar, Earley parser,
-> pretty-printer incl. `(t).Sort` disambiguation) — DONE. **L4 Operational — rules + rewriting (Pillar A)
-> DONE** (`rl`/`crl` incl. the `=>` condition, `rewrite`/`frewrite`, `search` + state graph, `continue`);
-> strategies + objects **DONE**; external-IO stays host-embedded per revised **D5** (not built in-engine).
-> **L6 Modules + parameterization — DONE**: import /
-> flatten / `+` / rename, *and* the whole parameterization layer (theories/views/parameterized-modules/
-> instantiation `M{V}` + all of "Axis A": op-maps, parameterized views, dedup, theory/module sorts, and
-> free-vs-bound nested instantiation — all three argument kinds — incl. cross-kind ad-hoc overloading) — a
-> pure `tnk-modules` `PreModule` transform, kernel unchanged. Everything above is conformance-verified.
-> **The real Maude prelude loads and reduces byte-identically** — the whole data library (`BOOL`/`NAT`/`INT`/
-> `RAT`/`FLOAT`/`STRING`/`QID`/`CONVERSION` + the containers `EXT-BOOL`/`SET`/`MAP`/`ARRAY`) *and* the
-> reflection core: `META-LEVEL` builds, and its descent family (`metaReduce`/`metaRewrite`/`metaApply`/
-> `metaMatch`/`metaSearch`/`metaSearchPath`/… + the `format`-attribute display) computes byte-identically
-> — as do the META `up*`/query/parse layer, the strategy language, and the object system
-> (`omod`/`erewrite`/STD-STREAM). **L7 Reflection/meta** core is done, including unification, variant,
-> and all in-scope narrowing descent. **L8 Symbolic S0–S3 is DONE**: BDD sort enumeration;
-> order-sorted unification modulo free/S/CUI/AC/ACU/A/AU at 27/27 fixtures (676 commands); folding
-> variants at 21/21 (289 commands); and v3 variant-based narrowing at 16/16 (the 15-fixture completion
-> manifest plus one post-close regression; 169 independently passing primary commands). SMT and LTL remain.
-> **Current verified state incl. all known deviations: `../../fable-audit.md`** (status refreshed
-> 2026-07-21); forward plan: `roadmap.md`. Feature inventory (§3) remains the parity target list.
+> **Build status (refreshed 2026-07-24).** **L0 Kernel**, **L1 Sorts**, **L2
+> Theories+matching**, and **L3 Built-ins** are DONE, including the
+> Diophantine/bipartite AC matcher and sequence-verifying cross-check. **L5 Frontend**
+> (lexer including bracketed comments and structured colon-vars, mixfix grammar, Earley
+> parser, and pretty-printer including `(t).Sort` disambiguation) is DONE. **L4
+> Operational** is DONE for rules, rewriting, search/state graphs, continuations,
+> strategies, and objects; external IO stays host-embedded per revised D5.
+> **L6 Modules + parameterization** is DONE: import/flatten/`+`/rename, theories, views,
+> parameterized modules/views, instantiation, deduplication, theory/module sorts, and
+> free-vs-bound nested instantiation are a pure `tnk-modules` transform.
+>
+> The real Maude prelude and reflection core load and compute byte-identically across the
+> claimed surface. **L7 Reflection/meta** includes the META descent family, current and
+> legacy symbolic operations, reusable `tnk-session::Session`, and local synchronous
+> `InterpreterManagerSymbol` protocols at **27/27 fixtures PASS**. **L8 Symbolic and
+> verification is DONE for S/T/M**: BDD-backed order-sorted unification modulo
+> free/S/CUI/AC/ACU/A/AU at 27/27 fixtures (676 commands), folding variants at 21/21
+> (289 commands), v3 narrowing at 16/16 (169 independently passing primary commands),
+> optional-z3 SMT at 11/11, and LTL model checking/SAT at 10/10 (50 commands). The
+> default release remains solver-free.
+>
+> Phase I-S is closed at its mandatory synchronous boundary; Phase I-C cancellation and
+> thread-backed coordination remain unstarted. **Current verified state including all
+> known deviations: `../../fable-audit.md`** (status refreshed 2026-07-24); forward plan:
+> `roadmap.md`. Feature inventory (§3) remains the parity target list.
 
 ## 1. What Maude is (the spine)
 Maude is a high-performance engine for **two nested logics**: *membership equational logic*

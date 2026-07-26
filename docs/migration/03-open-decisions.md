@@ -1,4 +1,4 @@
-# Decision Record — foundational choices (D1–D8) + correctness-goal defaults (D9–D11)
+# Decision Record — foundational choices (D1–D8) + correctness/subsystem decisions (D9–D12)
 
 The load-bearing tech decisions, ordered by blast radius. **D1–D4 and D8 are in force and validated** by the
 built engine (Phase 0/1 — the `Resolution`/`Amendment` notes record how); **D5 (IO/`mio`), D6 (BDD), D7 (SMT)
@@ -217,3 +217,12 @@ children (oracle-diffable), I3 cooperative cancellation at safe points, I4 the t
 `newProcess` semantics with documented deltas (no memory/abort isolation; cooperative abandonment;
 panic containment with the unwinding-panic build setting pinned). **Revisit:** only via the recorded
 process-backend trigger.
+
+**Phase-boundary clarification (user, 2026-07-23; binding).** Phase I is two
+separately opened and closed goals. **I-S** extracts the reusable Session and completes
+local synchronous meta-interpreters under live-oracle differential testing; it must
+close and yield with no cancellation/thread/channel implementation present. **I-C**
+starts only from that recorded closure and adds cancellation plus thread-backed
+coordination, using permanent local mode as its executable semantic specification.
+Concurrent work may not duplicate or alter Session/interpreter semantics. Detailed
+gates: `remaining-plans/06-sessions-meta-interpreters.md`.

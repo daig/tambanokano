@@ -16,7 +16,7 @@ use crate::grammar::{GSym, Nt};
 /// A concrete parse tree: the production applied, the token span `[start, end)`, and the subtrees for the
 /// rhs **nonterminals** (left-to-right). Terminals are not stored as children — `build_term` reads any
 /// literal/variable token it needs from `start` (each such production has a single leading terminal).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PTree {
     pub prod: u32,
     pub start: usize,
@@ -24,11 +24,14 @@ pub struct PTree {
     pub nt_children: Vec<PTree>,
 }
 
-/// The outcome of extraction: the first parse tree and whether the input was ambiguous.
+/// The outcome of extraction: the first parse tree, whether the input was ambiguous, and (when
+/// ambiguous) the second concrete parse in extraction order. Ordinary command parsing consumes only
+/// `tree`; META-LEVEL's `metaParse` reifies both trees in an `ambiguity` result.
 #[derive(Debug)]
 pub struct Parse {
     pub tree: PTree,
     pub ambiguous: bool,
+    pub alternative: Option<PTree>,
 }
 
 /// Extract the first parse for `start` from the chart, or an error describing why there is none.
@@ -45,7 +48,14 @@ pub fn extract(
     };
     let mut ambiguous = roots.len() > 1;
     let tree = extract_item(g, chart, root.prod, 0, n_tokens, &mut ambiguous);
-    Ok(Parse { tree, ambiguous })
+    let alternative = ambiguous
+        .then(|| second_parse(g, chart, &roots, n_tokens, &tree))
+        .flatten();
+    Ok(Parse {
+        tree,
+        ambiguous,
+        alternative,
+    })
 }
 
 /// Reconstruct the subtree for a finished item `(prod, ·, origin)` spanning `[origin, end)`.
@@ -118,4 +128,122 @@ fn find_split(
         }
     }
     found.expect("recognizer accepted but no split found (parser invariant)")
+}
+
+/// Enumerate just enough of the packed forest to recover the second concrete parse. The walk follows
+/// the same right-to-left split order as [`extract_item`], caps every branch at two trees, and rejects
+/// cyclic unit-production paths. The ordinary parser never pays this cost unless ambiguity was already
+/// detected by the first extraction.
+fn second_parse(
+    g: &CompiledGrammar,
+    chart: &Chart,
+    roots: &[Item],
+    n_tokens: usize,
+    first: &PTree,
+) -> Option<PTree> {
+    let mut visiting = Vec::new();
+    for root in roots {
+        for tree in enumerate_item(g, chart, root.prod, 0, n_tokens, &mut visiting) {
+            if &tree != first {
+                return Some(tree);
+            }
+        }
+    }
+    None
+}
+
+fn enumerate_item(
+    g: &CompiledGrammar,
+    chart: &Chart,
+    prod: u32,
+    origin: usize,
+    end: usize,
+    visiting: &mut Vec<(u32, usize, usize)>,
+) -> Vec<PTree> {
+    let key = (prod, origin, end);
+    if visiting.contains(&key) {
+        return Vec::new();
+    }
+    visiting.push(key);
+    let children = enumerate_prefix(
+        g,
+        chart,
+        prod,
+        origin,
+        g.prods[prod as usize].rhs.len(),
+        end,
+        visiting,
+    );
+    visiting.pop();
+    children
+        .into_iter()
+        .map(|nt_children| PTree {
+            prod,
+            start: origin,
+            end,
+            nt_children,
+        })
+        .take(2)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_prefix(
+    g: &CompiledGrammar,
+    chart: &Chart,
+    prod: u32,
+    origin: usize,
+    upto: usize,
+    end: usize,
+    visiting: &mut Vec<(u32, usize, usize)>,
+) -> Vec<Vec<PTree>> {
+    if upto == 0 {
+        return (end == origin).then(Vec::new).into_iter().collect();
+    }
+    let k = upto - 1;
+    match g.prods[prod as usize].rhs[k] {
+        GSym::T(_) => {
+            if end == 0 {
+                Vec::new()
+            } else {
+                enumerate_prefix(g, chart, prod, origin, k, end - 1, visiting)
+            }
+        }
+        GSym::N(nt) => {
+            let bound = g.prods[prod as usize].bound[k].unwrap();
+            let prefix = Item {
+                prod,
+                dot: k as u16,
+                origin: origin as u32,
+            };
+            let mut results = Vec::new();
+            for &item in &chart.sets[end] {
+                let child_prod = &g.prods[item.prod as usize];
+                if child_prod.lhs != nt
+                    || item.dot as usize != child_prod.rhs.len()
+                    || child_prod.prec > bound
+                {
+                    continue;
+                }
+                let split = item.origin as usize;
+                if !chart.contains(split, prefix) {
+                    continue;
+                }
+                let child_trees = enumerate_item(g, chart, item.prod, split, end, visiting);
+                for child in child_trees {
+                    for mut siblings in enumerate_prefix(g, chart, prod, origin, k, split, visiting)
+                    {
+                        siblings.push(child.clone());
+                        if !results.contains(&siblings) {
+                            results.push(siblings);
+                            if results.len() == 2 {
+                                return results;
+                            }
+                        }
+                    }
+                }
+            }
+            results
+        }
+    }
 }

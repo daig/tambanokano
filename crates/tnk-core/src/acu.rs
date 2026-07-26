@@ -25,7 +25,7 @@ use crate::engine::{Runtime, Signature};
 use crate::sort::SortId;
 use crate::symbol::{IdentityId, SymbolId};
 use crate::term::{Subst, Term};
-use crate::theory::LhsAutomaton;
+use crate::theory::{LhsAutomaton, RewriteMatchContext};
 use std::collections::HashSet;
 
 /// A compiled ACU left-hand side: the flattened pattern multiset partitioned into ground subterms
@@ -549,7 +549,6 @@ struct RecordedSolution {
     residue: Vec<(DagId, u32)>,
 }
 
-
 impl AcuSubproblem {
     /// Advance to the next solution, binding its variables into `subst` and recording its residue;
     /// `false` when exhausted. Builds binding nodes (so it needs `&mut Runtime`); a candidate whose
@@ -760,6 +759,14 @@ impl AcuSubproblem {
                 .map(|(i, &r)| (elements[i], r))
                 .collect();
             out.push(RecordedSolution { binds, residue });
+        }
+    }
+
+    pub(crate) fn rewrite_context(&self) -> RewriteMatchContext {
+        if self.matched_whole {
+            RewriteMatchContext::whole()
+        } else {
+            RewriteMatchContext::acu(self.symbol, self.residue.clone())
         }
     }
 
