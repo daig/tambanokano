@@ -1,0 +1,71 @@
+*** PRELUDE
+*** A5g-strategy-import-reflection — source/flat and transformed strategy payloads agree across meta APIs (TNK-005)
+mod A5G-COMMON is
+  sort S .
+  ops a b c d : -> S .
+  rl [rb] : a => b .
+  rl [rc] : a => c .
+  rl [rd] : a => d .
+endm
+smod A5G-BASE is
+  protecting A5G-COMMON .
+  strat base @ S .
+  sd base := rb .
+endsm
+smod A5G-LEFT is
+  protecting A5G-BASE .
+  strat left @ S .
+  sd left := rc .
+endsm
+smod A5G-RIGHT is
+  protecting A5G-BASE .
+  strat right @ S .
+  sd right := rd .
+endsm
+smod A5G-USE is
+  protecting A5G-LEFT .
+  protecting A5G-RIGHT .
+  strat local @ S .
+  sd local := idle .
+endsm
+reduce in META-LEVEL : upStratDecls('A5G-USE, false) .
+reduce in META-LEVEL : upStratDecls('A5G-USE, true) .
+reduce in META-LEVEL : upSds('A5G-USE, false) .
+reduce in META-LEVEL : upSds('A5G-USE, true) .
+reduce in META-LEVEL : getStrats(upModule('A5G-USE, false)) .
+reduce in META-LEVEL : getStrats(upModule('A5G-USE, true)) .
+reduce in META-LEVEL : getSds(upModule('A5G-USE, false)) .
+reduce in META-LEVEL : getSds(upModule('A5G-USE, true)) .
+
+smod A5G-SUM is
+  protecting A5G-BASE + A5G-LEFT .
+endsm
+reduce in META-LEVEL : upStratDecls('A5G-SUM, true) .
+reduce in META-LEVEL : upSds('A5G-SUM, true) .
+
+smod A5G-RENAMED is
+  protecting A5G-BASE * (sort S to T, label rb to moved) .
+endsm
+reduce in META-LEVEL : upStratDecls('A5G-RENAMED, true) .
+reduce in META-LEVEL : upSds('A5G-RENAMED, true) .
+
+fth A5G-THEORY is
+  sort Elt .
+endfth
+smod A5G-PARAM{X :: A5G-THEORY} is
+  var Y : X$Elt .
+  strat keep : X$Elt @ X$Elt .
+  sd keep(Y) := match Y .
+endsm
+fmod A5G-TARGET is
+  sort Elt .
+  op x : -> Elt .
+endfm
+view A5G-VIEW from A5G-THEORY to A5G-TARGET is
+  sort Elt to Elt .
+endv
+smod A5G-INSTANTIATED is
+  protecting A5G-PARAM{A5G-VIEW} .
+endsm
+reduce in META-LEVEL : upStratDecls('A5G-INSTANTIATED, true) .
+reduce in META-LEVEL : upSds('A5G-INSTANTIATED, true) .

@@ -40,6 +40,9 @@ use tnk_core::variant::{
 pub struct LoadedModule {
     pub built: BuiltModule,
     pub grammar: CompiledGrammar,
+    /// Imported strategy-definition home grammars, with semantic actions remapped to `built`. A strategy
+    /// definition carrying a distinct `home` is executable only when this map contains that home.
+    pub strategy_grammars: HashMap<String, CompiledGrammar>,
     /// Maude's module-wide `validForSMT_Rewriting` result.
     pub smt_rewrite_valid: bool,
 }
@@ -93,6 +96,7 @@ pub fn build_loaded_module(
     Ok(LoadedModule {
         built,
         grammar,
+        strategy_grammars: HashMap::new(),
         smt_rewrite_valid,
     })
 }
@@ -125,12 +129,26 @@ pub fn build_loaded_module_homed_traced<'m>(
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
     let trace_refs = load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
+    let strategy_grammars = pm
+        .strat_defs
+        .iter()
+        .filter_map(|def| def.home.as_deref())
+        .filter(|home| *home != pm.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|home| {
+            home_mod(home)
+                .and_then(|module| remap_home_grammar(module, &built))
+                .map(|grammar| (home.to_string(), grammar))
+        })
+        .collect();
     let smt_rewrite_valid =
         built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
     Ok((
         LoadedModule {
             built,
             grammar,
+            strategy_grammars,
             smt_rewrite_valid,
         },
         trace_refs,

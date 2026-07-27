@@ -1524,6 +1524,9 @@ impl<'a> Parser<'a> {
                         name,
                         domain: domain.clone(),
                         subject: subject.clone(),
+                        origin: None,
+                        source_index: None,
+                        home: None,
                     });
                 }
             }
@@ -1557,6 +1560,9 @@ impl<'a> Parser<'a> {
                     params,
                     body,
                     cond,
+                    origin: None,
+                    source_index: None,
+                    home: None,
                 });
             }
             other => return Err(format!("unsupported declaration `{other}`")),

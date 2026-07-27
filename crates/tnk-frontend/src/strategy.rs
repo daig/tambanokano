@@ -21,14 +21,17 @@
 //! is the documented residual, `fable-audit.md`). `xmatchrew` and conditional `csd` error clearly at resolve.
 
 use crate::build_term::VarIndex;
+use crate::cfparser::compile::CompiledGrammar;
 use crate::lex::{Interner, Token};
 use crate::load::{LoadedModule, parse_build, parse_condition, term_var_indices};
 use crate::surface::ast::{StratExpr, StratSugar, TestKind};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
 use tnk_core::dag::DagId;
 use tnk_core::engine::Engine;
+use tnk_core::sort::KindId;
 use tnk_core::term::{ConditionFragment, Term};
+use tnk_core::variant::term_from_dag_slots;
 
 /// One solution of a strategy run: the (reduced) result term + the cumulative rewrite count at its emit.
 pub struct StratSolution {
@@ -82,13 +85,48 @@ enum RStrat {
         cond: Vec<ConditionFragment>,
         by: Vec<(u32, Rc<RStrat>)>,
     },
-    Call(String),
+    Call {
+        name: String,
+        args: Vec<Term>,
+    },
+    /// Runtime-only resumable definition enumerator. Each body runs as a child call task while the
+    /// enumerator survives in the parent task, reproducing Maude's fair call-process interleaving.
+    CallGenerator {
+        bodies: Rc<Vec<Rc<RStrat>>>,
+        next: usize,
+    },
 }
 
-/// The evaluation context: the engine, the resolved `sd` definition table, and the cumulative rewrite count.
+#[derive(Clone, PartialEq, Eq)]
+struct ProfileKey {
+    name: String,
+    args: Vec<KindId>,
+    subject: KindId,
+}
+
+struct DeclProfile {
+    key: ProfileKey,
+    origins: HashSet<String>,
+}
+
+struct RDef {
+    key: ProfileKey,
+    patterns: Vec<Term>,
+    nr_vars: u32,
+    body: Rc<RStrat>,
+}
+
+#[derive(Default)]
+struct StrategyProgram {
+    profiles: Vec<DeclProfile>,
+    defs: Vec<RDef>,
+}
+
+/// The evaluation context: the engine, the compiled strategy-definition program, and the cumulative
+/// rewrite count.
 struct Cx<'a> {
     eng: &'a mut Engine,
-    defs: &'a HashMap<String, Rc<RStrat>>,
+    program: &'a StrategyProgram,
     count: u64,
 }
 
@@ -114,16 +152,23 @@ fn push_all(mut p: Pending, ss: &[Rc<RStrat>]) -> Pending {
     p
 }
 
-/// A structural key for a pending stack — the sequence of strategy-node pointer identities (stable across a
-/// command). Used by the seen-set.
+/// A structural key for a pending stack. Resolved nodes use their stable pointer identity; runtime call
+/// generators use the persistent body-vector identity plus cursor because their short-lived node allocation
+/// can otherwise reuse an address retained by the seen-set.
 fn pending_key(p: &Pending) -> Vec<usize> {
-    let mut k = Vec::new();
-    let mut cur = p.clone();
-    while let Some(f) = cur {
-        k.push(Rc::as_ptr(&f.strat) as *const () as usize);
-        cur = f.rest.clone();
+    let mut key = Vec::new();
+    let mut current = p.clone();
+    while let Some(frame) = current {
+        if let RStrat::CallGenerator { bodies, next } = &*frame.strat {
+            key.push(0);
+            key.push(Rc::as_ptr(bodies) as usize);
+            key.push(*next);
+        } else {
+            key.push(Rc::as_ptr(&frame.strat) as *const () as usize);
+        }
+        current = frame.rest.clone();
     }
-    k
+    key
 }
 
 /// A scheduled process: a term + its pending strategy stack + the task it belongs to, or — when `app` is set
@@ -159,6 +204,9 @@ struct TaskState {
 enum TaskKind {
     /// The top-level task — its solutions are the command's results.
     Root,
+    /// One named-strategy definition trial. Every body solution resumes the call's outer continuation in
+    /// the parent task; exhaustion has no fallback action.
+    Call { rest: Pending },
     /// `E ? success : failure` on `dag` (continuation `rest`): each `E`-solution → `success`; if `E` has none
     /// (exhausted with `!had_success`) → `failure` on `dag`.
     Branch {
@@ -206,19 +254,11 @@ pub fn srewrite_dag(
     strat: &StratExpr,
     depth_first: bool,
 ) -> Result<(Vec<StratSolution>, u64), String> {
-    let rstrat = resolve(strat, lm, i, 0)?;
-    let mut defs = HashMap::new();
-    for d in &lm.built.strat_defs {
-        if d.cond.is_none()
-            && d.params.is_empty()
-            && let Ok(body) = resolve(&d.body, lm, i, 0)
-        {
-            defs.insert(d.name.clone(), body);
-        }
-    }
+    let program = compile_strategy_program(lm, i);
+    let rstrat = resolve(strat, lm, i)?;
     let mut cx = Cx {
         eng: &mut lm.built.engine,
-        defs: &defs,
+        program: &program,
         count: 0,
     };
     cx.eng.reset_rewrites();
@@ -403,11 +443,18 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
 
 /// Resolve a surface [`StratExpr`] into an [`RStrat`] (shared via [`Rc`]). `depth` bounds parameterized-call
 /// inline expansion. `xmatchrew`/conditional `csd` error with a clear message (follow-ons).
-fn resolve(
+fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<Rc<RStrat>, String> {
+    resolve_in(e, lm, &lm.grammar, i, &VarIndex::new())
+}
+
+/// Resolve in a particular source grammar with `seed` variables already bound by an enclosing strategy
+/// definition. The grammar determines syntax; all semantic actions already point into `lm.built`.
+fn resolve_in(
     e: &StratExpr,
     lm: &LoadedModule,
+    grammar: &CompiledGrammar,
     i: &Interner,
-    depth: u32,
+    seed: &VarIndex,
 ) -> Result<Rc<RStrat>, String> {
     let r = match e {
         StratExpr::Idle => RStrat::Idle,
@@ -425,10 +472,10 @@ fn resolve(
         } => {
             let rules = rules_labelled(lm, label);
             if !rules.is_empty() {
-                let app_subst = resolve_subst(subst, lm, i)?;
+                let app_subst = resolve_subst(subst, lm, grammar, i, seed)?;
                 let subs = substrats
                     .iter()
-                    .map(|s| resolve(s, lm, i, depth))
+                    .map(|child| resolve_in(child, lm, grammar, i, seed))
                     .collect::<Result<Vec<_>, _>>()?;
                 RStrat::Apply {
                     rules,
@@ -437,14 +484,14 @@ fn resolve(
                     substrats: subs,
                 }
             } else if subst.is_empty() && substrats.is_empty() {
-                return resolve_call(label, &[], lm, i, depth);
+                return resolve_call(label, &[], lm, grammar, i, seed);
             } else {
                 return Err(format!(
                     "`{label}` is not a rule label (application `[…]{{…}}` needs a rule)"
                 ));
             }
         }
-        StratExpr::Top(inner) => match &*resolve(inner, lm, i, depth)? {
+        StratExpr::Top(inner) => match &*resolve_in(inner, lm, grammar, i, seed)? {
             RStrat::Apply {
                 rules,
                 subst,
@@ -458,23 +505,26 @@ fn resolve(
             },
             _ => return Err("top(…) of a non-rule strategy is a follow-on".to_string()),
         },
-        StratExpr::One(inner) => RStrat::One(resolve(inner, lm, i, depth)?),
-        StratExpr::Seq(a, b) => RStrat::Seq(resolve(a, lm, i, depth)?, resolve(b, lm, i, depth)?),
-        StratExpr::Union(a, b) => {
-            RStrat::Union(resolve(a, lm, i, depth)?, resolve(b, lm, i, depth)?)
-        }
-        StratExpr::Star(a) => RStrat::Star(resolve(a, lm, i, depth)?),
-        StratExpr::Plus(a) => RStrat::Plus(resolve(a, lm, i, depth)?),
-        StratExpr::Normalize(a) => RStrat::Normalize(resolve(a, lm, i, depth)?),
-        // Surface sugar desugars here (the parser preserves the spelling for the echo):
-        // try(a) = a ? idle : fail ; test(a) likewise (the test/try semantic distinction is the
-        // documented simplification); not(a) = a ? fail : idle ; or-else(a, b) = a ? idle : b.
+        StratExpr::One(inner) => RStrat::One(resolve_in(inner, lm, grammar, i, seed)?),
+        StratExpr::Seq(left, right) => RStrat::Seq(
+            resolve_in(left, lm, grammar, i, seed)?,
+            resolve_in(right, lm, grammar, i, seed)?,
+        ),
+        StratExpr::Union(left, right) => RStrat::Union(
+            resolve_in(left, lm, grammar, i, seed)?,
+            resolve_in(right, lm, grammar, i, seed)?,
+        ),
+        StratExpr::Star(child) => RStrat::Star(resolve_in(child, lm, grammar, i, seed)?),
+        StratExpr::Plus(child) => RStrat::Plus(resolve_in(child, lm, grammar, i, seed)?),
+        StratExpr::Normalize(child) => RStrat::Normalize(resolve_in(child, lm, grammar, i, seed)?),
+        // Surface sugar desugars here (the parser preserves the spelling for the echo).
         StratExpr::Sugar { kind, args } => {
-            let branch = |t: &StratExpr, s: StratExpr, f: StratExpr| StratExpr::Branch {
-                test: Box::new(t.clone()),
-                success: Box::new(s),
-                failure: Box::new(f),
-            };
+            let branch =
+                |test: &StratExpr, success: StratExpr, failure: StratExpr| StratExpr::Branch {
+                    test: Box::new(test.clone()),
+                    success: Box::new(success),
+                    failure: Box::new(failure),
+                };
             let desugared = match kind {
                 StratSugar::Try | StratSugar::TestS => {
                     branch(&args[0], StratExpr::Idle, StratExpr::Fail)
@@ -482,16 +532,16 @@ fn resolve(
                 StratSugar::NotS => branch(&args[0], StratExpr::Fail, StratExpr::Idle),
                 StratSugar::OrElse => branch(&args[0], StratExpr::Idle, args[1].clone()),
             };
-            return resolve(&desugared, lm, i, depth);
+            return resolve_in(&desugared, lm, grammar, i, seed);
         }
         StratExpr::Branch {
             test,
             success,
             failure,
         } => RStrat::Branch {
-            test: resolve(test, lm, i, depth)?,
-            success: resolve(success, lm, i, depth)?,
-            failure: resolve(failure, lm, i, depth)?,
+            test: resolve_in(test, lm, grammar, i, seed)?,
+            success: resolve_in(success, lm, grammar, i, seed)?,
+            failure: resolve_in(failure, lm, grammar, i, seed)?,
         },
         StratExpr::Test {
             kind,
@@ -503,13 +553,22 @@ fn resolve(
                 TestKind::AMatch => (true, false),
                 TestKind::XMatch => (false, true),
             };
-            let mut vars = VarIndex::new();
-            let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
-            let cond = resolve_test_cond(cond.as_deref(), &pat, &mut vars, lm, i, "test")?;
+            let mut vars = seed.clone();
+            let pattern = parse_build(pattern, grammar, &lm.built, i, &mut vars)?;
+            let cond = resolve_test_cond(
+                cond.as_deref(),
+                &pattern,
+                &mut vars,
+                lm,
+                grammar,
+                i,
+                seed.count(),
+                "test",
+            )?;
             RStrat::Test {
                 anywhere,
                 extension,
-                pattern: pat,
+                pattern,
                 nr_vars: vars.count(),
                 cond,
             }
@@ -520,264 +579,289 @@ fn resolve(
             cond,
             subs,
         } => {
-            let anywhere =
-                match kind {
-                    TestKind::Match => false,
-                    TestKind::AMatch => true,
-                    TestKind::XMatch => return Err(
+            let anywhere = match kind {
+                TestKind::Match => false,
+                TestKind::AMatch => true,
+                TestKind::XMatch => {
+                    return Err(
                         "xmatchrew (extension-match rewriting) reassembly is an engine follow-on"
                             .to_string(),
-                    ),
-                };
-            let mut vars = VarIndex::new();
-            let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
+                    );
+                }
+            };
+            let mut vars = seed.clone();
+            let pattern = parse_build(pattern, grammar, &lm.built, i, &mut vars)?;
             let cond = resolve_test_cond(
                 cond.as_deref(),
-                &pat,
+                &pattern,
                 &mut vars,
                 lm,
+                grammar,
                 i,
+                seed.count(),
                 "matchrew `such that`",
             )?;
             let mut by = Vec::new();
-            for (vtoks, st) in subs {
-                let name = token_text(vtoks, i);
-                let idx = (0..vars.count())
-                    .find(|&k| vars.name(k) == name)
+            for (variable, child) in subs {
+                let name = token_text(variable, i);
+                let index = (0..vars.count())
+                    .find(|&slot| vars.name(slot) == name)
                     .ok_or_else(|| {
                         format!("matchrew variable `{name}` does not occur in the pattern")
                     })?;
-                by.push((idx, resolve(st, lm, i, depth)?));
+                by.push((index, resolve_in(child, lm, grammar, i, seed)?));
             }
             RStrat::MatchRew {
                 anywhere,
-                pattern: pat,
+                pattern,
                 nr_vars: vars.count(),
                 cond,
                 by,
             }
         }
-        StratExpr::Call { name, args } => return resolve_call(name, args, lm, i, depth),
+        StratExpr::Call { name, args } => {
+            return resolve_call(name, args, lm, grammar, i, seed);
+        }
     };
     Ok(Rc::new(r))
 }
 
 /// Parse an optional `such that` condition for a test/matchrew, rejecting a rewrite (`=>`) fragment.
+#[allow(clippy::too_many_arguments)]
 fn resolve_test_cond(
     cond: Option<&[Token]>,
-    pat: &Term,
+    pattern: &Term,
     vars: &mut VarIndex,
     lm: &LoadedModule,
+    grammar: &CompiledGrammar,
     i: &Interner,
+    bound_prefix: u32,
     owner: &str,
 ) -> Result<Vec<ConditionFragment>, String> {
-    let Some(c) = cond else { return Ok(Vec::new()) };
-    let mut bound = BTreeSet::new();
-    let mut pvars = Vec::new();
-    term_var_indices(pat, &mut pvars);
-    bound.extend(pvars);
-    let frags = parse_condition(c, &lm.grammar, &lm.built, i, vars, &mut bound)?;
-    if frags
+    let Some(cond) = cond else {
+        return Ok(Vec::new());
+    };
+    let mut bound: BTreeSet<u32> = (0..bound_prefix).collect();
+    let mut pattern_vars = Vec::new();
+    term_var_indices(pattern, &mut pattern_vars);
+    bound.extend(pattern_vars);
+    let fragments = parse_condition(cond, grammar, &lm.built, i, vars, &mut bound)?;
+    if fragments
         .iter()
-        .any(|f| matches!(f, ConditionFragment::Rewrite { .. }))
+        .any(|fragment| matches!(fragment, ConditionFragment::Rewrite { .. }))
     {
         return Err(format!(
             "a rewrite condition (`=>`) is not allowed in a {owner}"
         ));
     }
-    Ok(frags)
+    Ok(fragments)
 }
 
-/// Resolve an application's initial substitution `[x <- t, …]` to `(var name, ground term)` pairs.
+/// Resolve an application's initial substitution. Values may reference variables bound by an enclosing
+/// strategy definition, but may not introduce new variables.
 fn resolve_subst(
     subst: &[(Vec<Token>, Vec<Token>)],
     lm: &LoadedModule,
+    grammar: &CompiledGrammar,
     i: &Interner,
+    seed: &VarIndex,
 ) -> Result<Vec<(String, Term)>, String> {
     let mut out = Vec::new();
-    for (var, val) in subst {
-        let name = token_text(var, i);
-        let mut vars = VarIndex::new();
-        let t = parse_build(val, &lm.grammar, &lm.built, i, &mut vars)?;
-        if vars.count() != 0 {
+    for (variable, value) in subst {
+        let name = token_text(variable, i);
+        let mut vars = seed.clone();
+        let term = parse_build(value, grammar, &lm.built, i, &mut vars)?;
+        if vars.count() != seed.count() {
             return Err(
-                "a strategy application substitution value must be a ground term".to_string(),
+                "an application substitution value contains an unbound strategy variable"
+                    .to_string(),
             );
         }
-        out.push((name, t));
+        out.push((name, term));
     }
     Ok(out)
 }
 
-/// Resolve a strategy call `name(args…)`: parameterless → a lazy [`RStrat::Call`]; parameterized → expanded
-/// inline by substituting parameter tokens with argument tokens (bounded by `MAX_PARAM_DEPTH`).
+/// Resolve a named call without expanding it. Every definition remains a separately matchable candidate,
+/// so recursion is naturally lazy and declaration-only strategies correctly yield no solutions.
 fn resolve_call(
     name: &str,
     args: &[Vec<Token>],
     lm: &LoadedModule,
+    grammar: &CompiledGrammar,
     i: &Interner,
-    depth: u32,
+    seed: &VarIndex,
 ) -> Result<Rc<RStrat>, String> {
-    if args.is_empty() {
-        if lm
-            .built
-            .strat_defs
-            .iter()
-            .any(|d| d.name == name && d.params.is_empty() && d.cond.is_none())
-        {
-            return Ok(Rc::new(RStrat::Call(name.to_string())));
-        }
-        if lm
-            .built
-            .strat_defs
-            .iter()
-            .any(|d| d.name == name && d.params.is_empty() && d.cond.is_some())
-        {
-            return Err(format!(
-                "conditional strategy definition (`csd {name}`) is a follow-on"
-            ));
-        }
+    let declared = lm
+        .built
+        .strat_decls
+        .iter()
+        .any(|decl| decl.name == name && decl.domain.len() == args.len());
+    if !declared {
         return Err(format!(
             "`{name}` is neither a rule label nor a strategy of this module"
         ));
     }
-    const MAX_PARAM_DEPTH: u32 = 64;
-    if depth >= MAX_PARAM_DEPTH {
-        return Err("parameterized strategy-call expansion too deep (recursive parameterized calls are a follow-on)".to_string());
-    }
-    let found = lm
+    let has_unconditional = lm
         .built
         .strat_defs
         .iter()
-        .find(|d| d.name == name && d.params.len() == args.len())
-        .map(|d| (d.params.clone(), d.body.clone(), d.cond.is_some()));
-    let Some((params, body0, has_cond)) = found else {
+        .any(|def| def.name == name && def.params.len() == args.len() && def.cond.is_none());
+    let has_conditional = lm
+        .built
+        .strat_defs
+        .iter()
+        .any(|def| def.name == name && def.params.len() == args.len() && def.cond.is_some());
+    if has_conditional && !has_unconditional {
         return Err(format!(
-            "no strategy `{name}` with {} argument(s) in this module",
-            args.len()
-        ));
-    };
-    if has_cond {
-        return Err(format!(
-            "conditional parameterized strategy definition (`csd {name}`) is a follow-on"
+            "conditional strategy definition (`csd {name}`) is a follow-on"
         ));
     }
-    let mut body = body0;
-    for (p, a) in params.iter().zip(args.iter()) {
-        body = subst_strat_tokens(&body, p, a);
+    let mut vars = seed.clone();
+    let mut resolved_args = Vec::with_capacity(args.len());
+    for arg in args {
+        resolved_args.push(parse_build(arg, grammar, &lm.built, i, &mut vars)?);
     }
-    resolve(&body, lm, i, depth + 1)
+    if vars.count() != seed.count() {
+        return Err(format!(
+            "strategy call `{name}` contains an unbound argument variable"
+        ));
+    }
+    Ok(Rc::new(RStrat::Call {
+        name: name.to_string(),
+        args: resolved_args,
+    }))
 }
 
-/// Substitute the token sequence `find` with `repl` in every raw token bubble of a strategy expression.
-fn subst_strat_tokens(e: &StratExpr, find: &[Token], repl: &[Token]) -> StratExpr {
-    match e {
-        StratExpr::Idle => StratExpr::Idle,
-        StratExpr::Fail => StratExpr::Fail,
-        StratExpr::All => StratExpr::All,
-        StratExpr::Apply {
-            label,
-            subst,
-            substrats,
-        } => StratExpr::Apply {
-            label: label.clone(),
-            subst: subst
-                .iter()
-                .map(|(v, t)| (replace_subseq(v, find, repl), replace_subseq(t, find, repl)))
-                .collect(),
-            substrats: substrats
-                .iter()
-                .map(|s| subst_strat_tokens(s, find, repl))
-                .collect(),
-        },
-        StratExpr::Top(a) => StratExpr::Top(Box::new(subst_strat_tokens(a, find, repl))),
-        StratExpr::One(a) => StratExpr::One(Box::new(subst_strat_tokens(a, find, repl))),
-        StratExpr::Seq(a, b) => StratExpr::Seq(
-            Box::new(subst_strat_tokens(a, find, repl)),
-            Box::new(subst_strat_tokens(b, find, repl)),
-        ),
-        StratExpr::Union(a, b) => StratExpr::Union(
-            Box::new(subst_strat_tokens(a, find, repl)),
-            Box::new(subst_strat_tokens(b, find, repl)),
-        ),
-        StratExpr::Star(a) => StratExpr::Star(Box::new(subst_strat_tokens(a, find, repl))),
-        StratExpr::Plus(a) => StratExpr::Plus(Box::new(subst_strat_tokens(a, find, repl))),
-        StratExpr::Normalize(a) => {
-            StratExpr::Normalize(Box::new(subst_strat_tokens(a, find, repl)))
-        }
-        StratExpr::Sugar { kind, args } => StratExpr::Sugar {
-            kind: *kind,
-            args: args
-                .iter()
-                .map(|e| subst_strat_tokens(e, find, repl))
-                .collect(),
-        },
-        StratExpr::Branch {
-            test,
-            success,
-            failure,
-        } => StratExpr::Branch {
-            test: Box::new(subst_strat_tokens(test, find, repl)),
-            success: Box::new(subst_strat_tokens(success, find, repl)),
-            failure: Box::new(subst_strat_tokens(failure, find, repl)),
-        },
-        StratExpr::Test {
-            kind,
-            pattern,
-            cond,
-        } => StratExpr::Test {
-            kind: *kind,
-            pattern: replace_subseq(pattern, find, repl),
-            cond: cond.as_ref().map(|c| replace_subseq(c, find, repl)),
-        },
-        StratExpr::MatchRew {
-            kind,
-            pattern,
-            cond,
-            subs,
-        } => StratExpr::MatchRew {
-            kind: *kind,
-            pattern: replace_subseq(pattern, find, repl),
-            cond: cond.as_ref().map(|c| replace_subseq(c, find, repl)),
-            subs: subs
-                .iter()
-                .map(|(v, s)| {
-                    (
-                        replace_subseq(v, find, repl),
-                        subst_strat_tokens(s, find, repl),
-                    )
-                })
-                .collect(),
-        },
-        StratExpr::Call { name, args } => StratExpr::Call {
-            name: name.clone(),
-            args: args.iter().map(|a| replace_subseq(a, find, repl)).collect(),
-        },
-    }
-}
-
-/// Replace each non-overlapping occurrence of `find` with `repl` (token identity by interned symbol).
-fn replace_subseq(toks: &[Token], find: &[Token], repl: &[Token]) -> Vec<Token> {
-    if find.is_empty() {
-        return toks.to_vec();
-    }
-    let mut out = Vec::new();
-    let mut k = 0;
-    while k < toks.len() {
-        if k + find.len() <= toks.len()
-            && toks[k..k + find.len()]
-                .iter()
-                .zip(find)
-                .all(|(a, b)| a.sym == b.sym)
+fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram {
+    let mut program = StrategyProgram::default();
+    let mut seen_declarations = HashSet::new();
+    for decl in &lm.built.strat_decls {
+        if let (Some(origin), Some(source_index)) = (&decl.origin, decl.source_index)
+            && !seen_declarations.insert((origin.clone(), source_index))
         {
-            out.extend_from_slice(repl);
-            k += find.len();
+            continue;
+        }
+        let Some(args) = decl
+            .domain
+            .iter()
+            .map(|sort| strategy_sort_kind(lm, sort))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let Some(subject) = strategy_sort_kind(lm, &decl.subject) else {
+            continue;
+        };
+        let key = ProfileKey {
+            name: decl.name.clone(),
+            args,
+            subject,
+        };
+        let origin = decl
+            .origin
+            .clone()
+            .unwrap_or_else(|| format!("{}#local", lm.built.name));
+        if let Some(profile) = program
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.key == key)
+        {
+            profile.origins.insert(origin);
         } else {
-            out.push(toks[k]);
-            k += 1;
+            program.profiles.push(DeclProfile {
+                key,
+                origins: HashSet::from([origin]),
+            });
         }
     }
-    out
+
+    let mut seen_definitions = HashSet::new();
+    for def in &lm.built.strat_defs {
+        if def.cond.is_some() {
+            continue;
+        }
+        if let (Some(origin), Some(source_index)) = (&def.origin, def.source_index)
+            && !seen_definitions.insert((origin.clone(), source_index))
+        {
+            continue;
+        }
+        let Some(grammar) = definition_grammar(lm, def.home.as_deref()) else {
+            // A plain donor whose grammar cannot be remapped is not executable; never silently parse its
+            // source bubbles in a different grammar.
+            continue;
+        };
+        let mut vars = VarIndex::new();
+        let mut patterns = Vec::with_capacity(def.params.len());
+        let mut arg_kinds = Vec::with_capacity(def.params.len());
+        let mut valid = true;
+        for param in &def.params {
+            match parse_build(param, grammar, &lm.built, i, &mut vars) {
+                Ok(pattern) => {
+                    arg_kinds.push(term_kind(&pattern, lm));
+                    patterns.push(pattern);
+                }
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let matching_profiles: Vec<ProfileKey> = program
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.origins.len() == 1
+                    && profile.key.name == def.name
+                    && profile.key.args == arg_kinds
+            })
+            .map(|profile| profile.key.clone())
+            .collect();
+        if matching_profiles.is_empty() {
+            continue;
+        }
+        let Ok(body) = resolve_in(&def.body, lm, grammar, i, &vars) else {
+            continue;
+        };
+        let nr_vars = vars.count();
+        for key in matching_profiles {
+            program.defs.push(RDef {
+                key,
+                patterns: patterns.clone(),
+                nr_vars,
+                body: body.clone(),
+            });
+        }
+    }
+    program
+}
+
+fn strategy_sort_kind(lm: &LoadedModule, name: &str) -> Option<KindId> {
+    lm.built
+        .sorts
+        .get(name)
+        .map(|&sort| lm.built.engine.sorts().kind_of(sort))
+}
+
+fn term_kind(term: &Term, lm: &LoadedModule) -> KindId {
+    match term {
+        Term::Var(variable) => lm.built.engine.sorts().kind_of(variable.sort),
+        _ => lm.built.engine.symbol_kind(
+            term.top_symbol()
+                .expect("non-variable term has a top symbol"),
+        ),
+    }
+}
+
+fn definition_grammar<'a>(lm: &'a LoadedModule, home: Option<&str>) -> Option<&'a CompiledGrammar> {
+    match home {
+        None => Some(&lm.grammar),
+        Some(home) if home == lm.built.name => Some(&lm.grammar),
+        Some(home) => lm.strategy_grammars.get(home),
+    }
 }
 
 /// The concatenated text of a token bubble (a variable `X:S` is one token).
@@ -892,7 +976,7 @@ impl Search {
     fn exhaust(&mut self, task: usize) {
         let parent = self.tasks[task].parent;
         let succ = match &mut self.tasks[task].kind {
-            TaskKind::Root | TaskKind::One { .. } => Vec::new(),
+            TaskKind::Root | TaskKind::One { .. } | TaskKind::Call { .. } => Vec::new(),
             TaskKind::Branch {
                 dag,
                 failure,
@@ -944,6 +1028,12 @@ impl Search {
                 self.out.push((dag, count));
                 return;
             }
+            TaskKind::Call { rest } => vec![Process {
+                dag,
+                pending: rest.clone(),
+                app: None,
+                task: parent,
+            }],
             TaskKind::Branch {
                 success,
                 rest,
@@ -1246,16 +1336,259 @@ impl Search {
                     task: t,
                 })
                 .collect(),
-            RStrat::Call(name) => match cx.defs.get(name) {
-                Some(body) => vec![Process {
-                    dag,
-                    pending: push(rest, body.clone()),
-                    app: None,
-                    task: t,
-                }],
-                None => Vec::new(),
-            },
+            RStrat::Call { name, args } => {
+                let bodies = Rc::new(call_bodies(cx, dag, name, args));
+                if bodies.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Process {
+                        dag,
+                        pending: push(rest, Rc::new(RStrat::CallGenerator { bodies, next: 0 })),
+                        app: None,
+                        task: t,
+                    }]
+                }
+            }
+            RStrat::CallGenerator { bodies, next } => {
+                if *next >= bodies.len() {
+                    Vec::new()
+                } else {
+                    let call_task = self.new_task(t, TaskKind::Call { rest: rest.clone() });
+                    let body = Process {
+                        dag,
+                        pending: push(&None, bodies[*next].clone()),
+                        app: None,
+                        task: call_task,
+                    };
+                    let again = Process {
+                        dag,
+                        pending: push(
+                            rest,
+                            Rc::new(RStrat::CallGenerator {
+                                bodies: bodies.clone(),
+                                next: next + 1,
+                            }),
+                        ),
+                        app: None,
+                        task: t,
+                    };
+                    vec![body, again]
+                }
+            }
         }
+    }
+}
+
+/// Match one named call against every compatible definition in donation order and specialize each body
+/// with its match substitution. Calls remain lazy in the resolved tree; recursive bodies are opened only
+/// when their call frame is decomposed.
+fn call_bodies(cx: &mut Cx, dag: DagId, name: &str, args: &[Term]) -> Vec<Rc<RStrat>> {
+    let subject_kind = cx.eng.sorts().kind_of(cx.eng.node(dag).sort());
+    let arg_kinds: Vec<KindId> = args
+        .iter()
+        .map(|arg| match arg {
+            Term::Var(variable) => cx.eng.sorts().kind_of(variable.sort),
+            _ => cx
+                .eng
+                .symbol_kind(arg.top_symbol().expect("non-variable call argument")),
+        })
+        .collect();
+    let mut arg_dags = Vec::with_capacity(args.len());
+    for arg in args {
+        let mut vars = Vec::new();
+        term_var_indices(arg, &mut vars);
+        if !vars.is_empty() {
+            return Vec::new();
+        }
+        arg_dags.push(inst_reduce(cx, arg, &[]));
+    }
+
+    let mut bodies = Vec::new();
+    for def in &cx.program.defs {
+        if def.key.name != name || def.key.args != arg_kinds || def.key.subject != subject_kind {
+            continue;
+        }
+        let mut substitutions = vec![vec![None; def.nr_vars as usize]];
+        for (pattern, &arg) in def.patterns.iter().zip(&arg_dags) {
+            let mut next = Vec::new();
+            for substitution in substitutions {
+                next.extend(match_extend(cx.eng, pattern, &substitution, arg, false));
+            }
+            substitutions = next;
+            if substitutions.is_empty() {
+                break;
+            }
+        }
+        for substitution in substitutions {
+            let terms: Vec<Option<Term>> = substitution
+                .into_iter()
+                .map(|binding| binding.map(|value| term_from_dag_slots(cx.eng, value)))
+                .collect();
+            bodies.push(specialize_strategy(&def.body, &terms));
+        }
+    }
+    bodies
+}
+
+fn specialize_strategy(strategy: &Rc<RStrat>, bindings: &[Option<Term>]) -> Rc<RStrat> {
+    let resolved = match &**strategy {
+        RStrat::Idle => RStrat::Idle,
+        RStrat::Fail => RStrat::Fail,
+        RStrat::Apply {
+            rules,
+            top,
+            subst,
+            substrats,
+        } => RStrat::Apply {
+            rules: rules.clone(),
+            top: *top,
+            subst: subst
+                .iter()
+                .map(|(name, term)| (name.clone(), specialize_term(term, bindings)))
+                .collect(),
+            substrats: substrats
+                .iter()
+                .map(|child| specialize_strategy(child, bindings))
+                .collect(),
+        },
+        RStrat::One(child) => RStrat::One(specialize_strategy(child, bindings)),
+        RStrat::Seq(left, right) => RStrat::Seq(
+            specialize_strategy(left, bindings),
+            specialize_strategy(right, bindings),
+        ),
+        RStrat::Union(left, right) => RStrat::Union(
+            specialize_strategy(left, bindings),
+            specialize_strategy(right, bindings),
+        ),
+        RStrat::Star(child) => RStrat::Star(specialize_strategy(child, bindings)),
+        RStrat::Plus(child) => RStrat::Plus(specialize_strategy(child, bindings)),
+        RStrat::Normalize(child) => RStrat::Normalize(specialize_strategy(child, bindings)),
+        RStrat::Branch {
+            test,
+            success,
+            failure,
+        } => RStrat::Branch {
+            test: specialize_strategy(test, bindings),
+            success: specialize_strategy(success, bindings),
+            failure: specialize_strategy(failure, bindings),
+        },
+        RStrat::Test {
+            anywhere,
+            extension,
+            pattern,
+            nr_vars,
+            cond,
+        } => RStrat::Test {
+            anywhere: *anywhere,
+            extension: *extension,
+            pattern: specialize_term(pattern, bindings),
+            nr_vars: *nr_vars,
+            cond: cond
+                .iter()
+                .map(|fragment| specialize_condition(fragment, bindings))
+                .collect(),
+        },
+        RStrat::MatchRew {
+            anywhere,
+            pattern,
+            nr_vars,
+            cond,
+            by,
+        } => RStrat::MatchRew {
+            anywhere: *anywhere,
+            pattern: specialize_term(pattern, bindings),
+            nr_vars: *nr_vars,
+            cond: cond
+                .iter()
+                .map(|fragment| specialize_condition(fragment, bindings))
+                .collect(),
+            by: by
+                .iter()
+                .map(|(variable, child)| (*variable, specialize_strategy(child, bindings)))
+                .collect(),
+        },
+        RStrat::Call { name, args } => RStrat::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| specialize_term(arg, bindings))
+                .collect(),
+        },
+        RStrat::CallGenerator { bodies, next } => RStrat::CallGenerator {
+            bodies: Rc::new(
+                bodies
+                    .iter()
+                    .map(|body| specialize_strategy(body, bindings))
+                    .collect(),
+            ),
+            next: *next,
+        },
+    };
+    Rc::new(resolved)
+}
+
+fn specialize_condition(
+    fragment: &ConditionFragment,
+    bindings: &[Option<Term>],
+) -> ConditionFragment {
+    match fragment {
+        ConditionFragment::Equality { lhs, rhs } => ConditionFragment::Equality {
+            lhs: specialize_term(lhs, bindings),
+            rhs: specialize_term(rhs, bindings),
+        },
+        ConditionFragment::SortTest { term, sort } => ConditionFragment::SortTest {
+            term: specialize_term(term, bindings),
+            sort: *sort,
+        },
+        ConditionFragment::Matching {
+            pattern,
+            subject,
+            fresh_vars,
+        } => ConditionFragment::Matching {
+            pattern: specialize_term(pattern, bindings),
+            subject: specialize_term(subject, bindings),
+            fresh_vars: fresh_vars
+                .iter()
+                .copied()
+                .filter(|&slot| bindings.get(slot as usize).is_none_or(Option::is_none))
+                .collect(),
+        },
+        ConditionFragment::Rewrite {
+            lhs,
+            pattern,
+            fresh_vars,
+        } => ConditionFragment::Rewrite {
+            lhs: specialize_term(lhs, bindings),
+            pattern: specialize_term(pattern, bindings),
+            fresh_vars: fresh_vars
+                .iter()
+                .copied()
+                .filter(|&slot| bindings.get(slot as usize).is_none_or(Option::is_none))
+                .collect(),
+        },
+    }
+}
+
+fn specialize_term(term: &Term, bindings: &[Option<Term>]) -> Term {
+    match term {
+        Term::Var(variable) => bindings
+            .get(variable.index as usize)
+            .and_then(Option::as_ref)
+            .cloned()
+            .unwrap_or_else(|| term.clone()),
+        Term::Op { symbol, args } => Term::Op {
+            symbol: *symbol,
+            args: args
+                .iter()
+                .map(|arg| specialize_term(arg, bindings))
+                .collect(),
+        },
+        Term::Iter { symbol, count, arg } => Term::Iter {
+            symbol: *symbol,
+            count: count.clone(),
+            arg: Box::new(specialize_term(arg, bindings)),
+        },
+        Term::Na { .. } => term.clone(),
     }
 }
 
@@ -1691,4 +2024,124 @@ fn dedup(eng: &Engine, sols: Vec<StratSolution>) -> Vec<StratSolution> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::tokenize;
+    use crate::load::build_loaded_module;
+    use crate::surface::parser::Parser;
+
+    fn loaded_strategy_module(source: &str) -> (LoadedModule, Interner) {
+        let mut interner = Interner::new();
+        let tokens = tokenize(source, &mut interner);
+        let mut source = Parser::new(&tokens, &interner)
+            .parse_source()
+            .expect("parse strategy module");
+        assert_eq!(source.modules.len(), 1);
+        let module = source.modules.remove(0);
+        let loaded = build_loaded_module(&module, &mut interner).expect("build strategy module");
+        (loaded, interner)
+    }
+
+    #[test]
+    fn declaration_profiles_use_kinds_not_exact_sorts() {
+        let (loaded, interner) = loaded_strategy_module(
+            "smod STRAT-PROFILES is
+               sorts K A B T .
+               subsorts A B < K .
+               ops a : -> A .
+               op b : -> B .
+               op t : -> T .
+               strat same : A @ A .
+               strat same : B @ B .
+               strat same : T @ T .
+               strat zero : @ A .
+               strat zero : @ B .
+             endsm",
+        );
+        let program = compile_strategy_program(&loaded, &interner);
+        let same = program
+            .profiles
+            .iter()
+            .filter(|profile| profile.key.name == "same")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            same.len(),
+            2,
+            "A/B declarations coalesce by their shared argument and subject kinds; T stays distinct"
+        );
+        assert_eq!(
+            program
+                .profiles
+                .iter()
+                .filter(|profile| profile.key.name == "zero")
+                .count(),
+            1,
+            "zero-argument declarations ignore the exact A/B subject sort within one kind"
+        );
+    }
+
+    #[test]
+    fn definitions_keep_order_and_share_lhs_variable_slots() {
+        let (loaded, interner) = loaded_strategy_module(
+            "smod STRAT-DEFINITIONS is
+               sort S .
+               ops a b : -> S .
+               var X : S .
+               strat choose : S @ S .
+               strat pair : S S @ S .
+               sd choose(a) := idle .
+               sd choose(b) := fail .
+               sd pair(X, X) := match X .
+             endsm",
+        );
+        let program = compile_strategy_program(&loaded, &interner);
+        let choose = program
+            .defs
+            .iter()
+            .filter(|definition| definition.key.name == "choose")
+            .collect::<Vec<_>>();
+        assert_eq!(choose.len(), 2);
+        let pattern_name = |definition: &RDef| match &definition.patterns[0] {
+            Term::Op { symbol, args } if args.is_empty() => {
+                loaded.built.engine.symbol(*symbol).name()
+            }
+            pattern => panic!("expected constant definition pattern, got {pattern:?}"),
+        };
+        assert_eq!(
+            choose
+                .iter()
+                .map(|definition| pattern_name(definition))
+                .collect::<Vec<_>>(),
+            ["a", "b"],
+            "definition donation order is retained"
+        );
+
+        let pair = program
+            .defs
+            .iter()
+            .find(|definition| definition.key.name == "pair")
+            .expect("pair definition");
+        assert_eq!(pair.nr_vars, 1);
+        let [Term::Var(left), Term::Var(right)] = pair.patterns.as_slice() else {
+            panic!("expected two variable patterns");
+        };
+        assert_eq!(
+            left.index, right.index,
+            "both lhs occurrences bind the same strategy variable slot"
+        );
+        let RStrat::Test {
+            pattern: Term::Var(body),
+            ..
+        } = &*pair.body
+        else {
+            panic!("expected match test body");
+        };
+        assert_eq!(
+            body.index, left.index,
+            "the lhs binding is shared with the resolved definition body"
+        );
+    }
 }

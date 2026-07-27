@@ -608,11 +608,7 @@ fn handle_module_operation(
     } else {
         None
     };
-    let module = if name == "srewriteTerm" {
-        module
-    } else {
-        source_module.as_ref().map_or(module, |root| root.get())
-    };
+    let module = source_module.as_ref().map_or(module, |root| root.get());
     match name {
         "reduceTerm" => {
             let (work, term, type_) =
@@ -1164,7 +1160,6 @@ fn handle_module_operation(
                 session,
                 ctx,
                 hooks,
-                module_name,
                 depth_first,
                 vec![module, *args.get(3)?, *args.get(4)?, *args.get(6)?],
             )?;
@@ -1205,24 +1200,23 @@ fn invoke_srewrite_descent(
     session: &mut Session,
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
-    module_name: &str,
     depth_first: bool,
     args: Vec<DagId>,
 ) -> Option<(DagId, u64)> {
     let symbol = ctx.resolve_op(&format!("%externalCall{}", args.len()), args.len())?;
     let redex = ctx.app(symbol, args);
     let before = ctx.rewrites();
-    let Session {
-        interner,
-        db,
-        modules,
-        views,
-        meta_state,
-        ..
-    } = session;
-    let strat_defs = &modules.get(module_name)?.built.strat_defs;
-    let mut descent = MetaDescent::new(interner, db, views, meta_state);
-    let result = descent.srewrite_with_strat_defs(ctx, hooks, redex, depth_first, strat_defs)?;
+    let result = {
+        let Session {
+            interner,
+            db,
+            views,
+            meta_state,
+            ..
+        } = session;
+        let mut descent = MetaDescent::new(interner, db, views, meta_state);
+        descent.descend(ctx, MetaOp::Srewrite { depth_first }, hooks, redex)?
+    };
     Some((result, ctx.rewrites().saturating_sub(before)))
 }
 

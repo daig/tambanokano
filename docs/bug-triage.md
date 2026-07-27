@@ -39,7 +39,7 @@ Severity is impact, not implementation order:
 | TNK-002 | Critical | Bug | Out-of-range `frozen` attribute panics instead of recovering | **Resolved 2026-07-26**; oracle-differential fixture retained |
 | TNK-003 | Critical | Bug | Nonbinary `assoc` declaration panics instead of recovering | **Resolved 2026-07-26**; oracle-differential fixture retained |
 | TNK-004 | High | Bug | Stuck conditional prevents required branch normalization | **Resolved 2026-07-26**; oracle-differential fixtures retained |
-| TNK-005 | High | Compatibility rejection | Imported strategy declarations/definitions disappear during flattening | Confirmed by direct oracle/tnk probe |
+| TNK-005 | High | Compatibility rejection | Imported strategy declarations/definitions disappear during flattening | **Resolved 2026-07-26**; six oracle-differential fixtures retained |
 | TNK-006 | Medium | Compatibility rejection | `top` on a non-application strategy errors instead of being ignored | Confirmed by direct oracle/tnk probe |
 | TNK-007 | Medium | Bug | Exact `decFloat(_, 0)` fails for extreme subnormals | Confirmed by direct oracle/tnk probe |
 | TNK-008 | Medium | Bug | Incomparable membership targets use the wrong tiebreak | Confirmed by direct oracle/tnk probe |
@@ -270,17 +270,17 @@ Signature construction also mirrors Maude's BranchSymbol sort completion: for ea
 
 ---
 
-### TNK-005 — Imported strategy declarations and definitions are unavailable
+### TNK-005 — Imported strategy declarations and definitions are unavailable — RESOLVED
 
 - **Severity:** High
 - **Classification:** Compatibility rejection
-- **Confidence:** Confirmed by direct comparison
-- **Primary area:** strategy-module flattening
-- **Likely implementation touchpoint:** `tnk-modules/src/flatten.rs`
+- **Resolved:** 2026-07-26
+- **Evidence:** six oracle-differential fixtures plus focused representation tests
+- **Primary areas:** module-expression flattening, strategy definition dispatch, home grammars, reflection, and session lifecycle
 
 #### Summary
 
-The module flattener carries the root strategy module's own `strat`/`sd` declarations but does not merge strategy declarations and definitions from imports. Ordinary sorts, operators, and rules from the imported module are present, leaving an internally inconsistent flattened strategy module.
+The module flattener formerly kept only the root strategy module's own `strat`/`sd` declarations. Ordinary imported sorts, operators, and rules were present, but an imported named strategy was rejected as unknown. Strategy modules therefore did not compose through the same module algebra as their ordinary declarations.
 
 #### Reproduction used
 
@@ -300,34 +300,38 @@ endsm
 srew in STRAT-USE : a using go .
 ```
 
-#### Expected behavior
+Maude resolves `go` and returns one `S: b` solution with one rewrite. The frozen tnk baseline instead reported that `go` was neither a rule label nor a strategy.
 
-Maude resolves imported strategy `go` and returns solution `b` with one rewrite.
+#### Resolution
 
-#### Actual behavior
+Strategy declarations and definitions now travel through the module-expression accumulator with stable source origin, source position, and plain-import home provenance. Direct, transitive, all-mode, sum, ordinary-renaming, and functional-instantiation paths preserve or transform the payload in the same order as ordinary module donation. Diamond paths suppress only repeated donations of the same origin; text-identical declarations from independent modules remain distinct. An ordinary module importing a strategy module ignores the complete illegal import and continues processing later input.
 
-tnk reports:
+The strategy compiler now resolves declaration profiles by argument and subject kinds, retains ordered definition candidates instead of overwriting by name, compiles each definition lhs, matches every compatible candidate, and specializes the body with the shared lhs substitution. Calls remain lazy, so recursive definitions do not expand during resolution. Plain imported definitions parse against a donor grammar whose semantic actions are re-pointed to destination-engine symbol/sort identities; an unmappable donor is skipped rather than parsed under the wrong grammar.
 
-```text
-error: `go` is neither a rule label nor a strategy of this module
-```
+Source and flattened strategy collections remain separate for `upStratDecls`, `upSds`, and `upModule`. The local META-INTERPRETER path consumes the same source-backed representation rather than patching a rebuilt module with a second definition list. Ordinary dependency invalidation rebuilds existing strategy importers after a donor redefinition.
 
-#### Impact
+#### Retained coverage
 
-- Strategy modules are not compositionally importable.
-- Real strategy libraries must duplicate declarations/definitions into each root module.
-- The current broad statement that strategy modules and named strategies are implemented needs this qualification.
+- `conformance/audit/A3f-strategy-import-basic.maude` — direct/transitive `protecting`/`extending`/`including`, declaration-only strategies, illegal cross-family import, and session continuity.
+- `conformance/audit/A3g-strategy-import-order.maude` — multiple definitions, local/import weaving, import-order reversal, diamond/repeated-origin dedup, independent conflicts, values, and cumulative counts.
+- `conformance/audit/A3h-strategy-definition-dispatch.maude` — kind profiles, same-kind overloads, subject-kind selection, definition-lhs matching, and shared bindings.
+- `conformance/audit/A3i-strategy-import-home.maude` — donor-grammar collisions, nested imported calls, unmappable definitions, and recovery.
+- `conformance/audit/A3j-strategy-import-transform.maude` — sums, renaming, instantiation, and donor redefinition.
+- `conformance/audit/A5g-strategy-import-reflection.maude` — source/flat and transformed strategy projections through the standalone and `upModule` APIs.
+- Focused Rust tests pin origin identity, kind profiles, candidate order/shared variables, destination identities, recursive payload transforms, source/flat separation, and importer invalidation.
 
-#### Current understanding
-
-Strategy declaration/definition lists are handled as root-owned data instead of participating in import flattening and deduplication. The repair must preserve home-module parsing, name resolution, import order, and duplicate behavior rather than merely concatenating token bubbles.
+Binding implementation record: [`migration/tnk-005-strategy-imports-goal.md`](migration/tnk-005-strategy-imports-goal.md).
 
 #### Acceptance contract
 
-- Imported strategy declarations and definitions are available in the importing module.
-- The probe produces `b` with oracle-compatible count/order.
-- Diamond imports and duplicate strategy names have defined, oracle-derived behavior.
-- Reflection of the flattened strategy module remains consistent with execution.
+- [x] Imported strategy declarations and definitions execute in every legal import mode.
+- [x] The motivating probe produces `b` with one rewrite.
+- [x] Diamond/repeated origins and independent conflicts follow oracle-derived order and deduplication.
+- [x] Overloaded and multi-definition calls retain every matching candidate and lhs binding.
+- [x] Plain imports preserve donor grammar semantics without foreign engine identities.
+- [x] Sum, ordinary renaming, instantiation, and redefinition preserve strategy behavior.
+- [x] Source/flat reflection agrees with execution.
+- [x] Illegal imports and malformed donor definitions remain recoverable.
 
 ---
 
@@ -736,7 +740,7 @@ TNK-004 is resolved with retained value, count, sort, laziness, and equation-ord
 
 ### 8.3 Strategy composition group
 
-TNK-005 and TNK-006 remain legal-input compatibility failures. TNK-001's operator-evaluation machinery is resolved independently; GAP-005/GAP-006 and RISK-001 remain separate proposals so strategy-language work does not silently become an unbounded rewrite.
+TNK-005 is resolved with compositional-import, ordering, transform, reflection, lifecycle, and recovery fixtures. TNK-006 remains a legal-input compatibility failure. TNK-001's operator-evaluation machinery is resolved independently; GAP-005/GAP-006 and RISK-001 remain separate proposals so strategy-language work does not silently become an unbounded rewrite.
 
 ### 8.4 Reflection group
 
@@ -757,7 +761,7 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, the TNK-002 probes in `conformance/audit/A3a-rewrite-frozen.maude`, the TNK-003 probes in `conformance/audit/A1b-opdecl-arity.maude`, and the TNK-004 probes in `conformance/audit/A3e-branch-stuck.maude` plus `conformance/prelude-bool.maude`; the other direct survey probes have not yet been added to the permanent corpus.
+The TNK-001 probes are retained in `conformance/strat.maude`, the TNK-002 probes in `conformance/audit/A3a-rewrite-frozen.maude`, the TNK-003 probes in `conformance/audit/A1b-opdecl-arity.maude`, the TNK-004 probes in `conformance/audit/A3e-branch-stuck.maude` plus `conformance/prelude-bool.maude`, and the TNK-005 matrix in `conformance/audit/A3f`–`A3j` plus `A5g`. The remaining direct survey probes have not yet all been added to the permanent corpus.
 
 ## 9. Prototype/v0 decision view
 
@@ -765,7 +769,7 @@ This document does not set release priority. It exposes the decisions:
 
 - **How much sibling declaration-recovery validation is required for v0?** The confirmed TNK-002 and TNK-003 panics are resolved; adjacent theory-attribute cases remain unverified risk candidates rather than confirmed defects.
 - **Can v0 claim open-term functional reduction?** TNK-004 no longer blocks this claim for BranchSymbol: its symbolic-condition value, count, and sort contract is retained against the oracle.
-- **Can v0 claim compositional strategy modules?** If so, TNK-005 needs resolution.
+- **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, and session invalidation covered by TNK-005. The separate TNK-006 generalized-`top` deviation remains.
 - **Are narrow numeric/nonconfluent/reflection corners acceptable as documented limitations?** This governs TNK-007–009.
 - **Is the 60-second I-S gate binding?** This governs TNK-010.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.

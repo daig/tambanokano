@@ -1,0 +1,86 @@
+*** A3g-strategy-import-order — definition order/counts, diamond dedup, and independent conflicts (TNK-005)
+mod A3G-COMMON is
+  sort S .
+  ops a b c d e : -> S .
+  rl [rb] : a => b .
+  rl [rc] : a => c .
+  rl [rd] : a => d .
+  rl [re] : a => e .
+endm
+
+smod A3G-MULTI is
+  protecting A3G-COMMON .
+  strat multi @ S .
+  sd multi := rb .
+  sd multi := rc .
+endsm
+srewrite in A3G-MULTI : a using multi .
+
+smod A3G-SHARED-BASE is
+  protecting A3G-COMMON .
+  strat shared @ S .
+  sd shared := rb .
+endsm
+smod A3G-LOCAL is
+  extending A3G-SHARED-BASE .
+  sd shared := rd .
+endsm
+srewrite in A3G-LOCAL : a using shared .
+
+smod A3G-WEAVE-BASE is
+  protecting A3G-COMMON .
+  strat weave @ S .
+  sd weave := rb .
+endsm
+smod A3G-WEAVE-LEFT is
+  extending A3G-WEAVE-BASE .
+  sd weave := rc .
+endsm
+smod A3G-WEAVE-RIGHT is
+  extending A3G-WEAVE-BASE .
+  sd weave := rd .
+endsm
+smod A3G-WEAVE-TOP is
+  including A3G-WEAVE-LEFT .
+  including A3G-WEAVE-RIGHT .
+endsm
+smod A3G-WEAVE-TOP-REV is
+  including A3G-WEAVE-RIGHT .
+  including A3G-WEAVE-LEFT .
+endsm
+smod A3G-WEAVE-LOCAL is
+  including A3G-WEAVE-LEFT .
+  including A3G-WEAVE-RIGHT .
+  sd weave := re .
+endsm
+srewrite in A3G-WEAVE-TOP : a using weave .
+srewrite in A3G-WEAVE-TOP-REV : a using weave .
+srewrite in A3G-WEAVE-LOCAL : a using weave .
+
+smod A3G-REPEAT is
+  protecting A3G-SHARED-BASE .
+  protecting A3G-SHARED-BASE .
+endsm
+srewrite in A3G-REPEAT : a using shared .
+
+smod A3G-CONFLICT-LEFT is
+  protecting A3G-COMMON .
+  strat conflict @ S .
+  sd conflict := rb .
+endsm
+smod A3G-CONFLICT-RIGHT is
+  protecting A3G-COMMON .
+  strat conflict @ S .
+  sd conflict := rc .
+endsm
+smod A3G-CONFLICT-USE is
+  protecting A3G-CONFLICT-LEFT .
+  protecting A3G-CONFLICT-RIGHT .
+endsm
+srewrite in A3G-CONFLICT-USE : a using conflict .
+mod A3G-SENTINEL is
+  sort T .
+  ops x y : -> T .
+  rl [ok] : x => y .
+endm
+rewrite in A3G-SENTINEL : x .

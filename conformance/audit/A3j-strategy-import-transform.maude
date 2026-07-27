@@ -1,0 +1,74 @@
+*** A3j-strategy-import-transform — sum, ordinary renaming, instantiation, and redefinition transform strategies (TNK-005)
+smod A3J-SUM-LEFT is
+  sort S .
+  ops a b c : -> S .
+  rl [rb] : a => b .
+  rl [rc] : a => c .
+  strat left @ S .
+  sd left := rb .
+endsm
+smod A3J-SUM-RIGHT is
+  protecting A3J-SUM-LEFT .
+  strat right @ S .
+  sd right := rc .
+endsm
+smod A3J-SUM is
+  protecting A3J-SUM-LEFT + A3J-SUM-RIGHT .
+endsm
+srewrite in A3J-SUM : a using left | right .
+
+smod A3J-RENAME-SOURCE is
+  sort Elt .
+  ops a b : -> Elt .
+  op wrap : Elt -> Elt .
+  var X : Elt .
+  rl [step] : wrap(a) => wrap(b) .
+  strat go : Elt @ Elt .
+  sd go(X) := match wrap(X) ; step .
+endsm
+smod A3J-RENAMED is
+  protecting A3J-RENAME-SOURCE * (sort Elt to Item, op wrap to box, label step to moved) .
+endsm
+srewrite in A3J-RENAMED : box(a) using go(a) .
+
+fth A3J-THEORY is
+  sort Elt .
+endfth
+smod A3J-PARAM{X :: A3J-THEORY} is
+  var Y : X$Elt .
+  strat keep : X$Elt @ X$Elt .
+  sd keep(Y) := match Y .
+endsm
+fmod A3J-TARGET is
+  sort Elt .
+  op x : -> Elt .
+endfm
+view A3J-VIEW from A3J-THEORY to A3J-TARGET is
+  sort Elt to Elt .
+endv
+smod A3J-INSTANTIATED is
+  protecting A3J-PARAM{A3J-VIEW} .
+endsm
+srewrite in A3J-INSTANTIATED : x using keep(x) .
+
+mod A3J-RD-COMMON is
+  sort R .
+  ops p q r : -> R .
+  rl [rq] : p => q .
+  rl [rr] : p => r .
+endm
+smod A3J-RD-BASE is
+  protecting A3J-RD-COMMON .
+  strat change @ R .
+  sd change := rq .
+endsm
+smod A3J-RD-USE is
+  protecting A3J-RD-BASE .
+endsm
+srewrite in A3J-RD-USE : p using change .
+smod A3J-RD-BASE is
+  protecting A3J-RD-COMMON .
+  strat change @ R .
+  sd change := rr .
+endsm
+srewrite in A3J-RD-USE : p using change .

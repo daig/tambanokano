@@ -1,0 +1,64 @@
+*** A3h-strategy-definition-dispatch — kind overloads and lhs matching select every applicable sd (TNK-005)
+smod A3H-DISTINCT is
+  sorts S T .
+  ops a b : -> S .
+  ops x y : -> T .
+  rl [rs] : a => b .
+  rl [rt] : x => y .
+  vars QS : S .
+  vars QT : T .
+  strat pick : S @ S .
+  strat pick : T @ T .
+  sd pick(QS) := rs .
+  sd pick(QT) := rt .
+endsm
+srewrite in A3H-DISTINCT : a using pick(a) .
+srewrite in A3H-DISTINCT : x using pick(x) .
+
+smod A3H-SAME-KIND is
+  sorts K A B .
+  subsorts A B < K .
+  ops aa ar : -> A .
+  ops bb br : -> B .
+  rl [ra] : aa => ar .
+  rl [rb] : bb => br .
+  vars QA : A .
+  vars QB : B .
+  strat collide : A @ A .
+  strat collide : B @ B .
+  sd collide(QA) := ra .
+  sd collide(QB) := rb .
+endsm
+srewrite in A3H-SAME-KIND : aa using collide(aa) .
+srewrite in A3H-SAME-KIND : bb using collide(bb) .
+
+smod A3H-SUBJECT is
+  sorts S T .
+  ops a b : -> S .
+  ops x y : -> T .
+  rl [rs] : a => b .
+  rl [rt] : x => y .
+  strat subjectOnly @ S .
+  strat subjectOnly @ T .
+  sd subjectOnly := rs .
+  sd subjectOnly := rt .
+endsm
+srewrite in A3H-SUBJECT : a using subjectOnly .
+srewrite in A3H-SUBJECT : x using subjectOnly .
+
+smod A3H-PATTERN is
+  sort S .
+  ops a b c d : -> S .
+  rl [ra] : a => c .
+  rl [rb] : a => d .
+  var X : S .
+  strat choose echo : S @ S .
+  sd choose(b) := rb .
+  sd choose(a) := ra .
+  sd echo(X) := match X .
+endsm
+srewrite in A3H-PATTERN : a using choose(a) .
+srewrite in A3H-PATTERN : a using choose(b) .
+srewrite in A3H-PATTERN : a using choose(c) .
+srewrite in A3H-PATTERN : a using echo(a) .
+srewrite in A3H-PATTERN : b using echo(b) .

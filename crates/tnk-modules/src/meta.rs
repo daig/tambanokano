@@ -31,17 +31,18 @@
 //!   and `metaWellFormed{Module,Term,Substitution}` (structural checks → `Bool`).
 //!
 //! Every implemented descent function conforms on **value, sort, rewrite count, *and* layout** (Stage 3.5
-//! taught `print_pretty` the `format` attribute). Base unification, variants, narrowing, and SMT checking
-//! have dedicated `MetaOp` variants; **SMT search** and **strategy-meta** descent remain in
-//! `MetaOp::Deferred`. Those deferred operations parse and load but reduce to the kind level; exhaustive
-//! dispatch still forces an explicit choice whenever a new descent operation is added. The strategy
-//! *language* itself
-//! (`srewrite`/`dsrewrite`, the full
-//! combinator + matchrew + conditional-rule surface) is **complete and conformant** in `tnk-frontend::strategy`
-//! (Phase 2.4 A–D); only the strategy *meta-reflection* (`upStratDecls`/`upSds`/`metaParseStrategy`/
-//! `metaPrettyPrintStrategy` — the Stage-5 strategy tail) stays inert here, pending sort-aware constructor
-//! resolution + a non-desugaring parse + the StratExpr→Strategy up-translation/inverse (`fable-audit.md`). The residuals are orthogonal corners, each riding its own
-//! subsystem (`fable-audit.md`): the Stage-3
+//! taught `print_pretty` the `format` attribute). Unification, variants, narrowing, SMT checking/search,
+//! strategic rewriting, and strategy declaration/definition reflection have dedicated [`MetaOp`] variants;
+//! exhaustive dispatch forces an explicit choice whenever a new descent operation is added.
+//!
+//! The strategy language supports both search modes, named strategy-module composition, the core
+//! combinators, tests, and matchrew/amatchrew. `xmatchrew` and conditional `csd` remain explicit
+//! resolution-time boundaries. `upModule`, `upStratDecls`, and `upSds` reflect source or flattened strategy
+//! payloads, including the covered sum/renaming/instantiation forms. The remaining strategy-meta gap is the
+//! parse/print pair (`metaParseStrategy`/`metaPrettyPrintStrategy`), which needs the inverse
+//! Strategy↔[`StratExpr`] translation without losing surface sugar.
+//!
+//! Other residuals are orthogonal corners, each riding its own subsystem (`fable-audit.md`): the Stage-3
 //! compute corners (conditional-rule `metaApply`, conditioned `metaMatch`, the partial substitution, the
 //! AC-residue `metaXmatch` context, the exhausted-search count); and the Stage-4 boundaries (flat-mode
 //! builtin imports — `special`/`poly` op hooks *and* the imported builtin module's statements, both leaving
@@ -83,7 +84,7 @@ use tnk_frontend::strategy::{StratSolution, srewrite_dag};
 use tnk_frontend::surface::ast::{
     Attrs, GatherElem, IdSide, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap,
     Parameter, PreModule, RenameItem, SpecialSpec, Statement, StratDecl, StratDef, StratExpr,
-    StratSugar, ViewDecl,
+    StratSugar, TestKind, ViewDecl,
 };
 
 use crate::db::ModuleDb;
@@ -948,36 +949,12 @@ impl MetaDescent<'_> {
     /// Execute the `(n+1)`-th META-INTERPRETER strategy result while retaining the completed search.
     /// Strategy search computes its solution stream eagerly; the cache transfers only the cumulative
     /// prefix through result `n`, then transfers the remaining tail when exhaustion is requested.
-    /// Execute a META-INTERPRETER strategy against the reflected module while restoring source-only
-    /// strategy definitions that `upModule` cannot yet encode.
-    pub fn srewrite_with_strat_defs(
-        &mut self,
-        ctx: &mut MetaCtx,
-        hooks: &MetaHooks,
-        redex: DagId,
-        depth_first: bool,
-        strat_defs: &[tnk_frontend::surface::ast::StratDef],
-    ) -> Option<DagId> {
-        self.meta_srewrite_inner(ctx, hooks, redex, depth_first, Some(strat_defs))
-    }
-
     fn meta_srewrite(
         &mut self,
         ctx: &mut MetaCtx,
         hooks: &MetaHooks,
         redex: DagId,
         depth_first: bool,
-    ) -> Option<DagId> {
-        self.meta_srewrite_inner(ctx, hooks, redex, depth_first, None)
-    }
-
-    fn meta_srewrite_inner(
-        &mut self,
-        ctx: &mut MetaCtx,
-        hooks: &MetaHooks,
-        redex: DagId,
-        depth_first: bool,
-        strat_defs: Option<&[tnk_frontend::surface::ast::StratDef]>,
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         if kids.len() != 4 {
@@ -998,10 +975,6 @@ impl MetaDescent<'_> {
                 .map(|dag| ctx.root(dag))
                 .collect();
             let mut loaded = self.down_module(ctx, hooks, key.module)?;
-            if let Some(strat_defs) = strat_defs {
-                loaded.built.strat_defs.clear();
-                loaded.built.strat_defs.extend_from_slice(strat_defs);
-            }
             let subject = down_term(ctx, hooks, key.subject, &mut loaded.built, self.interner)?;
             let strategy =
                 down_strategy(ctx, hooks, key.strategy, &mut loaded.built, self.interner)?;
@@ -4933,8 +4906,16 @@ impl MetaDescent<'_> {
             mbs,
             eqs,
             rls,
-            strat_decls: flat_pm.strat_decls.clone(),
-            strat_defs: flat_pm.strat_defs.clone(),
+            strat_decls: if flat {
+                flat_pm.strat_decls.clone()
+            } else {
+                pm.strat_decls.clone()
+            },
+            strat_defs: if flat {
+                flat_pm.strat_defs.clone()
+            } else {
+                pm.strat_defs.clone()
+            },
             loaded,
         })
     }
@@ -8192,7 +8173,26 @@ fn up_strategy(
         StratExpr::Call { name, args } => {
             up_call_strategy(ctx, hooks, loaded, interner, name, args)
         }
-        StratExpr::Test { .. } | StratExpr::MatchRew { .. } => None,
+        StratExpr::Test {
+            kind,
+            pattern,
+            cond,
+        } => {
+            // The empty condition is represented by the nullary identity of META-CONDITION's
+            // conjunction. Conditioned tests need one shared VarIndex across pattern and condition.
+            if cond.is_some() {
+                return None;
+            }
+            let pattern = up_strategy_term(ctx, hooks, loaded, interner, pattern)?;
+            let condition = ctx.app(hooks.ops["conjunctionSymbol"], Vec::new());
+            let hook = match kind {
+                TestKind::Match => "matchStratSymbol",
+                TestKind::XMatch => "xmatchStratSymbol",
+                TestKind::AMatch => "amatchStratSymbol",
+            };
+            Some(ctx.app(hooks.ops[hook], vec![pattern, condition]))
+        }
+        StratExpr::MatchRew { .. } => None,
     }
 }
 
@@ -10593,6 +10593,9 @@ fn down_strat_decls(
             name: qid_text(ctx, kids[0])?,
             domain: down_typelist(ctx, hooks, kids[1]),
             subject: qid_text(ctx, kids[2])?,
+            origin: None,
+            source_index: None,
+            home: None,
         });
     }
     Some(result)
@@ -10657,6 +10660,9 @@ fn down_strat_defs(
             params,
             body,
             cond: condition,
+            origin: None,
+            source_index: None,
+            home: None,
         });
     }
     Some(result)

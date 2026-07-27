@@ -656,4 +656,92 @@ mod tests {
             "got: {err}"
         );
     }
+
+    #[test]
+    fn strategy_home_grammar_actions_use_destination_identities() {
+        use tnk_frontend::grammar::Action;
+
+        let program = load_program(
+            "fmod STRAT-HOME-SHIFT is
+               sort Q .
+               ops q0 q1 q2 : -> Q .
+             endfm
+             smod STRAT-HOME-DONOR is
+               sort S .
+               op a : -> S .
+               op h : S -> S .
+               var X : S .
+               strat home : S @ S .
+               sd home(X) := match h(X) .
+             endsm
+             smod STRAT-HOME-USE is
+               protecting STRAT-HOME-SHIFT .
+               protecting STRAT-HOME-DONOR .
+             endsm",
+        )
+        .expect("load homed strategy modules");
+        let donor = &program.modules[program.module_index["STRAT-HOME-DONOR"]];
+        let importer = &program.modules[program.module_index["STRAT-HOME-USE"]];
+        let mapped = importer
+            .strategy_grammars
+            .get("STRAT-HOME-DONOR")
+            .expect("remapped donor grammar");
+
+        let donor_h = donor
+            .grammar
+            .prods
+            .iter()
+            .find_map(|production| match production.action {
+                Action::MakeTerm(symbol) if donor.built.engine.symbol(symbol).name() == "h" => {
+                    Some(symbol)
+                }
+                _ => None,
+            })
+            .expect("donor h action");
+        let imported_h = mapped
+            .prods
+            .iter()
+            .find_map(|production| match production.action {
+                Action::MakeTerm(symbol) if importer.built.engine.symbol(symbol).name() == "h" => {
+                    Some(symbol)
+                }
+                _ => None,
+            })
+            .expect("destination h action");
+        assert_ne!(
+            donor_h, imported_h,
+            "the preceding import shifts destination symbol identities"
+        );
+        assert_eq!(importer.built.engine.symbol(imported_h).name(), "h");
+
+        let donor_variable_sort = donor
+            .grammar
+            .prods
+            .iter()
+            .find_map(|production| match production.action {
+                Action::MakeVariable(sort) if donor.built.engine.sorts().name(sort) == "S" => {
+                    Some(sort)
+                }
+                _ => None,
+            })
+            .expect("donor S variable action");
+        let imported_variable_sort = mapped
+            .prods
+            .iter()
+            .find_map(|production| match production.action {
+                Action::MakeVariable(sort) if importer.built.engine.sorts().name(sort) == "S" => {
+                    Some(sort)
+                }
+                _ => None,
+            })
+            .expect("destination S variable action");
+        assert_ne!(
+            donor_variable_sort, imported_variable_sort,
+            "home variable actions are re-pointed to the destination sort table"
+        );
+        assert_eq!(
+            importer.built.engine.sorts().name(imported_variable_sort),
+            "S"
+        );
+    }
 }

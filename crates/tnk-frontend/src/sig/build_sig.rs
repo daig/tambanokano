@@ -561,6 +561,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         overload,
         integer_literal_kind_count,
         overloaded_naturals,
+        strat_decls: pm.strat_decls.clone(),
         strat_defs: pm.strat_defs.clone(),
         identity_specs,
     })

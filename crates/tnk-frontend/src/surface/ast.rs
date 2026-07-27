@@ -304,6 +304,14 @@ pub struct StratDecl {
     pub name: String,
     pub domain: Vec<String>,
     pub subject: String,
+    /// Stable donation identity assigned by the module flattener. Declarations copied from the same
+    /// source module share an origin; independently imported declarations do not.
+    pub origin: Option<String>,
+    /// Position in the source module's strategy-declaration list; paired with `origin` for diamond dedup.
+    pub source_index: Option<usize>,
+    /// Source module whose grammar owns this declaration. Cleared by source-transforming module
+    /// expressions (renaming/instantiation), whose tokens are rewritten for the destination grammar.
+    pub home: Option<String>,
 }
 
 /// A **strategy definition** `sd name(params) := body .` / `csd … := body if cond .`. The call-pattern
@@ -315,6 +323,12 @@ pub struct StratDef {
     pub params: Vec<Vec<Token>>,
     pub body: StratExpr,
     pub cond: Option<Vec<Token>>,
+    /// Stable donation identity assigned by the module flattener (parallel to [`StratDecl::origin`]).
+    pub origin: Option<String>,
+    /// Position in the source module's strategy-definition list; paired with `origin` for diamond dedup.
+    pub source_index: Option<usize>,
+    /// Source module whose grammar owns the raw parameter/body term bubbles.
+    pub home: Option<String>,
 }
 
 /// A test/matchrew matching mode: `match` (top), `xmatch` (with extension), `amatch` (anywhere).

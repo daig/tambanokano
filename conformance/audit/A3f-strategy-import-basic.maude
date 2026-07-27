@@ -1,0 +1,52 @@
+*** A3f-strategy-import-basic — named strategy imports are visible through every import mode and transitively (TNK-005)
+mod A3F-COMMON is
+  sort S .
+  ops a b : -> S .
+  rl [rb] : a => b .
+endm
+smod A3F-BASE is
+  protecting A3F-COMMON .
+  strat go @ S .
+  sd go := rb .
+endsm
+smod A3F-PROTECTING is
+  protecting A3F-BASE .
+endsm
+smod A3F-EXTENDING is
+  extending A3F-BASE .
+endsm
+smod A3F-INCLUDING is
+  including A3F-BASE .
+endsm
+smod A3F-MID is
+  protecting A3F-BASE .
+endsm
+smod A3F-TOP is
+  protecting A3F-MID .
+endsm
+srewrite in A3F-PROTECTING : a using go .
+dsrewrite in A3F-PROTECTING : a using go .
+srewrite in A3F-EXTENDING : a using go .
+srewrite in A3F-INCLUDING : a using go .
+srewrite in A3F-TOP : a using go .
+
+smod A3F-DECL-ONLY is
+  protecting A3F-COMMON .
+  strat empty @ S .
+endsm
+smod A3F-DECL-USE is
+  protecting A3F-DECL-ONLY .
+endsm
+srewrite in A3F-DECL-USE : a using empty .
+
+*** A non-strategy module may not import an smod; Maude ignores the complete import and continues.
+mod A3F-ILLEGAL is
+  protecting A3F-BASE .
+endm
+rewrite in A3F-ILLEGAL : a .
+mod A3F-SENTINEL is
+  sort T .
+  ops x y : -> T .
+  rl [ok] : x => y .
+endm
+rewrite in A3F-SENTINEL : x .

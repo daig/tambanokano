@@ -1,0 +1,36 @@
+*** A3i-strategy-import-home — imported sd lhs/body bubbles retain donor parsing semantics (TNK-005)
+smod A3I-HOME-BASE is
+  sort S .
+  ops a b : -> S .
+  op h : S -> S .
+  var X : S .
+  strat home nested : S @ S .
+  sd home(X) := match h(X) .
+  sd nested(X) := home(X) .
+endsm
+smod A3I-HOME-USE is
+  protecting A3I-HOME-BASE .
+  op X : -> S .
+  op h : -> S .
+endsm
+srewrite in A3I-HOME-USE : h(b) using home(b) .
+srewrite in A3I-HOME-USE : h(b) using nested(b) .
+srewrite in A3I-HOME-USE : h(X) using home(b) .
+
+*** A malformed donor definition is recoverable; the later independent sentinel still runs.
+smod A3I-BAD is
+  sort U .
+  op u : -> U .
+  strat bad @ U .
+  sd bad := match missing .
+endsm
+smod A3I-BAD-USE is
+  protecting A3I-BAD .
+endsm
+srewrite in A3I-BAD-USE : u using bad .
+mod A3I-SENTINEL is
+  sort T .
+  ops x y : -> T .
+  rl [ok] : x => y .
+endm
+rewrite in A3I-SENTINEL : x .

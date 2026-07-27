@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Interner, Token, tokenize};
 use tnk_frontend::rename_terms::{ReconTarget, ViewOpSubst};
 use tnk_frontend::surface::ast::{
-    Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, VarDecl,
-    ViewDecl,
+    Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, StratExpr,
+    VarDecl, ViewDecl,
 };
 
 use crate::db::ModuleDb;
@@ -29,6 +29,8 @@ pub struct FlatDecls {
     pub ops: Vec<OpDecl>,
     pub vars: Vec<VarDecl>,
     pub statements: Vec<Statement>,
+    pub strat_decls: Vec<tnk_frontend::surface::ast::StratDecl>,
+    pub strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
 }
 
 /// Accumulates merged declarations, de-duplicating sorts and variable names.
@@ -41,6 +43,8 @@ struct Acc {
     vars: Vec<VarDecl>,
     var_set: HashSet<String>,
     statements: Vec<Statement>,
+    strat_decls: Vec<tnk_frontend::surface::ast::StratDecl>,
+    strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
     /// Per-statement **home** module name, parallel to [`statements`](Self::statements) (D1a import-reparse
     /// point-fix). `Some(name)` for a plain named-module donation (its statement re-parses in that module's
     /// own grammar if the flattened grammar makes it ambiguous); `None` for a renamed/instantiated/parameter-
@@ -77,6 +81,8 @@ impl Acc {
         self.statement_homes
             .extend(std::iter::repeat(home.map(str::to_string)).take(d.statements.len()));
         self.statements.extend(d.statements);
+        self.strat_decls.extend(d.strat_decls);
+        self.strat_defs.extend(d.strat_defs);
     }
 
     fn into_decls(self) -> FlatDecls {
@@ -86,6 +92,8 @@ impl Acc {
             ops: self.ops,
             vars: self.vars,
             statements: self.statements,
+            strat_decls: self.strat_decls,
+            strat_defs: self.strat_defs,
         }
     }
 }
@@ -99,6 +107,30 @@ fn own_decls(pm: &PreModule) -> FlatDecls {
         ops: pm.ops.clone(),
         vars: pm.vars.clone(),
         statements: pm.statements.clone(),
+        strat_decls: pm
+            .strat_decls
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(source_index, mut decl)| {
+                decl.origin = Some(pm.name.clone());
+                decl.source_index = Some(source_index);
+                decl.home = Some(pm.name.clone());
+                decl
+            })
+            .collect(),
+        strat_defs: pm
+            .strat_defs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(source_index, mut def)| {
+                def.origin = Some(pm.name.clone());
+                def.source_index = Some(source_index);
+                def.home = Some(pm.name.clone());
+                def
+            })
+            .collect(),
     }
 }
 
@@ -193,15 +225,12 @@ pub fn flatten_with_homes(
     if let Some(pm) = root {
         acc.statements.rotate_right(pm.statements.len());
         acc.statement_homes.rotate_right(pm.statements.len());
+        acc.strat_decls.rotate_right(pm.strat_decls.len());
+        acc.strat_defs.rotate_right(pm.strat_defs.len());
     }
     let (kind, is_theory, is_strategy, is_object) = root
         .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy, pm.is_object))
         .unwrap_or((ModuleKind::Functional, false, false, false));
-    // Carry the root module's own strategy declarations/definitions through (a strategy module flattened by
-    // name keeps its own `strat`/`sd`; merging an *import's* strategies is the Pillar-2.4 follow-on).
-    let (strat_decls, strat_defs) = root
-        .map(|pm| (pm.strat_decls.clone(), pm.strat_defs.clone()))
-        .unwrap_or_default();
     let homes = std::mem::take(&mut acc.statement_homes);
     let mut d = acc.into_decls();
     // Imported variable aliases participate in the root grammar only when no visible nullary operator
@@ -254,8 +283,8 @@ pub fn flatten_with_homes(
         ops: d.ops,
         vars: d.vars,
         statements: d.statements,
-        strat_decls,
-        strat_defs,
+        strat_decls: d.strat_decls,
+        strat_defs: d.strat_defs,
     };
     Ok((pm, homes))
 }
@@ -285,6 +314,9 @@ pub fn flatten_pre(
     }
     let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
+        if !pm.is_strategy && import_targets_strategy(&imp.expr, db) {
+            continue;
+        }
         collect_expr(
             &imp.expr,
             db,
@@ -303,6 +335,8 @@ pub fn flatten_pre(
     // The transient IS the root module: its own statements go first (same rotation as `flatten`).
     acc.statements.rotate_right(pm.statements.len());
     acc.statement_homes.rotate_right(pm.statements.len());
+    acc.strat_decls.rotate_right(pm.strat_decls.len());
+    acc.strat_defs.rotate_right(pm.strat_defs.len());
     let d = acc.into_decls();
     Ok(PreModule {
         name: SENTINEL.to_string(),
@@ -317,8 +351,8 @@ pub fn flatten_pre(
         ops: d.ops,
         vars: d.vars,
         statements: d.statements,
-        strat_decls: pm.strat_decls.clone(),
-        strat_defs: pm.strat_defs.clone(),
+        strat_decls: d.strat_decls,
+        strat_defs: d.strat_defs,
     })
 }
 
@@ -343,6 +377,16 @@ fn import_targets_theory(expr: &ModuleExpr, db: &ModuleDb) -> bool {
     let mut bases = Vec::new();
     import_module_bases(expr, &mut bases);
     bases.iter().any(|n| db.get(n).is_some_and(|m| m.is_theory))
+}
+
+/// Strategy declarations and definitions are donated only into strategy modules/theories. Maude rejects
+/// an ordinary `mod`/`fmod` import of an `smod`/`sth` as a whole, including its ordinary declarations.
+fn import_targets_strategy(expr: &ModuleExpr, db: &ModuleDb) -> bool {
+    let mut bases = Vec::new();
+    import_module_bases(expr, &mut bases);
+    bases
+        .iter()
+        .any(|name| db.get(name).is_some_and(|module| module.is_strategy))
 }
 
 /// Whether an import expression directly names the importing module `name` (a self-import, C4c).
@@ -444,6 +488,9 @@ fn collect_named(
             return Err(format!(
                 "mutually recursive import of module `{name}` ignored"
             ));
+        }
+        if !pm.is_strategy && import_targets_strategy(&imp.expr, db) {
+            continue;
         }
         // A plain module (`fmod`/`mod`) importing a THEORY (`fth`/`th`) is not allowed: Maude recovers by
         // IGNORING the import — the module stays, minus the theory's contents (its axioms never run) (C4a).
@@ -910,6 +957,76 @@ fn instantiate(
     Ok(())
 }
 
+/// Rewrite every raw term bubble nested in a strategy expression, preserving its combinator tree.
+fn rewrite_strategy_bubbles(
+    expr: &mut StratExpr,
+    rewrite: &mut impl FnMut(&[Token]) -> Vec<Token>,
+) {
+    match expr {
+        StratExpr::Idle | StratExpr::Fail | StratExpr::All => {}
+        StratExpr::Apply {
+            subst, substrats, ..
+        } => {
+            for (variable, value) in subst {
+                *variable = rewrite(variable);
+                *value = rewrite(value);
+            }
+            for child in substrats {
+                rewrite_strategy_bubbles(child, rewrite);
+            }
+        }
+        StratExpr::Top(child)
+        | StratExpr::One(child)
+        | StratExpr::Star(child)
+        | StratExpr::Plus(child)
+        | StratExpr::Normalize(child) => rewrite_strategy_bubbles(child, rewrite),
+        StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
+            rewrite_strategy_bubbles(left, rewrite);
+            rewrite_strategy_bubbles(right, rewrite);
+        }
+        StratExpr::Branch {
+            test,
+            success,
+            failure,
+        } => {
+            rewrite_strategy_bubbles(test, rewrite);
+            rewrite_strategy_bubbles(success, rewrite);
+            rewrite_strategy_bubbles(failure, rewrite);
+        }
+        StratExpr::Test { pattern, cond, .. } => {
+            *pattern = rewrite(pattern);
+            if let Some(cond) = cond {
+                *cond = rewrite(cond);
+            }
+        }
+        StratExpr::MatchRew {
+            pattern,
+            cond,
+            subs,
+            ..
+        } => {
+            *pattern = rewrite(pattern);
+            if let Some(cond) = cond {
+                *cond = rewrite(cond);
+            }
+            for (variable, child) in subs {
+                *variable = rewrite(variable);
+                rewrite_strategy_bubbles(child, rewrite);
+            }
+        }
+        StratExpr::Sugar { args, .. } => {
+            for child in args {
+                rewrite_strategy_bubbles(child, rewrite);
+            }
+        }
+        StratExpr::Call { args, .. } => {
+            for arg in args {
+                *arg = rewrite(arg);
+            }
+        }
+    }
+}
+
 /// Rewrite `d`'s statement bubbles for a view's mixfix op→op maps `op_recon` (source canonical → target
 /// canonical): build the source (parameterized) module `mname`'s grammar (flattened standalone, so the
 /// parameter-theory operators and the module's variables are in scope) and re-emit each mapped operator
@@ -966,6 +1083,17 @@ fn apply_view_op_recon(
                     *c = mapper.rewrite(c, interner);
                 }
             }
+        }
+    }
+    for def in &mut d.strat_defs {
+        for param in &mut def.params {
+            *param = mapper.rewrite(param, interner);
+        }
+        rewrite_strategy_bubbles(&mut def.body, &mut |bubble| {
+            mapper.rewrite(bubble, interner)
+        });
+        if let Some(cond) = &mut def.cond {
+            *cond = mapper.rewrite(cond, interner);
         }
     }
     Ok(())
@@ -1479,6 +1607,41 @@ fn instantiate_decls(
             }
         }
     }
+    let mut instance_parts: Vec<_> = bindings
+        .iter()
+        .map(|(parameter, binding)| format!("{parameter}={}", binding.view_name))
+        .collect();
+    instance_parts.sort();
+    let instance_key = instance_parts.join(",");
+    for decl in &mut d.strat_decls {
+        for sort in &mut decl.domain {
+            *sort = inst_sort(sort, bindings);
+        }
+        decl.subject = inst_sort(&decl.subject, bindings);
+        decl.home = None;
+        if let Some(origin) = &mut decl.origin {
+            origin.push('{');
+            origin.push_str(&instance_key);
+            origin.push('}');
+        }
+    }
+    for def in &mut d.strat_defs {
+        def.home = None;
+        if let Some(origin) = &mut def.origin {
+            origin.push('{');
+            origin.push_str(&instance_key);
+            origin.push('}');
+        }
+        for param in &mut def.params {
+            *param = subst_bubble(param, bindings, op_subst, &var_inline, i);
+        }
+        rewrite_strategy_bubbles(&mut def.body, &mut |bubble| {
+            subst_bubble(bubble, bindings, op_subst, &var_inline, i)
+        });
+        if let Some(cond) = &mut def.cond {
+            *cond = subst_bubble(cond, bindings, op_subst, &var_inline, i);
+        }
+    }
     d
 }
 
@@ -1974,5 +2137,224 @@ fmod TOP is protecting L . protecting R . endfm
         let (db, views, mut i) = db_of("fmod M is protecting NOPE . endfm\n");
         let err = flatten("M", &db, &views, &mut i).unwrap_err();
         assert!(err.contains("not defined"), "got: {err}");
+    }
+
+    #[test]
+    fn strategy_diamonds_dedup_by_origin_not_identical_text() {
+        let (db, views, mut interner) = db_of(
+            "mod STRAT-COMMON is sort S . op a : -> S . endm
+             smod STRAT-BASE is
+               protecting STRAT-COMMON .
+               strat shared : @ S .
+               sd shared := idle .
+             endsm
+             smod STRAT-LEFT is
+               protecting STRAT-BASE .
+               strat twin : @ S .
+               sd twin := idle .
+             endsm
+             smod STRAT-RIGHT is
+               protecting STRAT-BASE .
+               strat twin : @ S .
+               sd twin := idle .
+             endsm
+             smod STRAT-TOP is
+               protecting STRAT-LEFT .
+               protecting STRAT-RIGHT .
+             endsm",
+        );
+        let flat = flatten("STRAT-TOP", &db, &views, &mut interner).expect("flatten");
+        assert_eq!(
+            flat.strat_decls
+                .iter()
+                .filter(|declaration| declaration.name == "shared")
+                .count(),
+            1,
+            "the shared base origin is donated once through the diamond"
+        );
+        assert_eq!(
+            flat.strat_defs
+                .iter()
+                .filter(|definition| definition.name == "shared")
+                .count(),
+            1
+        );
+        let independent = flat
+            .strat_defs
+            .iter()
+            .filter(|definition| definition.name == "twin")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            independent.len(),
+            2,
+            "text-identical definitions from independent modules remain distinct"
+        );
+        assert_ne!(independent[0].origin, independent[1].origin);
+    }
+
+    #[test]
+    fn strategy_payload_follows_sum_rename_and_instantiation() {
+        let (db, views, mut interner) = db_of(
+            "smod STRAT-TRANSFORM-SOURCE is
+               sort S .
+               ops a b : -> S .
+               op f : S -> S .
+               var X : S .
+               rl [step] : f(a) => b .
+               strat go : S @ S .
+               sd go(X) := match f(X) ; step .
+             endsm
+             smod STRAT-TRANSFORM-EXTRA is
+               sort E .
+               op e : -> E .
+               strat extra : @ E .
+               sd extra := idle .
+             endsm
+             smod STRAT-TRANSFORM-SUM is
+               protecting STRAT-TRANSFORM-SOURCE + STRAT-TRANSFORM-EXTRA .
+             endsm
+             smod STRAT-TRANSFORM-RENAMED is
+               protecting STRAT-TRANSFORM-SOURCE *
+                 (sort S to T, op f to g, label step to moved) .
+             endsm
+             fth STRAT-TRANSFORM-THEORY is sort Elt . endfth
+             smod STRAT-TRANSFORM-PARAM{P :: STRAT-TRANSFORM-THEORY} is
+               var Y : P$Elt .
+               strat keep : P$Elt @ P$Elt .
+               sd keep(Y) := match Y .
+             endsm
+             fmod STRAT-TRANSFORM-TARGET is
+               sort Elt .
+               op x : -> Elt .
+             endfm
+             view STRAT-TRANSFORM-VIEW from STRAT-TRANSFORM-THEORY
+               to STRAT-TRANSFORM-TARGET is
+               sort Elt to Elt .
+             endv
+             smod STRAT-TRANSFORM-INSTANTIATED is
+               protecting STRAT-TRANSFORM-PARAM{STRAT-TRANSFORM-VIEW} .
+             endsm",
+        );
+
+        let sum = flatten("STRAT-TRANSFORM-SUM", &db, &views, &mut interner).expect("flatten sum");
+        assert_eq!(
+            sum.strat_decls
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["go", "extra"]
+        );
+
+        let renamed =
+            flatten("STRAT-TRANSFORM-RENAMED", &db, &views, &mut interner).expect("flatten rename");
+        let declaration = renamed
+            .strat_decls
+            .iter()
+            .find(|declaration| declaration.name == "go")
+            .expect("renamed declaration");
+        assert_eq!(declaration.domain, ["T"]);
+        assert_eq!(declaration.subject, "T");
+        let definition = renamed
+            .strat_defs
+            .iter()
+            .find(|definition| definition.name == "go")
+            .expect("renamed definition");
+        assert_eq!(definition.home, None);
+        assert!(
+            definition.params[0]
+                .iter()
+                .any(|token| token.text(&interner) == "X"),
+            "bare declared variables are re-bound by the renamed result grammar"
+        );
+        let StratExpr::Seq(test, application) = &definition.body else {
+            panic!("expected nested test/application sequence");
+        };
+        let StratExpr::Test { pattern, .. } = &**test else {
+            panic!("expected transformed test");
+        };
+        let pattern = pattern
+            .iter()
+            .map(|token| token.text(&interner))
+            .collect::<Vec<_>>();
+        assert!(pattern.contains(&"g"));
+        assert!(pattern.contains(&"X"));
+        assert!(!pattern.contains(&"f"));
+        let StratExpr::Apply { label, .. } = &**application else {
+            panic!("expected transformed application");
+        };
+        assert_eq!(label, "moved");
+
+        let instantiated = flatten("STRAT-TRANSFORM-INSTANTIATED", &db, &views, &mut interner)
+            .expect("flatten instantiation");
+        let declaration = instantiated
+            .strat_decls
+            .iter()
+            .find(|declaration| declaration.name == "keep")
+            .expect("instantiated declaration");
+        assert_eq!(declaration.domain, ["Elt"]);
+        assert_eq!(declaration.subject, "Elt");
+        let definition = instantiated
+            .strat_defs
+            .iter()
+            .find(|definition| definition.name == "keep")
+            .expect("instantiated definition");
+        assert!(
+            definition.params[0]
+                .iter()
+                .any(|token| token.text(&interner) == "Y:Elt")
+        );
+        let StratExpr::Test { pattern, .. } = &definition.body else {
+            panic!("expected instantiated test");
+        };
+        assert!(pattern.iter().any(|token| token.text(&interner) == "Y:Elt"));
+    }
+
+    #[test]
+    fn source_and_flat_strategy_payloads_remain_distinct() {
+        let (db, views, mut interner) = db_of(
+            "mod STRAT-PROJECTION-COMMON is sort S . op a : -> S . endm
+             smod STRAT-PROJECTION-BASE is
+               protecting STRAT-PROJECTION-COMMON .
+               strat imported : @ S .
+               sd imported := idle .
+             endsm
+             smod STRAT-PROJECTION-TOP is
+               protecting STRAT-PROJECTION-BASE .
+               strat local : @ S .
+               sd local := idle .
+             endsm",
+        );
+        let source = db.get("STRAT-PROJECTION-TOP").expect("source module");
+        assert_eq!(
+            source
+                .strat_decls
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        assert_eq!(
+            source
+                .strat_defs
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+
+        let flat = flatten("STRAT-PROJECTION-TOP", &db, &views, &mut interner)
+            .expect("flatten projection");
+        let declarations = flat
+            .strat_decls
+            .iter()
+            .map(|declaration| declaration.name.as_str())
+            .collect::<Vec<_>>();
+        let definitions = flat
+            .strat_defs
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(declarations, ["local", "imported"]);
+        assert_eq!(definitions, ["local", "imported"]);
     }
 }

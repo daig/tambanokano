@@ -16,7 +16,7 @@ decisions doc).
   `trace`.
 - **Frontend** (`tnk-frontend`): lexer → surface parser → per-module mixfix grammar → Earley parser → term
   build → Maude-faithful pretty-printer.
-- **Modules** (`tnk-modules`): import/flatten (`protecting`/`extending`/`including`), summation `+`, renaming.
+- **Modules** (`tnk-modules`): import/flatten (`protecting`/`extending`/`including`), summation `+`, renaming, theories/views/parameterized instantiation, and compositional strategy declarations/definitions.
 - **REPL** (`tnk-repl`): `reduce`/`match`/`xmatch`, `show`/`select`/`set trace`, file load, output line-wrapping.
 
 **Symbolic phase S complete (2026-07-21).** `tnk-core::unify` implements order-sorted unification modulo
@@ -66,8 +66,11 @@ The retained release, audit, legacy, U/V/N/T/M gates remain green. The selected 
 stopped here: cancellation and thread-backed `newProcess` coordination remain the separate,
 unstarted Phase I-C.
 
+**TNK-005 / compositional strategy-module imports is complete (2026-07-26).**
+Named `strat`/`sd` payloads now preserve oracle-derived origin, order, overload/lhs dispatch, donor-home parsing, transforms, reflection, and session invalidation across the supported module algebra. The six-fixture `A3f`–`A3j`/`A5g` matrix is byte-identical to Maude; the binding record is `tnk-005-strategy-imports-goal.md`.
+
 **The verified current state—including every known deviation—is `../../fable-audit.md`** (status
-refreshed 2026-07-24); the forward plan is `roadmap.md`.
+refreshed 2026-07-26); the forward plan is `roadmap.md`.
 
 ## Crate layout
 
@@ -94,6 +97,7 @@ tnk-repl      thin terminal adapter: color/wrapping policy, line editing, prompt
 | `roadmap.md` | remaining plan | correctness-first completion plan (post-audit): panics/wrong values → counts → input acceptance → the two architecture reworks → diagnostics/tool surface → new subsystems |
 | `correctness-goal.md` | goal contract | the frozen fixture manifest + scoreboard metric, decision defaults, and completion criteria driving the correctness goal (`/goal`) |
 | `subsystems-goal.md` | subsystem contract | completed S/T/M/I-S ledger; future I-C scope, invariants, manifests, and gates |
+| `tnk-005-strategy-imports-goal.md` | completed goal contract | closed TNK-005 `/goal`: oracle matrix, module/strategy invariants, implementation record, retained fixtures, and verified completion gates |
 | `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, model checking, and the split synchronous/concurrent Phase I |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 

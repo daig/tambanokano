@@ -1,10 +1,10 @@
-# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-24)
+# Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-26)
 
-> **Current ledger (2026-07-24):** the correctness corpus and symbolic phases S1–S3 remain closed.
-> `tools/subsystems-scoreboard.sh -p U` is **27/27 PASS** over 676 commands, `-p V` is **21/21
-> PASS** over 289, and `-p N` is **16/16 PASS**; all 169 N primary commands also pass independently.
-> The retained audit is **77/77 PASS**, legacy is **87/87 CLEAN**, and
-> `cargo test --release --workspace` passes **444/444** tests across 12 suites.
+> **Current ledger (2026-07-26):** the correctness corpus and symbolic phases S1–S3 remain closed.
+> `tools/subsystems-scoreboard.sh` is **112/112 PASS** at the default harness timeout; its U/V/N
+> partitions remain **27/27**, **21/21**, and **16/16 PASS** respectively, and all 169 N primary
+> commands also pass independently. The retained audit is **84/84 PASS**, legacy is **87/87 CLEAN**,
+> and `cargo test --release --workspace --features smt-z3` passes **453/453** tests across 12 suites.
 >
 > **Phase T is complete.** T01–T10 pass the frozen Maude-3.5/Yices2 byte contract—10 fixtures /
 > 118 commands—covering typed SMT values, `check`, root-only constraint-bearing `smt-search`,
@@ -21,6 +21,12 @@
 > Walking-skeleton, direct/manager, pass-boundary, lifecycle/error, continuation,
 > multi-child isolation, and GC/root probes are included. Phase I-C cancellation and
 > thread/`newProcess` coordination have not begun.
+>
+> **TNK-005 is resolved (2026-07-26).** Named strategy declarations and definitions now compose through
+> legal direct/transitive imports, diamonds, sums, ordinary renaming, functional instantiation, donor
+> redefinition, source/flat reflection, and the local META-INTERPRETER path. The retained `A3f`–`A3j` and
+> `A5g` oracle fixtures pin definition order, kinds/lhs bindings, home parsing, values, counts, transforms,
+> recovery, and reflection. Generalized `top`, `xmatchrew`, and conditional `csd` remain separate boundaries.
 >
 > The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close;
 > §3.10's post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two
@@ -84,8 +90,9 @@ Everything in this list was re-verified against the live oracle this session (no
   **per-message-symbol round-robin — the gaps.md item claiming it missing is stale, it now conforms**;
   strategy `sd` recursion is cycle-safe where it could hang; *nested* meta (`metaReduce` inside an
   equation) computes with exact counts.
-- **Strategy language** (per repo suite + fresh probes): full combinator surface, solution values/order/
-  per-solution counts, both srewrite and dsrewrite.
+- **Strategy language** (per repo suite + fresh probes): the full covered combinator surface, solution
+  values/order/per-solution counts, both `srewrite` and `dsrewrite`, and compositional named strategies
+  across imports, diamonds/conflicts, home grammars, sums, renaming, instantiation, and redefinition.
 - **META-LEVEL descent surface**: the descent family, up*/down maps, sort/kind queries, metaParse/
   metaPrettyPrint on binary-nested inputs — including `upModule` of an *instantiated* parameterized module
   (`upModule('LIST`{Nat`})` is byte-identical). The flat-assoc reader gap and parameterized-module
@@ -252,10 +259,10 @@ documented but materially understated. Every item verified with the minimal repr
 - **[N] `metaNormalize` applies user equations.** **RESOLVED (8fe4be2).** It must normalize modulo structural axioms ONLY:
   oracle returns the term unchanged (`{'g['a.S], 'S}`); tnk fully reduces it (== `metaReduce`) —
   `meta.rs:94` routes `Reduce | Normalize` to one handler. (Pure AC-reordering cases coincide, masking it.)
-- **[N] `upModule` of a strategy module is wrong**: result sort `SModule` instead of `StratModule`, prints
-  `mod`…`endm`, and **omits the `strat` declarations and `sd` definitions entirely** (mb/rl content is
-  right). **[N]** `metaPrettyPrint` is inert even with the default `none` option set on a fresh module
-  (docs and the fixture claim it done — the conformance pin evidently exercises a narrower path).
+- **[N] `upModule` of a strategy module was wrong. RESOLVED (TNK-005 closeout; retained by `A5g`).**
+  Strategy-module constructors, real `strat` declarations, ordered `sd` definitions, and source/flat
+  projections now compute, including covered transformed/imported payloads. The strategy-specific
+  `metaPrettyPrintStrategy` operation remains inert; ordinary `metaPrettyPrint` is implemented.
 - **[N] Renaming a single-token mixfix op silently produces a *prefix* op.** **RESOLVED (fe2485e — incl. the op→op mixfix view family.)** `M * (op _+_ to _plus_)` →
   `x plus y` no longer parses; only `plus(x, y)` does (`rename.rs:77-89` keeps just the first literal
   fragment). If the renamed op occurs in any statement, the renamed module is REJECTED outright. Same
@@ -466,13 +473,12 @@ naturally rediscovered, and getting them wrong produces a new divergence:
    flattened statement list — so a faithful `flat = true` `upOpDecls`/`upModule` must up-translate
    `special (id-hook … op-hook …)` and `poly` attributes: the inverse of the down-path's `special → None`
    boundary. (Verified: `upModule('NAT, …)` stays inert today, and `metaReduce` over it likewise.)
-8. **Strategy-meta has two structural prerequisites** (why `upStratDecls`/`upSds`/`metaParseStrategy`
-   stay inert): (i) the ~25 strategy meta-constructors overload bare names (`none`, `_;_`, `_,_`, `_|_`)
-   across many result sorts, so the meta reader's resolve-by-(name, arity) (`descent.rs:74`) cannot build
-   them — resolution by *result sort* is required; (ii) tnk's strategy parser desugars
-   `try`/`not`/`test`/`or-else` into the `_?_:_` branch (verified in `strategy.rs`), but the meta-rep
-   keeps them as distinct constructors — a faithful round-trip needs the surface form preserved through
-   resolution.
+8. **Strategy-meta split into completed reflection and remaining parse/print.** `upModule`,
+   `upStratDecls`, and `upSds` now resolve the overloaded strategy meta-constructors by their installed
+   hook identities and preserve surface strategy sugar in the source representation. TNK-005 additionally
+   retains source versus flat imported/transformed payloads. `metaParseStrategy` and
+   `metaPrettyPrintStrategy` remain the inverse-direction gap: they need faithful Strategy↔surface
+   translation without collapsing `try`/`not`/`test`/`or-else` into `_?_:_`.
 
 ### 3.10 Post-goal findings (phase-S seeding sweep, 2026-07-05; fixtures `E*`, denominator 74 → 77)
 

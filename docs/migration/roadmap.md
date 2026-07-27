@@ -4,11 +4,12 @@ Ground truth for current state: **`fable-audit.md`** (repo root) — the 2026-07
 against Maude 3.5.1. This roadmap sequences the remaining work; every "§" reference below is into the
 audit. The build history that used to live here (Phases 0–2, all landed) is in git history.
 
-**Current implementation cursor (2026-07-24):** S, T, M, and the local synchronous
-**Phase I-S** slice are closed. The reusable Session and local meta-interpreter protocol
-pass the 27-fixture live-oracle gate. The selected implementation goal has stopped at its
-mandatory boundary; **Phase I-C** cancellation/thread coordination has not been selected
-or started. Binding record: `remaining-plans/06-sessions-meta-interpreters.md`.
+**Current implementation cursor (2026-07-26):** S, T, M, the local synchronous **Phase I-S**
+slice, and TNK-005 compositional strategy-module imports are closed. Session/local
+meta-interpreter behavior passes its 27-fixture live-oracle gate; the six-fixture `A3f`–`A3j`/`A5g`
+strategy-import matrix is also retained. **Phase I-C** cancellation/thread coordination has not
+been selected or started. Binding records: `remaining-plans/06-sessions-meta-interpreters.md` and
+`tnk-005-strategy-imports-goal.md`.
 
 **Ordering principle: correctness before new feature surface.** Nothing new gets built on top of a layer
 with known wrong values. Concretely: first make every *accepted* input compute what Maude computes and
@@ -211,12 +212,13 @@ Existing-Maude commands, in impact order:
 
 Ordered by (dependency, size); references are the kept deep-dives.
 
-- **G1. Strategy-meta tail** (`upStratDecls`/`upSds`/`metaParseStrategy`/`metaPrettyPrintStrategy`,
-  `metaSrewrite`). Prerequisites are structural, not incidental (§3.9.8): meta-constructor resolution by
-  result sort, and preserving the un-desugared surface strategy form through resolution. Also fixes the
-  §3.2 `upModule`-of-`smod` wrong result (SModule/strat-decl omission). Still open. Its former “do first”
-  ordering was superseded by the newer `subsystems-goal.md` contract; it does not block T or M, but remains
-  a prerequisite for faithful strategy reflection and should precede G7.
+- **G1. Strategy-meta tail — reflection/execution complete; parse/print remains.** TNK-005 closed
+  `upStratDecls`, `upSds`, strategy-aware `upModule`, and strategic meta execution across source/flat,
+  imported, summed, renamed, and instantiated payloads. The retained `A5g` fixture pins that cut.
+  `metaParseStrategy`/`metaPrettyPrintStrategy` remain open: they require the inverse
+  Strategy↔surface-AST translation without losing strategy sugar. Conditional `csd`, `xmatchrew`, and
+  generalized `top` are separately tracked strategy-language boundaries. This tail does not block T or M,
+  but remains a prerequisite for a complete strategy meta-programming surface and should precede G7.
 - **G2. Symbolic — complete (2026-07-21):** S0 (BDD/AllSat spike), S1 (order-sorted unification modulo
   free/S/CUI/AC/ACU/A/AU), S2 (folding variants and variant unification/matching), and S3 (v3
   variant-based narrowing, folding/filtering/history, paths/continuations, and all in-scope

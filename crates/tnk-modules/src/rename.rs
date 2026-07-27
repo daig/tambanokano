@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
 use tnk_frontend::rename_terms::{OpRenamer, ReconTarget, ViewOpSubst};
-use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement};
+use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement, StratExpr};
 
 use crate::flatten::FlatDecls;
 
@@ -295,6 +295,56 @@ pub fn apply_renaming(
         }
     }
 
+    let rename_identity = format!("{items:?}");
+    for decl in &mut d.strat_decls {
+        rename_each(&mut decl.domain, &sort_map);
+        if let Some(to) = sort_map.get(&decl.subject) {
+            decl.subject = to.clone();
+        }
+        decl.home = None;
+        if let Some(origin) = &mut decl.origin {
+            origin.push_str(&rename_identity);
+        }
+    }
+    for def in &mut d.strat_defs {
+        def.home = None;
+        if let Some(origin) = &mut def.origin {
+            origin.push_str(&rename_identity);
+        }
+        for param in &mut def.params {
+            rewrite_term(
+                param,
+                structural.as_ref(),
+                renamer.as_ref(),
+                &sort_map,
+                &single_op_map,
+                &const_qual,
+                &lparen,
+                interner,
+            );
+        }
+        rewrite_strategy_expr(
+            &mut def.body,
+            structural.as_ref(),
+            renamer.as_ref(),
+            &sort_map,
+            &single_op_map,
+            &const_qual,
+            &lparen,
+            &label_map,
+            interner,
+        );
+        if let Some(cond) = &mut def.cond {
+            rewrite_cond(
+                cond,
+                &sort_map,
+                &single_op_map,
+                &const_qual,
+                &lparen,
+                interner,
+            );
+        }
+    }
     // Statement-label renames (`label l to m`): rewrite the label field of each statement (rule/eq/mb).
     if !label_map.is_empty() {
         for st in &mut d.statements {
@@ -309,6 +359,183 @@ pub fn apply_renaming(
         }
     }
     Ok(d)
+}
+
+/// Apply an ordinary module renaming to every term-bearing leaf of a strategy expression. Strategy names
+/// themselves require Maude's separate `strat … to …` mapping and are intentionally left unchanged.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_strategy_expr(
+    expr: &mut StratExpr,
+    structural: Option<&ViewOpSubst>,
+    renamer: Option<&OpRenamer>,
+    sort_map: &HashMap<String, String>,
+    single_op_map: &HashMap<String, String>,
+    const_qual: &HashMap<String, Vec<Token>>,
+    lparen: &[Token],
+    label_map: &HashMap<String, String>,
+    interner: &mut Interner,
+) {
+    let mut rewrite_term_bubble = |bubble: &mut Vec<Token>| {
+        rewrite_term(
+            bubble,
+            structural,
+            renamer,
+            sort_map,
+            single_op_map,
+            const_qual,
+            lparen,
+            interner,
+        );
+    };
+    match expr {
+        StratExpr::Idle | StratExpr::Fail | StratExpr::All => {}
+        StratExpr::Apply {
+            label,
+            subst,
+            substrats,
+        } => {
+            if let Some(to) = label_map.get(label) {
+                *label = to.clone();
+            }
+            for (variable, value) in subst {
+                rewrite_term_bubble(variable);
+                rewrite_term_bubble(value);
+            }
+            drop(rewrite_term_bubble);
+            for child in substrats {
+                rewrite_strategy_expr(
+                    child,
+                    structural,
+                    renamer,
+                    sort_map,
+                    single_op_map,
+                    const_qual,
+                    lparen,
+                    label_map,
+                    interner,
+                );
+            }
+        }
+        StratExpr::Top(child)
+        | StratExpr::One(child)
+        | StratExpr::Star(child)
+        | StratExpr::Plus(child)
+        | StratExpr::Normalize(child) => {
+            drop(rewrite_term_bubble);
+            rewrite_strategy_expr(
+                child,
+                structural,
+                renamer,
+                sort_map,
+                single_op_map,
+                const_qual,
+                lparen,
+                label_map,
+                interner,
+            );
+        }
+        StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
+            drop(rewrite_term_bubble);
+            rewrite_strategy_expr(
+                left,
+                structural,
+                renamer,
+                sort_map,
+                single_op_map,
+                const_qual,
+                lparen,
+                label_map,
+                interner,
+            );
+            rewrite_strategy_expr(
+                right,
+                structural,
+                renamer,
+                sort_map,
+                single_op_map,
+                const_qual,
+                lparen,
+                label_map,
+                interner,
+            );
+        }
+        StratExpr::Branch {
+            test,
+            success,
+            failure,
+        } => {
+            drop(rewrite_term_bubble);
+            for child in [test, success, failure] {
+                rewrite_strategy_expr(
+                    child,
+                    structural,
+                    renamer,
+                    sort_map,
+                    single_op_map,
+                    const_qual,
+                    lparen,
+                    label_map,
+                    interner,
+                );
+            }
+        }
+        StratExpr::Test { pattern, cond, .. } => {
+            rewrite_term_bubble(pattern);
+            drop(rewrite_term_bubble);
+            if let Some(cond) = cond {
+                rewrite_cond(cond, sort_map, single_op_map, const_qual, lparen, interner);
+            }
+        }
+        StratExpr::MatchRew {
+            pattern,
+            cond,
+            subs,
+            ..
+        } => {
+            rewrite_term_bubble(pattern);
+            for (variable, _) in subs.iter_mut() {
+                rewrite_term_bubble(variable);
+            }
+            drop(rewrite_term_bubble);
+            if let Some(cond) = cond {
+                rewrite_cond(cond, sort_map, single_op_map, const_qual, lparen, interner);
+            }
+            for (_, child) in subs {
+                rewrite_strategy_expr(
+                    child,
+                    structural,
+                    renamer,
+                    sort_map,
+                    single_op_map,
+                    const_qual,
+                    lparen,
+                    label_map,
+                    interner,
+                );
+            }
+        }
+        StratExpr::Sugar { args, .. } => {
+            drop(rewrite_term_bubble);
+            for child in args {
+                rewrite_strategy_expr(
+                    child,
+                    structural,
+                    renamer,
+                    sort_map,
+                    single_op_map,
+                    const_qual,
+                    lparen,
+                    label_map,
+                    interner,
+                );
+            }
+        }
+        StratExpr::Call { args, .. } => {
+            for arg in args {
+                rewrite_term_bubble(arg);
+            }
+        }
+    }
 }
 
 /// Expand each bare constant occurrence `c` (a key of `const_qual`) into the sort-qualified `( c ) .Sort`
@@ -577,6 +804,8 @@ mod tests {
             ops: vec![],
             vars: vec![],
             statements: vec![],
+            strat_decls: vec![],
+            strat_defs: vec![],
         }
     }
 
@@ -644,6 +873,8 @@ mod tests {
             ops: pm.ops,
             vars: pm.vars,
             statements: pm.statements,
+            strat_decls: pm.strat_decls,
+            strat_defs: pm.strat_defs,
         };
         let op = |from: &str, to: &str| RenameItem::Op {
             from: from.into(),

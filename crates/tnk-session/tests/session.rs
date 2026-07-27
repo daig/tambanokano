@@ -52,3 +52,43 @@ fn direct_session_reports_rewrite_breakdowns_for_reduce_and_search() {
         searched.output
     );
 }
+
+#[test]
+fn redefining_strategy_donor_rebuilds_existing_importer() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "mod STRAT-INVALIDATION-COMMON is
+           sort S .
+           ops a b c : -> S .
+           rl [to-b] : a => b .
+           rl [to-c] : a => c .
+         endm
+         smod STRAT-INVALIDATION-BASE is
+           protecting STRAT-INVALIDATION-COMMON .
+           strat go : @ S .
+           sd go := to-b .
+         endsm
+         smod STRAT-INVALIDATION-USE is
+           protecting STRAT-INVALIDATION-BASE .
+         endsm",
+        false,
+    );
+    assert!(!entered.exit);
+
+    let before = session.eval("srewrite in STRAT-INVALIDATION-USE : a using go .", false);
+    assert!(before.output.contains("result S: b"), "{}", before.output);
+
+    let redefined = session.eval(
+        "smod STRAT-INVALIDATION-BASE is
+           protecting STRAT-INVALIDATION-COMMON .
+           strat go : @ S .
+           sd go := to-c .
+         endsm",
+        false,
+    );
+    assert!(!redefined.exit);
+
+    let after = session.eval("srewrite in STRAT-INVALIDATION-USE : a using go .", false);
+    assert!(after.output.contains("result S: c"), "{}", after.output);
+    assert!(!after.output.contains("result S: b"), "{}", after.output);
+}

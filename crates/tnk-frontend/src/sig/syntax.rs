@@ -169,6 +169,9 @@ pub struct BuiltModule {
     /// Canonical positive decimal spellings also declared as nullary user operators. These collide with
     /// built-in natural pseudo-literals even when there is only one numeral kind.
     pub(crate) overloaded_naturals: HashSet<String>,
+    /// Strategy declarations after module flattening. The interpreter coalesces these by
+    /// `(name, domain kinds, subject kind)` while retaining donation origins for conflict handling.
+    pub strat_decls: Vec<crate::surface::ast::StratDecl>,
     /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
     /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
     pub strat_defs: Vec<crate::surface::ast::StratDef>,
