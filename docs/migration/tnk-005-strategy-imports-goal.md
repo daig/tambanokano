@@ -1,6 +1,6 @@
 # TNK-005 goal — compositional strategy-module imports (the `/goal` contract)
 
-**Status:** complete; all behavior, recovery, reflection, lifecycle, and retained-suite gates passed on 2026-07-26.  
+**Status:** complete in `499123e`; all behavior, recovery, reflection, lifecycle, and retained-suite gates passed on 2026-07-26.  
 **Frozen baseline:** Maude 3.5.1 and tnk commit `9790dc1` (`2026-07-26`).  
 **Primary closure record:** `docs/bug-triage.md`, TNK-005.  
 **Purpose:** this remains the binding correctness contract and implementation record. The live code and
@@ -690,6 +690,6 @@ Observed on 2026-07-26 against the live Maude 3.5.1 oracle and the final release
 
 - [x] TNK-005 triage entry resolved with retained `A3f`–`A3j` and `A5g` fixtures.
 - [x] Survey, audit, crate status comment, migration index, and roadmap status prose updated after behavior passed.
-- [ ] Implementation/final-gate commit: `________________`
-- [ ] Documentation-ledger commit: `________________`
-- [ ] Scratch artifacts removed and clean worktree confirmed.
+- [x] Implementation/final-gate commit: `499123e`.
+- [x] Status-documentation commit: `499123e`; this ledger-only follow-up records that hash.
+- [x] Scratch artifacts removed and clean worktree confirmed at closeout.

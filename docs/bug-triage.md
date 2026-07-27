@@ -274,7 +274,7 @@ Signature construction also mirrors Maude's BranchSymbol sort completion: for ea
 
 - **Severity:** High
 - **Classification:** Compatibility rejection
-- **Resolved:** 2026-07-26
+- **Resolved:** 2026-07-26 in `499123e`
 - **Evidence:** six oracle-differential fixtures plus focused representation tests
 - **Primary areas:** module-expression flattening, strategy definition dispatch, home grammars, reflection, and session lifecycle
 
