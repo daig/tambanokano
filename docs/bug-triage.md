@@ -1,14 +1,14 @@
 # Known behavior triage
 
-**Date:** 2026-07-26
+**Date:** 2026-07-27
 **Purpose:** standalone triage of currently known tnk bugs, behavioral divergences, robustness failures, accepted differences, and unverified risk areas relevant to the prototype/v0 boundary.
-**Evidence boundary:** entries marked resolved were implemented and reverified on 2026-07-26 against focused live-Maude probes, the cited reference-source paths, and retained oracle-differential fixtures. Unresolved gaps and risks retain the documentation-survey evidence boundary: retained conformance records, source inspection, and the direct probes already run.
+**Evidence boundary:** entries marked resolved were implemented and reverified on the dates shown against focused live-Maude probes, the cited reference-source paths, and retained oracle-differential fixtures. Unresolved gaps and risks retain the documentation-survey evidence boundary: retained conformance records, source inspection, and the direct probes already run.
 
 ## 1. How to read this document
 
 A green test or sweep does not mean that tnk is behaviorally identical to Maude on every input:
 
-- The audit scoreboard is a growing corpus (88 fixtures after the four TNK-006–009 regressions landed); historical 77/77 records describe the frozen 2026-07-05 manifest, not a fixed denominator.
+- The audit scoreboard is a growing corpus (92 fixtures after the TNK-012–014 regressions landed); historical 77/77 records describe the frozen 2026-07-05 manifest, not a fixed denominator.
 - The legacy sweep calls a fixture **CLEAN** when its current difference is byte-identical to a ratified accepted diff.
 - The differential harness removes warning/advisory blocks before comparison.
 - Missing features and legal-input corners absent from the fixture corpus are not exercised.
@@ -46,6 +46,9 @@ Severity is impact, not implementation order:
 | TNK-009 | Medium | Behavioral divergence | Automatic BOOL imports use the wrong mode across module kinds | **Resolved 2026-07-26**; source/flat reflection matrix retained |
 | TNK-010 | Medium | Robustness/performance | I19/I20 no longer reliably satisfy the retained 60-second gate | **Resolved 2026-07-26**; gate restored without widening timeout |
 | TNK-011 | High | Bug | Collapsing memberships are not offered to compatible subject roots | **Resolved 2026-07-27**; oracle matrix and trace retained |
+| TNK-012 | Medium | Bug | View validation omits connected-component and operator-profile checks | **Resolved 2026-07-27**; rejection matrix retained |
+| TNK-013 | Medium | Compatibility rejection | Disambiguated source operator maps in views are parser-rejected | **Resolved 2026-07-27**; overloaded-map oracle fixture retained |
+| TNK-014 | Low | Behavioral divergence | Transformed module imports in parameter theories emit spurious generic-module errors | **Resolved 2026-07-27**; renamed/instantiated import fixture retained |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -558,6 +561,66 @@ passed: the live oracle diff, all 458 workspace tests, and the 89/89 audit score
 The closure is deliberately limited to **ACU/two-sided-AU/CUI collapsing membership indexing**.
 Associative one-sided `left id:`/`right id:` collapse remains a separate matcher gap.
 
+### TNK-012 — View validation omits kind and operator-profile checks — RESOLVED
+
+- **Severity:** Medium
+- **Classification:** Bug; invalid Maude views remained usable
+- **Confidence:** Oracle-differential fixture retained
+- **Status:** Resolved 2026-07-27
+- **Primary area:** `tnk-modules::view::validate_view`
+
+`validate_view` now builds the flattened source and target signatures before storing a plain view. It
+requires every source connected component to map into one target component, resolves explicit source
+operator signatures through the frontend's declaration-profile table, and checks op-to-op arity/domain/range
+compatibility. Op-to-term targets are parsed in the target grammar and must have a sort below the mapped
+source range. A bad kind split or unary-to-binary map therefore invalidates the view, and the dependent
+instance is not built.
+
+`conformance/audit/A4f-view-validation.maude` retains both rejection consequences: with diagnostics removed,
+neither invalid dependent command produces a result. Focused validator tests cover the kind split,
+operator-profile mismatch, and an ill-typed op-to-term target.
+
+Subsort nonpreservation remains a diagnostic-only difference. Maude warns but keeps that view usable; tnk
+also keeps it usable and still lacks the warning. Theory equations likewise remain user proof obligations,
+not executable validation conditions.
+
+### TNK-013 — Disambiguated source operator maps in views are rejected — RESOLVED
+
+- **Severity:** Medium
+- **Classification:** Compatibility rejection
+- **Confidence:** Oracle-differential fixture retained
+- **Status:** Resolved 2026-07-27
+- **Primary area:** view surface AST/parser, signature profiles, and grammar-aware instantiation maps
+
+The view parser now accepts and stores `op f : A -> A to gx`. Resolved source declarations retain their
+symbol/domain/range profiles; instantiation qualifies theory-owned source sorts, resolves each specific map
+to the parser's source `SymbolId`, and reconstructs only calls in that overload group. Generic maps retain
+their all-overloads behavior. `show view` and META view up/down translation preserve the specific signature.
+
+`conformance/audit/A4g-view-specific-map.maude` maps the two unary `f` overloads independently and matches
+Maude exactly: `X: x1` and `Y: y1`, two rewrites each.
+
+### TNK-014 — Transformed module imports in parameter theories report false errors — RESOLVED
+
+- **Severity:** Low
+- **Classification:** Behavioral divergence; spurious diagnostics
+- **Confidence:** Oracle-differential fixture retained
+- **Status:** Resolved 2026-07-27
+- **Primary area:** `flatten::module_origin_sorts`
+
+`module_origin_sorts` now classifies each branch of an import expression. Renamed and instantiated module
+branches contribute their transformed sort names; theory branches contribute only their recursively
+inherited module sorts. A mixed module/theory sum therefore keeps the theory's own sorts parameter-owned
+instead of either inventing `$`-qualified module sorts or dropping required `$` qualification from theory
+sorts.
+
+`conformance/audit/A4h-theory-transformed-imports.maude` retains three oracle cases. The renamed import
+returns `Truth: yes`, the instantiated import returns `BoxI{A4H-ToN-I}: boxi(zi)`, and a renamed mixed
+module/theory sum returns `TruthM: answerM`; every result takes two rewrites with no generic-module build
+error.
+
+The final verification gates passed: all 465 workspace tests and the complete 92/92 audit scoreboard.
+
 ## 4. Ratified accepted divergences
 
 These are known differences, not discoveries to hide behind the word “clean.” `tools/legacy-sweep.sh` verifies that they have not drifted beyond their recorded forms.
@@ -614,7 +677,7 @@ These are established residual families, but this document does not claim that e
 
 ### OUT-003 — Trace/result annotation and wording differences
 
-Known examples include some statement-body rendering, substitution/canonical order, matched-portion labels, blank lines, bounded rewrite sort annotations, zero-solution wording, `continue` wording, and meta-module grouping/order. These should be split into reproducible issues before repair rather than treated as one formatter task.
+Known examples include some statement-body rendering, substitution/canonical order, matched-portion labels, blank lines, bounded rewrite sort annotations, zero-solution wording, `continue` wording, and meta-module grouping/order. A signature-disambiguated `show view` map retains its selector but prints source sorts (`A -> A`) where Maude canonicalizes them as kinds (`[A] -> [A]`); execution uses the same selected overload. These should be split into reproducible issues before repair rather than treated as one formatter task.
 
 ## 6. Deferred or missing behavior
 
@@ -696,9 +759,15 @@ The exotic composition probes established the collapse-indexing bug closed by TN
 ACU/two-sided-AU/CUI candidate indexing while preserving the already-working iter/CUI/AC matcher composition.
 The independently confirmed one-sided-AU matcher boundary remains outside that closure.
 
-### RISK-004 — View validation and unusual map/module-expression forms
+### RISK-004 — Resolved as TNK-012 through TNK-014
 
-Source-admitted boundaries include connected-component/subsort preservation, operator-map type checks, theory proof obligations, disambiguated source op maps, renamed/instantiated theory imports, and instantiation over a module-sum base.
+Direct probes separated three confirmed issues: missing kind/operator-profile validation (TNK-012), rejection
+of legal overload-disambiguated view maps (TNK-013), and false generic-module errors for renamed/instantiated
+module imports in parameter theories (TNK-014). All three are resolved with retained oracle fixtures. Maude
+and tnk both accept an unsatisfied nonexecutive theory axiom because such axioms are user proof obligations
+rather than automatically checked view conditions. Both reject an instantiation whose summation base
+contains free parameters; the legal bound-parameter form `A{X} + B{X}` conforms. Nonpreserved subsorts still
+produce a Maude-only warning while both systems keep the view usable and compute the same result.
 
 ### RISK-005 — Reflection boundaries
 
@@ -745,7 +814,7 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, and TNK-009 in `C6d-implicit-bool-mode`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
+The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, TNK-009 in `C6d-implicit-bool-mode`, TNK-011 in `B3c-membership-collapse`, TNK-012 in `A4f-view-validation`, TNK-013 in `A4g-view-specific-map`, and TNK-014 in `A4h-theory-transformed-imports`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
 
 ## 9. Prototype/v0 decision view
 
@@ -756,6 +825,7 @@ This document does not set release priority. It exposes the decisions:
 - **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, session invalidation, and generalized-`top` recovery covered by TNK-005/TNK-006.
 - **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** No: TNK-007–009 are resolved and retained; broader unverified candidates remain classified separately.
 - **Is the 60-second I-S gate binding?** It remains binding and unchanged; TNK-010 restored I19/I20 beneath it.
+- **Can v0 claim the covered view/module-expression boundaries?** Yes for connected-component and operator-profile validation, overload-specific view maps, and renamed/instantiated/mixed module-origin imports covered by TNK-012–014. Theory proof obligations and warning-only subsort preservation remain explicit boundaries.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.
 
-The clean release statement is narrower than “bug-free”: every confirmed TNK-001–010 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.
+The clean release statement is narrower than “bug-free”: every confirmed TNK-001–014 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.

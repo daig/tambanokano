@@ -1,0 +1,94 @@
+*** A4h-theory-transformed-imports — module-origin sorts inherited by a parameter theory retain names
+*** produced by renamed and instantiated module expressions without absorbing theory sorts from mixed sums.
+fth A4H-TRIV-R is sort Elt . endfth
+fmod A4H-B-R is
+  sort BoolR .
+  ops ttR ffR : -> BoolR [ctor] .
+endfm
+fth A4H-ORD-R is
+  protecting A4H-B-R * (sort BoolR to Truth, op ttR to yes, op ffR to no) .
+  including A4H-TRIV-R .
+  op cmp : Elt Elt -> Truth .
+endfth
+fmod A4H-NN-R is
+  protecting A4H-B-R * (sort BoolR to Truth, op ttR to yes, op ffR to no) .
+  sort N .
+  op n0 : -> N [ctor] .
+  op le : N N -> Truth .
+  eq le(n0, n0) = yes .
+endfm
+view A4H-ToNN-R from A4H-ORD-R to A4H-NN-R is
+  sort Elt to N .
+  op cmp to le .
+endv
+fmod A4H-USE-ORD-R{X :: A4H-ORD-R} is
+  sort Wrap{X} .
+  op w : X$Elt -> Wrap{X} [ctor] .
+  op check : Wrap{X} Wrap{X} -> Truth .
+  vars P Q : X$Elt .
+  eq check(w(P), w(Q)) = cmp(P, Q) .
+endfm
+fmod A4H-USE-R is protecting A4H-USE-ORD-R{A4H-ToNN-R} . endfm
+red in A4H-USE-R : check(w(n0), w(n0)) .
+
+fth A4H-TRIV-I is sort EltI . endfth
+fmod A4H-NAT-I is sort NatI . op zi : -> NatI [ctor] . endfm
+view A4H-ToN-I from A4H-TRIV-I to A4H-NAT-I is sort EltI to NatI . endv
+fmod A4H-BOX-I{P :: A4H-TRIV-I} is
+  sort BoxI{P} .
+  op boxi : P$EltI -> BoxI{P} [ctor] .
+endfm
+fth A4H-TH-I is
+  protecting A4H-BOX-I{A4H-ToN-I} .
+  sort KeyI .
+  op tagi : KeyI -> BoxI{A4H-ToN-I} .
+endfth
+fmod A4H-TARGET-I is
+  protecting A4H-BOX-I{A4H-ToN-I} .
+  sort KI .
+  op ki : -> KI [ctor] .
+  op tag2i : KI -> BoxI{A4H-ToN-I} .
+  eq tag2i(ki) = boxi(zi) .
+endfm
+view A4H-W-I from A4H-TH-I to A4H-TARGET-I is
+  sort KeyI to KI .
+  op tagi to tag2i .
+endv
+fmod A4H-P-I{X :: A4H-TH-I} is
+  op testi : X$KeyI -> BoxI{A4H-ToN-I} .
+  var QI : X$KeyI .
+  eq testi(QI) = tagi(QI) .
+endfm
+fmod A4H-USE-I is protecting A4H-P-I{A4H-W-I} . endfm
+red in A4H-USE-I : testi(ki) .
+
+fmod A4H-M-BASE is
+  sort FlagM .
+endfm
+fth A4H-M-ELT is
+  sort EltM .
+endfth
+fth A4H-MIX is
+  including (A4H-M-BASE + A4H-M-ELT) *
+    (sort FlagM to TruthM, sort EltM to ItemM) .
+  op flagM : ItemM -> TruthM .
+endfth
+fmod A4H-M-TARGET is
+  protecting A4H-M-BASE * (sort FlagM to TruthM) .
+  sort NM .
+  op nM : -> NM [ctor] .
+  op answerM : -> TruthM [ctor] .
+  op flagNM : NM -> TruthM .
+  eq flagNM(nM) = answerM .
+endfm
+view A4H-M-V from A4H-MIX to A4H-M-TARGET is
+  sort ItemM to NM .
+  op flagM to flagNM .
+endv
+fmod A4H-M-P{X :: A4H-MIX} is
+  op testM : X$ItemM -> TruthM .
+  var E : X$ItemM .
+  eq testM(E) = flagM(E) .
+endfm
+fmod A4H-M-USE is protecting A4H-M-P{A4H-M-V} . endfm
+red in A4H-M-USE : testM(nM) .

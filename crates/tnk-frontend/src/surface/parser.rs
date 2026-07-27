@@ -1014,7 +1014,7 @@ impl<'a> Parser<'a> {
     /// A view definition `view V [{X :: T, …}] from <expr> to <expr> is <maps> endv` (B-ii / Axis-A2). An
     /// optional parameter list after the name makes it a *parameterized* view (`view V{X :: T} … to M{X}`),
     /// only used by a nested instantiation. `from`/`to` are module expressions. Maps: `sort A to B .`,
-    /// `op f to g .`, `op f to term t .` — a disambiguated source `op f : … to …` is rejected (follow-up).
+    /// `op f to g .`, `op f : A -> B to g .`, and `op f to term t .`.
     fn view(&mut self) -> PResult<ViewDecl> {
         self.eat("view")?;
         let name = self.name()?;
@@ -1058,22 +1058,58 @@ impl<'a> Parser<'a> {
                 }
                 "op" => {
                     self.advance();
-                    let from = self.collect_until(&["to"]);
-                    if from.iter().any(|t| self.i.resolve(t.sym) == ":") {
-                        return Err(
-                            "disambiguated view op map `op f : … to …` is a B-ii follow-up".into(),
-                        );
+                    // A signature selector has a top-level arrow before the map's top-level `to`.
+                    // Colons inside an op→term source pattern (`f(A:Elt)`) are therefore not mistaken for
+                    // the selector delimiter.
+                    let mut depth = 0i32;
+                    let mut signature_colon = None;
+                    let mut has_signature_arrow = false;
+                    for position in self.pos..self.toks.len() {
+                        match self.i.resolve(self.toks[position].sym) {
+                            "(" => depth += 1,
+                            ")" => depth -= 1,
+                            "to" if depth == 0 => break,
+                            ":" if depth == 0 => signature_colon = Some(position),
+                            "->" | "~>" if depth == 0 => {
+                                has_signature_arrow = true;
+                                break;
+                            }
+                            _ => {}
+                        }
                     }
+                    let (from, dom_range) = if has_signature_arrow {
+                        let delimiter =
+                            signature_colon.ok_or("disambiguated view op map is missing `:`")?;
+                        let from = self.toks[self.pos..delimiter].to_vec();
+                        self.pos = delimiter + 1;
+                        let mut domain = Vec::new();
+                        while !self.at("->") && !self.at("~>") {
+                            domain.push(self.sort_name()?);
+                        }
+                        self.advance();
+                        let range = self.sort_name()?;
+                        (from, Some((domain, range)))
+                    } else {
+                        (self.collect_until(&["to"]), None)
+                    };
                     self.eat("to")?;
                     if self.at("term") {
                         self.advance();
                         let term = self.collect_until(&[]);
                         self.eat_dot()?;
-                        op_maps.push(OpMap::Term { from, to: term });
+                        op_maps.push(OpMap::Term {
+                            from,
+                            to: term,
+                            dom_range,
+                        });
                     } else {
                         let to = self.collect_until(&[]);
                         self.eat_dot()?;
-                        op_maps.push(OpMap::Op { from, to });
+                        op_maps.push(OpMap::Op {
+                            from,
+                            to,
+                            dom_range,
+                        });
                     }
                 }
                 "class" => {
@@ -1089,7 +1125,11 @@ impl<'a> Parser<'a> {
                     // OO class maps are the sort map plus the honorary class-constant operator map
                     // created by `desugar_class`.
                     sort_maps.push((from_s, to_s));
-                    op_maps.push(OpMap::Op { from, to });
+                    op_maps.push(OpMap::Op {
+                        from,
+                        to,
+                        dom_range: None,
+                    });
                 }
                 "attr" => {
                     self.advance();
@@ -1110,7 +1150,11 @@ impl<'a> Parser<'a> {
                     from.extend(self.attribute_suffix(from_token.line));
                     let mut to = vec![to_token];
                     to.extend(self.attribute_suffix(to_token.line));
-                    op_maps.push(OpMap::Op { from, to });
+                    op_maps.push(OpMap::Op {
+                        from,
+                        to,
+                        dom_range: None,
+                    });
                 }
                 "msg" => {
                     self.advance();
@@ -1128,7 +1172,11 @@ impl<'a> Parser<'a> {
                     if from.is_empty() || to.is_empty() {
                         return Err("message view map has an empty source or target term".into());
                     }
-                    op_maps.push(OpMap::Term { from, to });
+                    op_maps.push(OpMap::Term {
+                        from,
+                        to,
+                        dom_range: None,
+                    });
                 }
                 other => {
                     return Err(format!(
@@ -2766,6 +2814,31 @@ endv
             matches!(&v.op_maps[1], OpMap::Term { .. }),
             "op 0 to term zero"
         );
+    }
+
+    #[test]
+    fn parses_disambiguated_view_op_map_without_confusing_colon_variables() {
+        let source = parse(
+            "view V from T to M is\n\
+               op f : A -> A to g .\n\
+               op h(X:A) to term X:B .\n\
+             endv\n",
+        );
+        let view = &source.views[0];
+        assert!(matches!(
+            &view.op_maps[0],
+            OpMap::Op {
+                dom_range: Some((domain, range)),
+                ..
+            } if domain == &["A"] && range == "A"
+        ));
+        assert!(matches!(
+            &view.op_maps[1],
+            OpMap::Term {
+                dom_range: None,
+                ..
+            }
+        ));
     }
 
     /// B-ii: an empty view (`view V from T to M is endv`) parses with no maps.

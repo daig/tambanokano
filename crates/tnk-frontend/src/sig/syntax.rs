@@ -47,6 +47,17 @@ impl SymbolSyntax {
     }
 }
 
+/// One source operator declaration after sort resolution. Distinct connected-component overloads have
+/// distinct [`symbol`](Self::symbol)s; subsort overloads in the same component share one symbol but retain
+/// each declaration profile here. Grammar-aware view maps use this table to resolve a disambiguated source
+/// signature to the same symbol identity as the term parser.
+#[derive(Debug, Clone)]
+pub struct OpProfile {
+    pub symbol: SymbolId,
+    pub domain: Vec<SortId>,
+    pub range: SortId,
+}
+
 /// Source-form trace metadata for one equation, keyed by the kernel's dense equation id
 /// (`BuiltModule::eq_traces[id]`). The kernel keeps no source `Term`s, so the full trace renderer reads
 /// the body from here: it Term-prints `[c]eq {lhs} = {rhs}[ if {condition}][ \[owise\]] .` and labels the
@@ -123,6 +134,8 @@ pub struct BuiltModule {
     pub ops: HashMap<(String, usize), SymbolId>,
     /// Per-symbol surface syntax.
     pub syntax: HashMap<SymbolId, SymbolSyntax>,
+    /// Every resolved source operator declaration, including overloads folded into one symbol.
+    pub op_profiles: Vec<OpProfile>,
     /// Declared variables `(name, sort)` (from `var`/`vars`). Used by the grammar builder (variable
     /// productions) and `build_term` (resolving a variable token to its sort + statement-local index).
     pub vars: Vec<(String, SortId)>,

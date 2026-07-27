@@ -1,0 +1,34 @@
+*** A4g-view-specific-map — signature-disambiguated maps select same-name unary operators by kind.
+fth A4G-OVERTH is
+  sorts A B .
+  ops aa : -> A .
+  ops bb : -> B .
+  op f : A -> A .
+  op f : B -> B .
+endfth
+fmod A4G-TARGET is
+  sorts X Y .
+  ops x0 x1 : -> X [ctor] .
+  ops y0 y1 : -> Y [ctor] .
+  op gx : X -> X .
+  op gy : Y -> Y .
+  eq gx(x0) = x1 .
+  eq gy(y0) = y1 .
+endfm
+view A4G-DISAMB from A4G-OVERTH to A4G-TARGET is
+  sort A to X .
+  sort B to Y .
+  op aa to x0 .
+  op bb to y0 .
+  op f : A -> A to gx .
+  op f : B -> B to gy .
+endv
+fmod A4G-APPLY{P :: A4G-OVERTH} is
+  ops ax : -> P$A .
+  ops by : -> P$B .
+  eq ax = f(aa) .
+  eq by = f(bb) .
+endfm
+fmod A4G-USE is protecting A4G-APPLY{A4G-DISAMB} . endfm
+red in A4G-USE : ax .
+red in A4G-USE : by .

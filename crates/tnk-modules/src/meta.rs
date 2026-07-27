@@ -4526,14 +4526,27 @@ impl MetaDescent<'_> {
         let mut om = Vec::with_capacity(v.op_maps.len());
         for mapping in &v.op_maps {
             match mapping {
-                OpMap::Op { from, to } => {
+                OpMap::Op {
+                    from,
+                    to,
+                    dom_range,
+                } => {
                     let from = canonical_name(from, self.interner);
                     let to = canonical_name(to, self.interner);
                     let from = ctx.make_na(qid, NaValue::Qid(from.into()));
                     let to = ctx.make_na(qid, NaValue::Qid(to.into()));
-                    om.push(ctx.app(hooks.ops["opMappingSymbol"], vec![from, to]));
+                    if let Some((domain, range)) = dom_range {
+                        let domain = up_type_name_list(ctx, hooks, domain);
+                        let range = ctx.make_na(qid, NaValue::Qid(range.as_str().into()));
+                        om.push(ctx.app(
+                            hooks.ops["opSpecificMappingSymbol"],
+                            vec![from, domain, range, to],
+                        ));
+                    } else {
+                        om.push(ctx.app(hooks.ops["opMappingSymbol"], vec![from, to]));
+                    }
                 }
-                OpMap::Term { from, to } => {
+                OpMap::Term { from, to, .. } => {
                     let (source, target) = term_modules.as_mut()?;
                     let from = qualify_view_variables(from, &source_variables, self.interner);
                     let to = qualify_view_variables(to, &target_variables, self.interner);
@@ -5311,15 +5324,30 @@ impl MetaDescent<'_> {
         } else {
             None
         };
+        let is_specific_map = |mapping: DagId| {
+            hooks.ops.get("opSpecificMappingSymbol") == Some(&ctx.top(mapping))
+                || ctx.name(ctx.top(mapping)) == "op_:_->_to_."
+        };
         let mut op_maps = Vec::with_capacity(mappings.len());
         for mapping in mappings {
             let args = ctx.children(mapping);
-            if hooks.ops.get("opMappingSymbol") == Some(&ctx.top(mapping)) {
+            if is_specific_map(mapping) {
+                let from = qid_text(ctx, *args.first()?)?;
+                let domain = down_typelist(ctx, hooks, *args.get(1)?);
+                let range = qid_text(ctx, *args.get(2)?)?;
+                let to = qid_text(ctx, *args.get(3)?)?;
+                op_maps.push(OpMap::Op {
+                    from: tokenize(&from, self.interner),
+                    to: tokenize(&to, self.interner),
+                    dom_range: Some((domain, range)),
+                });
+            } else if hooks.ops.get("opMappingSymbol") == Some(&ctx.top(mapping)) {
                 let from = qid_text(ctx, *args.first()?)?;
                 let to = qid_text(ctx, *args.get(1)?)?;
                 op_maps.push(OpMap::Op {
                     from: tokenize(&from, self.interner),
                     to: tokenize(&to, self.interner),
+                    dom_range: None,
                 });
             } else if is_term_map(mapping) {
                 let (source, target) = term_modules.as_mut()?;
@@ -5355,6 +5383,7 @@ impl MetaDescent<'_> {
                 op_maps.push(OpMap::Term {
                     from: source_term_tokens(&source.built, self.interner, &from_term, &from_names),
                     to: source_term_tokens(&target.built, self.interner, &to_term, &to_names),
+                    dom_range: None,
                 });
             } else {
                 return None;
@@ -7874,6 +7903,21 @@ fn down_type(ctx: &MetaCtx, m: &BuiltModule, d: DagId) -> Option<SortId> {
 fn up_type(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, s: SortId) -> DagId {
     let name = m.engine.sorts().name(s).to_string();
     ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()))
+}
+
+/// Up-translate already-spelled sort names to a meta `TypeList`.
+fn up_type_name_list(ctx: &mut MetaCtx, hooks: &MetaHooks, sorts: &[String]) -> DagId {
+    let qid = hooks.ops["qidSymbol"];
+    let elems = sorts
+        .iter()
+        .map(|sort| ctx.make_na(qid, NaValue::Qid(sort.as_str().into())))
+        .collect();
+    up_set(
+        ctx,
+        elems,
+        hooks.ops["nilQidListSymbol"],
+        hooks.ops["qidListSymbol"],
+    )
 }
 
 /// Up-translate a sort list to a meta `TypeList` (`__`-joined `Qid`s; a singleton stays a `Type`, empty is

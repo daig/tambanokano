@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Interner, Token, tokenize};
-use tnk_frontend::rename_terms::{ReconTarget, ViewOpSubst};
+use tnk_frontend::rename_terms::{ReconTarget, ViewOpMap, ViewOpSubst};
 use tnk_frontend::surface::ast::{
     Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, StratExpr,
     VarDecl, ViewDecl,
@@ -618,10 +618,81 @@ fn theory_pconst_ops(
         .collect())
 }
 
-/// Collect the sorts theory `name` inherits from an imported **module** (vs. a theory) — recursively, so a
-/// theory that includes another theory inherits *that* theory's module-origin sorts. These are excluded
-/// from the parameter-copy renaming (A4). Only `Named` imports are considered (a renamed/instantiated
-/// theory import is a follow-up).
+fn collect_expression_sorts(
+    expr: &ModuleExpr,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+    out: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut acc = Acc::default();
+    let mut visited = HashSet::new();
+    collect_expr(expr, db, views, &mut acc, &mut visited, interner, &[])?;
+    out.extend(acc.into_decls().sorts);
+    Ok(())
+}
+
+/// Collect only the module-origin subset of one theory import expression. Sums are classified branch by
+/// branch so a legal `MODULE + THEORY` import does not turn the theory's own sorts into module sorts.
+/// Renamings are then applied to that subset; instantiating a parameterized module contributes the whole
+/// instantiated signature because every sort in that result is module-origin.
+#[allow(clippy::too_many_arguments)]
+fn module_origin_expr_sorts(
+    expr: &ModuleExpr,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+    seen: &mut HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<(), String> {
+    match expr {
+        ModuleExpr::Named(name) => match db.get(name) {
+            Some(module) if module.is_theory => {
+                module_origin_sorts(name, db, views, interner, seen, out)
+            }
+            Some(_) => collect_expression_sorts(expr, db, views, interner, out),
+            None => Ok(()),
+        },
+        ModuleExpr::Sum(left, right) => {
+            module_origin_expr_sorts(left, db, views, interner, seen, out)?;
+            module_origin_expr_sorts(right, db, views, interner, seen, out)
+        }
+        ModuleExpr::Rename(inner, items) => {
+            let mut inner_sorts = HashSet::new();
+            module_origin_expr_sorts(inner, db, views, interner, seen, &mut inner_sorts)?;
+            let sort_maps: HashMap<&str, &str> = items
+                .iter()
+                .filter_map(|item| match item {
+                    RenameItem::Sort { from, to } => Some((from.as_str(), to.as_str())),
+                    _ => None,
+                })
+                .collect();
+            for mut sort in inner_sorts {
+                if let Some(target) = sort_maps.get(sort.as_str()) {
+                    sort = (*target).to_string();
+                }
+                out.insert(sort);
+            }
+            Ok(())
+        }
+        ModuleExpr::Instantiation(base, _) => {
+            let mut bases = Vec::new();
+            import_module_bases(base, &mut bases);
+            if bases
+                .iter()
+                .any(|name| db.get(*name).is_some_and(|module| !module.is_theory))
+            {
+                collect_expression_sorts(expr, db, views, interner, out)
+            } else {
+                module_origin_expr_sorts(base, db, views, interner, seen, out)
+            }
+        }
+    }
+}
+
+/// Collect the sorts a theory inherits from imported **modules** (vs. theories), recursively so an
+/// imported theory contributes its own module-origin sorts. Each transformed import branch retains its
+/// resulting sort names, while a mixed module/theory sum keeps the theory's own sorts parameter-owned.
 fn module_origin_sorts(
     name: &str,
     db: &ModuleDb,
@@ -633,21 +704,18 @@ fn module_origin_sorts(
     if !seen.insert(name.to_string()) {
         return Ok(());
     }
-    let Some(pm) = db.get(name) else {
-        return Ok(());
-    };
-    let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
-    for imp in &imports {
-        let ModuleExpr::Named(n) = imp else { continue };
-        if db.get(n).is_some_and(|m| m.is_theory) {
-            module_origin_sorts(n, db, views, interner, seen, out)?; // an imported theory
-        } else {
-            // An imported module: every sort in its closure is module-origin.
-            let flat = flatten(n, db, views, interner)?;
-            out.extend(flat.sorts);
+    let result = (|| {
+        let Some(pm) = db.get(name) else {
+            return Ok(());
+        };
+        let imports: Vec<ModuleExpr> = pm.imports.iter().map(|imp| imp.expr.clone()).collect();
+        for import in &imports {
+            module_origin_expr_sorts(import, db, views, interner, seen, out)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    seen.remove(name);
+    result
 }
 
 fn collect_expr(
@@ -864,7 +932,7 @@ fn instantiate(
     // sort images compose left-to-right; the structured-sort name is the whole chain (`ToT2}{C2`).
     let mut bindings: HashMap<String, ParamBinding> = HashMap::new();
     let mut op_subst: HashMap<String, Vec<Token>> = HashMap::new();
-    let mut op_recon: Vec<(String, ReconTarget)> = Vec::new();
+    let mut op_recon: Vec<ViewOpMap> = Vec::new();
     let mut param_to_arg: HashMap<String, ModuleExpr> = HashMap::new();
     for (i, param) in pm.params.iter().enumerate() {
         let chain: Vec<&ModuleExpr> = arg_lists.iter().map(|lvl| &lvl[i]).collect();
@@ -880,6 +948,10 @@ fn instantiate(
         }
         // A theory's parameter constants `c` (`[pconst]`) appear in the body as `X$c` (like a parameter
         // sort `X$s`), so the view's op map for `c` keys the substitution under `param.name$c`.
+        // Exact source profiles are written in the theory's unqualified sort names. The standalone source
+        // grammar contains the parameter copy, where genuine theory sorts are named `X$s`; module-origin
+        // sorts retain their names.
+        let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
         let pconst_ops = theory_pconst_ops(&param.theory, db, views, interner)?;
         for r in &resolutions {
             for (k, val) in &r.op_subst {
@@ -889,7 +961,19 @@ fn instantiate(
                     op_subst.insert(k.clone(), val.clone());
                 }
             }
-            op_recon.extend(r.op_recon.clone());
+            op_recon.extend(r.op_recon.iter().cloned().map(|mut map| {
+                if let Some((domain, range)) = &mut map.dom_range {
+                    for sort in domain {
+                        if theory_sorts.contains(sort) {
+                            *sort = format!("{}${sort}", param.name);
+                        }
+                    }
+                    if theory_sorts.contains(range) {
+                        *range = format!("{}${range}", param.name);
+                    }
+                }
+                map
+            }));
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
         let mut sort_image: HashMap<String, String> = HashMap::new();
@@ -910,7 +994,6 @@ fn instantiate(
             .collect::<Vec<_>>()
             .join("}{");
         // The parameter theory's genuine sorts — so a fake `X$Foo` in the body survives (A4d).
-        let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
         bindings.insert(
             param.name.clone(),
             ParamBinding {
@@ -1039,7 +1122,7 @@ fn apply_view_op_recon(
     mname: &str,
     db: &ModuleDb,
     views: &ViewDb,
-    op_recon: &[(String, ReconTarget)],
+    op_recon: &[ViewOpMap],
     interner: &mut Interner,
 ) -> Result<(), String> {
     let mut src = flatten(mname, db, views, interner)?;
@@ -1132,8 +1215,9 @@ struct ArgResolution {
     target: Option<ModuleExpr>,
     op_subst: HashMap<String, Vec<Token>>,
     /// Op maps that need grammar-aware reconstruction of the parameterized module's statement bubbles
-    /// ([`ViewOpSubst`]): mixfix op→op (fixity change) and op→term with variable arguments; see [`op_maps_of`].
-    op_recon: Vec<(String, ReconTarget)>,
+    /// ([`ViewOpSubst`]): signature-specific maps, mixfix fixity changes, and op→term maps with variable
+    /// arguments; see [`op_maps_of`].
+    op_recon: Vec<ViewOpMap>,
 }
 
 /// Resolve one instantiation argument against the enclosing parameter `scope`. A bare name in `scope` is a
@@ -1247,61 +1331,76 @@ fn resolve_arg(
 }
 
 /// The op-maps of a view, split into two application paths:
-/// - **textual** (`HashMap` source-token → target token(s)): a single-token prefix/constant source mapped
-///   to a hole-free (prefix/constant) target, or a constant `op f to term t` — the map is a plain token
-///   substitution on statement bubbles (`op f to g`, `empty to none`), the common case (A1).
-/// - **reconstruction** (`Vec` of (source canonical, target canonical)): any op→op map where a side is
-///   *mixfix* (`op f to _+_`, `op _#_ to g`, `op _#_ to _+_`). A token substitution cannot change fixity,
-///   so these route through [`ViewOpSubst`], which parses the bubble in the source grammar and re-emits the
-///   application in the target's syntax.
-///
-/// - **term template** (`ReconTarget::Term`): an op→term map with variable arguments (`op lt(A, B) to term
-///   A < B` or `msg to O from O' get to term to O get from O'`). The from-pattern's argument variables
-///   become the template's formal parameters; each occurrence re-emits the template with actual arguments
-///   substituted. Prefix patterns use their ordinary application syntax; mixfix patterns derive the
-///   canonical source name by replacing each declared view variable with an underscore.
+/// - **textual** (`HashMap` source-token → target token(s)): a non-disambiguated single-token
+///   prefix/constant source mapped to a hole-free target, or a constant `op f to term t`. These maps can
+///   safely substitute every occurrence of the source name.
+/// - **reconstruction** ([`ViewOpMap`]): every signature-disambiguated map, every op→op map where either
+///   side is mixfix, and every op→term map with variable arguments. [`ViewOpSubst`] parses each source
+///   bubble, resolves the selected source symbol, and re-emits the target syntax.
 #[allow(clippy::type_complexity)]
 fn op_maps_of(
     v: &ViewDecl,
     i: &Interner,
-) -> Result<(HashMap<String, Vec<Token>>, Vec<(String, ReconTarget)>), String> {
+) -> Result<(HashMap<String, Vec<Token>>, Vec<ViewOpMap>), String> {
     let mut op_subst = HashMap::new();
     let mut op_recon = Vec::new();
     for m in &v.op_maps {
         match m {
-            OpMap::Op { from, to } => {
+            OpMap::Op {
+                from,
+                to,
+                dom_range,
+            } => {
                 let from_canon: String = from.iter().map(|t| i.resolve(t.sym)).collect();
                 let to_canon: String = to.iter().map(|t| i.resolve(t.sym)).collect();
                 // A `_` in an op's canonical name is an argument hole (a literal underscore is backtick-
                 // escaped), so `contains('_')` distinguishes a mixfix name from a prefix/constant one.
-                if from.len() == 1 && !from_canon.contains('_') && !to_canon.contains('_') {
+                if dom_range.is_none()
+                    && from.len() == 1
+                    && !from_canon.contains('_')
+                    && !to_canon.contains('_')
+                {
                     op_subst.insert(from_canon, to.clone());
                 } else {
-                    op_recon.push((from_canon, ReconTarget::Op(to_canon)));
+                    op_recon.push(ViewOpMap {
+                        source: from_canon,
+                        dom_range: dom_range.clone(),
+                        target: ReconTarget::Op(to_canon),
+                    });
                 }
             }
-            OpMap::Term { from, to } => match from.as_slice() {
-                // A constant op→term (`op 0 to term 0.0`): a plain token substitution.
-                [tok] => {
+            OpMap::Term {
+                from,
+                to,
+                dom_range,
+            } => match from.as_slice() {
+                // A non-disambiguated constant op→term (`op 0 to term 0.0`): a plain token substitution.
+                [tok] if dom_range.is_none() => {
                     op_subst.insert(i.resolve(tok.sym).to_string(), to.clone());
                 }
                 // `op f(A, B, …) to term <template>`: a prefix source applied to argument variables.
                 _ => {
                     let (name, formals) = op_pattern_formals(from, i)
                         .or_else(|| mixfix_pattern_formals(from, &v.vars, i))
+                        .or_else(|| {
+                            dom_range.as_ref().map(|_| {
+                                (from.iter().map(|t| i.resolve(t.sym)).collect(), Vec::new())
+                            })
+                        })
                         .ok_or_else(|| {
                             format!(
                                 "view `{}`: malformed operator-to-term source pattern",
                                 v.name
                             )
                         })?;
-                    op_recon.push((
-                        name,
-                        ReconTarget::Term {
+                    op_recon.push(ViewOpMap {
+                        source: name,
+                        dom_range: dom_range.clone(),
+                        target: ReconTarget::Term {
                             formals,
                             template: to.clone(),
                         },
-                    ));
+                    });
                 }
             },
         }

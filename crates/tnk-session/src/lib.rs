@@ -2648,17 +2648,37 @@ fn render_view(v: &ViewDecl, i: &Interner) -> String {
     }
     for m in &v.op_maps {
         match m {
-            OpMap::Op { from, to } => {
+            OpMap::Op {
+                from,
+                to,
+                dom_range,
+            } => {
+                let signature = dom_range
+                    .as_ref()
+                    .map_or_else(String::new, |(domain, range)| {
+                        format!(" : {} -> {range}", domain.join(" "))
+                    });
                 s.push_str(&format!(
-                    "  op {} to {} .\n",
+                    "  op {}{} to {} .\n",
                     join_tokens(from, i),
+                    signature,
                     join_tokens(to, i)
                 ));
             }
-            OpMap::Term { from, to } => {
+            OpMap::Term {
+                from,
+                to,
+                dom_range,
+            } => {
+                let signature = dom_range
+                    .as_ref()
+                    .map_or_else(String::new, |(domain, range)| {
+                        format!(" : {} -> {range}", domain.join(" "))
+                    });
                 s.push_str(&format!(
-                    "  op {} to term {} .\n",
+                    "  op {}{} to term {} .\n",
                     join_tokens(from, i),
+                    signature,
                     join_tokens(to, i)
                 ));
             }

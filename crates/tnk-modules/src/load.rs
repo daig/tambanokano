@@ -618,6 +618,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signature_disambiguated_view_maps_conform() {
+        conform(
+            conformance_file!("audit/A4g-view-specific-map.maude"),
+            &[e("X", "x1", 2), e("Y", "y1", 2)],
+        );
+    }
+
+    #[test]
+    fn transformed_module_imports_in_parameter_theories_conform() {
+        conform(
+            conformance_file!("audit/A4h-theory-transformed-imports.maude"),
+            &[
+                e("Truth", "yes", 2),
+                e("BoxI{A4H-ToN-I}", "boxi(zi)", 2),
+                e("TruthM", "answerM", 2),
+            ],
+        );
+    }
+
     /// Cross-kind ad-hoc operator overloading (the kernel prerequisite nested instantiation surfaced):
     /// `f : A -> B` and `f : B -> C` are the *same* name+arity in *different* connected components, so they
     /// are distinct symbols (the argument kind selects the declaration), and `f(f(a))` types as `C`.

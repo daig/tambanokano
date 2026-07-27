@@ -6,7 +6,7 @@
 //! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
 
 use crate::lex::{Frag, Interner, Sym, Token, is_punct, split_mixfix};
-use crate::sig::syntax::{BuiltModule, IdentitySpec, SymbolSyntax};
+use crate::sig::syntax::{BuiltModule, IdentitySpec, OpProfile, SymbolSyntax};
 use crate::surface::ast::{Attrs, IdSide, PreModule, SpecialSpec};
 use std::collections::HashMap;
 use tnk_core::engine::Engine;
@@ -164,6 +164,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut ops: HashMap<(String, usize), SymbolId> = HashMap::new();
     let mut name_to_sym: HashMap<String, SymbolId> = HashMap::new();
     let mut syntax: HashMap<SymbolId, SymbolSyntax> = HashMap::new();
+    let mut op_profiles: Vec<OpProfile> = Vec::new();
     // Symbol identity is the **kind-profile** (name + domain/range connected components), not just
     // (name, arity): subsort overloading (same components, different sorts — `_+_ : NzNat Nat -> NzNat`
     // and `_+_ : Nat Nat -> Nat`) adds a declaration to the *same* symbol, but **ad-hoc** overloading
@@ -333,6 +334,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 );
                 sym
             };
+            op_profiles.push(OpProfile {
+                symbol: sym,
+                domain: domain.clone(),
+                range,
+            });
             if let Some(tokens) = &od.attrs.id
                 && !identity_specs.iter().any(|spec| spec.symbol == sym)
             {
@@ -543,6 +549,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         sorts,
         ops,
         syntax,
+        op_profiles,
         vars,
         statements: Vec::new(), // moved in by the caller (B4.4); kept out of `&PreModule`
         eq_traces: Vec::new(),  // populated by load_statements (full-trace metadata)

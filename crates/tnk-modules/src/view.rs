@@ -1,18 +1,17 @@
 //! View definitions (Pillar B-ii): store + signature-validate `view V from T to M is … endv`.
 //!
 //! A view maps a source theory `T` to a target module/theory `M` — it is the argument of a parameterized
-//! instantiation `M{V}` (B-iv). This module parses-then-stores views and **signature-validates** them:
-//! `from` resolves to a theory and `to` to a defined module; every sort the view explicitly maps — plus
-//! every theory sort by its identity default — names a sort that exists in the target. That is the check
-//! behind Maude's most common view diagnostic (`failed to find sort … to represent …`).
-//!
-//! Deferred to when B-iv exercises the maps (noted so the gap is explicit): the kind/connected-component
-//! and subsort-preservation checks (`View::checkSorts`), operator-mapping type checks (`checkOps` — op maps
-//! are parsed and stored but not yet validated), and the theory's axiom proof obligations.
+//! instantiation `M{V}` (B-iv). Validation covers the signature homomorphism before a view is stored:
+//! sort existence, connected-component preservation, and operator-map source/target profiles.
+//! Theory axioms remain proof obligations, as in Maude; they are not executed as validation tests.
 
 use std::collections::{HashMap, HashSet};
-use tnk_frontend::lex::Interner;
-use tnk_frontend::surface::ast::{ModuleExpr, ViewDecl};
+use tnk_core::sort::SortId;
+use tnk_frontend::lex::{Interner, Token};
+use tnk_frontend::load::{build_loaded_module, build_logic_command_parses};
+use tnk_frontend::sig::build_sig::build_module;
+use tnk_frontend::sig::syntax::{BuiltModule, OpProfile};
+use tnk_frontend::surface::ast::{ModuleExpr, OpMap, VarDecl, ViewDecl};
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten;
@@ -56,6 +55,142 @@ fn expr_base_name(e: &ModuleExpr) -> Result<&str, String> {
     }
 }
 
+#[derive(Clone)]
+enum OpMapTarget {
+    Op(String),
+    Term(Vec<Token>),
+}
+
+#[derive(Clone)]
+struct OpMapSpec {
+    source: String,
+    dom_range: Option<(Vec<String>, String)>,
+    target: OpMapTarget,
+}
+
+fn canonical_tokens(tokens: &[Token], interner: &Interner) -> String {
+    tokens
+        .iter()
+        .map(|token| interner.resolve(token.sym))
+        .collect()
+}
+
+/// Recover the canonical source operator name from an op-map source. Op→op maps carry just the name;
+/// op→term maps may carry a prefix or mixfix application whose variable positions denote holes.
+fn map_source_name(v: &ViewDecl, tokens: &[Token], interner: &Interner) -> String {
+    if tokens.len() >= 3 && interner.resolve(tokens[1].sym) == "(" {
+        return interner.resolve(tokens[0].sym).to_string();
+    }
+    let variables: HashSet<&str> = v
+        .vars
+        .iter()
+        .flat_map(|decl| decl.names.iter().map(String::as_str))
+        .collect();
+    tokens
+        .iter()
+        .map(|token| {
+            let text = interner.resolve(token.sym);
+            let base = text.split_once(':').map_or(text, |(name, _)| name);
+            if variables.contains(base) { "_" } else { text }
+        })
+        .collect()
+}
+
+fn op_map_specs(v: &ViewDecl, interner: &Interner) -> Vec<OpMapSpec> {
+    v.op_maps
+        .iter()
+        .map(|mapping| match mapping {
+            OpMap::Op {
+                from,
+                to,
+                dom_range,
+            } => OpMapSpec {
+                source: canonical_tokens(from, interner),
+                dom_range: dom_range.clone(),
+                target: OpMapTarget::Op(canonical_tokens(to, interner)),
+            },
+            OpMap::Term {
+                from,
+                to,
+                dom_range,
+            } => OpMapSpec {
+                source: map_source_name(v, from, interner),
+                dom_range: dom_range.clone(),
+                target: OpMapTarget::Term(to.clone()),
+            },
+        })
+        .collect()
+}
+
+fn selector_matches(
+    profile: &OpProfile,
+    selector: &(Vec<String>, String),
+    source: &BuiltModule,
+) -> bool {
+    selector.0.len() == profile.domain.len()
+        && selector
+            .0
+            .iter()
+            .zip(&profile.domain)
+            .all(|(name, &resolved)| {
+                source.sorts.get(name).is_some_and(|&declared| {
+                    source.engine.sorts().kind_of(declared)
+                        == source.engine.sorts().kind_of(resolved)
+                })
+            })
+        && source.sorts.get(&selector.1).is_some_and(|&range| {
+            source.engine.sorts().kind_of(range) == source.engine.sorts().kind_of(profile.range)
+        })
+}
+
+fn mapped_sort(
+    source_sort: SortId,
+    source: &BuiltModule,
+    target: &BuiltModule,
+    sort_image: &HashMap<String, String>,
+) -> Option<SortId> {
+    let source_sorts = source.engine.sorts();
+    if source_sorts.sort(source_sort).is_error {
+        let member = source_sorts
+            .kind(source_sorts.kind_of(source_sort))
+            .members
+            .first()
+            .copied()?;
+        let image = sort_image.get(source_sorts.name(member))?;
+        let target_member = *target.sorts.get(image)?;
+        Some(
+            target
+                .engine
+                .sorts()
+                .error_sort(target.engine.sorts().kind_of(target_member)),
+        )
+    } else {
+        sort_image
+            .get(source_sorts.name(source_sort))
+            .and_then(|name| target.sorts.get(name))
+            .copied()
+    }
+}
+
+fn profile_name<'a>(profile: &OpProfile, module: &'a BuiltModule) -> &'a str {
+    module.engine.symbol(profile.symbol).name()
+}
+
+fn profile_text(profile: &OpProfile, module: &BuiltModule) -> String {
+    let domain = profile
+        .domain
+        .iter()
+        .map(|&sort| module.engine.sorts().name(sort))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{} : {} -> {}",
+        profile_name(profile, module),
+        domain,
+        module.engine.sorts().name(profile.range)
+    )
+}
+
 /// Signature-validate a view against the module database. On success the view is well-formed enough to be
 /// stored and (later) used in an instantiation; on failure returns a diagnostic mirroring the reference
 /// binary's wording.
@@ -87,51 +222,193 @@ pub fn validate_view(
         )
     })?;
 
-    // Flatten the source theory / target module with the REAL view table: a target may itself be
-    // built from instantiations (`INT-VECTOR = VECTOR{Int0} * (…)`, stock linear.maude), so an
-    // empty table wrongly failed its flatten ("view `Int0` is not defined").
+    // Flatten with the real view table: a target may itself be built from an earlier instantiation.
     let from_flat = flatten(from_name, db, views, interner)?;
     let from_sorts: HashSet<&str> = from_flat.sorts.iter().map(String::as_str).collect();
 
-    // Sort-map sources must be sorts of the theory.
-    let mut mapped: HashSet<&str> = HashSet::new();
-    for (a, _b) in &v.sort_maps {
-        if !from_sorts.contains(a.as_str()) {
+    for (source, _) in &v.sort_maps {
+        if !from_sorts.contains(source.as_str()) {
             return Err(format!(
-                "view `{}`: sort `{a}` is not a sort of `{from_name}`",
+                "view `{}`: sort `{source}` is not a sort of `{from_name}`",
                 v.name
             ));
         }
-        mapped.insert(a.as_str());
     }
 
-    // Target-sort existence (Maude's `failed to find sort …`) needs a *flattenable* target. A parameterized
-    // view's target references the view's own parameters (`to LIST{X}`) and so cannot be flattened
-    // standalone — its sorts are checked when the view is used in an instantiation. For a plain named target
-    // (the B-ii common case) keep the full check, including the identity default for unmapped theory sorts.
-    if v.params.is_empty()
-        && let ModuleExpr::Named(_) = &v.to
-    {
-        let to_flat = flatten(to_name, db, views, interner)?;
-        let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
-        for (a, b) in &v.sort_maps {
-            if !to_sorts.contains(b.as_str()) {
-                return Err(format!(
-                    "view `{}`: failed to find sort {b} in {to_name} to represent sort {a} from {from_name}",
-                    v.name
-                ));
+    // A parameterized view's target contains its own free parameters and is checked when instantiated.
+    // A plain target is fully checkable now.
+    if !v.params.is_empty() || !matches!(&v.to, ModuleExpr::Named(_)) {
+        return Ok(());
+    }
+
+    let to_flat = flatten(to_name, db, views, interner)?;
+    let to_sorts: HashSet<&str> = to_flat.sorts.iter().map(String::as_str).collect();
+    let explicit: HashMap<&str, &str> = v
+        .sort_maps
+        .iter()
+        .map(|(source, target)| (source.as_str(), target.as_str()))
+        .collect();
+    let mut sort_image = HashMap::new();
+    for source in &from_flat.sorts {
+        let target = explicit
+            .get(source.as_str())
+            .copied()
+            .unwrap_or(source.as_str());
+        if !to_sorts.contains(target) {
+            return Err(format!(
+                "view `{}`: failed to find sort {target} in {to_name} to represent sort {source} from {from_name}",
+                v.name
+            ));
+        }
+        sort_image.insert(source.clone(), target.to_string());
+    }
+
+    let source = build_module(&from_flat, interner)?;
+    let target = build_module(&to_flat, interner)?;
+
+    // A sort map is a homomorphism of the order-sorted signature: connected source sorts stay connected.
+    for (index, left_name) in from_flat.sorts.iter().enumerate() {
+        let left = source.sorts[left_name];
+        let left_image = target.sorts[&sort_image[left_name]];
+        for right_name in &from_flat.sorts[index + 1..] {
+            let right = source.sorts[right_name];
+            if source.engine.sorts().same_kind(left, right) {
+                let right_image = target.sorts[&sort_image[right_name]];
+                if !target.engine.sorts().same_kind(left_image, right_image) {
+                    return Err(format!(
+                        "view `{}`: sorts {left_name} and {right_name} from {from_name} are in the same kind, \
+                         but {} and {} in {to_name} are in different kinds",
+                        v.name, sort_image[left_name], sort_image[right_name]
+                    ));
+                }
             }
         }
-        for a in &from_flat.sorts {
-            if mapped.contains(a.as_str()) {
-                continue;
-            }
-            if !to_sorts.contains(a.as_str()) {
+    }
+
+    let maps = op_map_specs(v, interner);
+    // Every explicit source must resolve. A signature selector identifies the source symbol's
+    // connected-component profile, matching Maude's overload grouping.
+    for mapping in &maps {
+        let found = source.op_profiles.iter().any(|profile| {
+            profile_name(profile, &source) == mapping.source
+                && mapping
+                    .dom_range
+                    .as_ref()
+                    .is_none_or(|selector| selector_matches(profile, selector, &source))
+        });
+        if !found {
+            return Err(format!(
+                "view `{}`: source operator `{}` is not defined in {from_name}",
+                v.name, mapping.source
+            ));
+        }
+    }
+
+    let mut term_target = if maps
+        .iter()
+        .any(|mapping| matches!(mapping.target, OpMapTarget::Term(_)))
+    {
+        let mut term_pm = to_flat.clone();
+        term_pm.statements.clear();
+        term_pm.strat_defs.clear();
+        for variable in &v.vars {
+            let target_sort = sort_image.get(&variable.sort).ok_or_else(|| {
+                format!(
+                    "view `{}`: variable sort `{}` is not a source theory sort",
+                    v.name, variable.sort
+                )
+            })?;
+            term_pm.vars.push(VarDecl {
+                names: variable.names.clone(),
+                sort: target_sort.clone(),
+            });
+        }
+        Some(build_loaded_module(&term_pm, interner)?)
+    } else {
+        None
+    };
+
+    for source_profile in &source.op_profiles {
+        let source_name = profile_name(source_profile, &source);
+        let exact = maps.iter().find(|mapping| {
+            mapping.source == source_name
+                && mapping
+                    .dom_range
+                    .as_ref()
+                    .is_some_and(|selector| selector_matches(source_profile, selector, &source))
+        });
+        let generic = maps
+            .iter()
+            .find(|mapping| mapping.source == source_name && mapping.dom_range.is_none());
+        let mapping = exact.or(generic);
+        let target_map = mapping.map(|mapping| &mapping.target);
+        let Some(mapped_domain): Option<Vec<SortId>> = source_profile
+            .domain
+            .iter()
+            .map(|&sort| mapped_sort(sort, &source, &target, &sort_image))
+            .collect()
+        else {
+            return Err(format!(
+                "view `{}`: could not map the domain of source operator {}",
+                v.name,
+                profile_text(source_profile, &source)
+            ));
+        };
+        let Some(mapped_range) = mapped_sort(source_profile.range, &source, &target, &sort_image)
+        else {
+            return Err(format!(
+                "view `{}`: could not map the range of source operator {}",
+                v.name,
+                profile_text(source_profile, &source)
+            ));
+        };
+        if let Some(OpMapTarget::Term(tokens)) = target_map {
+            let term_module = term_target
+                .as_mut()
+                .expect("term-map target module built above");
+            let parses =
+                build_logic_command_parses(term_module, interner, tokens).map_err(|error| {
+                    format!(
+                        "view `{}`: target term for operator {} does not parse in {to_name}: {error}",
+                        v.name,
+                        profile_text(source_profile, &source)
+                    )
+                })?;
+            let suitable = parses.iter().any(|(_, _, dag)| {
+                let sort = term_module.built.engine.sort_of(*dag);
+                term_module.built.engine.sorts().leq(sort, mapped_range)
+            });
+            if !suitable {
                 return Err(format!(
-                    "view `{}`: failed to find sort {a} in {to_name} to represent sort {a} from {from_name}",
-                    v.name
+                    "view `{}`: target term for operator {} does not have a sort below {} in {to_name}",
+                    v.name,
+                    profile_text(source_profile, &source),
+                    target.engine.sorts().name(mapped_range)
                 ));
             }
+            continue;
+        }
+        let target_name = match target_map {
+            Some(OpMapTarget::Op(name)) => name.as_str(),
+            Some(OpMapTarget::Term(_)) => unreachable!(),
+            None => source_name,
+        };
+        let suitable = target.op_profiles.iter().any(|profile| {
+            profile_name(profile, &target) == target_name
+                && profile.domain.len() == mapped_domain.len()
+                && mapped_domain
+                    .iter()
+                    .zip(&profile.domain)
+                    .all(|(&image, &domain)| target.engine.sorts().leq(image, domain))
+                && target.engine.sorts().leq(profile.range, mapped_range)
+        });
+        if !suitable {
+            return Err(format!(
+                "view `{}`: failed to find suitable operator {target_name} in {to_name} to represent \
+                 operator {} from {from_name}",
+                v.name,
+                profile_text(source_profile, &source)
+            ));
         }
     }
     Ok(())
@@ -201,5 +478,56 @@ mod tests {
         );
         let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
         assert!(err.contains("failed to find sort Key in NUM"), "got: {err}");
+    }
+    #[test]
+    fn connected_component_split_rejected() {
+        let (db, views, mut i) = setup(
+            "fth T is sorts A B . subsort A < B . endfth\n\
+             fmod M is sorts X Y . endfm\n\
+             view V from T to M is sort A to X . sort B to Y . endv\n",
+        );
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
+        assert!(err.contains("in different kinds"), "got: {err}");
+    }
+
+    #[test]
+    fn nonpreserving_subsort_map_remains_usable() {
+        let (db, views, mut i) = setup(
+            "fth T is sorts A B . subsort A < B . endfth\n\
+             fmod M is sorts X Y Top . subsorts X Y < Top . endfm\n\
+             view V from T to M is sort A to X . sort B to Y . endv\n",
+        );
+        assert!(
+            validate_view(&views[0], &db, &ViewDb::new(), &mut i).is_ok(),
+            "Maude warns about the missing subsort image but keeps the view usable"
+        );
+    }
+
+    #[test]
+    fn incompatible_operator_profile_rejected() {
+        let (db, views, mut i) = setup(
+            "fth T is sort E . op f : E -> E . endfth\n\
+             fmod M is sort S . op g : S S -> S . endfm\n\
+             view V from T to M is sort E to S . op f to g . endv\n",
+        );
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
+        assert!(
+            err.contains("failed to find suitable operator g"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn operator_to_term_range_rejected() {
+        let (db, views, mut i) = setup(
+            "fth T is sort E . op f : E -> E . endfth\n\
+             fmod M is sorts S Other . op other : -> Other . endfm\n\
+             view V from T to M is\n\
+               sort E to S .\n\
+               op f(X:E) to term other .\n\
+             endv\n",
+        );
+        let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
+        assert!(err.contains("does not have a sort below S"), "got: {err}");
     }
 }

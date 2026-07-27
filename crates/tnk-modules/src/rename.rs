@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
-use tnk_frontend::rename_terms::{OpRenamer, ReconTarget, ViewOpSubst};
+use tnk_frontend::rename_terms::{OpRenamer, ReconTarget, ViewOpMap, ViewOpSubst};
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement, StratExpr};
 
 use crate::flatten::FlatDecls;
@@ -66,10 +66,14 @@ pub fn apply_renaming(
     // Every non-disambiguated operator map is reconstructed structurally from the source parse. This is
     // necessary when fixity changes (`pair` → `_+_`): swapping the prefix token in `pair(a,b)` would yield
     // the invalid `+(a,b)`. Signature-disambiguated maps retain the arity-aware surgical renamer.
-    let structural_maps: Vec<(String, ReconTarget)> = op_renames
+    let structural_maps: Vec<ViewOpMap> = op_renames
         .iter()
         .filter(|s| s.dom_range.is_none())
-        .map(|s| (s.from.clone(), ReconTarget::Op(s.to.clone())))
+        .map(|s| ViewOpMap {
+            source: s.from.clone(),
+            dom_range: None,
+            target: ReconTarget::Op(s.to.clone()),
+        })
         .collect();
     let structural = ViewOpSubst::new(&premodule_of(&d), &structural_maps, interner)?;
     let grammar_renames: Vec<(String, Option<usize>, String)> = op_renames

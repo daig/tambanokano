@@ -18,7 +18,7 @@ use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A renamer for one import's op renamings: the source module's signature + grammar (built once from the
 /// *pre-rename* declarations) plus the from-name → target-fragment map.
@@ -164,11 +164,12 @@ impl OpRenamer {
 /// the (recursively rewritten) argument sub-bubbles. Every non-mapped subterm is reproduced token-for-token,
 /// so the bubble's shape is preserved wherever no mapped operator occurs.
 ///
-/// The from-name is a symbol of the source (parameter-theory) signature; the to-name is spelled in the
-/// target module's syntax — mirroring [`OpRenamer`], but generalized to a fixity change. Prefix→prefix and
-/// constant op→term maps stay on the caller's textual path; only maps with a mixfix side come here.
-/// The target of a view operator map that needs grammar-aware reconstruction: another operator (with a
-/// possibly different fixity), or a **term template** for an op→term map with variable arguments.
+/// Plain single-token maps stay on the caller's textual path. Fixity-changing maps and
+/// signature-disambiguated maps come here: the latter resolve their source declaration profile to the
+/// same symbol identity carried by each parse-tree action.
+///
+/// The target of a reconstructed view operator map is another operator (with a possibly different fixity)
+/// or a **term template** for an op→term map with variable arguments.
 #[derive(Clone)]
 pub enum ReconTarget {
     /// op→op: the target operator's canonical name (`g`, `_+_`) — the application is re-emitted in its syntax.
@@ -183,6 +184,15 @@ pub enum ReconTarget {
     },
 }
 
+/// One grammar-aware view operator map. `dom_range` selects one source overload by its resolved signature;
+/// `None` maps every source symbol with the canonical `source` name.
+#[derive(Clone)]
+pub struct ViewOpMap {
+    pub source: String,
+    pub dom_range: Option<(Vec<String>, String)>,
+    pub target: ReconTarget,
+}
+
 #[derive(Clone)]
 struct LexicalFallback {
     source: Vec<Frag>,
@@ -192,8 +202,10 @@ struct LexicalFallback {
 pub struct ViewOpSubst {
     built: BuiltModule,
     grammar: CompiledGrammar,
-    /// Source op canonical name (`f`, `_#_`, `lt`) → its reconstruction target.
-    targets: HashMap<String, ReconTarget>,
+    /// Signature-disambiguated maps resolved to the parser's source symbol identity.
+    symbol_targets: HashMap<tnk_core::symbol::SymbolId, ReconTarget>,
+    /// Plain maps apply to every overload of their canonical source name.
+    name_targets: HashMap<String, ReconTarget>,
     /// A token-local fallback for mixfix occurrences inside compound bubbles the standalone term parser
     /// cannot accept (notably juxtaposed object configurations and `if` branches).
     fallbacks: Vec<LexicalFallback>,
@@ -201,11 +213,11 @@ pub struct ViewOpSubst {
 
 impl ViewOpSubst {
     /// Build over `pm` (the source parameterized module, flattened with its parameter copies so the theory
-    /// operators and its variables are in scope). `Ok(None)` if `maps` is empty; `Err` only if building the
-    /// source module/grammar fails.
+    /// operators and its variables are in scope). `Ok(None)` if `maps` is empty; an exact source profile is
+    /// resolved to the same symbol identity carried by the source grammar.
     pub fn new(
         pm: &PreModule,
-        maps: &[(String, ReconTarget)],
+        maps: &[ViewOpMap],
         interner: &mut Interner,
     ) -> Result<Option<Self>, String> {
         if maps.is_empty() {
@@ -213,33 +225,87 @@ impl ViewOpSubst {
         }
         let built = build_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
-        let targets = maps.iter().cloned().collect();
+        let mut symbol_targets = HashMap::new();
+        let mut name_targets = HashMap::new();
+        for map in maps {
+            let Some((domain, range)) = &map.dom_range else {
+                name_targets.insert(map.source.clone(), map.target.clone());
+                continue;
+            };
+            let domain_ids: Vec<_> =
+                domain
+                    .iter()
+                    .map(|sort| {
+                        built.sorts.get(sort).copied().ok_or_else(|| {
+                            format!("unknown source sort `{sort}` in view operator map")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+            let range_id = built
+                .sorts
+                .get(range)
+                .copied()
+                .ok_or_else(|| format!("unknown source sort `{range}` in view operator map"))?;
+            let symbols: HashSet<_> = built
+                .op_profiles
+                .iter()
+                .filter(|profile| {
+                    built.engine.symbol(profile.symbol).name() == map.source
+                        && profile.domain == domain_ids
+                        && profile.range == range_id
+                })
+                .map(|profile| profile.symbol)
+                .collect();
+            if symbols.is_empty() {
+                return Err(format!(
+                    "source operator `{}` : {} -> {} is not defined",
+                    map.source,
+                    domain.join(" "),
+                    range
+                ));
+            }
+            for symbol in symbols {
+                if symbol_targets.insert(symbol, map.target.clone()).is_some() {
+                    return Err(format!(
+                        "conflicting view mappings select source operator `{}`",
+                        map.source
+                    ));
+                }
+            }
+        }
         let fallbacks = maps
             .iter()
-            .filter_map(|(source, target)| {
-                let fragments = split_mixfix(source, interner);
+            .filter(|map| map.dom_range.is_none())
+            .filter_map(|map| {
+                let fragments = split_mixfix(&map.source, interner);
                 let has_hole = fragments
                     .iter()
                     .any(|fragment| matches!(fragment, Frag::Hole));
-                let changes = !matches!(target, ReconTarget::Op(name) if name == source);
+                let changes = !matches!(&map.target, ReconTarget::Op(name) if name == &map.source);
                 (has_hole && changes).then(|| LexicalFallback {
                     source: fragments,
-                    target: target.clone(),
+                    target: map.target.clone(),
                 })
             })
             .collect();
         Ok(Some(Self {
             built,
             grammar,
-            targets,
+            symbol_targets,
+            name_targets,
             fallbacks,
         }))
     }
 
+    fn target(&self, symbol: tnk_core::symbol::SymbolId, name: &str) -> Option<&ReconTarget> {
+        self.symbol_targets
+            .get(&symbol)
+            .or_else(|| self.name_targets.get(name))
+    }
+
     /// Rewrite one term bubble. Grammar reconstruction handles arbitrary argument terms. If the bubble is
     /// not a standalone term (for example a juxtaposed object configuration), a conservative lexical path
-    /// still rewrites mixfix occurrences whose arguments are single tokens—the shape of flattened rule
-    /// patterns before variable inlining.
+    /// still rewrites non-disambiguated mixfix occurrences whose arguments are single tokens.
     pub fn rewrite(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
         if bubble.is_empty() {
             return bubble.to_vec();
@@ -299,7 +365,7 @@ impl ViewOpSubst {
                 .rsplit_once('^')
                 .map(|(_, count)| count.to_string());
             if let (Some(ReconTarget::Op(target)), Some(count)) =
-                (self.targets.get(name).cloned(), count)
+                (self.target(sym, name).cloned(), count)
             {
                 let args: Vec<Vec<Token>> = t
                     .nt_children
@@ -318,7 +384,7 @@ impl ViewOpSubst {
         }
         if let Action::MakeTerm(sym) = prod.action {
             let name = self.built.engine.symbol(sym).name();
-            if let Some(target) = self.targets.get(name).cloned() {
+            if let Some(target) = self.target(sym, name).cloned() {
                 let args: Vec<Vec<Token>> = t
                     .nt_children
                     .iter()
@@ -533,9 +599,17 @@ mod tests {
     fn view_substitution_preserves_compact_iter_count() {
         let mut i = Interner::new();
         let pm = iter_module(&mut i);
-        let mapper = ViewOpSubst::new(&pm, &[("g".into(), ReconTarget::Op("h".into()))], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let mapper = ViewOpSubst::new(
+            &pm,
+            &[ViewOpMap {
+                source: "g".into(),
+                dom_range: None,
+                target: ReconTarget::Op("h".into()),
+            }],
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
         let bubble = tokenize("g^1000000(a)", &mut i);
         let rewritten = mapper.rewrite(&bubble, &mut i);
         let text: String = rewritten.iter().map(|t| i.resolve(t.sym)).collect();

@@ -1,0 +1,41 @@
+*** A4f-view-validation — invalid view sort/order and operator profiles make their instances unusable.
+*** With diagnostics removed, both Maude and tnk produce no command result. Each command would return a
+*** value if the corresponding invalid view were incorrectly stored.
+fth A4F-SUBTH is
+  sorts Small Big .
+  subsort Small < Big .
+endfth
+fmod A4F-SPLIT is
+  sorts X Y .
+  op x : -> X [ctor] .
+endfm
+view A4F-BAD-SORTS from A4F-SUBTH to A4F-SPLIT is
+  sort Small to X .
+  sort Big to Y .
+endv
+fmod A4F-SORT-BOX{P :: A4F-SUBTH} is
+  sort Box{P} .
+  op box : P$Small -> Box{P} [ctor] .
+endfm
+fmod A4F-SORT-USE is protecting A4F-SORT-BOX{A4F-BAD-SORTS} . endfm
+red in A4F-SORT-USE : box(x) .
+
+fth A4F-OPTH is
+  sort Elt .
+  op f : Elt -> Elt .
+endfth
+fmod A4F-BAD-OPS is
+  sort S .
+  op s : -> S [ctor] .
+  op g : S S -> S [ctor] .
+endfm
+view A4F-BAD-OP from A4F-OPTH to A4F-BAD-OPS is
+  sort Elt to S .
+  op f to g .
+endv
+fmod A4F-OP-BOX{P :: A4F-OPTH} is
+  sort OBox{P} .
+  op obox : P$Elt -> OBox{P} [ctor] .
+endfm
+fmod A4F-OP-USE is protecting A4F-OP-BOX{A4F-BAD-OP} . endfm
+red in A4F-OP-USE : obox(s) .

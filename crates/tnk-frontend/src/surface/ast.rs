@@ -147,12 +147,20 @@ pub struct ViewDecl {
 }
 
 /// One operator mapping in a view: `op f to g .` (to another operator) or `op f to term t .` (to a target
-/// term, e.g. `op 0 to term 0.0`). Names/terms are raw token bubbles (the mixfix parse runs against the
-/// target module later). Disambiguated source `op f : A -> B to …` is a B-ii follow-up (rejected loudly).
+/// term, e.g. `op 0 to term 0.0`). A disambiguated source `op f : A -> B to …` carries its domain/range
+/// profile so one overload can be mapped without affecting another.
 #[derive(Debug, Clone)]
 pub enum OpMap {
-    Op { from: Vec<Token>, to: Vec<Token> },
-    Term { from: Vec<Token>, to: Vec<Token> },
+    Op {
+        from: Vec<Token>,
+        to: Vec<Token>,
+        dom_range: Option<(Vec<String>, String)>,
+    },
+    Term {
+        from: Vec<Token>,
+        to: Vec<Token>,
+        dom_range: Option<(Vec<String>, String)>,
+    },
 }
 
 /// One operator declaration `op <name> : <domain> -> <range> [<attrs>] .` (or `ops …` expanded to one
