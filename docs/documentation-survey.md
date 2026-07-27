@@ -219,8 +219,9 @@ These have current implementation evidence, a retained audit record, or a direct
 - Mixed-symbol ACU print/canonicalization order, bounded AC `frewrite` intermediate order, strategy-echo parentheses, and several trace/result annotation/wording differences cataloged in the audit.
 - Garbage-term Earley explosion on a large grammar remains a separate risk: the TNK-010 hasher repair removes dominant constant-factor cost from normal nested parsing but does not claim a general complexity bound for malformed large-grammar input.
 - TNK-007's exact-float boundary, TNK-008's membership tiebreak, TNK-009's automatic BOOL mode, TNK-010's
-  retained performance gate, and TNK-012–014's view/module-expression boundaries are resolved with focused
-  fixtures. They are historical findings, not current behavioral residuals.
+  retained performance gate, TNK-012–014's view/module-expression boundaries, and TNK-015's independent
+  META print settings are resolved with focused fixtures. They are historical findings, not current
+  behavioral residuals.
 - View theory proof obligations and free-parameter module-sum bases match the reference behavior.
   Subsort nonpreservation still differs only by a missing warning; both systems keep the view usable.
 
@@ -231,7 +232,7 @@ Do not copy these comments directly into a public limitations page. First determ
 - Recursive parameterized strategy calls pass a direct oracle comparison and use lazy runtime expansion; add a retained recursion fixture if that corner becomes a separately advertised v0 contract.
 - Unusual cross-kind overload grouping remains a candidate, but the direct basic case with two domain/range kinds conforms and does not reach the old assertion.
 - Exotic AC/iter membership-extension corners remain candidates. Direct CUI collapse matching and iter-membership probes produced the oracle's solution set/results, so the broad source comments are stale; TNK-008's unrelated incomparable-target ordering is resolved and retained.
-- Conditional `metaMatch`, conditional/partial `metaApply`, partial AC `metaXmatch` contexts, flat builtin-closure up-translation, non-mixfix print options, and structured module-expression/op-to-term view reflection.
+- Conditional `metaMatch`, conditional/partial `metaApply`, partial AC `metaXmatch` contexts, flat builtin-closure up-translation, and structured module-expression/op-to-term view reflection.
 - Re-entrant rewrite-condition GC rooting when the low-level engine is embedded with GC enabled; the REPL currently runs with GC disabled in the cited path.
 - Grammar sort-structure bias and unusual prefix/assoc forms mentioned as frontend follow-ups.
 - Unknown prelude `id-hook` families that currently load as inert operators; classify each by whether it belongs to LOOP-MODE, Full Maude, an optional extension, or v0 parity.

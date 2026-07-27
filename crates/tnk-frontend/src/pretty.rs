@@ -11,9 +11,10 @@
 //! kernel accessors (`DagNode::{repr,symbol,children}`).
 
 use crate::grammar::{PREFIX_GATHER, prec_gather};
-use crate::lex::{Frag, Interner, Sym};
+use crate::lex::{Frag, Interner, Sym, tokenize};
 use crate::sig::syntax::{BuiltModule, SymbolSyntax};
 use std::borrow::Cow;
+use std::rc::Rc;
 use tnk_core::Nat;
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::smt::SmtNumber;
@@ -50,6 +51,38 @@ enum Cat {
     Punct,
 }
 
+/// META-LEVEL's independently selectable pretty-print flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrintOptions {
+    pub mixfix: bool,
+    pub with_parens: bool,
+    pub with_sorts: bool,
+    pub flat: bool,
+    pub format: bool,
+    pub number: bool,
+    pub rational: bool,
+}
+
+const RAW_PRINT_OPTIONS: PrintOptions = PrintOptions {
+    mixfix: true,
+    with_parens: false,
+    with_sorts: false,
+    flat: true,
+    format: true,
+    number: true,
+    rational: false,
+};
+
+const PRETTY_PRINT_OPTIONS: PrintOptions = PrintOptions {
+    mixfix: true,
+    with_parens: false,
+    with_sorts: false,
+    flat: true,
+    format: true,
+    number: true,
+    rational: true,
+};
+
 /// Render `d` (a reduced node) as round-trippable plain text: `parse(print_raw(t)) == t`. Iter counts
 /// ≥ 2 print in compact power form and negation as `- n`, both forms our parser reads back.
 pub fn print_raw(m: &BuiltModule, i: &Interner, d: DagId) -> String {
@@ -58,9 +91,7 @@ pub fn print_raw(m: &BuiltModule, i: &Interner, d: DagId) -> String {
         i,
         faithful: false,
         color: false,
-        mixfix: true,
-        number: true,
-        rational: false,
+        options: RAW_PRINT_OPTIONS,
         vars: &[],
     }
     .render(d)
@@ -75,9 +106,7 @@ pub fn print_pretty(m: &BuiltModule, i: &Interner, d: DagId, color: bool) -> Str
         i,
         faithful: true,
         color,
-        mixfix: true,
-        number: true,
-        rational: true,
+        options: PRETTY_PRINT_OPTIONS,
         vars: &[],
     }
     .render(d)
@@ -97,23 +126,19 @@ pub fn print_pretty_with_variables(
         faithful: true,
         color,
         vars: variables,
-        mixfix: true,
-        number: true,
-        rational: true,
+        options: PRETTY_PRINT_OPTIONS,
     }
     .render(d)
 }
 
-/// Render a DAG with META-LEVEL's independently selectable `mixfix`, `number`, and `rat` options.
-/// This is deliberately separate from [`print_pretty`]: omitted options expose the underlying
-/// successor/division constructors rather than silently inheriting the interactive defaults.
+/// Render a DAG with META-LEVEL's independently selectable [`PrintOptions`].
+/// This is deliberately separate from [`print_pretty`]: omitted options expose the underlying syntax
+/// rather than silently inheriting the interactive defaults.
 pub fn print_with_options(
     m: &BuiltModule,
     i: &Interner,
     d: DagId,
-    mixfix: bool,
-    number: bool,
-    rational: bool,
+    options: PrintOptions,
 ) -> String {
     Printer {
         m,
@@ -121,11 +146,41 @@ pub fn print_with_options(
         faithful: true,
         color: false,
         vars: &[],
-        mixfix,
-        number,
-        rational,
+        options,
     }
     .render(d)
+}
+/// Render a DAG as META-LEVEL `QidList` elements. Ordinary layout whitespace is only lexical
+/// separation and is discarded; explicit `format` controls survive as `\s`, `\t`, and `\n` Qids.
+pub fn print_qid_tokens_with_options(
+    m: &BuiltModule,
+    i: &mut Interner,
+    d: DagId,
+    options: PrintOptions,
+) -> Vec<String> {
+    let chunks = {
+        let printer = Printer {
+            m,
+            i,
+            faithful: true,
+            color: false,
+            vars: &[],
+            options,
+        };
+        printer.render_qid_chunks(d)
+    };
+    let mut result = Vec::new();
+    for chunk in chunks {
+        match chunk {
+            QidChunk::Text(text) => {
+                for token in tokenize(&text, i) {
+                    result.push(i.resolve(token.sym).to_string());
+                }
+            }
+            QidChunk::Control(control) => result.push(control.to_string()),
+        }
+    }
+    result
 }
 
 /// Render a static [`Term`] (an equation/membership LHS/RHS pattern, with variables) — the inverse of the
@@ -139,9 +194,7 @@ pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], colo
         faithful: true,
         color,
         vars,
-        mixfix: true,
-        number: true,
-        rational: true,
+        options: PRETTY_PRINT_OPTIONS,
     }
     .print_term_top(t)
 }
@@ -156,18 +209,22 @@ struct Printer<'a> {
     faithful: bool,
     color: bool,
     vars: &'a [String],
-    mixfix: bool,
-    number: bool,
-    rational: bool,
+    options: PrintOptions,
 }
 
 /// A child to lay out in either walk: a reduced DAG node, or a static [`Term`] (pattern) node. Unifies the
 /// DAG printer (`print_raw`/`print_pretty`) and the `Term` printer (`print_term`, for the trace) under one
 /// iterative driver.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Item<'t> {
     Dag(DagId),
     Term(&'t Term),
+    /// A virtual right-associated tail over one flattened associative DAG node.
+    AssocDag {
+        symbol: SymbolId,
+        children: Rc<[DagId]>,
+        offset: usize,
+    },
 }
 
 /// One pending unit of output on the explicit work-stack. The recursive descent of the former
@@ -181,6 +238,10 @@ enum Work<'a, 't> {
         text: Cow<'a, str>,
     },
     Space,
+    /// An explicit `s` format directive (distinct from ordinary lexical separation for `QidList` output).
+    FormatSpace,
+    /// An explicit `t` format directive.
+    Tab,
     /// A `format`-attribute newline (`n`) — `\n` with no trailing space.
     Newline,
     /// A `format`-attribute indent (`i`) — spaces to the current indentation level.
@@ -197,11 +258,20 @@ enum Work<'a, 't> {
     },
 }
 
+enum QidChunk {
+    Text(String),
+    Control(&'static str),
+}
+
 impl<'a> Printer<'a> {
     fn render(&self, d: DagId) -> String {
         let mut out = String::new();
         self.run_stack(&mut out, Item::Dag(d));
         out
+    }
+
+    fn render_qid_chunks(&self, d: DagId) -> Vec<QidChunk> {
+        self.run_qid_stack(Item::Dag(d))
     }
 
     /// Print a static [`Term`] (a pattern, with named variables) — the trace's `eq lhs = rhs .` renderer.
@@ -235,7 +305,8 @@ impl<'a> Printer<'a> {
         while let Some(w) = stack.pop() {
             match w {
                 Work::Text { cat, text } => self.emit(out, cat, &text),
-                Work::Space => out.push(' '),
+                Work::Space | Work::FormatSpace => out.push(' '),
+                Work::Tab => out.push('\t'),
                 Work::Newline => out.push('\n'),
                 Work::Indent => {
                     for _ in 0..indent.max(0) {
@@ -264,6 +335,69 @@ impl<'a> Printer<'a> {
                 }
             }
         }
+    }
+
+    /// The META `QidList` counterpart of [`run_stack`](Self::run_stack): default spaces stay in text
+    /// chunks for the lexer to discard, while explicit format controls become first-class Qids.
+    fn run_qid_stack<'t>(&self, start: Item<'t>) -> Vec<QidChunk> {
+        let mut stack: Vec<Work<'a, 't>> = vec![Work::Visit {
+            item: start,
+            req_prec: UNBOUNDED,
+            lcap: NONE_CAP,
+            rcap: NONE_CAP,
+            range_known: false,
+            top_level: true,
+        }];
+        let mut pieces: Vec<Work<'a, 't>> = Vec::new();
+        let mut chunks = Vec::new();
+        let mut text = String::new();
+        let mut indent: i32 = 0;
+        while let Some(w) = stack.pop() {
+            match w {
+                Work::Text { cat, text: piece } => self.emit(&mut text, cat, &piece),
+                Work::Space => text.push(' '),
+                Work::FormatSpace => {
+                    flush_qid_text(&mut chunks, &mut text);
+                    chunks.push(QidChunk::Control("\\s"));
+                }
+                Work::Tab => {
+                    flush_qid_text(&mut chunks, &mut text);
+                    chunks.push(QidChunk::Control("\\t"));
+                }
+                Work::Newline => {
+                    flush_qid_text(&mut chunks, &mut text);
+                    chunks.push(QidChunk::Control("\\n"));
+                }
+                Work::Indent => {
+                    flush_qid_text(&mut chunks, &mut text);
+                    for _ in 0..indent.max(0) {
+                        chunks.push(QidChunk::Control("\\s"));
+                    }
+                }
+                Work::IndentDelta(d) => indent += d,
+                Work::Visit {
+                    item,
+                    req_prec,
+                    lcap,
+                    rcap,
+                    range_known,
+                    top_level,
+                } => {
+                    self.layout(
+                        item,
+                        req_prec,
+                        lcap,
+                        rcap,
+                        range_known,
+                        top_level,
+                        &mut pieces,
+                    );
+                    stack.extend(pieces.drain(..).rev());
+                }
+            }
+        }
+        flush_qid_text(&mut chunks, &mut text);
+        chunks
     }
 
     /// Lay out ONE node into its forward piece sequence — emitting `Text`/`Space` and pushing each child as
@@ -330,6 +464,23 @@ impl<'a> Printer<'a> {
                     text: Cow::Owned(text),
                 });
             }
+            Item::AssocDag {
+                symbol,
+                children,
+                offset,
+            } => {
+                let tail = if offset + 2 == children.len() {
+                    Item::Dag(children[offset + 1])
+                } else {
+                    Item::AssocDag {
+                        symbol,
+                        children: Rc::clone(&children),
+                        offset: offset + 1,
+                    }
+                };
+                let nested = [Item::Dag(children[offset]), tail];
+                self.layout_app(symbol, &nested, req_prec, lcap, rcap, true, out);
+            }
             Item::Dag(d) => self.layout_dag(d, req_prec, lcap, rcap, range_known, top_level, out),
         }
     }
@@ -353,10 +504,22 @@ impl<'a> Printer<'a> {
             match node.repr() {
                 NodeRepr::App => None,
                 NodeRepr::Iter { count, arg } => Some(Leaf::Iter { count, arg }),
-                NodeRepr::Str(s) => Some(Leaf::Atom(render_string(s))),
-                NodeRepr::Qid(q) => Some(Leaf::Atom(render_qid(q))),
-                NodeRepr::Float(f) => Some(Leaf::Atom(render_float(f))),
-                NodeRepr::SmtNum(number) => Some(Leaf::Atom(self.smt_number_text(symbol, number))),
+                NodeRepr::Str(s) => Some(Leaf::Atom {
+                    text: render_string(s),
+                    constant: true,
+                }),
+                NodeRepr::Qid(q) => Some(Leaf::Atom {
+                    text: render_qid(q),
+                    constant: true,
+                }),
+                NodeRepr::Float(f) => Some(Leaf::Atom {
+                    text: render_float(f),
+                    constant: true,
+                }),
+                NodeRepr::SmtNum(number) => Some(Leaf::Atom {
+                    text: self.smt_number_text(symbol, number),
+                    constant: true,
+                }),
                 // A genuine variable leaf (symbolic-engine DAGs): `base:Sort`, the form Maude
                 // prints for a `VariableDagNode` (only fresh `#n`/`%n`/`@n` variables survive into
                 // printed unifiers, and those always print with their sort).
@@ -377,31 +540,34 @@ impl<'a> Printer<'a> {
                     } else {
                         base.to_string()
                     };
-                    Some(Leaf::Atom(text))
+                    Some(Leaf::Atom {
+                        text,
+                        constant: false,
+                    })
                 }
             }
         };
         match leaf {
-            Some(Leaf::Atom(text)) => out.push(Work::Text {
-                cat: Cat::Lit,
-                text: Cow::Owned(text),
-            }),
+            Some(Leaf::Atom { text, constant }) => {
+                self.layout_literal(d, text, constant && self.options.with_sorts, out);
+            }
             Some(Leaf::Iter { count, arg }) => {
                 // A Nat numeral is a pseudo literal. In an unknown-range context Maude qualifies it only
                 // if two kinds provide integer syntax (for example NAT plus SMT integers), or a nullary
                 // user operator has the same numeric spelling.
-                if !top_level
-                    && !range_known
+                let need_disambig = self.options.with_sorts
+                    || (!top_level
+                        && !range_known
+                        && self.m.nat_succ == Some(symbol)
+                        && self.is_zero(arg)
+                        && (self.m.integer_literal_kind_count > 1
+                            || self.m.overloaded_naturals.contains(&count)));
+                if need_disambig
+                    && self.options.number
                     && self.m.nat_succ == Some(symbol)
                     && self.is_zero(arg)
-                    && (self.m.integer_literal_kind_count > 1
-                        || self.m.overloaded_naturals.contains(&count))
                 {
-                    let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
-                    out.push(Work::Text {
-                        cat: Cat::Lit,
-                        text: Cow::Owned(format!("({count}).{sort}")),
-                    });
+                    self.layout_literal(d, count.clone(), true, out);
                 } else {
                     self.layout_iter(symbol, &count, Item::Dag(arg), req_prec, lcap, rcap, out);
                 }
@@ -411,35 +577,30 @@ impl<'a> Printer<'a> {
                 // Maude-faithful negation: `-(s^n(0))` → the compact `-n` (Maude's `handleMinus`). The raw
                 // printer instead lets the normal `- arg` mixfix handle it (which re-parses).
                 if self.faithful
+                    && self.options.number
                     && self.m.minus_sym == Some(symbol)
                     && children.len() == 1
                     && let Some(dec) = self.pos_nat_decimal(children[0])
                 {
-                    out.push(Work::Text {
-                        cat: Cat::Lit,
-                        text: Cow::Owned(format!("-{dec}")),
-                    });
+                    self.layout_literal(d, format!("-{dec}"), self.options.with_sorts, out);
                     return;
                 }
                 // Maude-faithful rational: a `DivisionSymbol` node over integer numerals (Maude's `isRat`)
                 // → the compact `num/den`. A zero numerator is the `Zero` constant, not a numeral, so
                 // `0 / 5` falls through to the generic mixfix spacing — matching the reference binary.
-                if self.rational
+                if self.options.rational
                     && self.m.division_sym == Some(symbol)
                     && children.len() == 2
                     && let Some(rat) = self.rational_text(children[0], children[1])
                 {
-                    out.push(Work::Text {
-                        cat: Cat::Lit,
-                        text: Cow::Owned(rat),
-                    });
+                    self.layout_literal(d, rat, self.options.with_sorts, out);
                     return;
                 }
-                let items: Vec<Item> = children.iter().map(|&c| Item::Dag(c)).collect();
                 // Disambiguation (Maude `dagNodePrint.cc`): an ad-hoc-overloaded symbol whose range is not
-                // determined by context prints `(t).Sort` so the output round-trips. The wrap is emitted
-                // around the whole application, and the arguments inherit a possibly-unknown range.
-                let need_disambig = !range_known && self.ambiguous(symbol);
+                // determined by context prints `(t).Sort` so the output round-trips. `with-sorts` forces
+                // the same qualification for every constant.
+                let need_disambig = (!range_known && self.ambiguous(symbol))
+                    || (self.options.with_sorts && children.is_empty());
                 let arg_rk = self.range_of_args_known(symbol, range_known, need_disambig);
                 if need_disambig {
                     out.push(Work::Text {
@@ -447,7 +608,29 @@ impl<'a> Printer<'a> {
                         text: Cow::Borrowed("("),
                     });
                 }
-                self.layout_app(symbol, &items, req_prec, lcap, rcap, arg_rk, out);
+                let nested_prefix = !self.options.flat
+                    && self.m.syntax.get(&symbol).is_some_and(|syn| {
+                        syn.assoc
+                            && syn.arity() == 2
+                            && children.len() > 2
+                            && (!self.options.mixfix
+                                || !syn.frags.iter().any(|f| matches!(f, Frag::Hole)))
+                    });
+                if nested_prefix {
+                    let children: Rc<[DagId]> = children.into();
+                    let items = [
+                        Item::Dag(children[0]),
+                        Item::AssocDag {
+                            symbol,
+                            children: Rc::clone(&children),
+                            offset: 1,
+                        },
+                    ];
+                    self.layout_app(symbol, &items, req_prec, lcap, rcap, arg_rk, out);
+                } else {
+                    let items: Vec<Item> = children.iter().map(|&c| Item::Dag(c)).collect();
+                    self.layout_app(symbol, &items, req_prec, lcap, rcap, arg_rk, out);
+                }
                 if need_disambig {
                     let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
                     out.push(Work::Text {
@@ -456,6 +639,32 @@ impl<'a> Printer<'a> {
                     });
                 }
             }
+        }
+    }
+
+    fn layout_literal<'t>(
+        &self,
+        d: DagId,
+        text: String,
+        disambiguate: bool,
+        out: &mut Vec<Work<'a, 't>>,
+    ) {
+        if disambiguate {
+            out.push(Work::Text {
+                cat: Cat::Punct,
+                text: Cow::Borrowed("("),
+            });
+        }
+        out.push(Work::Text {
+            cat: Cat::Lit,
+            text: Cow::Owned(text),
+        });
+        if disambiguate {
+            let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
+            out.push(Work::Text {
+                cat: Cat::Punct,
+                text: Cow::Owned(format!(").{sort}")),
+            });
         }
     }
 
@@ -474,15 +683,18 @@ impl<'a> Printer<'a> {
         out: &mut Vec<Work<'a, 't>>,
     ) {
         let command_arguments = self.m.engine.symbol(symbol).is_meta_operation();
-        if !self.mixfix {
-            out.push(Work::Text {
-                cat: if children.is_empty() {
-                    Cat::Lit
-                } else {
-                    Cat::Op
-                },
-                text: Cow::Borrowed(self.m.engine.symbol(symbol).name()),
-            });
+        if !self.options.mixfix {
+            let cat = if children.is_empty() {
+                Cat::Lit
+            } else {
+                Cat::Op
+            };
+            self.layout_prefix_name(
+                Cow::Borrowed(self.m.engine.symbol(symbol).name()),
+                self.m.syntax.get(&symbol),
+                cat,
+                out,
+            );
             if !children.is_empty() {
                 self.layout_arg_list(children, arg_rk, command_arguments, out);
             }
@@ -490,10 +702,12 @@ impl<'a> Printer<'a> {
         }
         let Some(syn) = self.m.syntax.get(&symbol) else {
             // No recorded syntax (should not happen for a user op): prefix-print with the kernel name.
-            out.push(Work::Text {
-                cat: Cat::Op,
-                text: Cow::Borrowed(self.m.engine.symbol(symbol).name()),
-            });
+            self.layout_prefix_name(
+                Cow::Borrowed(self.m.engine.symbol(symbol).name()),
+                None,
+                Cat::Op,
+                out,
+            );
             if !children.is_empty() {
                 self.layout_arg_list(children, arg_rk, command_arguments, out);
             }
@@ -522,10 +736,7 @@ impl<'a> Printer<'a> {
                 name.push_str(&text);
                 no_space = special;
             }
-            out.push(Work::Text {
-                cat,
-                text: Cow::Owned(name),
-            });
+            self.layout_prefix_name(Cow::Owned(name), Some(syn), cat, out);
             if !children.is_empty() {
                 self.layout_arg_list(children, arg_rk, command_arguments, out);
             }
@@ -538,7 +749,9 @@ impl<'a> Printer<'a> {
             syn.gather.as_deref(),
             syn.assoc,
         );
-        let paren = req_prec < pg.prec || self.captures(syn, &pg.gather, lcap, rcap);
+        let paren = self.options.with_parens
+            || req_prec < pg.prec
+            || self.captures(syn, &pg.gather, lcap, rcap);
         if paren {
             out.push(Work::Text {
                 cat: Cat::Punct,
@@ -570,13 +783,34 @@ impl<'a> Printer<'a> {
         }
     }
 
+    fn layout_prefix_name<'t>(
+        &self,
+        text: Cow<'a, str>,
+        syntax: Option<&SymbolSyntax>,
+        cat: Cat,
+        out: &mut Vec<Work<'a, 't>>,
+    ) {
+        let format = if self.options.format {
+            syntax
+                .and_then(|syn| syn.format.as_deref())
+                .filter(|f| f.len() == 2 && format_supported(f))
+        } else {
+            None
+        };
+        emit_gap(format.map(|f| f[0].as_str()), false, out);
+        out.push(Work::Text { cat, text });
+        if let Some(format) = format {
+            emit_gap(Some(format[1].as_str()), false, out);
+        }
+    }
+
     /// Lay out a mixfix form: walk the syntax fragments, emitting literal tokens and pushing each argument
     /// hole as a `Visit` (at its gather bound + adjacency context). An associative operator with more
     /// arguments than its arity folds its flattened children over the infix tokens (`a + b + c`).
     #[allow(clippy::too_many_arguments)]
     fn layout_mixfix<'t>(
         &self,
-        symbol: SymbolId,
+        _symbol: SymbolId,
         syn: &SymbolSyntax,
         pg: &prec_gather::PrecGather,
         children: &[Item<'t>],
@@ -596,10 +830,13 @@ impl<'a> Printer<'a> {
         // spacing as the binary path — and the same `format`-attribute override (the META `__`
         // declaration/trace lists put each element on a new line, `format (d ni d)` / `(d n d)`).
         if syn.assoc && nr_args == 2 && left_bare && right_bare && children.len() > 2 {
-            let format = syn
-                .format
-                .as_deref()
-                .filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f));
+            let format = if self.options.format {
+                syn.format
+                    .as_deref()
+                    .filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f))
+            } else {
+                None
+            };
             let m = syn.frags.len() - 1; // the trailing Hole's index (`f0`/`f_m` are the two arg holes)
             emit_gap(format.map(|f| f[0].as_str()), false, out); // leading gap (before the first element)
             for (idx, c) in children.iter().enumerate() {
@@ -625,12 +862,14 @@ impl<'a> Printer<'a> {
                 } else {
                     pg.gather[0]
                 };
+                let range_known =
+                    arg_rk || (command_arguments && self.is_nonzero_nat_item(c.clone()));
                 out.push(Work::Visit {
-                    item: *c,
+                    item: c.clone(),
                     req_prec: bound,
                     lcap: NONE_CAP,
                     rcap: NONE_CAP,
-                    range_known: arg_rk || (command_arguments && self.is_nonzero_nat_item(*c)),
+                    range_known,
                     top_level: false,
                 });
             }
@@ -649,10 +888,13 @@ impl<'a> Printer<'a> {
         // directive word per **gap** (before each fragment, plus a trailing one), where `d` is exactly that
         // default, `s`/`n`/`i`/`+`/`-` the explicit space/newline/indent/level. An op whose format uses a
         // directive we don't model (`r`/`o`, on some IO/array ops) falls back to the default.
-        let format = syn
-            .format
-            .as_deref()
-            .filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f));
+        let format = if self.options.format {
+            syn.format
+                .as_deref()
+                .filter(|f| f.len() == syn.frags.len() + 1 && format_supported(f))
+        } else {
+            None
+        };
         let object_colons = matches!(
             syn.frags.first(),
             Some(Frag::Tok(symbol)) if self.i.resolve(*symbol) == "<"
@@ -704,13 +946,14 @@ impl<'a> Printer<'a> {
                     emit_gap(word, after_object_colon || !no_space, out);
                     let (lc, rc) =
                         self.hole_caps(syn, pg, k, nr_args, left_bare, right_bare, lcap, rcap, pos);
+                    let range_known = arg_rk
+                        || (command_arguments && self.is_nonzero_nat_item(children[k].clone()));
                     out.push(Work::Visit {
-                        item: children[k],
+                        item: children[k].clone(),
                         req_prec: pg.gather[k],
                         lcap: lc,
                         rcap: rc,
-                        range_known: arg_rk
-                            || (command_arguments && self.is_nonzero_nat_item(children[k])),
+                        range_known,
                         top_level: false,
                     });
                     k += 1;
@@ -814,7 +1057,8 @@ impl<'a> Printer<'a> {
         rcap: Cap,
         out: &mut Vec<Work<'a, 't>>,
     ) {
-        if self.number && self.m.nat_succ == Some(symbol) && self.is_zero_item(arg) {
+        if self.options.number && self.m.nat_succ == Some(symbol) && self.is_zero_item(arg.clone())
+        {
             out.push(Work::Text {
                 cat: Cat::Lit,
                 text: Cow::Owned(count.to_string()),
@@ -823,10 +1067,7 @@ impl<'a> Printer<'a> {
         }
         if count != "1" {
             let power = format!("{}^{count}", self.canonical_name(symbol));
-            out.push(Work::Text {
-                cat: Cat::Op,
-                text: Cow::Owned(power),
-            });
+            self.layout_prefix_name(Cow::Owned(power), self.m.syntax.get(&symbol), Cat::Op, out);
             out.push(Work::Text {
                 cat: Cat::Punct,
                 text: Cow::Borrowed("("),
@@ -869,12 +1110,13 @@ impl<'a> Printer<'a> {
                 });
                 out.push(Work::Space);
             }
+            let range_known = arg_rk || (command_arguments && self.is_nonzero_nat_item(c.clone()));
             out.push(Work::Visit {
-                item: *c,
+                item: c.clone(),
                 req_prec: PREFIX_GATHER,
                 lcap: NONE_CAP,
                 rcap: NONE_CAP,
-                range_known: arg_rk || (command_arguments && self.is_nonzero_nat_item(*c)),
+                range_known,
                 top_level: false,
             });
         }
@@ -896,7 +1138,7 @@ impl<'a> Printer<'a> {
             Item::Term(Term::Iter { symbol, arg, .. }) => {
                 self.m.nat_succ == Some(*symbol) && self.is_zero_term(arg)
             }
-            Item::Term(_) => false,
+            Item::Term(_) | Item::AssocDag { .. } => false,
         }
     }
 
@@ -916,6 +1158,7 @@ impl<'a> Printer<'a> {
         match arg {
             Item::Dag(d) => self.is_zero(d),
             Item::Term(t) => self.is_zero_term(t),
+            Item::AssocDag { .. } => false,
         }
     }
 
@@ -1062,11 +1305,8 @@ fn emit_gap<'a, 't>(word: Option<&str>, default_space: bool, out: &mut Vec<Work<
     for c in w.chars() {
         match c {
             'd' if default_space => out.push(Work::Space),
-            's' => out.push(Work::Space),
-            't' => out.push(Work::Text {
-                cat: Cat::Punct,
-                text: Cow::Borrowed("\t"),
-            }),
+            's' => out.push(Work::FormatSpace),
+            't' => out.push(Work::Tab),
             'n' => out.push(Work::Newline),
             'i' => out.push(Work::Indent),
             '+' => out.push(Work::IndentDelta(1)),
@@ -1094,7 +1334,13 @@ impl Cat {
 /// Owned leaf rendering data, extracted from a node's `repr` so the borrow is released before recursion.
 enum Leaf {
     Iter { count: String, arg: DagId },
-    Atom(String),
+    Atom { text: String, constant: bool },
+}
+
+fn flush_qid_text(chunks: &mut Vec<QidChunk>, text: &mut String) {
+    if !text.is_empty() {
+        chunks.push(QidChunk::Text(std::mem::take(text)));
+    }
 }
 
 /// Render a quoted identifier with its leading `'` and Maude's token-name escapes. Raw punctuation

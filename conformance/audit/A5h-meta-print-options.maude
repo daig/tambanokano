@@ -1,0 +1,36 @@
+*** PRELUDE
+*** A5h-meta-print-options - META print flags independently control textual and Qid-list rendering (TNK-015)
+set show timing off .
+fmod A5H-PRINT is
+  sort S .
+  ops a b c : -> S [ctor] .
+  op _;_ : S S -> S [ctor assoc prec 40 format (d n d d)] .
+endfm
+
+*** `number` and `mixfix` are independent; omitting both exposes prefix successor syntax.
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], 's_^2['0.Zero]], number, none) .
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], 's_^2['0.Zero]], mixfix, none) .
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], 's_^2['0.Zero]], none, none) .
+
+*** `with-parens` and `with-sorts` alter both String and QidList products.
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], '_*_['s_^2['0.Zero], 's_^3['0.Zero]]], mixfix number, none) .
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], '_*_['s_^2['0.Zero], 's_^3['0.Zero]]], mixfix with-parens number, none) .
+red in META-LEVEL : metaPrintToString(['NAT], none, '_+_['s_['0.Zero], 's_^2['0.Zero]], mixfix with-sorts number, none) .
+red in META-LEVEL : metaPrettyPrint(['NAT], none, '_+_['s_['0.Zero], '_*_['s_^2['0.Zero], 's_^3['0.Zero]]], mixfix with-parens number, none) .
+red in META-LEVEL : metaPrettyPrint(['NAT], none, '_+_['s_['0.Zero], 's_^2['0.Zero]], mixfix with-sorts number, none) .
+
+*** `format` is opt-in; metaPrettyPrint preserves its newline as the `\n` formatting Qid.
+red in META-LEVEL : metaPrintToString(['A5H-PRINT], none, '_;_['a.S, '_;_['b.S, 'c.S]], mixfix, none) .
+red in META-LEVEL : metaPrintToString(['A5H-PRINT], none, '_;_['a.S, '_;_['b.S, 'c.S]], mixfix format, none) .
+red in META-LEVEL : metaPrettyPrint(['A5H-PRINT], none, '_;_['a.S, '_;_['b.S, 'c.S]], mixfix, none) .
+red in META-LEVEL : metaPrettyPrint(['A5H-PRINT], none, '_;_['a.S, '_;_['b.S, 'c.S]], mixfix format, none) .
+
+*** `flat` affects associative prefix output only when explicitly selected.
+red in META-LEVEL : metaPrintToString(['A5H-PRINT], none, '_;_['a.S, 'b.S, 'c.S], none, none) .
+red in META-LEVEL : metaPrintToString(['A5H-PRINT], none, '_;_['a.S, 'b.S, 'c.S], flat, none) .
+red in META-LEVEL : metaPrettyPrint(['A5H-PRINT], none, '_;_['a.S, 'b.S, 'c.S], none, none) .
+red in META-LEVEL : metaPrettyPrint(['A5H-PRINT], none, '_;_['a.S, 'b.S, 'c.S], flat, none) .
+
+*** `rat` alone controls compact rational literals.
+red in META-LEVEL : metaPrintToString(['RAT], none, '_/_['s_['0.Zero], 's_^2['0.Zero]], mixfix number, none) .
+red in META-LEVEL : metaPrintToString(['RAT], none, '_/_['s_['0.Zero], 's_^2['0.Zero]], mixfix number rat, none) .

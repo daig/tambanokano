@@ -76,7 +76,8 @@ use tnk_frontend::load::{
     parse_statement_trace,
 };
 use tnk_frontend::pretty::{
-    print_raw, print_term, print_with_options, render_float, render_string,
+    PrintOptions, print_qid_tokens_with_options, print_raw, print_term, print_with_options,
+    render_float, render_string,
 };
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
@@ -4674,9 +4675,8 @@ impl MetaDescent<'_> {
     }
 
     /// `metaPrettyPrint(M, VS, T, opts, Q)` → the `QidList` of tokens rendering `T` in `M`'s grammar, or (if
-    /// `to_string`) `metaPrintToString` → the `String` of the rendered text. `mixfix`, `number`, and `rat`
-    /// are independent: omitting one exposes prefix syntax, successor constructors, or division syntax,
-    /// respectively. `None` if `T` does not down-translate.
+    /// `to_string`) `metaPrintToString` → the `String` of the rendered text. Every META-LEVEL print option
+    /// is independent; omitting one disables that presentation rule. `None` if `T` does not down-translate.
     fn meta_pretty_print(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4685,26 +4685,27 @@ impl MetaDescent<'_> {
         to_string: bool,
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
-        let options = *kids.get(3)?;
-        let mixfix = has_option(ctx, options, "mixfix");
-        let number = has_option(ctx, options, "number");
-        let rational = has_option(ctx, options, "rat");
+        let option_set = *kids.get(3)?;
+        let options = PrintOptions {
+            mixfix: has_option(ctx, option_set, "mixfix"),
+            with_parens: has_option(ctx, option_set, "with-parens"),
+            with_sorts: has_option(ctx, option_set, "with-sorts"),
+            flat: has_option(ctx, option_set, "flat"),
+            format: has_option(ctx, option_set, "format"),
+            number: has_option(ctx, option_set, "number"),
+            rational: has_option(ctx, option_set, "rat"),
+        };
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let term = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
-        let printed =
-            print_with_options(&loaded.built, self.interner, term, mixfix, number, rational);
         if to_string {
+            let printed = print_with_options(&loaded.built, self.interner, term, options);
             // A string value is raw bytes; the printed ASCII text becomes those bytes.
             return Some(ctx.make_na(
                 hooks.ops["stringSymbol"],
                 NaValue::Str(printed.into_bytes().into()),
             ));
         }
-        let tokens = tokenize(&printed, self.interner);
-        let texts: Vec<String> = tokens
-            .iter()
-            .map(|t| self.interner.resolve(t.sym).to_string())
-            .collect();
+        let texts = print_qid_tokens_with_options(&loaded.built, self.interner, term, options);
         let qid = hooks.ops["qidSymbol"];
         let qids: Vec<DagId> = texts
             .iter()

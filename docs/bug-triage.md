@@ -8,7 +8,7 @@
 
 A green test or sweep does not mean that tnk is behaviorally identical to Maude on every input:
 
-- The audit scoreboard is a growing corpus (92 fixtures after the TNK-012–014 regressions landed); historical 77/77 records describe the frozen 2026-07-05 manifest, not a fixed denominator.
+- The audit scoreboard is a growing corpus (93 fixtures after the TNK-015 regression landed); historical 77/77 records describe the frozen 2026-07-05 manifest, not a fixed denominator.
 - The legacy sweep calls a fixture **CLEAN** when its current difference is byte-identical to a ratified accepted diff.
 - The differential harness removes warning/advisory blocks before comparison.
 - Missing features and legal-input corners absent from the fixture corpus are not exercised.
@@ -49,6 +49,7 @@ Severity is impact, not implementation order:
 | TNK-012 | Medium | Bug | View validation omits connected-component and operator-profile checks | **Resolved 2026-07-27**; rejection matrix retained |
 | TNK-013 | Medium | Compatibility rejection | Disambiguated source operator maps in views are parser-rejected | **Resolved 2026-07-27**; overloaded-map oracle fixture retained |
 | TNK-014 | Low | Behavioral divergence | Transformed module imports in parameter theories emit spurious generic-module errors | **Resolved 2026-07-27**; renamed/instantiated import fixture retained |
+| TNK-015 | Medium | Bug | META pretty-print options are ignored or applied unconditionally | **Resolved 2026-07-27**; complete String/QidList option matrix retained |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -619,7 +620,34 @@ returns `Truth: yes`, the instantiated import returns `BoxI{A4H-ToN-I}: boxi(zi)
 module/theory sum returns `TruthM: answerM`; every result takes two rewrites with no generic-module build
 error.
 
-The final verification gates passed: all 465 workspace tests and the complete 92/92 audit scoreboard.
+
+### TNK-015 — META pretty-print options are ignored or applied unconditionally — RESOLVED
+
+- **Severity:** Medium
+- **Classification:** Bug; reflected output did not honor the requested print settings
+- **Confidence:** Oracle-differential fixture retained
+- **Status:** Resolved 2026-07-27
+- **Primary area:** `MetaDescent::meta_pretty_print` and `tnk_frontend::pretty::Printer`
+
+`meta_pretty_print` now decodes all seven independent META options into `PrintOptions`: `mixfix`,
+`with-parens`, `with-sorts`, `flat`, `format`, `number`, and `rat`. The shared printer applies each option
+only when selected:
+
+- `with-parens` forces parentheses around mixfix applications.
+- `with-sorts` qualifies constants and literal forms as `(value).Sort`.
+- `format` gates operator `format` attributes instead of applying them unconditionally.
+- Omitted `flat` reconstructs right-associated prefix applications from flattened associative DAGs; selected
+  `flat` retains the flattened prefix argument list.
+- `number` and `rat` independently gate decimal/negative-integer and compact-rational forms.
+
+`metaPrettyPrint` uses the same layout but preserves explicit `format` spaces, tabs, newlines, and
+indentation as formatting Qids; ordinary lexical separation is still omitted from its `QidList`.
+`conformance/audit/A5h-meta-print-options.maude` retains omission and selection cases for every option
+across both `metaPrintToString` and `metaPrettyPrint`. Its outputs match Maude 3.5.1 exactly, including
+`(1 + (2 * 3))`, `(1).NzNat + (2).NzNat`, opt-in newlines, nested/flat prefix forms, and `1 / 2` versus
+`1/2`.
+
+The final verification gates passed: all 465 workspace tests and the complete 93/93 audit scoreboard.
 
 ## 4. Ratified accepted divergences
 
@@ -769,9 +797,19 @@ rather than automatically checked view conditions. Both reject an instantiation 
 contains free parameters; the legal bound-parameter form `A{X} + B{X}` conforms. Nonpreserved subsorts still
 produce a Maude-only warning while both systems keep the view usable and compute the same result.
 
-### RISK-005 — Reflection boundaries
+### RISK-005 — Reflection boundaries (classified)
 
-Potential partial behavior remains around flat builtin closures, non-mixfix print options, structured module expressions, and op-to-term view reflection. Several older reflection comments have already proven stale, so each requires a fresh probe.
+Fresh probes found three broad limitation claims stale and promoted the remaining defect to TNK-015. A flat
+module protecting `BOOL` reflected its imported declarations, `poly`/`special` hooks, and equations, then
+round-tripped through `upModule(..., true)` and `metaReduce` for both an ordinary Boolean equation and
+polymorphic equality. Its displayed metadata still differs in hook line wrapping and one AC-equivalent
+reflected-equation argument order, but no missing or inert closure behavior was observed. Structured module
+expressions matched Maude exactly in both directions for sums, renamings, and view-based instantiation.
+`upView` also matched exactly for an operator-to-term map with variable arguments.
+
+The print-option probe established TNK-015 and its retained regression now confirms all seven flags across
+String and Qid-list results. Flat builtin-closure, structured module-expression, and op-to-term view
+reflection were stale risk claims; the separately recorded print-settings defect is also resolved.
 
 ### RISK-006 — Re-entrant condition GC
 
@@ -797,7 +835,11 @@ TNK-005 and TNK-006 are resolved with compositional-import, ordering, transform,
 
 ### 8.4 Reflection group
 
-TNK-009 is resolved at the automatic-import source: functional, system, and strategy source/flat reflection now preserve Maude's `including BOOL` mode. This remains independent from the still-inert strategy meta parse/pretty-print operations.
+TNK-009 is resolved at the automatic-import source: functional, system, and strategy source/flat reflection
+now preserve Maude's `including BOOL` mode. Fresh RISK-005 probes close the broad flat builtin-closure,
+structured module-expression, and op-to-term view-reflection claims. TNK-015's complete META print-option
+matrix is also resolved and retained. The still-inert strategy meta parse/pretty-print operations remain a
+separate deferred surface.
 
 ### 8.5 Performance group
 
@@ -814,7 +856,7 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, TNK-009 in `C6d-implicit-bool-mode`, TNK-011 in `B3c-membership-collapse`, TNK-012 in `A4f-view-validation`, TNK-013 in `A4g-view-specific-map`, and TNK-014 in `A4h-theory-transformed-imports`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
+The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, TNK-009 in `C6d-implicit-bool-mode`, TNK-011 in `B3c-membership-collapse`, TNK-012 in `A4f-view-validation`, TNK-013 in `A4g-view-specific-map`, TNK-014 in `A4h-theory-transformed-imports`, and TNK-015 in `A5h-meta-print-options`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
 
 ## 9. Prototype/v0 decision view
 
@@ -823,9 +865,9 @@ This document does not set release priority. It exposes the decisions:
 - **How much sibling declaration-recovery validation is required for v0?** The confirmed TNK-002 and TNK-003 panics are resolved; adjacent theory-attribute cases remain unverified risk candidates rather than confirmed defects.
 - **Can v0 claim open-term functional reduction?** TNK-004 no longer blocks this claim for BranchSymbol: its symbolic-condition value, count, and sort contract is retained against the oracle.
 - **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, session invalidation, and generalized-`top` recovery covered by TNK-005/TNK-006.
-- **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** No: TNK-007–009 are resolved and retained; broader unverified candidates remain classified separately.
+- **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** TNK-007–009 and TNK-015 are resolved and retained, and the three broad RISK-005 reflection claims are stale; no confirmed defect remains from that reflection group.
 - **Is the 60-second I-S gate binding?** It remains binding and unchanged; TNK-010 restored I19/I20 beneath it.
 - **Can v0 claim the covered view/module-expression boundaries?** Yes for connected-component and operator-profile validation, overload-specific view maps, and renamed/instantiated/mixed module-origin imports covered by TNK-012–014. Theory proof obligations and warning-only subsort preservation remain explicit boundaries.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.
 
-The clean release statement is narrower than “bug-free”: every confirmed TNK-001–014 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.
+The clean release statement is narrower than “bug-free”: every confirmed TNK-001–015 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.
