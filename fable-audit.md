@@ -1,10 +1,11 @@
 # Migration audit — tnk vs Maude 3.5.1 (2026-07-01; status refreshed 2026-07-26)
 
 > **Current ledger (2026-07-26):** the correctness corpus and symbolic phases S1–S3 remain closed.
-> `tools/subsystems-scoreboard.sh` is **112/112 PASS** at the default harness timeout; its U/V/N
-> partitions remain **27/27**, **21/21**, and **16/16 PASS** respectively, and all 169 N primary
-> commands also pass independently. The retained audit is **84/84 PASS**, legacy is **87/87 CLEAN**,
-> and `cargo test --release --workspace --features smt-z3` passes **453/453** tests across 12 suites.
+> The last complete `tools/subsystems-scoreboard.sh` run was **112/112 PASS** at the default timeout;
+> focused post-TNK-010 runs pass I19/I20 in 24.98/26.10 seconds under the same 60-second gate. The
+> last complete audit run was **84/84 PASS**; four new TNK-006–009 fixtures each pass their live-oracle
+> diff and raise the growing corpus to 88. Legacy remains **87/87 CLEAN**, and the last full optional-z3
+> release suite passed **453/453** tests across 12 suites.
 >
 > **Phase T is complete.** T01–T10 pass the frozen Maude-3.5/Yices2 byte contract—10 fixtures /
 > 118 commands—covering typed SMT values, `check`, root-only constraint-bearing `smt-search`,
@@ -26,7 +27,15 @@
 > legal direct/transitive imports, diamonds, sums, ordinary renaming, functional instantiation, donor
 > redefinition, source/flat reflection, and the local META-INTERPRETER path. The retained `A3f`–`A3j` and
 > `A5g` oracle fixtures pin definition order, kinds/lhs bindings, home parsing, values, counts, transforms,
-> recovery, and reflection. Generalized `top`, `xmatchrew`, and conditional `csd` remain separate boundaries.
+> recovery, and reflection. `xmatchrew` and conditional `csd` remain separate boundaries.
+>
+> **TNK-006–010 are resolved (2026-07-26).** Inapplicable `top` is discarded before named-call
+> expansion while direct rule `top` is preserved; exact `decFloat(_, 0)` covers all finite IEEE-754
+> denominator exponents; membership constraints use Maude's descending component-local sort index;
+> automatic BOOL imports are `including` across module kinds and reflection; and targeted Earley-item
+> hashing restores I19/I20 beneath the unchanged performance gate. `A3k`, `A2k`, `B3b`, `C6d`, and
+> I19/I20 retain the boundary matrices. Source findings, corrected scopes, and observed timings are in
+> `docs/bug-triage.md`; the body below remains the dated audit that discovered several now-resolved items.
 >
 > The 2026-07-05 correctness ledger closed its frozen manifest at **77/77 PASS** (74 at goal close;
 > §3.10's post-goal E-fixtures grew the denominator), with the legacy corpus **87/87 CLEAN**. Two

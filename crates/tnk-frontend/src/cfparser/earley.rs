@@ -6,6 +6,7 @@ use super::compile::CompiledGrammar;
 use crate::grammar::{GSym, Nt, Terminal};
 use crate::lex::{Interner, TokKind, Token};
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// An Earley item: a production, the dot position within its rhs, and the token index where the item
 /// started (its origin). `(prod, dot, origin)` is the full identity for chart dedup.
@@ -16,13 +17,47 @@ pub struct Item {
     pub origin: u32,
 }
 
+/// Earley items contain only compact parser indices. The chart never iterates its hash sets—the
+/// insertion-ordered `sets` vectors drive recognition and forest extraction—so a deterministic,
+/// allocation-free integer hasher removes SipHash from this hot dedup path without changing order.
+#[derive(Default)]
+struct ItemHasher(u64);
+
+impl ItemHasher {
+    fn mix(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for ItemHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.mix(u64::from(byte));
+        }
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.mix(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+}
+
+type ItemSet = HashSet<Item, BuildHasherDefault<ItemHasher>>;
+
 /// The Earley chart: one item set per token position `0..=n` (`sets[j]` = items recognized just before
 /// token `j`; `sets[n]` is the final set). `present[j]` is the same content as a set, for O(1) membership
 /// (the forest extractor's prefix check, B4.4b). Retained for forest extraction.
 #[derive(Debug)]
 pub struct Chart {
     pub sets: Vec<Vec<Item>>,
-    present: Vec<HashSet<Item>>,
+    present: Vec<ItemSet>,
 }
 
 impl Chart {
@@ -102,7 +137,7 @@ fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
 pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> Chart {
     let n = tokens.len();
     let mut sets: Vec<Vec<Item>> = vec![Vec::new(); n + 1];
-    let mut seen: Vec<HashSet<Item>> = vec![HashSet::new(); n + 1];
+    let mut seen: Vec<ItemSet> = vec![ItemSet::default(); n + 1];
 
     // Seed: predict every production of the start nonterminal at position 0.
     for &p in g.productions_for(start) {
@@ -177,7 +212,7 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
 fn complete(
     g: &CompiledGrammar,
     sets: &mut [Vec<Item>],
-    seen: &mut [HashSet<Item>],
+    seen: &mut [ItemSet],
     j: usize,
     item: Item,
 ) {
@@ -207,7 +242,7 @@ fn complete(
 }
 
 /// Add `item` to set `pos` if not already present (chart dedup keeps the work-list finite).
-fn add(sets: &mut [Vec<Item>], seen: &mut [HashSet<Item>], pos: usize, item: Item) {
+fn add(sets: &mut [Vec<Item>], seen: &mut [ItemSet], pos: usize, item: Item) {
     if seen[pos].insert(item) {
         sets[pos].push(item);
     }

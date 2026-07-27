@@ -1,0 +1,36 @@
+*** PRELUDE
+*** C6d-implicit-bool-mode — TNK-009: implicit BOOL uses including mode in every module kind and reflection view.
+set show timing off .
+fmod C6D-FM is
+  sort FS .
+  op fa : -> FS .
+endfm
+mod C6D-M is
+  sort MS .
+  op ma : -> MS .
+endm
+smod C6D-SM is
+  sort SS .
+  op sa : -> SS .
+endsm
+fmod C6D-EXPLICIT is
+  protecting BOOL .
+  sort ES .
+  op ea : -> ES .
+endfm
+set include BOOL off .
+fmod C6D-OFF is
+  sort OS .
+  op oa : -> OS .
+endfm
+fmod C6D-OFF-EXPLICIT is
+  protecting BOOL .
+  sort PES .
+  op pea : -> PES .
+endfm
+red in META-LEVEL : upImports('C6D-FM) .
+red in META-LEVEL : upModule('C6D-M, false) .
+red in META-LEVEL : upModule('C6D-SM, false) .
+red in META-LEVEL : upImports('C6D-EXPLICIT) .
+red in META-LEVEL : upImports('C6D-OFF) .
+red in META-LEVEL : upImports('C6D-OFF-EXPLICIT) .

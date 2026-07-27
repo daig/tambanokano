@@ -1,0 +1,15 @@
+*** PRELUDE
+*** A3k-top-recovery — TNK-006: discard top on non-applications before echo/expansion; retain direct rule semantics.
+set show timing off .
+smod A3K-TOP is
+  sort S .
+  ops a b : -> S .
+  op f : S -> S [ctor] .
+  rl [r] : a => b .
+  strat via-rule @ S .
+  sd via-rule := r .
+endsm
+*** Direct top(r) cannot rewrite below f; top(call) is ignored before its rule body expands; top(idle) is idle.
+srew in A3K-TOP : f(a) using top(r) .
+srew in A3K-TOP : f(a) using top(via-rule) .
+srew in A3K-TOP : f(a) using top(idle) .

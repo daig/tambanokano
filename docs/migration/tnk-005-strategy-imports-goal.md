@@ -7,6 +7,10 @@
 six retained oracle fixtures now satisfy the work graph and completion gate; the ledger in §9 records the
 observed closeout rather than a future plan.
 
+**Post-goal note (2026-07-26):** TNK-006 and TNK-009 were resolved after this contract closed. Their
+present-tense appearances below describe the intentionally frozen TNK-005 scope, not current defects.
+`xmatchrew` is tracked separately as GAP-005 in `bug-triage.md`.
+
 ## Goal statement
 
 Make strategy modules compose through tnk's existing module algebra. A strategy declared or defined in an
@@ -125,7 +129,7 @@ invariants.
 Do not expand this goal to adjacent strategy-language work:
 
 - conditional strategy definitions (`csd`), including condition binding and backtracking;
-- `xmatchrew` (TNK-006) or any new strategy combinator;
+- `xmatchrew` (GAP-005) or any new strategy combinator;
 - strategy-specific module renamings such as `strat old to new` or strategy mappings in views;
 - strategy theories as parameter theories, strategy-view bindings, or a new parameterization model;
 - a full D10 compiled-module algebra rework or general import-as-reparse;
@@ -287,8 +291,9 @@ For a strategy module with local and imported declarations/definitions:
 - execution and reflection consume one authoritative strategy collection. A strategy cannot execute while
   being absent from flat reflection, or reflect while being unavailable to execution.
 
-TNK-009's known implicit-BOOL import-mode difference remains allowed. Tests for this goal must project or
-otherwise isolate the strategy fields rather than declaring all unrelated `upModule` output fixed.
+At this goal's close, TNK-009's implicit-BOOL import-mode difference was an allowed out-of-scope diff.
+Tests therefore project the strategy fields rather than using unrelated `upModule` output for this claim;
+`C6d-implicit-bool-mode.maude` later closed that difference independently.
 
 ### 2.9 Redefinition and session continuity
 
@@ -460,8 +465,8 @@ Strategy-specific renaming syntax and strategy-view mappings do not belong in th
 - flat output contains each diamond origin once;
 - non-flat output contains only root-local strategies plus the source import expression;
 - summed, ordinarily renamed, and functionally instantiated forms reflect transformed payloads;
-- project the strategy fields of `upModule` so TNK-009's unrelated BOOL import-mode difference does not
-  contaminate the claim.
+- project the strategy fields of `upModule`: TNK-009's then-open BOOL mode was outside this fixture's claim
+  and was later closed independently by `C6d-implicit-bool-mode.maude`.
 
 ### 5.3 Required focused Rust tests
 

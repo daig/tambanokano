@@ -6,9 +6,11 @@
 
 **TNK-005 closeout refresh (2026-07-26):** compositional strategy-module imports are now implemented and retained by six new oracle-differential fixtures. Counts and strategy-specific classifications below have been refreshed; unrelated survey findings remain unchanged.
 
+**TNK-006–010 closeout refresh (2026-07-26):** the five remaining confirmed TNK issues were source-traced, implemented, and rechecked with focused live-oracle matrices. Four new audit fixtures raise the corpus from 84 to 88; I19/I20 retain the original 60-second gate. The investigation details and corrected issue boundaries are preserved in `bug-triage.md`.
+
 ## 1. Executive findings
 
-1. **The implementation is substantially ahead of its planning documents.** The TNK-005 closeout checkout passes the 84/84 audit corpus, the 87/87 legacy sweep, 453 release tests, and all 112 subsystem fixtures under the default 60-second harness timeout. Every U/V/N/T/M/I-S fixture passes. The initial survey run had timed out on the large I19/I20 Russian-dolls fixtures before both passed with a 180-second allowance; the later green run does not by itself retire that timing-sensitive performance record.
+1. **The implementation is substantially ahead of its planning documents.** The TNK-005 closeout checkout passed the then-current 84/84 audit corpus, the 87/87 legacy sweep, 453 release tests, and all 112 subsystem fixtures under the default 60-second harness timeout. The TNK-006–010 closeout added four individually verified oracle fixtures (88 total) and restored the timing-sensitive I19/I20 fixtures to 24.98/26.10 seconds without widening that timeout. Every U/V/N/T/M/I-S fixture remains covered by its retained harness.
 2. **There is no reliable single source of current truth.** `docs/migration/README.md` and `01-architecture-map.md` point to `fable-audit.md` as the complete current ledger, but that file now mixes four things: a valuable historical differential audit, resolved findings, still-live limitations, and descriptions made false by later implementation. Its status heading was refreshed without refreshing several substantive sections.
 3. **The raw material for an actually-working feature list exists, but is scattered.** The best starting points are `fable-audit.md` §1, the command enum and `Session` dispatch, the completion headers in `remaining-plans/`, the subsystem fixtures, and crate-level code. None is sufficient alone. The feature inventory in `01-architecture-map.md` is explicitly a Maude parity-target list, not a tnk support matrix.
 4. **Future work is interleaved with history.** `roadmap.md`, `subsystems-goal.md`, `objects-io-plan.md`, the six `remaining-plans`, and source comments all contain future-looking statements. Many are completed or stale; others are real but differ in confidence. They should not be retained as one linear roadmap. They should be extracted into independent issue/proposal records with explicit dependency edges and acceptance evidence.
@@ -32,13 +34,18 @@
 | Initial `TIMEOUT_SECS=180 tools/subsystems-scoreboard.sh` survey rerun | **112/112 PASS** | Every retained subsystem fixture remained conformant with the allowance used to classify the I19/I20 residual. |
 | TNK-005 closeout `tools/subsystems-scoreboard.sh` rerun | **112/112 PASS** at the default 60-second timeout | Every retained subsystem fixture passed without widening the harness timeout; the earlier I19/I20 timing sensitivity remains recorded separately as TNK-010. |
 | `B1b-collapse-counts.maude` direct oracle diff | **PASS** | The audit's still-unresolved-looking collapse-count bullet and related fixture comments are stale. |
-| Incomparable-membership probe | Oracle chooses sort `D`; tnk chooses `B` | The component-index tiebreak remains a real wrong-sort result on contradictory membership specifications. |
-| Strategy-module reflection probe | `upModule`, `upStratDecls`, and `upSds` compute; one diff: reflected implicit BOOL import is `protecting` instead of the oracle's `including` | The old “strategy reflection is inert” claim is stale, but the newly observed import-mode divergence needs its own issue/fixture. |
+| Initial incomparable-membership probe | Oracle chose sort `D`; tnk chose `B` | This established TNK-008 at survey time; the later component-index closeout row records its resolution. |
+| Initial strategy-module reflection probe | `upModule`, `upStratDecls`, and `upSds` computed; one diff: reflected implicit BOOL was `protecting` instead of `including` | This established TNK-009 at survey time; the later source-injection closeout row records its resolution. |
 | General evaluation-strategy probe | Oracle and tnk match on retained interleaved/multiple-top, `owise`, shared-redex, and AC/AU semi-eager cases | TNK-001 is resolved; `conformance/strat.maude` preserves value, sort, and rewrite-count coverage. |
-| Strategy import/modifier probes | The six retained TNK-005 fixtures now match Maude for imported declarations/definitions, order, home parsing, transforms, reflection, and recovery; Maude still ignores `top(idle)` with a warning while tnk errors | Strategy modules are compositionally importable on the retained matrix; generalized `top` remains the separate TNK-006 deviation. |
+| Initial strategy import/modifier probes | The six TNK-005 fixtures matched; Maude ignored `top(idle)` with a warning while tnk errored | This established the separate TNK-006 deviation at survey time; `A3k` below records its resolution. |
 | Stuck conditional-branch probe | Maude and tnk both normalize the branches to `false` and `true`, perform 5 rewrites, and report result sort `Bool` | TNK-004 is resolved; decided conditions remain lazy and user equations are tried only after stuck branches normalize. |
 | Declaration-recovery probes | Maude warns and recovers from out-of-range `frozen` and nonbinary `assoc`; tnk now matches both semantic recovery paths, with warning text still normalized away | TNK-002 and TNK-003 are resolved with retained oracle-differential fixtures. |
-| Extreme-subnormal `decFloat(_, 0)` probe | Oracle returns a 783-byte exact `DecFloat`; tnk leaves the application unreduced | The bounded numeric residual is confirmed directly. |
+| Initial extreme-subnormal `decFloat(_, 0)` probe | Oracle returned a 783-byte exact `DecFloat`; tnk left the application unreduced | This established TNK-007 and led to the broader denominator-boundary matrix below. |
+| TNK-006 `top` source/matrix closeout | **PASS**, `A3k-top-recovery.maude` | Reference `MAKE_TOP` discards the modifier before call expansion; direct rule, named call, and `idle` now match in echo/value/count. |
+| TNK-007 exact-float boundary matrix | **PASS**, `A2k-decfloat-exact.maude` | The real boundary was any canonical denominator $2^k$, $k>63$, not only subnormals; ordinary small, least-normal, least-subnormal, signed, and positive-precision controls match. |
+| TNK-008 component-index matrix | **PASS**, `B3b-membership-order.maude` | Maude orders constraints by descending per-component `Sort::index`: membership order does not control the tie, while reversing independent subsort edges changes the component indices and the selected incomparable target; the comparable control also matches. |
+| TNK-009 automatic-BOOL mode matrix | **PASS**, `C6d-implicit-bool-mode.maude` | The defect was session source injection across module kinds, not strategy reflection; automatic-only, automatic-plus-explicit, automatic-off, and explicit-off modes now match exactly. |
+| TNK-010 targeted profile and unchanged gates | I19 **PASS 24.98 s**; I20 **PASS 26.10 s** | Sampling localized dominant work to SipHash in Earley `Item` dedup; a compact integer hasher restored margin under the retained 60-second gate. |
 | Candidate-control probes | Basic cross-kind overloading, CUI collapse matching, and iter-membership matching compute correctly | Several broad source “follow-up” comments are stale; only narrower untested corners should remain candidates. |
 | Local Markdown link scan | No missing file targets | Navigation is conceptually confusing but not presently broken at the file-link level. |
 
@@ -119,12 +126,12 @@ The supported `show module` is a reconstructed flattened summary, not a source-f
 - Named strategy declarations/definitions compose through direct/transitive `protecting`/`extending`/`including`, diamonds and independent conflicts, module sums, ordinary renaming, functional instantiation, donor redefinition, source/flat reflection, and local META-INTERPRETER execution.
 - Object-module desugaring; class/message/configuration roles; object-message `erewrite`; fast object/message delivery and generic multi-object `leftOver` rules; standard-stream scripted input/output.
 
-Explicit strategy boundaries: `xmatchrew` and conditional `csd` reject at resolution, and generalized `top(...)` remains TNK-006. Matchrew/amatchrew scheduling has a recorded cumulative-count divergence.
+Explicit strategy boundaries: `xmatchrew` and conditional `csd` reject at resolution. Inapplicable `top(...)` modifiers now follow Maude's recoverable discard-before-expansion rule. Matchrew/amatchrew scheduling retains its recorded cumulative-count divergence.
 
 ### 3.6 Reflection, symbolic reasoning, and verification
 
 - META-LEVEL down/up translation for modules, views, terms, imports/declarations/statements, sort/kind queries, parsing, ordinary pretty printing, well-formedness checks, reduce/normalize/rewrite/frewrite/apply/xapply/match/xmatch/search/search-path, and the implemented symbolic operations.
-- `upModule`, including covered parameterized and strategy-module forms; `upStratDecls` and `upSds` now compute. A direct strategy-module probe found one remaining difference: tnk reflects its implicit BOOL import as `protecting`, while the oracle emits `including`.
+- `upModule`, including covered parameterized and strategy-module forms; `upStratDecls` and `upSds` compute. Automatic BOOL imports now retain Maude's `including` mode across functional, system, and strategy source/flat reflection.
 - Order-sorted unification modulo free/S/CUI/AC/ACU/A/AU, irredundant and disjoint modes, current/legacy meta forms, incompleteness propagation, exact retained gate output.
 - Folding variants, variant subsumption, variant unification/matching, filters/blockers, current/legacy meta forms, and resumable enumeration.
 - Variant-based narrowing, rooted state graph, fold/vfold, delayed filtering, paths/frontiers/most-general states, current in-scope meta narrowing operations, and persistent caches.
@@ -145,7 +152,7 @@ Explicit reflection boundaries include `metaParseStrategy`/`metaPrettyPrintStrat
 | `03-open-decisions.md` | Durable rationale for arena/GC/dispatch/backends/session boundaries | Title/status language still treats implemented choices as forward decisions; some proposed crate/binary names do not match the workspace; resolved decisions and genuinely open decisions are mixed | Retain as an ADR index, give each decision a status and actual implementation pointer, and move open choices into issue proposals. |
 | `roadmap.md` | Contains many useful acceptance notes, dependencies, and residual descriptions | Mostly a historical execution plan. A–D and most of G landed; E/F are partial/open; priority and risk sections mix resolved and live entries | Dissolve rather than refresh as another linear roadmap. Archive completed phases; extract live leaves into issue files and dependencies into an issue index. |
 | `correctness-goal.md` | Frozen correctness-goal contract and original gate semantics | Reads as an active goal driver; counts/status predate later subsystem work; accepted-divergence references are split from their current ledger | Archive as a completed contract. Create a current conformance guide generated from harness manifests and `accepted-diffs/`. |
-| `subsystems-goal.md` | Valuable S/T/M/I contracts, manifests, invariants, and phase boundaries | Umbrella goal is complete through I-S, yet still carries serial-cursor planning language. I-C is future work; recorded 27/27 I-S status currently misses the 60-second performance gate | Archive completed subsystem contract; extract I-C and the I19/I20 performance gate as separate issues. Keep fixture manifests machine-derived where possible. |
+| `subsystems-goal.md` | Valuable S/T/M/I contracts, manifests, invariants, and phase boundaries | Umbrella goal is complete through I-S, yet still carries serial-cursor planning language. I-C is future work; historical I19/I20 boundary runs predate TNK-010's profiled Earley repair | Archive completed subsystem contract; extract I-C separately. Keep fixture manifests and the unchanged 60-second I gate machine-derived where possible. |
 | `ac-matcher-plan.md` | Detailed source-derived algorithm/verification record | Still framed as an implementation plan and contains pre-port “current matcher” claims | Reclassify as a completed implementation record/reference. Move only real residuals (ordering/performance/representation) to issues. |
 | `objects-io-plan.md` | Useful Maude object/IO source map and D5 rationale | Mixes completed object/STD-STREAM/host suspension work with a shelved in-engine reactor plan. Several “remaining object scheduler” statements are false: the generic `leftOver` path is implemented and tested | Split historical object implementation record from future host manager proposals. Do not revive the shelved reactor as the default design. |
 | `remaining-plans/01`–`05` | High-quality completion records for AU, variants, narrowing, SMT, and model checking | Directory name says “remaining”; long bodies intentionally preserve present-tense preimplementation claims | Move to an implementation-history/archive namespace. Keep their top completion headers and source citations. |
@@ -163,10 +170,10 @@ These are not stylistic complaints; they can cause an incorrect user manual or b
 - `fable-audit.md` §2 says there are no file commands or CLI flags and that implicit BOOL/verbose controls are inert. `load`, `sload`, initial file loading, `-no-prelude`, `-no-banner`, `set include BOOL`, and `set verbose` are implemented.
 - The same section says on-the-fly kind variables are absent. Current command parsing accepts them; a direct multi-top kind probe parsed and reduced `Z:[X]`.
 - Its collapse-under-identity count residual is now false: the retained B1b fixture matches 1/2 and 2/4/6 rewrite targets exactly.
-- Its multi-top kind-label residual is half stale: tnk now reproduces the oracle's DFS-derived `[B,D,A]`. The code still uses a different tie-break for incomparable membership targets, so that should become a separate issue rather than leaving the combined bullet unchanged.
-- Its `upModule`-of-strategy-module and ordinary `metaPrettyPrint` statements predate newer reflection work. The retained `prelude-meta.maude` fixture proves ordinary pretty printing and the strat-free `upStratDecls`/`upSds` case. A direct strategy-module probe shows `upModule`, real strategy declarations, and `sd` definitions now compute, with one newly observed difference: implicit BOOL is reflected as `protecting` rather than the oracle's `including`.
+- Its multi-top kind-label and incomparable-membership residual is now stale: tnk reproduces the DFS-derived kind order and, after TNK-008, orders membership constraints by the same descending component index as Maude.
+- Its `upModule`-of-strategy-module and ordinary `metaPrettyPrint` statements predate newer reflection work. Strategy modules, real declarations, and `sd` definitions compute; TNK-009 corrected automatic BOOL injection to `including`, so the former reflection diff is also closed.
 - `fable-audit.md` §4 still says there is no standing prelude, implicit import, or file command. All three landed. §5 recommends multiple already-completed audit phases.
-- `docs/migration/README.md`, `01-architecture-map.md`, `subsystems-goal.md`, and the I-S plan record the 27/27 I gate. The initial survey found I19/I20 timing-sensitive at 60 seconds, while the TNK-005 closeout rerun passed all 112 subsystem fixtures at that default gate. Preserve both observations under TNK-010 rather than inferring that one run proves or disproves a persistent regression.
+- `docs/migration/README.md`, `01-architecture-map.md`, `subsystems-goal.md`, and the I-S plan record the 27/27 I gate. Preserve the initial 59.77/82.01-second observations as TNK-010 history, but current focused runs after the Earley repair pass I19/I20 in 24.98/26.10 seconds under the unchanged limit.
 - `tnk-core/src/symbol.rs` says only a subset of theory variants is implemented and refers to a future `Na` variant that is not in the current enum. The actual enum and runtime have moved on.
 - The `tnk-modules/src/meta.rs` strategy status comment was corrected during TNK-005: `upModule`/`upStratDecls`/`upSds` and strategic meta execution are live, while `metaParseStrategy`/`metaPrettyPrintStrategy`, conditional `csd`, and `xmatchrew` remain explicit boundaries.
 - `tnk-repl` tests and `conformance/prelude-meta.maude` still label now-computing strategy reflection results as deliberately inert.
@@ -195,7 +202,7 @@ These have current implementation evidence, a retained audit record, or a direct
 - `xmatchrew`: requires exposing the extension residue and reassembling the rewritten portion.
 - Conditional `csd`: requires runtime condition bindings to enter the strategy body.
 - `metaParseStrategy` and `metaPrettyPrintStrategy`: require faithful strategy meta-construction and a surface-preserving strategy representation.
-- `top(...)` over a non-application strategy differs: Maude warns, ignores the modifier, and executes the inner strategy; tnk rejects it.
+- Inapplicable `top(...)` recovery is no longer a boundary: TNK-006 discards the modifier before named-call expansion, while preserving direct rule-application `top`.
 - Full Maude and LaTeX output remain deliberately deferred product surfaces.
 
 #### REPL and diagnostics
@@ -210,19 +217,16 @@ These have current implementation evidence, a retained audit record, or a direct
 - Matchrew/amatchrew parallel-odometer accounting; indexed metaSearch billing. These are ratified accepted diffs, not hidden failures.
 - AC match-solution enumeration order and mixed-symbol ACU search-goal print order. These are also recorded accepted diffs.
 - Mixed-symbol ACU print/canonicalization order, bounded AC `frewrite` intermediate order, strategy-echo parentheses, and several trace/result annotation/wording differences cataloged in the audit.
-- `decFloat(f, 0)` on extreme subnormal values: exact decomposition still attempts to convert the power-of-two denominator to `u64`.
-- Garbage-term Earley explosion on a large grammar; current protection removes a common trigger but not the underlying case.
-- Incomparable membership-target tie-breaking; the kind-label component-index repair should not be conflated with this remaining semantic corner.
-- Strategy-module `upModule` reflects the automatic BOOL import with the wrong mode (`protecting` versus oracle `including`); add the survey probe as a retained fixture before treating strategy reflection as closed.
-- I19/I20 performance relative to the retained 60-second I-S gate.
+- Garbage-term Earley explosion on a large grammar remains a separate risk: the TNK-010 hasher repair removes dominant constant-factor cost from normal nested parsing but does not claim a general complexity bound for malformed large-grammar input.
+- TNK-007's exact-float boundary, TNK-008's membership tiebreak, TNK-009's automatic BOOL mode, and TNK-010's retained performance gate are resolved with focused fixtures. They are historical findings, not current behavioral residuals.
 
 ### 5.2 Source-admitted candidates that need a minimal oracle fixture
 
 Do not copy these comments directly into a public limitations page. First determine whether the comment is stale, whether Maude accepts the form, and whether the behavior matters to the supported v0 contract.
 
-- Recursive parameterized strategy calls now pass a direct oracle comparison and use lazy runtime expansion; add a retained recursion fixture if that corner becomes a separately advertised v0 contract. The generalized `top` case remains the confirmed TNK-006 deviation.
+- Recursive parameterized strategy calls pass a direct oracle comparison and use lazy runtime expansion; add a retained recursion fixture if that corner becomes a separately advertised v0 contract.
 - Unusual cross-kind overload grouping remains a candidate, but the direct basic case with two domain/range kinds conforms and does not reach the old assertion.
-- Exotic AC/iter membership-extension corners remain candidates. Direct CUI collapse matching and iter-membership probes produced the oracle's solution set/results, so the broad source comments are stale. The incomparable-membership tiebreak and stuck-branch behavior are separately confirmed above.
+- Exotic AC/iter membership-extension corners remain candidates. Direct CUI collapse matching and iter-membership probes produced the oracle's solution set/results, so the broad source comments are stale; TNK-008's unrelated incomparable-target ordering is resolved and retained.
 - View kind/subsort preservation, op-map type checking, theory proof obligations, disambiguated source op maps, renamed/instantiated theory imports, and instantiation whose base is a module sum.
 - Conditional `metaMatch`, conditional/partial `metaApply`, partial AC `metaXmatch` contexts, flat builtin-closure up-translation, non-mixfix print options, and structured module-expression/op-to-term view reflection.
 - Re-entrant rewrite-condition GC rooting when the low-level engine is embedded with GC enabled; the REPL currently runs with GC disabled in the cited path.
@@ -261,20 +265,18 @@ Use one self-contained file per issue under a neutral namespace such as `docs/is
 | `STRAT-xmatchrew` | confirmed feature gap | needs extension-residue/reassembly API |
 | `STRAT-conditional-definitions` | confirmed feature gap | needs condition bindings in strategy resolution/execution |
 | `STRAT-parallel-odometer` | accepted divergence / behavioral issue | also owns `strategy.diff`; related to indexed metaSearch accounting |
-| `STRAT-generalized-top` | confirmed behavioral deviation | TNK-006; evaluation-strategy, recursion, and imported-strategy claims from the former broad family are resolved |
 | `META-strategy-parse-print` | confirmed feature gap | needs sort-aware meta constructors and surface-preserving strategy AST |
 | `META-conditional-and-partial-compute` | candidate family | reuse the engine condition-enumeration seam; split by observable contract |
 | `META-flat-and-structured-reflection` | candidate/design family | related to, but not automatically blocked by, module representation work |
 | `MOD-view-validation-and-map-forms` | source-admitted correctness family | independent checks can be split; theory obligations may need diagnostics |
 | `MOD-source-preserving-module-algebra` | architecture proposal | would enable source-faithful show and simplify some Full Maude/meta work |
 | `CORE-memo` | confirmed feature gap | memo controls depend on the runtime table |
-| `CORE-membership-residuals` | correctness candidates | use component index for incomparable tie-break; separate iter/extension repros |
 | `PARSE-garbage-complexity-cap` | robustness issue | ambiguity warnings relate to diagnostics; the cap itself is independent |
 | `PRINT-canonicalization-and-echo` | accepted/cosmetic family | mixed ACU order drives bounded-frewrite and some echo differences |
-| `NUM-decfloat-subnormal-exact` | bounded correctness issue | independent |
-| `PERF-local-interpreter-gate` | current performance regression | acceptance is I19/I20 under the retained 60-second gate |
 | `PERF-sort-diagrams` | optional optimization | require benchmark threshold before implementation |
 | `LANG-full-maude`, `PRINT-latex` | deferred proposals | likely consume module/meta/printing work; no v0 ordering implied |
+
+The former `STRAT-generalized-top`, `CORE-membership-residuals` tiebreak, `NUM-decfloat-subnormal-exact`, and `PERF-local-interpreter-gate` proposals were retired by TNK-006–010. Their source findings and permanent gates remain in `bug-triage.md` and `A3k`/`A2k`/`B3b`/`C6d`/I19/I20 rather than open issue files.
 
 A minimal issue file should contain:
 

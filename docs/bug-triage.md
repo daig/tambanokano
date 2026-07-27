@@ -2,13 +2,13 @@
 
 **Date:** 2026-07-26
 **Purpose:** standalone triage of currently known tnk bugs, behavioral divergences, robustness failures, accepted differences, and unverified risk areas relevant to the prototype/v0 boundary.
-**Evidence boundary:** entries not marked resolved retain the documentation-survey evidence boundary: retained conformance records, source inspection, and the direct probes already run. TNK-001 and TNK-002 were subsequently implemented and reverified against the live Maude oracle and retained regressions.
+**Evidence boundary:** entries marked resolved were implemented and reverified on 2026-07-26 against focused live-Maude probes, the cited reference-source paths, and retained oracle-differential fixtures. Unresolved gaps and risks retain the documentation-survey evidence boundary: retained conformance records, source inspection, and the direct probes already run.
 
 ## 1. How to read this document
 
 A green test or sweep does not mean that tnk is behaviorally identical to Maude on every input:
 
-- The audit scoreboard covers its fixed 77-fixture corpus.
+- The audit scoreboard is a growing corpus (88 fixtures after the four TNK-006–009 regressions landed); historical 77/77 records describe the frozen 2026-07-05 manifest, not a fixed denominator.
 - The legacy sweep calls a fixture **CLEAN** when its current difference is byte-identical to a ratified accepted diff.
 - The differential harness removes warning/advisory blocks before comparison.
 - Missing features and legal-input corners absent from the fixture corpus are not exercised.
@@ -40,11 +40,11 @@ Severity is impact, not implementation order:
 | TNK-003 | Critical | Bug | Nonbinary `assoc` declaration panics instead of recovering | **Resolved 2026-07-26**; oracle-differential fixture retained |
 | TNK-004 | High | Bug | Stuck conditional prevents required branch normalization | **Resolved 2026-07-26**; oracle-differential fixtures retained |
 | TNK-005 | High | Compatibility rejection | Imported strategy declarations/definitions disappear during flattening | **Resolved 2026-07-26**; six oracle-differential fixtures retained |
-| TNK-006 | Medium | Compatibility rejection | `top` on a non-application strategy errors instead of being ignored | Confirmed by direct oracle/tnk probe |
-| TNK-007 | Medium | Bug | Exact `decFloat(_, 0)` fails for extreme subnormals | Confirmed by direct oracle/tnk probe |
-| TNK-008 | Medium | Bug | Incomparable membership targets use the wrong tiebreak | Confirmed by direct oracle/tnk probe |
-| TNK-009 | Medium | Behavioral divergence | Strategy-module reflection emits the wrong implicit BOOL import mode | Confirmed by direct oracle/tnk probe |
-| TNK-010 | Medium | Robustness/performance | I19/I20 no longer reliably satisfy the retained 60-second gate | Confirmed by current gate runs |
+| TNK-006 | Medium | Compatibility rejection | `top` on a non-application errors instead of being ignored | **Resolved 2026-07-26**; direct/named/non-application matrix retained |
+| TNK-007 | Medium | Bug | Exact `decFloat(_, 0)` fails when the canonical denominator exceeds `u64` | **Resolved 2026-07-26**; finite-range boundary matrix retained |
+| TNK-008 | Medium | Bug | Incomparable membership targets use the wrong tiebreak | **Resolved 2026-07-26**; component-index/order matrix retained |
+| TNK-009 | Medium | Behavioral divergence | Automatic BOOL imports use the wrong mode across module kinds | **Resolved 2026-07-26**; source/flat reflection matrix retained |
+| TNK-010 | Medium | Robustness/performance | I19/I20 no longer reliably satisfy the retained 60-second gate | **Resolved 2026-07-26**; gate restored without widening timeout |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -335,256 +335,196 @@ Binding implementation record: [`migration/tnk-005-strategy-imports-goal.md`](mi
 
 ---
 
-### TNK-006 — `top` on a non-application strategy is rejected
+### TNK-006 — `top` on a non-application strategy is rejected — RESOLVED
 
 - **Severity:** Medium
 - **Classification:** Compatibility rejection
-- **Confidence:** Confirmed by direct comparison
-- **Primary area:** strategy resolution
-- **Likely implementation touchpoint:** `tnk-frontend/src/strategy.rs`
+- **Confidence:** Resolved by reference-source inspection and direct oracle matrices
+- **Primary area:** strategy surface recovery and resolution
+- **Implementation touchpoints:** `tnk-frontend/src/strategy.rs`, `tnk-session/src/lib.rs`
+- **Retained fixture:** `conformance/audit/A3k-top-recovery.maude`
 
-#### Summary
+#### Historical behavior
 
-Maude treats `top` on a strategy for which the modifier has no meaning as a recoverable misuse: it warns, drops the modifier, and executes the inner strategy. tnk rejects the whole strategy expression.
-
-#### Reproduction used
-
-```maude
-mod TOP-STRAT is
-  sort S .
-  op a : -> S .
-endm
-srew in TOP-STRAT : a using top(idle) .
-```
-
-#### Expected behavior
-
-Maude warns that the top modifier on a non-application strategy is ignored, then returns `a` as the one `idle` solution with zero rewrites.
-
-#### Actual behavior
-
-tnk returns:
+Maude treats `top` on a strategy for which the modifier has no meaning as recoverable misuse: it warns, drops the modifier, and executes the inner strategy. tnk rejected the whole expression with:
 
 ```text
 error: top(…) of a non-rule strategy is a follow-on
 ```
 
-#### Impact
+The minimal `top(idle)` probe therefore produced one zero-rewrite `idle` solution on Maude and an error on tnk.
 
-- Legal/recoverable Maude input is rejected.
-- Warning normalization would otherwise permit exact command-result parity.
-- The impact is bounded because the underlying inner strategy is already supported.
+#### Source and boundary findings
 
-#### Current understanding
+The reference parser handles `MAKE_TOP` in `Mixfix/mixfixParser.cc`: it dynamically casts the already-built child to `ApplicationStrategy`. A direct rule application accepts `setTop()`; every other strategy class emits a warning and is returned unchanged. This happens before named strategy-call expansion, so `top(call)` means `call`, not “expand the call and apply its body only at the subject root.”
 
-The resolver pattern-matches `top` only around rule application and treats every other inner strategy as unsupported. The Maude-compatible recovery is to discard the modifier and resolve the inner expression, with an optional diagnostic.
+The broader differential matrix separated three cases:
 
-#### Acceptance contract
+- `top(r)` around a direct rule application remains operative: `r : a => b` cannot rewrite below `f`, so `f(a)` has no solution;
+- `top(via-rule)` around a named zero-argument strategy is discarded before expansion: the call body `r` rewrites below `f`, yielding `f(b)` in one rewrite;
+- `top(idle)` is echoed and executed as `idle`, yielding `f(a)` with zero rewrites.
 
-- `top(idle)` executes as `idle`.
-- The result, sort, solution count, and rewrite count match the oracle.
-- Applicable `top(rule-or-strategy-application)` semantics remain unchanged.
+tnk's surface tree has both explicit `Call` nodes and unresolved bare `Apply` nodes whose rule-vs-call meaning is determined from the loaded module. Merely accepting every `Top(Apply)` would therefore preserve `top` incorrectly on zero-argument named calls.
+
+#### Resolution
+
+`discard_inapplicable_top` recursively normalizes the owned command AST before both command echo and execution. It preserves the modifier only for `all` or an `Apply` whose label resolves to at least one rule; otherwise it replaces the wrapper with its child. The resolver also retains a defensive non-rule fallback for direct library callers that bypass session normalization.
+
+#### Verification
+
+`A3k-top-recovery.maude` retains all three distinctions against Maude 3.5.1. The focused post-fix diff is empty: direct `top(r)` has no solution, the named call yields `f(b)` with one rewrite, and ignored `top(idle)` yields `f(a)` with zero rewrites. Warning text remains intentionally outside the normalized differential contract.
 
 ---
-
-### TNK-007 — Extreme-subnormal exact `decFloat` remains unreduced
+### TNK-007 — Exact `decFloat(_, 0)` fails beyond a machine-sized denominator — RESOLVED
 
 - **Severity:** Medium
 - **Classification:** Bug; bounded wrong numeric behavior
-- **Confidence:** Confirmed by direct comparison
+- **Confidence:** Resolved by source inspection and a finite-range boundary matrix
 - **Primary area:** float conversion built-in
-- **Likely implementation touchpoint:** `tnk-core/src/builtin.rs`, `dec_float_parts`
+- **Implementation touchpoint:** `tnk-core/src/builtin.rs`, `dec_float_parts`
+- **Retained fixture:** `conformance/audit/A2k-decfloat-exact.maude`
 
-#### Summary
+#### Historical behavior
 
-`decFloat(f, 0)` requests the exact decimal decomposition of a binary float. Normal values and positive requested precisions work. The exact path for an extreme subnormal attempts to convert its power-of-two denominator to `u64`; that conversion cannot represent the denominator and the built-in declines to reduce.
-
-#### Reproduction used
-
-With the standard prelude loaded:
+`decFloat(f, 0)` requests the exact decimal decomposition of a binary float. The original direct probe used the least positive subnormal:
 
 ```maude
 red in CONVERSION : decFloat(4.9406564584124654e-324, 0) .
 ```
 
-#### Expected behavior
+Maude returned a 783-byte exact `DecFloat` result. tnk left the application unreduced.
 
-Maude returns an exact `DecFloat` triple. The observed result line was 783 bytes long.
+#### Source and boundary findings
 
-#### Actual behavior
+The first description was too narrow: the failure was not specific to extreme subnormals. `dec_float_parts` obtained the exact arbitrary-precision rational, then converted its canonical power-of-two denominator to `u64` merely to call `trailing_zeros`. It therefore returned `None` whenever the reduced denominator was $2^k$ with $k > 63$. Ordinary finite values such as `0.00001` and `1.0e-20` crossed the same boundary; `0.1` ($k = 55$) did not.
 
-tnk returns the unreduced application:
+The exact conversion needs the exponent `k`, not a machine representation of the integer $2^k$. For a normal IEEE-754 value, `k` follows from the encoded exponent and the trailing zeros of the 53-bit significand. For a subnormal, the fraction is scaled by $2^{-1074}$ and the same trailing-zero cancellation yields the canonical denominator exponent. The existing arbitrary-precision numerator then gives decimal digits `num * 5^k` and decimal exponent `digits.len() - k`.
 
-```text
-result DecFloat: decFloat(4.9406564584124654e-324, 0)
-```
+This derivation covers every nonzero finite `f64`, including the least normal and least subnormal values, without allocating the unnecessary big denominator. Zero retains its dedicated result. Non-finite values still decline the built-in as before, and positive precision continues through the existing scientific-format rounding path.
 
-#### Impact
+#### Resolution
 
-- Exact conversion is incomplete over the full finite IEEE-754 domain.
-- The issue is narrow: ordinary-range floats and finite positive precision are not implicated by this probe.
+`exact_float_denominator_exponent` derives `k` directly from the IEEE-754 encoding. The precision-zero path no longer calls `to_u64()` on the denominator; it uses the derived exponent with the existing arbitrary-precision numerator and power-of-five calculation.
 
-#### Current understanding
+#### Verification
 
-The algorithm needs the exponent of a power-of-two big-integer denominator, not the denominator represented as a machine integer. Computing the exponent directly would avoid the lossy conversion boundary.
-
-#### Acceptance contract
-
-- Every finite subnormal accepted by the float parser reduces under precision zero.
-- The exact sign/digits/exponent triple matches Maude.
-- Existing positive-precision rounding and ordinary-range exact cases remain unchanged.
+`A2k-decfloat-exact.maude` compares `0.1`, `0.00001`, `±1.0e-20`, the least normal, and the least subnormal at precision zero, plus a positive-precision least-subnormal control. All exact sign/digit/exponent triples and rewrite counts match Maude 3.5.1; the positive-precision control confirms that rounding stayed on the prior path.
 
 ---
-
-### TNK-008 — Incomparable membership targets choose a different sort
+### TNK-008 — Incomparable membership targets choose a different sort — RESOLVED
 
 - **Severity:** Medium
 - **Classification:** Bug; wrong sort in a nonconfluent specification
-- **Confidence:** Confirmed by direct comparison
-- **Primary area:** membership ordering and connected-component sort indices
-- **Likely implementation touchpoint:** membership-table sorting in `tnk-core`
+- **Confidence:** Resolved by reference-source inspection and order-isolating oracle matrices
+- **Primary area:** membership constraint ordering
+- **Implementation touchpoints:** `tnk-core/src/engine.rs`, `tnk-core/src/sort.rs`
+- **Retained fixture:** `conformance/audit/B3b-membership-order.maude`
 
-#### Summary
+#### Historical behavior
 
-When two applicable memberships lower a kind term to incomparable target sorts, the specification is contradictory/nonconfluent, but Maude still has a deterministic observable tiebreak based on connected-component sort indexing. tnk breaks the tie using declaration-level `SortId` order.
+With two applicable memberships lowering a kind term to incomparable `B` and `D`, Maude performed one membership application and reported `D`; tnk reported `B`. The specification is intentionally contradictory/nonconfluent, but the selected sort is still observable.
 
-#### Reproduction used
+#### Source and boundary findings
 
-```maude
-fmod MB-TIE is
-  sorts A B D X Y .
-  subsorts X < A B .
-  subsorts Y < A D .
-  op t : -> [X] .
-  mb t : B .
-  mb t : D .
-endfm
-red in MB-TIE : t .
-```
+The earlier “partial order plus declaration fallback” model was wrong. Maude's `Core/sortConstraintTable.cc:58-68` sorts every constraint by descending `Sort::index()`—“largest index (smallest sort) first.” Sort indices are unique within a connected component, so they provide a deterministic total order even for incomparable targets. Membership declaration order is not the tiebreak.
 
-#### Expected behavior
+tnk already exposed the corresponding DFS/topological per-component index as `SortTable::component_index`, but its constraint comparator used subsort reachability for comparable pairs and raw global `SortId` for incomparable pairs. Raw `SortId` reflects unrelated registration/allocation order and can disagree with Maude's component-local index.
 
-Maude performs one membership application and reports sort `D`.
+The confirmation matrix isolated the rules:
 
-#### Actual behavior
+- reversing the two incomparable membership declarations does not change Maude's selected `D`;
+- swapping the independent `X < A B` and `Y < A D` declaration lines changes their component indices and changes Maude's selected incomparable target to `B`;
+- when `B < D`, the genuinely smaller target `B` is selected first and the reduction still takes one membership rewrite.
 
-tnk performs one membership application and reports sort `B`.
+This is separate from kind-name ordering and does not claim confluence for contradictory specifications.
 
-#### Impact
+#### Resolution
 
-- A real wrong-sort result is observable.
-- The input is intentionally nonconfluent, so the practical scope is narrow.
-- This is distinct from multi-top kind-name ordering, which now matches Maude.
+The membership table now sorts by descending `component_index`, exactly matching the reference comparator. Rust's stable sort retains source order only when target sorts are identical; distinct component sorts have distinct indices.
 
-#### Current understanding
+#### Verification
 
-The membership table sorts incomparable targets by raw `SortId`. It should use the same connected-component order that Maude uses for its constraint table. The already-implemented DFS-derived component index is likely the relevant information, but the exact direction and stable-order rules must remain those established by the probe/reference.
-
-#### Acceptance contract
-
-- The probe returns sort `D` with one rewrite.
-- Comparable targets continue to apply smallest-target-first.
-- Declaration order and component order are separately tested.
+`B3b-membership-order.maude` retains both incomparable membership declaration orders, the subsort-edge-order variant, and the comparable control. Each command has an empty Maude 3.5.1 diff: the first two cases report `D`, the edge-order variant and comparable control report `B`, and every case performs one rewrite.
 
 ---
-
-### TNK-009 — Strategy reflection uses the wrong implicit BOOL import mode
+### TNK-009 — Automatic BOOL imports use the wrong mode — RESOLVED
 
 - **Severity:** Medium
-- **Classification:** Behavioral divergence; wrong reflected value
-- **Confidence:** Confirmed by direct comparison
-- **Primary area:** `upModule` and implicit-import reflection
-- **Likely implementation touchpoint:** source-backed module up-translation
+- **Classification:** Behavioral divergence; wrong source/reflected module value
+- **Confidence:** Resolved by reference-source inspection and module-kind/mode matrices
+- **Primary area:** standing-prelude automatic import injection
+- **Implementation touchpoint:** `tnk-session/src/lib.rs`
+- **Retained fixture:** `conformance/audit/C6d-implicit-bool-mode.maude`
 
-#### Summary
+#### Historical behavior
 
-Strategy-module reflection now works substantially beyond what older documentation claims: `upModule`, `upStratDecls`, and `upSds` compute real strategy declarations/definitions. One structural difference remains in the direct probe: the automatic BOOL import is emitted with the wrong import mode.
-
-#### Reproduction shape
-
-A small `smod SM` containing a sort, constants, a labelled rule, `strat go`, and `sd go := r` was reflected with:
-
-```maude
-red in META-LEVEL : upModule('SM, false) .
-red in META-LEVEL : upStratDecls('SM, false) .
-red in META-LEVEL : upSds('SM, false) .
-```
-
-#### Expected behavior
-
-The reflected strategy module begins with:
+The issue was first observed while reflecting a strategy module: `upModule`, `upStratDecls`, and `upSds` all computed, but Maude's automatic import was:
 
 ```text
 including 'BOOL .
 ```
 
-#### Actual behavior
-
-tnk emits:
+while tnk emitted:
 
 ```text
 protecting 'BOOL .
 ```
 
-The strategy declarations and definition otherwise matched in the observed diff.
+The strategy declarations and definitions otherwise matched.
 
-#### Impact
+#### Source and boundary findings
 
-- Reflected module values are structurally different.
-- Meta-programs that inspect import modes can branch differently.
-- A reflect/down-translate round trip can encode a different import contract.
+The initial reflection-specific diagnosis was too narrow. `upModule` was faithfully exposing a wrong surface import that `Session::enter_module` injected into every entered module while `set include BOOL on` was active. The injected AST node used `ImportMode::Protecting`; Maude's `SyntacticPreModule::finishModule` obtains its automatic imports from the owner and processes the BOOL entry as `INCLUDING`.
 
-#### Current understanding
+The same mismatch therefore affected functional, system, strategy, and object module source before reflection. It was not a loss inside `upModule` or strategy-field translation.
 
-The implicit BOOL injection path loses or substitutes the import mode when producing source/reflected module data. This should be handled independently from the broader, now-working strategy reflection implementation.
+Automatic-import ordering also matters. With automatic BOOL enabled, the generated `including BOOL` is inserted before an explicit `protecting BOOL`; source `upImports` retains both entries in that order. With automatic imports disabled, no generated import appears and an explicit `protecting BOOL` remains protecting.
 
-#### Acceptance contract
+#### Resolution
 
-- The direct strategy-module probe has no import-mode diff.
-- Ordinary modules and explicit BOOL imports retain their correct modes.
-- `upStratDecls` and `upSds` remain unchanged.
+The session now injects `ImportMode::Including`. No meta/reflection special case was added; source and flat reflection inherit the corrected module representation.
+
+#### Verification
+
+`C6d-implicit-bool-mode.maude` covers functional, system, and strategy modules; `upImports` and source-form `upModule`; an explicit BOOL import while automatic inclusion is on; `set include BOOL off`; and an explicit protecting import while automatic inclusion is off. Automatic-only cases report `including`; automatic plus explicit reports `including` followed by `protecting`; the no-import case is empty; and the explicit-off case reports `protecting`, all with empty Maude 3.5.1 diffs. The retained TNK-005 `A5g` fixture separately pins unchanged strategy declarations and definitions.
 
 ---
-
-### TNK-010 — Local meta-interpreter fixtures miss the retained timeout gate
+### TNK-010 — Local meta-interpreter fixtures miss the retained timeout gate — RESOLVED
 
 - **Severity:** Medium
 - **Classification:** Robustness/performance
-- **Confidence:** Confirmed by current gate runs
-- **Primary area:** nested non-flat local meta-interpreters
+- **Confidence:** Resolved by targeted profiling and the unchanged retained gate
+- **Primary area:** repeated Earley chart dedup in nested reflected-module parsing
 - **Relevant fixtures:** `I19-russian-dolls-nonflat`, `I20-russian-dolls-nonflat2`
+- **Implementation touchpoint:** `tnk-frontend/src/cfparser/earley.rs`
 
-#### Summary
+#### Historical gate evidence
 
-The I-S documentation states that all 27 fixtures pass the retained per-fixture 60-second gate. On the surveyed checkout/machine, the combined subsystem run reported 110/112 because I19 and I20 timed out. I19 passed in isolation at 59.77 seconds. I20 still timed out in isolation at 60.32 seconds and passed with an extended timeout in 82.01 seconds.
+The initial survey's combined subsystem run reported 110/112 because I19 and I20 hit the per-fixture 60-second timeout. I19 passed in isolation at 59.77 seconds. I20 timed out at 60.32 seconds and, with `TIMEOUT_SECS=180`, produced exact oracle output in 82.01 seconds. A later full run happened to pass both at the default limit, confirming timing sensitivity rather than removing the release-gate risk.
 
-#### Expected behavior
+No semantic divergence was found; widening the gate would have changed the contract rather than fixed the observed regression.
 
-All I-S fixtures complete with matching output under the recorded 60-second limit.
+#### Investigation findings
 
-#### Actual behavior
+The I20 fixture was split at its five nesting-level commands without changing the module prefix. Before the repair, level 0 completed in 5.80 seconds while level 4 took 23.26 seconds. This localized the growth to repeated nested reflected-module work rather than one fixed startup cost.
 
-- I19 is timing-sensitive and effectively on the boundary.
-- I20 misses the limit.
-- I20's output matches the oracle when given more time; no semantic difference was observed.
+A 10-second `/usr/bin/sample` capture of the level-4 process put `tnk_frontend::cfparser::earley::parse` at the dominant sampled stack. Its `HashSet<Item>` dedup path repeatedly reached `core::hash::BuildHasher::hash_one`/hashbrown table operations. Repeated `tnk_modules::meta::MetaDescent::module_pieces` and flattening were visible secondary work, but the profile did not point to the interpreter scheduler or rewrite loop as the primary regression.
 
-#### Impact
+An Earley `Item` is only `(prod: u32, dot: u16, origin: u32)`. The hash sets are never iteration-order authorities: insertion-ordered `Vec<Item>` sets drive recognizer work and forest extraction, while the hash tables answer membership only. SipHash therefore imposed substantial general-purpose hashing cost without providing a semantic ordering property.
 
-- The current “27/27 retained gate green” status is inaccurate.
-- CI or slower machines can fail nondeterministically even when semantics are correct.
-- The nested interpreter path may be impractical for prototype users at modest nesting depth.
+#### Resolution
 
-#### Current understanding
+The chart uses a deterministic, allocation-free integer hasher specialized for the three compact indices. It mixes the derived `Hash` calls for `u32`/`u16` directly. The recognizer vectors, item identity, chart contents, parse ordering, and forest extraction are unchanged.
 
-This is a performance regression or an inadequately calibrated gate, not an established semantic bug. Triage must decide whether the 60-second invariant is part of v0 correctness. Raising the timeout without understanding the regression would change the contract rather than restore it.
+#### Verification
 
-#### Acceptance contract
+On the same workstation and release binary:
 
-One of the following must be chosen explicitly:
+- the isolated level-4 probe dropped from 23.26 to 8.69 seconds;
+- `tools/subsystems-scoreboard.sh -p I20` passed with exact output in 26.10 seconds;
+- `tools/subsystems-scoreboard.sh -p I19` passed with exact output in 24.98 seconds.
 
-1. Restore I19/I20 below the retained 60-second limit with their exact outputs unchanged; or
-2. Revise the gate with a documented reason and a replacement performance invariant.
-
+Both retained fixtures are again comfortably below the unchanged 60-second per-fixture limit. No timeout or fixture contract was widened.
 ## 4. Ratified accepted divergences
 
 These are known differences, not discoveries to hide behind the word “clean.” `tools/legacy-sweep.sh` verifies that they have not drifted beyond their recorded forms.
@@ -673,7 +613,7 @@ Extension-match rewriting is parsed but rejected during strategy resolution. The
 
 ### GAP-007 — Strategy meta parse/print
 
-`metaParseStrategy` and `metaPrettyPrintStrategy` remain inert. `upModule`, `upStratDecls`, and `upSds` should not be grouped into this gap: they now compute, subject to TNK-009.
+`metaParseStrategy` and `metaPrettyPrintStrategy` remain inert. `upModule`, `upStratDecls`, and `upSds` should not be grouped into this gap: they compute, and TNK-009's automatic BOOL mode is now retained against the oracle.
 
 ### GAP-008 — Conditional and partial meta operations
 
@@ -736,19 +676,19 @@ TNK-001, TNK-002, and TNK-003 are resolved with retained fixtures. No confirmed 
 
 ### 8.2 Semantic-correctness group
 
-TNK-004 is resolved with retained value, count, sort, laziness, and equation-ordering coverage. TNK-007 and TNK-008 remain genuine but sharply bounded numeric/nonconfluent wrong-computation corners.
+TNK-004, TNK-007, and TNK-008 are resolved with retained value, count, sort, numeric-boundary, and ordering coverage. No confirmed wrong-normal-form, exact-float, or membership-tiebreak defect remains from this survey; adjacent source-admitted risks remain separate.
 
 ### 8.3 Strategy composition group
 
-TNK-005 is resolved with compositional-import, ordering, transform, reflection, lifecycle, and recovery fixtures. TNK-006 remains a legal-input compatibility failure. TNK-001's operator-evaluation machinery is resolved independently; GAP-005/GAP-006 and RISK-001 remain separate proposals so strategy-language work does not silently become an unbounded rewrite.
+TNK-005 and TNK-006 are resolved with compositional-import, ordering, transform, reflection, lifecycle, recovery, and generalized-`top` fixtures. TNK-001's operator-evaluation machinery is resolved independently; GAP-005/GAP-006 and RISK-001 remain separate proposals so strategy-language work does not silently become an unbounded rewrite.
 
 ### 8.4 Reflection group
 
-TNK-009 is a small, observed structural mismatch within otherwise newly working strategy reflection. It should not be used to relabel the entire strategy-reflection surface as inert.
+TNK-009 is resolved at the automatic-import source: functional, system, and strategy source/flat reflection now preserve Maude's `including BOOL` mode. This remains independent from the still-inert strategy meta parse/pretty-print operations.
 
 ### 8.5 Performance group
 
-TNK-010 requires an explicit product/gate decision. Semantic conformance after 82 seconds does not satisfy a documented 60-second invariant, but changing the invariant is not the same as fixing a regression.
+TNK-010 is resolved without changing the product gate: targeted profiling removed SipHash from Earley item dedup, and I19/I20 now pass exact output in 24.98/26.10 seconds under the retained 60-second limit on the surveyed workstation.
 
 ### 8.6 Fixture policy
 
@@ -761,7 +701,7 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, the TNK-002 probes in `conformance/audit/A3a-rewrite-frozen.maude`, the TNK-003 probes in `conformance/audit/A1b-opdecl-arity.maude`, the TNK-004 probes in `conformance/audit/A3e-branch-stuck.maude` plus `conformance/prelude-bool.maude`, and the TNK-005 matrix in `conformance/audit/A3f`–`A3j` plus `A5g`. The remaining direct survey probes have not yet all been added to the permanent corpus.
+The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, and TNK-009 in `C6d-implicit-bool-mode`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
 
 ## 9. Prototype/v0 decision view
 
@@ -769,9 +709,9 @@ This document does not set release priority. It exposes the decisions:
 
 - **How much sibling declaration-recovery validation is required for v0?** The confirmed TNK-002 and TNK-003 panics are resolved; adjacent theory-attribute cases remain unverified risk candidates rather than confirmed defects.
 - **Can v0 claim open-term functional reduction?** TNK-004 no longer blocks this claim for BranchSymbol: its symbolic-condition value, count, and sort contract is retained against the oracle.
-- **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, and session invalidation covered by TNK-005. The separate TNK-006 generalized-`top` deviation remains.
-- **Are narrow numeric/nonconfluent/reflection corners acceptable as documented limitations?** This governs TNK-007–009.
-- **Is the 60-second I-S gate binding?** This governs TNK-010.
+- **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, session invalidation, and generalized-`top` recovery covered by TNK-005/TNK-006.
+- **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** No: TNK-007–009 are resolved and retained; broader unverified candidates remain classified separately.
+- **Is the 60-second I-S gate binding?** It remains binding and unchanged; TNK-010 restored I19/I20 beneath it.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.
 
-The cleanest release statement, pending those decisions, is: the retained mainstream corpus is green, but tnk is not bug-free and still has confirmed wrong-normal-form behavior, legal-input rejection, bounded numeric/sort, reflection, accounting/order, diagnostics, and performance differences.
+The clean release statement is narrower than “bug-free”: every confirmed TNK-001–010 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.

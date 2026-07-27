@@ -2482,19 +2482,13 @@ impl Signature {
         let sorts = &self.sorts;
         let v = self.memberships.entry(top).or_default();
         v.push(compiled);
-        // Order smallest-target-sort first (subsorts before supersorts), so the constrain pass lowers
-        // a node straight to its smallest applicable sort in ONE application — matching the membership
-        // count Maude reports (Maude also tries smallest-sort-first).
+        // Maude orders sort constraints by descending per-component sort index. That is
+        // smallest-target-first for comparable sorts and supplies its observable deterministic
+        // tiebreak for incomparable targets; equal targets retain declaration order (`sort_by` is stable).
         v.sort_by(|x, y| {
-            if x.sort == y.sort {
-                Ordering::Equal
-            } else if sorts.leq(x.sort, y.sort) {
-                Ordering::Less
-            } else if sorts.leq(y.sort, x.sort) {
-                Ordering::Greater
-            } else {
-                x.sort.cmp(&y.sort) // incomparable: deterministic tie-break (non-confluent is a follow-up)
-            }
+            sorts
+                .component_index(y.sort)
+                .cmp(&sorts.component_index(x.sort))
         });
         id
     }

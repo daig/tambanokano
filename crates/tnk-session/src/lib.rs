@@ -80,8 +80,8 @@ pub struct Session {
     /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
     stdin: String,
     /// `set include BOOL on|off` (decision D11): while on, every entered module gets an implicit
-    /// `protecting BOOL .` (Maude's auto-import, prelude.maude:3233 turns it on after BOOL exists;
-    /// the prelude's own early modules build while it is off). Default off — the engine/library
+    /// `including BOOL .` (the command's actual import mode; prelude.maude:3233 turns it on after BOOL
+    /// exists). The prelude's own early modules build while it is off. Default off — the engine/library
     /// layer stays prelude-free; the standing prelude flips it via its own `set include` line.
     include_bool: bool,
     /// Canonicalized paths already `load`ed — `sload` (skip-load) consults this and loads only once.
@@ -344,14 +344,14 @@ impl Session {
     fn enter_module(&mut self, pm: PreModule, out: &mut String) {
         let mut pm = pm;
         let name = pm.name.clone();
-        // Implicit BOOL (D11 / fable-audit.md §3.4): while `set include BOOL on`, every module
-        // gets `protecting BOOL .` injected (Maude's auto-import). An explicit BOOL import
-        // dedups in flatten's visited set, so injection is idempotent.
+        // Implicit BOOL (D11 / fable-audit.md §3.4): `set include BOOL on` injects
+        // `including BOOL .`. An explicit BOOL import dedups in flatten's visited set, so injection is
+        // idempotent for executable declarations while both source import modes remain reflectable.
         if self.include_bool && name != "BOOL" && self.db.get("BOOL").is_some() {
             pm.imports.insert(
                 0,
                 tnk_frontend::surface::ast::Import {
-                    mode: tnk_frontend::surface::ast::ImportMode::Protecting,
+                    mode: tnk_frontend::surface::ast::ImportMode::Including,
                     expr: tnk_frontend::surface::ast::ModuleExpr::Named("BOOL".into()),
                 },
             );
@@ -887,9 +887,10 @@ impl Session {
                     Err(_) => {}
                 }
             }
-            Command::Srewrite { depth_first, term, strategy, .. } => {
+            Command::Srewrite { depth_first, term, mut strategy, .. } => {
                 self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
+                tnk_frontend::strategy::discard_inapplicable_top(&mut strategy, lm);
                 let kw = if depth_first { "dsrewrite" } else { "srewrite" };
                 let echo = command_echo(lm, &self.interner, &term, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));

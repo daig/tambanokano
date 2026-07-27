@@ -1,0 +1,37 @@
+*** B3b-membership-order — TNK-008: memberships use descending component-local sort index; membership order is irrelevant, while edge order may change indices.
+set show timing off .
+fmod B3B-MB-ORIGINAL is
+  sorts A B D X Y .
+  subsorts X < A B .
+  subsorts Y < A D .
+  op t : -> [X] .
+  mb t : B .
+  mb t : D .
+endfm
+fmod B3B-MB-REVERSED-MBS is
+  sorts A B D X Y .
+  subsorts X < A B .
+  subsorts Y < A D .
+  op t : -> [X] .
+  mb t : D .
+  mb t : B .
+endfm
+fmod B3B-MB-SWAPPED-EDGES is
+  sorts A B D X Y .
+  subsorts Y < A D .
+  subsorts X < A B .
+  op t : -> [X] .
+  mb t : B .
+  mb t : D .
+endfm
+fmod B3B-MB-COMPARABLE is
+  sorts A B D .
+  subsorts B < A D .
+  op t : -> [A] .
+  mb t : D .
+  mb t : B .
+endfm
+red in B3B-MB-ORIGINAL : t .
+red in B3B-MB-REVERSED-MBS : t .
+red in B3B-MB-SWAPPED-EDGES : t .
+red in B3B-MB-COMPARABLE : t .

@@ -1428,10 +1428,32 @@ fn conv_base(n: Nat) -> Option<u8> {
         .filter(|&b| (2..=36).contains(&b))
 }
 
+/// Exponent `k` of the canonical power-of-two denominator of a positive finite IEEE-754 value.
+/// Computing it from the encoded significand avoids trying to fit `2^k` itself in a machine integer.
+fn exact_float_denominator_exponent(mag: f64) -> u32 {
+    debug_assert!(mag.is_finite() && mag > 0.0);
+    const FRACTION_MASK: u64 = (1u64 << 52) - 1;
+
+    let bits = mag.to_bits();
+    let encoded_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & FRACTION_MASK;
+    let (significand, binary_exponent) = if encoded_exponent == 0 {
+        // Subnormal: no implicit leading bit, and the fraction is scaled by 2^-1074.
+        (fraction, -1074)
+    } else {
+        ((1u64 << 52) | fraction, encoded_exponent - 1023 - 52)
+    };
+    if binary_exponent >= 0 {
+        0
+    } else {
+        ((-binary_exponent) as u32).saturating_sub(significand.trailing_zeros())
+    }
+}
+
 /// Decompose a float for `decFloat(f, prec)` into `(sign, digits, exp)` with value `sign · 0.digits ·
 /// 10^exp` (Maude's `DecFloat`). `sign` is 1 / -1 / 0; `prec > 0` rounds to that many significant digits;
 /// `prec == 0` gives the **exact** full decimal expansion (`|f| = num/2^k` ⇒ digits `num·5^k`, exp
-/// `len − k`). `None` if the exact denominator exponent exceeds machine width (extreme subnormals).
+/// `len − k`) across the complete finite IEEE-754 range.
 fn dec_float_parts(f: f64, prec: usize) -> Option<(i32, String, i64)> {
     if f == 0.0 {
         return Some((0, "0".repeat(prec.max(1)), 0));
@@ -1439,8 +1461,8 @@ fn dec_float_parts(f: f64, prec: usize) -> Option<(i32, String, i64)> {
     let sign = if f < 0.0 { -1 } else { 1 };
     let mag = f.abs();
     if prec == 0 {
-        let (num, den) = num::rational_of_f64(mag)?;
-        let k = i64::from(den.to_u64()?.trailing_zeros()); // den is a power of two, 2^k
+        let (num, _) = num::rational_of_f64(mag)?;
+        let k = i64::from(exact_float_denominator_exponent(mag));
         let five_k = Int::from_nat(&Nat::from_u64(5)).pow_u64(k as u64);
         let digits = num.mul(&five_k).magnitude().to_decimal();
         let exp = digits.len() as i64 - k;

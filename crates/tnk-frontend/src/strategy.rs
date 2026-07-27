@@ -441,6 +441,62 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
     }
 }
 
+/// Apply Maude's recoverable `top` rule to the surface tree before echoing/execution: the modifier
+/// survives only around a direct rule application (`all` or a rule label). Named strategy calls are
+/// deliberately tested before expansion, so `top(call)` is discarded even if the call body applies a rule.
+pub fn discard_inapplicable_top(e: &mut StratExpr, lm: &LoadedModule) {
+    match e {
+        StratExpr::Top(inner) => {
+            discard_inapplicable_top(inner, lm);
+            let direct_application = match &**inner {
+                StratExpr::All => true,
+                StratExpr::Apply { label, .. } => !rules_labelled(lm, label).is_empty(),
+                _ => false,
+            };
+            if !direct_application {
+                *e = std::mem::replace(&mut **inner, StratExpr::Idle);
+            }
+        }
+        StratExpr::Apply { substrats, .. } => {
+            for child in substrats {
+                discard_inapplicable_top(child, lm);
+            }
+        }
+        StratExpr::One(child)
+        | StratExpr::Star(child)
+        | StratExpr::Plus(child)
+        | StratExpr::Normalize(child) => discard_inapplicable_top(child, lm),
+        StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
+            discard_inapplicable_top(left, lm);
+            discard_inapplicable_top(right, lm);
+        }
+        StratExpr::Branch {
+            test,
+            success,
+            failure,
+        } => {
+            discard_inapplicable_top(test, lm);
+            discard_inapplicable_top(success, lm);
+            discard_inapplicable_top(failure, lm);
+        }
+        StratExpr::MatchRew { subs, .. } => {
+            for (_, child) in subs {
+                discard_inapplicable_top(child, lm);
+            }
+        }
+        StratExpr::Sugar { args, .. } => {
+            for child in args {
+                discard_inapplicable_top(child, lm);
+            }
+        }
+        StratExpr::Idle
+        | StratExpr::Fail
+        | StratExpr::All
+        | StratExpr::Test { .. }
+        | StratExpr::Call { .. } => {}
+    }
+}
+
 /// Resolve a surface [`StratExpr`] into an [`RStrat`] (shared via [`Rc`]). `depth` bounds parameterized-call
 /// inline expansion. `xmatchrew`/conditional `csd` error with a clear message (follow-ons).
 fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<Rc<RStrat>, String> {
@@ -491,20 +547,34 @@ fn resolve_in(
                 ));
             }
         }
-        StratExpr::Top(inner) => match &*resolve_in(inner, lm, grammar, i, seed)? {
-            RStrat::Apply {
-                rules,
-                subst,
-                substrats,
-                ..
-            } => RStrat::Apply {
-                rules: rules.clone(),
-                top: true,
-                subst: subst.clone(),
-                substrats: substrats.clone(),
-            },
-            _ => return Err("top(…) of a non-rule strategy is a follow-on".to_string()),
-        },
+        StratExpr::Top(inner) => {
+            let resolved = resolve_in(inner, lm, grammar, i, seed)?;
+            // Maude attaches `top` only to a direct rule application. A named strategy call is a
+            // distinct surface node: the modifier is ignored before the call body is expanded, even
+            // when that body happens to resolve to an application strategy.
+            let direct_application = match &**inner {
+                StratExpr::All => true,
+                StratExpr::Apply { label, .. } => !rules_labelled(lm, label).is_empty(),
+                _ => false,
+            };
+            if !direct_application {
+                return Ok(resolved);
+            }
+            match &*resolved {
+                RStrat::Apply {
+                    rules,
+                    subst,
+                    substrats,
+                    ..
+                } => RStrat::Apply {
+                    rules: rules.clone(),
+                    top: true,
+                    subst: subst.clone(),
+                    substrats: substrats.clone(),
+                },
+                _ => unreachable!("a direct application must resolve to RStrat::Apply"),
+            }
+        }
         StratExpr::One(inner) => RStrat::One(resolve_in(inner, lm, grammar, i, seed)?),
         StratExpr::Seq(left, right) => RStrat::Seq(
             resolve_in(left, lm, grammar, i, seed)?,
