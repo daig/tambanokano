@@ -497,8 +497,8 @@ pub fn discard_inapplicable_top(e: &mut StratExpr, lm: &LoadedModule) {
     }
 }
 
-/// Resolve a surface [`StratExpr`] into an [`RStrat`] (shared via [`Rc`]). `depth` bounds parameterized-call
-/// inline expansion. `xmatchrew`/conditional `csd` error with a clear message (follow-ons).
+/// Resolve a surface [`StratExpr`] into an [`RStrat`] (shared via [`Rc`]). Named calls remain lazy and
+/// recursive definitions are opened by the runtime call generator. `xmatchrew`/conditional `csd` error clearly.
 fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<Rc<RStrat>, String> {
     resolve_in(e, lm, &lm.grammar, i, &VarIndex::new())
 }

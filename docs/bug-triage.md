@@ -45,6 +45,7 @@ Severity is impact, not implementation order:
 | TNK-008 | Medium | Bug | Incomparable membership targets use the wrong tiebreak | **Resolved 2026-07-26**; component-index/order matrix retained |
 | TNK-009 | Medium | Behavioral divergence | Automatic BOOL imports use the wrong mode across module kinds | **Resolved 2026-07-26**; source/flat reflection matrix retained |
 | TNK-010 | Medium | Robustness/performance | I19/I20 no longer reliably satisfy the retained 60-second gate | **Resolved 2026-07-26**; gate restored without widening timeout |
+| TNK-011 | High | Bug | Collapsing memberships are not offered to compatible subject roots | **Resolved 2026-07-27**; oracle matrix and trace retained |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -525,6 +526,38 @@ On the same workstation and release binary:
 - `tools/subsystems-scoreboard.sh -p I19` passed with exact output in 24.98 seconds.
 
 Both retained fixtures are again comfortably below the unchanged 60-second per-fixture limit. No timeout or fixture contract was widened.
+
+### TNK-011 — Collapsing memberships are indexed only at their syntactic top — RESOLVED
+
+- **Severity:** High
+- **Classification:** Bug; wrong value, least sort, and rewrite count
+- **Confidence:** Confirmed by direct Maude 3.5.1 comparisons
+- **Status:** Resolved 2026-07-27
+- **Primary area:** sort-constraint indexing across ACU/AU/CUI collapse
+- **Completed goal:** [`migration/tnk-011-collapse-memberships-goal.md`](migration/tnk-011-collapse-memberships-goal.md)
+
+Before the repair, `push_membership` stored each executable `mb`/`cmb` only under
+`lhs.top_symbol()`. A lhs such as `a * X` over `[comm id: z]` therefore worked on a rooted
+`a * b` node but was never offered to the bare `a` node it matches with `X = z`. The omission
+changed values as well as accounting: without the refinement `a : Special`, a sorted equation
+such as `eq wrap(S:Special) = b` could not match.
+
+The signature now owns every compiled `SortConstraint` once in a dense, declaration-ordered arena.
+Direct-symbol and collapsing-result-kind indexes contain constraint IDs. Registration classifies
+ACU/two-sided-AU identity and CUI identity/idempotent roots; least-sort computation allocation-free
+merges the direct and collapse streams by descending component-local target-sort index and declaration
+ID. Each constraint remains in exactly one stream, and the existing whole matcher rejects conservative
+false-positive offers.
+
+`conformance/audit/B3c-membership-collapse.maude` retains the direct Maude matrix: values, least sorts,
+counts, unconditional and conditional collapse, recursive survivors, identity re-entry, noncollapse
+controls, direct/collapse ordering, downstream sorted matching, and the complete membership trace with
+`X --> z` and `Whole: a`. Focused frontend and REPL assertions consume the same fixture. The final gates
+passed: the live oracle diff, all 458 workspace tests, and the 89/89 audit scoreboard.
+
+The closure is deliberately limited to **ACU/two-sided-AU/CUI collapsing membership indexing**.
+Associative one-sided `left id:`/`right id:` collapse remains a separate matcher gap.
+
 ## 4. Ratified accepted divergences
 
 These are known differences, not discoveries to hide behind the word “clean.” `tools/legacy-sweep.sh` verifies that they have not drifted beyond their recorded forms.
@@ -640,17 +673,28 @@ These belong in the feature/issue collection, not in a claim that the implemente
 
 The following remain risks, not confirmed bugs. They should not be presented as factual limitations until a minimal Maude/tnk comparison establishes the input and behavior.
 
-### RISK-001 — Recursive parameterized strategy calls
+### RISK-001 — Recursive parameterized strategy calls (closed)
 
-The current resolver uses bounded inline expansion. Recursive parameterized definitions may reject or hit the expansion bound, but no direct oracle probe is recorded here.
+The resolver no longer performs bounded inline expansion: it retains named calls in `RStrat::Call` and opens
+matching, specialized definition bodies through the runtime `CallGenerator`. A direct 256-level decreasing
+parameter recursion probe matches Maude 3.5.1 exactly (one `S: b` solution, one rewrite, then exhaustion).
+This behavior has direct oracle evidence but no retained conformance fixture.
 
-### RISK-002 — Unusual cross-kind overload grouping
+### RISK-002 — Unusual cross-kind overload grouping (closed)
 
-A source comment warns about cross-kind declaration groups. A direct basic overload with distinct domain/range kinds worked correctly and did not reach the old assertion. Only a narrower grouping case, if one exists, remains suspect.
+The narrower same-domain-kind case also conforms. Direct probes covered identical domain sorts with different
+range kinds and incomparable subsorts from one domain kind with different range kinds; contextual
+disambiguation selected both declarations, and equations attached to each declaration reduced exactly like
+Maude 3.5.1. The frontend keys symbol groups by name, domain kinds, and range kind, so different range kinds
+cannot reach the kernel's same-group assertion. One adjacent output-only divergence remains for an
+unconstrained ambiguous ill-sorted parse: tnk prints the computed error-sort suffix `.[B]` where Maude prints
+the selected declaration suffix `.B`; contextual terms and reduction semantics agree.
 
-### RISK-003 — Exotic AC/iter membership extension
+### RISK-003 — Resolved as TNK-011
 
-Broad source comments about CUI collapse and iter membership are stale for the direct common probes: CUI collapse produced the same solution set, and iter membership produced the same result/count. More exotic extension compositions remain unverified.
+The exotic composition probes established the collapse-indexing bug closed by TNK-011. The repair covers
+ACU/two-sided-AU/CUI candidate indexing while preserving the already-working iter/CUI/AC matcher composition.
+The independently confirmed one-sided-AU matcher boundary remains outside that closure.
 
 ### RISK-004 — View validation and unusual map/module-expression forms
 

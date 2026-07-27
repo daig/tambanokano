@@ -1,18 +1,17 @@
 //! CUI matching: a matcher for `comm` (commutative, **not** associative; optionally `idem`/`id:`)
 //! binary operators.
 //!
-//! A CUI node is binary, so matching `f(p1, p2)` against the canonical `f(s1, s2)` is just the two
-//! commutative pairings — `(p1↦s1, p2↦s2)` and `(p1↦s2, p2↦s1)` — with no extension (the whole node
-//! is matched). Idempotence and identity are handled by *construction* (`make_cui` collapses
-//! `f(a,a)`/`f(a,e)` to a single element), so the subject of an in-reduction CUI match is always a
-//! two-argument node; **collapse matching** of `f(X,Y)` against a non-`f` subject (the `match`-command
-//! case `f(X,Y) <=? a`) is a follow-up.
+//! A CUI node is binary. Matching `f(p1, p2)` against canonical `f(s1, s2)` enumerates both
+//! commutative pairings. With `id:`, extension matching also lets one operand take the identity while
+//! the other matches one subject argument, leaving the second argument as rewrite residue. Against a
+//! non-`f` subject, `id:` and `idem` collapse arms match the operands against the identity/whole subject.
 //!
 //! Each argument sub-pattern is matched through the full [`LhsAutomaton`](crate::theory) seam (via
 //! [`enumerate_alien_solutions`](crate::theory::enumerate_alien_solutions)), so it may be a variable
-//! (including the non-linear `f(X, X)`), a ground/free subterm, **or a theory-rooted subterm** — the two
-//! arguments compose as a length-2 alien sequence, sharing the substitution. (Collapse matching of
-//! `f(X, Y)` against a non-`f` subject — the `match`-command case `f(X,Y) <=? a` — is still a follow-up.)
+//! (including the non-linear `f(X, X)`), a ground/free subterm, or a theory-rooted subterm. Statement
+//! indexing is separate from this matcher: each membership is compiled once, then referenced from either
+//! its direct-symbol index or a result-kind collapse index. Runtime whole matching rejects conservative
+//! collapse candidates that cannot apply to the current subject.
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};

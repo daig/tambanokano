@@ -98,6 +98,7 @@ tnk-repl      thin terminal adapter: color/wrapping policy, line editing, prompt
 | `correctness-goal.md` | goal contract | the frozen fixture manifest + scoreboard metric, decision defaults, and completion criteria driving the correctness goal (`/goal`) |
 | `subsystems-goal.md` | subsystem contract | completed S/T/M/I-S ledger; future I-C scope, invariants, manifests, and gates |
 | `tnk-005-strategy-imports-goal.md` | completed goal contract | closed TNK-005 `/goal`: oracle matrix, module/strategy invariants, implementation record, retained fixtures, and verified completion gates |
+| `tnk-011-collapse-memberships-goal.md` | completed goal contract | closed TNK-011 `/goal`: ACU/two-sided-AU/CUI collapse indexing, single-compile arena, retained oracle/trace matrix, explicit one-sided-AU boundary, and verified completion gates |
 | `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, model checking, and the split synchronous/concurrent Phase I |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 

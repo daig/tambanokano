@@ -3,9 +3,9 @@
 ***
 *** Memberships compile to the same `LhsAutomaton` as equations and match via the same seam, so the C8
 *** cross-theory alien matching covers their lhs too: an AC/AU/iter membership lhs — including non-linear
-*** variables and alien subterms — matches modulo the theory. (Residual: a membership pattern that
-*** *collapses* under an identity, e.g. `mb a L : Lst` with `[id: nil]`, applies to collapsed sub-elements
-*** in Maude too — the deferred collapse-matching gap, count-only; Maude itself warns on such patterns.)
+*** variables and alien subterms — matches modulo the theory. ACU/two-sided-AU/CUI collapse indexing is
+*** covered by audit/B3c-membership-collapse.maude; this fixture remains the rooted theory-matcher and
+*** cross-theory composition baseline.
 
 fmod AC-MB is
   sorts E Pair Sym .

@@ -260,6 +260,22 @@ struct SortConstraint {
     condition: Vec<CompiledFragment>,
 }
 
+/// Observable sort-constraint order: descending component-local target-sort index, then declaration id.
+/// Both direct-symbol and collapsing-kind indexes use this comparator so their runtime merge is allocation-free.
+fn membership_order(
+    constraints: &[SortConstraint],
+    sorts: &Sorts,
+    left: u32,
+    right: u32,
+) -> Ordering {
+    let left_constraint = &constraints[left as usize];
+    let right_constraint = &constraints[right as usize];
+    sorts
+        .component_index(right_constraint.sort)
+        .cmp(&sorts.component_index(left_constraint.sort))
+        .then_with(|| left.cmp(&right))
+}
+
 /// A rule `rl lhs => rhs` compiled for the engine: structurally a [`CompiledEquation`] minus `[owise]`
 /// (rules have no owise phase). Unlike equations, rules live in their own [`Signature::rules`] table and
 /// are applied **only** by `rewrite`/`frewrite`/`search` (Pillar A) — never by [`reduce`](Engine::reduce),
@@ -475,10 +491,15 @@ pub(crate) struct Signature {
     identities: Arena<Identity>,
     /// Unconditional equations (LHS compiled to a theory automaton), indexed by lhs top symbol.
     equations: HashMap<SymbolId, Vec<CompiledEquation>>,
-    /// Membership axioms (`mb`), indexed by lhs top symbol; applied to lower a node's least sort at
-    /// construction (B2.2). Empty in modules without memberships — the construction hot path checks
-    /// `memberships.is_empty()` before doing any per-node work, so the free reduce path is untouched.
-    memberships: HashMap<SymbolId, Vec<SortConstraint>>,
+    /// Every compiled membership axiom exactly once, in declaration/id order. The direct and collapsing
+    /// indexes below contain ids into this arena, avoiding matcher/condition copies for broadly offered
+    /// collapse constraints. Empty in modules without memberships, preserving the hot-path gate.
+    memberships: Vec<SortConstraint>,
+    /// Noncollapsing memberships, indexed only by their syntactic lhs top symbol.
+    membership_index: HashMap<SymbolId, Vec<u32>>,
+    /// ACU/two-sided-AU/CUI memberships that can collapse at the top, offered to every subject in the
+    /// target sort's kind. The compiled matcher rejects impossible conservative candidates.
+    collapsing_memberships: HashMap<KindId, Vec<u32>>,
     /// Rules (`rl`/`crl`), indexed by lhs top symbol. Applied **only** by `rewrite`/`frewrite`/`search`
     /// (Pillar A) — never by [`reduce`](Engine::reduce), so equational normal forms never apply a rule.
     /// Adding a rule does not bump `eq_epoch` (rules don't change any equational normal form).
@@ -986,7 +1007,9 @@ impl Default for Signature {
             symbols: Arena::default(),
             identities: Arena::default(),
             equations: HashMap::default(),
-            memberships: HashMap::default(),
+            memberships: Vec::default(),
+            membership_index: HashMap::default(),
+            collapsing_memberships: HashMap::default(),
             rules: HashMap::default(),
             smt_rules: HashMap::default(),
             smt_rules_valid: true,
@@ -1860,8 +1883,8 @@ impl Signature {
             decls
                 .iter()
                 .all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
-            "cross-kind ad-hoc overloading of `{}` is not yet supported (a B2 follow-up): the args, \
-             not the range, would select the declaration group",
+            "operator declaration group invariant violated for `{}`: range kinds differ; cross-kind \
+             range overloads must use distinct symbols",
             self.symbols.get(symbol).name()
         );
         // Walk declarations in order, intersecting applicable range down-sets. `running` is the
@@ -2469,27 +2492,41 @@ impl Signature {
         let top = lhs
             .top_symbol()
             .expect("membership lhs must be an application");
+        // Maude offers a top-collapsing sort constraint broadly, then lets each symbol/matcher reject
+        // impossible candidates. A kind-wide index is the same semantic envelope without cloning the
+        // compiled constraint or duplicating recursive collapse-symbol analysis.
+        let collapse_kind = {
+            let symbol = self.symbols.get(top);
+            match symbol.theory() {
+                Theory::Acu | Theory::Au if symbol.identity().is_some() => {
+                    Some(self.sorts.kind_of(sort))
+                }
+                Theory::Cui if symbol.identity().is_some() || symbol.axioms.idem => {
+                    Some(self.sorts.kind_of(sort))
+                }
+                _ => None,
+            }
+        };
         let id = self.next_mb_id;
         self.next_mb_id += 1;
+        debug_assert_eq!(id as usize, self.memberships.len());
         let condition_variables = condition_variable_indices(&condition);
-        let compiled = SortConstraint {
+        self.memberships.push(SortConstraint {
             id,
             lhs: LhsAutomaton::compile_avoiding_nonlinear_vars(lhs, self, &condition_variables),
             sort,
             nr_vars,
             condition: self.compile_condition(condition, CondOwner::EqOrMb),
-        };
-        let sorts = &self.sorts;
-        let v = self.memberships.entry(top).or_default();
-        v.push(compiled);
-        // Maude orders sort constraints by descending per-component sort index. That is
-        // smallest-target-first for comparable sorts and supplies its observable deterministic
-        // tiebreak for incomparable targets; equal targets retain declaration order (`sort_by` is stable).
-        v.sort_by(|x, y| {
-            sorts
-                .component_index(y.sort)
-                .cmp(&sorts.component_index(x.sort))
         });
+
+        let constraints = &self.memberships;
+        let sorts = &self.sorts;
+        let ids = match collapse_kind {
+            Some(kind) => self.collapsing_memberships.entry(kind).or_default(),
+            None => self.membership_index.entry(top).or_default(),
+        };
+        ids.push(id);
+        ids.sort_by(|&left, &right| membership_order(constraints, sorts, left, right));
         id
     }
 
@@ -2563,8 +2600,9 @@ impl Runtime {
     /// `constrainToSmallerSort`): whole-match the node against each membership (see
     /// [`constrain_node_whole`](Self::constrain_node_whole)).
     /// **Each application counts as one rewrite** (Maude counts membership applications in
-    /// its `rewrites` total). Non-confluent membership sets (incomparable applicable targets) and
-    /// matching modulo `iter` are follow-ups.
+    /// its `rewrites` total). Non-confluent membership sets (incomparable applicable targets) remain a
+    /// follow-up. Theory matching includes `iter`; identity/idem-collapse memberships still need
+    /// collapse-target indexing so they are offered to subjects rooted outside the lhs operator.
     ///
     /// **Lazy timing (C1):** this is called only at a node's reduce **normal-form point** (after its
     /// equations are exhausted), never at construction — mirroring Maude's `fastComputeTrueSort`. So a
@@ -2604,14 +2642,52 @@ impl Runtime {
         whole: Option<DagId>,
         frames: &[ReduceFrame],
     ) {
-        let symbol = self.node(id).symbol();
-        let Some(constraints) = sig.memberships.get(&symbol) else {
+        let node = self.node(id);
+        let symbol = node.symbol();
+        let kind = sig.sorts.kind_of(node.sort);
+        let direct = sig
+            .membership_index
+            .get(&symbol)
+            .map_or(&[][..], Vec::as_slice);
+        let collapsing = sig
+            .collapsing_memberships
+            .get(&kind)
+            .map_or(&[][..], Vec::as_slice);
+        if direct.is_empty() && collapsing.is_empty() {
             return;
-        };
+        }
+
         loop {
             let current = self.node(id).sort;
             let mut lowered = false;
-            for sc in constraints {
+            let (mut direct_cursor, mut collapse_cursor) = (0, 0);
+            while direct_cursor < direct.len() || collapse_cursor < collapsing.len() {
+                let constraint_id = match (
+                    direct.get(direct_cursor).copied(),
+                    collapsing.get(collapse_cursor).copied(),
+                ) {
+                    (Some(left), Some(right))
+                        if membership_order(&sig.memberships, &sig.sorts, left, right)
+                            != Ordering::Greater =>
+                    {
+                        direct_cursor += 1;
+                        left
+                    }
+                    (Some(_), Some(right)) => {
+                        collapse_cursor += 1;
+                        right
+                    }
+                    (Some(left), None) => {
+                        direct_cursor += 1;
+                        left
+                    }
+                    (None, Some(right)) => {
+                        collapse_cursor += 1;
+                        right
+                    }
+                    (None, None) => unreachable!("candidate cursors are exhausted"),
+                };
+                let sc = &sig.memberships[constraint_id as usize];
                 // Only a membership whose target is *strictly below* the current sort can refine it.
                 if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
                     continue;
@@ -2634,7 +2710,7 @@ impl Runtime {
                     self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
                     self.membership_count += 1;
                     lowered = true;
-                    break; // restart the scan with the new, smaller sort
+                    break; // restart the merged order with the new, smaller sort
                 }
             }
             if !lowered {
@@ -2647,7 +2723,8 @@ impl Runtime {
     /// condition holds under that match. Reads through the A3 matcher seam, so a free lhs uses the
     /// recursive matcher and a theory lhs its own automaton. A condition that fails for one match
     /// solution backtracks into the next (B2.3c); the condition's own reductions count toward the
-    /// rewrite total whether or not it ends up holding. (AC/`iter` membership matching is a follow-up.)
+    /// rewrite total whether or not it ends up holding. Identity/idem-collapse memberships still need
+    /// extra-symbol indexing; once offered, their theory matchers already handle the collapse.
     /// On success returns the membership match's substitution snapshot (for the trace), or an empty
     /// `Vec` when not tracing (no allocation); `None` on no-match. A conditional membership (`cmb`) emits
     /// a *trial* per matcher solution, backtracking on condition failure.

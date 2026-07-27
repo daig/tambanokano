@@ -1590,6 +1590,33 @@ fn trace_fixtures_run_through_repl() {
     );
 }
 
+/// TNK-011 end to end: the retained collapse-membership fixture reaches the downstream value and its
+/// traced collapsed application preserves the original statement id/body, identity binding, and Whole line.
+#[test]
+fn collapsing_membership_fixture_through_repl() {
+    let out = repl()
+        .eval(conformance_file!("audit/B3c-membership-collapse.maude"))
+        .output;
+    assert!(
+        out.contains(
+            "reduce in B3C-DOWNSTREAM-VALUE : wrap(a) .\n\
+             rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             result E: b"
+        ),
+        "downstream sorted equation:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "*********** membership axiom\n\
+             mb a * X : Special .\n\
+             X --> z\n\
+             Whole: a\n\
+             E: a becomes Special"
+        ),
+        "collapsed membership trace:\n{out}"
+    );
+}
+
 /// Pillar A-i: `rl` + `rewrite`/`continue` through the REPL, byte-matching the reference binary
 /// (`conformance/rewrite.maude`). Reduce-then-rule-fair, the bound, the top-down `f(a)` traversal (7
 /// steps), and the resumable `continue` (which resets the count).

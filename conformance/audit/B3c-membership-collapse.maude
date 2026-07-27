@@ -1,0 +1,169 @@
+*** B3c-membership-collapse — TNK-011: executable memberships whose lhs collapses under a
+*** supported identity/idempotence theory are offered at every compatible subject root. This fixture
+*** pins values, least sorts, counts, recursive cross-theory survivors, condition handling, direct/collapse
+*** ordering, identity re-entry, a noncollapse control, downstream sorted matching, and trace identity.
+
+fmod B3C-ACU is
+  sorts E Special .
+  subsort Special < E .
+  ops empty a : -> E [ctor] .
+  op _,_ : E E -> E [assoc comm id: empty] .
+  var S : E .
+  mb a, S : Special .
+endfm
+red in B3C-ACU : a .
+
+fmod B3C-AU is
+  sorts E Special .
+  subsort Special < E .
+  ops nil a : -> E [ctor] .
+  op __ : E E -> E [assoc id: nil] .
+  var L : E .
+  mb a L : Special .
+endfm
+red in B3C-AU : a .
+
+fmod B3C-CUI-ID is
+  sorts E Special .
+  subsort Special < E .
+  ops z a b : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  var X : E .
+  mb a * X : Special .
+endfm
+red in B3C-CUI-ID : a .
+red in B3C-CUI-ID : a * b .
+
+fmod B3C-CUI-IDEM is
+  sorts E Special .
+  subsort Special < E .
+  op a : -> E [ctor] .
+  op g : E E -> E [comm idem] .
+  var X : E .
+  mb g(X, X) : Special .
+endfm
+red in B3C-CUI-IDEM : a .
+
+fmod B3C-CUI-ITER-MB is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op s_ : E -> E [ctor iter] .
+  op _*_ : E E -> E [comm id: z] .
+  vars X Y : E .
+  mb (s X) * Y : Special .
+endfm
+red in B3C-CUI-ITER-MB : s a .
+
+fmod B3C-CUI-ITER-CMB is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op s_ : E -> E [ctor iter] .
+  op _*_ : E E -> E [comm id: z] .
+  vars X Y : E .
+  cmb (s X) * Y : Special if X = a .
+endfm
+red in B3C-CUI-ITER-CMB : s a .
+
+fmod B3C-NESTED-AU is
+  sorts E Special .
+  subsort Special < E .
+  ops z nil a : -> E [ctor] .
+  op _;_ : E E -> E [assoc id: nil] .
+  op _*_ : E E -> E [comm id: z] .
+  vars L Y : E .
+  mb (a ; L) * Y : Special .
+endfm
+red in B3C-NESTED-AU : a .
+
+fmod B3C-NESTED-CUI is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  vars X Y : E .
+  mb (a * X) * Y : Special .
+endfm
+red in B3C-NESTED-CUI : a .
+
+fmod B3C-ALL-VARIABLES is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  vars X Y : E .
+  mb X * Y : Special .
+endfm
+red in B3C-ALL-VARIABLES : a .
+red in B3C-ALL-VARIABLES : z .
+
+fmod B3C-NONCOLLAPSE is
+  sorts E Special .
+  subsort Special < E .
+  ops z a b : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  mb a * b : Special .
+endfm
+red in B3C-NONCOLLAPSE : a .
+red in B3C-NONCOLLAPSE : a * b .
+
+fmod B3C-MERGED-ORDER is
+  sorts E Mid Low .
+  subsorts Low < Mid < E .
+  ops z a : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  var X : E .
+  mb a : Mid .
+  mb a * X : Low .
+endfm
+red in B3C-MERGED-ORDER : a .
+
+fmod B3C-DOWNSTREAM-VALUE is
+  sorts E Special .
+  subsort Special < E .
+  ops z a b : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  op wrap : E -> E .
+  op wrap : Special -> Special .
+  var X : E .
+  var S : Special .
+  mb a * X : Special .
+  eq wrap(S) = b .
+endfm
+red in B3C-DOWNSTREAM-VALUE : wrap(a) .
+
+fmod B3C-ITER-CONTAINS-CUI is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  op s_ : E -> E [ctor iter] .
+  var X : E .
+  mb s (a * X) : Special .
+endfm
+red in B3C-ITER-CONTAINS-CUI : s a .
+
+fmod B3C-CUI-CONTAINS-ITER-AC is
+  sorts E Special .
+  subsort Special < E .
+  ops z a b : -> E [ctor] .
+  op _+_ : E E -> E [assoc comm id: z] .
+  op _*_ : E E -> E [comm id: z] .
+  op s_ : E -> E [ctor iter] .
+  vars X Y : E .
+  cmb (s (X + X)) * Y : Special if Y = b .
+endfm
+red in B3C-CUI-CONTAINS-ITER-AC : (s (a + a)) * b .
+
+fmod B3C-TRACE is
+  sorts E Special .
+  subsort Special < E .
+  ops z a : -> E [ctor] .
+  op _*_ : E E -> E [comm id: z] .
+  var X : E .
+  mb a * X : Special .
+endfm
+set trace on .
+set trace whole on .
+red in B3C-TRACE : a .

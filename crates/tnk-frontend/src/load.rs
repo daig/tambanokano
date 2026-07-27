@@ -3797,6 +3797,41 @@ mod tests {
         );
     }
 
+    /// TNK-011: top-collapsing ACU/two-sided-AU/CUI memberships are offered outside their syntactic
+    /// root. Covers recursive survivors, conditional matching, direct+collapse ordering, identity
+    /// re-entry, a false-positive control, and the downstream sorted-equation value impact.
+    #[test]
+    fn tnk_011_collapsing_memberships_conform() {
+        let source = conformance_file!("audit/B3c-membership-collapse.maude")
+            .lines()
+            .filter(|line| !line.starts_with("set trace"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        conform(
+            &source,
+            &[
+                e("Special", "a", 1),             // ACU identity collapse
+                e("Special", "a", 1),             // AU two-sided identity collapse
+                e("Special", "a", 1),             // CUI identity collapse
+                e("Special", "a * b", 2),         // child collapse + rooted membership
+                e("Special", "a", 1),             // CUI idempotent collapse
+                e("Special", "s a", 1),           // collapse to iter survivor
+                e("Special", "s a", 1),           // conditional collapse to iter
+                e("Special", "a", 1),             // recursive CUI-over-AU survivor
+                e("Special", "a", 1),             // recursive CUI-over-CUI survivor
+                e("Special", "a", 1),             // all-variable ordinary subject
+                e("Special", "z", 1),             // all-variable identity subject
+                e("E", "a", 0),                   // conservative noncollapse control
+                e("Special", "a * b", 1),         // rooted ground membership still applies
+                e("Low", "a", 1),                 // direct+collapse streams: smallest first
+                e("E", "b", 2),                   // true sort enables sorted equation
+                e("Special", "s a", 1),           // iter contains CUI collapse
+                e("Special", "b * s (a + a)", 1), // CUI contains iter + nonlinear AC
+                e("Special", "a", 1),             // trace module's reduction
+            ],
+        );
+    }
+
     /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
