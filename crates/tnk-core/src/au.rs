@@ -29,6 +29,7 @@ use crate::theory::{LhsAutomaton, RewriteMatchContext};
 pub(crate) struct AuLhs {
     symbol: SymbolId,
     elements: Vec<AuElem>,
+    /// The common identity term for a two-sided or one-sided identity declaration.
     identity: Option<IdentityId>,
     /// `true` when the pattern has an alien or a non-linear (repeated) variable — matched by the
     /// binding-aware path in [`AuSubproblem::next`] rather than the pure positional enumeration.
@@ -39,8 +40,13 @@ pub(crate) struct AuLhs {
 enum AuElem {
     /// A ground, free-matchable sub-pattern: matches exactly one structurally-equal subject element.
     Ground(Term),
-    /// A variable: matches a contiguous run (≥1, or ≥0 with identity). A repeated index is non-linear.
-    Var { index: u32, sort: SortId },
+    /// A variable matches a contiguous run. The run may be empty only where the symbol's left/right
+    /// identity can legally disappear at this flattened pattern position.
+    Var {
+        index: u32,
+        sort: SortId,
+        take_identity: bool,
+    },
     /// An alien (non-ground, or theory-rooted) sub-pattern: matches exactly one subject element
     /// recursively via its own automaton (Maude's `NonGroundAlien`).
     Alien(Term),
@@ -52,23 +58,32 @@ impl AuLhs {
     /// matched recursively). A repeated variable or any alien sets the `complex` flag.
     pub(crate) fn compile(lhs: Term, sig: &Signature) -> Self {
         let symbol = lhs.top_symbol().expect("AU lhs must be an application");
-        let identity = sig.symbol(symbol).identity();
+        let sym = sig.symbol(symbol);
+        let left_identity = sym.left_identity();
+        let right_identity = sym.right_identity();
+        let identity = sym.identity().or(left_identity).or(right_identity);
         let mut flat: Vec<Term> = Vec::new();
         flatten(lhs, symbol, &mut flat);
+        let nr_elements = flat.len();
 
         let mut elements: Vec<AuElem> = Vec::new();
         let mut seen_vars: Vec<u32> = Vec::new();
         let mut complex = false;
-        for t in flat {
+        for (position, t) in flat.into_iter().enumerate() {
             match t {
                 Term::Var(v) => {
                     if seen_vars.contains(&v.index) {
                         complex = true; // a repeated (non-linear) variable
                     }
                     seen_vars.push(v.index);
+                    // Maude's AU_Term::idPossible: a left identity may fill any position except the
+                    // final one; a right identity may fill any position except the first one.
+                    let take_identity = (left_identity.is_some() && position + 1 < nr_elements)
+                        || (right_identity.is_some() && position > 0);
                     elements.push(AuElem::Var {
                         index: v.index,
                         sort: v.sort,
+                        take_identity,
                     });
                 }
                 // A built-in literal is a ground, free-matchable leaf — same fast path as a ground Op.
@@ -165,8 +180,7 @@ impl AuLhs {
             // (the matched portion must span >= 2 subject subterms). Fixes the `X Y <=? a b c`
             // over-enumeration (20 → 10; fable-audit.md §3.3 / ac-matcher-plan Phase 5). No maximal-first
             // re-sort — partition order *is* the reference order.
-            let var_min: i64 = if self.identity.is_some() { 0 } else { 1 };
-            seq_partition_candidates(rt, sig, &seq, &self.elements, var_min, 2)
+            seq_partition_candidates(rt, sig, &seq, &self.elements, 2)
         } else {
             let n = seq.len();
             let mut throwaway = Subst::new();
@@ -209,7 +223,7 @@ impl AuLhs {
             .elements
             .iter()
             .map(|e| match e {
-                AuElem::Var { index, sort } => Some((*index, *sort)),
+                AuElem::Var { index, sort, .. } => Some((*index, *sort)),
                 AuElem::Ground(_) => None,
                 AuElem::Alien(_) => {
                     unreachable!("the pure path has no aliens (would set `complex`)")
@@ -283,8 +297,8 @@ impl AuLhs {
                     lengths.pop();
                 }
             }
-            AuElem::Var { .. } => {
-                let min_len = usize::from(self.identity.is_none()); // ≥1 without identity, else ≥0
+            AuElem::Var { take_identity, .. } => {
+                let min_len = usize::from(!take_identity);
                 for len in min_len..=(n - pos) {
                     lengths.push(len);
                     self.walk(
@@ -506,17 +520,16 @@ impl SeqPartition {
 
 /// Generate the AU FULL-matcher candidates for an extension `xmatch` in Maude's `SequencePartition`
 /// order, filtered by the `bigEnough` floor. The parts are `[leftExt] ++ elements ++ [rightExt]`, both
-/// extensions unbounded `[0, ∞)`; each variable element is `[var_min, ∞)` and each ground `[1, 1]`. A
-/// partition survives when its matched portion (the span of all `elements`) is at least `floor` subterms
-/// and each ground element structurally matches at its position; variable *sort* checks stay in
-/// [`AuSubproblem::next`] (a rejected candidate is simply skipped, preserving order). `elements` must be
-/// the pure path (grounds + variables — no aliens).
+/// extensions unbounded `[0, ∞)`; each variable element is `[0, ∞)` only when its pattern position may
+/// take the identity, otherwise `[1, ∞)`, and each ground is `[1, 1]`. A partition survives when its
+/// matched portion (the span of all `elements`) is at least `floor` subterms and each ground element
+/// structurally matches at its position; variable *sort* checks stay in [`AuSubproblem::next`] (a
+/// rejected candidate is simply skipped, preserving order). `elements` must be the pure path.
 fn seq_partition_candidates(
     rt: &Runtime,
     sig: &Signature,
     seq: &[DagId],
     elements: &[AuElem],
-    var_min: i64,
     floor: i64,
 ) -> Vec<Candidate> {
     let n = seq.len() as i64;
@@ -526,7 +539,10 @@ fn seq_partition_candidates(
     for e in elements {
         match e {
             AuElem::Ground(_) => sp.insert_part(1, 1),
-            _ => sp.insert_part(var_min, UNBOUNDED),
+            AuElem::Var { take_identity, .. } => {
+                sp.insert_part(i64::from(!take_identity), UNBOUNDED);
+            }
+            AuElem::Alien(_) => unreachable!("the partition path has no aliens"),
         }
     }
     sp.insert_part(0, UNBOUNDED); // right extension
@@ -604,10 +620,9 @@ struct AuRecorded {
 impl AuSubproblem {
     /// A **bare variable** matched with extension against an AU node (Maude's
     /// `AU_DagNode::matchVariableWithExtension`): the single top variable spans a contiguous portion of
-    /// the subject, leaving an ordered prefix/suffix residue. The variable's lower bound is 2 (a
-    /// two-sided / no identity op is never `oneSidedId`, so tnk — which models only two-sided identities
-    /// — always uses 2), and the matched portion must be `bigEnough` (>= 2 subterms). Enumerated in
-    /// `SequencePartition` order (`xmatch X <=? a b c` → `a b`, `(whole)`, `b c`; fable-audit.md §3.3).
+    /// the subject, leaving an ordered prefix/suffix residue. The matched portion must be `bigEnough`
+    /// (>= 2 subterms). Enumerated in `SequencePartition` order (`xmatch X <=? a b c` → `a b`,
+    /// `(whole)`, `b c`; fable-audit.md §3.3).
     pub(crate) fn match_variable_with_extension(
         rt: &Runtime,
         sig: &Signature,
@@ -620,8 +635,9 @@ impl AuSubproblem {
         let elements = [AuElem::Var {
             index: var_index,
             sort: var_sort,
+            take_identity: false,
         }];
-        let candidates = seq_partition_candidates(rt, sig, &subject_args, &elements, 2, 2);
+        let candidates = seq_partition_candidates(rt, sig, &subject_args, &elements, 2);
         AuSubproblem {
             symbol,
             identity,
@@ -834,12 +850,17 @@ impl AuSubproblem {
                     *scratch = checkpoint;
                 }
             }
-            AuElem::Var { index, sort } => {
+            AuElem::Var {
+                index,
+                sort,
+                take_identity,
+            } => {
                 let (index, sort) = (*index, *sort);
                 if let Some(b) = scratch.get(index) {
                     // Repeated (non-linear) variable: the run is forced to equal the existing binding.
                     let blen = au_run_len(rt, sig, b, self.symbol, self.identity);
-                    if pos + blen <= n
+                    if (blen != 0 || *take_identity)
+                        && pos + blen <= n
                         && let Some(run) = build_run(
                             rt,
                             sig,
@@ -852,7 +873,7 @@ impl AuSubproblem {
                         self.rec_complex(elem_idx + 1, pos + blen, start, rt, sig, scratch, out);
                     }
                 } else {
-                    let min_len = usize::from(self.identity.is_none()); // ≥1 without identity, else ≥0
+                    let min_len = usize::from(!take_identity);
                     for len in min_len..=(n - pos) {
                         let Some(binding) = build_run(
                             rt,

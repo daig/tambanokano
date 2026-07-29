@@ -20,6 +20,81 @@ use tnk_core::symbol::{
 
 type R<T> = Result<T, String>;
 
+#[derive(Clone, Copy)]
+struct EffectiveAxioms {
+    assoc: bool,
+    comm: bool,
+    idem: bool,
+    iter: bool,
+    identity: bool,
+    id_side: IdSide,
+}
+
+impl EffectiveAxioms {
+    /// Mirror Maude's `MixfixModule::validateAttributes`: structural attributes are checked against
+    /// the source declaration's arity and connected components before a theory-specific symbol is
+    /// selected. `None` denotes a polymorphic position.
+    fn for_profile(attrs: &Attrs, domain: &[Option<KindId>], range: Option<KindId>) -> Self {
+        fn same_component_or_all_polymorphic(kinds: &[Option<KindId>]) -> bool {
+            if kinds.iter().all(Option::is_none) {
+                return true;
+            }
+            let Some(first) = kinds.first().copied().flatten() else {
+                return false;
+            };
+            kinds.iter().all(|kind| *kind == Some(first))
+        }
+
+        fn same_component_or_both_polymorphic(left: Option<KindId>, right: Option<KindId>) -> bool {
+            matches!((left, right), (None, None))
+                || matches!((left, right), (Some(a), Some(b)) if a == b)
+        }
+
+        let arity = domain.len();
+        let mut effective = EffectiveAxioms {
+            assoc: attrs.assoc,
+            comm: attrs.comm,
+            idem: attrs.idem,
+            iter: attrs.iter,
+            identity: attrs.id.is_some(),
+            id_side: attrs.id_side,
+        };
+
+        effective.iter =
+            effective.iter && arity == 1 && same_component_or_all_polymorphic(&[domain[0], range]);
+        effective.assoc = effective.assoc
+            && arity == 2
+            && same_component_or_all_polymorphic(&[domain[0], domain[1], range]);
+        effective.comm = effective.comm
+            && arity == 2
+            && same_component_or_all_polymorphic(&[domain[0], domain[1]]);
+        effective.idem = effective.idem
+            && arity == 2
+            && same_component_or_all_polymorphic(&[domain[0], domain[1], range]);
+
+        if effective.identity {
+            if arity != 2 {
+                effective.identity = false;
+            } else {
+                // Commutativity makes either one-sided declaration an implicit identity on both sides.
+                let check_left = matches!(attrs.id_side, IdSide::Both | IdSide::Left)
+                    || (attrs.id_side == IdSide::Right && effective.comm);
+                let check_right = matches!(attrs.id_side, IdSide::Both | IdSide::Right)
+                    || (attrs.id_side == IdSide::Left && effective.comm);
+                let left_ok =
+                    domain[0].is_some() && same_component_or_both_polymorphic(domain[1], range);
+                let right_ok =
+                    domain[1].is_some() && same_component_or_both_polymorphic(domain[0], range);
+                effective.identity = (!check_left || left_ok) && (!check_right || right_ok);
+                if effective.identity && effective.comm {
+                    effective.id_side = IdSide::Both;
+                }
+            }
+        }
+        effective
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct ConstructorAxiomProfile {
     assoc: bool,
@@ -30,16 +105,22 @@ struct ConstructorAxiomProfile {
 }
 
 impl ConstructorAxiomProfile {
-    fn from_attrs(attrs: &Attrs, effective_assoc: bool) -> Self {
+    fn from_attrs(attrs: &Attrs, effective: EffectiveAxioms) -> Self {
         Self {
-            assoc: effective_assoc,
-            comm: attrs.comm,
-            idem: attrs.idem,
-            iter: attrs.iter,
-            identity: attrs.id.as_ref().map(|tokens| {
+            assoc: effective.assoc,
+            comm: effective.comm,
+            idem: effective.idem,
+            iter: effective.iter,
+            identity: effective.identity.then(|| {
                 (
-                    attrs.id_side,
-                    tokens.iter().map(|token| token.sym).collect(),
+                    effective.id_side,
+                    attrs
+                        .id
+                        .as_ref()
+                        .expect("an effective identity has source tokens")
+                        .iter()
+                        .map(|token| token.sym)
+                        .collect(),
                 )
             }),
         }
@@ -200,11 +281,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         let od = &pm.ops[idx];
         let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
-        // Maude validates semantic attributes before choosing a theory-specific symbol. A nonbinary
-        // declaration keeps its raw `[assoc]` spelling for source display, but its compiled attribute
-        // is cleared and the operator falls back to the remaining effective theory (free in TNK-003).
-        // Warning delivery remains part of the deferred diagnostics surface.
-        let effective_assoc = od.attrs.assoc && arity == 2;
+        // Maude validates semantic attributes before choosing a theory-specific symbol. The raw
+        // spelling remains on `od.attrs` for source reflection; only the effective attributes below
+        // drive compiled syntax, identity attachment, and kernel theory selection.
 
         // The (domain, range) profile(s) this declaration expands to.
         let mut profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
@@ -258,6 +337,26 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             }
         }
 
+        // Reconstruct Maude's pre-instantiation kind profile. A `poly` position is still an absent
+        // (`null`) sort when attributes are validated; validating each concrete expansion separately
+        // would incorrectly retain attributes on only some instances.
+        let first_profile = profiles
+            .first()
+            .expect("an operator declaration produces at least one profile");
+        let poly = od.attrs.poly.as_deref().unwrap_or(&[]);
+        let declared_domain_kinds: Vec<Option<KindId>> = first_profile
+            .0
+            .iter()
+            .enumerate()
+            .map(|(position, &sort)| {
+                (!poly.contains(&(position as u32 + 1))).then(|| engine.sorts().kind_of(sort))
+            })
+            .collect();
+        let declared_range_kind =
+            (!poly.contains(&0)).then(|| engine.sorts().kind_of(first_profile.1));
+        let effective =
+            EffectiveAxioms::for_profile(&od.attrs, &declared_domain_kinds, declared_range_kind);
+
         let mut decl_syms: Vec<SymbolId> = Vec::with_capacity(profiles.len());
         for (domain, range) in profiles {
             let dom_kinds: Vec<KindId> =
@@ -271,7 +370,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 } else {
                     od.attrs.ctor
                 };
-                let incoming = ConstructorAxiomProfile::from_attrs(&od.attrs, effective_assoc);
+                let incoming = ConstructorAxiomProfile::from_attrs(&od.attrs, effective);
                 if !inherited
                     && constructor_axiom_profiles
                         .get(&existing)
@@ -283,23 +382,31 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 constructor_flags.insert(existing, ctor);
                 existing
             } else {
-                let sym = declare_op(
-                    &mut engine,
-                    &cname,
-                    &od.attrs,
-                    effective_assoc,
-                    &domain,
-                    range,
-                );
+                let sym = declare_op(&mut engine, &cname, &od.attrs, effective, &domain, range);
                 constructor_axiom_profiles.insert(
                     sym,
-                    ConstructorAxiomProfile::from_attrs(&od.attrs, effective_assoc),
+                    ConstructorAxiomProfile::from_attrs(&od.attrs, effective),
                 );
                 constructor_flags.insert(sym, od.attrs.ctor);
                 sym_by_profile.insert(profile, sym);
                 ops.entry((cname.clone(), arity)).or_insert(sym); // first symbol of this (name, arity)
                 name_to_sym.entry(cname.clone()).or_insert(sym);
-                let mut frags = split_mixfix(&cname, interner);
+                let object_attribute = cname.ends_with(":_")
+                    && engine.sorts().name(range) == "Attribute"
+                    && od.attrs.ctor;
+                // A zero-arity name whose one declaration token contains `:` is a literal constant
+                // (for example, escaped `marker:tag`), not the spaced colon syntax of object attributes.
+                let source_name = strip_outer_parens(&od.name, interner);
+                let literal_colon_constant = arity == 0
+                    && source_name.len() == 1
+                    && source_name
+                        .first()
+                        .is_some_and(|token| interner.resolve(token.sym).contains(':'));
+                let mut frags = if literal_colon_constant {
+                    vec![Frag::Tok(interner.intern(&cname))]
+                } else {
+                    split_mixfix(&cname, interner)
+                };
                 let holes = frags.iter().filter(|f| matches!(f, Frag::Hole)).count();
                 let mut prec = od.attrs.prec;
                 let mut gather = od.attrs.gather.clone();
@@ -314,9 +421,6 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                     gather = None;
                     format = None;
                 }
-                let object_attribute = cname.ends_with(":_")
-                    && engine.sorts().name(range) == "Attribute"
-                    && od.attrs.ctor;
                 syntax.insert(
                     sym,
                     SymbolSyntax {
@@ -327,8 +431,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                         gather,
                         object_attribute,
                         spaced_label_colon: object_attribute && od.name.len() > 1,
-                        assoc: effective_assoc,
-                        iter: od.attrs.iter,
+                        assoc: effective.assoc,
+                        iter: effective.iter,
                         format,
                     },
                 );
@@ -339,10 +443,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 domain: domain.clone(),
                 range,
             });
-            if let Some(tokens) = &od.attrs.id
+            if effective.identity
+                && let Some(tokens) = &od.attrs.id
                 && !identity_specs.iter().any(|spec| spec.symbol == sym)
             {
-                match od.attrs.id_side {
+                match effective.id_side {
                     crate::surface::ast::IdSide::Both => engine.reserve_identity(sym, range),
                     crate::surface::ast::IdSide::Left => {
                         engine.reserve_one_sided_identity(
@@ -362,7 +467,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 identity_specs.push(IdentitySpec {
                     symbol: sym,
                     sort: range,
-                    side: od.attrs.id_side,
+                    side: effective.id_side,
                     tokens: tokens.clone(),
                 });
             }
@@ -630,23 +735,23 @@ fn declare_op(
     engine: &mut Engine,
     name: &str,
     attrs: &Attrs,
-    effective_assoc: bool,
+    effective: EffectiveAxioms,
     domain: &[SortId],
     range: SortId,
 ) -> SymbolId {
-    let symbol = if attrs.iter {
+    let symbol = if effective.iter {
         engine.add_op_iter(name.to_string(), domain.to_vec(), range)
-    } else if effective_assoc && attrs.comm {
+    } else if effective.assoc && effective.comm {
         engine.add_op_ac(name.to_string(), domain.to_vec(), range, None)
-    } else if effective_assoc {
+    } else if effective.assoc {
         engine.add_op_au(name.to_string(), domain.to_vec(), range, None)
-    } else if attrs.comm || attrs.idem || attrs.id.is_some() {
+    } else if effective.comm || effective.idem || effective.identity {
         engine.add_op_cui(
             name.to_string(),
             domain.to_vec(),
             range,
-            attrs.comm,
-            attrs.idem,
+            effective.comm,
+            effective.idem,
             None,
         )
     } else {
@@ -1493,5 +1598,58 @@ endfm
             rejection,
             EligibilityRejection::InconsistentOverloadedConstructorAxioms { .. }
         ));
+    }
+
+    #[test]
+    fn cross_range_kind_overloads_use_distinct_symbols() {
+        let cases = [
+            "\
+fmod SAME-DOMAIN-RANGE-KINDS is
+  sorts A B C .
+  op f : A -> B .
+  op f : A -> C .
+endfm
+",
+            "\
+fmod INCOMPARABLE-DOMAIN-RANGE-KINDS is
+  sorts A A1 A2 B C .
+  subsorts A1 A2 < A .
+  op f : A1 -> B .
+  op f : A2 -> C .
+endfm
+",
+        ];
+
+        for source in cases {
+            let module = build(source);
+            let profiles = module
+                .op_profiles
+                .iter()
+                .filter(|profile| module.engine.symbol(profile.symbol).name() == "f")
+                .collect::<Vec<_>>();
+            let [left, right] = profiles.as_slice() else {
+                panic!("expected exactly two source profiles for f");
+            };
+            assert_ne!(
+                left.symbol, right.symbol,
+                "different range kinds must not share one kernel symbol"
+            );
+            let sorts = module.engine.sorts();
+            assert_ne!(
+                sorts.kind_of(left.range),
+                sorts.kind_of(right.range),
+                "the fixture must exercise distinct range kinds"
+            );
+            for profile in &profiles {
+                let range_kind = sorts.kind_of(profile.range);
+                assert!(
+                    profiles
+                        .iter()
+                        .filter(|other| other.symbol == profile.symbol)
+                        .all(|other| sorts.kind_of(other.range) == range_kind),
+                    "a symbol declaration group must have one range kind"
+                );
+            }
+        }
     }
 }

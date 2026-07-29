@@ -77,7 +77,12 @@ fn canonical_tokens(tokens: &[Token], interner: &Interner) -> String {
 
 /// Recover the canonical source operator name from an op-map source. Op→op maps carry just the name;
 /// op→term maps may carry a prefix or mixfix application whose variable positions denote holes.
-fn map_source_name(v: &ViewDecl, tokens: &[Token], interner: &Interner) -> String {
+fn map_source_name(
+    v: &ViewDecl,
+    tokens: &[Token],
+    interner: &Interner,
+    source: &BuiltModule,
+) -> String {
     if tokens.len() >= 3 && interner.resolve(tokens[1].sym) == "(" {
         return interner.resolve(tokens[0].sym).to_string();
     }
@@ -90,8 +95,8 @@ fn map_source_name(v: &ViewDecl, tokens: &[Token], interner: &Interner) -> Strin
         .iter()
         .map(|token| {
             let text = interner.resolve(token.sym);
-            let (base, qualified) = text.rsplit_once(':').map_or((text, false), |(name, sort)| {
-                (name, !name.is_empty() && !sort.is_empty())
+            let (base, qualified) = text.rsplit_once(':').map_or((text, false), |(name, ty)| {
+                (name, !name.is_empty() && source_type_name(source, ty))
             });
             if variables.contains(base) || qualified {
                 "_"
@@ -102,7 +107,19 @@ fn map_source_name(v: &ViewDecl, tokens: &[Token], interner: &Interner) -> Strin
         .collect()
 }
 
-fn op_map_specs(v: &ViewDecl, interner: &Interner) -> Vec<OpMapSpec> {
+/// Whether a colon suffix denotes a source sort or kind. A colon inside an operator token is not enough
+/// to make that token a variable (`marker:tag` may be a declared constant).
+fn source_type_name(source: &BuiltModule, name: &str) -> bool {
+    if source.sorts.contains_key(name) {
+        return true;
+    }
+    name.strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .and_then(|kind| kind.split(',').next())
+        .is_some_and(|maximal| source.sorts.contains_key(maximal.trim()))
+}
+
+fn op_map_specs(v: &ViewDecl, interner: &Interner, source: &BuiltModule) -> Vec<OpMapSpec> {
     v.op_maps
         .iter()
         .map(|mapping| match mapping {
@@ -120,7 +137,7 @@ fn op_map_specs(v: &ViewDecl, interner: &Interner) -> Vec<OpMapSpec> {
                 to,
                 dom_range,
             } => OpMapSpec {
-                source: map_source_name(v, from, interner),
+                source: map_source_name(v, from, interner, source),
                 dom_range: dom_range.clone(),
                 target: OpMapTarget::Term(to.clone()),
             },
@@ -291,7 +308,7 @@ pub fn validate_view(
         }
     }
 
-    let maps = op_map_specs(v, interner);
+    let maps = op_map_specs(v, interner, &source);
     // Every explicit source must resolve. A signature selector identifies the source symbol's
     // connected-component profile, matching Maude's overload grouping.
     for mapping in &maps {

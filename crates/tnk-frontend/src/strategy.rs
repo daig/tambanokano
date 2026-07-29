@@ -287,10 +287,9 @@ pub fn srewrite_dag(
 /// Render a strategy expression back to source text (the echo). Best-effort.
 pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
     /// Maude's echo precedence (tightest first): atoms/calls/keyword forms (0), postfix
-    /// iteration `* + !` (1), `;` (2), `|` (3), `? :` (4). A child prints parenthesized only
-    /// when its precedence exceeds what the position admits; an iteration over an atomic child
-    /// prints spaced (`r1 *`), over a compound child glued to the parens (`(r1 | r2)!`) —
-    /// oracle-probed spellings.
+    /// iteration `* + !` (1), `;` (2), `|` (3), `? :` (4). A child prints parenthesized when
+    /// its precedence exceeds what the position admits. A right child at the same precedence is
+    /// also grouped for the left-associative `;` and `|` parsers, preserving the original AST.
     fn prec(e: &StratExpr) -> u8 {
         match e {
             StratExpr::Star(_) | StratExpr::Plus(_) | StratExpr::Normalize(_) => 1,
@@ -300,12 +299,17 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             _ => 0,
         }
     }
-    fn child(e: &StratExpr, i: &Interner, max: u8) -> String {
+    fn child(e: &StratExpr, i: &Interner, max: u8, group_equal: bool) -> String {
         let s = print_strategy(e, i);
-        if prec(e) > max { format!("({s})") } else { s }
+        let p = prec(e);
+        if p > max || (group_equal && p == max) {
+            format!("({s})")
+        } else {
+            s
+        }
     }
     fn iteration(a: &StratExpr, i: &Interner, op: &str) -> String {
-        if prec(a) == 0 {
+        if prec(a) <= 1 {
             format!("{} {op}", print_strategy(a, i))
         } else {
             format!("({}){op}", print_strategy(a, i))
@@ -360,8 +364,12 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
         }
         StratExpr::Top(a) => format!("top({})", print_strategy(a, i)),
         StratExpr::One(a) => format!("one({})", print_strategy(a, i)),
-        StratExpr::Seq(a, b) => format!("{} ; {}", child(a, i, 2), child(b, i, 2)),
-        StratExpr::Union(a, b) => format!("{} | {}", child(a, i, 3), child(b, i, 3)),
+        StratExpr::Seq(a, b) => {
+            format!("{} ; {}", child(a, i, 2, false), child(b, i, 2, true))
+        }
+        StratExpr::Union(a, b) => {
+            format!("{} | {}", child(a, i, 3, false), child(b, i, 3, true))
+        }
         StratExpr::Star(a) => iteration(a, i, "*"),
         StratExpr::Plus(a) => iteration(a, i, "+"),
         StratExpr::Normalize(a) => iteration(a, i, "!"),
@@ -372,9 +380,9 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
         } => {
             format!(
                 "{} ? {} : {}",
-                child(test, i, 3),
-                child(success, i, 3),
-                child(failure, i, 3)
+                child(test, i, 3, false),
+                child(success, i, 4, false),
+                child(failure, i, 4, false)
             )
         }
         StratExpr::Test {

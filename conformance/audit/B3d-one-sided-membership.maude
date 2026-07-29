@@ -1,0 +1,100 @@
+*** B3d-one-sided-membership — TNK-020: collapsing memberships over associative operators with a
+*** one-sided identity. A left identity can fill every pattern position except the final one; a right
+*** identity can fill every position except the first. The opposite edge must not collapse.
+
+fmod B3D-LEFT is
+  sorts E Special .
+  subsort Special < E .
+  ops e a b : -> E [ctor] .
+  op __ : E E -> E [assoc left id: e] .
+  var X : E .
+  mb X a : Special .
+endfm
+red in B3D-LEFT : a .
+red in B3D-LEFT : b a .
+red in B3D-LEFT : a b .
+red in B3D-LEFT : e .
+
+fmod B3D-RIGHT is
+  sorts E Special .
+  subsort Special < E .
+  ops e a b : -> E [ctor] .
+  op __ : E E -> E [assoc right id: e] .
+  var X : E .
+  mb a X : Special .
+endfm
+red in B3D-RIGHT : a .
+red in B3D-RIGHT : a b .
+red in B3D-RIGHT : b a .
+red in B3D-RIGHT : e .
+
+*** Non-ground aliens still receive the legal empty binding at the one-sided edge.
+fmod B3D-LEFT-ALIEN is
+  sorts E Special .
+  subsort Special < E .
+  ops e a : -> E [ctor] .
+  op s_ : E -> E [ctor] .
+  op __ : E E -> E [assoc left id: e] .
+  vars X Y : E .
+  mb X (s Y) : Special .
+endfm
+red in B3D-LEFT-ALIEN : s a .
+
+fmod B3D-RIGHT-ALIEN is
+  sorts E Special .
+  subsort Special < E .
+  ops e a : -> E [ctor] .
+  op s_ : E -> E [ctor] .
+  op __ : E E -> E [assoc right id: e] .
+  vars X Y : E .
+  mb (s Y) X : Special .
+endfm
+red in B3D-RIGHT-ALIEN : s a .
+
+*** A surrounding iter automaton must preserve the nested one-sided collapse.
+fmod B3D-LEFT-ITER is
+  sorts E Special .
+  subsort Special < E .
+  ops e a : -> E [ctor] .
+  op __ : E E -> E [assoc left id: e] .
+  op s_ : E -> E [ctor iter] .
+  var X : E .
+  mb s (X a) : Special .
+endfm
+red in B3D-LEFT-ITER : s a .
+
+fmod B3D-RIGHT-ITER is
+  sorts E Special .
+  subsort Special < E .
+  ops e a : -> E [ctor] .
+  op __ : E E -> E [assoc right id: e] .
+  op s_ : E -> E [ctor iter] .
+  var X : E .
+  mb s (a X) : Special .
+endfm
+red in B3D-RIGHT-ITER : s a .
+
+*** The first partition binds X to e and fails; a later partition binds X to b and succeeds.
+fmod B3D-CONDITION is
+  sorts E Special .
+  subsort Special < E .
+  ops e a b c : -> E [ctor] .
+  op __ : E E -> E [assoc left id: e] .
+  vars X Y : E .
+  cmb X Y a : Special if X = b .
+endfm
+red in B3D-CONDITION : b c a .
+red in B3D-CONDITION : c b a .
+
+*** Trace identity: the source membership and the edge variable's e binding remain observable.
+fmod B3D-TRACE is
+  sorts E Special .
+  subsort Special < E .
+  ops e a : -> E [ctor] .
+  op __ : E E -> E [assoc left id: e] .
+  var X : E .
+  mb X a : Special .
+endfm
+set trace on .
+set trace whole on .
+red in B3D-TRACE : a .

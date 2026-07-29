@@ -1,0 +1,35 @@
+*** A1e-cross-kind-overload-grouping — COV-002: same-name declarations with different range kinds
+*** stay in distinct kernel symbols. Required result context selects each declaration and its equation.
+
+set show timing off .
+fmod COV002-SAME-DOMAIN is
+  sorts A B C Out .
+  op a : -> A [ctor] .
+  op b : -> B [ctor] .
+  op c : -> C [ctor] .
+  op f : A -> B .
+  op f : A -> C .
+  op gb : B -> Out [ctor] .
+  op gc : C -> Out [ctor] .
+  eq (f(a)).B = b .
+  eq (f(a)).C = c .
+endfm
+red in COV002-SAME-DOMAIN : gb(f(a)) .
+red in COV002-SAME-DOMAIN : gc(f(a)) .
+
+fmod COV002-INCOMPARABLE-DOMAINS is
+  sorts A A1 A2 B C Out .
+  subsorts A1 A2 < A .
+  op a1 : -> A1 [ctor] .
+  op a2 : -> A2 [ctor] .
+  op b : -> B [ctor] .
+  op c : -> C [ctor] .
+  op f : A1 -> B .
+  op f : A2 -> C .
+  op gb : B -> Out [ctor] .
+  op gc : C -> Out [ctor] .
+  eq (f(a1)).B = b .
+  eq (f(a2)).C = c .
+endfm
+red in COV002-INCOMPARABLE-DOMAINS : gb(f(a1)) .
+red in COV002-INCOMPARABLE-DOMAINS : gc(f(a2)) .

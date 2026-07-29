@@ -1,0 +1,68 @@
+*** A1d-semantic-attribute-recovery — TNK-019: Maude validates semantic operator attributes before
+*** selecting a kernel theory. Invalid attributes are cleared atomically; declarations and the session
+*** survive. Diagnostics are normalized, so values, sorts, structure, and counts pin recovery semantics.
+
+fmod A1D-ARITY is
+  sort S .
+  op a : -> S [ctor] .
+  op fc : S S S -> S [comm] .
+  op fi : S S S -> S [idem] .
+  op fd : S S S -> S [id: a] .
+  op ft : S S -> S [iter] .
+endfm
+red in A1D-ARITY : fc(a, a, a) .
+red in A1D-ARITY : fi(a, a, a) .
+red in A1D-ARITY : fd(a, a, a) .
+red in A1D-ARITY : ft(a, a) .
+red in A1D-ARITY : a .
+
+*** Kind failures are independent of arity. Each invalid axiom falls back to a free operator.
+fmod A1D-KINDS is
+  sorts A B .
+  ops a : -> A [ctor] .
+  ops b : -> B [ctor] .
+  op iterBad : A -> B [iter] .
+  op commBad : A B -> A [comm] .
+  op assocBad : A A -> B [assoc] .
+  op idemBad : A A -> B [idem] .
+  op idBad : A B -> A [id: a] .
+endfm
+red in A1D-KINDS : iterBad(a) .
+red in A1D-KINDS : commBad(a, b) .
+red in A1D-KINDS : assocBad(a, a) .
+red in A1D-KINDS : idemBad(a, a) .
+red in A1D-KINDS : idBad(a, b) .
+red in A1D-KINDS : a .
+
+*** Clearing one invalid flag must retain another valid flag from the same declaration.
+fmod A1D-ASSOC-COMM-FALLBACK is
+  sorts A B .
+  ops a1 a2 : -> A [ctor] .
+  op b : -> B [ctor] .
+  op f : A A -> B [assoc comm] .
+  eq f(a1, a2) = b .
+endfm
+red in A1D-ASSOC-COMM-FALLBACK : f(a2, a1) .
+
+fmod A1D-IDEM-COMM-FALLBACK is
+  sorts A B .
+  ops a1 a2 : -> A [ctor] .
+  op b : -> B [ctor] .
+  op f : A A -> B [comm idem] .
+  eq f(a1, a2) = b .
+endfm
+red in A1D-IDEM-COMM-FALLBACK : f(a2, a1) .
+
+*** Valid declarations remain theory-dispatched after the recovery pass.
+fmod A1D-VALID is
+  sort S .
+  ops e a b : -> S [ctor] .
+  op c : S S -> S [comm] .
+  op i : S S -> S [idem] .
+  op d : S S -> S [id: e] .
+  op s : S -> S [iter] .
+endfm
+red in A1D-VALID : c(b, a) .
+red in A1D-VALID : i(a, a) .
+red in A1D-VALID : d(e, a) .
+red in A1D-VALID : s(s(a)) .

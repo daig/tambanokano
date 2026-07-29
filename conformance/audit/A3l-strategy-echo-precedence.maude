@@ -1,0 +1,23 @@
+*** A3l-strategy-echo-precedence — TNK-021: command echo retains every precedence-critical strategy
+*** parenthesis. The emitted command must denote the parsed strategy rather than merely execute it once.
+
+smod A3L-STRATEGY-ECHO is
+  sort S .
+  ops a b c d : -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [r3] : b => d .
+  rl [r4] : c => d .
+endsm
+
+srewrite in A3L-STRATEGY-ECHO : a using (r1 | r2) ! .
+srewrite in A3L-STRATEGY-ECHO : a using (r1 | r2) ; (r3 | r4) .
+srewrite in A3L-STRATEGY-ECHO : a using (r1 ? r3 : r4) | r2 .
+srewrite in A3L-STRATEGY-ECHO : a using try((r1 | r2) ; (r3 | r4)) .
+srewrite in A3L-STRATEGY-ECHO : a using not((r1 | r2) ; fail) .
+srewrite in A3L-STRATEGY-ECHO : a using one((r1 | r2) ; (r3 | r4)) .
+srewrite in A3L-STRATEGY-ECHO : a using (r1 | r2) * .
+srewrite in A3L-STRATEGY-ECHO : a using (r1 | r2) + .
+srewrite in A3L-STRATEGY-ECHO : a using (r1 | r2) ? r3 : r4 .
+srewrite in A3L-STRATEGY-ECHO : a using r3 ? r4 : (r1 | r2) .
+srewrite in A3L-STRATEGY-ECHO : a using top(r1) | r2 .

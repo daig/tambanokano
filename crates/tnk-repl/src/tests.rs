@@ -326,6 +326,92 @@ fn strategy_fair_counts_through_repl() {
     );
 }
 
+/// TNK-021 — every command echo is executable source for the same strategy tree. Besides the
+/// precedence boundaries, right-nested `;`/`|` pin grouping that a flat left-associative echo would lose.
+/// Re-executing each emitted strategy must retain solution order and cumulative rewrite counts.
+#[test]
+fn strategy_echoes_round_trip_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod STRAT-ECHO-ROUNDTRIP is
+  sort S .
+  ops a b c d : -> S [ctor] .
+  op f : S S -> S [ctor] .
+  op g : S -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [r3] : b => d .
+  rl [r4] : c => d .
+  crl [wrap] : a => g(Z:S) if a => Z:S .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "strategy round-trip module: {}",
+        setup.output
+    );
+
+    let cases = [
+        ("a", "(r1 | r2) !", "(r1 | r2)!"),
+        ("a", "(r1 | r2) ; (r3 | r4)", "(r1 | r2) ; (r3 | r4)"),
+        ("a", "(r1 | r2) ? r3 : r4", "r1 | r2 ? r3 : r4"),
+        ("a", "r3 ? r4 : (r1 | r2)", "r3 ? r4 : r1 | r2"),
+        ("a", "(r1 ? r3 : r4) | r2", "(r1 ? r3 : r4) | r2"),
+        (
+            "a",
+            "try((r1 | r2) ; (r3 | r4))",
+            "try((r1 | r2) ; (r3 | r4))",
+        ),
+        ("a", "not((r1 | r2) ; fail)", "not((r1 | r2) ; fail)"),
+        ("a", "top(r1) | r2", "top(r1) | r2"),
+        ("a", "r1 | (r2 | fail)", "r1 | (r2 | fail)"),
+        ("a", "r1 ; (r3 ; idle)", "r1 ; (r3 ; idle)"),
+        ("a", "(r1 +) *", "r1 + *"),
+        ("a", "wrap{r1 | r2}", "wrap{r1 | r2}"),
+        (
+            "f(a, a)",
+            "matchrew f(X:S, Y:S) by X:S using (r1 | r2), Y:S using r1",
+            "matchrew f(X:S, Y:S) by X:S using (r1 | r2), Y:S using r1",
+        ),
+    ];
+
+    for (subject, original, expected_echo) in cases {
+        let first = r
+            .eval(&format!("srewrite {subject} using {original} ."))
+            .output;
+        assert!(
+            !first.contains("error") && !first.contains("no parse"),
+            "original `{original}`: {first}"
+        );
+        let header = first
+            .split_once("\n\n")
+            .map_or(first.as_str(), |(header, _)| header);
+        let echoed = header
+            .split_once(" using ")
+            .and_then(|(_, strategy)| strategy.strip_suffix(" ."))
+            .unwrap_or_else(|| panic!("malformed echo for `{original}`: {header}"));
+        // Mixfix `format` attributes may make the subject/strategy command header multiline; newlines are
+        // source whitespace, so compare and replay its token-equivalent one-line spelling.
+        let emitted = echoed.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(emitted, expected_echo, "echo for `{original}`");
+
+        let replay = r
+            .eval(&format!("srewrite {subject} using {emitted} ."))
+            .output;
+        assert!(
+            !replay.contains("error") && !replay.contains("no parse"),
+            "replayed `{emitted}`: {replay}"
+        );
+        assert_eq!(
+            strategy_value_counts(&first),
+            strategy_value_counts(&replay),
+            "behavior changed after echo/reparse: `{original}` -> `{emitted}`"
+        );
+    }
+}
+
 fn prelude_results(out: &str) -> Vec<String> {
     let lines: Vec<&str> = out.lines().collect();
     let mut results = Vec::new();
@@ -2937,5 +3023,84 @@ erewrite in TNK18-DRIVER :
     assert!(
         output.contains("insertedView(me, interpreter(0))") && output.contains("pending: nil"),
         "child accepted the reflected mixfix term map: {output}"
+    );
+}
+
+/// COV-003: the full reflected-view matrix must survive `upView -> insertView`, instantiate a
+/// parameterized client in the child, and execute every mapped form rather than merely accepting it.
+#[test]
+fn reflected_term_map_matrix_survives_child_execution() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude"));
+    assert!(
+        !prelude.exit && !prelude.output.contains("error in module"),
+        "META-LEVEL prelude loads: {}",
+        prelude.output
+    );
+    let stock = r.eval(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../metaInterpreter.maude"
+    )));
+    assert!(
+        !stock.exit && !stock.output.contains("error in module"),
+        "stock meta-interpreter loads: {}",
+        stock.output
+    );
+    let fixture = conformance_file!("subsystems/I28-reflected-view-term-maps.maude").replacen(
+        "load metaInterpreter\n",
+        "",
+        1,
+    );
+    let output = r.eval(&fixture).output;
+
+    assert!(
+        !output.contains("Bad view.")
+            && !output.contains("interpreterError")
+            && !output.contains("error in module"),
+        "reflected view and child modules load: {output}"
+    );
+    assert!(
+        output.contains("functional: reducedTerm(me, interpreter(0), 21")
+            && output.contains("'probe['s_^6['0.Zero]")
+            && output.contains("'s_^16['0.Zero]")
+            && output.contains("'s_^4['0.Zero]")
+            && output.contains("'s_^5['0.Zero]")
+            && output.contains("'s_^26['0.Zero]")
+            && output.contains("'s_^37[")
+            && output.contains("'aux1.AuxT]"),
+        "all functional mappings execute in the child: {output}"
+    );
+    assert!(
+        output.contains("messaging: rewroteTerm(me, interpreter(0),")
+            && output.contains("4, '__['done['s_^8['0.Zero]]")
+            && output.contains("pending: nil"),
+        "both inherited message mappings execute in the child: {output}"
+    );
+}
+
+/// COV-002 / OUT-003: retain tnk's known context-free cross-kind suffix spelling without
+/// ratifying it as an accepted divergence. Maude prints `.B`; tnk currently prints `.[B]`.
+#[test]
+fn cross_kind_ill_sorted_suffix_remains_classified() {
+    let output = repl()
+        .eval(conformance_file!(
+            "probes/cross-kind-ill-sorted-output.maude"
+        ))
+        .output;
+    assert!(
+        output.contains(
+            "reduce in COV002-ILL-SORTED-OUTPUT : (f(a1)).B .\n\
+             rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             result B: b"
+        ),
+        "applicable first profile: {output}"
+    );
+    assert!(
+        output.contains(
+            "reduce in COV002-ILL-SORTED-OUTPUT : (f(a2)).[B] .\n\
+             rewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             result [B]: (f(a2)).[B]"
+        ),
+        "classified ill-sorted spelling: {output}"
     );
 }

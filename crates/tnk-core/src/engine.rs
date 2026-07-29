@@ -2498,7 +2498,9 @@ impl Signature {
         let collapse_kind = {
             let symbol = self.symbols.get(top);
             match symbol.theory() {
-                Theory::Acu | Theory::Au if symbol.identity().is_some() => {
+                Theory::Acu | Theory::Au
+                    if symbol.left_identity().is_some() || symbol.right_identity().is_some() =>
+                {
                     Some(self.sorts.kind_of(sort))
                 }
                 Theory::Cui if symbol.identity().is_some() || symbol.axioms.idem => {

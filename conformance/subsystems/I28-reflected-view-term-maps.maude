@@ -1,0 +1,190 @@
+*** I28-reflected-view-term-maps — COV-003: upView -> insertView preserves rich op-to-term maps.
+*** The child executes two inherited NatW-shaped message maps plus structured-sort, kind-qualified,
+*** prefix/mixfix, literal-colon, and same-base/different-sort variable forms.
+*** PRELUDE
+set show timing off .
+set show advisories off .
+
+fth COV3-ELEM is
+  sort Elt .
+endfth
+
+fmod COV3-CELL{X :: COV3-ELEM} is
+  sort Cell{X} .
+  op cell : X$Elt -> Cell{X} [ctor] .
+  op get : Cell{X} -> X$Elt .
+  var E : X$Elt .
+  eq get(cell(E)) = E .
+endfm
+
+view COV3-NAT-ELEM from COV3-ELEM to NAT is
+  sort Elt to Nat .
+endv
+
+oth COV3-SOURCE is
+  sorts Elt Aux Box .
+  class Wrapper | contents : Elt .
+  msg to_from_get : Oid Oid -> Msg .
+  msg to_from_answer(_) : Oid Oid Elt -> Msg .
+  op prefix3 : Elt Elt Elt -> Elt .
+  op _link_link_ : Elt Elt Elt -> Elt .
+  op fromBox : Box -> Elt .
+  op kindPick : Elt -> Elt .
+  op marker`:tag : -> Elt [ctor] .
+  op sameElt : Elt -> Elt .
+  op sameAux : Aux -> Aux .
+endoth
+
+omod COV3-TARGET is
+  protecting NAT .
+  protecting COV3-CELL{COV3-NAT-ELEM} .
+  sort AuxT .
+  ops aux0 aux1 : -> AuxT [ctor] .
+  op pick3 : Nat Nat Nat -> Nat .
+  op kindKeep : [Nat] -> Nat .
+  op markTarget : Nat -> Nat .
+  op eltTarget : Nat -> Nat .
+  op auxTarget : AuxT -> AuxT .
+  vars A B C N : Nat .
+  eq pick3(A, B, C) = A + B + C + 10 .
+  eq kindKeep(N) = N .
+  eq markTarget(N) = N + 20 .
+  eq eltTarget(N) = N + 30 .
+  eq auxTarget(aux0) = aux1 .
+  class NatWrapper | value : Nat .
+  msg to_get from_ : Oid Oid -> Msg .
+  msg to_answer_from_ : Oid Nat Oid -> Msg .
+  vars O1 O2 : Oid .
+  rl < O1 : NatWrapper | value : N > (to O1 get from O2)
+    => < O1 : NatWrapper | > (to O2 answer N from O1) .
+endom
+
+view COV3-MAP from COV3-SOURCE to COV3-TARGET is
+  sort Elt to Nat .
+  sort Aux to AuxT .
+  sort Box to Cell{COV3-NAT-ELEM} .
+  class Wrapper to NatWrapper .
+  attr contents to value .
+  vars O O' : Oid .
+  var X : Elt .
+  msg to O from O' get to term to O get from O' .
+  msg to O from O' answer(X) to term to O answer X from O' .
+  op prefix3(A:Elt, B:Elt, C:Elt) to term A:Nat + B:Nat + C:Nat .
+  op A:Elt link B:Elt link C:Elt to term pick3(A:Nat, B:Nat, C:Nat) .
+  op fromBox(B:Box) to term get(B:Cell{COV3-NAT-ELEM}) .
+  op kindPick(K:[Elt]) to term kindKeep(K:[Nat]) .
+  op marker`:tag to term markTarget(6) .
+  op sameElt(X:Elt) to term eltTarget(X:Nat) .
+  op sameAux(X:Aux) to term auxTarget(X:AuxT) .
+endv
+
+omod COV3-CLIENT{X :: COV3-SOURCE} is
+  op callPrefix : X$Elt X$Elt X$Elt -> X$Elt .
+  op callMix : X$Elt X$Elt X$Elt -> X$Elt .
+  op callBox : X$Box -> X$Elt .
+  op callKind : X$Elt -> X$Elt .
+  op callColon : -> X$Elt .
+  op callElt : X$Elt -> X$Elt .
+  op callAux : X$Aux -> X$Aux .
+  op ask : Oid Oid -> Msg .
+  msg done : X$Elt -> Msg .
+  vars A B C E : X$Elt .
+  var Q : X$Aux .
+  var BX : X$Box .
+  var K : X$Elt .
+  vars W R : Oid .
+  eq callPrefix(A, B, C) = prefix3(A, B, C) .
+  eq callMix(A, B, C) = A link B link C .
+  eq callBox(BX) = fromBox(BX) .
+  eq callKind(K) = kindPick(K) .
+  eq callColon = marker`:tag .
+  eq callElt(E) = sameElt(E) .
+  eq callAux(Q) = sameAux(Q) .
+  eq ask(W, R) = to W from R get .
+  rl (to R from W answer(E)) => done(E) .
+endom
+
+omod COV3-RUN is
+  protecting COV3-TARGET .
+  protecting COV3-CLIENT{COV3-MAP} .
+  sort Probe .
+  op probe : Nat Nat Nat Nat Nat Nat AuxT -> Probe [ctor] .
+  op functionalProbe : -> Probe .
+  eq functionalProbe = probe(
+    callPrefix(1, 2, 3),
+    callMix(1, 2, 3),
+    callBox(cell(4)),
+    callKind(5),
+    callColon,
+    callElt(7),
+    callAux(aux0)) .
+  ops w c : -> Oid .
+  op request : -> Configuration .
+  eq request = < w : NatWrapper | value : 8 > ask(w, c) .
+endom
+
+load metaInterpreter
+
+mod META-COV3 is
+  including COV3-RUN .
+  protecting META-INTERPRETER .
+
+  sort ViewCmd ModuleCmd Seq .
+  subsort ViewCmd ModuleCmd < Seq .
+  op v : Qid -> ViewCmd .
+  op m : Qid -> ModuleCmd .
+  op __ : Seq Seq -> Seq [assoc id: nil] .
+  op nil : -> Seq .
+  op predef : -> Seq .
+  eq predef =
+    m('TRUTH-VALUE) m('BOOL-OPS) m('TRUTH) m('BOOL) m('NAT) m('TRIV)
+    m('CONFIGURATION)
+    m('COV3-ELEM) m('COV3-CELL) v('COV3-NAT-ELEM)
+    m('COV3-SOURCE) m('COV3-TARGET) v('COV3-MAP)
+    m('COV3-CLIENT) m('COV3-RUN) .
+
+  op me : -> Oid .
+  op User : -> Cid .
+  op pending:_ : Seq -> Attribute .
+  op functional:_ : Msg -> Attribute .
+  op messaging:_ : Msg -> Attribute .
+
+  vars X Y Z : Oid .
+  var Q : Qid .
+  var Rest : Seq .
+  var AS : AttributeSet .
+  var N : RewriteCount .
+  var T : Term .
+  var TY : Type .
+
+  rl < X : User | pending: (m(Q) Rest), AS > createdInterpreter(X, Y, Z) =>
+    < X : User | pending: Rest, AS > insertModule(Z, X, upModule(Q, false)) .
+
+  rl < X : User | pending: (m(Q) Rest), AS > insertedModule(X, Y) =>
+    < X : User | pending: Rest, AS > insertModule(Y, X, upModule(Q, false)) .
+
+  rl < X : User | pending: (m(Q) Rest), AS > insertedView(X, Y) =>
+    < X : User | pending: Rest, AS > insertModule(Y, X, upModule(Q, false)) .
+
+  rl < X : User | pending: (v(Q) Rest), AS > insertedModule(X, Y) =>
+    < X : User | pending: Rest, AS > insertView(Y, X, upView(Q)) .
+
+  rl < X : User | pending: (v(Q) Rest), AS > insertedView(X, Y) =>
+    < X : User | pending: Rest, AS > insertView(Y, X, upView(Q)) .
+
+  rl < X : User | pending: nil, AS > insertedModule(X, Y) =>
+    < X : User | pending: nil, AS >
+      reduceTerm(Y, X, 'COV3-RUN, 'functionalProbe.Probe) .
+
+  rl < X : User | pending: nil, AS > reducedTerm(X, Y, N, T, TY) =>
+    < X : User | pending: nil, functional: reducedTerm(X, Y, N, T, TY), AS >
+      rewriteTerm(Y, X, unbounded, 'COV3-RUN, 'request.Configuration) .
+
+  rl < X : User | pending: nil, AS > rewroteTerm(X, Y, N, T, TY) =>
+    < X : User | pending: nil, messaging: rewroteTerm(X, Y, N, T, TY), AS >
+      quit(Y, X) .
+endm
+
+erew in META-COV3 : <>
+  < me : User | pending: predef >
+  createInterpreter(interpreterManager, me, none) .

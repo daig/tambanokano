@@ -1620,21 +1620,15 @@ impl<'a> Parser<'a> {
 
     // ---- strategy expressions (Pillar 2.4) ----
 
-    /// Parse a strategy expression (precedence low→high: `|` < `;` < `? :` < postfix `* + !` < atom). Term-
-    /// carrying parts (test/matchrew patterns + conditions, application substitutions, call arguments) are
-    /// left as raw token bubbles, parsed against the module grammar at execution time.
+    /// Parse a strategy expression (precedence low→high: `? :` < `|` < `;` < postfix `* + !` < atom).
+    /// Term-carrying parts (test/matchrew patterns + conditions, application substitutions, call arguments)
+    /// are left as raw token bubbles, parsed against the module grammar at execution time.
     fn strategy(&mut self) -> PResult<StratExpr> {
-        let mut e = self.strat_branch()?;
-        while self.at("|") {
-            self.advance();
-            let rhs = self.strat_branch()?;
-            e = StratExpr::Union(Box::new(e), Box::new(rhs));
-        }
-        Ok(e)
+        self.strat_branch()
     }
 
     fn strat_branch(&mut self) -> PResult<StratExpr> {
-        let e = self.strat_seq()?;
+        let e = self.strat_union()?;
         if self.at("?") {
             self.advance();
             let success = self.strategy()?;
@@ -1645,6 +1639,16 @@ impl<'a> Parser<'a> {
                 success: Box::new(success),
                 failure: Box::new(failure),
             });
+        }
+        Ok(e)
+    }
+
+    fn strat_union(&mut self) -> PResult<StratExpr> {
+        let mut e = self.strat_seq()?;
+        while self.at("|") {
+            self.advance();
+            let rhs = self.strat_seq()?;
+            e = StratExpr::Union(Box::new(e), Box::new(rhs));
         }
         Ok(e)
     }

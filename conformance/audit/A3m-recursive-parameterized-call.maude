@@ -1,0 +1,16 @@
+*** A3m-recursive-parameterized-call — COV-001: lazy named-call recursion must not regress to bounded inline expansion.
+*** A 256-level decreasing parameter reaches the base definition, applies exactly one rule, and exhausts.
+
+set show timing off .
+smod COV001-RECURSIVE-PARAMETERIZED is
+  sorts N S .
+  op z : -> N [ctor] .
+  op s : N -> N [ctor] .
+  ops a b : -> S [ctor] .
+  rl [r] : a => b .
+  strat descend : N @ S .
+  var K : N .
+  sd descend(z) := r .
+  sd descend(s(K)) := descend(K) .
+endsm
+srewrite a using descend(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(s(z))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) .
