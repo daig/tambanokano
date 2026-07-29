@@ -52,6 +52,7 @@ Severity is impact, not implementation order:
 | TNK-015 | Medium | Bug | META pretty-print options are ignored or applied unconditionally | **Resolved 2026-07-27**; complete String/QidList option matrix retained |
 | TNK-016 | Medium | Robustness/performance | Large-grammar command parsing has no work bound and can stall on a late typo | **Resolved 2026-07-27**; deterministic effort cap, ordered completion index, and recovery/scaling coverage retained |
 | TNK-017 | Critical | Bug | GC can reclaim live rewrite-condition BFS states in embedded-engine mode | **Resolved 2026-07-28**; rooted graph/pending-successor ownership and focused GC regressions retained |
+| TNK-018 | Medium | Compatibility rejection | Reflected mixfix op-to-term view maps lose variable holes and fail child `insertView` | **Resolved 2026-07-29**; typed reflected variables recover as source-operator holes, with focused and I23 oracle regressions retained |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -814,6 +815,125 @@ correct rooting contract.
   multi-level cases.
 - [x] The default GC-off REPL path and ordinary rooted `StateGraph` behavior remain unchanged.
 
+### TNK-018 — Reflected mixfix view term maps lose variable holes — RESOLVED
+
+- **Severity:** Medium
+- **Classification:** Compatibility rejection; Maude accepts and executes the reflected child-interpreter
+  workflow while tnk rejects a legal view
+- **Confidence:** Confirmed by the retained I23 Maude 3.5.1 differential, direct debug inspection of the
+  hidden validation diagnostic, and a complete source-level `upView`/`down_view` trace
+- **Status:** Resolved 2026-07-29
+- **Primary area:** reflected view decoding and local-interpreter `insertView`
+- **Implementation touchpoints:** `tnk-modules/src/meta.rs::MetaDescent::down_view`,
+  `tnk-modules/src/view.rs::map_source_name`, and
+  `tnk-session/src/interpreter.rs::LocalInterpreter::insert_view`
+- **Retained fixture:** `conformance/subsystems/I23-meta-oo-list.maude`
+
+#### Confirmed failure
+
+I23 defines the plain view `NatW` from `WRAPPER` to `NAT-WRAPPER`. Besides sort/class/attribute maps, it
+contains two mixfix operator-to-term maps whose source applications use declared variables:
+
+```maude
+msg to O from O' get
+  to term to O get from O' .
+msg to O from O' answer(X)
+  to term to O answer X from O' .
+```
+
+The `META-OO` driver creates a local child interpreter, reflects each module and view through `upModule` or
+`upView`, inserts those values into the child, and finally requests a rewrite in the fully instantiated
+`SORTED-NAT-LIST` module. Maude completes the workflow in 82 rewrites: the user object's pending queue is
+`nil`, and the reply is `rewroteTerm(me, interpreter(0), 35, ..., 'Configuration)`.
+
+tnk instead stops after 29 rewrites while inserting `NatW`. The earlier `Oid` view has already succeeded,
+but the remaining module/view queue is left pending and the child returns:
+
+```text
+interpreterError(me, interpreter(0), "Bad view.")
+```
+
+`insert_view` intentionally hides a validator's detailed text behind that manager-level response. A
+debugger stopped immediately after `Session::enter_view` established the exact underlying diagnostic:
+
+```text
+error: view `NatW`: source operator
+`toO:OidfromO':Oidanswer(X:Elt)`
+is not defined in WRAPPER
+```
+
+#### Root cause
+
+The source-parsed `ViewDecl` records `O`, `O'`, and `X` in `ViewDecl::vars`. `upView` converts each
+operator-to-term map into META-MODULE source and target terms whose variables carry explicit sorts.
+`down_view` successfully decodes those terms and recreates source tokens such as `O:Oid` and `X:Elt`, but
+then constructs the reflected `ViewDecl` with `vars: Vec::new()`.
+
+`map_source_name` recovers the source operator name by replacing tokens named in `ViewDecl::vars` with
+holes. With the original declaration it therefore obtains `to_from_answer(_)`. With the reflected
+declaration's empty variable table, it treats every typed variable token as literal operator-name text and
+obtains `toO:OidfromO':Oidanswer(X:Elt)`. The strengthened TNK-012 validator correctly fails to find that
+invented name in `WRAPPER`, and `insert_view` reports `Bad view`.
+
+The decoder's empty variable table predates the stricter validator. The source-operator validation added in
+`21bec1af` exposes that older information loss; the fix must repair the reflected representation boundary,
+not weaken TNK-012's source-operator or target-sort checks.
+
+#### Scope
+
+The same file's direct, source-level `SORTED-NAT-LIST` rewrite still succeeds in 40 rewrites, and its final
+comparison reduces to `true` in two rewrites. Ordinary parsing/validation of `NatW`, parameterized module
+instantiation, object rewriting, and list behavior are therefore functioning. The confirmed defect is the
+`upView -> down_view -> insertView` round trip for a mixfix operator-to-term map with variables. Plain
+operator maps and the earlier reflected `Oid` view do not trigger this failure. Other reflected mixfix
+term maps with typed variable positions are in the suspected impact family but remain unclaimed until
+covered.
+
+#### Resolution
+
+- `map_source_name` now preserves the variable identity that survives reflection: a nonempty
+  `name:sort` token is an operator hole even when the decoded `ViewDecl` has no separate variable table.
+  Source-parsed views continue to recognize their declared bare variables.
+- The repair does not bypass TNK-012 validation. It reconstructs `to_from_get` and
+  `to_from_answer(_)`, then performs the same exact source-profile and target-sort checks as before.
+- This matches the existing instantiation path's treatment of qualified mixfix formals and leaves plain
+  operator maps, source-parsed views, and local-interpreter error handling unchanged.
+
+#### Retained regression evidence
+
+- `tnk-repl::tests::reflected_mixfix_term_map_survives_child_insert_view` drives the real
+  `upView -> down_view -> insertView` path with both NatW-shaped source operators and requires the child
+  to return `insertedView`, with no `Bad view` or `interpreterError`.
+- The unchanged I23 oracle differential now matches Maude 3.5.1 exactly: the child workflow takes 82
+  rewrites and returns `rewroteTerm(..., 'Configuration)` with `pending: nil`; the direct controls remain
+  40 rewrites and two rewrites yielding `Bool: true`.
+- Focused view validation is 14/14, the optional-Z3 subsystem gate is 112/112 at the unchanged timeout,
+  the audit scoreboard is 93/93, and the workspace suite is 473 passed with one ignored.
+
+#### Acceptance contract
+
+- [x] A focused Rust regression exercises the actual `upView -> down_view` round trip for `NatW`-shaped
+  mixfix operator-to-term mappings, reproduces the malformed source-name rejection before repair, and
+  passes after repair.
+- [x] The decoded mappings resolve to the canonical source operators `to_from_get` and
+  `to_from_answer(_)`; typed tokens such as `O:Oid`, `O':Oid`, and `X:Elt` are treated as variable holes,
+  not literal name fragments.
+- [x] Inserting the reflected `NatW` value returns `insertedView`, permits every remaining I23 module/view
+  insertion, and allows the child interpreter to execute the requested rewrite.
+- [x] `TNK_BIN=<fixed-release> tools/subsystems-scoreboard.sh -p I23` reports
+  `PASS I23-meta-oo-list` and `SUBSYSTEMS 1/1 PASS` under the unchanged 60-second timeout, with no fixture
+  edits or normalization changes.
+- [x] I23's first `META-OO` command matches Maude exactly after normalization: 82 rewrites, pending `nil`,
+  and `rewroteTerm(me, interpreter(0), 35, ..., 'Configuration)`; neither `Bad view` nor
+  `interpreterError` remains.
+- [x] I23's direct controls remain unchanged: the `SORTED-NAT-LIST` rewrite takes 40 rewrites and the final
+  comparison returns `Bool: true` in two rewrites.
+- [x] The repair does not bypass validation: undefined source operators, cross-kind sort maps, incompatible
+  operator profiles, and ill-sorted operator-to-term targets remain rejected; the retained A4f/A4g view
+  validation fixtures and focused validator tests stay green.
+- [x] The complete optional-Z3 release subsystem gate returns 112/112 at the existing per-fixture timeout,
+  the audit scoreboard remains 93/93, and the workspace test suite passes.
+
 ## 4. Ratified accepted divergences
 
 These are known differences, not discoveries to hide behind the word “clean.” `tools/legacy-sweep.sh` verifies that they have not drifted beyond their recorded forms.
@@ -964,17 +1084,21 @@ produce a Maude-only warning while both systems keep the view usable and compute
 
 ### RISK-005 — Reflection boundaries (classified)
 
-Fresh probes found three broad limitation claims stale and promoted the remaining defect to TNK-015. A flat
-module protecting `BOOL` reflected its imported declarations, `poly`/`special` hooks, and equations, then
+Fresh probes found the flat builtin-closure and structured module-expression claims stale. A flat module
+protecting `BOOL` reflected its imported declarations, `poly`/`special` hooks, and equations, then
 round-tripped through `upModule(..., true)` and `metaReduce` for both an ordinary Boolean equation and
 polymorphic equality. Its displayed metadata still differs in hook line wrapping and one AC-equivalent
 reflected-equation argument order, but no missing or inert closure behavior was observed. Structured module
 expressions matched Maude exactly in both directions for sums, renamings, and view-based instantiation.
-`upView` also matched exactly for an operator-to-term map with variable arguments.
 
-The print-option probe established TNK-015 and its retained regression now confirms all seven flags across
-String and Qid-list results. Flat builtin-closure, structured module-expression, and op-to-term view
-reflection were stale risk claims; the separately recorded print-settings defect is also resolved.
+The earlier standalone `upView` probe matched Maude for an operator-to-term map with variable arguments,
+but established only upward reflection. I23 later exposed TNK-018 at the
+`upView -> down_view -> insertView` boundary. The repair now retains qualified mixfix variables as holes,
+and the unchanged fixture confirms successful child insertion and execution.
+
+The print-option probe established TNK-015 and its retained regression confirms all seven flags across
+String and Qid-list results. Flat builtin closure, structured module-expression reflection, and the
+reflected view-insertion path covered by TNK-018 are resolved and retained.
 
 ### RISK-006 — Resolved as TNK-017
 
@@ -1010,9 +1134,10 @@ TNK-005 and TNK-006 are resolved with compositional-import, ordering, transform,
 ### 8.4 Reflection group
 
 TNK-009 is resolved at the automatic-import source: functional, system, and strategy source/flat reflection
-now preserve Maude's `including BOOL` mode. Fresh RISK-005 probes close the broad flat builtin-closure,
-structured module-expression, and op-to-term view-reflection claims. TNK-015's complete META print-option
-matrix is also resolved and retained. The still-inert strategy meta parse/pretty-print operations remain a
+now preserve Maude's `including BOOL` mode. Fresh RISK-005 probes close the broad flat builtin-closure and
+structured module-expression claims, while resolved TNK-018 retains the distinct
+`upView -> down_view -> insertView` path for mixfix term maps. TNK-015's complete META print-option
+matrix is resolved and retained. The still-inert strategy meta parse/pretty-print operations remain a
 separate deferred surface.
 
 ### 8.5 Performance group
@@ -1037,7 +1162,14 @@ Before changing implementation, preserve every confirmed direct probe as a retai
 - diagnostic normalization policy;
 - timeout where relevant.
 
-The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in `A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in `A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in `B3b-membership-order`, TNK-009 in `C6d-implicit-bool-mode`, TNK-011 in `B3c-membership-collapse`, TNK-012 in `A4f-view-validation`, TNK-013 in `A4g-view-specific-map`, TNK-014 in `A4h-theory-transformed-imports`, and TNK-015 in `A5h-meta-print-options`. TNK-010 remains pinned by subsystem fixtures I19/I20 and their unchanged 60-second harness gate.
+The TNK-001 probes are retained in `conformance/strat.maude`, TNK-002 in `A3a-rewrite-frozen`, TNK-003 in
+`A1b-opdecl-arity`, TNK-004 in `A3e-branch-stuck` plus `conformance/prelude-bool.maude`, TNK-005 in
+`A3f`–`A3j` plus `A5g`, TNK-006 in `A3k-top-recovery`, TNK-007 in `A2k-decfloat-exact`, TNK-008 in
+`B3b-membership-order`, TNK-009 in `C6d-implicit-bool-mode`, TNK-011 in `B3c-membership-collapse`, TNK-012
+in `A4f-view-validation`, TNK-013 in `A4g-view-specific-map`, TNK-014 in
+`A4h-theory-transformed-imports`, TNK-015 in `A5h-meta-print-options`, and TNK-018 in subsystem fixture
+`I23-meta-oo-list`. TNK-010 remains pinned by I19/I20 and their unchanged 60-second harness gate; TNK-016
+and TNK-017 retain their focused Rust scaling/recovery and embedded-GC regressions.
 
 ## 9. Prototype/v0 decision view
 
@@ -1046,11 +1178,11 @@ This document does not set release priority. It exposes the decisions:
 - **How much sibling declaration-recovery validation is required for v0?** The confirmed TNK-002 and TNK-003 panics are resolved; adjacent theory-attribute cases remain unverified risk candidates rather than confirmed defects.
 - **Can v0 claim open-term functional reduction?** TNK-004 no longer blocks this claim for BranchSymbol: its symbolic-condition value, count, and sort contract is retained against the oracle.
 - **Can v0 claim compositional strategy modules?** Yes for the retained import modes, ordering/conflict matrix, home parsing, sum/renaming/instantiation transforms, reflection, session invalidation, and generalized-`top` recovery covered by TNK-005/TNK-006.
-- **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** TNK-007–009 and TNK-015 are resolved and retained, and the three broad RISK-005 reflection claims are stale; no confirmed defect remains from that reflection group.
+- **Do the surveyed numeric/nonconfluent/reflection corners remain release limitations?** TNK-007–009, TNK-015, and TNK-018 are resolved and retained. The broad flat-module and structured-expression RISK-005 claims are stale; no confirmed defect remains in that reflection group.
 - **Is the 60-second I-S gate binding?** It remains binding and unchanged; TNK-010 restored I19/I20 beneath it.
 - **Can v0 claim the covered view/module-expression boundaries?** Yes for connected-component and operator-profile validation, overload-specific view maps, and renamed/instantiated/mixed module-origin imports covered by TNK-012–014. Theory proof obligations and warning-only subsort preservation remain explicit boundaries.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.
 
-The clean release statement is narrower than “bug-free”: TNK-001–016 are resolved and retained, while
+The clean release statement is narrower than “bug-free”: TNK-001–018 are resolved and retained, while
 accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified
 candidates remain documented.

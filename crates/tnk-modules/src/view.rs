@@ -90,8 +90,14 @@ fn map_source_name(v: &ViewDecl, tokens: &[Token], interner: &Interner) -> Strin
         .iter()
         .map(|token| {
             let text = interner.resolve(token.sym);
-            let base = text.split_once(':').map_or(text, |(name, _)| name);
-            if variables.contains(base) { "_" } else { text }
+            let (base, qualified) = text.rsplit_once(':').map_or((text, false), |(name, sort)| {
+                (name, !name.is_empty() && !sort.is_empty())
+            });
+            if variables.contains(base) || qualified {
+                "_"
+            } else {
+                text
+            }
         })
         .collect()
 }

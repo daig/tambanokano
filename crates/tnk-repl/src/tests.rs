@@ -2839,3 +2839,103 @@ red metaVariantUnify(['A-UNIF], upTerm(A:List B:List) =?
         "associative incompleteness: {output}"
     );
 }
+
+/// TNK-018: a child interpreter receives a view through the real `upView -> down_view -> insertView`
+/// path. The reflected op-to-term sources carry typed variables but no separate variable-declaration
+/// field; both mixfix variable positions must still recover as operator holes.
+#[test]
+fn reflected_mixfix_term_map_survives_child_insert_view() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude"));
+    assert!(
+        !prelude.exit && !prelude.output.contains("error in module"),
+        "META-LEVEL prelude loads: {}",
+        prelude.output
+    );
+    let stock = r.eval(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../metaInterpreter.maude"
+    )));
+    assert!(
+        !stock.exit && !stock.output.contains("error in module"),
+        "stock meta-interpreter loads: {}",
+        stock.output
+    );
+    let output = r
+        .eval(
+            r#"
+set include BOOL off .
+
+fth TNK18-SOURCE is
+  sorts Elt Oid Msg .
+  op to_from_get : Oid Oid -> Msg .
+  op to_from_answer(_) : Oid Oid Elt -> Msg .
+endfth
+
+fmod TNK18-TARGET is
+  sorts Item Oid Msg .
+  op fetch : Oid Oid -> Msg .
+  op reply : Oid Oid Item -> Msg .
+endfm
+
+view TNK18-VIEW from TNK18-SOURCE to TNK18-TARGET is
+  sort Elt to Item .
+  vars O O' : Oid .
+  var X : Elt .
+  msg to O from O' get to term fetch(O, O') .
+  msg to O from O' answer(X) to term reply(O, O', X) .
+endv
+
+mod TNK18-DRIVER is
+  protecting TNK18-SOURCE .
+  protecting TNK18-TARGET .
+  protecting META-INTERPRETER .
+
+  sort ViewCmd ModuleCmd Seq .
+  subsort ViewCmd ModuleCmd < Seq .
+  op v : Qid -> ViewCmd .
+  op m : Qid -> ModuleCmd .
+  op __ : Seq Seq -> Seq [assoc id: nil] .
+  op nil : -> Seq .
+  op predef : -> Seq .
+  eq predef = m('TNK18-SOURCE) m('TNK18-TARGET) v('TNK18-VIEW) .
+
+  op me : -> Oid .
+  op User : -> Cid .
+  op pending:_ : Seq -> Attribute .
+
+  vars X Y Z : Oid .
+  var Q : Qid .
+  var Rest : Seq .
+  var AS : AttributeSet .
+
+  rl < X : User | pending: (m(Q) Rest), AS > createdInterpreter(X, Y, Z) =>
+     < X : User | pending: Rest, AS > insertModule(Z, X, upModule(Q, false)) .
+  rl < X : User | pending: (m(Q) Rest), AS > insertedModule(X, Y) =>
+     < X : User | pending: Rest, AS > insertModule(Y, X, upModule(Q, false)) .
+  rl < X : User | pending: (v(Q) Rest), AS > insertedModule(X, Y) =>
+     < X : User | pending: Rest, AS > insertView(Y, X, upView(Q)) .
+endm
+
+erewrite in TNK18-DRIVER :
+  <> < me : User | pending: predef >
+  createInterpreter(interpreterManager, me, none) .
+"#,
+        )
+        .output;
+
+    assert!(
+        !output.contains("Bad view.")
+            && !output.contains("interpreterError")
+            && !output.contains("error in module"),
+        "reflected view insertion succeeds: {output}"
+    );
+    assert!(
+        output.contains("rewrites: 7"),
+        "oracle-compatible count: {output}"
+    );
+    assert!(
+        output.contains("insertedView(me, interpreter(0))") && output.contains("pending: nil"),
+        "child accepted the reflected mixfix term map: {output}"
+    );
+}
