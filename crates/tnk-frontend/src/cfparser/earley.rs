@@ -3,9 +3,10 @@
 //! extractor (B4.4b) to build terms.
 
 use super::compile::CompiledGrammar;
+use super::{EffortExceeded, ParseEffort};
 use crate::grammar::{GSym, Nt, Terminal};
 use crate::lex::{Interner, TokKind, Token};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// An Earley item: a production, the dot position within its rhs, and the token index where the item
@@ -50,6 +51,7 @@ impl Hasher for ItemHasher {
 }
 
 type ItemSet = HashSet<Item, BuildHasherDefault<ItemHasher>>;
+type Waiting = HashMap<Nt, Vec<Item>, BuildHasherDefault<ItemHasher>>;
 
 /// The Earley chart: one item set per token position `0..=n` (`sets[j]` = items recognized just before
 /// token `j`; `sets[n]` is the final set). `present[j]` is the same content as a set, for O(1) membership
@@ -130,20 +132,29 @@ fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
         }
     }
 }
-
 /// Run the Earley recognizer over `tokens`, seeding the start nonterminal `start`. Returns the chart;
 /// call [`Chart::recognized`] / [`Chart::root_items`] to interpret it. `i` resolves token text for the
-/// built-in lexical-class terminals (`SMALL_NAT`).
-pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> Chart {
+/// built-in lexical-class terminals (`SMALL_NAT`). Every grammar visit is charged to `effort`.
+pub fn parse(
+    g: &CompiledGrammar,
+    tokens: &[Token],
+    start: Nt,
+    i: &Interner,
+    effort: &mut ParseEffort,
+) -> Result<Chart, EffortExceeded> {
     let n = tokens.len();
     let mut sets: Vec<Vec<Item>> = vec![Vec::new(); n + 1];
     let mut seen: Vec<ItemSet> = vec![ItemSet::default(); n + 1];
+    let mut waiting: Vec<Waiting> = (0..=n).map(|_| Waiting::default()).collect();
 
     // Seed: predict every production of the start nonterminal at position 0.
     for &p in g.productions_for(start) {
+        effort.charge(0)?;
         add(
+            g,
             &mut sets,
             &mut seen,
+            &mut waiting,
             0,
             Item {
                 prod: p,
@@ -162,15 +173,18 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
             let prod = &g.prods[item.prod as usize];
             let dot = item.dot as usize;
             if dot == prod.rhs.len() {
-                complete(g, &mut sets, &mut seen, j, item);
+                complete(g, &mut sets, &mut seen, &mut waiting, j, item, effort)?;
             } else {
                 match prod.rhs[dot] {
                     GSym::N(nt) => {
                         // Predict: add every production of `nt`, starting here.
                         for &p in g.productions_for(nt) {
+                            effort.charge(j)?;
                             add(
+                                g,
                                 &mut sets,
                                 &mut seen,
+                                &mut waiting,
                                 j,
                                 Item {
                                     prod: p,
@@ -182,10 +196,13 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
                     }
                     GSym::T(t) => {
                         // Scan: consume token j if it matches, advancing into set j+1.
+                        effort.charge(j)?;
                         if j < n && terminal_matches(t, &tokens[j], i) {
                             add(
+                                g,
                                 &mut sets,
                                 &mut seen,
+                                &mut waiting,
                                 j + 1,
                                 Item {
                                     prod: item.prod,
@@ -200,10 +217,10 @@ pub fn parse(g: &CompiledGrammar, tokens: &[Token], start: Nt, i: &Interner) -> 
         }
     }
 
-    Chart {
+    Ok(Chart {
         sets,
         present: seen,
-    }
+    })
 }
 
 /// Completer: a finished production of nonterminal `N` (`item`, spanning `[item.origin, j)`) advances
@@ -213,38 +230,72 @@ fn complete(
     g: &CompiledGrammar,
     sets: &mut [Vec<Item>],
     seen: &mut [ItemSet],
+    waiting: &mut [Waiting],
     j: usize,
     item: Item,
-) {
+    effort: &mut ParseEffort,
+) -> Result<(), EffortExceeded> {
     let finished = &g.prods[item.prod as usize];
     let (n, prec) = (finished.lhs, finished.prec);
-    // No epsilon productions, so a completed item spans ≥1 token ⇒ origin < j ⇒ sets[origin] ≠ sets[j];
-    // collect first to release the shared borrow before pushing.
+    // No epsilon productions, so a completed item spans ≥1 token ⇒ origin < j. That lets the completer
+    // read the origin's ordered waiter index while appending directly to the current set—no whole-origin
+    // scan and no temporary candidate Vec.
     let origin = item.origin as usize;
-    let advanced: Vec<Item> = sets[origin]
-        .iter()
-        .filter_map(|&it2| {
-            let p2 = &g.prods[it2.prod as usize];
-            let d2 = it2.dot as usize;
-            match p2.rhs.get(d2) {
-                Some(GSym::N(nt)) if *nt == n && p2.bound[d2].unwrap() >= prec => Some(Item {
+    debug_assert!(origin < j, "completed item must span at least one token");
+    let (prior_waiting, current_waiting) = waiting.split_at_mut(j);
+    let Some(candidates) = prior_waiting[origin].get(&n) else {
+        return Ok(());
+    };
+    let current_waiting = &mut current_waiting[0];
+    let current_set = &mut sets[j];
+    let current_seen = &mut seen[j];
+    for &it2 in candidates {
+        effort.charge(j)?;
+        let p2 = &g.prods[it2.prod as usize];
+        let d2 = it2.dot as usize;
+        if p2.bound[d2].unwrap() >= prec {
+            add_to_set(
+                g,
+                current_set,
+                current_seen,
+                current_waiting,
+                Item {
                     prod: it2.prod,
                     dot: it2.dot + 1,
                     origin: it2.origin,
-                }),
-                _ => None,
-            }
-        })
-        .collect();
-    for a in advanced {
-        add(sets, seen, j, a);
+                },
+            );
+        }
     }
+    Ok(())
 }
 
-/// Add `item` to set `pos` if not already present (chart dedup keeps the work-list finite).
-fn add(sets: &mut [Vec<Item>], seen: &mut [ItemSet], pos: usize, item: Item) {
-    if seen[pos].insert(item) {
-        sets[pos].push(item);
+/// Add `item` to set `pos` if not already present. The ordered waiter index mirrors only items whose dot
+/// precedes a nonterminal; it accelerates completion without becoming an ordering authority.
+fn add(
+    g: &CompiledGrammar,
+    sets: &mut [Vec<Item>],
+    seen: &mut [ItemSet],
+    waiting: &mut [Waiting],
+    pos: usize,
+    item: Item,
+) {
+    add_to_set(g, &mut sets[pos], &mut seen[pos], &mut waiting[pos], item);
+}
+
+fn add_to_set(
+    g: &CompiledGrammar,
+    set: &mut Vec<Item>,
+    seen: &mut ItemSet,
+    waiting: &mut Waiting,
+    item: Item,
+) {
+    if seen.insert(item) {
+        let prod = &g.prods[item.prod as usize];
+        if let Some(GSym::N(nt)) = prod.rhs.get(item.dot as usize) {
+            waiting.entry(*nt).or_default().push(item);
+        }
+        set.push(item);
     }
 }
 
@@ -283,7 +334,10 @@ endfm
         let g = CompiledGrammar::compile(&build_grammar(&m, &mut i));
         move |term: &str| {
             let tokens = tokenize(term, &mut i);
-            parse(&g, &tokens, Nt::Term, &i).recognized(&g, Nt::Term)
+            let mut effort = ParseEffort::default();
+            parse(&g, &tokens, Nt::Term, &i, &mut effort)
+                .expect("parse effort")
+                .recognized(&g, Nt::Term)
         }
     }
 

@@ -165,7 +165,7 @@ pub fn load_program(src: &str) -> Result<Program, String> {
 mod tests {
     use super::*;
     use tnk_frontend::lex::{Token, tokenize};
-    use tnk_frontend::load::reduce_command;
+    use tnk_frontend::load::{parse_command_term, reduce_command};
     use tnk_frontend::pretty::print_raw;
 
     /// One expected `reduce` result, transcribed from the reference binary:
@@ -201,7 +201,9 @@ mod tests {
         assert_eq!(cmds.len(), expected.len(), "command count");
 
         for (idx, ((m, term), exp)) in cmds.iter().zip(expected).enumerate() {
-            let (got, rw) = reduce_command(&mut prog.modules[*m], &prog.interner, term)
+            let parsed = parse_command_term(&prog.modules[*m], &prog.interner, term)
+                .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+            let (got, rw) = reduce_command(&mut prog.modules[*m], &prog.interner, &parsed)
                 .unwrap_or_else(|err| panic!("command {idx}: {err}"));
             {
                 let eng = &prog.modules[*m].built.engine;
@@ -215,7 +217,9 @@ mod tests {
 
             // Value: reduce the expected surface term through the same module and compare.
             let exp_toks = tokenize(exp.term, &mut prog.interner);
-            let (want, _) = reduce_command(&mut prog.modules[*m], &prog.interner, &exp_toks)
+            let expected_parsed = parse_command_term(&prog.modules[*m], &prog.interner, &exp_toks)
+                .unwrap_or_else(|err| panic!("command {idx} expected `{}`: {err}", exp.term));
+            let (want, _) = reduce_command(&mut prog.modules[*m], &prog.interner, &expected_parsed)
                 .unwrap_or_else(|err| panic!("command {idx} expected `{}`: {err}", exp.term));
             {
                 let eng = &prog.modules[*m].built.engine;
@@ -229,8 +233,11 @@ mod tests {
             // Round-trip: the printed result re-parses to the same term.
             let printed = print_raw(&prog.modules[*m].built, &prog.interner, got);
             let toks = tokenize(&printed, &mut prog.interner);
-            let (reparsed, _) = reduce_command(&mut prog.modules[*m], &prog.interner, &toks)
+            let reparsed_term = parse_command_term(&prog.modules[*m], &prog.interner, &toks)
                 .unwrap_or_else(|err| panic!("command {idx} reparse `{printed}`: {err}"));
+            let (reparsed, _) =
+                reduce_command(&mut prog.modules[*m], &prog.interner, &reparsed_term)
+                    .unwrap_or_else(|err| panic!("command {idx} reparse `{printed}`: {err}"));
             let eng = &prog.modules[*m].built.engine;
             assert!(
                 eng.deep_equal(got, reparsed),

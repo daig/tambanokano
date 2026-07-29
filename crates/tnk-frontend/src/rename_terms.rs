@@ -11,7 +11,7 @@
 
 use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
-use crate::cfparser::{earley, forest};
+use crate::cfparser::{ParseEffort, earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt};
 use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
@@ -555,8 +555,11 @@ pub fn literal_frags(name: &str, interner: &mut Interner) -> Vec<String> {
 
 /// Parse a term token bubble to its first parse tree (the statement/pattern path, sans build).
 fn parse_term(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
-    let chart = earley::parse(g, tokens, Nt::Term, i);
-    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term)?;
+    let mut effort = ParseEffort::default();
+    let chart = earley::parse(g, tokens, Nt::Term, i, &mut effort)
+        .map_err(|e| format!("parse effort limit exceeded at token {}", e.at))?;
+    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term, &mut effort)
+        .map_err(|e| e.to_string())?;
     if parsed.ambiguous {
         return Err("ambiguous".into());
     }

@@ -1,6 +1,6 @@
 # Known behavior triage
 
-**Date:** 2026-07-27
+**Date:** 2026-07-28
 **Purpose:** standalone triage of currently known tnk bugs, behavioral divergences, robustness failures, accepted differences, and unverified risk areas relevant to the prototype/v0 boundary.
 **Evidence boundary:** entries marked resolved were implemented and reverified on the dates shown against focused live-Maude probes, the cited reference-source paths, and retained oracle-differential fixtures. Unresolved gaps and risks retain the documentation-survey evidence boundary: retained conformance records, source inspection, and the direct probes already run.
 
@@ -50,6 +50,8 @@ Severity is impact, not implementation order:
 | TNK-013 | Medium | Compatibility rejection | Disambiguated source operator maps in views are parser-rejected | **Resolved 2026-07-27**; overloaded-map oracle fixture retained |
 | TNK-014 | Low | Behavioral divergence | Transformed module imports in parameter theories emit spurious generic-module errors | **Resolved 2026-07-27**; renamed/instantiated import fixture retained |
 | TNK-015 | Medium | Bug | META pretty-print options are ignored or applied unconditionally | **Resolved 2026-07-27**; complete String/QidList option matrix retained |
+| TNK-016 | Medium | Robustness/performance | Large-grammar command parsing has no work bound and can stall on a late typo | **Resolved 2026-07-27**; deterministic effort cap, ordered completion index, and recovery/scaling coverage retained |
+| TNK-017 | Critical | Bug | GC can reclaim live rewrite-condition BFS states in embedded-engine mode | **Resolved 2026-07-28**; rooted graph/pending-successor ownership and focused GC regressions retained |
 | DIV-001 | Accepted | Behavioral divergence | AC match solution order differs | Recorded accepted diff |
 | DIV-002 | Accepted | Behavioral divergence | Mixed-symbol ACU search-goal echo differs | Recorded accepted diff |
 | DIV-003 | Accepted | Behavioral divergence | `matchrew`/`amatchrew` cumulative counts differ | Recorded accepted diff |
@@ -649,6 +651,169 @@ across both `metaPrintToString` and `metaPrettyPrint`. Its outputs match Maude 3
 
 The final verification gates passed: all 465 workspace tests and the complete 93/93 audit scoreboard.
 
+### TNK-016 — Large-grammar command parsing has no work bound — RESOLVED
+
+- **Severity:** Medium
+- **Classification:** Robustness/performance
+- **Confidence:** Resolved by deterministic work accounting, release-binary reproduction, and retained scaling/recovery coverage
+- **Status:** Resolved 2026-07-27
+- **Primary area:** `tnk-frontend::cfparser` and the command parse/echo lifecycle
+- **Implementation touchpoints:** `cfparser.rs`, `earley.rs`, `forest.rs`, `load.rs`, and
+  `tnk-session/src/lib.rs`
+
+#### Historical reproduction
+
+A generated 44,396-byte module declared 1,000 distinct associative binary operators over one sort, then
+submitted a 1,280-atom `_o0_` chain followed by `o0 bogus`. The rejected token was at index 2,560, so the
+parser had consumed the longest valid prefix before discovering the typo.
+
+Before the repair, `/usr/bin/time -l` on the same workstation and file reported:
+
+- `target/release/tnk-repl -no-banner -no-prelude`: 24.72 seconds and 181,288,960 bytes maximum RSS before
+  reporting `no parse`;
+- Maude 3.5.1 with `-no-banner -no-advise -no-prelude`: 0.03 seconds and 5,177,344 bytes maximum RSS before
+  warning `bad token bogus` / `no parse for term`.
+
+A 5-second sample put all 3,437 main-thread samples below
+`command_echo -> parse_forest_any -> earley::parse`. For every completed item, the completer scanned the
+entire origin chart set and allocated a temporary candidate `Vec`. The recognizer had no cancellation or
+deterministic work limit. A malformed reduce was also parsed twice: command echo first parsed and discarded
+the error, then command construction parsed the same bubble again.
+
+A syntactically valid same-sized chain took a comparable 24.00 seconds. The evidence therefore established
+broad uncapped large-grammar scaling, not the older claim of a distinct invalid-only exponential path.
+Per-position item dedup still bounded recognizer state enumeration polynomially.
+
+#### Resolution
+
+`ParseEffort` is now shared by recognition and forest extraction. The default 100,000,000-unit limit charges
+every predictor-production visit, terminal scanner check, completion-candidate check, parse-root/candidate
+scan, and forest node/combination visit. Exhaustion returns `EffortExceeded` at the chart token being
+processed; command users receive the distinct `parse effort limit exceeded at token N` diagnostic,
+including the token text. The limit is operation-based, not elapsed
+time, and is recreated for every parse, so the failure point is deterministic and one rejected command
+cannot consume the next command's allowance.
+
+Each chart position also keeps an insertion-ordered index from awaited nonterminal to waiting items.
+`earley::complete` reads only the matching waiter list and appends directly to the current chart set. This
+removes the whole-origin scan and temporary candidate allocation while preserving the original chart order,
+which remains the authority for first-parse selection.
+
+`ParsedCommandTerm` now owns one forest result (and borrows the common-case token bubble). Reduce, check,
+rewrite/frewrite/erewrite, search/SMT-search, and strategy-rewrite echo and execution paths reuse that parsed
+tree. A parse failure is reported once instead of being swallowed by echo and recomputed by execution.
+Omitted object attributes retain their existing token-materialization path inside the same parsed command.
+
+#### Post-fix evidence and retained coverage
+
+With the release binary and the original 1,000-operator/1,280-atom typo probe, the deterministic cap now
+reported an effort-limit error after 1.06 seconds at 18,513,920 bytes maximum RSS, versus the historical
+24.72 seconds/181,288,960 bytes. The token in that diagnostic is the deterministic budget-exhaustion
+position; the parser intentionally no longer spends enough work to reach the late typo.
+
+Coverage is retained in Rust rather than as an always-on multi-second oracle fixture:
+
+- `load::tests::large_grammar_valid_and_invalid_parse_benchmark` is an opt-in generated
+  1,000-operator/1,280-atom pair run with an explicit unlimited budget. It keeps both the valid scaling path
+  and the exact late-typo rejection available for profiling without weakening the interactive limit.
+- `load::tests::parse_effort_limit_is_deterministic` runs the same explicitly bounded parse twice and pins
+  identical diagnostics and exact budget consumption.
+- `load::tests::forest_extraction_shares_recognizer_budget` gives recognition exactly its measured cost and
+  requires extraction to exhaust that same allowance rather than starting a fresh budget.
+- `load::tests::two_thousand_atom_flat_command_fits_parse_budget` protects the retained legal large-term
+  boundary.
+- `tnk-session/tests/session.rs::parser_effort_limit_reports_once_and_session_recovers` exceeds the default
+  limit, requires exactly one effort diagnostic, and then obtains `result S: a` from the following command
+  in the same submission.
+- `tnk-repl::tests::erewrite_parse_failure_preserves_pending_stdin` verifies that a rejected external
+  rewrite leaves scripted input available to the following valid `erewrite`.
+
+The final gates pass all 470 workspace tests and the complete 93/93 oracle audit scoreboard.
+
+#### Acceptance contract
+
+- [x] Recognition and forest extraction share one deterministic per-parse work budget.
+- [x] The budget covers prediction, scanning, completion candidates, and forest work rather than wall time
+  or ambiguity alone.
+- [x] Completion uses an insertion-ordered awaited-nonterminal index with no temporary candidate vector.
+- [x] Echo and execution share one parsed command tree.
+- [x] Budget exhaustion has a distinct token-positioned diagnostic and does not poison session recovery.
+- [x] A retained 2,000-atom legal term remains accepted, and the generated valid/invalid scaling pair remains
+  available as an opt-in benchmark.
+
+### TNK-017 — Rewrite-condition BFS state is not fully GC-rooted — RESOLVED
+
+- **Severity:** Critical
+- **Classification:** Bug; legal embedded-engine use could terminate the process in debug or silently use a
+  reclaimed/recycled DAG slot in release
+- **Confidence:** Reproduced by two focused runtime regressions before repair; source-level ownership proof
+  and post-fix GC-on/GC-off parity retained
+- **Status:** Resolved 2026-07-28
+- **Primary area:** `tnk-core::engine::Runtime::solve_rewrite_condition`
+- **Affected mode before repair:** low-level `Engine` embedding with `set_gc_interval(Some(_))`; the REPL
+  leaves in-reduction GC disabled
+
+#### Historical failure and root cause
+
+A rewrite condition (`crl ... if lhs => pattern`) builds a local breadth-first reachability graph.
+`solve_rewrite_condition` rooted only `start`, while `seen` and `frontier` retained discovered states as bare
+`DagId`s. Its eager successor helper obtained rooted `RawSuccessor`s, copied only `(rule_id, term)` into a
+plain vector, and dropped every `RawSuccessor::_root` before reducing that batch.
+
+This made the following legal shape sufficient:
+
+```maude
+rl start => first .
+rl start => target .
+crl trigger => done if start => target .
+```
+
+For an embedded caller using `set_gc_interval(Some(1))`, reducing `start` reset the allocation counter at
+its safe point. Successor construction then allocated `first` and `target`. When the loop reduced `first`,
+the reduce-loop safe point marked its own frame, registered roots (`start`), and the outer condition's
+protected redex/bindings, but not the other bare successor `target`. Sweep could reclaim `target`; the next
+loop iteration dereferenced its stale id. Debug arena generations turned that into an immediate
+use-after-free panic. Release builds omitted generation checks, so the same id could reference a free slot
+(panic) or a recycled, unrelated node (silent wrong search result).
+
+The same ownership hole covered previously discovered `seen`/`frontier` states and fresh bindings matched
+from a reached state across subsequent condition fragments. Outer reduce frames, substitutions, redexes,
+equality results, matching-condition subjects, and ordinary `StateGraph` searches already followed the
+correct rooting contract.
+
+#### Resolution
+
+- The local graph is now `Vec<RootedDag>`: every discovered canonical state owns a `RootGuard` for the
+  graph's full lifetime, and the frontier stores stable state indexes rather than independent DAG handles.
+- `solve_rewrite_condition` consumes `state_successors_deferred` directly. The batch retains every raw
+  successor guard while earlier successors undergo nested reduction; a successor's guard is released only
+  after its reduced result is either rooted as a new canonical state or identified as a duplicate.
+- The currently matched reached state therefore remains transitively live while later condition fragments
+  consume its fresh bindings.
+- Enumeration and tail work are still charged before the first successor reduction, preserving the
+  previous eager rewrite-count order. The now-unused guard-dropping helper was removed.
+
+#### Retained regression evidence
+
+- `rewrite_condition_pending_successors_survive_safe_point_gc` constructs two ordered successors, targets
+  the second, binds its child into the conditional rule RHS, and asserts the same result and three-rewrite
+  count with GC disabled and with `set_gc_interval(Some(1))`.
+- `rewrite_condition_discovered_states_and_bindings_survive_safe_point_gc` reaches a target in two rule
+  steps, then runs an allocating equality fragment before consuming the bound child. It asserts the same
+  result and four-rewrite count in both GC modes.
+- Before the repair both tests failed immediately at the arena generation assertion with stale IDs. After
+  the repair both pass in debug and release builds, the existing REPL rewrite-condition regression passes,
+  and the 472-test workspace suite remains green.
+
+#### Acceptance contract
+
+- [x] Every pending successor remains rooted until reduced or discarded.
+- [x] Every discovered state remains rooted while retained by the local graph.
+- [x] A reached state remains rooted across later condition fragments, preserving fresh bindings.
+- [x] GC-on behavior matches GC-off result, binding, BFS order, and rewrite count in branching and
+  multi-level cases.
+- [x] The default GC-off REPL path and ordinary rooted `StateGraph` behavior remain unchanged.
+
 ## 4. Ratified accepted divergences
 
 These are known differences, not discoveries to hide behind the word “clean.” `tools/legacy-sweep.sh` verifies that they have not drifted beyond their recorded forms.
@@ -811,13 +976,22 @@ The print-option probe established TNK-015 and its retained regression now confi
 String and Qid-list results. Flat builtin-closure, structured module-expression, and op-to-term view
 reflection were stale risk claims; the separately recorded print-settings defect is also resolved.
 
-### RISK-006 — Re-entrant condition GC
+### RISK-006 — Resolved as TNK-017
 
-A code path notes incomplete rooting for re-entrant rewrite-condition state when the low-level engine is embedded with GC enabled. The REPL's cited path has GC disabled. No current end-to-end failure is established.
+The source-confirmed lifetime violation was reproduced by focused embedded-engine regressions and closed by
+giving the rewrite-condition BFS the same ownership model as `StateGraph`: one `RootGuard` per discovered
+state, frontier indexes into that rooted state vector, and live `RawSuccessor` guards across nested
+reductions. The retained GC-on/GC-off tests cover a later pending successor, a multi-level reached state,
+fresh binding use by a subsequent condition fragment, and exact rewrite counts. The default GC-off REPL
+path remains behaviorally unchanged.
 
-### RISK-007 — Garbage-term Earley complexity
+### RISK-007 — Resolved as TNK-016
 
-The audit records a latent exponential blowup for genuinely unparseable terms against a large grammar. A common trigger was removed, but the general complexity problem is not known to be bounded. This follow-up did not re-run that expensive reproducer.
+The large-grammar probe promoted this source-level concern to TNK-016. TNK-016 now owns and closes the
+confirmed availability failure with deterministic recognition/forest work accounting, ordered completion
+waiters, a single-parse command lifecycle, and retained valid/invalid and recovery coverage. The narrower
+historical claim of invalid-only exponential growth remains unsupported: equivalent valid input exhibited
+comparable pre-fix cost.
 
 ## 8. Triage recommendations
 
@@ -845,6 +1019,13 @@ separate deferred surface.
 
 TNK-010 is resolved without changing the product gate: targeted profiling removed SipHash from Earley item dedup, and I19/I20 now pass exact output in 24.98/26.10 seconds under the retained 60-second limit on the surveyed workstation.
 
+TNK-016 is resolved. Earley completion now reads insertion-ordered nonterminal-specific waiter lists,
+recognition and forest extraction share a deterministic 100,000,000-unit budget, and command echo/execution
+reuse one parse. The original release probe is bounded to approximately one second on the surveyed
+workstation, while the retained 2,000-atom legal case and post-limit same-submission recovery remain covered.
+The remaining speed/memory parity opportunity is tracked separately as the optional, non-blocking
+`PERF-earley-leo-parser` proposal; it does not reopen TNK-016 while the availability and D3 gates hold.
+
 ### 8.6 Fixture policy
 
 Before changing implementation, preserve every confirmed direct probe as a retained fixture with:
@@ -870,4 +1051,6 @@ This document does not set release priority. It exposes the decisions:
 - **Can v0 claim the covered view/module-expression boundaries?** Yes for connected-component and operator-profile validation, overload-specific view maps, and renamed/instantiated/mixed module-origin imports covered by TNK-012–014. Theory proof obligations and warning-only subsort preservation remain explicit boundaries.
 - **Do ratified accepted diffs remain accepted for v0?** If yes, DIV-001–004 must appear in the user-facing limitations document rather than only in conformance internals.
 
-The clean release statement is narrower than “bug-free”: every confirmed TNK-001–015 issue in this survey is resolved and retained, while accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified candidates remain documented.
+The clean release statement is narrower than “bug-free”: TNK-001–016 are resolved and retained, while
+accepted accounting/order differences, explicit deferred surfaces, diagnostics gaps, and unverified
+candidates remain documented.

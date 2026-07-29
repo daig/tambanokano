@@ -11,7 +11,7 @@
 use crate::build_term::{VarIndex, build_dag, build_logic_dag, build_term};
 use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
-use crate::cfparser::{earley, forest};
+use crate::cfparser::{ParseEffort, earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt, NtType, Terminal};
 use crate::lex::{Frag, Interner, TokKind, Token, tokenize};
@@ -1381,10 +1381,25 @@ fn parse_forest_pick(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Res
     Ok(parse_forest_any(tokens, g, i)?.tree)
 }
 
+fn parse_effort_error(at: usize, tokens: &[Token], i: &Interner) -> String {
+    let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
+    format!("parse effort limit exceeded at token {at} (`{token}`)")
+}
+
 fn parse_forest_any(
     tokens: &[Token],
     g: &CompiledGrammar,
     i: &Interner,
+) -> Result<forest::Parse, String> {
+    let mut effort = ParseEffort::default();
+    parse_forest_any_with_effort(tokens, g, i, &mut effort)
+}
+
+fn parse_forest_any_with_effort(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    i: &Interner,
+    effort: &mut ParseEffort,
 ) -> Result<forest::Parse, String> {
     if tokens.is_empty() {
         return Err("empty term".into());
@@ -1396,7 +1411,8 @@ fn parse_forest_any(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let chart = earley::parse(g, tokens, Nt::Term, i);
+    let chart = earley::parse(g, tokens, Nt::Term, i, effort)
+        .map_err(|e| format!("{}: `{}`", parse_effort_error(e.at, tokens, i), rendered()))?;
     if !chart.recognized(g, Nt::Term) {
         let at = chart.furthest();
         let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
@@ -1405,7 +1421,14 @@ fn parse_forest_any(
             rendered()
         ));
     }
-    forest::extract(g, &chart, tokens.len(), Nt::Term).map_err(|e| format!("{e}: `{}`", rendered()))
+    forest::extract(g, &chart, tokens.len(), Nt::Term, effort).map_err(|e| match e {
+        forest::ExtractError::Effort(exceeded) => format!(
+            "{}: `{}`",
+            parse_effort_error(exceeded.at, tokens, i),
+            rendered()
+        ),
+        forest::ExtractError::NoParse => format!("no parse: `{}`", rendered()),
+    })
 }
 
 /// Maude accepts an omitted third argument in object syntax (`< O : C | >`) as the empty
@@ -1448,6 +1471,44 @@ fn fill_empty_object_attributes<'a>(
         }
     }
     Cow::Owned(filled)
+}
+
+/// One command term parsed once against its module grammar. The token bubble is borrowed on the common
+/// path and owned only when omitted object attributes need their identity token materialized.
+pub struct ParsedCommandTerm<'a> {
+    tokens: Cow<'a, [Token]>,
+    parsed: forest::Parse,
+}
+
+impl ParsedCommandTerm<'_> {
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+    pub(crate) fn tree(&self) -> &PTree {
+        &self.parsed.tree
+    }
+    pub(crate) fn unambiguous_tree(&self, i: &Interner) -> Result<&PTree, String> {
+        if self.parsed.ambiguous {
+            let rendered = self
+                .tokens
+                .iter()
+                .map(|token| token.text(i))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Err(format!("ambiguous parse: `{rendered}`"));
+        }
+        Ok(&self.parsed.tree)
+    }
+}
+
+pub fn parse_command_term<'a>(
+    lm: &LoadedModule,
+    i: &Interner,
+    tokens: &'a [Token],
+) -> Result<ParsedCommandTerm<'a>, String> {
+    let tokens = fill_empty_object_attributes(tokens, &lm.built, i);
+    let parsed = parse_forest_any(&tokens, &lm.grammar, i)?;
+    Ok(ParsedCommandTerm { tokens, parsed })
 }
 
 /// Parse a term token bubble and build its kernel [`Term`] (the statement/pattern path).
@@ -1502,13 +1563,19 @@ fn parse_forest_at(
     if tokens.is_empty() {
         return Err("empty term".into());
     }
-    let chart = earley::parse(g, tokens, start, i);
+    let mut effort = ParseEffort::default();
+    let chart = earley::parse(g, tokens, start, i, &mut effort)
+        .map_err(|e| parse_effort_error(e.at, tokens, i))?;
     if !chart.recognized(g, start) {
         let at = chart.furthest();
         let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
         return Err(format!("no parse at token {at} (`{token}`)"));
     }
-    let parsed = forest::extract(g, &chart, tokens.len(), start).map_err(|e| format!("{e}"))?;
+    let parsed =
+        forest::extract(g, &chart, tokens.len(), start, &mut effort).map_err(|e| match e {
+            forest::ExtractError::Effort(exceeded) => parse_effort_error(exceeded.at, tokens, i),
+            forest::ExtractError::NoParse => "no parse".to_string(),
+        })?;
     if parsed.ambiguous {
         return Err("ambiguous parse".into());
     }
@@ -1526,27 +1593,27 @@ fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortI
         .ok_or_else(|| format!("unknown sort `{name}`"))
 }
 
-/// Parse, build, and reduce a ground command term; returns `(result, rewrite count)`. Builds the term
-/// directly as a DAG ([`build_dag`]) so built-in literals (string/qid/float) and compact numerals work.
 /// The Maude-faithful command echo for `reduce in M : <term> .`: the parsed term, theory-normalized and
-/// pretty-printed exactly as the reference binary prints it — so float / rational / negative special
-/// constants collapse to their canonical surface form (`1.0e+2`, `2/4`, `-3`), redundant parens drop, and
-/// AC arguments appear in the kernel's canonical order, matching Maude's "normalize, then print" echo
-/// behaviour. Builds the pre-reduction DAG (a second, cheap parse — the echo is interactive-only) and
-/// renders it; returns an error if the term does not parse, so the caller can fall back to a raw rendering.
+/// pretty-printed exactly as the reference binary prints it. Float, rational, and negative special
+/// constants collapse to canonical surface forms (`1.0e+2`, `2/4`, `-3`), redundant parentheses drop, and
+/// AC arguments appear in kernel canonical order. Reuses the command's parsed tree, builds the
+/// pre-reduction DAG, and renders it.
 pub fn command_echo(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
     color: bool,
 ) -> Result<String, String> {
-    let tree = parse_forest_pick(term, &lm.grammar, i)?;
-    let dag = build_subject_dag(lm, &tree, term, i)?;
+    let dag = build_subject_dag(lm, term.tree(), term.tokens(), i)?;
     let mut echo = print_pretty(&lm.built, i, dag, color);
     // Nullary overloads share one runtime symbol and therefore cannot carry the parent's expected
     // declaration into pretty-printing. The variant metalevel APIs uniquely require their `empty`
     // argument at `GroundTermList`; restore that statically known domain in the command echo.
-    let head = term.first().map(|token| token.text(i)).unwrap_or("");
+    let head = term
+        .tokens()
+        .first()
+        .map(|token| token.text(i))
+        .unwrap_or("");
     if matches!(
         head,
         "metaGetVariant"
@@ -1563,9 +1630,8 @@ pub fn command_echo(
 pub fn reduce_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
 ) -> Result<(DagId, u64), String> {
-    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     // Reset BEFORE building so this command's count starts clean. Construction itself does no rewrites
     // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
     // `reduce` below is where every equation and membership application is counted (Maude's accounting).
@@ -1575,26 +1641,25 @@ pub fn reduce_command(
     // DAG. The window must close before `reduce` (it spans only construction); end it even on a build
     // error, then propagate, so a failed parse never leaks an open window into the next command.
     lm.built.engine.begin_dedup();
-    let dag = build_subject_dag(lm, &tree, term, i);
+    let dag = build_subject_dag(lm, term.tree(), term.tokens(), i);
     lm.built.engine.end_dedup();
     let dag = dag?;
     let result = lm.built.engine.reduce(dag);
     Ok((result, lm.built.engine.rewrites()))
 }
 
-/// Parse + build a ground command subject DAG, resetting the rewrite counter and building inside a dedup
-/// window exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders and the
-/// REPL's `reduce` (which then drives [`Engine::reduce_with`](tnk_core::engine::Engine::reduce_with) for
+/// Build a parsed command subject DAG, resetting the rewrite counter and building inside a dedup window
+/// exactly like [`reduce_command`]. Shared by the `rewrite`/`frewrite` session builders and the REPL's
+/// `reduce` (which then drives [`Engine::reduce_with`](tnk_core::engine::Engine::reduce_with) for
 /// META-LEVEL descent).
 pub fn build_command_dag(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
 ) -> Result<DagId, String> {
-    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
-    let dag = build_subject_dag(lm, &tree, term, i);
+    let dag = build_subject_dag(lm, term.tree(), term.tokens(), i);
     lm.built.engine.end_dedup();
     dag
 }
@@ -1647,19 +1712,18 @@ pub fn build_logic_command_parses(
 pub fn build_logic_command_dag(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
 ) -> Result<DagId, String> {
-    let tree = parse_forest_pick(term, &lm.grammar, i)?;
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
     let mut vars = VarIndex::new();
     let dag = build_logic_dag(
-        &tree,
+        term.tree(),
         &lm.grammar,
         &mut lm.built.engine,
         lm.built.nat_zero,
         lm.built.nat_succ,
-        term,
+        term.tokens(),
         i,
         &mut vars,
     );
@@ -1725,7 +1789,11 @@ fn tree_has_var(tree: &PTree, g: &CompiledGrammar) -> bool {
 /// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (fable-audit.md
 /// §3.3 B4); parsed at the universal `Term` start, matching [`build_command_dag`].
 pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -> usize {
-    earley::parse(&lm.grammar, term, Nt::Term, i).furthest()
+    let mut effort = ParseEffort::default();
+    match earley::parse(&lm.grammar, term, Nt::Term, i, &mut effort) {
+        Ok(chart) => chart.furthest(),
+        Err(exceeded) => exceeded.at,
+    }
 }
 
 /// Begin a `rewrite` (rule-fair) session over `term` (Pillar A). The caller drives the returned
@@ -1733,7 +1801,7 @@ pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -
 pub fn rewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
 ) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
     Ok(lm.built.engine.rewrite(dag))
@@ -1744,7 +1812,7 @@ pub fn rewrite_command(
 pub fn frewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
     gas: u64,
 ) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
@@ -1756,7 +1824,7 @@ pub fn frewrite_command(
 pub fn erewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
     gas: u64,
 ) -> Result<Rewriting, String> {
     let dag = build_command_dag(lm, i, term)?;
@@ -1771,15 +1839,22 @@ pub fn erewrite_command(
 pub fn search_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    subject: &[Token],
+    subject: &ParsedCommandTerm<'_>,
     arrow: SearchArrow,
-    pattern: &[Token],
+    pattern: &ParsedCommandTerm<'_>,
     such_that: Option<&[Token]>,
     max_depth: Option<u64>,
 ) -> Result<(Search, VarIndex), String> {
     // Goal pattern + such-that condition share one variable index.
     let mut vars = VarIndex::new();
-    let pat = parse_build(pattern, &lm.grammar, &lm.built, i, &mut vars)?;
+    let pat = build_term(
+        pattern.unambiguous_tree(i)?,
+        &lm.grammar,
+        &lm.built,
+        pattern.tokens(),
+        i,
+        &mut vars,
+    )?;
     let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
     let cond = match such_that {
         Some(c) => parse_condition(c, &lm.grammar, &lm.built, i, &mut vars, &mut bound)?,
@@ -1788,15 +1863,14 @@ pub fn search_command(
     let nr = vars.count();
     // Subject as a ground DAG (reset the counter so the search's rewrites start clean).
     lm.built.engine.reset_rewrites();
-    let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
     lm.built.engine.begin_dedup();
     let subj = build_dag(
-        &subj_tree,
+        subject.tree(),
         &lm.grammar,
         &mut lm.built.engine,
         lm.built.nat_zero,
         lm.built.nat_succ,
-        subject,
+        subject.tokens(),
         i,
     );
     lm.built.engine.end_dedup();
@@ -1826,9 +1900,9 @@ pub struct SmtSearchCommand {
 pub fn smt_search_command(
     lm: &mut LoadedModule,
     i: &mut Interner,
-    subject: &[Token],
+    subject: &ParsedCommandTerm<'_>,
     arrow: SearchArrow,
-    pattern: &[Token],
+    pattern: &ParsedCommandTerm<'_>,
     such_that: Option<&[Token]>,
     max_depth: Option<u64>,
 ) -> Result<SmtSearchCommand, String> {
@@ -1836,8 +1910,8 @@ pub fn smt_search_command(
         return Err("=>! mode is not supported for searching modulo SMT".to_string());
     }
 
-    let subject_tree = parse_forest_pick(subject, &lm.grammar, i)?;
-    let pattern_tree = parse_forest_pick(pattern, &lm.grammar, i)?;
+    let subject_tree = subject.tree();
+    let pattern_tree = pattern.tree();
 
     let mut subject_variables = VarIndex::new();
     let mut goal_variables = VarIndex::new();
@@ -1845,7 +1919,7 @@ pub fn smt_search_command(
         &pattern_tree,
         &lm.grammar,
         &lm.built,
-        pattern,
+        pattern.tokens(),
         i,
         &mut goal_variables,
     )?;
@@ -1870,12 +1944,12 @@ pub fn smt_search_command(
     lm.built.engine.reset_rewrites();
     lm.built.engine.begin_dedup();
     let subject_dag = build_logic_dag(
-        &subject_tree,
+        subject_tree,
         &lm.grammar,
         &mut lm.built.engine,
         lm.built.nat_zero,
         lm.built.nat_succ,
-        subject,
+        subject.tokens(),
         i,
         &mut subject_variables,
     );
@@ -3352,8 +3426,11 @@ mod tests {
                         rewrites,
                     },
                 ) => {
-                    let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                    let parsed = parse_command_term(&loaded.modules[*m], &loaded.interner, term)
                         .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+                    let (got, rw) =
+                        reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
+                            .unwrap_or_else(|err| panic!("command {idx}: {err}"));
                     {
                         let eng = &loaded.modules[*m].built.engine;
                         assert_eq!(
@@ -3365,8 +3442,13 @@ mod tests {
                     assert_eq!(rw, *rewrites, "command {idx} rewrite count");
 
                     let exp_toks = tokenize(eterm, &mut loaded.interner);
+                    let expected_parsed =
+                        parse_command_term(&loaded.modules[*m], &loaded.interner, &exp_toks)
+                            .unwrap_or_else(|err| {
+                                panic!("command {idx} expected `{eterm}`: {err}")
+                            });
                     let (want, _) =
-                        reduce_command(&mut loaded.modules[*m], &loaded.interner, &exp_toks)
+                        reduce_command(&mut loaded.modules[*m], &loaded.interner, &expected_parsed)
                             .unwrap_or_else(|err| {
                                 panic!("command {idx} expected `{eterm}`: {err}")
                             });
@@ -3439,12 +3521,13 @@ mod tests {
         let term = tokenize("s^1000000(0)", &mut loaded.interner);
         let lm = &mut loaded.modules[0];
 
+        let parsed = parse_command_term(lm, &loaded.interner, &term).expect("parse command");
         assert_eq!(
-            command_echo(lm, &loaded.interner, &term, false).expect("command echo"),
+            command_echo(lm, &loaded.interner, &parsed, false).expect("command echo"),
             "s^1000000(0)"
         );
         let (result, rewrites) =
-            reduce_command(lm, &loaded.interner, &term).expect("reduce compact prefix iteration");
+            reduce_command(lm, &loaded.interner, &parsed).expect("reduce compact prefix iteration");
         assert_eq!(rewrites, 0);
         assert_eq!(
             lm.built
@@ -3493,13 +3576,14 @@ mod tests {
         ] {
             let term = tokenize(input, &mut loaded.interner);
             let lm = &mut loaded.modules[0];
+            let parsed = parse_command_term(lm, &loaded.interner, &term).expect("parse command");
             assert_eq!(
-                command_echo(lm, &loaded.interner, &term, false).expect("iter command echo"),
+                command_echo(lm, &loaded.interner, &parsed, false).expect("iter command echo"),
                 echo,
                 "oracle print for `{input}`"
             );
             let (result, rewrites) =
-                reduce_command(lm, &loaded.interner, &term).expect("reduce overloaded iter");
+                reduce_command(lm, &loaded.interner, &parsed).expect("reduce overloaded iter");
             assert_eq!(rewrites, 0);
             assert_eq!(
                 lm.built
@@ -3983,7 +4067,9 @@ mod tests {
             else {
                 panic!("conform_render handles only reduce expectations");
             };
-            let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+            let parsed = parse_command_term(&loaded.modules[*m], &loaded.interner, term)
+                .unwrap_or_else(|err| panic!("command {idx}: {err}"));
+            let (got, rw) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
                 .unwrap_or_else(|err| panic!("command {idx}: {err}"));
             let built = &loaded.modules[*m].built;
             let sort = built
@@ -4413,18 +4499,29 @@ endm
             for (idx, (m, cmd)) in cmds.iter().enumerate() {
                 match cmd {
                     Cmd::Reduce(term) => {
+                        let parsed =
+                            parse_command_term(&loaded.modules[*m], &loaded.interner, term)
+                                .unwrap_or_else(|e| panic!("{name} cmd {idx}: parse: {e}"));
                         let (result, _) =
-                            reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+                            reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
                                 .unwrap_or_else(|e| panic!("{name} cmd {idx}: reduce: {e}"));
                         if round_trip {
                             let printed =
                                 print_raw(&loaded.modules[*m].built, &loaded.interner, result);
                             let toks = tokenize(&printed, &mut loaded.interner);
-                            let (reparsed, _) =
-                                reduce_command(&mut loaded.modules[*m], &loaded.interner, &toks)
+                            let reparsed_term =
+                                parse_command_term(&loaded.modules[*m], &loaded.interner, &toks)
                                     .unwrap_or_else(|e| {
                                         panic!("{name} cmd {idx} reparse `{printed}`: {e}")
                                     });
+                            let (reparsed, _) = reduce_command(
+                                &mut loaded.modules[*m],
+                                &loaded.interner,
+                                &reparsed_term,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!("{name} cmd {idx} reparse `{printed}`: {e}")
+                            });
                             let eng = &loaded.modules[*m].built.engine;
                             assert!(
                                 eng.deep_equal(result, reparsed),
@@ -4449,5 +4546,141 @@ endm
                 }
             }
         }
+    }
+
+    #[test]
+    fn parse_effort_limit_is_deterministic() {
+        let mut loaded = load_source(
+            "fmod EFFORT-LIMIT is
+               sort S .
+               op a : -> S [ctor] .
+               op _+_ : S S -> S [assoc comm] .
+             endfm",
+        )
+        .expect("load effort grammar");
+        let text = std::iter::repeat_n("a", 200)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let tokens = tokenize(&text, &mut loaded.interner);
+        let mut first_error = None;
+        for _ in 0..2 {
+            let mut effort = ParseEffort::new(1_000);
+            let error = parse_forest_any_with_effort(
+                &tokens,
+                &loaded.modules[0].grammar,
+                &loaded.interner,
+                &mut effort,
+            )
+            .expect_err("small explicit budget must reject");
+            assert_eq!(effort.used(), 1_000);
+            assert!(
+                error.starts_with("parse effort limit exceeded at token "),
+                "{error}"
+            );
+            if let Some(first) = &first_error {
+                assert_eq!(&error, first);
+            } else {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    #[test]
+    fn forest_extraction_shares_recognizer_budget() {
+        let mut loaded = load_source(
+            "fmod FOREST-EFFORT is
+               sort S .
+               op a : -> S [ctor] .
+               op _+_ : S S -> S [assoc comm] .
+             endfm",
+        )
+        .expect("load forest effort grammar");
+        let text = std::iter::repeat_n("a", 20).collect::<Vec<_>>().join(" + ");
+        let tokens = tokenize(&text, &mut loaded.interner);
+        let grammar = &loaded.modules[0].grammar;
+
+        let mut recognition = ParseEffort::new(u64::MAX);
+        earley::parse(
+            grammar,
+            &tokens,
+            Nt::Term,
+            &loaded.interner,
+            &mut recognition,
+        )
+        .expect("recognize term");
+        let recognition_cost = recognition.used();
+
+        let mut shared = ParseEffort::new(recognition_cost);
+        let error = parse_forest_any_with_effort(&tokens, grammar, &loaded.interner, &mut shared)
+            .expect_err("forest must not receive a fresh budget");
+        assert_eq!(shared.used(), recognition_cost);
+        assert!(
+            error.starts_with(&format!(
+                "parse effort limit exceeded at token {} (`<end>`)",
+                tokens.len()
+            )),
+            "{error}"
+        );
+    }
+
+    /// Opt-in TNK-016 scaling benchmark. Both inputs deliberately exceed the interactive safety budget so
+    /// parser algorithm changes can still be compared without weakening that availability boundary.
+    #[test]
+    #[ignore = "opt-in large-grammar parser benchmark"]
+    fn large_grammar_valid_and_invalid_parse_benchmark() {
+        let mut source = String::from("fmod EFFORT is\n sort S .\n op a : -> S [ctor] .\n");
+        for index in 0..1000 {
+            source.push_str(&format!(" op _o{index}_ : S S -> S [assoc] .\n"));
+        }
+        source.push_str("endfm\n");
+        let mut loaded = load_source(&source).expect("load generated grammar");
+        let mut text = String::from("a");
+        for _ in 1..1280 {
+            text.push_str(" o0 a");
+        }
+
+        let valid = tokenize(&text, &mut loaded.interner);
+        let mut valid_effort = ParseEffort::new(u64::MAX);
+        parse_forest_any_with_effort(
+            &valid,
+            &loaded.modules[0].grammar,
+            &loaded.interner,
+            &mut valid_effort,
+        )
+        .expect("valid benchmark term");
+        assert!(valid_effort.used() > crate::cfparser::DEFAULT_PARSE_EFFORT_LIMIT);
+
+        let invalid = tokenize(&format!("{text} o0 bogus"), &mut loaded.interner);
+        let mut invalid_effort = ParseEffort::new(u64::MAX);
+        let error = parse_forest_any_with_effort(
+            &invalid,
+            &loaded.modules[0].grammar,
+            &loaded.interner,
+            &mut invalid_effort,
+        )
+        .expect_err("invalid benchmark term");
+        assert!(
+            error.starts_with("no parse at token 2560 (`bogus`)"),
+            "{error}"
+        );
+        assert!(invalid_effort.used() > crate::cfparser::DEFAULT_PARSE_EFFORT_LIMIT);
+    }
+
+    #[test]
+    fn two_thousand_atom_flat_command_fits_parse_budget() {
+        let mut loaded = load_source(
+            "fmod D3 is
+               sort S .
+               op 1 : -> S [ctor] .
+               op _+_ : S S -> S [assoc comm] .
+             endfm",
+        )
+        .expect("load D3 grammar");
+        let text = std::iter::repeat_n("1", 2000)
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let tokens = tokenize(&text, &mut loaded.interner);
+        parse_command_term(&loaded.modules[0], &loaded.interner, &tokens)
+            .expect("retained 2,000-atom command must remain below the parser budget");
     }
 }

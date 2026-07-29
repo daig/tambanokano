@@ -1421,7 +1421,7 @@ pub fn render_float(f: f64) -> String {
 mod tests {
     use super::*;
     use crate::lex::tokenize;
-    use crate::load::{load_source, reduce_command};
+    use crate::load::{load_source, parse_command_term, reduce_command};
     use crate::surface::ast::Command;
 
     /// Round-trip: every milestone command's reduced result, raw-printed and re-reduced, is `deep_equal`
@@ -1437,13 +1437,18 @@ mod tests {
             })
             .collect();
         for (idx, (m, term)) in cmds.iter().enumerate() {
-            let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+            let parsed = parse_command_term(&loaded.modules[*m], &loaded.interner, term)
+                .unwrap_or_else(|e| panic!("command {idx}: {e}"));
+            let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
                 .unwrap_or_else(|e| panic!("command {idx}: {e}"));
             let printed = print_raw(&loaded.modules[*m].built, &loaded.interner, result);
             // Re-lex + re-reduce the printed form; it must denote the same term.
             let toks = tokenize(&printed, &mut loaded.interner);
-            let (reparsed, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &toks)
+            let reparsed_term = parse_command_term(&loaded.modules[*m], &loaded.interner, &toks)
                 .unwrap_or_else(|e| panic!("command {idx} reparse of `{printed}`: {e}"));
+            let (reparsed, _) =
+                reduce_command(&mut loaded.modules[*m], &loaded.interner, &reparsed_term)
+                    .unwrap_or_else(|e| panic!("command {idx} reparse of `{printed}`: {e}"));
             let eng = &loaded.modules[*m].built.engine;
             assert!(
                 eng.deep_equal(result, reparsed),
@@ -1521,7 +1526,9 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
         for (idx, ((m, term), want)) in cmds.iter().zip(expected).enumerate() {
-            let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, term)
+            let parsed = parse_command_term(&loaded.modules[*m], &loaded.interner, term)
+                .unwrap_or_else(|e| panic!("command {idx}: {e}"));
+            let (result, _) = reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
                 .unwrap_or_else(|e| panic!("command {idx}: {e}"));
             let got = print_pretty(&loaded.modules[*m].built, &loaded.interner, result, false);
             assert_eq!(&got.as_str(), want, "command {idx}");
@@ -1582,8 +1589,10 @@ mod tests {
             Command::Reduce { term, .. } => term.clone(),
             _ => unreachable!(),
         };
+        let parsed =
+            parse_command_term(&loaded.modules[0], &loaded.interner, &term).expect("parse");
         let (result, _) =
-            reduce_command(&mut loaded.modules[0], &loaded.interner, &term).expect("reduce");
+            reduce_command(&mut loaded.modules[0], &loaded.interner, &parsed).expect("reduce");
         let m = &loaded.modules[0].built;
         let colored = print_pretty(m, &loaded.interner, result, true);
         let plain = print_pretty(m, &loaded.interner, result, false);

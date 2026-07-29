@@ -11,6 +11,7 @@
 
 use super::compile::CompiledGrammar;
 use super::earley::{Chart, Item};
+use super::{EffortExceeded, ParseEffort};
 use crate::grammar::{GSym, Nt};
 
 /// A concrete parse tree: the production applied, the token span `[start, end)`, and the subtrees for the
@@ -34,23 +35,50 @@ pub struct Parse {
     pub alternative: Option<PTree>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractError {
+    NoParse,
+    Effort(EffortExceeded),
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoParse => f.write_str("no parse"),
+            Self::Effort(exceeded) => {
+                write!(f, "parse effort limit exceeded at token {}", exceeded.at)
+            }
+        }
+    }
+}
+
+impl From<EffortExceeded> for ExtractError {
+    fn from(value: EffortExceeded) -> Self {
+        Self::Effort(value)
+    }
+}
+
 /// Extract the first parse for `start` from the chart, or an error describing why there is none.
 pub fn extract(
     g: &CompiledGrammar,
     chart: &Chart,
     n_tokens: usize,
     start: Nt,
-) -> Result<Parse, String> {
+    effort: &mut ParseEffort,
+) -> Result<Parse, ExtractError> {
+    effort.charge_many(chart.sets[n_tokens].len(), n_tokens)?;
     let roots: Vec<Item> = chart.root_items(g, start).collect();
     let root = match roots.first() {
-        None => return Err("no parse".to_string()),
+        None => return Err(ExtractError::NoParse),
         Some(&r) => r,
     };
     let mut ambiguous = roots.len() > 1;
-    let tree = extract_item(g, chart, root.prod, 0, n_tokens, &mut ambiguous);
-    let alternative = ambiguous
-        .then(|| second_parse(g, chart, &roots, n_tokens, &tree))
-        .flatten();
+    let tree = extract_item(g, chart, root.prod, 0, n_tokens, &mut ambiguous, effort)?;
+    let alternative = if ambiguous {
+        second_parse(g, chart, &roots, n_tokens, &tree, effort)?
+    } else {
+        None
+    };
     Ok(Parse {
         tree,
         ambiguous,
@@ -66,29 +94,33 @@ fn extract_item(
     origin: usize,
     end: usize,
     ambiguous: &mut bool,
-) -> PTree {
+    effort: &mut ParseEffort,
+) -> Result<PTree, EffortExceeded> {
+    effort.charge(end)?;
     let rhs = &g.prods[prod as usize].rhs;
     let mut pos = end;
     let mut kids_rev = Vec::new();
     for k in (0..rhs.len()).rev() {
+        effort.charge(pos)?;
         match rhs[k] {
-            GSym::T(_) => pos -= 1, // a terminal consumed exactly one token
+            GSym::T(_) => pos -= 1,
             GSym::N(nt) => {
                 let bound = g.prods[prod as usize].bound[k].unwrap();
-                let (s, q) = find_split(g, chart, prod, origin, k, nt, bound, pos, ambiguous);
-                kids_rev.push(extract_item(g, chart, q, s, pos, ambiguous));
+                let (s, q) =
+                    find_split(g, chart, prod, origin, k, nt, bound, pos, ambiguous, effort)?;
+                kids_rev.push(extract_item(g, chart, q, s, pos, ambiguous, effort)?);
                 pos = s;
             }
         }
     }
     debug_assert_eq!(pos, origin, "rhs spans did not tile [origin, end)");
     kids_rev.reverse();
-    PTree {
+    Ok(PTree {
         prod,
         start: origin,
         end,
         nt_children: kids_rev,
-    }
+    })
 }
 
 /// Find the split for the `k`-th rhs symbol (a nonterminal `nt`) of `prod` (started at `origin`) whose
@@ -106,7 +138,8 @@ fn find_split(
     bound: u32,
     end: usize,
     ambiguous: &mut bool,
-) -> (usize, u32) {
+    effort: &mut ParseEffort,
+) -> Result<(usize, u32), EffortExceeded> {
     let prefix = Item {
         prod,
         dot: k as u16,
@@ -114,6 +147,7 @@ fn find_split(
     };
     let mut found: Option<(usize, u32)> = None;
     for &it in &chart.sets[end] {
+        effort.charge(end)?;
         let q = &g.prods[it.prod as usize];
         if q.lhs == nt && it.dot as usize == q.rhs.len() && q.prec <= bound {
             let s = it.origin as usize;
@@ -127,7 +161,7 @@ fn find_split(
             }
         }
     }
-    found.expect("recognizer accepted but no split found (parser invariant)")
+    Ok(found.expect("recognizer accepted but no split found (parser invariant)"))
 }
 
 /// Enumerate just enough of the packed forest to recover the second concrete parse. The walk follows
@@ -140,16 +174,18 @@ fn second_parse(
     roots: &[Item],
     n_tokens: usize,
     first: &PTree,
-) -> Option<PTree> {
+    effort: &mut ParseEffort,
+) -> Result<Option<PTree>, EffortExceeded> {
     let mut visiting = Vec::new();
     for root in roots {
-        for tree in enumerate_item(g, chart, root.prod, 0, n_tokens, &mut visiting) {
+        for tree in enumerate_item(g, chart, root.prod, 0, n_tokens, &mut visiting, effort)? {
+            effort.charge(n_tokens)?;
             if &tree != first {
-                return Some(tree);
+                return Ok(Some(tree));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn enumerate_item(
@@ -159,10 +195,13 @@ fn enumerate_item(
     origin: usize,
     end: usize,
     visiting: &mut Vec<(u32, usize, usize)>,
-) -> Vec<PTree> {
+    effort: &mut ParseEffort,
+) -> Result<Vec<PTree>, EffortExceeded> {
+    effort.charge(end)?;
+    effort.charge_many(visiting.len(), end)?;
     let key = (prod, origin, end);
     if visiting.contains(&key) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     visiting.push(key);
     let children = enumerate_prefix(
@@ -173,9 +212,10 @@ fn enumerate_item(
         g.prods[prod as usize].rhs.len(),
         end,
         visiting,
-    );
+        effort,
+    )?;
     visiting.pop();
-    children
+    Ok(children
         .into_iter()
         .map(|nt_children| PTree {
             prod,
@@ -184,7 +224,7 @@ fn enumerate_item(
             nt_children,
         })
         .take(2)
-        .collect()
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,17 +236,19 @@ fn enumerate_prefix(
     upto: usize,
     end: usize,
     visiting: &mut Vec<(u32, usize, usize)>,
-) -> Vec<Vec<PTree>> {
+    effort: &mut ParseEffort,
+) -> Result<Vec<Vec<PTree>>, EffortExceeded> {
+    effort.charge(end)?;
     if upto == 0 {
-        return (end == origin).then(Vec::new).into_iter().collect();
+        return Ok((end == origin).then(Vec::new).into_iter().collect());
     }
     let k = upto - 1;
     match g.prods[prod as usize].rhs[k] {
         GSym::T(_) => {
             if end == 0 {
-                Vec::new()
+                Ok(Vec::new())
             } else {
-                enumerate_prefix(g, chart, prod, origin, k, end - 1, visiting)
+                enumerate_prefix(g, chart, prod, origin, k, end - 1, visiting, effort)
             }
         }
         GSym::N(nt) => {
@@ -218,6 +260,7 @@ fn enumerate_prefix(
             };
             let mut results = Vec::new();
             for &item in &chart.sets[end] {
+                effort.charge(end)?;
                 let child_prod = &g.prods[item.prod as usize];
                 if child_prod.lhs != nt
                     || item.dot as usize != child_prod.rhs.len()
@@ -229,21 +272,24 @@ fn enumerate_prefix(
                 if !chart.contains(split, prefix) {
                     continue;
                 }
-                let child_trees = enumerate_item(g, chart, item.prod, split, end, visiting);
+                let child_trees =
+                    enumerate_item(g, chart, item.prod, split, end, visiting, effort)?;
                 for child in child_trees {
-                    for mut siblings in enumerate_prefix(g, chart, prod, origin, k, split, visiting)
+                    for mut siblings in
+                        enumerate_prefix(g, chart, prod, origin, k, split, visiting, effort)?
                     {
+                        effort.charge(end)?;
                         siblings.push(child.clone());
                         if !results.contains(&siblings) {
                             results.push(siblings);
                             if results.len() == 2 {
-                                return results;
+                                return Ok(results);
                             }
                         }
                     }
                 }
             }
-            results
+            Ok(results)
         }
     }
 }

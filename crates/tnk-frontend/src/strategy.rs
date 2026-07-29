@@ -20,10 +20,12 @@
 //! when interleaved with parallel unequal-depth work — Maude's `SubtermTask`/`rewriteTask` parallel-odometer
 //! is the documented residual, `fable-audit.md`). `xmatchrew` and conditional `csd` error clearly at resolve.
 
-use crate::build_term::VarIndex;
+use crate::build_term::{VarIndex, build_term};
 use crate::cfparser::compile::CompiledGrammar;
 use crate::lex::{Interner, Token};
-use crate::load::{LoadedModule, parse_build, parse_condition, term_var_indices};
+use crate::load::{
+    LoadedModule, ParsedCommandTerm, parse_build, parse_condition, term_var_indices,
+};
 use crate::surface::ast::{StratExpr, StratSugar, TestKind};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
@@ -232,12 +234,19 @@ enum TaskKind {
 pub fn srewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
-    term: &[Token],
+    term: &ParsedCommandTerm<'_>,
     strat: &StratExpr,
     depth_first: bool,
 ) -> Result<(Vec<StratSolution>, u64), String> {
     let mut vars = VarIndex::new();
-    let subj_term = parse_build(term, &lm.grammar, &lm.built, i, &mut vars)?;
+    let subj_term = build_term(
+        term.unambiguous_tree(i)?,
+        &lm.grammar,
+        &lm.built,
+        term.tokens(),
+        i,
+        &mut vars,
+    )?;
     if vars.count() != 0 {
         return Err("srewrite subject must be a ground term".to_string());
     }

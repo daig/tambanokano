@@ -92,3 +92,44 @@ fn redefining_strategy_donor_rebuilds_existing_importer() {
     assert!(after.output.contains("result S: c"), "{}", after.output);
     assert!(!after.output.contains("result S: b"), "{}", after.output);
 }
+
+#[test]
+fn parser_effort_limit_reports_once_and_session_recovers() {
+    let mut session = Session::new();
+    let mut module = String::from(
+        "fmod PARSE-EFFORT-RECOVERY is
+           sort S .
+           op a : -> S [ctor] .
+",
+    );
+    for index in 0..500 {
+        module.push_str(&format!("op _o{index}_ : S S -> S [assoc] .\n"));
+    }
+    module.push_str("endfm");
+    let entered = session.eval(&module, false);
+    assert!(!entered.exit, "{}", entered.output);
+    assert_eq!(session.current(), Some("PARSE-EFFORT-RECOVERY"));
+
+    let mut command = String::from("reduce a");
+    for _ in 1..640 {
+        command.push_str(" o0 a");
+    }
+    command.push_str(" o0 bogus .\nreduce a .");
+    let recovered = session.eval(&command, false);
+    assert!(!recovered.exit);
+    assert_eq!(
+        recovered
+            .output
+            .matches("parse effort limit exceeded at token")
+            .count(),
+        1,
+        "{}",
+        recovered.output
+    );
+
+    assert!(
+        recovered.output.contains("result S: a"),
+        "{}",
+        recovered.output
+    );
+}

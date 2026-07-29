@@ -2015,6 +2015,37 @@ fn objects_io_through_repl() {
     );
 }
 
+#[test]
+fn erewrite_parse_failure_preserves_pending_stdin() {
+    let mut r = repl();
+    let (modules, _) = conformance_file!("objects-io.maude")
+        .split_once("erewrite in GREET")
+        .expect("objects-io command boundary");
+    let loaded = r.eval(modules);
+    assert!(
+        !loaded.exit && !loaded.output.contains("error in module"),
+        "{}",
+        loaded.output
+    );
+
+    r.set_stdin("kept\n");
+    let rejected = r.eval("erewrite in ECHO : bogus .");
+    assert!(
+        rejected
+            .output
+            .contains("error: no parse at token 0 (`bogus`)"),
+        "{}",
+        rejected.output
+    );
+
+    let recovered = r.eval("erewrite in ECHO : <> start(e) < e : Echoer | n : (s 0) > .");
+    assert!(
+        recovered.output.contains("\nkept\n"),
+        "failed erewrite must not consume pending stdin: {}",
+        recovered.output
+    );
+}
+
 /// Pillar 2.5-E — the object-oriented **surface language** (`omod`/`class`/`subclass`/`msg`). Each `omod`
 /// desugars to CONFIGURATION-based Core-Maude (`class C` → sort + `subsort C < Cid` + constant `op C`;
 /// attribute `a : S` → `op a :_ : S -> Attribute`; `subclass` → subsort; `msg` → `[ctor msg]` op) and

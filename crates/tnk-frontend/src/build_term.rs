@@ -583,7 +583,7 @@ pub fn unquote_string(tok: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfparser::{earley, forest};
+    use crate::cfparser::{ParseEffort, earley, forest};
     use crate::grammar::{Nt, build::build_grammar};
     use crate::lex::tokenize;
     use crate::sig::build_sig::build_module;
@@ -627,8 +627,11 @@ endfm
         /// Parse + build + reduce a ground term; return `(result, rewrites)`.
         fn reduce(&mut self, term: &str) -> (tnk_core::dag::DagId, u64) {
             let tokens = tokenize(term, &mut self.i);
-            let chart = earley::parse(&self.g, &tokens, Nt::Term, &self.i);
-            let parse = forest::extract(&self.g, &chart, tokens.len(), Nt::Term).expect("parse");
+            let mut effort = ParseEffort::default();
+            let chart = earley::parse(&self.g, &tokens, Nt::Term, &self.i, &mut effort)
+                .expect("parse effort");
+            let parse = forest::extract(&self.g, &chart, tokens.len(), Nt::Term, &mut effort)
+                .expect("parse");
             assert!(!parse.ambiguous, "`{term}` parsed ambiguously");
             let mut vars = VarIndex::new();
             let t = build_term(&parse.tree, &self.g, &self.m, &tokens, &self.i, &mut vars)
@@ -704,9 +707,11 @@ endfm
     fn static_prefix_iteration_is_one_bignum_term_node() {
         let mut e = natb();
         let tokens = tokenize("s_^1000000(0)", &mut e.i);
-        let chart = earley::parse(&e.g, &tokens, Nt::Term, &e.i);
-        let parse =
-            forest::extract(&e.g, &chart, tokens.len(), Nt::Term).expect("parse compact iter");
+        let mut effort = ParseEffort::default();
+        let chart =
+            earley::parse(&e.g, &tokens, Nt::Term, &e.i, &mut effort).expect("parse effort");
+        let parse = forest::extract(&e.g, &chart, tokens.len(), Nt::Term, &mut effort)
+            .expect("parse compact iter");
         assert!(!parse.ambiguous);
         let term = build_term(&parse.tree, &e.g, &e.m, &tokens, &e.i, &mut VarIndex::new())
             .expect("build compact static iter");

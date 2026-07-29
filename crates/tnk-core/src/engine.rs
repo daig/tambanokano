@@ -4955,24 +4955,6 @@ impl Runtime {
         node
     }
 
-    /// Collect **every** one-step successor of `root` (Pillar A-iv `search`): each `(rule_id, term)` where
-    /// some rule, at some non-frozen position, rewrites `root` to `term` (path rebuilt to the root). Every
-    /// successor counts as one rewrite (Maude's search statistic). Unlike [`rewrite_step`](Self::rewrite_step)
-    /// (first applicable), this enumerates all rules × all matcher solutions at all positions.
-    pub(crate) fn state_successors(
-        &mut self,
-        sig: &Signature,
-        root: DagId,
-        out: &mut Vec<(u32, DagId)>,
-    ) {
-        let batch = self.state_successors_deferred(sig, root);
-        for successor in batch.entries {
-            self.rewrite_count += successor.enumeration_rewrites;
-            out.push((successor.rule_id, successor.term));
-        }
-        self.rewrite_count += batch.tail_rewrites;
-    }
-
     /// Eagerly materialize one state's raw rule results while deferring the equational work spent
     /// finding them. `StateGraph` replays each prefix only when its corresponding result is consumed,
     /// and replays the tail only when the caller asks to prove the stream exhausted. This matches
@@ -5456,8 +5438,13 @@ impl Runtime {
     /// includes zero steps), match `pattern` against each — binding `fresh_vars` — and recurse into the
     /// rest of the condition, backtracking to the next reachable state on failure. Every rule step counts
     /// as a rewrite (Maude accounting). Non-termination on an infinite reachable space is inherited from
-    /// Maude. (The REPL runs with GC off, so the discovered states stay live; a GC-rooted variant is the
-    /// same follow-up as the other re-entrant condition reductions, F-2.)
+    /// Maude.
+    ///
+    /// Every retained DAG follows the same ownership contract as `StateGraph`: `states` owns one
+    /// [`RootGuard`] per discovered canonical state, and each raw successor keeps its guard until it has
+    /// been reduced and either interned into `states` or discarded as a duplicate. Frontier entries are
+    /// state indexes rather than independent DAG handles. Consequently a nested reduce may collect without
+    /// reclaiming pending successors, the current state, or fresh bindings reachable from a matched state.
     #[allow(clippy::too_many_arguments)]
     fn solve_rewrite_condition(
         &mut self,
@@ -5472,10 +5459,13 @@ impl Runtime {
         stmt_id: u32,
         depth: u32,
     ) -> bool {
-        let _root = self.root(start);
-        let mut seen: Vec<DagId> = vec![start];
-        let mut frontier: VecDeque<DagId> = VecDeque::from([start]);
-        while let Some(state) = frontier.pop_front() {
+        let mut states = vec![RootedDag {
+            node: start,
+            _root: self.root(start),
+        }];
+        let mut frontier = VecDeque::from([0usize]);
+        while let Some(state_index) = frontier.pop_front() {
+            let state = states[state_index].node;
             for &fv in fresh_vars {
                 subst.unbind(fv);
             }
@@ -5487,19 +5477,40 @@ impl Runtime {
                     }
                 }
             }
-            // Expand: every rule step is a rewrite; reduce each successor and hash-cons new states.
-            let mut succs: Vec<(u32, DagId)> = Vec::new();
-            self.state_successors(sig, state, &mut succs);
-            for (_rule_id, succ) in succs {
+
+            // Generate eagerly exactly as `state_successors` does, including charging all matcher/
+            // condition work before reducing the first result. Keep the raw guards, however: reducing
+            // one successor may collect, so every other pending result must remain live.
+            let batch = self.state_successors_deferred(sig, state);
+            for successor in &batch.entries {
+                self.rewrite_count += successor.enumeration_rewrites;
+            }
+            self.rewrite_count += batch.tail_rewrites;
+            for successor in batch.entries {
+                let RawSuccessor {
+                    term: succ,
+                    _root: pending_root,
+                    ..
+                } = successor;
                 self.rewrite_count += 1;
                 self.rule_rewrite_count += 1;
                 self.condition_depth += 1;
                 let reduced = self.reduce(sig, succ, &mut NullDescent);
                 self.condition_depth -= 1;
-                if !seen.iter().any(|&s| self.deep_equal(s, reduced)) {
-                    seen.push(reduced);
-                    frontier.push_back(reduced);
+                if !states
+                    .iter()
+                    .any(|rooted| self.deep_equal(rooted.node, reduced))
+                {
+                    let next = states.len();
+                    states.push(RootedDag {
+                        node: reduced,
+                        _root: self.root(reduced),
+                    });
+                    frontier.push_back(next);
                 }
+                // If `reduced` was new, `states` now owns it. If it was a duplicate, the matching
+                // canonical state was already rooted and this transient result is no longer needed.
+                drop(pending_root);
             }
         }
         self.end_fragment(kind, stmt_id, i, depth, false, subst);
@@ -9217,10 +9228,10 @@ mod tests {
         assert_eq!(e.node(r2).symbol(), nzq, "nz?(z) is its own normal form");
     }
 
-    /// B2.3a audit-F-2 mitigation: a conditional equation whose condition reduces re-entrantly stays
-    /// correct with safe-point GC enabled. GC is disabled *during* condition evaluation, so the nested
-    /// reduce can't sweep the outer reduction's in-flight state; the result and rewrite count are
-    /// identical to the GC-off run. (`ceq f(N) = z if g(N) = tt`, with `g(s^k z)` reducing in `k+1`.)
+    /// B2.3a/F-2: a conditional equation whose condition reduces re-entrantly stays correct with
+    /// safe-point GC enabled. The nested reduce keeps GC enabled while `condition_holds` protects the
+    /// outer frame/bindings/redex and the equality arm pins its left result across right-side reduction.
+    /// Result and rewrite count must be identical to the GC-off run.
     #[test]
     fn conditional_reduce_is_stable_under_safe_point_gc() {
         fn run(interval: Option<u64>) -> (SymbolId, u64) {
@@ -9259,7 +9270,7 @@ mod tests {
             (e.node(r).symbol(), e.rewrites())
         }
         let off = run(None);
-        let on = run(Some(4)); // aggressive collection around (not during) the condition reduce
+        let on = run(Some(4)); // aggressive collection during the condition reduce
         assert_eq!(
             off.1, 22,
             "f(20) → z in 22 rewrites (21 condition + 1 equation)"
@@ -11765,6 +11776,139 @@ mod tests {
             decode(&e, children[1], zero, s),
             120,
             "pickm(b) = b + b = 120 (matched subject survived)"
+        );
+    }
+
+    /// TNK-017 pending-result boundary: `start` has two successors and the rewrite-condition target is
+    /// the second. Reducing the first successor under per-allocation GC must not collect the still-pending
+    /// second successor while the deferred successor batch is consumed.
+    #[test]
+    fn rewrite_condition_pending_successors_survive_safe_point_gc() {
+        fn run(interval: Option<u64>) -> (bool, bool, u64) {
+            let mut e = Engine::new();
+            let s = e.add_sort("S");
+            e.close_sorts();
+            let trigger = e.add_op("trigger", vec![], s);
+            let start = e.add_op("start", vec![], s);
+            let first = e.add_op("first", vec![], s);
+            let value = e.add_op("value", vec![], s);
+            let box_ = e.add_op("box", vec![s], s);
+            let got = e.add_op("got", vec![s], s);
+
+            e.add_rule(Term::constant(start), Term::constant(first), 0);
+            e.add_rule(
+                Term::constant(start),
+                Term::op(box_, vec![Term::constant(value)]),
+                0,
+            );
+            let y = Term::var(0, s);
+            e.add_conditional_rule(
+                Term::constant(trigger),
+                Term::op(got, vec![y.clone()]),
+                1,
+                vec![ConditionFragment::Rewrite {
+                    lhs: Term::constant(start),
+                    pattern: Term::op(box_, vec![y]),
+                    fresh_vars: vec![0],
+                }],
+            );
+
+            e.set_gc_interval(interval);
+            let initial = e.make_const(trigger);
+            let mut rewriting = e.rewrite(initial);
+            let result = rewriting.run(&mut e, Some(1)).term;
+            let (symbol, children) = {
+                let node = e.node(result);
+                (node.symbol(), node.children().collect::<Vec<_>>())
+            };
+            (
+                symbol == got,
+                children.len() == 1 && e.node(children[0]).symbol() == value,
+                e.rewrites(),
+            )
+        }
+
+        let off = run(None);
+        assert_eq!(off, (true, true, 3), "later successor binds Y: value");
+        assert_eq!(
+            run(Some(1)),
+            off,
+            "pending successor survives nested safe-point GC"
+        );
+    }
+
+    /// TNK-017 discovered-state/binding boundary: the target is two rule steps deep, then an unrelated
+    /// equality fragment allocates and reduces before the rhs consumes the fresh binding. Every retained
+    /// BFS state—and therefore the reached state's bound child—must remain rooted across that reduction.
+    #[test]
+    fn rewrite_condition_discovered_states_and_bindings_survive_safe_point_gc() {
+        fn run(interval: Option<u64>) -> (bool, bool, u64) {
+            let mut e = Engine::new();
+            let s = e.add_sort("S");
+            e.close_sorts();
+            let trigger = e.add_op("trigger", vec![], s);
+            let start = e.add_op("start", vec![], s);
+            let middle = e.add_op("middle", vec![], s);
+            let value = e.add_op("value", vec![], s);
+            let zero = e.add_op("zero", vec![], s);
+            let box_ = e.add_op("box", vec![s], s);
+            let got = e.add_op("got", vec![s], s);
+            let burn = e.add_op("burn", vec![s], s);
+
+            e.add_equation(Equation {
+                lhs: Term::op(burn, vec![Term::var(0, s)]),
+                rhs: Term::var(0, s),
+                nr_vars: 1,
+            });
+            e.add_rule(Term::constant(start), Term::constant(middle), 0);
+            e.add_rule(
+                Term::constant(middle),
+                Term::op(box_, vec![Term::constant(value)]),
+                0,
+            );
+            let y = Term::var(0, s);
+            e.add_conditional_rule(
+                Term::constant(trigger),
+                Term::op(got, vec![y.clone()]),
+                1,
+                vec![
+                    ConditionFragment::Rewrite {
+                        lhs: Term::constant(start),
+                        pattern: Term::op(box_, vec![y]),
+                        fresh_vars: vec![0],
+                    },
+                    ConditionFragment::Equality {
+                        lhs: Term::op(burn, vec![Term::constant(zero)]),
+                        rhs: Term::constant(zero),
+                    },
+                ],
+            );
+
+            e.set_gc_interval(interval);
+            let initial = e.make_const(trigger);
+            let mut rewriting = e.rewrite(initial);
+            let result = rewriting.run(&mut e, Some(1)).term;
+            let (symbol, children) = {
+                let node = e.node(result);
+                (node.symbol(), node.children().collect::<Vec<_>>())
+            };
+            (
+                symbol == got,
+                children.len() == 1 && e.node(children[0]).symbol() == value,
+                e.rewrites(),
+            )
+        }
+
+        let off = run(None);
+        assert_eq!(
+            off,
+            (true, true, 4),
+            "two search steps + one equality + outer rule"
+        );
+        assert_eq!(
+            run(Some(1)),
+            off,
+            "discovered states and fresh binding survive later-fragment GC"
         );
     }
 

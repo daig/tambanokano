@@ -171,11 +171,19 @@ Count fidelity that does *not* ride the AC rework (that part is D2):
   Phase 5 (extension/residue) owns the xmatch solution-set corners (§3.3), including the S-theory/iter and
   AU-bare-variable under-enumeration the audit added. B1 (collapse) will already have landed — keep its
   fixtures as the Phase-4 regression net.
-- **D3. Front-end scaling (§3.5).** The ~cubic parse/build of large well-formed terms (5000-element AC
-  sum: >60s vs oracle 30ms) — profile the Earley + term-build path on flat-chain input; likely a
-  representation/algorithmic fix in the forest→term walk, independent of D2. Plus the documented
-  garbage-term Earley blowup: add a parse-effort cap with a clean error. Fragility: medium — measure
-  first, the audit only bounded the exponent, not the site.
+- **D3. Front-end scaling (§3.5) — resolved as TNK-016.** The well-formed 2,000-element flat-chain
+  regression remains below the parser budget. The separate large-grammar availability failure—historically
+  24.72 seconds/181 MB for a late typo versus Maude's 0.03 seconds/5 MB—is now bounded by deterministic
+  recognition/forest work accounting. Earley completion uses insertion-ordered per-nonterminal waiter
+  indexes, command echo/execution share one parsed tree, and an effort failure does not poison the following
+  command. Generated valid/invalid scaling remains available through an opt-in benchmark; the default gate
+  retains the legal flat-chain and same-submission recovery cases.
+  **Non-blocking follow-up (`PERF-earley-leo-parser`):** evaluate Maude's compiled terminal/nonterminal
+  decision trees, left-recursion expansion tables, Leo deterministic-reduction-path memoization, and dense
+  integer-indexed call/return storage to close the remaining throughput and memory gap. This is an optional
+  optimization, not a correctness or release blocker while TNK-016's availability contract and D3 remain
+  green. Preserve parse ordering and ambiguity behavior; use the retained D3 case and generated
+  1,000-operator/1,280-atom benchmark to gate each phase.
 
 ## E. Diagnostics surface (§2, §4.4)
 
@@ -301,6 +309,11 @@ generations — the drop list in `01-architecture-map.md` §5 stands).
    `#n`/`%n`/`@n`; variants and narrowing share it, including the byte-visible family alternation.
 9. **Search/state-graph memory — resolved for S3.** Retained states own `RootGuard`s; descendant
    eviction and session/cache teardown release those roots under the existing arena-GC discipline.
+10. **Rewrite-condition BFS GC rooting — resolved as TNK-017.** The local graph in
+    `Runtime::solve_rewrite_condition` now owns one `RootGuard` per discovered state, stores frontier
+    indexes, and retains each pending `RawSuccessor` guard across nested reduction. Focused
+    `set_gc_interval(Some(1))` regressions pin branching and multi-level state/binding lifetimes against the
+    unchanged GC-off result and rewrite counts.
 
 ## Conformance strategy (unchanged in spirit, upgraded in mechanism)
 

@@ -382,11 +382,15 @@ Each of these breaks real specs; several break stock library files.
 - **[N] Super-linear (~cubic) handling of large well-formed terms**: **RESOLVED (dd46724 + earlier frontend work — the 2000-element chain parses, reduces (1999 counted folds), and prints oracle-equal well inside the budget; D3 fixture passes.)** a flat 2000-element AC sum takes 14s
   (oracle: milliseconds), 5000 elements > 60s vs oracle 30ms. Distinct from the documented garbage-bubble
   Earley blowup — this is the well-formed path (parse/build dominates; AC contributes the larger factor).
-- **[D] Garbage-term Earley blowup** (the distinct, documented case — not re-reproduced this audit): a
-  genuinely unparseable command term against a large module's grammar can enumerate exponentially. The
-  `in <MODULE> :` command qualifier removed the common historical trigger (the module name is parsed
-  structurally, not as part of the term bubble); a true typo against a big module remains a latent hang. A
-  parse timeout / ambiguity cap is the eventual fix.
+- **[D] Garbage-term Earley blowup — RESOLVED (TNK-016).** The confirmed probe used 1,000 associative
+  operators and a 1,280-atom chain ending in `bogus`: before the repair tnk took 24.72 seconds and 181 MB
+  before reporting no parse, versus Maude 3.5.1 at 0.03 seconds and 5 MB. Completion now reads
+  insertion-ordered waiter lists indexed by expected nonterminal; recognition and forest extraction share
+  a deterministic 100,000,000-unit budget; and command echo/execution reuse one parse. The original release
+  probe now returns the distinct effort-limit diagnostic in 1.06 seconds at 18.5 MB. A 2,000-atom legal
+  term, an opt-in generated valid/invalid scaling pair, deterministic exhaustion, and same-submission
+  recovery are retained. Equivalent valid/invalid pre-fix costs still disprove the older invalid-only
+  exponential characterization.
 - **[N] `rewrites/second` timing is a stub** (always `0ms (~ rewrites/second)`).
 
 ### 3.6 Extra acceptance (tnk accepts what Maude rejects)

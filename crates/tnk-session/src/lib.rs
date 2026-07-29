@@ -19,11 +19,11 @@ use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtResult};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{Interner, TokKind, Token, tokenize};
 use tnk_frontend::load::{
-    InternerNames, LoadedModule, build_command_dag, build_logic_command_dag, command_echo,
-    command_variable_display_name, erewrite_command, format_matchers, frewrite_command,
-    match_command, maude_variable_name_rank, narrow_command, render_unifier, rewrite_command,
-    search_command, smt_search_command, unify_command, variant_command, variant_match_command,
-    variant_unify_command,
+    InternerNames, LoadedModule, ParsedCommandTerm, build_command_dag, build_logic_command_dag,
+    command_echo, command_variable_display_name, erewrite_command, format_matchers,
+    frewrite_command, match_command, maude_variable_name_rank, narrow_command, parse_command_term,
+    render_unifier, rewrite_command, search_command, smt_search_command, unify_command,
+    variant_command, variant_match_command, variant_unify_command,
 };
 use tnk_frontend::pretty::{print_pretty, print_pretty_with_variables};
 use tnk_frontend::surface::ast::{
@@ -560,10 +560,15 @@ impl Session {
             Command::Reduce { term, .. } => {
                 self.last = None; // a non-continue command invalidates the saved rewrite continuation
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
-                // Maude echoes the *normalized, pretty-printed* parsed term (special constants collapsed,
-                // AC args canonically ordered), not the raw input; fall back to the token join if it
-                // somehow does not parse (the reduce below then reports the real error).
-                let echo = command_echo(lm, &self.interner, &term, self.render_color)
+                let Some(parsed) =
+                    parse_command_or_report(lm, &self.interner, &term, out)
+                else {
+                    return;
+                };
+                // Maude echoes the normalized, pretty-printed term. The tree was parsed once above and is
+                // reused by echo and execution; raw joining is only a fallback if echo DAG construction
+                // fails, in which case execution reports the build error.
+                let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
@@ -571,7 +576,7 @@ impl Session {
                 // handed to `MetaDescent`, which down-translates its meta-module argument into a real
                 // object module (resolving imports from the db) and reduces in it. The descent borrows the
                 // interner mutably, so it is dropped before the (immutable-interner) pretty-print.
-                let reduced = build_command_dag(lm, &self.interner, &term).map(|dag| {
+                let reduced = build_command_dag(lm, &self.interner, &parsed).map(|dag| {
                     let mut descent = MetaDescent::new(
                         &mut self.interner,
                         &self.db,
@@ -635,9 +640,14 @@ impl Session {
             Command::Check { term, .. } => {
                 self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
-                let echo = command_echo(lm, &self.interner, &term, self.render_color)
+                let Some(parsed) =
+                    parse_command_or_report(lm, &self.interner, &term, out)
+                else {
+                    return;
+                };
+                let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
-                match build_logic_command_dag(lm, &self.interner, &term) {
+                match build_logic_command_dag(lm, &self.interner, &parsed) {
                     Ok(dag) => {
                         let mut solver = ConfiguredSmtEngine::default();
                         let result = solver.check_dag(&lm.built.engine, dag);
@@ -678,12 +688,17 @@ impl Session {
             Command::Rewrite { bound, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `rewrite` restarts the `counter` built-in
-                let echo = command_echo(lm, &self.interner, &term, self.render_color)
+                let Some(parsed) =
+                    parse_command_or_report(lm, &self.interner, &term, out)
+                else {
+                    return;
+                };
+                let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                 let bound_str = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
-                match rewrite_command(lm, &self.interner, &term) {
+                match rewrite_command(lm, &self.interner, &parsed) {
                     Ok(mut rw) => {
                         let body = render_rewriting(
                             lm,
@@ -704,7 +719,12 @@ impl Session {
             Command::Frewrite { bound, gas, term, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `frewrite` restarts the `counter` built-in
-                let echo = command_echo(lm, &self.interner, &term, self.render_color)
+                let Some(parsed) =
+                    parse_command_or_report(lm, &self.interner, &term, out)
+                else {
+                    return;
+                };
+                let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
@@ -716,7 +736,7 @@ impl Session {
                     (None, Some(g)) => format!(" [, {g}]"),
                     _ => String::new(),
                 };
-                match frewrite_command(lm, &self.interner, &term, gas.unwrap_or(1)) {
+                match frewrite_command(lm, &self.interner, &parsed, gas.unwrap_or(1)) {
                     Ok(mut rw) => {
                         let body = render_rewriting(
                             lm,
@@ -748,15 +768,18 @@ impl Session {
                     show_breakdown,
                     ..
                 } = self;
-                let external_input = std::mem::take(stdin);
                 let lm = modules.get_mut(&cur).expect("current module is built");
+                let Some(parsed) = parse_command_or_report(lm, interner, &term, out) else {
+                    return;
+                };
+                let external_input = std::mem::take(stdin);
                 lm.built.engine.reset_counter();
                 lm.built.engine.reset_external();
                 // Interpreter objects are capabilities of one top-level `erewrite` command. A new
                 // command discards the prior configuration and Maude reuses child id 0.
                 *interpreters = InterpreterRegistry::default();
                 lm.built.engine.set_external_input(external_input);
-                let echo = command_echo(lm, interner, &term, *render_color)
+                let echo = command_echo(lm, interner, &parsed, *render_color)
                     .unwrap_or_else(|_| join_tokens(&term, interner));
                 lm.built.engine.set_trace(trace.master);
                 lm.built.engine.set_record_whole(trace.master && trace.whole);
@@ -765,7 +788,7 @@ impl Session {
                     (Some(n), None) => format!(" [{n}]"),
                     _ => String::new(),
                 };
-                match erewrite_command(lm, interner, &term, gas.unwrap_or(1)) {
+                match erewrite_command(lm, interner, &parsed, gas.unwrap_or(1)) {
                     Ok(mut rw) => {
                         let step = drive_external_rewriting(
                             &mut rw,
@@ -799,14 +822,40 @@ impl Session {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // search is not traced (yet)
                 lm.built.engine.set_record_whole(false);
-                let header = search_header(lm, &self.interner, &subject, arrow, &pattern, such_that.as_deref(), self.render_color);
+                let Some(subject_parsed) =
+                    parse_command_or_report(lm, &self.interner, &subject, out)
+                else {
+                    return;
+                };
+                let Some(pattern_parsed) =
+                    parse_command_or_report(lm, &self.interner, &pattern, out)
+                else {
+                    return;
+                };
+                let header = search_header(
+                    lm,
+                    &self.interner,
+                    &subject_parsed,
+                    arrow,
+                    &pattern_parsed,
+                    such_that.as_deref(),
+                    self.render_color,
+                );
                 let bound_str = match (max_solutions, max_depth) {
                     (None, None) => String::new(),
                     (Some(n), None) => format!(" [{n}]"),
                     (Some(n), Some(m)) => format!(" [{n}, {m}]"),
                     (None, Some(m)) => format!(" [, {m}]"),
                 };
-                match search_command(lm, &self.interner, &subject, arrow, &pattern, such_that.as_deref(), max_depth) {
+                match search_command(
+                    lm,
+                    &self.interner,
+                    &subject_parsed,
+                    arrow,
+                    &pattern_parsed,
+                    such_that.as_deref(),
+                    max_depth,
+                ) {
                     Ok((search, vars)) => {
                         let mut session = SearchSession { search, vars };
                         let body = render_search(
@@ -839,12 +888,22 @@ impl Session {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false);
                 lm.built.engine.set_record_whole(false);
+                let Some(subject_parsed) =
+                    parse_command_or_report(lm, &self.interner, &subject, out)
+                else {
+                    return;
+                };
+                let Some(pattern_parsed) =
+                    parse_command_or_report(lm, &self.interner, &pattern, out)
+                else {
+                    return;
+                };
                 let header = search_header(
                     lm,
                     &self.interner,
-                    &subject,
+                    &subject_parsed,
                     arrow,
-                    &pattern,
+                    &pattern_parsed,
                     such_that.as_deref(),
                     self.render_color,
                 );
@@ -857,9 +916,9 @@ impl Session {
                 match smt_search_command(
                     lm,
                     &mut self.interner,
-                    &subject,
+                    &subject_parsed,
                     arrow,
-                    &pattern,
+                    &pattern_parsed,
                     such_that.as_deref(),
                     max_depth,
                 ) {
@@ -891,12 +950,17 @@ impl Session {
                 self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 tnk_frontend::strategy::discard_inapplicable_top(&mut strategy, lm);
+                let Some(parsed) =
+                    parse_command_or_report(lm, &self.interner, &term, out)
+                else {
+                    return;
+                };
                 let kw = if depth_first { "dsrewrite" } else { "srewrite" };
-                let echo = command_echo(lm, &self.interner, &term, self.render_color)
+                let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 let strat_str = tnk_frontend::strategy::print_strategy(&strategy, &self.interner);
                 match tnk_frontend::strategy::srewrite_command(
-                    lm, &self.interner, &term, &strategy, depth_first,
+                    lm, &self.interner, &parsed, &strategy, depth_first,
                 ) {
                     Ok((sols, total)) => {
                         let rate = "0ms cpu (0ms real) (~ rewrites/second)";
@@ -1785,6 +1849,21 @@ fn join_tokens(toks: &[Token], i: &Interner) -> String {
     out
 }
 
+fn parse_command_or_report<'a>(
+    lm: &LoadedModule,
+    i: &Interner,
+    tokens: &'a [Token],
+    out: &mut String,
+) -> Option<ParsedCommandTerm<'a>> {
+    match parse_command_term(lm, i, tokens) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            out.push_str(&format!("error: {error}\n"));
+            None
+        }
+    }
+}
+
 /// Run a `rewrite`/`continue` session and render the `rewrites: … / result …` block (shared by the
 /// `rewrite` and `continue` commands). Runs `rw` for `bound` steps, renders any recorded trace, then the
 /// count and the result — `result (sort not calculated): …` when a bounded `frewrite` stop left a
@@ -1884,20 +1963,22 @@ fn render_rewrite_step(
 fn search_header(
     lm: &mut LoadedModule,
     i: &Interner,
-    subject: &[Token],
+    subject: &ParsedCommandTerm<'_>,
     arrow: SearchArrow,
-    pattern: &[Token],
+    pattern: &ParsedCommandTerm<'_>,
     such_that: Option<&[Token]>,
     color: bool,
 ) -> String {
-    let subj = command_echo(lm, i, subject, color).unwrap_or_else(|_| join_tokens(subject, i));
+    let subj =
+        command_echo(lm, i, subject, color).unwrap_or_else(|_| join_tokens(subject.tokens(), i));
     let arrow_str = match arrow {
         SearchArrow::One => "=>1",
         SearchArrow::Plus => "=>+",
         SearchArrow::Star => "=>*",
         SearchArrow::Bang => "=>!",
     };
-    let pattern = command_echo(lm, i, pattern, color).unwrap_or_else(|_| join_tokens(pattern, i));
+    let pattern =
+        command_echo(lm, i, pattern, color).unwrap_or_else(|_| join_tokens(pattern.tokens(), i));
     let mut h = format!("{subj} {arrow_str} {pattern}");
     if let Some(c) = such_that {
         h.push_str(&format!(" such that {}", join_tokens(c, i)));

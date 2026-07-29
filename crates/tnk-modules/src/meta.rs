@@ -73,7 +73,7 @@ use tnk_frontend::load::{
     InternerNames, LoadedModule, StatementTraceRef, StmtTrace, build_command_dag,
     build_loaded_module, build_loaded_module_homed_traced, build_logic_command_parses,
     command_parse_furthest, executable_variant_equations, maude_variable_name_rank,
-    parse_statement_trace,
+    parse_command_term, parse_statement_trace,
 };
 use tnk_frontend::pretty::{
     PrintOptions, print_qid_tokens_with_options, print_raw, print_term, print_with_options,
@@ -9183,7 +9183,8 @@ fn up_special(
         ));
     }
     for (purpose, term) in &spec.term_hooks {
-        let object_term = build_command_dag(lm, interner, term).ok()?;
+        let parsed = parse_command_term(lm, interner, term).ok()?;
+        let object_term = build_command_dag(lm, interner, &parsed).ok()?;
         let object_term = up_term(ctx, hooks, &lm.built, object_term);
         let purpose = ctx.make_na(qid_symbol, NaValue::Qid(purpose.as_str().into()));
         out.push(ctx.app(hooks.ops["termHookSymbol"], vec![purpose, object_term]));

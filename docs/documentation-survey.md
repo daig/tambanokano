@@ -8,6 +8,10 @@
 
 **TNK-006–010 closeout refresh (2026-07-26):** the five remaining confirmed TNK issues were source-traced, implemented, and rechecked with focused live-oracle matrices. Four new audit fixtures raise the corpus from 84 to 88; I19/I20 retain the original 60-second gate. The investigation details and corrected issue boundaries are preserved in `bug-triage.md`.
 
+**TNK-017 closeout refresh (2026-07-28):** rewrite-condition BFS states and pending successors now retain
+their GC roots across nested reductions. Two embedded-engine regressions reproduce the former stale-ID
+failure and pin GC-on/GC-off result, binding, and rewrite-count parity.
+
 ## 1. Executive findings
 
 1. **The implementation is substantially ahead of its planning documents.** The TNK-005 closeout checkout passed the then-current 84/84 audit corpus, the 87/87 legacy sweep, 453 release tests, and all 112 subsystem fixtures under the default 60-second harness timeout. The TNK-006–010 closeout added four individually verified oracle fixtures (88 total) and restored the timing-sensitive I19/I20 fixtures to 24.98/26.10 seconds without widening that timeout. Every U/V/N/T/M/I-S fixture remains covered by its retained harness.
@@ -217,11 +221,13 @@ These have current implementation evidence, a retained audit record, or a direct
 - Matchrew/amatchrew parallel-odometer accounting; indexed metaSearch billing. These are ratified accepted diffs, not hidden failures.
 - AC match-solution enumeration order and mixed-symbol ACU search-goal print order. These are also recorded accepted diffs.
 - Mixed-symbol ACU print/canonicalization order, bounded AC `frewrite` intermediate order, strategy-echo parentheses, and several trace/result annotation/wording differences cataloged in the audit.
-- Garbage-term Earley explosion on a large grammar remains a separate risk: the TNK-010 hasher repair removes dominant constant-factor cost from normal nested parsing but does not claim a general complexity bound for malformed large-grammar input.
+- Large-grammar parser scaling (TNK-016) is bounded: recognition and forest extraction share a deterministic
+  work budget, completion uses ordered nonterminal-specific waiter indexes, and command echo/execution reuse
+  one parse. Generated scaling and same-submission recovery regressions are retained.
 - TNK-007's exact-float boundary, TNK-008's membership tiebreak, TNK-009's automatic BOOL mode, TNK-010's
-  retained performance gate, TNK-012–014's view/module-expression boundaries, and TNK-015's independent
-  META print settings are resolved with focused fixtures. They are historical findings, not current
-  behavioral residuals.
+  retained performance gate, TNK-012–014's view/module-expression boundaries, TNK-015's independent
+  META print settings, TNK-016's parser availability bound, and TNK-017's rewrite-condition GC ownership
+  are resolved with focused fixtures. They are historical findings, not current behavioral residuals.
 - View theory proof obligations and free-parameter module-sum bases match the reference behavior.
   Subsort nonpreservation still differs only by a missing warning; both systems keep the view usable.
 
@@ -233,7 +239,6 @@ Do not copy these comments directly into a public limitations page. First determ
 - Unusual cross-kind overload grouping remains a candidate, but the direct basic case with two domain/range kinds conforms and does not reach the old assertion.
 - Exotic AC/iter membership-extension corners remain candidates. Direct CUI collapse matching and iter-membership probes produced the oracle's solution set/results, so the broad source comments are stale; TNK-008's unrelated incomparable-target ordering is resolved and retained.
 - Conditional `metaMatch`, conditional/partial `metaApply`, partial AC `metaXmatch` contexts, flat builtin-closure up-translation, and structured module-expression/op-to-term view reflection.
-- Re-entrant rewrite-condition GC rooting when the low-level engine is embedded with GC enabled; the REPL currently runs with GC disabled in the cited path.
 - Grammar sort-structure bias and unusual prefix/assoc forms mentioned as frontend follow-ups.
 - Unknown prelude `id-hook` families that currently load as inert operators; classify each by whether it belongs to LOOP-MODE, Full Maude, an optional extension, or v0 parity.
 
@@ -243,6 +248,10 @@ These should be labeled proposals, not bugs, unless a benchmark or accepted inpu
 
 - Precompiled sort decision diagrams/sort paths instead of direct least-sort computation.
 - Red-black/persistent AC matching structures and further matcher allocation/performance work.
+- Maude-style Earley-Leo parser optimization: compiled terminal/nonterminal decision trees, left-recursion
+  expansion tables, deterministic-reduction-path memoization, and denser integer-indexed parse state.
+  Track as `PERF-earley-leo-parser`; it is benchmark-gated and non-blocking while TNK-016's deterministic
+  availability bound and retained D3 case remain green.
 - A compiled/source-preserving module representation beyond the landed home-grammar point fix. It could improve faithful source `show`, Full Maude, and difficult reflection/import cases, but it is a design decision rather than an automatic prerequisite for all v0 work.
 - Broader conformance CI and generated manifests. The harness exists; repository CI configuration does not.
 
@@ -275,7 +284,9 @@ Use one self-contained file per issue under a neutral namespace such as `docs/is
 | `MOD-view-validation-and-map-forms` | source-admitted correctness family | independent checks can be split; theory obligations may need diagnostics |
 | `MOD-source-preserving-module-algebra` | architecture proposal | would enable source-faithful show and simplify some Full Maude/meta work |
 | `CORE-memo` | confirmed feature gap | memo controls depend on the runtime table |
-| `PARSE-garbage-complexity-cap` | robustness issue | ambiguity warnings relate to diagnostics; the cap itself is independent |
+| `CORE-rewrite-condition-gc-roots` | resolved bug (TNK-017) | rooted state vector, indexed frontier, and guarded pending successors retained with embedded GC regressions |
+| `PARSE-garbage-complexity-cap` | resolved robustness/performance issue (TNK-016) | deterministic recognition/forest budget, ordered completion index, and single-parse command lifecycle retained |
+| `PERF-earley-leo-parser` | optional optimization | follows resolved TNK-016; gate phases with D3 and the generated 1,000-operator/1,280-atom benchmark |
 | `PRINT-canonicalization-and-echo` | accepted/cosmetic family | mixed ACU order drives bounded-frewrite and some echo differences |
 | `PERF-sort-diagrams` | optional optimization | require benchmark threshold before implementation |
 | `LANG-full-maude`, `PRINT-latex` | deferred proposals | likely consume module/meta/printing work; no v0 ordering implied |
