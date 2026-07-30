@@ -616,6 +616,8 @@ fn rewrite_cond(
 fn premodule_of(d: &FlatDecls) -> PreModule {
     PreModule {
         name: "$RENAME-SRC".to_string(),
+        source_line: None,
+        diagnostics: Vec::new(),
         kind: ModuleKind::System,
         is_theory: false,
         is_strategy: false,

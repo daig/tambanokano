@@ -670,10 +670,7 @@ fn resolve_in(
                 TestKind::Match => false,
                 TestKind::AMatch => true,
                 TestKind::XMatch => {
-                    return Err(
-                        "xmatchrew (extension-match rewriting) reassembly is an engine follow-on"
-                            .to_string(),
-                    );
+                    return Err("xmatchrew is recognized but not implemented".to_string());
                 }
             };
             let mut vars = seed.clone();
@@ -800,9 +797,23 @@ fn resolve_call(
         .iter()
         .any(|def| def.name == name && def.params.len() == args.len() && def.cond.is_some());
     if has_conditional && !has_unconditional {
-        return Err(format!(
-            "conditional strategy definition (`csd {name}`) is a follow-on"
-        ));
+        return Err(
+            "conditional strategy definitions (`csd`) are recognized but not implemented"
+                .to_string(),
+        );
+    }
+    let unconditional_defs: Vec<_> = lm
+        .built
+        .strat_defs
+        .iter()
+        .filter(|def| def.name == name && def.params.len() == args.len() && def.cond.is_none())
+        .collect();
+    if !unconditional_defs.is_empty()
+        && unconditional_defs
+            .iter()
+            .all(|def| contains_xmatchrew(&def.body))
+    {
+        return Err("xmatchrew is recognized but not implemented".to_string());
     }
     let mut vars = seed.clone();
     let mut resolved_args = Vec::with_capacity(args.len());
@@ -818,6 +829,36 @@ fn resolve_call(
         name: name.to_string(),
         args: resolved_args,
     }))
+}
+
+fn contains_xmatchrew(strategy: &StratExpr) -> bool {
+    match strategy {
+        StratExpr::MatchRew {
+            kind: TestKind::XMatch,
+            ..
+        } => true,
+        StratExpr::Apply { substrats, .. } => substrats.iter().any(contains_xmatchrew),
+        StratExpr::Top(child)
+        | StratExpr::One(child)
+        | StratExpr::Star(child)
+        | StratExpr::Plus(child)
+        | StratExpr::Normalize(child) => contains_xmatchrew(child),
+        StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
+            contains_xmatchrew(left) || contains_xmatchrew(right)
+        }
+        StratExpr::Branch {
+            test,
+            success,
+            failure,
+        } => contains_xmatchrew(test) || contains_xmatchrew(success) || contains_xmatchrew(failure),
+        StratExpr::MatchRew { subs, .. } => subs.iter().any(|(_, child)| contains_xmatchrew(child)),
+        StratExpr::Sugar { args, .. } => args.iter().any(contains_xmatchrew),
+        StratExpr::Idle
+        | StratExpr::Fail
+        | StratExpr::All
+        | StratExpr::Test { .. }
+        | StratExpr::Call { .. } => false,
+    }
 }
 
 fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram {

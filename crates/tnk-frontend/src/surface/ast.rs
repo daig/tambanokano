@@ -4,11 +4,49 @@
 
 use crate::lex::Token;
 
+/// Severity carried by a frontend/build diagnostic. Rendering belongs to the Session layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+/// An owned, source-ordered diagnostic produced while parsing or building a module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Diagnostic {
+    pub severity: DiagnosticSeverity,
+    pub module: Option<String>,
+    pub line: Option<u32>,
+    pub subject: Option<String>,
+    pub message: String,
+}
+
+impl Diagnostic {
+    pub fn warning(
+        module: impl Into<String>,
+        line: Option<u32>,
+        subject: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Warning,
+            module: Some(module.into()),
+            line,
+            subject: Some(subject.into()),
+            message: message.into(),
+        }
+    }
+}
+
 /// A parsed functional-module skeleton. `Clone` so the module system (B5) can combine the declarations
 /// of an import closure into one flattened `PreModule`.
 #[derive(Debug, Clone)]
 pub struct PreModule {
     pub name: String,
+    /// Line of the module-opening keyword when the declaration came from source text.
+    pub source_line: Option<u32>,
+    /// Nonfatal source diagnostics retained until the Session renders them.
+    pub diagnostics: Vec<Diagnostic>,
     /// Functional (`fmod`/`fth`) or system (`mod`/`th`). A system module/theory may declare rules
     /// (`rl`/`crl`); a functional one may not. This is the *rule-gating* axis only.
     pub kind: ModuleKind,
@@ -130,6 +168,8 @@ pub enum RenameItem {
 #[derive(Debug, Clone)]
 pub struct ViewDecl {
     pub name: String,
+    /// Line of the `view` keyword when the declaration came from source text.
+    pub source_line: Option<u32>,
     /// Formal parameters `{X :: T, …}` of a *parameterized* view (Axis-A2). Empty for an ordinary view.
     /// A parameterized view is only used by instantiating it (`V{Arg}`) inside a nested module
     /// instantiation; that instantiation substitutes the args into `to`/`sort_maps`/`op_maps`.
@@ -204,6 +244,8 @@ pub struct Attrs {
     pub frozen: Option<Vec<u32>>,
     pub special: Option<SpecialSpec>,
     pub ditto: bool,
+    /// `memo` — retained for an explicit unsupported-feature warning; it has no kernel semantics.
+    pub memo: bool,
     /// `poly (<positions>)` — the polymorphic argument/range positions (Maude's `Polymorph`),
     /// numbered with arguments `1..n` and the range as `0`. A position listed here is `Universal`:
     /// `build_sig` expands the op into one concrete declaration per kind, substituting that kind's

@@ -26,8 +26,10 @@ use tnk_frontend::load::{
     variant_command, variant_match_command, variant_unify_command,
 };
 use tnk_frontend::pretty::{print_pretty, print_pretty_with_variables};
+use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::surface::ast::{
-    Command, ModuleExpr, NarrowDisplay, OpMap, PreModule, SearchArrow, TopItem, ViewDecl,
+    Command, Diagnostic, DiagnosticSeverity, ModuleExpr, NarrowDisplay, OpMap, PreModule,
+    SearchArrow, TopItem, ViewDecl,
 };
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
@@ -72,9 +74,9 @@ pub struct Session {
     /// The full `trace` flags (`set trace [<option>] on|off`); `master` off by default.
     trace: TraceFlags,
     /// The last resumable session (`rewrite`/`frewrite` or `search`) and the module name it ran in, for
-    /// `continue` (and `show path`/`show search graph`). Any non-`continue` command (or a module rebuild /
-    /// `select`) clears it — Maude's continuation invalidation. Stays valid between commands because the
-    /// REPL runs with in-reduction GC off, so the session's terms are never collected.
+    /// `continue` (and `show path`/`show search graph`). A new execution command normally replaces or
+    /// clears it; a strategy rejected before execution retains the previous continuation. It stays valid
+    /// between commands because in-reduction GC is off, so the session's terms are never collected.
     last: Option<(String, Continuation)>,
     /// Pending `stdin` for `erewrite`'s `getLine` (Pillar 2.5-C). Set via [`set_stdin`](Self::set_stdin)
     /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
@@ -86,10 +88,6 @@ pub struct Session {
     include_bool: bool,
     /// Canonicalized paths already `load`ed — `sload` (skip-load) consults this and loads only once.
     loaded_files: std::collections::HashSet<std::path::PathBuf>,
-    /// `set show timing on|off` (Maude default on): gates the `Decision time:` line of
-    /// `match`/`xmatch`/`unify` (the only commands whose output the flag affects — `reduce`/`rewrite`
-    /// timing tails are already normalized away). Other timing-tail lines are hardcoded 0ms.
-    show_timing: bool,
     show_breakdown: bool,
     /// `set verbose on|off`: show narrowing fold decisions and terminal state counts.
     verbose: bool,
@@ -99,6 +97,9 @@ pub struct Session {
     /// Unequal identity-collapse notices already emitted by a lazy symbolic command. Maude
     /// computes this property once per operator, so `set verbose on` prints each notice once.
     reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId, bool)>,
+    /// Source diagnostics already shown in this Session. Imported, renamed, instantiated, or
+    /// dependent rebuilds may rediscover the same source declaration; they must not create warning storms.
+    reported_source_diagnostics: HashSet<Diagnostic>,
 }
 
 /// A resumable session stored for `continue` / `show`.
@@ -182,11 +183,11 @@ impl Session {
             stdin: String::new(),
             include_bool: false,
             loaded_files: std::collections::HashSet::new(),
-            show_timing: true,
             show_breakdown: false,
             verbose: false,
             interpreters: InterpreterRegistry::default(),
             reported_identity_collapses: HashSet::new(),
+            reported_source_diagnostics: HashSet::new(),
         }
     }
 
@@ -281,6 +282,14 @@ impl Session {
             "select" => return self.meta_select(&join_tokens(&toks, &self.interner)),
             "show" => return self.meta_show(&join_tokens(&toks, &self.interner)),
             "set" => return self.meta_set(&join_tokens(&toks, &self.interner)),
+            "do" if toks.get(1).map(|token| self.interner.resolve(token.sym)) == Some("clear")
+                && toks.get(2).map(|token| self.interner.resolve(token.sym)) == Some("memo") =>
+            {
+                return Eval {
+                    output: unsupported_memo_control_warning().to_string(),
+                    exit: false,
+                };
+            }
             _ => {}
         }
 
@@ -295,7 +304,16 @@ impl Session {
                     Ok(Some(it)) => items.push(it),
                     Ok(None) => break,
                     Err(e) => {
-                        output.push_str(&format!("parse error: {e}\n"));
+                        let line = p.error_line();
+                        let context = p.error_context();
+                        output.push_str("parse error:");
+                        if let Some((kind, name)) = context {
+                            output.push_str(&format!(" {kind} `{name}`,"));
+                        }
+                        if let Some(line) = line {
+                            output.push_str(&format!(" line {line}:"));
+                        }
+                        output.push_str(&format!(" {e}\n"));
                         break;
                     }
                 }
@@ -341,46 +359,57 @@ impl Session {
 
     /// Define (or redefine) a module: insert into the DB, flatten its import closure, build it, and make
     /// it current. Silent on success (as Maude is); flatten/build errors become output.
-    fn enter_module(&mut self, pm: PreModule, out: &mut String) {
-        let mut pm = pm;
+    fn enter_module(&mut self, mut pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
         // Implicit BOOL (D11 / fable-audit.md §3.4): `set include BOOL on` injects
-        // `including BOOL .`. An explicit BOOL import dedups in flatten's visited set, so injection is
-        // idempotent for executable declarations while both source import modes remain reflectable.
+        // `including BOOL .`. An explicit BOOL import dedups in flatten's visited set.
         if self.include_bool && name != "BOOL" && self.db.get("BOOL").is_some() {
             pm.imports.insert(
                 0,
                 tnk_frontend::surface::ast::Import {
                     mode: tnk_frontend::surface::ast::ImportMode::Including,
-                    expr: tnk_frontend::surface::ast::ModuleExpr::Named("BOOL".into()),
+                    expr: ModuleExpr::Named("BOOL".into()),
                 },
             );
         }
-        self.last = None; // a (re)built module invalidates any saved rewrite continuation
-        self.meta_state.clear(); // rebuilt engines invalidate persistent metalevel DAG keys
-        // Record this module's direct dependencies (imports + parameter theories) so a later redefinition
-        // of anything it references can find and re-flatten it (A4c).
-        self.deps.insert(name.clone(), module_dep_names(&pm));
-        // Inject any built-in prelude module this module imports (e.g. an `omod`'s auto-imported
-        // `CONFIGURATION`) that the user has not defined, so flattening can resolve it.
+
+        let dependencies = module_dep_names(&pm);
         let imports = pm.imports.clone();
-        self.db.insert(pm);
-        tnk_modules::prelude::ensure_builtins(&imports, &mut self.db, &mut self.interner);
-        // Flatten + build with the D1a import-reparse point-fix: an imported statement the flattened
-        // grammar parses ambiguously re-parses against its home module's own (already-built) grammar. The
-        // module cache resolves each statement's home; the borrow of `self.modules` is scoped so this
-        // module's own insertion below is unobstructed.
+        let mut diagnostics = unsupported_memo_diagnostics(&pm, &self.interner);
+
+        // Build against a candidate database. A failed replacement must not poison the source DB or
+        // invalidate the previously built module, current selection, continuations, or metalevel DAGs.
+        let mut candidate_db = self.db.clone();
+        candidate_db.insert(pm);
+        tnk_modules::prelude::ensure_builtins(&imports, &mut candidate_db, &mut self.interner);
         let built = {
             let mods = &self.modules;
-            let home_mod = |n: &str| mods.get(n);
-            flatten_and_build(&name, &self.db, &self.views, &home_mod, &mut self.interner)
+            let home_mod = |module: &str| mods.get(module);
+            flatten_and_build(
+                &name,
+                &candidate_db,
+                &self.views,
+                &home_mod,
+                &mut self.interner,
+            )
         };
+
         match built {
-            Ok(lm) => {
+            Ok(mut lm) => {
+                diagnostics.append(&mut lm.diagnostics);
+                sort_diagnostics(&mut diagnostics, &name);
+                self.reported_source_diagnostics
+                    .retain(|diagnostic| diagnostic.module.as_deref() != Some(name.as_str()));
+                append_diagnostics(out, &diagnostics, &mut self.reported_source_diagnostics);
                 if self.verbose && !lm.built.oo_completion_diagnostics.is_empty() {
                     out.push_str(&lm.built.oo_completion_diagnostics.join("\n\n"));
                     out.push_str("\n\n");
                 }
+
+                self.last = None;
+                self.meta_state.clear();
+                self.db = candidate_db;
+                self.deps.insert(name.clone(), dependencies);
                 if !self.modules.contains_key(&name) {
                     self.order.push(name.clone());
                 }
@@ -388,14 +417,19 @@ impl Session {
                     .retain(|(module, _, _)| module != &name);
                 self.modules.insert(name.clone(), lm);
                 self.current = Some(name.clone());
+                self.rebuild_dependents(&name, out);
             }
-            Err(e) => out.push_str(&format!("error in module `{name}`: {e}\n")),
+            Err(e) => {
+                out.push_str(&format!("error: module `{name}`"));
+                if let Some(line) = candidate_db
+                    .get(&name)
+                    .and_then(|module| module.source_line)
+                {
+                    out.push_str(&format!(", line {line}"));
+                }
+                out.push_str(&format!(": {e}\n"));
+            }
         }
-        // A (re)definition of `name` invalidates the cached builds of every module that transitively
-        // depends on it: re-flatten and rebuild them so `reduce in <dependent>` uses the new definition.
-        // On a first definition this is a no-op (nothing built imports a name that was undefined until
-        // now), so ordinary loads pay only a cheap empty reverse-reachability walk.
-        self.rebuild_dependents(&name, out);
     }
 
     /// Install a module already decoded and compiled from a META-INTERPRETER `Module` value. Maude's
@@ -441,7 +475,13 @@ impl Session {
                 // (`M{V}` was flattened with the old view), so re-flatten its transitive dependents (A4c).
                 self.rebuild_dependents(&name, out);
             }
-            Err(e) => out.push_str(&format!("error: {e}\n")),
+            Err(e) => {
+                out.push_str(&format!("error: view `{}`", v.name));
+                if let Some(line) = v.source_line {
+                    out.push_str(&format!(", line {line}"));
+                }
+                out.push_str(&format!(": {e}\n"));
+            }
         }
     }
 
@@ -630,8 +670,7 @@ impl Session {
                         let breakdown = rewrite_breakdown(lm, self.show_breakdown);
                         out.push_str(&format!(
                             "{identity_diagnostics}reduce in {cur} : {echo} .\n{trace}{verbose_stats}\
-                             rewrites: {rw} in 0ms cpu (0ms real) (~ rewrites/second){breakdown}\n\
-                             result {sort}: {value}\n"
+                             rewrites: {rw}{breakdown}\nresult {sort}: {value}\n"
                         ));
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
@@ -676,10 +715,9 @@ impl Session {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // the match's subject-reduce is not traced (yet)
                 lm.built.engine.set_record_whole(false);
-                let dtime = if self.show_timing { "Decision time: 0ms cpu (0ms real)\n" } else { "" };
                 match match_command(lm, &self.interner, &pattern, &subject, xmatch) {
                     Ok(blocks) => out.push_str(&format!(
-                        "{kw} in {cur} : {pe} <=? {se} .\n{dtime}\n{}\n",
+                        "{kw} in {cur} : {pe} <=? {se} .\n\n{}\n",
                         format_matchers(&blocks)
                     )),
                     Err(e) => out.push_str(&format!("error: {e}\n")),
@@ -934,7 +972,6 @@ impl Session {
                             lm,
                             &self.interner,
                             self.render_color,
-                            self.show_timing,
                             max_solutions,
                         );
                         out.push_str(&format!(
@@ -947,7 +984,6 @@ impl Session {
                 }
             }
             Command::Srewrite { depth_first, term, mut strategy, .. } => {
-                self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 tnk_frontend::strategy::discard_inapplicable_top(&mut strategy, lm);
                 let Some(parsed) =
@@ -963,22 +999,22 @@ impl Session {
                     lm, &self.interner, &parsed, &strategy, depth_first,
                 ) {
                     Ok((sols, total)) => {
-                        let rate = "0ms cpu (0ms real) (~ rewrites/second)";
+                        self.last = None;
                         let mut body = String::new();
                         if sols.is_empty() {
-                            body.push_str(&format!("\nNo solution.\nrewrites: {total} in {rate}\n"));
+                            body.push_str(&format!("\nNo solution.\nrewrites: {total}\n"));
                         } else {
                             let eng = &lm.built.engine;
                             for (k, s) in sols.iter().enumerate() {
                                 let sort = eng.sorts().name(eng.sort_of(s.term)).to_string();
                                 let value = print_pretty(&lm.built, &self.interner, s.term, self.render_color);
                                 body.push_str(&format!(
-                                    "\nSolution {}\nrewrites: {} in {rate}\nresult {sort}: {value}\n",
+                                    "\nSolution {}\nrewrites: {}\nresult {sort}: {value}\n",
                                     k + 1,
                                     s.rewrites
                                 ));
                             }
-                            body.push_str(&format!("\nNo more solutions.\nrewrites: {total} in {rate}\n"));
+                            body.push_str(&format!("\nNo more solutions.\nrewrites: {total}\n"));
                         }
                         out.push_str(&format!("{kw} in {cur} : {echo} using {strat_str} .\n{body}"));
                     }
@@ -1025,9 +1061,6 @@ impl Session {
                             if irredundant {
                                 unifiers =
                                     tnk_core::unify::filter::irredundant(&mut lm.built.engine, unifiers);
-                            }
-                            if self.show_timing {
-                                out.push_str("Decision time: 0ms cpu (0ms real)\n");
                             }
                             if unifiers.is_empty() {
                                 out.push_str("No unifier.\n");
@@ -1269,7 +1302,6 @@ impl Session {
                             lm,
                             interner,
                             self.render_color,
-                            self.show_timing,
                             self.show_breakdown,
                             verbose,
                             path,
@@ -1344,7 +1376,6 @@ impl Session {
                         lm,
                         &self.interner,
                         self.render_color,
-                        self.show_timing,
                         bound,
                     );
                     out.push_str(&body);
@@ -1380,7 +1411,6 @@ impl Session {
                         lm,
                         &mut self.interner,
                         self.render_color,
-                        self.show_timing,
                         self.show_breakdown,
                         self.verbose,
                         show_state_number,
@@ -1548,11 +1578,15 @@ impl Session {
     fn meta_set(&mut self, line: &str) -> Eval {
         let words: Vec<&str> = line
             .split_whitespace()
-            .map(|s| s.trim_end_matches('.'))
-            .filter(|s| !s.is_empty())
+            .map(|word| word.trim_end_matches('.'))
+            .filter(|word| !word.is_empty())
             .collect();
         let out = match words.get(1).copied() {
             Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
+            Some("memo") => unsupported_memo_control_warning().to_string(),
+            Some("clear") if words.get(2).copied() == Some("memo") => {
+                unsupported_memo_control_warning().to_string()
+            }
             // `set include BOOL on|off` (D11): toggle the implicit-BOOL auto-import. Other
             // `set include <MOD>` names remain silent no-ops (nothing else is auto-imported).
             Some("include") if words.get(2).copied() == Some("BOOL") => {
@@ -1563,14 +1597,13 @@ impl Session {
                 }
                 String::new()
             }
-            // `set show timing on|off`: gates the `Decision time:` line of match/xmatch/unify.
+            // Timing measurement is not implemented. `off` is silent; `on` reports the unavailable
+            // capability and leaves timing output disabled.
             Some("show") if words.get(2).copied() == Some("timing") => {
                 match words.get(3).copied() {
-                    Some("on") => self.show_timing = true,
-                    Some("off") => self.show_timing = false,
-                    _ => {}
+                    Some("on") => unsupported_timing_control_warning().to_string(),
+                    _ => String::new(),
                 }
-                String::new()
             }
             Some("show") if words.get(2).copied() == Some("breakdown") => {
                 match words.get(3).copied() {
@@ -1588,10 +1621,8 @@ impl Session {
                 }
                 String::new()
             }
-            // Every other interpreter directive (`set show advisories off`, `set include … on/off`,
-            // `set oo include … on`, …) is a silent no-op, as the file-loading parser already treats
-            // `set` (we never auto-import, and these toggles do not affect our output). Silence matches
-            // Maude — it applies these without echoing — so loaded `.maude` files stay byte-comparable.
+            // Unimplemented directives remain inert. Commands with supported syntax but unavailable
+            // semantics are handled explicitly above instead of disappearing silently.
             _ => String::new(),
         };
         Eval {
@@ -1774,6 +1805,82 @@ impl Session {
     }
 }
 
+fn unsupported_memo_control_warning() -> &'static str {
+    "warning: memoization controls are recognized but not implemented; this command has no effect."
+}
+
+fn unsupported_timing_control_warning() -> &'static str {
+    "warning: timing measurements are unavailable; timing output remains disabled."
+}
+
+fn unsupported_memo_diagnostics(pm: &PreModule, interner: &Interner) -> Vec<Diagnostic> {
+    pm.ops
+        .iter()
+        .filter(|op| op.attrs.memo)
+        .map(|op| {
+            let name = canonical_name(&op.name, interner);
+            Diagnostic::warning(
+                pm.name.clone(),
+                op.name.first().map(|token| token.line),
+                format!("operator `{name}`"),
+                format!(
+                    "`[memo]` on operator `{name}` is recognized but not implemented; \
+                     evaluation continues without memoization"
+                ),
+            )
+        })
+        .collect()
+}
+
+fn sort_diagnostics(diagnostics: &mut Vec<Diagnostic>, root: &str) {
+    let mut module_order = HashMap::<String, usize>::new();
+    module_order.insert(root.to_string(), 0);
+    for diagnostic in diagnostics.iter() {
+        let next = module_order.len();
+        if let Some(module) = diagnostic.module.as_ref() {
+            module_order.entry(module.clone()).or_insert(next);
+        }
+    }
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            diagnostic
+                .module
+                .as_ref()
+                .and_then(|module| module_order.get(module))
+                .copied()
+                .unwrap_or(usize::MAX),
+            diagnostic.line.unwrap_or(u32::MAX),
+        )
+    });
+    let mut seen = HashSet::new();
+    diagnostics.retain(|diagnostic| seen.insert(diagnostic.clone()));
+}
+
+fn append_diagnostics(
+    out: &mut String,
+    diagnostics: &[Diagnostic],
+    reported: &mut HashSet<Diagnostic>,
+) {
+    for diagnostic in diagnostics {
+        if !reported.insert(diagnostic.clone()) {
+            continue;
+        }
+        let severity = match diagnostic.severity {
+            DiagnosticSeverity::Warning => "warning",
+            DiagnosticSeverity::Error => "error",
+        };
+        out.push_str(severity);
+        out.push(':');
+        if let Some(module) = diagnostic.module.as_ref() {
+            out.push_str(&format!(" module `{module}`"));
+        }
+        if let Some(line) = diagnostic.line {
+            out.push_str(&format!(", line {line}"));
+        }
+        out.push_str(&format!(": {}\n", diagnostic.message));
+    }
+}
+
 /// Maude defers binary-symbol sort checks until a symbolic command first needs them. Under
 /// `set verbose on`, an identity whose collapse lowers the result sort therefore reports once,
 /// immediately before that command's echo.
@@ -1953,10 +2060,7 @@ fn render_rewrite_step(
     } else {
         format!("result (sort not calculated): {value}")
     };
-    format!(
-        "{trace}rewrites: {rw_count} in 0ms cpu (0ms real) (~ rewrites/second){breakdown}\n\
-         {result_line}\n"
-    )
+    format!("{trace}rewrites: {rw_count}{breakdown}\n{result_line}\n")
 }
 
 /// The `search` command's echoed query: `{subject} {arrow} {pattern}[ such that {cond}]`.
@@ -2008,7 +2112,7 @@ fn render_search(
                 let bindings = render_search_bindings(lm, i, &session.vars, &sol.bindings, color);
                 let breakdown = rewrite_breakdown(lm, show_breakdown);
                 out.push_str(&format!(
-                    "\nSolution {} (state {})\nstates: {}  rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second){breakdown}\n{bindings}\n",
+                    "\nSolution {} (state {})\nstates: {}  rewrites: {}{breakdown}\n{bindings}\n",
                     sol.number, sol.state, sol.states, sol.rewrites
                 ));
             }
@@ -2017,7 +2121,7 @@ fn render_search(
                 let rewrites = lm.built.engine.rewrites();
                 let breakdown = rewrite_breakdown(lm, show_breakdown);
                 out.push_str(&format!(
-                    "\nNo more solutions.\nstates: {states}  rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second){breakdown}\n"
+                    "\nNo more solutions.\nstates: {states}  rewrites: {rewrites}{breakdown}\n"
                 ));
                 return out;
             }
@@ -2032,7 +2136,6 @@ fn render_smt_search(
     lm: &mut LoadedModule,
     i: &Interner,
     color: bool,
-    show_timing: bool,
     limit: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -2049,7 +2152,7 @@ fn render_smt_search(
             };
             out.push_str(&format!(
                 "\n{message}\n{}\n",
-                narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing)
+                rewrite_count_line(lm.built.engine.rewrites())
             ));
             return out;
         };
@@ -2066,7 +2169,7 @@ fn render_smt_search(
         out.push_str(&format!(
             "\nSolution {}\n{}\nstate: {state}\n",
             solution.number,
-            narrowing_rewrite_line(solution.rewrites, show_timing)
+            rewrite_count_line(solution.rewrites)
         ));
         let mut rendered_binding = false;
         for slot in 0..session.target_variable_count {
@@ -2123,9 +2226,7 @@ fn render_variants(
         };
         if session.irredundant && !session.reported_total {
             let rewrites = lm.built.engine.rewrites();
-            out.push_str(&format!(
-                "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)\n"
-            ));
+            out.push_str(&format!("rewrites: {rewrites}\n"));
             session.reported_total = true;
         }
         match next {
@@ -2136,10 +2237,7 @@ fn render_variants(
                 let value = print_pretty(&lm.built, i, variant.term, color);
                 out.push_str(&format!("\nVariant {}\n", variant.index + 1));
                 if !session.irredundant {
-                    out.push_str(&format!(
-                        "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
-                        variant.rewrites
-                    ));
+                    out.push_str(&format!("rewrites: {}\n", variant.rewrites));
                 }
                 out.push_str(&format!("{sort}: {value}\n"));
                 for (slot, &binding) in variant.substitution.iter().enumerate() {
@@ -2151,9 +2249,7 @@ fn render_variants(
                 out.push_str("\nNo more variants.\n");
                 if !session.irredundant {
                     let rewrites = lm.built.engine.rewrites();
-                    out.push_str(&format!(
-                        "rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)\n"
-                    ));
+                    out.push_str(&format!("rewrites: {rewrites}\n"));
                 }
                 return out;
             }
@@ -2233,10 +2329,7 @@ fn render_variant_unifiers(
     if session.upfront {
         session.prepare_filtered(lm, i);
         if !session.reported_total {
-            out.push_str(&format!(
-                "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
-                lm.built.engine.rewrites()
-            ));
+            out.push_str(&format!("rewrites: {}\n", lm.built.engine.rewrites()));
             if show_breakdown {
                 let breakdown = rewrite_breakdown(lm, true);
                 out.push_str(breakdown.trim_start_matches('\n'));
@@ -2272,10 +2365,7 @@ fn render_variant_unifiers(
             };
             out.push_str(&format!("\n{message}\n"));
             if !session.upfront {
-                out.push_str(&format!(
-                    "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
-                    lm.built.engine.rewrites()
-                ));
+                out.push_str(&format!("rewrites: {}\n", lm.built.engine.rewrites()));
                 if show_breakdown {
                     let breakdown = rewrite_breakdown(lm, true);
                     out.push_str(breakdown.trim_start_matches('\n'));
@@ -2294,10 +2384,7 @@ fn render_variant_unifiers(
         };
         out.push_str(&format!("\n{label} {}\n", session.next_number));
         if !session.upfront {
-            out.push_str(&format!(
-                "rewrites: {} in 0ms cpu (0ms real) (~ rewrites/second)\n",
-                result_rewrites
-            ));
+            out.push_str(&format!("rewrites: {result_rewrites}\n"));
             if show_breakdown {
                 let breakdown = format_rewrite_breakdown(result_rewrites, 0, 0, result_rewrites, 0);
                 out.push_str(breakdown.trim_start_matches('\n'));
@@ -2327,12 +2414,8 @@ fn render_variant_unifiers(
 
 /// `Var --> value` lines for a search solution. The variable is rendered by its written name (Maude
 /// echoes a goal variable as written: a declared `X` prints `X`, an on-the-fly `X:Sort` prints
-fn narrowing_rewrite_line(rewrites: u64, show_timing: bool) -> String {
-    if show_timing {
-        format!("rewrites: {rewrites} in 0ms cpu (0ms real) (~ rewrites/second)")
-    } else {
-        format!("rewrites: {rewrites}")
-    }
+fn rewrite_count_line(rewrites: u64) -> String {
+    format!("rewrites: {rewrites}")
 }
 
 fn render_narrow_accumulated(
@@ -2462,7 +2545,6 @@ fn render_narrowing(
     lm: &mut LoadedModule,
     i: &mut Interner,
     color: bool,
-    show_timing: bool,
     show_breakdown: bool,
     verbose: bool,
     show_state_number: bool,
@@ -2501,7 +2583,7 @@ fn render_narrowing(
             };
             out.push_str(&format!(
                 "\n{message}\n{}{}\n",
-                narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing),
+                rewrite_count_line(lm.built.engine.rewrites()),
                 rewrite_breakdown(lm, show_breakdown),
             ));
             return out;
@@ -2539,7 +2621,7 @@ fn render_narrowing(
             "\nSolution {}{state_number}\n{}{}\nstate: {state}{initial_state}\n\
              accumulated substitution:\n{accumulated}{accumulated_newline}variant unifier:\n{unifier}{unifier_newline}",
             session.next_number,
-            narrowing_rewrite_line(lm.built.engine.rewrites(), show_timing),
+            rewrite_count_line(lm.built.engine.rewrites()),
             rewrite_breakdown(lm, show_breakdown),
         ));
     }

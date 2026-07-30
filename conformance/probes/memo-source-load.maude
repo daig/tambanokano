@@ -1,0 +1,7 @@
+*** Source-file `[memo]` warning probe for the V1 honest-behavior contract.
+fmod MEMO-FILE is
+  sort N .
+  op z : -> N [ctor] .
+  op f : N -> N [memo] .
+  eq f(z) = z .
+endfm

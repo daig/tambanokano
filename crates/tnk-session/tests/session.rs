@@ -44,7 +44,7 @@ fn direct_session_reports_rewrite_breakdowns_for_reduce_and_search() {
     let searched = session.eval("search [3] a =>* X:State .", false);
     assert!(
         searched.output.contains(
-            "states: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+            "states: 2  rewrites: 1\n\
              mb applications: 0  equational rewrites: 0  rule rewrites: 1  \
              variant narrowing steps: 0  narrowing steps: 0"
         ),

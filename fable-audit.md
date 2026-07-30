@@ -154,10 +154,10 @@ Remaining planned or deliberately excluded surfaces:
   are intentionally out of scope for the engine (host-embedding model); existing Maude IO programs do not
   run unmodified, and `process.maude` additionally requires `sload`.
 - **LOOP-MODE**, Full Maude, and LaTeX output. LEXICAL is no longer in this list.
-- **`memo`** remains parsed but ignored.
-- **Tracing inside `search`** (and inside a rewrite-condition's nested `=>` search): with `set trace on`,
-  Maude prints the per-rule trace blocks during the search; tnk prints none (verified — results and counts
-  unaffected). `reduce`/`rewrite` tracing itself conforms.
+- **`memo` semantics are not implemented.** Source `[memo]` is retained for diagnostics, evaluates uncached,
+  and emits one warning per source declaration; memo-clear controls warn that they have no effect.
+- **Tracing inside ordinary `search`** remains absent with `set trace on`; rewrite-condition nested-search
+  tracing is implemented. Results and counts are unaffected.
 - **`xmatchrew`** (extension-match *rewriting*) and **conditional strategy definitions (`csd`)** — both
   error clearly at resolve time (verified; parser state survives). For the eventual fixes: `xmatchrew`
   needs the engine to expose an extension match's *residue* so the rewritten matched portion can be
@@ -170,20 +170,22 @@ Remaining planned or deliberately excluded surfaces:
   - `load`/`in`/`sload`/`pwd`/`cd`/`ls`/`popd`/`eof`: **no file commands at all** (breaks nearly every
     real-world multi-file spec, incl. two stock library files).
   - `parse`, `debug` family (`debug reduce`, `resume`/`abort`/`step`/`where`), `trace select/exclude`,
-    `break select`, profiling (`set profile`, `show profile`), `do clear memo`.
+    `break select`, and profiling (`set profile`, `show profile`).
   - Most of `show`: `show all/sorts/kinds/ops/vars/mbs/eqs/rls/summary/components/desugared` are stubs;
     `show module` prints a flattened internal summary (no attributes, imports, statements, or `endfm`;
     everything renders as `fmod`) — the introspection surface is essentially absent.
   - The **entire `set print` family is silently inert** (`flat`, `with parentheses`, `number`, `rat`,
     `graph`, `conceal`, `attribute`, statement `print` attributes) — accepted, no effect.
-  - `set include BOOL on/off` (see §3.4 — the `on` direction is the implicit-BOOL gap), `set verbose`,
-    `set clear …`, `set break` — silent no-ops.
-  - CLI flags: none exist (`-no-banner`, `-no-prelude`, `-batch`, `-random-seed`, … are read as a filename).
+  - `set include BOOL on/off` (see §3.4 — the `on` direction is the implicit-BOOL gap), `set verbose`, and
+    `set break` remain silent no-ops. `set clear memo` and `do clear memo` are recognized warning no-ops.
+  - CLI supports `-no-banner` and `-no-prelude`; broader Maude flag parity (`-batch`, `-random-seed`, and
+    others) remains absent.
 - **Kind-level on-the-fly variables** `X:[Foo]` in command terms (kind sorts in declarations DO work).
 - **Interrupts**: no Ctrl-C abort of a running reduction.
-- **Diagnostics**: Maude's warning/advisory surface (preregularity, collapse-at-top, ambiguity, import
-  hygiene, "discarding module", …) is entirely absent. Where Maude warns-and-continues, tnk is silent (or
-  hard-errors — see §3.4). This is a cross-cutting feature gap, not one bug.
+- **Diagnostics**: focused, source-owned diagnostics now cover ignored `[memo]`, memo controls, dropped
+  statements, and fatal parse/module/view failures with recovery. Maude's broader warning/advisory surface
+  (preregularity, collapse-at-top, ambiguity, import hygiene, "discarding module", and more) remains a
+  cross-cutting compatibility gap; warning-text parity is not claimed.
 
 ## 3. Behavioral deviations (same input, different outcome)
 
@@ -422,8 +424,7 @@ Each of these breaks real specs; several break stock library files.
   `such that` echo omits Maude's `= true`; a goal variable shadowing a declared var prints `N:Nat` vs `N`;
   `metaXapply`'s AC hole context puts the hole first (`'_+_[[], 'b.S]` vs Maude's residue-first — RESOLVED (8fe4be2));
   `continue`-with-nothing-pending wording; meta-module echo grouping parens/element order; count-1 prefix
-  iter prints `t c` (doesn't round-trip); no warnings/advisories anywhere (the single largest byte-diff
-  source vs the oracle on real files).
+  iter prints `t c` (doesn't round-trip); broad warning/advisory parity remains absent.
 - **[D] Multi-top-component kind labels and the incomparable-membership tiebreak.** A kind-level result in
   a component with several *maximal* sorts lists them in declaration order (`[A,B,D]`) where Maude uses its
   ConnectedComponent sort index (a per-component DFS-topological numbering, `Core/sort.cc`
@@ -476,11 +477,12 @@ naturally rediscovered, and getting them wrong produces a new divergence:
 5. **`DagNode.nf` (normal-form forwarding) is load-bearing.** It costs ~6% on sharing-free workloads by
    field size alone, and it is what makes structure-sharing rewrite *counts* byte-faithful (a membership
    or reduction over a repeated subterm counts once, as in Maude). Don't strip it for throughput.
-6. **Conditional-rule `metaApply` / conditioned `metaMatch` want a condition-evaluator seam, not new
-   logic.** The engine already evaluates `ceq`/`crl` conditions internally; the work is exposing a
-   reusable "evaluate this condition under this substitution, enumerate solutions" entry point. Until
-   then both stay inert (never misfire) — verified, along with the non-empty-partial-substitution
-   `metaApply` corner (inert; Maude returns `(failure).ResultTriple?`).
+6. **Conditional-rule `metaApply`/`metaXapply` and conditioned `metaMatch`/`metaXmatch` want a
+   condition-evaluator seam, not new logic.** The engine already evaluates `ceq`/`crl` conditions internally;
+   the work is exposing a reusable “evaluate this condition under this substitution, enumerate solutions”
+   entry point. Until then the valid direct calls remain unreduced. Nonempty initial substitutions for an
+   unconditional ordinary `metaApply` are implemented; do not conflate that supported path with condition
+   evaluation.
 7. **Flat-mode `up*` over a builtin-importing closure omits the builtin declarations by construction.**
    Builtin/prelude imports live at the *engine* level — their ops/eqs are never re-inlined into the
    flattened statement list — so a faithful `flat = true` `upOpDecls`/`upModule` must up-translate

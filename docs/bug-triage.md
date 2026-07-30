@@ -14,7 +14,7 @@ The baseline at this revision is:
 
 - optional-Z3 subsystem scoreboard: **113/113 PASS** at the unchanged per-fixture timeout;
 - audit scoreboard: **98/98 PASS**;
-- workspace tests: **474 passed, 1 ignored**;
+- workspace tests: **479 passed, 1 ignored**;
 - legacy sweep: **87/87 CLEAN**, including the four ratified accepted-diff records.
 
 These gates cover only their fixtures. They do not overrule the open items below.
@@ -53,7 +53,7 @@ Until that policy is adopted, reference recovery is normative.
 |---|---|---|---|
 | DIV-001–004 | Accepted | Behavioral divergences | Ratified order/accounting differences remain observable and must stay pinned |
 | OUT-001, OUT-003 | Unclassified | Observable differences | Canonical presentation and trace/result formatting families still need isolation and decisions |
-| GAP-001–009 | Deferred | Compatibility gaps | Tracing, diagnostics, timing, cancellation, strategy, meta, and broader surface gaps remain |
+| GAP-001–009 | Deferred | Compatibility gaps | Tracing, full diagnostics parity, real timing, cancellation, strategy execution, META, and broader surfaces remain |
 
 ## 4. Confirmed open bugs
 
@@ -126,14 +126,16 @@ condition nested search tracing already matches Maude and is outside this gap.
 
 ### GAP-002 — Diagnostics
 
-Most warning/advisory behavior remains absent: preregularity, collapse-at-top, ambiguity, declaration
-recovery, import hygiene, discarded modules, and related messages. The differential harness strips these
-blocks, so semantic recovery fixtures do not prove warning-text parity.
+Focused diagnostics now cover source `[memo]`, unsupported memo controls, dropped statements, and fatal
+parse/module/view failures with recovery. Full Maude warning/advisory parity remains absent: preregularity,
+collapse-at-top, ambiguity, import hygiene, discarded modules, and related messages are not complete. The
+differential harness strips diagnostic blocks, so semantic recovery fixtures do not prove warning-text parity.
 
 ### GAP-003 — Real timing and rate reporting
 
-Most commands print fixed `0ms` and unknown-rate tails rather than measured timing. Rewrite counts remain the
-meaningful current contract.
+Real timing is not implemented. No command now prints a fabricated CPU time, elapsed time, decision time, or
+rewrite rate: `set show timing on .` warns and leaves timing disabled, while `set show timing off .` is silent.
+Exact rewrite and state counts remain the meaningful contract.
 
 ### GAP-004 — Cooperative cancellation
 
@@ -142,33 +144,40 @@ operations have no shared cancellation token.
 
 ### GAP-005 — `xmatchrew`
 
-Extension-match rewriting parses but rejects during strategy resolution because extension residue is not
-exposed and reassembled around the rewritten portion.
+Extension-match rewriting parses, then rejects during strategy resolution with an explicit recognized-but-not-
+implemented error. The Session remains usable. Execution still requires exposing the extension residue and
+reassembling it around the rewritten portion.
 
 ### GAP-006 — Conditional strategy definitions (`csd`)
 
-`csd` parses but rejects during resolution because runtime condition bindings are not threaded into the
-strategy body.
+`csd` parses, then a call selecting a conditional definition rejects with an explicit recognized-but-not-
+implemented error. The Session remains usable. Execution still requires threading runtime condition bindings
+into the strategy body.
 
 ### GAP-007 — Strategy meta parse and print
 
-`metaParseStrategy` and `metaPrettyPrintStrategy` remain inert. Strategy declaration/definition reflection is
-not part of this gap.
+`metaParseStrategy` and `metaPrettyPrintStrategy` remain inert: direct calls stay unreduced. Strategy
+declaration/definition up-reflection (`upStratDecls`/`upSds`) is supported and is not part of this gap.
 
-### GAP-008 — Conditioned and proper-partial meta operations
+### GAP-008 — Conditioned and partial-AC META operations
 
-The remaining established boundaries are:
+The retained direct probe `conformance/probes/meta-recognized-boundaries.maude` establishes these open
+boundaries:
 
-- non-empty conditions for `metaMatch`;
-- conditional-rule forms of `metaApply`;
-- proper partial-AC residue contexts for `metaXmatch`.
+- nonempty conditions leave `metaMatch` and `metaXmatch` unreduced;
+- selecting a conditional rule leaves `metaApply` and `metaXapply` unreduced;
+- a same-head partial AC pattern (for example, `f(X, Y)` against `f(a, b, c)`) gives non-oracle bindings and
+  context in `metaXmatch`, and a non-oracle result/context in `metaXapply`.
 
-Non-empty partial substitutions for ordinary `metaApply` are implemented and covered by
-`I01-meta-int-apply`; they are not part of this gap.
+Do not conflate the last item with DIV-001's AC solution-order difference. Ordinary operations with `nil`
+conditions, nonempty initial substitutions for unconditional `metaApply`, and atomic extension matches/rules
+that return a proper AC residue context are implemented and directly oracle-matched.
 
 ### GAP-009 — Other deliberately deferred surfaces
 
-- `memo` semantics and controls;
+- `memo` tables, cache behavior, and clear semantics: source `[memo]` executes uncached with one warning, and
+  memo controls warn that they have no effect; `upModule` omits the attribute while literal reflected modules
+  accept it inertly;
 - external managers beyond STD-STREAM;
 - LOOP-MODE and Full Maude;
 - LaTeX output;

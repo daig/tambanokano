@@ -268,6 +268,10 @@ pub fn flatten_with_homes(
     );
     let pm = PreModule {
         name: name.to_string(),
+        source_line: root.and_then(|module| module.source_line),
+        diagnostics: root
+            .map(|module| module.diagnostics.clone())
+            .unwrap_or_default(),
         kind,
         is_theory,
         is_strategy,
@@ -340,6 +344,8 @@ pub fn flatten_pre(
     let d = acc.into_decls();
     Ok(PreModule {
         name: SENTINEL.to_string(),
+        source_line: pm.source_line,
+        diagnostics: pm.diagnostics.clone(),
         kind: pm.kind,
         is_theory: pm.is_theory,
         is_strategy: pm.is_strategy,
@@ -718,6 +724,16 @@ fn module_origin_sorts(
     result
 }
 
+fn renames_free_parameter_sort(item: &RenameItem, scope: &[String]) -> bool {
+    let RenameItem::Sort { from, .. } = item else {
+        return false;
+    };
+    scope.iter().any(|parameter| {
+        from.strip_prefix(parameter)
+            .is_some_and(|rest| rest.starts_with('$'))
+    })
+}
+
 fn collect_expr(
     expr: &ModuleExpr,
     db: &ModuleDb,
@@ -750,7 +766,21 @@ fn collect_expr(
                 interner,
                 scope,
             )?;
-            let renamed = apply_renaming(tmp.into_decls(), items, interner)?;
+            let renamed = if items
+                .iter()
+                .any(|item| renames_free_parameter_sort(item, scope))
+            {
+                // Maude ignores an attempt to rename a sort owned by an enclosing parameter (`Y$Elt`):
+                // the parameter binding, not the import renaming, owns that name (A4e).
+                let effective: Vec<_> = items
+                    .iter()
+                    .filter(|item| !renames_free_parameter_sort(item, scope))
+                    .cloned()
+                    .collect();
+                apply_renaming(tmp.into_decls(), &effective, interner)?
+            } else {
+                apply_renaming(tmp.into_decls(), items, interner)?
+            };
             // Renamed donation: bubbles are rewritten in-place, parse against the flattened grammar (D1a
             // scoped to plain named imports).
             acc.add(renamed, None);

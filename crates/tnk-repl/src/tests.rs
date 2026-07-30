@@ -462,10 +462,10 @@ fn prelude_results(out: &str) -> Vec<String> {
 fn prelude_meta_through_repl() {
     let out = repl().eval(conformance_file!("prelude-meta.maude")).output;
     assert!(
-        !out.contains("no parse") && !out.contains("error in module"),
+        !out.lines()
+            .any(|line| line.starts_with("error") || line.starts_with("parse error")),
         "META tower builds: {out}"
     );
-    assert!(!out.contains("parse error"), "no parse errors: {out}");
     assert_eq!(
         prelude_results(&out),
         vec![
@@ -923,13 +923,13 @@ fn prelude_bool_m0_through_repl() {
     // Distinctive rewrite counts: four single-rewrite reduces, the 5-rewrite stuck conditional, and
     // the 7-rewrite xor expansion.
     assert_eq!(
-        out.matches("rewrites: 1 ").count(),
+        out.matches("rewrites: 1\n").count(),
         4,
         "1-rewrite reduces: {out}"
     );
-    assert!(out.contains("rewrites: 7 "), "xor-expansion count: {out}");
+    assert!(out.contains("rewrites: 7\n"), "xor-expansion count: {out}");
     assert!(
-        out.contains("rewrites: 5 "),
+        out.contains("rewrites: 5\n"),
         "stuck-branch normalization count: {out}"
     );
 }
@@ -961,7 +961,7 @@ fn poly_multikind_through_repl() {
     // reference binary prints it (==' s prec 51 makes them unnecessary).
     assert!(
         out.contains("reduce in MK : if c1 == c2 then c0 else c2 fi .")
-            && out.contains("rewrites: 2 "),
+            && out.contains("rewrites: 2\n"),
         "nested ==/if count: {out}"
     );
 }
@@ -981,9 +981,13 @@ fn bare_condition_through_repl() {
         "bare-cond values: {out}"
     );
     // f(a): == eval + eq application = 2; f(b): == eval only (condition false) = 1.
-    assert_eq!(out.matches("rewrites: 2 ").count(), 1, "fired count: {out}");
     assert_eq!(
-        out.matches("rewrites: 1 ").count(),
+        out.matches("rewrites: 2\n").count(),
+        1,
+        "fired count: {out}"
+    );
+    assert_eq!(
+        out.matches("rewrites: 1\n").count(),
         1,
         "not-fired count: {out}"
     );
@@ -1030,7 +1034,11 @@ fn prelude_nat_m1_through_repl() {
         "NAT values/sorts: {out}"
     );
     // Every reduce here is a single built-in rewrite (2-operand / prefix N-ary).
-    assert_eq!(out.matches("rewrites: 1 ").count(), 24, "NAT counts: {out}");
+    assert_eq!(
+        out.matches("rewrites: 1\n").count(),
+        24,
+        "NAT counts: {out}"
+    );
 }
 
 /// Tier 2 — the remaining built-in data types + leaf special ops: INT (`abs`/`~`, signed bignum +
@@ -1108,7 +1116,7 @@ fn prelude_tier2_through_repl() {
     // folds) — the only multi-rewrite command here (the kind-sorted `[Float]`/`counter` results above
     // already attest the partial-op / inert-counter non-reductions).
     assert!(
-        out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5 in"),
+        out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5\n"),
         "counter: {out}"
     );
 }
@@ -1686,7 +1694,7 @@ fn collapsing_membership_fixture_through_repl() {
     assert!(
         out.contains(
             "reduce in B3C-DOWNSTREAM-VALUE : wrap(a) .\n\
-             rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             rewrites: 2\n\
              result E: b"
         ),
         "downstream sorted equation:\n{out}"
@@ -1709,11 +1717,25 @@ fn collapsing_membership_fixture_through_repl() {
 #[test]
 fn rewrite_command_through_repl() {
     let out = repl().eval(conformance_file!("rewrite.maude")).output;
-    assert!(out.contains("rewrite in CHAIN : a .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: d"), "rewrite a:\n{out}");
-    assert!(out.contains("rewrite [2] in CHAIN : a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "rewrite [2] a:\n{out}");
-    assert!(out.contains("rewrite in CHAIN : f(a) .\nrewrites: 7 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: d"), "rewrite f(a) (7 steps):\n{out}");
+    assert!(
+        out.contains("rewrite in CHAIN : a .\nrewrites: 3\nresult S: d"),
+        "rewrite a:\n{out}"
+    );
+    assert!(
+        out.contains("rewrite [2] in CHAIN : a .\nrewrites: 2\nresult S: c"),
+        "rewrite [2] a:\n{out}"
+    );
+    assert!(
+        out.contains("rewrite in CHAIN : f(a) .\nrewrites: 7\nresult S: d"),
+        "rewrite f(a) (7 steps):\n{out}"
+    );
     // `rewrite [1] a .` -> b, then `continue 1 .` -> c (count reset to the 1 step done in the continue).
-    assert!(out.contains("rewrite [1] in CHAIN : a .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: b\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"), "[1] then continue:\n{out}");
+    assert!(
+        out.contains(
+            "rewrite [1] in CHAIN : a .\nrewrites: 1\nresult S: b\nrewrites: 1\nresult S: c"
+        ),
+        "[1] then continue:\n{out}"
+    );
 }
 
 /// `set trace on` + `rewrite` renders the rule step exactly as the reference: `*********** rule` + the
@@ -1733,10 +1755,7 @@ fn traced_rewrite_renders_rule_blocks() {
         s.contains("*********** rule\nrl b => c .\nempty substitution\nb\n--->\nc"),
         "rule block 2:\n{s}"
     );
-    assert!(
-        s.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"),
-        "tail:\n{s}"
-    );
+    assert!(s.contains("rewrites: 2\nresult S: c"), "tail:\n{s}");
 }
 
 /// Pillar A-ii: `frewrite` (position-fair) + frozen arguments, byte-matching the reference
@@ -1747,13 +1766,25 @@ fn traced_rewrite_renders_rule_blocks() {
 fn frewrite_command_through_repl() {
     let out = repl().eval(conformance_file!("frewrite.maude")).output;
     // Unbounded: all three positions reach `d` in 9 steps.
-    assert!(out.contains("frewrite in FR : (a | a) | a .\nrewrites: 9 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: (d | d) | d"), "unbounded:\n{out}");
+    assert!(
+        out.contains("frewrite in FR : (a | a) | a .\nrewrites: 9\nresult S: (d | d) | d"),
+        "unbounded:\n{out}"
+    );
     // Fairness: greedy `rewrite [2]` drains one position; fair `frewrite [2]` spreads across two.
-    assert!(out.contains("rewrite [2] in FR : (a | a) | a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: (a | a) | c"), "greedy:\n{out}");
-    assert!(out.contains("frewrite [2] in FR : (a | a) | a .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult (sort not calculated): (b | b) | a"), "fair + sort-not-calculated:\n{out}");
+    assert!(
+        out.contains("rewrite [2] in FR : (a | a) | a .\nrewrites: 2\nresult S: (a | a) | c"),
+        "greedy:\n{out}"
+    );
+    assert!(out.contains("frewrite [2] in FR : (a | a) | a .\nrewrites: 2\nresult (sort not calculated): (b | b) | a"), "fair + sort-not-calculated:\n{out}");
     // Frozen: a rule never rewrites inside f's (frozen) argument; g's argument IS rewritten.
-    assert!(out.contains("frewrite in FR : f(a) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: f(a)"), "frozen blocks:\n{out}");
-    assert!(out.contains("frewrite in FR : g(a) .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(d)"), "non-frozen rewrites:\n{out}");
+    assert!(
+        out.contains("frewrite in FR : f(a) .\nrewrites: 0\nresult S: f(a)"),
+        "frozen blocks:\n{out}"
+    );
+    assert!(
+        out.contains("frewrite in FR : g(a) .\nrewrites: 3\nresult S: g(d)"),
+        "non-frozen rewrites:\n{out}"
+    );
 }
 
 /// Pillar A-iii: conditional rules (`crl`) with equality / matching / sort-test fragments, byte-matching
@@ -1761,10 +1792,22 @@ fn frewrite_command_through_repl() {
 #[test]
 fn crl_command_through_repl() {
     let out = repl().eval(conformance_file!("crl.maude")).output;
-    assert!(out.contains("rewrite in CRL : f(a) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(a)"), "equality holds:\n{out}");
-    assert!(out.contains("rewrite in CRL : f(b) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: h(b)"), "backtrack to `:=`:\n{out}");
-    assert!(out.contains("rewrite in CRL : k(a) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: g(a)"), "sort-test holds:\n{out}");
-    assert!(out.contains("rewrite in CRL : k(b) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: k(b)"), "sort-test fails -> no rewrite:\n{out}");
+    assert!(
+        out.contains("rewrite in CRL : f(a) .\nrewrites: 1\nresult S: g(a)"),
+        "equality holds:\n{out}"
+    );
+    assert!(
+        out.contains("rewrite in CRL : f(b) .\nrewrites: 1\nresult S: h(b)"),
+        "backtrack to `:=`:\n{out}"
+    );
+    assert!(
+        out.contains("rewrite in CRL : k(a) .\nrewrites: 1\nresult S: g(a)"),
+        "sort-test holds:\n{out}"
+    );
+    assert!(
+        out.contains("rewrite in CRL : k(b) .\nrewrites: 0\nresult S: k(b)"),
+        "sort-test fails -> no rewrite:\n{out}"
+    );
 }
 
 /// A traced `crl` renders the rule trial / condition-fragment / backtrack stream exactly as the
@@ -1809,16 +1852,26 @@ fn traced_crl_backtrack() {
 fn search_command_through_repl() {
     let out = repl().eval(conformance_file!("search.maude")).output;
     // =>1: exactly the one-step successors b, c (states 3, rewrites 2 at the end).
-    assert!(out.contains("search in NDET : a =>1 X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> b"), "=>1 sol1:\n{out}");
-    assert!(out.contains("Solution 2 (state 2)\nstates: 3  rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> c\n\nNo more solutions.\nstates: 3  rewrites: 2"), "=>1 sol2+end:\n{out}");
+    assert!(
+        out.contains(
+            "search in NDET : a =>1 X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1\nX --> b"
+        ),
+        "=>1 sol1:\n{out}"
+    );
+    assert!(out.contains("Solution 2 (state 2)\nstates: 3  rewrites: 2\nX --> c\n\nNo more solutions.\nstates: 3  rewrites: 2"), "=>1 sol2+end:\n{out}");
     // =>* includes the initial state 0 at rewrites 0.
-    assert!(out.contains("search in NDET : a =>* X .\n\nSolution 1 (state 0)\nstates: 1  rewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> a"), "=>* state 0:\n{out}");
+    assert!(
+        out.contains(
+            "search in NDET : a =>* X .\n\nSolution 1 (state 0)\nstates: 1  rewrites: 0\nX --> a"
+        ),
+        "=>* state 0:\n{out}"
+    );
     // =>! finds only the normal form e (whole graph explored: states 5, rewrites 5).
-    assert!(out.contains("search in NDET : a =>! X .\n\nSolution 1 (state 4)\nstates: 5  rewrites: 5 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> e\n\nNo more solutions."), "=>! e:\n{out}");
+    assert!(out.contains("search in NDET : a =>! X .\n\nSolution 1 (state 4)\nstates: 5  rewrites: 5\nX --> e\n\nNo more solutions."), "=>! e:\n{out}");
     // such that filters to state 3 (d), but exploration still finishes the whole graph.
-    assert!(out.contains("such that X = d .\n\nSolution 1 (state 3)\nstates: 4  rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> d\n\nNo more solutions.\nstates: 5  rewrites: 5"), "such-that:\n{out}");
+    assert!(out.contains("such that X = d .\n\nSolution 1 (state 3)\nstates: 4  rewrites: 3\nX --> d\n\nNo more solutions.\nstates: 5  rewrites: 5"), "such-that:\n{out}");
     // [1] then continue: the second solution c is generated lazily during continue, so rewrites: 1.
-    assert!(out.contains("search [1] in NDET : a =>+ X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> b\n\nSolution 2 (state 2)\nstates: 3  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nX --> c"), "bounded+continue:\n{out}");
+    assert!(out.contains("search [1] in NDET : a =>+ X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1\nX --> b\n\nSolution 2 (state 2)\nstates: 3  rewrites: 1\nX --> c"), "bounded+continue:\n{out}");
 }
 
 /// `show path N` and `show search graph` for the last search, byte-matching the reference.
@@ -1854,32 +1907,59 @@ fn search_show_path_and_graph() {
 fn rewrite_condition_through_repl() {
     let out = repl().eval(conformance_file!("rewrite-cond.maude")).output;
     // X => c holds via a->b->c (2 search rewrites) + the rule itself = 3.
-    assert!(out.contains("rewrite in REACH : f(a) .\nrewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: done"), "reach a:\n{out}");
+    assert!(
+        out.contains("rewrite in REACH : f(a) .\nrewrites: 3\nresult S: done"),
+        "reach a:\n{out}"
+    );
     // c matches c at 0 steps -> just the rule fires (1 rewrite).
-    assert!(out.contains("rewrite in REACH : f(c) .\nrewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: done"), "reach c (0 steps):\n{out}");
+    assert!(
+        out.contains("rewrite in REACH : f(c) .\nrewrites: 1\nresult S: done"),
+        "reach c (0 steps):\n{out}"
+    );
     // stuck reaches nothing matching c -> condition fails, no rewrite.
-    assert!(out.contains("rewrite in REACH : f(stuck) .\nrewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: f(stuck)"), "unreachable:\n{out}");
+    assert!(
+        out.contains("rewrite in REACH : f(stuck) .\nrewrites: 0\nresult S: f(stuck)"),
+        "unreachable:\n{out}"
+    );
     // The target pattern s(Y) binds Y from a reached state — matching the reference byte-for-byte (Y = z,
     // 2 rewrites). The exact `=>` search order is Maude's; we reproduce it (verified across cases).
-    assert!(out.contains("rewrite in BIND : f(s(s(z))) .\nrewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult N: g(z)"), "binding:\n{out}");
+    assert!(
+        out.contains("rewrite in BIND : f(s(s(z))) .\nrewrites: 2\nresult N: g(z)"),
+        "binding:\n{out}"
+    );
 }
 
-/// A rewrite condition (`=>`) is legal only in a rule. In an equation Maude warns "no parse for statement"
-/// and DROPS the statement, keeping the module usable (fable-audit.md §3.4 statement recovery — verified
-/// against the oracle: `reduce a` returns `a`, the dropped `ceq` never fires). Our diagnostics are phase E,
-/// so the drop is silent; the pin is that the module builds and the bad `ceq` has no effect.
+/// A rewrite condition (`=>`) is legal only in a rule. An equation using one is dropped with an
+/// actionable warning, while the module and its following commands remain usable.
 #[test]
 fn rewrite_condition_dropped_in_equation() {
-    let out = repl()
-        .eval("fmod E is sort S . ops a b : -> S . var X : S . ceq a = b if X => b . endfm\nreduce a .")
+    let mut r = repl();
+    let warning = r
+        .eval(
+            "fmod E is\n\
+               sort S .\n\
+               ops a b : -> S .\n\
+               var X : S .\n\
+               ceq a = b if X => b .\n\
+             endfm",
+        )
         .output;
+    assert_eq!(
+        warning,
+        wrap::auto_wrap(
+            "warning: module `E`, line 5: dropped equation: a rewrite condition (`=>`) is only \
+             allowed in a rule (`crl`), not an equation"
+        )
+    );
+
+    let output = r.eval("reduce in E : a .").output;
     assert!(
-        out.contains("result S: a"),
-        "module usable, bad ceq dropped: {out}"
+        output.contains("rewrites: 0\nresult S: a"),
+        "module usable, bad ceq dropped: {output}"
     );
     assert!(
-        !out.contains("result S: b"),
-        "the dropped ceq must not fire: {out}"
+        !output.contains("result S: b"),
+        "the dropped ceq must not fire: {output}"
     );
 }
 
@@ -1921,9 +2001,12 @@ fn rule_in_fmod_is_rejected() {
     let out = repl()
         .eval("fmod F is sort S . ops a b : -> S . rl a => b . endfm")
         .output;
-    assert!(
-        out.contains("not allowed in a functional module"),
-        "rejection: {out}"
+    assert_eq!(
+        out,
+        wrap::auto_wrap(
+            "parse error: module `F`, line 1: rule `rl` is not allowed in a functional module \
+             (`fmod F`); use `mod`"
+        )
     );
 }
 
@@ -1943,10 +2026,7 @@ fn eval_mixed_file_with_meta_commands() {
         out.contains("*********** rule\nrl a => b ."),
         "traced rule from a one-shot file load:\n{out}"
     );
-    assert!(
-        out.contains("rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)\nresult S: c"),
-        "result:\n{out}"
-    );
+    assert!(out.contains("rewrites: 2\nresult S: c"), "result:\n{out}");
 }
 
 /// The multi-line buffer boundary: a command terminator / a closed module complete; an open module body
@@ -1973,9 +2053,8 @@ fn input_complete_boundaries() {
 /// Extract the conformance-relevant outcome lines from an objects-system run: every line that is **not**
 /// a command echo (the `rewrite`/`reduce`/`search` line and any wrapped continuation, ending at the
 /// trailing ` .`). What remains — `result …`, `rewrites:`, `states:`, `Solution …`, the `Var --> v`
-/// bindings — is exactly what we compare byte-for-byte to the reference (the echo's `__`-parenthesization
-/// and ordering is a known rendering divergence that every conformance fixture abstracts over; the
-/// `rewrites/second` *rate* is timing noise — ours is always `~`).
+/// bindings — is exactly what we compare byte-for-byte to the reference. The echo's
+/// `__`-parenthesization and ordering is a known rendering divergence abstracted by every fixture.
 fn objects_outcomes(out: &str) -> Vec<String> {
     let mut lines = out.lines().peekable();
     let mut keep = Vec::new();
@@ -2019,41 +2098,41 @@ fn objects_through_repl() {
         objects_outcomes(&out),
         vec![
             // BANK: two credits apply (4 rewrites), balances updated, objects in `a < b` order.
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: < a : Account | bal : 50 > < b : Account | bal : 125 >",
             // getClass: an ordinary equation over the object constructor.
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Cid: Account",
             // BANK search: credit 5 then 7 reaches balance 12 (state 3 of 4); declared var `N` prints bare.
             "",
             "Solution 1 (state 3)",
-            "states: 4  rewrites: 6 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "states: 4  rewrites: 6",
             "N --> 12",
             "",
             "No more solutions.",
-            "states: 4  rewrites: 8 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "states: 4  rewrites: 8",
             // PINGPONG `rewrite [4]`: four message hand-offs; the leftover `ping(p1, p2)` (arity 2) prints
             // BEFORE the two arity-3 objects — the arity-first ACU order. (Result wraps at 80 cols.)
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: ping(p1, p2) < p1 : Player | turns : 2 > < p2 : Player |",
             "    turns : 2 >",
             // PINGPONG search `=>+`: the first `pong(p2, p1)` state (depth 1), the soup remainder bound to C.
             "",
             "Solution 1 (state 1)",
-            "states: 2  rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "states: 2  rewrites: 1",
             "C:Configuration --> < p1 : Player | turns : 1 > < p2 : Player | turns : 0 >",
             // erewrite (object-message-fair, Pillar 2.5-B). The `msg`-flagged credit/ping/pong engage the
             // ConfigSymbol scheduler. BANK: one pass delivers BOTH credits (the bound counts passes), 4
             // rewrites (2 credits x rule+`+`).
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: < a : Account | bal : 50 > < b : Account | bal : 125 >",
             // BANK, two credits to ONE account: `a` evolves 0->5->12 within the pass; the lone object
             // collapses to `result Object:`.
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Object: < a : Account | bal : 12 >",
             // PINGPONG `erewrite [3]`: one delivery per pass (each produces the next message), so [3] = 3
             // hand-offs — pong leftover, p1 at 2 turns, p2 at 1. (Result wraps at 80 cols.)
-            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 3",
             "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
             "    turns : 1 >",
         ],
@@ -2082,19 +2161,19 @@ fn objects_io_through_repl() {
             // GREET: start -> write "hello\n" -> wrote -> stop. The write happens externally (not a
             // rewrite); the count is the `go`+`done` rules = 2.
             "hello",
-            "rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 2",
             "result Configuration: <> < g : Greeter | none >",
             // TICKER: three sequential "tick\n" writes (go + next + next), then stop = 4 rule rewrites.
             "tick",
             "tick",
             "tick",
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: <> < t : Ticker | n : 0 >",
             // ECHO: getLine reads "one\n"/"two\n" (incl. newline), each echoed straight to stdout; count is
             // go + got + next + got + stop = 5 rule rewrites (the getLine/write handling is not a rewrite).
             "one",
             "two",
-            "rewrites: 5 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 5",
             "result Configuration: <> < e : Echoer | n : 0 >",
         ],
         "STD-STREAM stdout writes + stdin getLine + erewrite outcomes must match the reference: {out}"
@@ -2153,26 +2232,26 @@ fn objects_omod_through_repl() {
         objects_outcomes(&out),
         vec![
             // rewrite: credit fires on the Account and on the Savings subclass (its extra `rate` preserved).
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: < a : Account | bal : 50 > < b : Savings | bal : 125,",
             "    rate : 5 >",
             // getClass on the subclass instance returns its actual class.
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Savings: Savings",
             // search: credit 5 then 7 reaches balance 12 (state 3 of 4).
             "",
             "Solution 1 (state 3)",
-            "states: 4  rewrites: 6 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "states: 4  rewrites: 6",
             "N --> 12",
             "",
             "No more solutions.",
-            "states: 4  rewrites: 8 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "states: 4  rewrites: 8",
             // erewrite (object-message-fair): one pass delivers both credits.
-            "rewrites: 4 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 4",
             "result Configuration: < a : Account | bal : 50 > < b : Savings | bal : 125,",
             "    rate : 5 >",
             // erewrite ping-pong: [3] = three hand-offs; pong leftover, p1 at 2 turns, p2 at 1.
-            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 3",
             "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
             "    turns : 1 >",
         ],
@@ -2200,10 +2279,10 @@ fn objects_omod_attrs_through_repl() {
         objects_outcomes(&out),
         vec![
             // applyRate: bal := bal + rate (100 + 5); rate preserved via the missing-attribute copy.
-            "rewrites: 2 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 2",
             "result Object: < s1 : Savings | bal : 105, rate : 5 >",
             // log: count := s count, last := 7 (last matched by a fresh kind-variable on the LHS).
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Object: < lg : Logger | count : 1, last : 7 >",
         ],
         "object-pattern completion attribute edge cases must match the reference: {out}"
@@ -2230,10 +2309,10 @@ fn objects_omod_multi_through_repl() {
         objects_outcomes(&out),
         vec![
             // reward(a,5) via the fast path (a: 0->5, +1 for the `+`), then pair via leftOver (a->6, b->1) = 3.
-            "rewrites: 3 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 3",
             "result Configuration: < a : Member | pts : 6 > < b : Member | pts : 1 >",
             // pair alone: one leftOver rewrite bumps both objects.
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Configuration: < a : Member | pts : 1 > < b : Member | pts : 1 >",
         ],
         "erewrite object-message fast path + multi-object leftOver path must match the reference: {out}"
@@ -2256,10 +2335,10 @@ fn objects_oth_through_repl() {
     assert_eq!(
         objects_outcomes(&out),
         vec![
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Shape: Shape",
             // getClass on a Square (a subclass of Shape) instance returns its own class.
-            "rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)",
+            "rewrites: 1",
             "result Square: Square",
         ],
         "oth (object theory) class/subclass/msg build + getClass must match the reference: {out}"
@@ -2680,12 +2759,16 @@ fn meta_variant_repl() -> Repl {
     let mut r = repl();
     let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
     assert!(
-        !prelude.contains("error in module") && !prelude.contains("no parse"),
+        !prelude
+            .lines()
+            .any(|line| line.starts_with("error") || line.starts_with("parse error")),
         "meta prelude: {prelude}"
     );
     let setup = r.eval(META_VARIANT_XOR).output;
     assert!(
-        !setup.contains("error in module") && !setup.contains("no parse"),
+        !setup
+            .lines()
+            .any(|line| line.starts_with("error") || line.starts_with("parse error")),
         "variant meta setup: {setup}"
     );
     r
@@ -3090,7 +3173,7 @@ fn cross_kind_ill_sorted_suffix_remains_classified() {
     assert!(
         output.contains(
             "reduce in COV002-ILL-SORTED-OUTPUT : (f(a1)).B .\n\
-             rewrites: 1 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             rewrites: 1\n\
              result B: b"
         ),
         "applicable first profile: {output}"
@@ -3098,9 +3181,491 @@ fn cross_kind_ill_sorted_suffix_remains_classified() {
     assert!(
         output.contains(
             "reduce in COV002-ILL-SORTED-OUTPUT : (f(a2)).[B] .\n\
-             rewrites: 0 in 0ms cpu (0ms real) (~ rewrites/second)\n\
+             rewrites: 0\n\
              result [B]: (f(a2)).[B]"
         ),
         "classified ill-sorted spelling: {output}"
     );
+}
+
+/// Timing is never synthesized. Every renderer keeps its observable counts, `set show timing off`
+/// stays silent, and requesting unavailable timing reports one explicit warning.
+#[test]
+fn timing_output_is_count_only_across_command_families() {
+    let output = repl()
+        .eval(
+            r#"set show timing off .
+set show timing on .
+set show timing off .
+smod TIMING-MATRIX is
+  sort S .
+  ops a b c : -> S [ctor] .
+  op pair : S S -> S [ctor] .
+  vars X Y : S .
+  rl [r1] : a => b .
+  rl [r2] : b => c .
+  strat step : @ S .
+  sd step := r1 .
+endsm
+red in TIMING-MATRIX : a .
+match in TIMING-MATRIX : X:S <=? a .
+unify in TIMING-MATRIX : X:S =? a .
+rewrite [1] in TIMING-MATRIX : a .
+continue 1 .
+frewrite [1] in TIMING-MATRIX : pair(a, a) .
+search [1] in TIMING-MATRIX : a =>* X:S .
+continue 1 .
+srewrite in TIMING-MATRIX : a using step .
+fmod TIMING-VARIANTS is
+  sort S .
+  ops a b : -> S [ctor] .
+  op _*_ : S S -> S [assoc comm] .
+  vars X Y : S .
+  eq X * X = X [variant] .
+endfm
+get variants [1] in TIMING-VARIANTS : X:S * Y:S .
+continue 1 .
+variant unify in TIMING-VARIANTS : X:S * a =? Y:S * b .
+mod TIMING-NARROW is
+  sort N .
+  op z : -> N .
+  op s : N -> N .
+  var X : N .
+  rl [up] : s(X) => s(s(X)) [narrowing] .
+endm
+vu-narrow [1] in TIMING-NARROW : s(X:N) =>1 s(s(z)) .
+continue 1 ."#,
+        )
+        .output;
+
+    let timing_warning =
+        "warning: timing measurements are unavailable; timing output remains disabled.";
+    assert_eq!(output.matches(timing_warning).count(), 1, "{output}");
+    for forbidden in ["0ms", "Decision time", "rewrites/second"] {
+        assert!(!output.contains(forbidden), "{forbidden}: {output}");
+    }
+    for header in [
+        "reduce in TIMING-MATRIX",
+        "match in TIMING-MATRIX",
+        "unify in TIMING-MATRIX",
+        "rewrite [1] in TIMING-MATRIX",
+        "frewrite [1] in TIMING-MATRIX",
+        "search [1] in TIMING-MATRIX",
+        "srewrite in TIMING-MATRIX",
+        "get variants [1] in TIMING-VARIANTS",
+        "variant unify in TIMING-VARIANTS",
+        "vu-narrow [1] in TIMING-NARROW",
+    ] {
+        assert!(output.contains(header), "missing `{header}`:\n{output}");
+    }
+    assert!(
+        output.contains(
+            "rewrite [1] in TIMING-MATRIX : a .\nrewrites: 1\nresult S: b\n\
+             rewrites: 1\nresult S: c"
+        ),
+        "rewrite continuation counts:\n{output}"
+    );
+    assert!(
+        output.contains("states: 1  rewrites: 0")
+            && output.contains("states: 2  rewrites: 1")
+            && output.contains("Variant 2\nrewrites: 1")
+            && output.contains("No more unifiers.\nrewrites: 4")
+            && output.contains("variant unifier:"),
+        "count-only search/variant/narrowing output:\n{output}"
+    );
+}
+
+#[test]
+fn memo_attribute_and_controls_warn_without_changing_results() {
+    let mut r = repl();
+    let source_warning = r
+        .eval(
+            "fmod MEMO-BASE is\n\
+               sort N .\n\
+               op z : -> N [ctor] .\n\
+               op s : N -> N [ctor] .\n\
+               op f : N -> N [memo] .\n\
+               var N : N .\n\
+               eq f(z) = z .\n\
+               eq f(s(N)) = f(N) .\n\
+             endfm",
+        )
+        .output;
+    assert_eq!(
+        source_warning,
+        wrap::auto_wrap(
+            "warning: module `MEMO-BASE`, line 5: `[memo]` on operator `f` is recognized but not \
+             implemented; evaluation continues without memoization"
+        )
+    );
+
+    let import_output = r
+        .eval(
+            "fmod MEMO-LEFT is protecting MEMO-BASE . endfm\n\
+             fmod MEMO-RIGHT is protecting MEMO-BASE . endfm\n\
+             fmod MEMO-DIAMOND is\n\
+               protecting MEMO-LEFT .\n\
+               protecting MEMO-RIGHT .\n\
+             endfm",
+        )
+        .output;
+    assert!(!import_output.contains("[memo]"), "{import_output}");
+
+    let file_warning = r
+        .eval(concat!(
+            "load ",
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../conformance/probes/memo-source-load.maude"
+        ))
+        .output;
+    assert_eq!(
+        file_warning,
+        wrap::auto_wrap(
+            "warning: module `MEMO-FILE`, line 5: `[memo]` on operator `f` is recognized but not \
+             implemented; evaluation continues without memoization"
+        )
+    );
+    assert!(
+        r.eval("red in MEMO-FILE : f(z) .")
+            .output
+            .contains("rewrites: 1\nresult N: z")
+    );
+
+    let before = r.eval("red in MEMO-DIAMOND : f(s(z)) .").output;
+    assert!(before.contains("rewrites: 2\nresult N: z"), "{before}");
+    assert_eq!(r.eval("red in MEMO-DIAMOND : f(s(z)) .").output, before);
+
+    let control_warning = "warning: memoization controls are recognized but not implemented; this command has no effect.";
+    for control in [
+        "set memo on .",
+        "set clear memo on .",
+        "set clear memo off .",
+        "do clear memo .",
+        "do clear memo MEMO-DIAMOND .",
+    ] {
+        assert_eq!(
+            r.eval(control).output,
+            wrap::auto_wrap(control_warning),
+            "{control}"
+        );
+        assert_eq!(
+            r.eval("red in MEMO-DIAMOND : f(s(z)) .").output,
+            before,
+            "after {control}"
+        );
+    }
+    assert_eq!(r.eval("red in MEMO-DIAMOND : f(s(z)) .").output, before);
+}
+
+#[test]
+fn unsupported_strategy_forms_fail_directly_and_through_imports() {
+    let mut r = repl();
+    let setup = r
+        .eval(
+            "smod UNSUPPORTED-STRAT is\n\
+               sort S .\n\
+               ops a b c : -> S [ctor] .\n\
+               rl [r] : a => b .\n\
+               rl [r2] : b => c .\n\
+               strats sx sc ok : @ S .\n\
+               sd sx := xmatchrew X:S by X using r .\n\
+               csd sc := r if a = b .\n\
+               sd ok := r .\n\
+             endsm\n\
+             smod UNSUPPORTED-USE is\n\
+               protecting UNSUPPORTED-STRAT .\n\
+             endsm",
+        )
+        .output;
+    assert!(setup.is_empty(), "{setup}");
+
+    let pending = r.eval("rewrite [1] in UNSUPPORTED-USE : a .").output;
+    assert!(pending.contains("rewrites: 1\nresult S: b"), "{pending}");
+    let rejected = r.eval("srewrite in UNSUPPORTED-USE : a using sx .").output;
+    assert_eq!(
+        rejected,
+        wrap::auto_wrap("error: xmatchrew is recognized but not implemented")
+    );
+    let resumed = r.eval("continue 1 .").output;
+    assert!(
+        resumed.contains("rewrites: 1\nresult S: c"),
+        "continuation after rejected strategy:\n{resumed}"
+    );
+
+    for (command, module, strategy, expected) in [
+        (
+            "srewrite",
+            "UNSUPPORTED-STRAT",
+            "sx",
+            "error: xmatchrew is recognized but not implemented",
+        ),
+        (
+            "dsrewrite",
+            "UNSUPPORTED-STRAT",
+            "sx",
+            "error: xmatchrew is recognized but not implemented",
+        ),
+        (
+            "srewrite",
+            "UNSUPPORTED-USE",
+            "sx",
+            "error: xmatchrew is recognized but not implemented",
+        ),
+        (
+            "dsrewrite",
+            "UNSUPPORTED-USE",
+            "sx",
+            "error: xmatchrew is recognized but not implemented",
+        ),
+        (
+            "srewrite",
+            "UNSUPPORTED-STRAT",
+            "sc",
+            "error: conditional strategy definitions (`csd`) are recognized but not implemented",
+        ),
+        (
+            "srewrite",
+            "UNSUPPORTED-USE",
+            "sc",
+            "error: conditional strategy definitions (`csd`) are recognized but not implemented",
+        ),
+    ] {
+        let output = r
+            .eval(&format!("{command} in {module} : a using {strategy} ."))
+            .output;
+        assert_eq!(output, wrap::auto_wrap(expected));
+        assert!(!output.contains("Solution"), "{output}");
+
+        let recovery = r
+            .eval(&format!("srewrite in {module} : a using ok ."))
+            .output;
+        assert!(
+            recovery.contains("Solution 1")
+                && recovery.contains("rewrites: 1")
+                && recovery.contains("result S: b"),
+            "strategy recovery after `{command} {strategy}`:\n{recovery}"
+        );
+    }
+}
+
+#[test]
+fn statement_and_module_failures_are_actionable_and_recoverable() {
+    let mut r = repl();
+    assert!(
+        r.eval(
+            "fmod RECOVER is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               eq a = b .\n\
+             endfm",
+        )
+        .output
+        .is_empty()
+    );
+
+    assert_eq!(
+        r.eval(
+            "fmod RECOVER is\n\
+               sort S .\n\
+               op a : -> Missing [ctor] .\n\
+             endfm",
+        )
+        .output,
+        wrap::auto_wrap("error: module `RECOVER`, line 1: unknown sort `Missing`")
+    );
+    let preserved = r.eval("red in RECOVER : a .").output;
+    assert!(
+        preserved.contains("rewrites: 1\nresult S: b"),
+        "{preserved}"
+    );
+    assert!(
+        r.eval("fmod RECOVER-USE is protecting RECOVER . endfm")
+            .output
+            .is_empty()
+    );
+    assert!(
+        r.eval("red in RECOVER-USE : a .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+
+    let dropped = r
+        .eval(
+            "fmod DROP is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               op f : S -> S .\n\
+               var X : S .\n\
+               eq f(X) = X [print Z] .\n\
+               eq f(a) = b .\n\
+             endfm",
+        )
+        .output;
+    assert_eq!(
+        dropped,
+        wrap::auto_wrap(
+            "warning: module `DROP`, line 6: dropped equation: `[print]` item `Z` is not a declared \
+             statement variable"
+        )
+    );
+    assert!(
+        r.eval("red in DROP : f(a) .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+
+    let imported_drop = r
+        .eval(
+            "fmod DROP-SOURCE is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               op f : S -> S .\n\
+               vars X Y : S .\n\
+               eq f(X) = Y .\n\
+               eq f(a) = b .\n\
+             endfm\n\
+             fmod DROP-LEFT is protecting DROP-SOURCE . endfm\n\
+             fmod DROP-RIGHT is protecting DROP-SOURCE . endfm\n\
+             fmod DROP-DIAMOND is\n\
+               protecting DROP-LEFT .\n\
+               protecting DROP-RIGHT .\n\
+             endfm",
+        )
+        .output;
+    assert_eq!(
+        imported_drop,
+        wrap::auto_wrap(
+            "warning: module `DROP-SOURCE`, line 6: dropped equation: unbound variable in equation \
+             right-hand side or condition"
+        )
+    );
+    assert!(
+        r.eval("red in DROP-DIAMOND : f(a) .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+
+    let unparseable_drop = r
+        .eval(
+            "fmod DROP-UNPARSEABLE is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               op f : S -> S .\n\
+               eq f(a) = bogus .\n\
+               eq f(a) = b .\n\
+             endfm",
+        )
+        .output;
+    assert_eq!(
+        unparseable_drop,
+        wrap::auto_wrap(
+            "warning: module `DROP-UNPARSEABLE`, line 5: dropped equation: no parse at token 0 \
+             (`bogus`): `bogus`"
+        )
+    );
+    assert!(
+        r.eval("red in DROP-UNPARSEABLE : f(a) .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+
+    let kind_drops = r
+        .eval(
+            "mod DROP-KINDS is\n\
+               sort S .\n\
+               ops a b : -> S [ctor] .\n\
+               var X : S .\n\
+               mb a : S [print Z] .\n\
+               rl a => b [print Z] .\n\
+               rl a => b .\n\
+             endm",
+        )
+        .output;
+    assert_eq!(
+        kind_drops,
+        wrap::auto_wrap(
+            "warning: module `DROP-KINDS`, line 5: dropped membership: `[print]` item `Z` is not a \
+             declared statement variable\n\
+             warning: module `DROP-KINDS`, line 6: dropped rule: `[print]` item `Z` is not a \
+             declared statement variable"
+        )
+    );
+    assert!(
+        r.eval("rewrite [1] in DROP-KINDS : a .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+
+    assert_eq!(
+        r.eval("fmod NEVER is\n  sort S .\n  op a : -> S .").output,
+        wrap::auto_wrap("parse error: module `NEVER`, line 3: unexpected end of input in module")
+    );
+    assert!(
+        r.eval("fmod LATER is sort S . op ok : -> S [ctor] . endfm")
+            .output
+            .is_empty()
+    );
+    assert!(
+        r.eval("red in LATER : ok .")
+            .output
+            .contains("rewrites: 0\nresult S: ok")
+    );
+
+    assert_eq!(
+        r.eval("view BAD from RECOVER to RECOVER is endv").output,
+        wrap::auto_wrap("error: view `BAD`, line 1: view `BAD`: source `RECOVER` is not a theory")
+    );
+    assert!(
+        r.eval("red in RECOVER : a .")
+            .output
+            .contains("rewrites: 1\nresult S: b")
+    );
+}
+
+#[test]
+fn meta_boundaries_distinguish_supported_and_inert_operations() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(
+        !prelude.contains("error: module") && !prelude.contains("parse error:"),
+        "META prelude build:\n{prelude}"
+    );
+    let output = r
+        .eval(
+            r#"fmod META-BOUNDARY-MATCH is
+  sort S .
+  ops a b : -> S [ctor] .
+endfm
+mod META-BOUNDARY-APPLY is
+  sort S .
+  ops a b : -> S [ctor] .
+  op f : S -> S [ctor] .
+  vars X Y : S .
+  crl [r] : f(X) => Y if Y := b .
+endm
+red in META-LEVEL : metaMatch(upModule('META-BOUNDARY-MATCH, false), 'X:S, 'a.S, nil, 0) .
+red in META-LEVEL : metaMatch(upModule('META-BOUNDARY-MATCH, false), 'X:S, 'a.S, 'X:S := 'a.S, 0) .
+red in META-LEVEL : metaApply(upModule('META-BOUNDARY-APPLY, false), 'f['a.S], 'r, none, 0) .
+red in META-LEVEL : metaParseStrategy(['NAT], none, 'top '`( 'all '`)) ."#,
+        )
+        .output;
+
+    assert!(
+        output.contains("result Assignment: \n  'X:S <- 'a.S"),
+        "unconditioned metaMatch:\n{output}"
+    );
+    assert!(
+        output.contains("result [Substitution?]: metaMatch("),
+        "conditioned metaMatch remains inert:\n{output}"
+    );
+    assert!(
+        output.contains(": metaApply("),
+        "conditioned metaApply remains inert:\n{output}"
+    );
+    assert!(
+        output.contains("result [StrategyList,Strategy?]: metaParseStrategy("),
+        "strategy META hook remains inert:\n{output}"
+    );
+    assert!(!output.contains("dropped rule"), "{output}");
+    assert!(!output.contains("error:"), "{output}");
 }

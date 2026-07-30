@@ -1,6 +1,6 @@
-*** A1c-unbound-rhs — unbound right-hand-side variable: oracle warns + leaves unreduced, tnk crashes (fable-audit.md §3.1)
-*** Direct route first: oracle accepts at load (warning only) and `reduce wrap(x)` stays unreduced.
-*** tnk panics (term.rs:371 "unbound variable in instantiation") on the reduce.
+*** A1c-unbound-rhs — unbound right-hand-side variable: both sides warn and leave the term unreduced.
+*** Direct route first: the source statement is dropped without poisoning the module; `wrap(x)` stays
+*** unreduced and a following command remains usable.
 fmod UNBOUND is
   sort S .
   op x : -> S [ctor] .

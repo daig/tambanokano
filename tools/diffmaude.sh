@@ -23,10 +23,10 @@
 # Normalization (exact; §1.1 — NOTHING else may be stripped):
 #   - `====…` separator lines
 #   - the tnk banner line, `Bye.`, `Maude>` prompts
-#   - timing values: the tail of `rewrites: N in …` / `states: N rewrites: M in …` lines
-#     (counts stay), and the volatile cpu/real values on `Decision time:` (the line stays)
+#   - timing-only text: the tail of `rewrites: N in …` / `states: N rewrites: M in …` lines
+#     (counts stay), and the standalone `Decision time:` line
 #   - diagnostic bodies are deliberately OUT OF parity (`DIAGNOSTIC_PARITY=ignore`):
-#     `Warning:` / `Advisory:` blocks and symmetric tnk `error:` / `parse error:` /
+#     `Warning:` / `Advisory:` blocks and symmetric tnk `warning:` / `error:` / `parse error:` /
 #     `error in module` blocks are stripped through the next recognizable output line.
 #     S1 parity still includes incompleteness/exhaustion result forms; warning prose is not contractual.
 #   Everything else — echoes, result/Solution lines, sorts, counts, bindings,
@@ -87,7 +87,7 @@ normalize() {
       next
     }
     # diagnostic-block openers (both sides; symmetric)
-    if ($0 ~ /^(Warning:|Advisory:|error:|parse error:|error in module)/) {
+    if ($0 ~ /^(Warning:|Advisory:|warning:|error:|parse error:|error in module)/) {
       inblock = 1
       next
     }
@@ -106,11 +106,12 @@ normalize() {
       }
       # a block runs until the next recognizable real-output line
       if ($0 ~ /^=+$/ || $0 ~ /^Bye\.$/ ||
-          $0 ~ /^(reduce|rewrite|frewrite|erewrite|search|smt-search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|irredundant unify|variant) / ||
+          $0 ~ /^(check|get variants|filtered variant unify|reduce|rewrite|frewrite|erewrite|search|smt-search|match|xmatch|srewrite|dsrewrite|continue|parse|unify|irredundant unify|variant) / ||
           $0 ~ /^(\{v?fold\} )?(f?vu-narrow|narrow) / ||
           $0 ~ /^(rewrites:|states:|Decision time:|result |Solution |Unifier [0-9]+|Matcher [0-9]+|Variant [0-9]+|No solution|No more solutions|No unifier|No more unifiers|No match|empty substitution)/ ||
           $0 ~ /^(state [0-9]|arc [0-9]|Narrowing solution [0-9]+)/ || $0 ~ /^\*\*\*\*/ ||
-          $0 ~ /^(fmod |mod |fth |th |smod |omod |oth |view |tambanokano REPL )/) {
+          $0 ~ /^Considering object completion on:$/ ||
+          $0 ~ /^(op |fmod |mod |fth |th |smod |omod |oth |view |tambanokano REPL )/) {
         inblock = 0
       } else {
         next
@@ -122,10 +123,10 @@ normalize() {
     if ($0 ~ /^tambanokano REPL /) next
     if ($0 ~ /^Bye\.$/) next
 
-    # timing values (observable counts and line presence stay)
+    # timing-only text (observable rewrite/state counts stay)
+    if ($0 ~ /^Decision time: /) next
     if ($0 ~ /^rewrites: [0-9]+ in /) { sub(/ in .*/, "") }
     else if ($0 ~ /^states: [0-9]+ +rewrites: [0-9]+ in /) { sub(/ in .*/, "") }
-    else if ($0 ~ /^Decision time: /) { $0 = "Decision time:" }
 
     print
   }'

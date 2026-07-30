@@ -69,8 +69,32 @@ unstarted Phase I-C.
 **TNK-005 / compositional strategy-module imports is complete (2026-07-26).**
 Named `strat`/`sd` payloads now preserve oracle-derived origin, order, overload/lhs dispatch, donor-home parsing, transforms, reflection, and session invalidation across the supported module algebra. The six-fixture `A3f`–`A3j`/`A5g` matrix is byte-identical to Maude; the binding record is `tnk-005-strategy-imports-goal.md`.
 
-**The verified current state—including every known deviation—is `../../fable-audit.md`** (status
-refreshed 2026-07-26); the forward plan is `roadmap.md`.
+**V1 honest-behavior release hardening is complete (2026-07-29).**
+Command output is count-only rather than carrying fabricated timing; source `[memo]`, unsupported memo
+controls, dropped statements, fatal module/view failures, `xmatchrew`, and `csd` now have explicit,
+recoverable diagnostics owned by `Session`. Advanced META gaps remain inert and are classified below rather
+than receiving synthetic runtime warnings. The binding record and same-tree verification evidence are in
+`v1-honest-behavior-goal.md`.
+
+### Recognized but unsupported/inert META boundaries
+
+The retained direct-oracle matrix is
+`../../conformance/probes/meta-recognized-boundaries.maude`. These reflective calls do not emit synthetic
+runtime warnings: doing so would change META values and rewrite counts.
+
+| Surface | Current tnk boundary | Nearest supported path |
+|---|---|---|
+| `metaParseStrategy`, `metaPrettyPrintStrategy` | The hooks are recognized, but the calls remain unreduced. | Parse/print/execute strategies at object level; `upStratDecls` and `upSds` reflection is supported. |
+| `metaMatch`, `metaXmatch` with a nonempty `Condition` | The call remains unreduced; the condition is not evaluated. | Use `nil` for ordinary matching and evaluate the condition through an object-level command. |
+| `metaApply`, `metaXapply` selecting a conditional rule | The call remains unreduced; rule conditions are not evaluated through these META hooks. | Use an unconditional reflected rule, or object-level rewriting where `crl` conditions execute. Ordinary `metaApply` with a nonempty initial substitution is supported. |
+| `metaXmatch`, `metaXapply` over AC residue | An atomic match/rule inside an AC subject returns the oracle-compatible residue context. A same-head partial AC pattern such as `f(X, Y)` against `f(a, b, c)` is **not compatible**: tnk returns different bindings/context and, for apply, a different result. | Use an atomic/full AC pattern whose extension result is covered, or perform the operation at object level. This is separate from DIV-001's AC solution-order difference. |
+| Reflected `memo` attributes | Memo tables and cache counts are unavailable. `upModule` currently omits source `[memo]`; a literal reflected module carrying `memo` executes with the attribute inert. | Source `[memo]` declarations execute uncached and warn once; omit `memo` where reflective round-tripping matters. |
+
+The broader warning/advisory, real-timing, `xmatchrew`, `csd`, and META gaps remain open in
+`../bug-triage.md`.
+
+**The verified current state—including every known deviation—is `../../fable-audit.md`**, refined by the
+active register in `../bug-triage.md`; the forward plan is `roadmap.md`.
 
 ## Crate layout
 
@@ -99,6 +123,7 @@ tnk-repl      thin terminal adapter: color/wrapping policy, line editing, prompt
 | `subsystems-goal.md` | subsystem contract | completed S/T/M/I-S ledger; future I-C scope, invariants, manifests, and gates |
 | `tnk-005-strategy-imports-goal.md` | completed goal contract | closed TNK-005 `/goal`: oracle matrix, module/strategy invariants, implementation record, retained fixtures, and verified completion gates |
 | `tnk-011-collapse-memberships-goal.md` | completed goal contract | closed TNK-011 `/goal`: ACU/two-sided-AU/CUI collapse indexing, single-compile arena, retained oracle/trace matrix, explicit one-sided-AU boundary, and verified completion gates |
+| `v1-honest-behavior-goal.md` | completed goal contract | closed V1 release hardening: count-only output, explicit unsupported-feature diagnostics, recoverable source errors, retained META boundaries, and verified completion gates |
 | `remaining-plans/` | implementation records | source-verified plans and completion notes for AU, variants, narrowing, SMT, model checking, and the split synchronous/concurrent Phase I |
 | `reports/A1–A8` | reference | per-subsystem deep-dives of the **C++ reference** — the detail behind the gaps and the roadmap |
 

@@ -19,7 +19,7 @@ use crate::oo_complete;
 use crate::pretty::{print_pretty, print_pretty_with_variables, print_term};
 use crate::sig::build_sig::build_module;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
-use crate::surface::ast::{Command, PreModule, SearchArrow, Source, Statement};
+use crate::surface::ast::{Command, Diagnostic, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -40,6 +40,8 @@ use tnk_core::variant::{
 pub struct LoadedModule {
     pub built: BuiltModule,
     pub grammar: CompiledGrammar,
+    /// Nonfatal parse/build diagnostics, rendered only by the owning Session.
+    pub diagnostics: Vec<Diagnostic>,
     /// Imported strategy-definition home grammars, with semantic actions remapped to `built`. A strategy
     /// definition carrying a distinct `home` is executable only when this map contains that home.
     pub strategy_grammars: HashMap<String, CompiledGrammar>,
@@ -90,12 +92,13 @@ pub fn build_loaded_module(
     let mut built = build_module(pm, interner)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
-    load_statements(pm, &mut built, &grammar, interner)?;
+    let diagnostics = load_statements(pm, &mut built, &grammar, interner)?;
     let smt_rewrite_valid =
         built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
     Ok(LoadedModule {
         built,
         grammar,
+        diagnostics,
         strategy_grammars: HashMap::new(),
         smt_rewrite_valid,
     })
@@ -128,7 +131,8 @@ pub fn build_loaded_module_homed_traced<'m>(
     let mut built = build_module(pm, interner)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
-    let trace_refs = load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
+    let (trace_refs, diagnostics) =
+        load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
     let strategy_grammars = pm
         .strat_defs
         .iter()
@@ -148,6 +152,7 @@ pub fn build_loaded_module_homed_traced<'m>(
         LoadedModule {
             built,
             grammar,
+            diagnostics,
             strategy_grammars,
             smt_rewrite_valid,
         },
@@ -298,6 +303,30 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
     })
 }
 
+fn statement_kind(statement: &Statement) -> &'static str {
+    match statement {
+        Statement::Eq { .. } => "equation",
+        Statement::Mb { .. } => "membership",
+        Statement::Rule { .. } => "rule",
+    }
+}
+
+fn statement_line(statement: &Statement) -> Option<u32> {
+    match statement {
+        Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => lhs
+            .first()
+            .or_else(|| rhs.first())
+            .or_else(|| cond.as_ref().and_then(|tokens| tokens.first())),
+        Statement::Mb {
+            lhs, sort, cond, ..
+        } => lhs
+            .first()
+            .or_else(|| sort.first())
+            .or_else(|| cond.as_ref().and_then(|tokens| tokens.first())),
+    }
+    .map(|token| token.line)
+}
+
 /// Parse + build + add each of the module's statement bubbles to the engine, all against the flattened
 /// module's own grammar `g`. The import-free / meta / REPL-legacy entry (no home information); the module
 /// system's [`build_loaded_module_homed`] adds the D1a per-statement home grammars on top.
@@ -306,8 +335,8 @@ fn load_statements(
     m: &mut BuiltModule,
     g: &CompiledGrammar,
     i: &Interner,
-) -> Result<(), String> {
-    load_statements_homed(pm, m, g, &[], &|_| None, i).map(|_| ())
+) -> Result<Vec<Diagnostic>, String> {
+    load_statements_homed(pm, m, g, &[], &|_| None, i).map(|(_, diagnostics)| diagnostics)
 }
 
 /// Parse + build + add each statement in its defining module's grammar. Imported statements are parsed
@@ -324,7 +353,7 @@ pub fn load_statements_homed<'m>(
     homes: &[Option<String>],
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     i: &Interner,
-) -> Result<Vec<Option<StatementTraceRef>>, String> {
+) -> Result<(Vec<Option<StatementTraceRef>>, Vec<Diagnostic>), String> {
     // Object-pattern completion context (Pillar 2.5-E): resolved once for an `omod`'s flattened module
     // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
     // module, or one with no object constructor in scope — completion then never runs.
@@ -333,6 +362,7 @@ pub fn load_statements_homed<'m>(
     // these first; `None` means the home is unavailable or cannot be remapped, so the flat grammar is used.
     let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
     let mut trace_refs = Vec::with_capacity(pm.statements.len());
+    let mut diagnostics = pm.diagnostics.clone();
 
     for (idx, stmt) in pm.statements.iter().enumerate() {
         // Ordinary nonexec equations/memberships are proof obligations. Rules still pass through:
@@ -342,11 +372,11 @@ pub fn load_statements_homed<'m>(
             trace_refs.push(None);
             continue;
         }
-        let trace_ref = Some(match stmt {
+        let trace_ref = match stmt {
             Statement::Mb { .. } => StatementTraceRef::Membership(m.mb_traces.len()),
             Statement::Eq { .. } => StatementTraceRef::Equation(m.eq_traces.len()),
             Statement::Rule { .. } => StatementTraceRef::Rule(m.rl_traces.len()),
-        });
+        };
         // Imported statements belong to their defining grammar. Trying the flattened grammar first is
         // unsafe even when it parses: importer declarations can shadow a home variable name and change
         // its sort without producing an error.
@@ -358,9 +388,9 @@ pub fn load_statements_homed<'m>(
                 home_grammars.insert(home.to_string(), remapped);
             }
             if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref)
-                && load_one_stmt(stmt, m, hg, true, false, &oo, i).is_ok()
+                && let Ok(registered) = load_one_stmt(stmt, m, hg, true, false, &oo, i)
             {
-                trace_refs.push(trace_ref);
+                trace_refs.push(registered.then_some(trace_ref));
                 continue;
             }
         }
@@ -369,19 +399,47 @@ pub fn load_statements_homed<'m>(
             .and_then(|home| home.as_deref())
             .is_some_and(|home| home == m.name);
         // Home parsing was not applicable or failed. A statement whose flattened parse/build fails is
-        // dropped (Maude warns per statement and keeps the module). `load_one_stmt` registers nothing
-        // before its fallible parsing finishes, so either attempt leaves the dense trace indices intact.
+        // dropped with an owned diagnostic; nothing is registered before the last fallible check.
         match load_one_stmt(stmt, m, g, false, own_statement, &oo, i) {
-            Ok(()) => {
-                trace_refs.push(trace_ref);
-                continue;
+            Ok(registered) => {
+                trace_refs.push(registered.then_some(trace_ref));
             }
-            Err(_) => {}
+            Err(error) => {
+                trace_refs.push(None);
+                let home = homes
+                    .get(idx)
+                    .and_then(|home| home.as_deref())
+                    .unwrap_or(&pm.name);
+                let kind = statement_kind(stmt);
+                diagnostics.push(Diagnostic::warning(
+                    home,
+                    statement_line(stmt),
+                    kind,
+                    format!("dropped {kind}: {error}"),
+                ));
+            }
         }
-        trace_refs.push(None);
-        // Drop this statement and keep building the module (the diagnostic is phase E).
     }
-    Ok(trace_refs)
+
+    // Root statements precede imported statements in the flattened stream. Within each source module,
+    // line order interleaves parser-time and build-time diagnostics deterministically.
+    let mut source_order: HashMap<Option<String>, usize> = HashMap::new();
+    for diagnostic in &diagnostics {
+        let next = source_order.len();
+        source_order
+            .entry(diagnostic.module.clone())
+            .or_insert(next);
+    }
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            source_order
+                .get(&diagnostic.module)
+                .copied()
+                .unwrap_or(usize::MAX),
+            diagnostic.line.unwrap_or(u32::MAX),
+        )
+    });
+    Ok((trace_refs, diagnostics))
 }
 
 /// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover the
@@ -581,7 +639,7 @@ fn load_one_stmt(
     record_oo_diagnostic: bool,
     oo: &Option<tnk_core::engine::OoInfo>,
     i: &Interner,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Parse + build the rhs: kind-homogeneous with the lhs against the flattened grammar (disambiguates a
     // bare overloaded constant), or universal in the home-grammar path.
     let build_rhs = |rhs: &[Token], lhs_t: &Term, m: &BuiltModule, vars: &mut VarIndex| {
@@ -640,7 +698,7 @@ fn load_one_stmt(
             // kernel returns the dense equation id, which must index `eq_traces` (asserted).
             reject_rewrite_fragment(&condition, "equation")?;
             if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
+                return Err("unbound variable in equation right-hand side or condition".to_string());
             }
             let trace = EqTrace {
                 lhs: lhs_t.clone(),
@@ -673,6 +731,7 @@ fn load_one_stmt(
                 "equation id is the dense eq_traces index"
             );
             m.eq_traces.push(trace);
+            return Ok(true);
         }
         Statement::Mb {
             lhs,
@@ -716,10 +775,10 @@ fn load_one_stmt(
             let nr = vars.count();
             reject_rewrite_fragment(&condition, "membership")?;
             if !statement_vars_bound(&lhs_t, &condition, None) {
-                return Ok(()); // unbound condition variable: Maude warns + nonexecs (§3.1 A1c)
+                return Err("unbound variable in membership condition".to_string());
             }
             if lhs_t.top_symbol().is_none() {
-                return Ok(()); // a bare-variable membership is nonexec
+                return Err("membership left-hand side is a variable".to_string());
             }
             let trace = MbTrace {
                 lhs: lhs_t.clone(),
@@ -745,6 +804,7 @@ fn load_one_stmt(
                 "membership id is the dense mb_traces index"
             );
             m.mb_traces.push(trace);
+            return Ok(true);
         }
         Statement::Rule {
             label,
@@ -806,10 +866,15 @@ fn load_one_stmt(
             } else {
                 Vec::new()
             };
-            // Maude rejects conditions on `[narrowing]` rules; the statement remains loadable but has
-            // no symbolic or executable rule instance.
+            // Maude rejects conditions on `[narrowing]` rules.
             if *narrowing && !condition.is_empty() {
-                return Ok(());
+                return Err("a narrowing rule cannot have a condition".to_string());
+            }
+            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) && !*nonexec {
+                return Err("unbound variable in rule right-hand side or condition".to_string());
+            }
+            if lhs_t.top_symbol().is_none() && !(*nonexec || *narrowing) {
+                return Err("rule left-hand side is a variable".to_string());
             }
             m.engine.add_smt_rule(
                 lhs_t.clone(),
@@ -818,10 +883,6 @@ fn load_one_stmt(
                 variable_names.clone(),
                 condition.clone(),
             );
-            if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) && !(*narrowing && *nonexec)
-            {
-                return Ok(()); // unbound rhs/condition variable: Maude warns + nonexecs (§3.1 A1c)
-            }
             if *narrowing {
                 m.engine.add_narrowing_rule(
                     lhs_t.clone(),
@@ -835,7 +896,7 @@ fn load_one_stmt(
             }
             // A nonexec or bare-lhs narrowing rule exists only in the symbolic descriptor table.
             if *nonexec || lhs_t.top_symbol().is_none() {
-                return Ok(());
+                return Ok(false);
             }
             let (trace_lhs, trace_rhs) = if *narrowing {
                 (
@@ -867,9 +928,9 @@ fn load_one_stmt(
                 "rule id is the dense rl_traces index"
             );
             m.rl_traces.push(trace);
+            return Ok(true);
         }
     }
-    Ok(())
 }
 
 fn push_oo_diagnostic(m: &mut BuiltModule, kind: &str, source: String, transformed: String) {
@@ -1302,8 +1363,8 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
 /// Whether every variable a statement *instantiates* is bound by the time it is needed: rhs and each
 /// condition fragment's evaluated side may use only lhs variables plus the fresh binders of *earlier*
 /// `:=`/`=>` fragments (Maude's "used before it is bound" check). A violating statement is degraded to
-/// non-executable — parsed but never registered — instead of panicking at `instantiate` (§3.1 A1c); the
-/// warning text is deferred diagnostics (roadmap phase E).
+/// non-executable — parsed but never registered — instead of panicking at `instantiate` (§3.1 A1c);
+/// the caller retains the rejection cause as an owned dropped-statement diagnostic.
 fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option<&Term>) -> bool {
     let mut bound = Vec::new();
     term_var_indices(lhs, &mut bound);

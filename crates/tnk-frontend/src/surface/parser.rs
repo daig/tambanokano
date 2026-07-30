@@ -173,22 +173,63 @@ fn peel_irreducible_suffix(body: &mut Vec<Token>, i: &Interner) -> PResult<Vec<T
 /// declared `var`/`vars` of the module. Maude rejects any other token ("bad token X") and DROPS the whole
 /// statement — a bare name that only appears on-the-fly in the body is *not* accepted (fable-audit.md §3.6,
 /// C4f; a declared-but-unused variable IS accepted — Maude only warns, so it stays valid here).
-fn print_attr_ok(print: &[Token], m: &PreModule, i: &Interner) -> bool {
-    print.iter().all(|t| {
+fn print_attr_error(print: &[Token], m: &PreModule, i: &Interner) -> Option<String> {
+    print.iter().find_map(|t| {
         if t.kind == TokKind::Str {
-            return true; // a string literal is always a valid print item
+            return None;
         }
-        let s = i.resolve(t.sym);
-        if s.contains(':') {
-            return true; // an on-the-fly typed variable `X:Sort` declares itself
+        let name = i.resolve(t.sym);
+        if name.contains(':')
+            || m.vars
+                .iter()
+                .any(|decl| decl.names.iter().any(|declared| declared == name))
+        {
+            None
+        } else {
+            Some(format!(
+                "`[print]` item `{name}` is not a declared statement variable"
+            ))
         }
-        m.vars.iter().any(|vd| vd.names.iter().any(|n| n == s))
     })
 }
 
 impl<'a> Parser<'a> {
     pub fn new(toks: &'a [Token], i: &'a Interner) -> Self {
         Parser { toks, pos: 0, i }
+    }
+
+    /// Source line nearest the current cursor, for a caller that turns a parse failure into a diagnostic.
+    pub fn error_line(&self) -> Option<u32> {
+        self.toks
+            .get(self.pos)
+            .or_else(|| self.pos.checked_sub(1).and_then(|pos| self.toks.get(pos)))
+            .map(|token| token.line)
+    }
+
+    /// The open top-level module or view containing the current cursor, when its name was parsed.
+    pub fn error_context(&self) -> Option<(&'static str, String)> {
+        let mut context = None;
+        let end = self.pos.min(self.toks.len().saturating_sub(1));
+        for pos in 0..=end {
+            match self.i.resolve(self.toks[pos].sym) {
+                "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
+                    context = self
+                        .toks
+                        .get(pos + 1)
+                        .map(|token| ("module", self.i.resolve(token.sym).to_string()));
+                }
+                "view" => {
+                    context = self
+                        .toks
+                        .get(pos + 1)
+                        .map(|token| ("view", self.i.resolve(token.sym).to_string()));
+                }
+                "endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth" | "endom" | "endoth"
+                | "endv" => context = None,
+                _ => {}
+            }
+        }
+        context
     }
 
     // ---- cursor primitives ----
@@ -875,6 +916,7 @@ impl<'a> Parser<'a> {
     }
 
     fn module(&mut self) -> PResult<PreModule> {
+        let source_line = self.peek().map(|token| token.line);
         // System (`mod`/`th`) allows rules; functional (`fmod`/`fth`) rejects them (in `decl`). `fth`/`th`
         // are theories (the `is_theory` axis — a view source / parameter bound, statements not executed).
         let kw = self.peek_text().unwrap_or("");
@@ -900,6 +942,8 @@ impl<'a> Parser<'a> {
         self.eat("is")?;
         let mut m = PreModule {
             name,
+            diagnostics: Vec::new(),
+            source_line,
             kind,
             is_theory,
             is_strategy,
@@ -1016,6 +1060,7 @@ impl<'a> Parser<'a> {
     /// only used by a nested instantiation. `from`/`to` are module expressions. Maps: `sort A to B .`,
     /// `op f to g .`, `op f : A -> B to g .`, and `op f to term t .`.
     fn view(&mut self) -> PResult<ViewDecl> {
+        let source_line = self.peek().map(|token| token.line);
         self.eat("view")?;
         let name = self.name()?;
         let params = if self.at("{") {
@@ -1189,6 +1234,7 @@ impl<'a> Parser<'a> {
         self.advance(); // endv
         Ok(ViewDecl {
             name,
+            source_line,
             params,
             from,
             to,
@@ -1420,6 +1466,7 @@ impl<'a> Parser<'a> {
             }
             "eq" | "ceq" => {
                 let conditional = kw == "ceq";
+                let line = self.peek().map(|token| token.line);
                 self.advance();
                 // Optional leading `[name] :` label (Maude's labelled-equation syntax). Only a real
                 // `[name] :` is peeled; a `[_]`-headed lhs (`eq [x] = y .`) leaves its `[` for the body.
@@ -1431,9 +1478,15 @@ impl<'a> Parser<'a> {
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
-                // A `[print …]` referencing a non-variable token is rejected by Maude, which DROPS the
-                // statement and keeps the module (C4f). Drop it here (skip the push); the module survives.
-                if !print_attr_ok(&sa.print, m, self.i) {
+                // A `[print …]` referencing a non-variable token is rejected by Maude, which drops the
+                // statement while keeping the module. Retain the cause for Session-owned rendering.
+                if let Some(reason) = print_attr_error(&sa.print, m, self.i) {
+                    m.diagnostics.push(Diagnostic::warning(
+                        m.name.clone(),
+                        line,
+                        "equation",
+                        format!("dropped equation: {reason}"),
+                    ));
                     return Ok(());
                 }
                 let cond = if conditional {
@@ -1460,6 +1513,7 @@ impl<'a> Parser<'a> {
             }
             "mb" | "cmb" => {
                 let conditional = kw == "cmb";
+                let line = self.peek().map(|token| token.line);
                 self.advance();
                 // Optional leading `[name] :` label, like `eq`/`rl` (fable-audit.md §3.4).
                 let leading = self.peel_leading_label()?;
@@ -1479,8 +1533,14 @@ impl<'a> Parser<'a> {
                 }
                 let sa = self.stmt_attrs()?;
                 self.eat_dot()?;
-                if !print_attr_ok(&sa.print, m, self.i) {
-                    return Ok(()); // bad `[print …]` variable: drop the statement, keep the module (C4f)
+                if let Some(reason) = print_attr_error(&sa.print, m, self.i) {
+                    m.diagnostics.push(Diagnostic::warning(
+                        m.name.clone(),
+                        line,
+                        "membership",
+                        format!("dropped membership: {reason}"),
+                    ));
+                    return Ok(());
                 }
                 m.statements.push(Statement::Mb {
                     lhs,
@@ -1491,6 +1551,7 @@ impl<'a> Parser<'a> {
                 });
             }
             "rl" | "crl" => {
+                let line = self.peek().map(|token| token.line);
                 if m.kind == ModuleKind::Functional {
                     return Err(format!(
                         "rule `{kw}` is not allowed in a functional module (`fmod {}`); use `mod`",
@@ -1510,8 +1571,14 @@ impl<'a> Parser<'a> {
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
-                if !print_attr_ok(&sa.print, m, self.i) {
-                    return Ok(()); // bad `[print …]` variable: drop the statement, keep the module (C4f)
+                if let Some(reason) = print_attr_error(&sa.print, m, self.i) {
+                    m.diagnostics.push(Diagnostic::warning(
+                        m.name.clone(),
+                        line,
+                        "rule",
+                        format!("dropped rule: {reason}"),
+                    ));
+                    return Ok(());
                 }
                 // The arrow `=>` lexes as one token (a run of non-punctuation chars); an unspaced `t=>p`
                 // lexes as a single token and so will not split here — rejected exactly as Maude rejects it.
@@ -2307,6 +2374,7 @@ impl<'a> Parser<'a> {
                 }
                 "memo" => {
                     self.advance();
+                    a.memo = true;
                 }
                 // Object-system role attributes (Pillar 2.5). `obj`≡`object`, `msg`≡`message`,
                 // `config`≡`configuration` (Maude's lexer aliases). Recorded onto the symbol; they
@@ -2553,6 +2621,7 @@ impl Attrs {
             frozen: self.frozen.clone(),
             special: self.special.clone(),
             ditto: self.ditto,
+            memo: self.memo,
             poly: self.poly.clone(),
             format: self.format.clone(),
             config: self.config,

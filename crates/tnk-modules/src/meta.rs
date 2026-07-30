@@ -4953,6 +4953,8 @@ impl MetaDescent<'_> {
         let kids = ctx.children(m);
         let pm = PreModule {
             name: "%META-SORTS%".to_string(),
+            source_line: None,
+            diagnostics: Vec::new(),
             kind,
             is_theory,
             is_strategy,
@@ -5163,6 +5165,8 @@ impl MetaDescent<'_> {
         ops.sort_by_key(|o| !o.domain.is_empty());
         let mut pm = PreModule {
             name,
+            source_line: None,
+            diagnostics: Vec::new(),
             kind,
             is_theory,
             is_strategy,
@@ -5393,6 +5397,7 @@ impl MetaDescent<'_> {
 
         Some(ViewDecl {
             name,
+            source_line: None,
             params,
             from,
             to,
