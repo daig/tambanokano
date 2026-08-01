@@ -1,10 +1,10 @@
 # The TNK Language and System Reference
 
 **Document status:** normative for the repository at workspace version `0.1.0`
-**Reference edition:** 2026-07-29
+**Reference edition:** 2026-08-01
 **Implementation name:** tambanokano (`tnk`)
 
-This document specifies TNK as an independent rewriting-logic system. It defines the product's user-visible semantics and embedding contracts. Maude is useful lineage and compatibility evidence, but it does not define TNK.
+This document specifies TNK as an independent rewriting-logic system. It defines the product's user-visible semantics and embedding contracts. Maude is part of the implementation lineage and can supply historical regression baselines, but it does not define TNK or set a compatibility target.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are normative. A paragraph carrying a `TNK-*` identifier is a stable contract clause.
 
@@ -12,7 +12,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 
 ### 0.1 Normative hierarchy
 
-**TNK-DOC-001 — Authority.** Contract clauses define intended TNK behavior. If this Reference is ambiguous, the behavior is unspecified until a clause resolves it. Rustdoc and the compiler define the exact Rust type and ownership surface of the installed release; this Reference defines its semantic behavior.
+**TNK-DOC-001 — Authority.** Contract clauses define intended TNK behavior. If this Reference is ambiguous, the behavior is unspecified until a clause resolves it. Rustdoc and the compiler define the exact Rust type and ownership surface of the installed release; this Reference defines its semantic behavior. `TNK-RECOVERY-001` separately records tentative current-release behavior at named invalid-input seams, including known deviations from the intended contracts.
 
 ### 0.2 Feature states
 
@@ -57,6 +57,8 @@ implementation enumeration order, or human-oriented whitespace unless a clause m
 **TNK-DOC-006 — Failure classification.** A public operation classifies failure at the narrowest owning boundary: lexical/parse, static declaration or statement, module/view composition, command construction, Unsupported capability, backend `Unknown`/`BadDag`, user bound, internal incompleteness, external I/O, or resource exhaustion. A diagnostic's category and documented state effect are semantic; incidental prose is not. Accepted input MUST NOT panic, abort the process, or cause memory unsafety.
 
 Invalid module/view definitions are atomic unless a clause explicitly permits statement-local isolation. Invalid commands do not partially apply their requested semantic transition. Low-level Rust API precondition violations, such as using an engine-relative ID with another `Engine`, are programmer errors rather than accepted source input.
+
+The current workspace does not satisfy this policy uniformly for incorrect input. Appendix H.4 is the release-specific exception ledger: it records what the implementation presently does, but does not make those inputs accepted language or relax the intended conformance rules.
 
 **TNK-DOC-007 — Resource policy.** A user bound is a requested finite prefix, not a timeout and not proof of exhaustion. An implementation resource limit MUST be reported separately from no-solution. External harness timeouts and operating-system termination are outside TNK semantics.
 
@@ -275,13 +277,13 @@ Spacing is semantic at tokenization: `1/6` is a rational token while `1 / 6` is 
 
 TNK constructs a per-module context-free grammar from sort and operator declarations.
 
-**TNK-PARSE-001 — Mixfix holes.** Each `_` in an operator name is an argument hole. The number of holes MUST equal the declared arity. Literal fragments, precedence, and gather annotations determine admissible parses. Prefix operators and constants use their declared spelling. Parentheses group terms. `(t).Sort` explicitly disambiguates an overloaded term at a sort.
+**TNK-PARSE-001 — Mixfix holes.** Each `_` in an operator name is an argument hole. A valid declaration has exactly as many holes as its declared arity. Literal fragments, precedence, and gather annotations determine admissible parses. Prefix operators and constants use their declared spelling. Parentheses group terms. `(t).Sort` explicitly disambiguates an overloaded term at a sort. The current fallback for an invalid hole/arity mismatch is catalogued in Appendix H.4.
 
 `prec n` assigns precedence. `gather (E e & ...)` constrains each hole (`E` strong, `e` weak, `&` unconstrained). If omitted, TNK derives defaults from fixity and precedence.
 
 **TNK-PARSE-002 — Parse outcomes.** Statement terms and membership target sorts require one parse. Unique parse is also required for a `match`/`xmatch` pattern, a search goal, and an `srewrite`/`dsrewrite` subject. The current command surface selects the first packed-forest parse for reduce/check/rewrite/frewrite/erewrite subjects, match subjects, search subjects, unification pairs, variant terms/blockers, and narrowing subject/goal terms. The selected first-parse order is Implementation-defined; portable source disambiguates it.
 
-No parse rejects the owning statement or command. Ambiguity rejects only the bubbles listed as unique-parse above. Statement-local rejection follows `TNK-STMT-001`; command rejection follows the Session transition table.
+No parse rejects the owning statement or command under the intended parser contract. Ambiguity rejects only the bubbles listed as unique-parse above. Statement-local rejection follows `TNK-STMT-001`; command rejection follows the Session transition table. Current invalid-input exceptions, including skipped top-level tokens and nonuniform trailing-attribute handling, are catalogued in Appendix H.4.
 
 **TNK-PARSE-003 — Resource bound.** Production parsing uses a deterministic effort limit of `100,000,000` parser work units. Exceeding it is resource exhaustion, not a malformed-term result. The diagnostic identifies the furthest token. The limit is Stable until an explicit Reference revision changes it.
 
@@ -383,11 +385,11 @@ A user sort identifier cannot contain `.`. Bracketed sort names denote kinds; st
 [Label] ":" crl lhs => rhs if Condition [StmtAttrs] .
 ```
 
-The leading `[Label] :` is optional for every statement family. For rules, the familiar `rl [Label] : ...` token arrangement is accepted by the same label peeling. Retained execution attributes are `owise`, `variant`, `nonexec`, `narrowing`, and `label Name`; `print` is retained for validation/trace presentation. `metadata`, `format`, and `dnt` are parsed but semantically ignored. Other trailing statement-attribute tokens are accepted as Implementation-defined metadata and MUST NOT be treated as executable features.
+The leading `[Label] :` is optional for every statement family. For rules, the familiar `rl [Label] : ...` token arrangement is accepted by the same label peeling. Retained execution attributes are `owise`, `variant`, `nonexec`, `narrowing`, and `label Name`; `print` is retained for validation/trace presentation. `metadata`, `format`, and `dnt` are parsed but semantically ignored. Unknown trailing statement-attribute tokens do not have one uniform current treatment; Appendix H.4 records the parser-path-dependent behavior. Portable source uses only the listed attributes.
 
 `Condition` is a `/\`-separated conjunction of the fragments in §3.4; `\/` is not a statement-condition connective.
 
-**TNK-STMT-001 — Invalid statement isolation.** A statement whose terms, variable discipline, print metadata, or supported condition forms are invalid is dropped with a diagnostic when the enclosing module can otherwise be built. Dropping one statement MUST NOT shift the source identity of later executable statements or corrupt reflection metadata.
+**TNK-STMT-001 — Invalid statement isolation.** Under the intended statement boundary, a statement whose terms, variable discipline, print metadata, or supported condition forms are invalid is dropped with a diagnostic when the enclosing module can otherwise be built. Dropping one statement MUST NOT shift the source identity of later executable statements or corrupt reflection metadata. Appendix H.4 records current invalid-input seams that silently retain a statement or otherwise differ from this rule.
 
 ### 5.5 Views
 
@@ -631,7 +633,7 @@ irred unify ...
 
 **TNK-UNIFY-004 — Completion.** Low-level finite exhaustion with `is_incomplete() == false` means the returned set is complete for the implemented theories. `is_incomplete() == true` means returned unifiers remain sound but completeness is not claimed. “No unifier,” “unsupported theory,” and “incomplete exploration” are distinct semantic outcomes.
 
-The object-level Session renderer does not currently expose `UnifyProblem::is_incomplete` or a completion marker and is therefore an Experimental presentation boundary for completeness-sensitive clients. It also does not save an ordinary-unification continuation. Use the low-level API when the distinction is required.
+The object-level Session renderer does not currently expose `UnifyProblem::is_incomplete`, unsupported-theory readiness, or a completion marker and is therefore an Experimental presentation boundary for completeness-sensitive clients. An unsupported ordinary unification command can produce only its command echo, as recorded in Appendix H.4. The Session also does not save an ordinary-unification continuation. Use the low-level API when the distinction is required.
 
 `irredundant unify` filters the collected stream to a minimal complete set under substitution instantiation. Result order and fresh-variable spelling are Implementation-defined.
 
@@ -673,7 +675,7 @@ fvu-narrow ...
 
 `fvu-narrow` implies fold mode. Prefix options select state folding and retained path data; the post-command option block selects unifier filtering and delayed filtering.
 
-**TNK-NARROW-001 — Narrowing graph.** Narrowing uses rules marked `[narrowing]`, including such rules marked `[nonexec]`. Conditional narrowing rules are Unsupported and rejected at module load. It explores non-variable, non-frozen positions and composes rule unifiers with each state's accumulated substitution.
+**TNK-NARROW-001 — Narrowing graph.** Narrowing uses rules marked `[narrowing]`, including such rules marked `[nonexec]`. Conditional narrowing rules are Unsupported. In the current loader, such a rule is diagnosed and dropped as one invalid statement while the enclosing module and later valid statements are retained; Appendix H.4 records the exact recovery boundary. Narrowing explores non-variable, non-frozen positions and composes rule unifiers with each state's accumulated substitution.
 
 **TNK-NARROW-002 — Search options.** `fold` removes states matched by retained states. `vfold` uses variant subsumption. `filter` retains most-general unifiers; `delay` defers that filtering as defined by the search. `path` retains step substitutions and rule/position records for `show path`. `=>1`, `=>+`, `=>*`, and `=>!` have the same depth qualification as ordinary search; the second bound is narrowing depth.
 
@@ -949,6 +951,7 @@ The reusable source pipeline and its principal entry points are:
 | rule-fair/position-fair rewriting and BFS search | Stable | all | `TNK-REWRITE-001/002`, `TNK-SEARCH-*` |
 | saved-operation continuation without an intervening command | Stable | supported owners only | `TNK-CONT-001` |
 | failed-command continuation invalidation details | Experimental | Session renderer | `TNK-CONT-001` |
+| current invalid-input recovery and diagnostic gaps | Experimental | incorrect input only; do not rely on it | `TNK-RECOVERY-001`, Appendix H.4 |
 | external/object rewriting, streams, child interpreters | Experimental | hook-loaded object modules | `TNK-REWRITE-003`, `TNK-OO-001` |
 | strategy combinators and unconditional definitions | Stable | strategy modules | `TNK-STRAT-*` |
 | order-sorted unification | Stable | theories in `TNK-UNIFY-002` | `TNK-UNIFY-*` |
@@ -978,7 +981,7 @@ The following boundaries are explicit:
 1. Memoization attributes/controls have no execution semantics.
 2. Timing measurement is unavailable.
 3. `xmatchrew` and conditional `csd` are rejected.
-4. Conditional `[narrowing]` rules are rejected.
+4. Conditional `[narrowing]` rules are diagnosed and dropped while the rest of a buildable module is retained.
 5. Non-ground unification under CUI idempotence or associative one-sided identity is rejected as unsupported.
 6. `smt-search =>!` is unsupported.
 7. Without `smt-z3`, SMT answers are `Unknown`.
@@ -1325,7 +1328,7 @@ Rule applications may carry a label, substitutions, and `using` strategies for r
 
 ### E.1 Grammar construction
 
-For each operator declaration, TNK splits the canonical name at unescaped `_`. The number of holes equals arity. Literal fragments become terminals and holes become sort/kind nonterminals. Constants and true prefix operators add ordinary productions; a hole-bearing operator does not also gain a synthetic `f(a,b)` spelling.
+For each valid operator declaration, TNK splits the canonical name at unescaped `_`; the number of holes equals arity. Literal fragments become terminals and holes become sort/kind nonterminals. Constants and true prefix operators add ordinary productions; a valid hole-bearing operator does not also gain a synthetic `f(a,b)` spelling. The current prefix-only fallback for a declaration whose hole count is invalid is recorded in Appendix H.4.
 
 The current numeric precedence model is:
 
@@ -1389,7 +1392,7 @@ Attributes not listed above are rejected as unsupported operator attributes. `le
 | `[metadata "text"]` | statement | retained metadata, no execution change | Stable |
 | `[print ...]` | statement | presentation metadata only | Experimental |
 
-Statement attributes may be comma-separated or adjacent inside one bracket list. `owise`, `variant`, and `nonexec` are semantic selectors, not comments. Unknown statement attributes reject the statement under `TNK-STMT-001`.
+Statement attributes may be comma-separated or adjacent inside one bracket list. `owise`, `variant`, and `nonexec` are semantic selectors, not comments. Unknown statement attributes are invalid input; their current equation/rule and membership recovery paths are nonuniform and are catalogued in Appendix H.4. Portable source MUST NOT rely on either rejection or silent retention.
 
 # Appendix G — Built-in hook catalogue
 
@@ -1473,7 +1476,7 @@ With color disabled, the stable semantic fields are:
 | variant unify/match | numbered `Unifier` or `Matcher`; rewrite count; bindings | `No ...` / `No more ...` |
 | narrowing | numbered state/solution, rewrite count, state term, accumulated substitution, optional variant unifier | no-more marker only on exhaustion |
 | strategy rewrite | numbered result; rewrite count; `result SORT: TERM` | eager end after all results |
-| check | backend answer (`Sat`, `Unsat`, `Unknown`, or `BadDag`) plus command presentation | one answer |
+| check | command presentation plus a `Sat`, `Unsat`, or `Unknown` backend answer; current `BadDag` omission is recorded in Appendix H.4 | one answer except for the current `BadDag` gap |
 | show/select/set/load | command-specific text or empty success | return from call |
 
 A bounded resumable invocation that stops exactly at its requested prefix emits no no-more marker and retains a matching continuation. Eager commands (`match`, `xmatch`, strategy rewrite, and bounded object-level unify) do not create a continuation. `continue` output appends records from the saved operation and emits its completion marker only when exhaustion is observed.
@@ -1481,6 +1484,8 @@ A bounded resumable invocation that stops exactly at its requested prefix emits 
 Trace blocks, breakdown rows, verbose statistics, ANSI color, whitespace wrapping, source excerpts, and diagnostic prose are Experimental presentation. Counts are semantic only where `TNK-COUNT-*` or a command clause names them.
 
 ### H.3 Diagnostic ownership and state effect
+
+This table is the intended ownership model. The current implementation exceptions in H.4 control the description of what workspace version `0.1.0` actually does for the specifically named invalid inputs; they are not accepted-language guarantees.
 
 | Category | Owner | Required Session state effect |
 |---|---|---|
@@ -1490,12 +1495,49 @@ Trace blocks, breakdown rows, verbose statistics, ANSI color, whitespace wrappin
 | command parse/build | frontend/Session command boundary | no semantic execution; prior continuation remains only where `TNK-SESSION-003` permits |
 | unsupported capability | owning feature boundary | no false success or exhaustion claim |
 | user bound | command enumerator | finite prefix; continuation retained only for resumable families |
-| solver `Unknown`/`BadDag` | SMT boundary | reported distinctly from `Sat`/`Unsat` |
+| solver `Unknown`/`BadDag` | SMT boundary | intended to be reported distinctly from `Sat`/`Unsat`; the current Session `BadDag` omission is in H.4 |
 | internal incompleteness | unification/variant/narrowing boundary | distinct from exhausted/no-solution |
 | external I/O | Session external manager/load boundary | error returned as text; process remains live |
 | resource exhaustion | parser/algorithm boundary | distinct from malformed input and semantic exhaustion |
 
 The category table defines semantic ownership; `Eval` does not currently carry a machine-readable category enum. Clients use a stable documented prefix plus state effect or a typed lower-level API.
+
+### H.4 Tentative invalid-input and recovery ledger
+
+**TNK-RECOVERY-001 — Current invalid-input behavior.** The tables below record actual workspace-version-`0.1.0` behavior at known malformed, statically invalid, or unsupported input seams. This entire surface is **Experimental, tentative, and in flux**. It is diagnostic documentation, not a supported recovery API: it does not enlarge the accepted grammar, promise that a repaired declaration or retained statement will keep working, or grant compatibility to a missing diagnostic or panic. For the named cases, the tables describe the current implementation even where it deviates from `TNK-DOC-003`, `TNK-DOC-006`, `TNK-STMT-001`, or H.3.
+
+**Practical rule:** submit only well-formed, statically valid, supported TNK input. Do not use skipped tokens, repaired declarations, dropped statements, inert hooks, silent commands, or process failure as a programming technique. Portable programs MUST NOT depend on any behavior in this section. If input satisfies the grammar and static requirements in Parts I–III, these invalid-input seams are avoidable.
+
+Here, **silent** means that `Session::eval` adds no diagnostic text for the named problem. A later recognized item may still produce its ordinary output.
+
+#### H.4.1 Source, declaration, and statement seams
+
+| Incorrect input or seam | Current diagnostic | Current state/evaluation effect |
+|---|---|---|
+| unrecognized top-level tokens before a recognized module, view, or command opener | silent for the skipped tokens | tokens are discarded one at a time; the next recognized suffix in the same submission is parsed and executed with its normal state effects |
+| two commands on one physical line | `error: more than one command on a line.` | the physical-line command group is rejected before either command is dispatched |
+| mixfix operator name whose `_` count differs from its arity | silent | no mixfix production is installed; the declaration remains callable in prefix form using its full declared name and arity |
+| nonbinary or kind-incompatible `assoc`, `comm`, `idem`, identity, or `iter` attribute | silent | the invalid algebraic flag is cleared; the declaration remains installed with any independently valid surviving flags, otherwise as a free operator |
+| `frozen (...)` containing an argument position outside the declaration's arity | silent | the complete `frozen` attribute is ignored and the declaration remains installed |
+| unknown operator attribute or unknown `special` subdirective | `parse error:` | the submitted module definition is not installed; this differs from an unknown `id-hook` class below |
+| ordinary statement whose term, variables, condition, or `[print ...]` data fails frontend construction | `warning:` naming a dropped equation, membership, or rule | that statement is omitted; the enclosing buildable module and later valid statements are retained |
+| trailing equation/rule bracket group whose first token is not a recognized statement attribute | no attribute-specific diagnostic; a downstream dropped-statement warning is emitted if the resulting term bubble does not parse | the bracket group remains part of the statement term bubble rather than being peeled as attributes; if that bubble parses, its term meaning controls |
+| unknown token after a recognized first attribute in an equation/rule bracket group | silent for the unknown token | the token is consumed, recognized attributes still apply, and the statement remains installed if its terms build |
+| unknown token in a membership attribute group | silent for the unknown token | the token is consumed and the membership remains installed if its term and target sort build |
+| conditional rule carrying `[narrowing]` | `warning:` naming a dropped rule | the entire rule is omitted; the enclosing module and later valid statements are retained |
+| cyclic subsort declarations | Rust panic text is written by the panic hook, not returned as an `Eval` diagnostic | sort closure panics; under the default CLI build the process exits with status `101`, and no Session recovery or state-preservation guarantee applies |
+
+#### H.4.2 Unsupported and silent command/hook seams
+
+| Input or outcome | Current diagnostic/output | Current state/evaluation effect |
+|---|---|---|
+| recognized `id-hook` class with no TNK implementation, or an unknown special id-hook class | silent | no `SpecialOp` is attached; the operator remains ordinary and may still reduce through user equations |
+| unknown `set` control, unsupported `set include` module, or unrecognized value on the include/breakdown/verbose/timing paths | silent | the directive is consumed and the corresponding Session setting is unchanged |
+| `set memo ...`, `set clear memo`, `do clear memo`, or `set show timing on` | `warning:` that the capability is unavailable | no memo table or timing mode is enabled; other Session state is unchanged |
+| ordinary unification rejected by low-level unsupported-theory readiness | command echo only; no warning, unifier, `No unifier.`, or completion marker | no unifier stream or continuation is created |
+| `check` whose configured SMT backend returns `BadDag` | command echo only; no backend-answer line | the prior continuation has already been cleared; no satisfiability claim is made |
+
+These rows intentionally expose inconsistencies rather than synthesizing a general recovery principle. They are expected to change when invalid-input handling is made uniform.
 
 # Appendix I — Rust API map
 
@@ -1602,8 +1644,8 @@ Missing optional libraries must produce a load/build/unsupported outcome. They m
 | `memo` operator attribute and `set memo`/`set clear memo` | accepted; warning; no cache semantics | warning and unchanged reduction semantics |
 | `set show timing on` | warning; timing remains disabled | no timing rows and state unchanged |
 | conditional strategy definition `csd` | parses; rejected during strategy resolution | rejection, no partial definition |
-| conditional narrowing rule | rejected while loading narrowing metadata | module not partially installed |
-| non-ground unification under idempotent CUI or one-sided-identity associative theories | unsupported; no ordinary unifier stream | distinguish unsupported from no-unifier |
+| conditional narrowing rule | warning; the invalid rule statement is dropped | enclosing module and later valid statements remain installed; see H.4 |
+| non-ground unification under idempotent CUI or one-sided-identity associative theories | low-level problem is unsupported; no ordinary unifier stream | object-level Session currently emits only the command echo; no warning or no-unifier marker |
 | SMT-search `=>!` | command rejects mode | no search/continuation created |
 | conditional constraint in reflected `metaMatch` | unsupported at reflected boundary | no unrelated dispatch |
 | `metaNarrow2` state-only dispatch | recognized but inert | term remains unreduced or explicit facade failure |
@@ -1613,7 +1655,7 @@ Missing optional libraries must produce a load/build/unsupported outcome. They m
 | cooperative cancellation, semantic timeouts, and async Session evaluation | no API | hosts must provide process/thread policy; timeout is not no-solution |
 | typed Session result/diagnostic stream | no API; `Eval` is text plus exit | use lower-level APIs for typed control flow |
 
-Unsupported syntax recognized at a public boundary should diagnose under `TNK-DOC-006`. The currently silent unknown-hook and unknown-`set` cases remain Unsupported; an unchanged result is not evidence that either feature ran.
+Unsupported syntax recognized at a public boundary should diagnose under `TNK-DOC-006`. Appendix H.4 catalogs the current silent, repaired, dropped, and panic paths without promoting them to supported behavior.
 
 ### K.2 Sound but potentially incomplete
 
@@ -1676,6 +1718,7 @@ The identifier is the stable reference; section numbers are navigational. The in
 | Session state | `TNK-SESSION-001`, `TNK-SESSION-002`, `TNK-SESSION-003`, `TNK-SESSION-004`, `TNK-SESSION-005`, `TNK-SESSION-006` | §17 |
 | loading | `TNK-LOAD-001`, `TNK-LOAD-002` | §17.5 |
 | output and diagnostics | `TNK-OUT-001`, `TNK-OUT-002`, `TNK-OUT-003` | §18 |
+| tentative invalid-input recovery | `TNK-RECOVERY-001` | Appendix H.4 |
 | accounting | `TNK-COUNT-001`, `TNK-COUNT-002` | §18.2 |
 | CLI | `TNK-CLI-001` | §19 |
 | Rust APIs | `TNK-API-001`, `TNK-API-002`, `TNK-API-003`, `TNK-API-004`, `TNK-API-005` | §§20–22 |
