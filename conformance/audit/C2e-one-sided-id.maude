@@ -1,4 +1,4 @@
-*** C2e-one-sided-id — left id: / right id: parse; one-sided collapse matches (fable-audit.md §3.4)
+*** C2e-one-sided-id — left id: / right id: parse; one-sided collapse matches
 fmod C2E is
   sort E .
   ops a e : -> E .

@@ -1,15 +1,15 @@
-//! The [`Engine`] — the instantiable owner of all runtime state (decision **D1**: no globals,
+//! The [`Engine`] — the instantiable owner of all runtime state (no globals,
 //! so several engines can coexist, e.g. for meta-interpreters).
 //!
-//! Internally it is split (Stage A4 / review R3 H1) into an immutable-during-reduction `Signature`
+//! Internally it is split into an immutable-during-reduction `Signature`
 //! (sorts, symbols, compiled equations) and a mutable `Runtime` (the GC'd DAG arena, roots, and
 //! rewrite statistics): matching and instantiation hold a *shared* borrow of the signature while
 //! mutating the runtime, so a rewrite instantiates an equation's right-hand side straight out of
 //! the still-borrowed equation table — no defensive clone. [`Engine`] is a thin facade that
 //! re-exposes the same public API over the two halves.
 //!
-//! It computes each node's least sort at construction and runs garbage collection (decision **D2**:
-//! non-moving mark-sweep) over the DAG from an explicit root set.
+//! It computes each node's least sort at construction and runs garbage collection
+//! (non-moving mark-sweep) over the DAG from an explicit root set.
 
 use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
@@ -218,8 +218,8 @@ fn term_matches_pattern(pattern: &Term, subject: &Term) -> bool {
     matches(pattern, subject, &mut HashMap::new())
 }
 
-/// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`]
-/// (decision D3 / review R3 C1), with the right-hand side and variable count kept for instantiation.
+/// An equation as stored in the engine: its left-hand side compiled to a theory [`LhsAutomaton`],
+/// with the right-hand side and variable count kept for instantiation.
 /// The public [`Equation`] (lhs as a [`Term`]) is compiled into this by [`Engine::add_equation`].
 #[derive(Clone)]
 struct CompiledEquation {
@@ -514,7 +514,7 @@ pub(crate) struct Signature {
     /// deliberately absent from `rules`; symbolic unification needs their lhs/rhs and variable layout.
     narrowing_rules: Vec<crate::narrow::NarrowingRule>,
     /// Bumped whenever the equation set changes; stamped into nodes when they are proved canonical,
-    /// so `add_equation` invalidates stale "reduced" results (review R2 H2). `0` is the "never
+    /// so `add_equation` invalidates stale "reduced" results. `0` is the "never
     /// reduced" sentinel stored on nodes, so this starts at `1`.
     eq_epoch: u32,
     /// Next dense equation id (the count of equations added). Assigned to each [`CompiledEquation`] so
@@ -950,7 +950,7 @@ pub(crate) struct Runtime {
     /// Whether to reconstruct the whole root term at each rewrite (`set trace whole`). Off by default
     /// (the reconstruction allocates O(depth) nodes per rewrite, so it is gated). Only acts when tracing.
     record_whole: bool,
-    /// Persistent GC roots held by live [`RootGuard`]s (decision D2 amendment). `gc` always marks
+    /// Persistent GC roots held by live [`RootGuard`]s. `gc` always marks
     /// from here; the shared `Rc<RefCell<…>>` lets a guard outlive a `&mut self` call.
     roots: Roots,
     /// If `Some(n)`, [`reduce`](Engine::reduce) collects at its loop head once this many DAG nodes
@@ -2131,8 +2131,8 @@ impl Signature {
         // Collapse indexing (Maude's Module::indexEquation): an equation whose lhs can COLLAPSE —
         // its top operator's identity/idem axioms can erase it, leaving a term rooted elsewhere —
         // must also be offered to the symbols it can collapse to, so `eq a + X = c` (id: e) is tried
-        // on a bare subject `a`, and `eq (S ; S) = S` on the identity constant `e` (§3.2 collapse,
-        // §3.9.4). Computed before `lhs` moves into the automaton.
+        // on a bare subject `a`, and `eq (S ; S) = S` on the identity constant `e` (B1a/B1b).
+        // Computed before `lhs` moves into the automaton.
         let extra_targets = self.collapse_targets(&lhs, top);
         let compiled = CompiledEquation {
             id,
@@ -2149,7 +2149,7 @@ impl Signature {
         }
         self.equations.entry(top).or_default().push(compiled);
         // A term canonical under the old equation set may now be reducible: invalidate every
-        // node's cached "reduced" stamp by advancing the epoch (review R2 H2).
+        // node's cached "reduced" stamp by advancing the epoch.
         self.eq_epoch += 1;
         id
     }
@@ -2625,7 +2625,7 @@ impl Runtime {
         // LAZILY (an unreduced nested node stays nested until its parent's rebuild), tnk's
         // subjects keep the parse shape through reduction and the same mechanism fires
         // naturally — including Maude's written-order-dependent counts on heterogeneous
-        // multisets (the earlier synthetic canonical-prefix replay is gone). §3.3.
+        // multisets (the earlier synthetic canonical-prefix replay is gone).
         self.constrain_node_whole(sig, id, whole, frames);
     }
 
@@ -2996,7 +2996,7 @@ impl Runtime {
     /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
     /// across two separate strat frames* in one reduction would be refined once per frame — a narrow edge
     /// needing `strat` + `mb` + a repeated strat-skipped compound. C7's construction dedup can now produce
-    /// such sharing, but no observed case hits it; see `fable-audit.md`.)
+    /// such sharing, but no observed case hits it.)
     fn compute_true_sort(
         &mut self,
         sig: &Signature,
@@ -3857,7 +3857,7 @@ impl Runtime {
         self.dags.capacity()
     }
 
-    // ---- garbage collection (D2) ----
+    // ---- garbage collection ----
 
     /// Stable identity of this runtime's DAG arena/root domain. Persistent descent caches use it to
     /// discard engine-local DAG keys before servicing a different loaded module.
@@ -4218,9 +4218,9 @@ impl Runtime {
             if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent, final_step) {
                 self.rewrite_count += 1;
                 // Maude's `while (!isReduced())` exit: a rewrite whose result is ALREADY reduced (a
-                // bare-variable rhs bound to the cached identity dag — the collapse one-shot, §3.9.4)
+                // bare-variable rhs bound to the cached identity dag — the collapse one-shot)
                 // terminates this position immediately; the rewrite above still counted. Fresh RHS
-                // nodes never carry the stamp, so `eq a = a` keeps looping (§3.9.1).
+                // nodes never carry the stamp, so `eq a = a` keeps looping.
                 if self.node(next).reduced_epoch == sig.eq_epoch() {
                     let done = self.node(next).nf.unwrap_or(next);
                     if self.record_whole && self.tracing() {
@@ -4906,7 +4906,7 @@ impl Runtime {
                     for (ai, c) in children.into_iter().enumerate() {
                         if sig.symbol(sym).is_frozen_arg(ai) {
                             continue; // frozen blocks rule application below (same check as frewrite;
-                            // equational reduction is untouched — §3.9.2)
+                            // equational reduction is untouched)
                         }
                         stack.push(RedexPos {
                             node: c,
@@ -5143,8 +5143,8 @@ impl Runtime {
             if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state) {
                 // Snapshot the rewrite count *after* the `such that` condition's equational reductions
                 // (the `rem`/`=/=` etc.): Maude bills those to the solution the condition admits, so the
-                // per-solution `rewrites:` count includes the condition evaluation (fable-audit.md §3.3
-                // B2a). An empty condition is 0-cost, so this equals the discovery count.
+                // per-solution `rewrites:` count includes the condition evaluation.
+                // An empty condition is 0-cost, so this equals the discovery count.
                 let bindings = (0..nr_vars)
                     .map(|k| subst.get(k).expect("goal variable bound"))
                     .collect();
@@ -5185,7 +5185,7 @@ impl Runtime {
         // condition → nested search → rule application → …). Grow the stack on demand so an
         // unboundedly recursive condition (`crl b => c if b => c .`) diverges the way Maude
         // does — heap-growing, interruptible in principle — instead of aborting the process on
-        // call-stack overflow (§3.1d; manual-verify item, not oracle-diffable).
+        // call-stack overflow (manual-verify item, not oracle-diffable).
         stacker::maybe_grow(128 * 1024, 8 * 1024 * 1024, || {
             self.condition_holds_inner(sig, condition, subst, kind, stmt_id, frames, redex)
         })
@@ -6591,9 +6591,9 @@ impl Engine {
         self.rt.node_capacity()
     }
 
-    // ---- garbage collection (D2) ----
+    // ---- garbage collection ----
 
-    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives (decision D2 amendment).
+    /// Pin `id` as a GC root for as long as the returned [`RootGuard`] lives.
     /// The guard registers the root on construction and releases it on `Drop`; it holds a shared
     /// handle to the registry rather than borrowing the engine, so the caller can keep it alive
     /// across `&mut self` calls like [`reduce`](Self::reduce).
@@ -6633,7 +6633,7 @@ impl Engine {
     /// Register an unconditional equation, indexed by its left-hand side's top symbol. The lhs is
     /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once. A term canonical under
     /// the old equation set may now be reducible, so this advances the equation epoch, invalidating
-    /// every node's cached "reduced" stamp (review R2 H2).
+    /// every node's cached "reduced" stamp.
     pub fn add_equation(&mut self, eq: Equation) -> u32 {
         self.rank_term_variable_sorts(&[&eq.lhs, &eq.rhs]);
         self.sig.add_equation(eq)
@@ -7173,7 +7173,7 @@ impl Engine {
     /// Match the compiled `goal` (filtered by `such_that`) against `state`, returning `(bindings,
     /// rewrites-at-acceptance)` per solution — the `search` goal test. The rewrite count is snapshotted
     /// after each solution's `such that` condition evaluation, so the per-solution `rewrites:` count bills
-    /// the condition's reductions (fable-audit.md §3.3 B2a).
+    /// the condition's reductions.
     pub(crate) fn eval_goal(
         &mut self,
         goal: &LhsAutomaton,
@@ -7193,7 +7193,7 @@ impl Engine {
     }
 
     /// One position-fair traversal pass of `node` (Pillar A-ii): post-order (leaves first, left to
-    /// right — a *clean*, well-defined order; see the `frewrite` divergence note in `fable-audit.md`), giving
+    /// right — a *clean*, well-defined order), giving
     /// each **non-frozen** position up to `gas` rule applications with an equational reduce between each.
     /// `remaining` bounds the rewrites across the whole run (`None` = unbounded); `progress` records
     /// whether any rule fired (the pass loop repeats while it does). Faithful to Maude's `fairTraversal`
@@ -7865,7 +7865,7 @@ impl Engine {
     ///
     /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
     /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
-    /// the process on deep terms (review R2 C1). This is a faithful simulation: children are reduced
+    /// the process on deep terms. This is a faithful simulation: children are reduced
     /// left-to-right before the top is rewritten, and each rewrite result is itself re-reduced, so
     /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
     #[must_use]
@@ -11246,7 +11246,7 @@ mod tests {
 
     #[test]
     fn reduced_flag_invalidated_by_new_equation() {
-        // Regression for review R2 H2: a node reduced before an equation is added must not stay
+        // A node reduced before an equation is added must not stay
         // cached as canonical. Reduce `a` (no equations) → a; add `a = b`; reduce `a` → b.
         let mut e = Engine::new();
         let s = e.add_sort("S");
@@ -11336,7 +11336,7 @@ mod tests {
     }
 
     /// Depth 200_000 is ~4x the old recursive reducer's debug stack cliff (~50k); the recursive
-    /// `reduce`/`reduce_args` aborted the *process* here (review R2 C1). The iterative work-stack
+    /// `reduce`/`reduce_args` aborted the *process* here. The iterative work-stack
     /// must reduce it. `s^N + s^N` drives the deepest recursion the old code had (the addition loop
     /// rebuilds `s(plus(..))` and re-descends ~N frames).
     #[test]

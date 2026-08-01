@@ -1,4 +1,4 @@
-*** A3c-id-only — [id: e] without assoc/comm applies (identity absorbed at term build); compound nested case (fable-audit.md §3.2)
+*** A3c-id-only — [id: e] without assoc/comm applies (identity absorbed at term build); compound nested case
 fmod IDO is
   sort E .
   ops a e : -> E [ctor] .

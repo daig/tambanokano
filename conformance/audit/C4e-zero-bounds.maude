@@ -1,4 +1,4 @@
-*** C4e-zero-bounds — [0] bound on rew/search; oracle rejects at parse, tnk runs 0 steps (fable-audit.md §3.6)
+*** C4e-zero-bounds — [0] bound on rew/search; oracle rejects at parse, tnk runs 0 steps
 mod M is
   sort S .
   ops a b c : -> S .

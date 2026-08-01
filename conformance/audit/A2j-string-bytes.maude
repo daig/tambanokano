@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A2j-string-bytes — Maude strings are byte sequences, not UTF-8 code points (fable-audit.md §3.2)
+*** A2j-string-bytes — Maude strings are byte sequences, not UTF-8 code points
 red in CONVERSION : length("héllo") .
 red in CONVERSION : substr("héllo", 1, 1) .
 red in CONVERSION : ascii("é") .

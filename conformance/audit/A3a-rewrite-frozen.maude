@@ -1,4 +1,4 @@
-*** A3a-rewrite-frozen — valid frozen traversal plus atomic recovery from invalid positions (fable-audit.md §3.2, §3.9.2)
+*** A3a-rewrite-frozen — valid frozen traversal plus atomic recovery from invalid positions
 mod FROZ is
   sort S .
   ops a b c d : -> S .

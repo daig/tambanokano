@@ -1,14 +1,14 @@
 //! `tnk-core` — the tambanokano kernel.
 //!
-//! Covers layers **L0–L3** of the migration map (`docs/migration/01-architecture-map.md`):
-//! the `Term`(static) / `DagNode`(runtime) representation, the garbage-collected node
-//! arena, the order-sorted type system, the equational theories, and equational reduction.
+//! Term/DAG representation, garbage-collected node arena, order-sorted type
+//! system, equational theories, and equational reduction, plus the higher
+//! rewriting/search/symbolic layers built on that foundation.
 //!
-//! Foundational decisions live in `docs/migration/03-open-decisions.md`:
-//! - **D1** instance-based [`engine::Engine`] (no global state); ids are engine-relative.
-//! - **D2** non-moving mark-sweep GC over an index [`arena::Arena`]; ids are stable for a
-//!   node's lifetime.
-//! - **D3** enum-dispatch for the closed theory set; `dyn` only at open seams.
+//! Design defaults used throughout the crate:
+//! - instance-based [`engine::Engine`] (no global state); ids are engine-relative
+//! - non-moving mark-sweep GC over an index [`arena::Arena`]; ids are stable for a
+//!   node's lifetime
+//! - enum-dispatch for the closed theory set; `dyn` only at open seams
 
 pub mod arena;
 pub mod dag;

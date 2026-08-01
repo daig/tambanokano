@@ -1,5 +1,5 @@
 *** PRELUDE
-*** B5-graph-arcs — show search graph merges arcs differently and renders rule-text NAT literals differently (fable-audit.md §3.3)
+*** B5-graph-arcs — show search graph merges arcs differently and renders rule-text NAT literals differently
 *** SG has two labelled rules r1, r2 that both rewrite a to f(2) — the same successor state. After the search,
 *** show search graph prints on the oracle ONE merged arc listing both rules; tnk prints two separate arcs.
 *** The rule text also diverges: the oracle renders the RHS as f(2), tnk as f(s s 0) (the state term f(2) agrees).

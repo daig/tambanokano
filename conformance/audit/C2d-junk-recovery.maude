@@ -1,4 +1,4 @@
-*** C2d-junk-recovery — comment before select desyncs tnk; top-level junk skipped, next module loads (fable-audit.md §3.4)
+*** C2d-junk-recovery — comment before select desyncs tnk; top-level junk skipped, next module loads
 fmod MA is
   sort SA .
   ops a1 a2 : -> SA .

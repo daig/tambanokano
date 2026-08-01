@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C1a-rational-glued — glued rational literals parse and compute (fable-audit.md §3.4)
+*** C1a-rational-glued — glued rational literals parse and compute
 fmod C1A is
   protecting RAT .
   op probe : Rat -> Rat .

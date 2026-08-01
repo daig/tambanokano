@@ -1,4 +1,4 @@
-*** C6b-load-cmd — load + sload (relative path from fixture dir); oracle loads and reduces, tnk has no file commands (fable-audit.md §3.4)
+*** C6b-load-cmd — load + sload (relative path from fixture dir); oracle loads and reduces, tnk has no file commands
 load lib/C6b-helper.maude
 sload lib/C6b-helper.maude
 reduce in C6BHELPER : flip(flip(red)) .

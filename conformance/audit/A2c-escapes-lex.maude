@@ -1,4 +1,4 @@
 *** PRELUDE
-*** A2c-escapes-lex — octal + control escapes in string literals lexed correctly (fable-audit.md §3.2)
+*** A2c-escapes-lex — octal + control escapes in string literals lexed correctly
 red in STRING : "\101\102\103" .
 red in STRING : "\a\b\f\r\v" .

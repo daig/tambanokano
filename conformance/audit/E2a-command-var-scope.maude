@@ -1,6 +1,6 @@
 *** E2a-command-var-scope — variable aliases are module-local: a command in module M parses with M's
 *** OWN var declarations, which take priority over any imported module's same-named variable —
-*** fable-audit.md §3.10 E2. Pre-fix, prelude BOOL-OPS's Bool-sorted A B C, collected first by the
+*** Pre-fix, prelude BOOL-OPS's Bool-sorted A B C, collected first by the
 *** flatten, shadowed the module's own N-sorted A B C in the command grammar: reducing A typed it at
 *** Bool, and reducing c applied to A and B failed to parse entirely.
 *** PRELUDE

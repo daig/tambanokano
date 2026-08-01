@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A5f-metaxapply-hole — metaXapply AC extension context is residue-first ('_+_['b.S, []]) (fable-audit.md §3.7)
+*** A5f-metaxapply-hole — metaXapply AC extension context is residue-first ('_+_['b.S, []])
 mod M is
   sort S .
   op a : -> S .

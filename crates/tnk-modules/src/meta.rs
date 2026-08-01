@@ -42,7 +42,7 @@
 //! parse/print pair (`metaParseStrategy`/`metaPrettyPrintStrategy`), which needs the inverse
 //! Strategy↔[`StratExpr`] translation without losing surface sugar.
 //!
-//! Other residuals are orthogonal corners, each riding its own subsystem (`fable-audit.md`): the Stage-3
+//! Other residuals are orthogonal corners, each riding its own subsystem: the Stage-3
 //! compute corners (conditional-rule `metaApply`, conditioned `metaMatch`, the partial substitution, the
 //! AC-residue `metaXmatch` context, the exhausted-search count); and the Stage-4 boundaries (flat-mode
 //! builtin imports — `special`/`poly` op hooks *and* the imported builtin module's statements, both leaving
@@ -938,7 +938,7 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::NarrowingApply => self.meta_narrowing_apply(ctx, hooks, redex),
             MetaOp::NarrowingSearch { path } => self.meta_narrowing_search(ctx, hooks, redex, path),
             MetaOp::Narrow { state_only: false } => self.meta_narrow(ctx, hooks, redex),
-            // The retired v1 state-enumeration surface is recognized but out of scope by S3 §8.2.
+            // The retired v1 state-enumeration surface is recognized but intentionally inert.
             MetaOp::Narrow { state_only: true } => None,
             MetaOp::Srewrite { depth_first } => self.meta_srewrite(ctx, hooks, redex, depth_first),
             MetaOp::Deferred => None,
@@ -4665,7 +4665,7 @@ impl MetaDescent<'_> {
             Err(_) => {
                 // The unparseable-token position: the furthest token a valid partial parse reached
                 // (Maude's `badTokenIndex`), so `'a 'b` over a module where `a` parses but nothing follows
-                // reports `noParse(1)`, not `noParse(0)` (fable-audit.md §3.3 B4).
+                // reports `noParse(1)`, not `noParse(0)`.
                 let pos = command_parse_furthest(&loaded, self.interner, &tokens);
                 let n = up_nat(ctx, pos as u64)?;
                 ctx.app(*hooks.ops.get("noParseSymbol")?, vec![n])

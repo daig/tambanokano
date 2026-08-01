@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 use tnk_repl::Repl;
 
 fn main() -> rustyline::Result<()> {
-    // Flags (decision D11): `-no-prelude` skips the standing prelude, `-no-banner` the banner
+    // Flags: `-no-prelude` skips the standing prelude, `-no-banner` the banner
     // line; the first non-flag argument is the file to load (as `maude file.maude` does).
     let mut no_prelude = false;
     let mut no_banner = false;
@@ -30,7 +30,7 @@ fn main() -> rustyline::Result<()> {
         );
     }
 
-    // Standing prelude (D11): load `prelude.maude` from `$MAUDE_LIB` (colon-separated dirs) or
+    // Standing prelude: load `prelude.maude` from `$MAUDE_LIB` (colon-separated dirs) or
     // the CWD. Its own `set include BOOL on` line then enables the implicit-BOOL auto-import.
     // The engine/library layer stays prelude-free — this is REPL plumbing only.
     if !no_prelude {

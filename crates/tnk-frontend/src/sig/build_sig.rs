@@ -1064,7 +1064,7 @@ fn special_op(
         },
         // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol, ...): declare the
         // operator WITHOUT a special binding. The module loads and everything else in it works; the op
-        // itself stays inert (§2 graceful-degrade stance).
+        // itself stays inert (graceful-degrade stance).
         _other => return Ok(None),
     };
     Ok(Some(op))

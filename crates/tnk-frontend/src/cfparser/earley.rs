@@ -78,7 +78,7 @@ impl Chart {
     /// item. Sets fill contiguously (set `j` gains items only when a token was scanned into it from set
     /// `j-1`, or via predict/complete triggered by such a scan), so this is "one past the last token of a
     /// valid partial parse" — Maude's `badTokenIndex` (`Parser/parser.hh`), reported by `metaParse` as the
-    /// `noParse(n)` failure position (fable-audit.md §3.3 B4).
+    /// `noParse(n)` failure position.
     pub fn furthest(&self) -> usize {
         (0..self.sets.len())
             .rev()

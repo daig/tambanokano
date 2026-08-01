@@ -1,9 +1,9 @@
 *** PRELUDE
-*** B2b-bang-snapshot — =>! per-solution snapshots differ; tnk explores lazily, Maude expands the frontier first (fable-audit.md §3.3)
+*** B2b-bang-snapshot — =>! per-solution snapshots differ; tnk explores lazily, Maude expands the frontier first
 *** Object level: M1 branches a=>{b,c}; b=>d (nf), c=>e=>f (nf). The FIRST =>! solution (d) prints
 ***   states: 5  rewrites: 4 (oracle) vs states: 4  rewrites: 3 (tnk); the totals (6/5) agree.
 *** Meta level: metaSearch(['M1], ..., '!, ..., 0) reports rewrites: 6 (oracle) vs 5 (tnk); result term identical.
-*** The [Q] import-expression module form keeps the command echo clean (no inline-module grouping divergence, §3.7).
+*** The [Q] import-expression module form keeps the command echo clean (no inline-module grouping divergence).
 mod M1 is
   sort St .
   ops a b c d e f : -> St .

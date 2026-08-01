@@ -1,4 +1,4 @@
-*** C4a-theory-import — a theory imported into an fmod; oracle refuses, axioms never run (fable-audit.md §3.6)
+*** C4a-theory-import — a theory imported into an fmod; oracle refuses, axioms never run
 fth TH is
   sort Elt .
   ops p q : -> Elt .

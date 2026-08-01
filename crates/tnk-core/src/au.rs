@@ -178,7 +178,7 @@ impl AuLhs {
             // `xmatch` command over an AU node: Maude's FULL matcher (AU_Layer + SequencePartition)
             // enumerates each matched portion in partition order, filtered by AU_ExtensionInfo::bigEnough
             // (the matched portion must span >= 2 subject subterms). Fixes the `X Y <=? a b c`
-            // over-enumeration (20 → 10; fable-audit.md §3.3 / ac-matcher-plan Phase 5). No maximal-first
+            // over-enumeration (20 → 10). No maximal-first
             // re-sort — partition order *is* the reference order.
             seq_partition_candidates(rt, sig, &seq, &self.elements, 2)
         } else {
@@ -622,7 +622,7 @@ impl AuSubproblem {
     /// `AU_DagNode::matchVariableWithExtension`): the single top variable spans a contiguous portion of
     /// the subject, leaving an ordered prefix/suffix residue. The matched portion must be `bigEnough`
     /// (>= 2 subterms). Enumerated in `SequencePartition` order (`xmatch X <=? a b c` → `a b`,
-    /// `(whole)`, `b c`; fable-audit.md §3.3).
+    /// `(whole)`, `b c`).
     pub(crate) fn match_variable_with_extension(
         rt: &Runtime,
         sig: &Signature,

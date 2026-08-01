@@ -1,4 +1,4 @@
-*** C2b-stmt-recovery — one unparseable statement dropped, module + later commands survive (fable-audit.md §3.4)
+*** C2b-stmt-recovery — one unparseable statement dropped, module + later commands survive
 fmod C2B is
   sort S .
   ops a b good : -> S .

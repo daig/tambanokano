@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# tools/subsystems-scoreboard.sh — the subsystems-goal progress metric
-# (docs/migration/subsystems-goal.md §1.2).
+# tools/subsystems-scoreboard.sh — run conformance/subsystems/*.maude through diffmaude.
 #
 # Runs ordinary fixtures through tools/diffmaude.sh. T11 uses the dedicated native
 # value/sort contract checker because its authoritative oracle is the external Maude-2.7

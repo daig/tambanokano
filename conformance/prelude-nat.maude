@@ -5,7 +5,7 @@
 ***
 *** Oracle: reduce against Maude's BUILT-IN NAT, `~/Downloads/Maude-3/maude -no-banner` with
 *** `red in NAT : <term> .`. All cases are 2-operand or prefix N-ary, whose rewrite COUNT matches
-*** exactly; a >=3-operand *infix* built-in fold has a known count delta (see fable-audit.md) and is omitted.
+*** exactly; a >=3-operand *infix* built-in fold has a known count delta and is omitted.
 
 fmod TRUTH-VALUE is
   sort Bool .

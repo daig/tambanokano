@@ -1,4 +1,4 @@
 *** PRELUDE
-*** A2e-divides-zero — `divides` with a zero divisor stays at kind [Bool] (fable-audit.md §3.2)
+*** A2e-divides-zero — `divides` with a zero divisor stays at kind [Bool]
 red in INT : 0 divides 5 .
 red in INT : 0 divides 0 .

@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C1c-float-forms — abbreviated float literals accepted; 1.5e and lone . rejected (fable-audit.md §3.4)
+*** C1c-float-forms — abbreviated float literals accepted; 1.5e and lone . rejected
 reduce in FLOAT : 1. .
 reduce in FLOAT : .5 .
 reduce in FLOAT : 1.e3 .

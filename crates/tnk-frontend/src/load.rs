@@ -1363,7 +1363,7 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
 /// Whether every variable a statement *instantiates* is bound by the time it is needed: rhs and each
 /// condition fragment's evaluated side may use only lhs variables plus the fresh binders of *earlier*
 /// `:=`/`=>` fragments (Maude's "used before it is bound" check). A violating statement is degraded to
-/// non-executable — parsed but never registered — instead of panicking at `instantiate` (§3.1 A1c);
+/// non-executable — parsed but never registered — instead of panicking at `instantiate` (A1c);
 /// the caller retains the rejection cause as an owned dropped-statement diagnostic.
 fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option<&Term>) -> bool {
     let mut bound = Vec::new();
@@ -1432,7 +1432,7 @@ fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<P
     Ok(parsed.tree)
 }
 
-/// Parse a **command** term bubble, warn-and-pick on ambiguity (decision D9): Maude warns and takes
+/// Parse a **command** term bubble, warn-and-pick on ambiguity: Maude warns and takes
 /// its first parse — our extraction is the same `extractFirstSubparse` walk (first split in
 /// chart/completion order, pass2.cc), so the picked tree is used; the warning text is deferred
 /// diagnostics (phase E). Statement bubbles keep the strict [`parse_forest`]: their ambiguity today
@@ -1794,7 +1794,7 @@ pub fn build_logic_command_dag(
 
 /// Build a command's subject DAG from its parse tree, handling BOTH ground terms (the [`build_dag`] fast
 /// path — compact literals/numerals) and **open** terms with variables. Maude reduces open terms (a
-/// variable is inert under reduction — `red X:A .`, `red g(X, a) .`, `red N + 1 .`, fable-audit.md §3.4);
+/// variable is inert under reduction — `red X:A .`, `red g(X, a) .`, `red N + 1 .`);
 /// tnk's kernel DAG has no variable node, so each distinct variable is realized as a fresh nullary
 /// constant of its declared sort, named for the variable's print form — a declared var prints bare (`N`),
 /// an on-the-fly var with its sort (`X:A`), because that is the variable's source token. The [`VarIndex`]
@@ -1847,8 +1847,8 @@ fn tree_has_var(tree: &PTree, g: &CompiledGrammar) -> bool {
 }
 
 /// The token index where a failed command/term parse got stuck — the furthest token a valid partial
-/// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (fable-audit.md
-/// §3.3 B4); parsed at the universal `Term` start, matching [`build_command_dag`].
+/// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (B4);
+/// parsed at the universal `Term` start, matching [`build_command_dag`].
 pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -> usize {
     let mut effort = ParseEffort::default();
     match earley::parse(&lm.grammar, term, Nt::Term, i, &mut effort) {
@@ -2537,7 +2537,7 @@ struct RawSolution {
 /// the kernel matcher's enumeration order; [`format_matchers`] wraps them into Maude's `Matcher N`
 /// display. The blocks are the unit the conformance harness compares against the reference binary —
 /// **as a set**, since exact ACU/AU solution *order* (Maude's Diophantine order) is a deferred B1
-/// follow-up (§4); every solution and its bindings are reproduced, only the order may differ.
+/// follow-up; every solution and its bindings are reproduced, only the order may differ.
 ///
 /// The pattern is built as a kernel [`Term`] (tracking variable names for display); the subject is
 /// built as a ground DAG and reduced to normal form, matching Maude's behaviour (and a no-op on the
@@ -3981,7 +3981,7 @@ mod tests {
     /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
     /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
     /// membership counted (4 rewrites). Distinct subterms only — a repeated reducible-membership subterm
-    /// was, at C1 time, the separate subject-DAG-sharing divergence (C7, since resolved; see `fable-audit.md`).
+    /// was, at C1 time, the separate subject-DAG-sharing divergence (C7, since resolved).
     #[test]
     fn correctness_strat_mb_conforms() {
         conform(
@@ -4212,7 +4212,7 @@ mod tests {
     /// `eq f(a)=b` is first, `c` when `eq f(X)=c` is first); a non-confluent `eq a=b . eq a=c` → `b`;
     /// comparable membership targets apply smallest-sort-first (1 rewrite, no double count); a conditional
     /// fallback takes the first whose condition holds. (The incomparable-membership tiebreak and
-    /// repeated-subterm sharing are separate documented residuals — doc 09 C3 / C7.)
+    /// repeated-subterm sharing are separate documented residuals — C7.)
     #[test]
     fn eq_mb_order_conforms() {
         conform_render(

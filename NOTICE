@@ -14,7 +14,7 @@ This includes, without limitation:
   - crates/**                (Rust engine, frontend, session, REPL)
   - tools/**                 (harness scripts)
   - share/tnk/**             (tnk-authored Maude facades, e.g. variant-satisfiability)
-  - original project docs and spikes authored for this port
+  - original project docs authored for this port
 
 2. Stock Maude library sources (GPLv2 or later)
 ----------------------------------------------

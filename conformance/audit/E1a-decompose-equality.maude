@@ -1,5 +1,5 @@
 *** E1a-decompose-equality — `.=.` (CommutativeDecomposeEqualitySymbol) must decompose symbolic
-*** arguments over stable constructors instead of misfiring to `false` (fable-audit.md §3.10 E1).
+*** arguments over stable constructors instead of misfiring to `false`.
 *** Lifted from the reference suite (tests/Misc/initialEqualityPredicate.maude) with one adaptation:
 *** the three `s^40(X)`-style commands use spelled-out `s(s(...))` nesting — the `s^k` INPUT notation
 *** is a separate recorded finding, and the nested spelling exercises the same iter-decompose arm.

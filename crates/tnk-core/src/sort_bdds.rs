@@ -4,7 +4,7 @@
 //! maximal-sort-assignment constraint (`src/Higher/unificationProblem.cc findOrderSortedUnifiers`),
 //! and the `AllSat` enumeration walk (`src/Utility/allSat.cc`) — on `biodivine-lib-bdd`.
 //!
-//! Production port of the S0 spike (`spikes/bdd-spike/`, GO — `docs/migration/reports/S0-bdd-spike.md`).
+//! Production port of the S0 BDD spike (GO).
 //!
 //! **BuDDy-isms and their biodivine replacements** (all validated in the spike):
 //!   * `bdd_replace` upward block remap → [`SortBdds::shift_block`], an **order-preserving**
@@ -239,7 +239,7 @@ impl SortBdds {
     /// the module's only `unsafe`.
     // The one deliberate `unsafe` in this module (workspace policy `unsafe_code = "warn"`): an
     // order-preserving BDD variable relabel, its precondition documented above and validated in the
-    // S0 spike (report §6). The alternative — rebuilding the relation from its DNF at the target
+    // S0 spike. The alternative — rebuilding the relation from its DNF at the target
     // block — is 2.6–13× slower and adds no safety (the relabel provably yields the same canonical
     // ROBDD). Allowed here, at the single call, rather than downgrading the crate-wide lint.
     #[allow(unsafe_code)]

@@ -81,7 +81,7 @@ pub struct Session {
     /// Pending `stdin` for `erewrite`'s `getLine` (Pillar 2.5-C). Set via [`set_stdin`](Self::set_stdin)
     /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
     stdin: String,
-    /// `set include BOOL on|off` (decision D11): while on, every entered module gets an implicit
+    /// `set include BOOL on|off`: while on, every entered module gets an implicit
     /// `including BOOL .` (the command's actual import mode; prelude.maude:3233 turns it on after BOOL
     /// exists). The prelude's own early modules build while it is off. Default off — the engine/library
     /// layer stays prelude-free; the standing prelude flips it via its own `set include` line.
@@ -252,7 +252,7 @@ impl Session {
         }
         // Tokenize once so the meta-command dispatch keys on the first *token* (comments already stripped
         // by the lexer) rather than the first raw word: a `***`/`---` comment on the line before
-        // `select`/`show`/`set` no longer desyncs it (fable-audit.md §3.4 — the comment-before-select bug).
+        // `select`/`show`/`set` no longer desyncs it.
         // The meta handlers re-space the tokens (`join_tokens`), which keeps structured names (`LIST{Nat}`)
         // intact and drops the comment prefix.
         let toks = tokenize(input, &mut self.interner);
@@ -325,7 +325,7 @@ impl Session {
         // submission at a time, so a *single-line* `red a . red b .` arrives here as several parsed items —
         // reject the whole submission when any command is followed by another item. Commands on SEPARATE
         // lines are separate submissions (each its own `dispatch_one`), so multi-command files are
-        // unaffected (fable-audit.md §3.4). A module/view followed by a trailing command is Maude-legal and
+        // unaffected. A module/view followed by a trailing command is Maude-legal and
         // left alone (the command is the last item — nothing follows it).
         if items
             .iter()
@@ -361,7 +361,7 @@ impl Session {
     /// it current. Silent on success (as Maude is); flatten/build errors become output.
     fn enter_module(&mut self, mut pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
-        // Implicit BOOL (D11 / fable-audit.md §3.4): `set include BOOL on` injects
+        // Implicit BOOL: `set include BOOL on` injects
         // `including BOOL .`. An explicit BOOL import dedups in flatten's visited set.
         if self.include_bool && name != "BOOL" && self.db.get("BOOL").is_some() {
             pm.imports.insert(
@@ -535,7 +535,7 @@ impl Session {
         // A `[0]` component in a bracketed bound (`rewrite`/`frewrite`/`erewrite`/`search`) is illegal:
         // Maude rejects it at parse ("bad token in / no parse for term|command") — before resolving the
         // module — so the command produces no output, while the following legal commands still run
-        // (fable-audit.md §3.6, C4e). Every bound slot rejects a 0 (verified against the oracle: bound and
+        //. Every bound slot rejects a 0 (verified against the oracle: bound and
         // gas for `frewrite [n, g]`/`erewrite`, and both solution/depth bounds for `search [n, m]`).
         // `continue`'s bare number is a different grammar and DOES allow 0, so it is not checked here.
         let zero_bound = match &c {
@@ -767,7 +767,7 @@ impl Session {
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                 // The echo shows the bound exactly as written (`[n]` or `[n, g]`); Maude's default gas is
-                // one rule application per position per pass (fable-audit.md §3.4).
+                // one rule application per position per pass.
                 let bound_str = match (bound, gas) {
                     (Some(n), Some(g)) => format!(" [{n}, {g}]"),
                     (Some(n), None) => format!(" [{n}]"),
@@ -1587,7 +1587,7 @@ impl Session {
             Some("clear") if words.get(2).copied() == Some("memo") => {
                 unsupported_memo_control_warning().to_string()
             }
-            // `set include BOOL on|off` (D11): toggle the implicit-BOOL auto-import. Other
+            // `set include BOOL on|off`: toggle the implicit-BOOL auto-import. Other
             // `set include <MOD>` names remain silent no-ops (nothing else is auto-imported).
             Some("include") if words.get(2).copied() == Some("BOOL") => {
                 match words.get(3).copied() {
@@ -1631,7 +1631,7 @@ impl Session {
         }
     }
 
-    /// `load <file>` / `sload <file>` (D11): read the file and evaluate its contents in place
+    /// `load <file>` / `sload <file>`: read the file and evaluate its contents in place
     /// (modules + commands), resolving relative to the CWD then `$MAUDE_LIB` (colon-separated),
     /// with and without an appended `.maude`. `sload` skips a file that was already loaded.
     fn meta_load(&mut self, sload: bool, path: &str) -> Eval {
@@ -1721,7 +1721,7 @@ impl Session {
         // A command keyword *claims* the statement it leads (`red …`, `search …`): a module-open keyword
         // inside a command's term (`red fmod … endfm .`, `reduce metaReduce(…)`) is then an operator-name
         // fragment, not a real module. Junk tokens do NOT claim the statement, so a module preceded by
-        // top-level junk (`junkalpha … fmod MC …`, fable-audit.md §3.4) is still recognized — the buffer
+        // top-level junk (`junkalpha … fmod MC …`) is still recognized — the buffer
         // must not complete mid-module at the module's first inner `.`.
         let is_command = |s: &str| {
             matches!(
@@ -2784,7 +2784,7 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
         let value = print_pretty(&lm.built, i, *term, color);
         out.push_str(&format!("state {sidx}, {sort}: {value}\n"));
         // One arc per distinct successor state; all rules reaching it are listed on that single arc, each
-        // in its own parens (Maude merges arcs by target — fable-audit.md §3.3 B5).
+        // in its own parens (Maude merges arcs by target ).
         for (arc_n, (target, rules)) in arcs.iter().enumerate() {
             let bodies: String = rules
                 .iter()

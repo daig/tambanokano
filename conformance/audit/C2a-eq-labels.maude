@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C2a-eq-labels — leading bracketed labels on eq/ceq/mb/cmb parse and fire (fable-audit.md §3.4)
+*** C2a-eq-labels — leading bracketed labels on eq/ceq/mb/cmb parse and fire
 fmod C2A is
   protecting BOOL .
   sorts S T .

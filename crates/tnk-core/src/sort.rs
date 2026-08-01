@@ -307,7 +307,7 @@ impl Sorts {
         }
 
         // 4b. Reject subsort cycles: two distinct user sorts that are mutually `<=` (Maude errors
-        // on these; review R2 L6 / R3 M3).
+        // on these).
         for s in 0..n0 {
             let sid = Id::<Sort>::from_raw(s as u32);
             for &t in &geq[s] {

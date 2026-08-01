@@ -1,4 +1,4 @@
-*** A4a-mixfix-rename — renaming single-token mixfix op _+_ to _plus_: mixfix parse survives; renamed module carrying a _+_ statement builds (fable-audit.md §3.2)
+*** A4a-mixfix-rename — renaming single-token mixfix op _+_ to _plus_: mixfix parse survives; renamed module carrying a _+_ statement builds
 fmod MA is
   sort V .
   ops x y : -> V [ctor] .

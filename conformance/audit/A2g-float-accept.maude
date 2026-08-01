@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A2g-float-accept — float(String) accepts only valid Maude float syntax (fable-audit.md §3.2)
+*** A2g-float-accept — float(String) accepts only valid Maude float syntax
 red in CONVERSION : float("NaN") .
 red in CONVERSION : float("nan") .
 red in CONVERSION : float("inf") .

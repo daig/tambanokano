@@ -1,8 +1,8 @@
-//! A non-moving, garbage-collected index arena (decision **D2**).
+//! A non-moving, garbage-collected index arena.
 //!
 //! Slots are never relocated, so [`Id<T>`] handles stay valid for a node's lifetime. Reclaimed
 //! slots return to a free list and may be reused; because the GC only frees *unreachable* nodes,
-//! no live id ever dangles, so we do not need generational tags (deferred — see D2).
+//! no live id ever dangles, so we do not need generational tags in release builds.
 //!
 //! The arena exposes mark/sweep primitives so a theory-aware tracer (the DAG's GC) can drive
 //! reachability from a root set: [`Arena::clear_marks`] → mark roots transitively via
@@ -29,7 +29,7 @@ fn next_arena_id() -> u32 {
 ///
 /// In debug builds each slot also carries a *generation* (bumped on free) and the arena carries a
 /// unique id, both stamped into the [`Id`]s it mints, so a stale or cross-arena handle is caught at
-/// access time (decision **D2 amendment**). These cost nothing in release (the fields and checks are
+/// access time. These cost nothing in release (the fields and checks are
 /// `cfg(debug_assertions)`-gated and compiled out).
 pub struct Arena<T> {
     slots: Vec<Slot<T>>,
@@ -320,8 +320,8 @@ mod tests {
     }
 
     /// Free a slot, let the next `alloc` recycle it, then access the *old* handle. In release this
-    /// silently aliases the recycled node (the documented D2 risk); in debug the generation check
-    /// turns it into a panic at the point of misuse (D2 amendment / review R1 C1).
+    /// silently aliases the recycled node; in debug the generation check
+    /// turns it into a panic at the point of misuse.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stale")]

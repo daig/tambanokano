@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A2d-escapes-print — control/high bytes printed with escapes, not raw (fable-audit.md §3.2)
+*** A2d-escapes-print — control/high bytes printed with escapes, not raw
 red in CONVERSION : char(0) .
 red in CONVERSION : char(7) .
 red in CONVERSION : char(13) .

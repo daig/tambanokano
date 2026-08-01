@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C2j-nonground-reduce — reduce of open terms; declared-var print parity (fable-audit.md §3.4)
+*** C2j-nonground-reduce — reduce of open terms; declared-var print parity
 fmod C2J is
   protecting NAT .
   sort A .

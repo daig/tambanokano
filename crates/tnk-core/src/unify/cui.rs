@@ -26,8 +26,8 @@ use std::cmp::Ordering;
 /// The two arguments of a CUI-unification node. Read generically through `children()` so it works
 /// for BOTH node representations a CUI-unification-theory symbol can have: a genuine `Cui` node
 /// (two-sided `id:` / `comm` / `idem` ops, identity kept in the kernel) and a **`Free`** node
-/// (one-sided `left id:`/`right id:` ops, whose identity the frontend withholds from the kernel —
-/// fable-audit §3.4 — so tnk builds them as binary free applications). Both are binary with
+/// (one-sided `left id:`/`right id:` ops, whose identity the frontend withholds from the kernel,
+/// so tnk builds them as binary free applications). Both are binary with
 /// positionally-meaningful (or, for comm, `dag_compare`-ordered) arguments.
 fn cui_args(e: &Engine, id: DagId) -> (DagId, DagId) {
     let mut kids = e.node(id).children();

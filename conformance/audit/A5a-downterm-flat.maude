@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A5a-downterm-flat — downTerm of a flat 3-arg assoc meta-term must down-translate to 9 (fable-audit.md §3.2)
+*** A5a-downterm-flat — downTerm of a flat 3-arg assoc meta-term must down-translate to 9
 fmod A5A is
   protecting META-LEVEL .
   protecting NAT .

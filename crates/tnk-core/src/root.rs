@@ -1,5 +1,4 @@
-//! GC roots: an [`Engine`](crate::engine::Engine) root registry and the RAII [`RootGuard`]
-//! (decision **D2 amendment**, Stage A2).
+//! GC roots: an [`Engine`](crate::engine::Engine) root registry and the RAII [`RootGuard`].
 //!
 //! A `RootGuard` pins a `DagId` so the collector keeps it — and everything reachable from it — live;
 //! it registers on construction and unregisters on `Drop`. Crucially it holds a *shared handle* to

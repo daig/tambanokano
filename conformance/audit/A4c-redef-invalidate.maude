@@ -1,4 +1,4 @@
-*** A4c-redef-invalidate — redefining an imported module (and a view target) recomputes dependents on the oracle; tnk stays stale (fable-audit.md §3.2)
+*** A4c-redef-invalidate — redefining an imported module (and a view target) recomputes dependents on the oracle; tnk stays stale
 fmod M is
   sort S .
   ops a v1 v2 : -> S [ctor] .

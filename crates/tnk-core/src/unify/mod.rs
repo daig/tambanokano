@@ -1,5 +1,5 @@
 //! Order-sorted unification core — the solved-form machinery under the `unify` command and the
-//! `metaUnify` descent family (subsystems-goal.md phase S1).
+//! `metaUnify` descent family ( phase S1).
 //!
 //! Ports the reference's layered protocol faithfully, **including enumeration order**:
 //!

@@ -5,7 +5,7 @@
 //! Maude tests subsumption by *matching* the retained unifier's bindings against the candidate's. We
 //! express the same relation as unification, because tnk's unifier is complete for every implemented
 //! theory — including the one-sided-identity collapse (`left id:` / `right id:`) that the kernel
-//! matcher deliberately omits (fable-audit §3.4). Concretely, a retained unifier `r` subsumes a
+//! matcher deliberately omits. Concretely, a retained unifier `r` subsumes a
 //! candidate `u` iff `u` is an instance of `r` on the interesting variables, i.e. the system
 //! `{ r[i] =? freeze(u[i]) }` is satisfiable, where `freeze` replaces `u`'s fresh variables with
 //! fresh distinct ground constants (so the only remaining variables are `r`'s — one-sided

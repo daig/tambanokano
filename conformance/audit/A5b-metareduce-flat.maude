@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A5b-metareduce-flat — metaReduce over a flat 3-arg assoc meta-term computes in the real NAT (fable-audit.md §3.2)
+*** A5b-metareduce-flat — metaReduce over a flat 3-arg assoc meta-term computes in the real NAT
 fmod A5B is
   protecting META-LEVEL .
 endfm

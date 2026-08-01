@@ -270,7 +270,7 @@ pub struct Attrs {
     /// sort `X$s`); instantiating `P{V}` maps `X$c` through `V`'s op map for `c`.
     pub pconst: bool,
     /// Which side(s) the `id:` collapses: `left id:` / `right id:` collapse only that side (Maude's
-    /// one-sided identity), a plain `id:` is two-sided (fable-audit.md §3.4). Meaningful only when
+    /// one-sided identity), a plain `id:` is two-sided. Meaningful only when
     /// [`id`](Self::id) is `Some`.
     pub id_side: IdSide,
 }
@@ -393,7 +393,7 @@ pub enum TestKind {
 /// substitution / its rewrite-condition substrategies, a test/matchrew pattern + condition, a call's
 /// arguments) are raw token bubbles, parsed against the module grammar at execution time. The derived forms
 /// `try`/`not`/`test`/`or-else` keep their surface spelling ([`StratExpr::Sugar`]) for the command echo
-/// and desugar to [`StratExpr::Branch`] at resolution (fable-audit.md §3.9.8 ii).
+/// and desugar to [`StratExpr::Branch`] at resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StratSugar {
     Try,
@@ -452,8 +452,8 @@ pub enum StratExpr {
         subs: Vec<(Vec<Token>, StratExpr)>,
     },
     /// A derived branch form kept in its SURFACE spelling for the command echo — `try(α)`, `not(α)`,
-    /// `test(α)`, `or-else(α, β)` — resolution desugars to the `? :` branch (fable-audit.md §3.9.8 ii:
-    /// the round-trip must preserve the surface form).
+    /// `test(α)`, `or-else(α, β)` — resolution desugars to the `? :` branch;
+    /// the round-trip must preserve the surface form.
     Sugar {
         kind: StratSugar,
         args: Vec<StratExpr>,
@@ -491,7 +491,7 @@ pub enum Command {
         term: Vec<Token>,
     },
     /// `frewrite [bound [, gas]] term .` — position-fair rewriting (Pillar A-ii). `gas` (default 1) is the
-    /// number of rule applications per position per pass (fable-audit.md §3.4).
+    /// number of rule applications per position per pass.
     Frewrite {
         module: Option<String>,
         bound: Option<u64>,

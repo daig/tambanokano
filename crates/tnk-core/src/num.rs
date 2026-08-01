@@ -1,4 +1,4 @@
-//! Arbitrary-precision arithmetic behind a thin wrapper (decision **D4**: `malachite`, pure Rust).
+//! Arbitrary-precision arithmetic behind a thin wrapper (`malachite`, pure Rust).
 //!
 //! The kernel never names `malachite` directly — the S-theory successor count
 //! ([`crate::dag::NodeTerm::S`]) and the built-in numeric operators (`NAT`/`INT`) go through [`Nat`]

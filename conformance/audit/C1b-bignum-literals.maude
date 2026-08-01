@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C1b-bignum-literals — integer literals beyond 2^64 parse and re-read (fable-audit.md §3.4)
+*** C1b-bignum-literals — integer literals beyond 2^64 parse and re-read
 reduce in NAT : 18446744073709551616 .
 reduce in NAT : 2 ^ 100 .
 reduce in NAT : 1267650600228229401496703205376 .

@@ -465,8 +465,8 @@ impl Search {
     /// The snapshot is taken *live* (current `states` + `rewrites`) rather than from the state's discovery
     /// counts, which matters in two ways: a `=>!` solution is found when its state is dequeued and
     /// confirmed a normal form — *after* the frontier ahead of it was expanded (more states/rewrites than
-    /// at discovery — §3.3 B2b) — and a `such that` solution's rewrite count includes the condition's own
-    /// reductions, which `eval_goal` snapshots per binding (§3.3 B2a). For the plain `=>1`/`=>+`/`=>*`
+    /// at discovery) — and a `such that` solution's rewrite count includes the condition's own
+    /// reductions, which `eval_goal` snapshots per binding (B2a). For the plain `=>1`/`=>+`/`=>*`
     /// cases the solution is found at discovery, so the live counts equal the old discovery snapshot.
     fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
         let term = self.graph.state_dag(s).expect("search state exists");

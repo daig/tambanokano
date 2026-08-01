@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# tools/audit-scoreboard.sh — the correctness-goal progress metric
-# (docs/migration/correctness-goal.md §1.1).
+# tools/audit-scoreboard.sh — run conformance/audit/*.maude through diffmaude.
 #
 # Runs every fixture in conformance/audit/*.maude through tools/diffmaude.sh
 # (per-fixture 60s timeout on each side; a timeout is a FAIL attributed to

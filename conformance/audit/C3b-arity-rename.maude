@@ -1,4 +1,4 @@
-*** C3b-arity-rename — arity-disambiguated op rename of one overload (fable-audit.md §3.4)
+*** C3b-arity-rename — arity-disambiguated op rename of one overload
 fmod M is
   sorts A B C .
   op a : -> A .

@@ -1,4 +1,4 @@
-*** C4f-print-attr-check — malformed [print] attr (unbound var); oracle drops the statement (fable-audit.md §3.6)
+*** C4f-print-attr-check — malformed [print] attr (unbound var); oracle drops the statement
 fmod M is
   sort S .
   ops a b : -> S .

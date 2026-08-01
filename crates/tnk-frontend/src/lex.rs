@@ -952,7 +952,7 @@ mod tests {
         // Abbreviated float forms Maude's `looksLikeFloat` ACCEPTS (verified against Maude 3.5.1:
         // `reduce in FLOAT : 1. .` → `result FiniteFloat: 1.0`, `.5` → `5.0e-1`, `1.e3`/`1e3` → `1.0e+3`,
         // `.5e2` → `5.0e+1`, `Infinity` → `result Float: Infinity`). The prior pins asserted Maude
-        // rejected `1.`/`.5` — it does not (fable-audit.md §3.4, roadmap C1c).
+        // rejected `1.`/`.5` — it does not.
         assert_eq!(classify("1."), TokKind::Float);
         assert_eq!(classify(".5"), TokKind::Float);
         assert_eq!(classify("1.e3"), TokKind::Float);

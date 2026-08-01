@@ -198,7 +198,7 @@ impl SSubproblem {
     /// `S_DagNode::matchVariableWithExtension` → `S_Subproblem` with `mustMatchAtLeast = 1`): bind
     /// `X = s^j(base)` for `j = n, n−1, …, 1`, leaving `residue = n − j` surplus successors. The floor of
     /// 1 keeps at least one successor in the matched portion (so `xmatch X:Nat <=? 3` yields the whole
-    /// plus the `2` and `1` portions — not the bare `0`; fable-audit.md §3.3).
+    /// plus the `2` and `1` portions — not the bare `0`).
     pub(crate) fn match_variable_with_extension(
         symbol: SymbolId,
         n: Nat,

@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C3a-renamed-inst — instantiating a renamed parameterized module (fable-audit.md §3.4)
+*** C3a-renamed-inst — instantiating a renamed parameterized module
 fmod M{X :: TRIV} is
   sort S .
   op wrap : X$Elt -> S [ctor] .

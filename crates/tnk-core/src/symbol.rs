@@ -7,7 +7,7 @@
 //! data on the symbol and [`Symbol::theory`] classifies them. Ad-hoc overloading (multiple
 //! declarations + sort diagram) and the remaining attributes are layered on later by composition.
 //!
-//! Fields are `pub(crate)`; read access is through getters (review R3 H4).
+//! Fields are `pub(crate)`; read access is through getters.
 
 use crate::id::Id;
 use crate::smt::SmtOp;
@@ -43,7 +43,7 @@ pub(crate) struct Axioms {
 }
 
 /// Which equational theory an operator belongs to — selects its `DagNode` representation and its
-/// matching automaton (decision **D3**: a closed enum, enum-dispatched). This slice implements
+/// matching automaton (a closed enum, enum-dispatched). This slice implements
 /// [`Free`](Theory::Free), [`Acu`](Theory::Acu), and [`Au`](Theory::Au); `Cui`/`S`/`Na` are later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Theory {
@@ -183,7 +183,7 @@ pub enum SymbolClass {
 /// bits (`symbolType.hh`), set from the `config`/`obj`/`msg`/`portal` operator attributes
 /// (`obj`≡`object`, `msg`≡`message`, `config`≡`configuration`). The roles are independent bits (an op
 /// could in principle carry more than one), matching the C++ flag word. The `erewrite` scheduler keys
-/// its soup partition on these — **not** on the `Object`/`Msg` sorts (see the plan §2.8 / hazards).
+/// its soup partition on these — **not** on the `Object`/`Msg` sorts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OoFlags {
     /// `config` — the configuration multiset constructor (`__`), built as a `ConfigSymbol` in C++.
@@ -239,7 +239,7 @@ pub struct SatSolverHooks {
     pub false_term: SymbolId,
 }
 
-/// A built-in operator's reduction rule (decision **#6** / **D3**): Maude's `special (id-hook …)` seam
+/// A built-in operator's reduction rule: Maude's `special (id-hook …)` seam
 /// as a typed enum resolved at module-build time and dispatched by `match` in symbol reduction — not
 /// C++'s attached member-function pointers. `term-hook`/`op-hook` references are resolved to
 /// [`SymbolId`]s. This slice has the BOOL operators; NAT/INT arithmetic variants are added with those
@@ -468,7 +468,7 @@ pub enum MetaOp {
     },
     /// Complete-set variant matching (the current Qid-family signature).
     VariantMatch,
-    /// Legacy `metaNarrow`; `metaNarrow2` is recognized separately but intentionally inert (S3 §8.2).
+    /// Legacy `metaNarrow`; `metaNarrow2` is recognized separately but intentionally inert.
     Narrow {
         state_only: bool,
     },
@@ -689,10 +689,10 @@ impl Symbol {
         self.inconsistent_constructor_axioms
     }
 
-    /// The operator's equational theory (decision **D3**), classified from its [`Axioms`]:
+    /// The operator's equational theory, classified from its [`Axioms`]:
     /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm`, `id:`, or
     /// `idem` (any subset, non-assoc) → [`Cui`](Theory::Cui) — Maude's CUI_Theory covers all {C,U,I}
-    /// combinations, and an `id:`-only / `idem`-only op must still collapse (§3.2 A3c) — else
+    /// combinations, and an `id:`-only / `idem`-only op must still collapse (A3c) — else
     /// [`Free`](Theory::Free). Non-comm CUI ops keep positional argument order everywhere; only the
     /// collapse axioms apply.
     pub(crate) fn theory(&self) -> Theory {

@@ -1,4 +1,4 @@
-*** A1a-iter-nonlinear — non-linear equation over an [iter] constructor (fable-audit.md §3.1)
+*** A1a-iter-nonlinear — non-linear equation over an [iter] constructor
 fmod ITER-NL is
   sorts Zero Nat .
   subsort Zero < Nat .

@@ -1,4 +1,4 @@
-*** C4d-dotted-sorts — a dotted sort name; oracle rejects, tnk accepts and computes (fable-audit.md §3.6)
+*** C4d-dotted-sorts — a dotted sort name; oracle rejects, tnk accepts and computes
 fmod M is
   sort A.B .
   ops p q : -> A.B .

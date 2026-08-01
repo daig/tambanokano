@@ -487,7 +487,7 @@ fn collect_named(
     // parameters stay free, so the imports are collected unsubstituted with `X` in scope.
     let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
-        // Import hygiene (fable-audit.md §3.6). A module importing ITSELF is a mutually-recursive import:
+        // Import hygiene. A module importing ITSELF is a mutually-recursive import:
         // Maude marks the module unusable due to unpatchable errors, so flattening fails and it is never
         // built (C4c). Checked first, before the theory/free-param recoveries.
         if import_names_self(&imp.expr, name) {

@@ -509,7 +509,7 @@ fn increment_mixed_radix(idx: &mut [usize], radices: &[usize]) -> bool {
     false
 }
 
-/// A resumable enumerator over the solutions of an [`AcuLhs`] against a subject (decision D3: an arm
+/// A resumable enumerator over the solutions of an [`AcuLhs`] against a subject (an arm
 /// of the closed [`crate::theory::Subproblem`] enum). Each `next()` undoes the previous solution's
 /// bindings, then binds the next candidate's variables (building their multiset bindings as fresh
 /// canonical ACU nodes) and records the residue (the extension). Owns all its state — no borrows of

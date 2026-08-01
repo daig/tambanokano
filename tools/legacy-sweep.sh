@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# tools/legacy-sweep.sh — criterion 3 of the correctness goal (correctness-goal.md §1.3):
-# every legacy conformance/*.maude fixture harness-clean against the live oracle, modulo ONLY
-# the enumerated accepted divergences. Prints one line per fixture and a final
+# tools/legacy-sweep.sh — every legacy conformance/*.maude fixture harness-clean
+# against the live oracle, modulo ONLY the enumerated accepted divergences.
+# Prints one line per fixture and a final
 #   LEGACY <n>/<m> CLEAN
 # Exit 0 iff n = m.
 #

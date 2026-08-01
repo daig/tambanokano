@@ -1,5 +1,5 @@
 *** PRELUDE
-*** D2a-ac-hang — cardinality of a 30-element SET{Nat}: oracle fast (30), tnk naive-AC hang > harness budget (fable-audit.md §3.5)
+*** D2a-ac-hang — cardinality of a 30-element SET{Nat}: oracle fast (30), tnk naive-AC hang > harness budget
 fmod D2AHANG is
   protecting SET{Nat} .
 endfm

@@ -1,3 +1,3 @@
 *** PRELUDE
-*** A2h-negzero-eq — IEEE equality: -0.0 == 0.0 is true (fable-audit.md §3.2)
+*** A2h-negzero-eq — IEEE equality: -0.0 == 0.0 is true
 red in FLOAT : - 0.0 == 0.0 .

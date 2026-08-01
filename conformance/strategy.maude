@@ -1,6 +1,6 @@
 *** Phase 2.4 — strategy language (core combinators). Oracle: the reference binary's srewrite/dsrewrite.
 *** Solution values + order are byte-identical; the per-solution srewrite rewrite count follows the BFS
-*** snapshot (see fable-audit.md), so the test pins the solution values/structure.
+*** snapshot, so the test pins the solution values/structure.
 mod STRAT-CORE is
   sort S .
   ops a b c d : -> S [ctor] .
@@ -32,7 +32,7 @@ dsrewrite a using r1 | r2 .
 dsrewrite a using (r1 | r2) ; r3 .
 
 *** Strategy definitions (sd) + calls (Phase C). `dsrewrite` for multi-solution calls — its depth-first
-*** order/count is faithful; the fair `srewrite` BFS order for unequal-depth branches is a follow-on (fable-audit.md).
+*** order/count is faithful; the fair `srewrite` BFS order for unequal-depth branches is a follow-on.
 smod STRAT-DEFS is
   protecting STRAT-CORE .
   strats go go2 reach : @ S .
@@ -47,7 +47,7 @@ dsrewrite a using reach .
 *** Phase D — matchrew/amatchrew, conditional rules (equality + rewrite-condition substrategies), the
 *** application substitution `L[x <- t]`, the `xmatch` test, and parameterized strategy calls. `dsrewrite`
 *** pins the unequal-depth multi-solution case (its depth-first order/count is faithful; the fair `srewrite`
-*** BFS order for unequal-depth branches is the documented follow-on, fable-audit.md). Solution values + order are
+*** BFS order for unequal-depth branches is the documented follow-on). Solution values + order are
 *** byte-identical to the reference.
 mod STRAT-D is
   sort S .

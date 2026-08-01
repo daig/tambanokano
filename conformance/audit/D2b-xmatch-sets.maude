@@ -1,5 +1,5 @@
 *** PRELUDE
-*** D2b-xmatch-sets — xmatch enumeration: AU-with-id 10, iter-Nat 3, AU bare-var 3 (fable-audit.md §3.3)
+*** D2b-xmatch-sets — xmatch enumeration: AU-with-id 10, iter-Nat 3, AU bare-var 3
 fmod D2BI is
   sort Elt List .
   subsort Elt < List .

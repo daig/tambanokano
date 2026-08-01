@@ -1,4 +1,4 @@
-*** C3g-decl-attrs — generated-by import mode + rpo op attribute (fable-audit.md §3.4)
+*** C3g-decl-attrs — generated-by import mode + rpo op attribute
 fmod BASE is
   sort S .
   ops a b : -> S [rpo 1] .

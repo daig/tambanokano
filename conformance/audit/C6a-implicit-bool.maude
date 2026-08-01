@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C6a-implicit-bool — oracle auto-injects BOOL (==/and/if_then_else_fi work without import); set include BOOL off drops the eq, module survives (fable-audit.md §3.4)
+*** C6a-implicit-bool — oracle auto-injects BOOL (==/and/if_then_else_fi work without import); set include BOOL off drops the eq, module survives
 fmod C6AIMPL is
   sort S .
   ops a b : -> S .

@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C6c-standing-prelude — the plain binary has NAT/BOOL via the standing prelude (fable-audit.md §3.4).
+*** C6c-standing-prelude — the plain binary has NAT/BOOL via the standing prelude.
 *** Marker added when the C6c fix landed: post-flip the harness runs marker'd fixtures on the standing
 *** prelude — exactly what this fixture pins — and markerless ones with -no-prelude.
 reduce in NAT : 2 + 2 .

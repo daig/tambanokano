@@ -1,4 +1,4 @@
-*** C4c-self-import — a module importing itself; oracle marks it unusable (fable-audit.md §3.6)
+*** C4c-self-import — a module importing itself; oracle marks it unusable
 fmod M is
   protecting M .
   sort S .

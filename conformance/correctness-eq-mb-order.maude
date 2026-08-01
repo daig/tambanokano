@@ -3,7 +3,7 @@
 *** targets apply smallest-sort-first with no double count. Differential vs the binary:
 ***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-eq-mb-order.maude < /dev/null
 *** The contradictory-membership tiebreak (incomparable targets) and repeated-subterm sharing are separate
-*** documented residuals (doc 09 C3 / C7), not exercised here.
+*** documented residuals (C7), not exercised here.
 fmod EQORD is
   sort S .
   ops a d b c : -> S [ctor] .

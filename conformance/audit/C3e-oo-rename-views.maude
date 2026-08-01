@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C3e-oo-rename-views — OO renaming items (class/attr/msg to) over an omod (fable-audit.md §3.4)
+*** C3e-oo-rename-views — OO renaming items (class/attr/msg to) over an omod
 omod FOO is
   sort Val .
   ops v0 v1 : -> Val [ctor] .

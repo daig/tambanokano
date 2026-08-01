@@ -1,4 +1,4 @@
-*** B3-mb-extension — AC (conditional) memberships are not applied through extension (fable-audit.md §3.3)
+*** B3-mb-extension — AC (conditional) memberships are not applied through extension
 *** Over AC _|_, a membership whose LHS is a proper sub-multiset of the subject must fire through extension.
 *** MB-EXT: mb a | a : Special. red a | a is 1 rewrite on both engines by a direct match. red a | a | a stays
 *** 1 rewrite on the oracle because it fires through extension, but is 0 on tnk.

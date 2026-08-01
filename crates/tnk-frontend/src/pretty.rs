@@ -427,7 +427,7 @@ impl<'a> Printer<'a> {
             Item::Term(Term::Op { symbol, args }) => {
                 // A `nat_succ` tower over `nat_zero` folds to its decimal — `f(2)`, not `f(s s 0)`.
                 // Static terms may mix ordinary unary `Op` layers with compact `Iter` runs; Maude folds
-                // both when printing (fable-audit.md §3.3 B5).
+                // both when printing.
                 if let Some(dec) = self.term_nat_decimal(*symbol, args) {
                     out.push(Work::Text {
                         cat: Cat::Lit,

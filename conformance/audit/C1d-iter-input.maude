@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C1d-iter-input — s_^k(t) iter input notation accepted (fable-audit.md §3.4)
+*** C1d-iter-input — s_^k(t) iter input notation accepted
 fmod C1D is
   sort Foo .
   op z : -> Foo [ctor] .

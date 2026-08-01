@@ -6,7 +6,7 @@
 *** strat `0` step (FreeTheory/freeSymbol.cc), refining even the skipped ones — so their memberships
 *** apply (and count) and an overloaded operator's result sort reflects the refined argument sort.
 *** Mirrors the engine.rs C1 seam-3 test. (Distinct subterms only: a *repeated* reducible-membership
-*** subterm was a separate subject-DAG-sharing divergence at C1 time — C7, since resolved; see fable-audit.md.)
+*** subterm was a separate subject-DAG-sharing divergence at C1 time — C7, since resolved.)
 
 fmod STRAT-MB-WRAP is
   sorts Elem Sml Wr WrS .

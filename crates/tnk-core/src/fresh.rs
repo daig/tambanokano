@@ -1,4 +1,4 @@
-//! The central fresh-variable generator (S1 constraint, subsystems-goal.md §2: ONE generator before
+//! The central fresh-variable generator (S1 constraint: ONE generator before
 //! a second consumer exists) — Maude's `FreshVariableSource` (src/Mixfix/freshVariableSource.cc).
 //!
 //! Three families, one per symbolic layer, each printing as `<char><n>`:

@@ -1,4 +1,4 @@
-//! The theory-plugin seam (review R3 C1; A2 report §2): a compiled [`LhsAutomaton`] whose two-phase
+//! The theory-plugin seam: a compiled [`LhsAutomaton`] whose two-phase
 //! match produces a resumable, multi-solution [`Subproblem`].
 //!
 //! Phase 1 implements only the **free theory** — a deterministic, single-solution structural match —
@@ -129,7 +129,7 @@ impl RewriteMatchContext {
     }
 }
 
-/// A left-hand side compiled for matching in its theory. Closed set (decision **D3**); this slice has
+/// A left-hand side compiled for matching in its theory. Closed set; this slice has
 /// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
 /// automata and are pure additions behind this type.
 #[derive(Clone)]
@@ -198,7 +198,7 @@ impl LhsAutomaton {
     /// enables the extension refinements that Maude's interactive matcher shows but the rewrite engine
     /// takes the first solution of — the AU `bigEnough` floor + `SequencePartition` order, and the
     /// subject-driven *bare-variable* extension (`matchVariableWithExtension`). Keeping it off the
-    /// rewrite path guarantees reduce/rewrite behaviour is unchanged (fable-audit.md §3.3).
+    /// rewrite path guarantees reduce/rewrite behaviour is unchanged.
     pub(crate) fn match_(
         &self,
         rt: &Runtime,
@@ -280,7 +280,7 @@ impl LhsAutomaton {
 ///
 /// This is the stream the reduce driver consumes: ACU matching populates it with the several
 /// solutions of an associative-commutative match, and conditional equations (B2) will `next()` again
-/// when a solution fails its condition. Closed set (decision **D3**); solution *combinators*
+/// when a solution fails its condition. Closed set; solution *combinators*
 /// (sequence / disjunction over sub-matches) are the heterogeneous case that may later use boxing.
 pub(crate) enum Subproblem {
     /// The free theory has at most one solution (a deterministic structural match), already bound in

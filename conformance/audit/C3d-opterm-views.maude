@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C3d-opterm-views — op→term view with variable arguments (op lt(A,B) to term A < B) (fable-audit.md §3.4)
+*** C3d-opterm-views — op→term view with variable arguments (op lt(A,B) to term A < B)
 fth TH is
   protecting BOOL .
   sort Elt .

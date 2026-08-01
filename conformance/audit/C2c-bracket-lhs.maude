@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C2c-bracket-lhs — rule LHS starting with a [_]-headed term parses as a term (fable-audit.md §3.4)
+*** C2c-bracket-lhs — rule LHS starting with a [_]-headed term parses as a term
 mod C2C is
   protecting NAT .
   sort Obj .

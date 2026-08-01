@@ -207,7 +207,7 @@ pub struct Membership {
 
 /// One fragment of a conditional statement's condition (`ceq`/`cmb`/`crl` ... `if` ...). The fragments
 /// are a conjunction evaluated left-to-right; a failure backtracks into the previous fragment's next
-/// solution (and ultimately into the next matcher solution of the statement). Closed set (decision D3).
+/// solution (and ultimately into the next matcher solution of the statement). Closed set.
 #[derive(Debug, Clone)]
 pub enum ConditionFragment {
     /// `lhs = rhs` — holds iff both sides, instantiated under the match and reduced, are equal modulo
@@ -420,10 +420,10 @@ impl Runtime {
     ///
     /// Iterative (explicit pair-stack) for the same reason as [`Engine::reduce`]: the recursive form
     /// descended on *subject* depth and overflowed on deep terms (e.g. a non-linear pattern over a
-    /// million-deep chain — review R2 C1).
+    /// million-deep chain).
     ///
     /// Compares top symbols and walks children through the [`DagNode::children`] visitor rather than
-    /// matching a specific `NodeTerm` arm (review R3 H3): same-symbol + pairwise-equal-children is the
+    /// matching a specific `NodeTerm` arm: same-symbol + pairwise-equal-children is the
     /// free-theory equality. It also serves the canonically-ordered representations whose identity is
     /// fully carried by the child sequence (ACU, *provided* `children` yields the whole ordered
     /// multiset, repeats included). A theory whose node carries scalar payload that is *not* a child
@@ -676,7 +676,7 @@ impl Runtime {
 
     /// [`instantiate`](Self::instantiate) with Maude's `RhsBuilder` CSE: each **textually repeated**
     /// compound subterm of the rhs is built once and reused (so it reduces once and counts once —
-    /// §3.9.5, the `< g(X), g(X) >` case), while *distinct* rhs subterms that merely instantiate to
+    /// the `< g(X), g(X) >` case), while *distinct* rhs subterms that merely instantiate to
     /// equal values stay separate nodes and count separately — RAT's
     /// `(I * M + J * N) / (N * M)` on `1/6 + 1/6` reduces `1 * 6` twice, exactly like Maude (a
     /// value-keyed dedup window here undercounted by one).
@@ -906,8 +906,8 @@ mod tests {
     }
 
     /// Two structurally-equal chains `g^200000(a)` with *distinct* node ids: the recursive
-    /// `deep_equal` descended on subject depth and overflowed the stack on deep terms (review R2 C1,
-    /// e.g. a non-linear pattern `h(X, X)` over deep arguments). The iterative pair-stack must not.
+    /// `deep_equal` descended on subject depth and overflowed the stack on deep terms
+    /// (e.g. a non-linear pattern `h(X, X)` over deep arguments). The iterative pair-stack must not.
     #[test]
     fn deep_equal_iterative_on_deep_terms() {
         fn chain(e: &mut Engine, a: SymbolId, g: SymbolId, n: u32) -> DagId {

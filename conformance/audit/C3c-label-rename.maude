@@ -1,4 +1,4 @@
-*** C3c-label-rename — renaming a rule label; new label usable as a strategy (fable-audit.md §3.4)
+*** C3c-label-rename — renaming a rule label; new label usable as a strategy
 mod M is
   sort S .
   ops a b : -> S .

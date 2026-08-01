@@ -1,3 +1,3 @@
 *** PRELUDE
-*** A2f-char-domain — char domain is bytes 0..255; char(256) is unreduced (fable-audit.md §3.2)
+*** A2f-char-domain — char domain is bytes 0..255; char(256) is unreduced
 red in CONVERSION : char(256) .

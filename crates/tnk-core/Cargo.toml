@@ -17,13 +17,14 @@ smt-z3 = ["dep:z3"]
 # D4: arbitrary-precision integers/rationals (pure Rust). Wrapped behind `crate::num` so the kernel
 # never names the backend; `Float` stays IEEE f64. License: LGPL-3.0-only (revisit before distribution).
 malachite = "0.9"
-# Heap-backed stack growth at the nested-condition seam (§3.1d): unbounded rewrite-condition
+# Heap-backed stack growth at the nested-condition seam: unbounded rewrite-condition
 # recursion (`crl b => c if b => c .`) must diverge like Maude (interruptible, heap-growing),
 # not abort on call-stack overflow. Used only in `condition_holds`.
 stacker = "0.1"
-# S1 (subsystems goal): the order-sorted-unification sort computation (SortBdds + AllSat), per the
-# S0 spike (docs/migration/reports/S0-bdd-spike.md, GO). Pure Rust — the default build stays
-# pure-Rust and green without any native BDD library. Replaces Maude's BuDDy.
+# Order-sorted-unification sort computation (SortBdds + AllSat). Pure Rust —
+# the default build stays pure-Rust without any native BDD library. Replaces
+# Maude's BuDDy.
+
 biodivine-lib-bdd = "0.5.27"
 # D7: optional native SMT backend. All SMT metadata and command plumbing remain in the default
 # pure-Rust build; only DAG-to-z3 translation and solving are gated.

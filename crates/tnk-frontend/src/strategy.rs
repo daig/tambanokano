@@ -18,7 +18,7 @@
 //! `matchrew`/`amatchrew` and **conditional-rule rewrite-condition substrategies** run their sub-searches
 //! *eagerly within a step* (faithful values + order + reachability; their per-solution count can collapse
 //! when interleaved with parallel unequal-depth work — Maude's `SubtermTask`/`rewriteTask` parallel-odometer
-//! is the documented residual, `fable-audit.md`). `xmatchrew` and conditional `csd` error clearly at resolve.
+//! is the documented residual). `xmatchrew` and conditional `csd` error clearly at resolve.
 
 use crate::build_term::{VarIndex, build_term};
 use crate::cfparser::compile::CompiledGrammar;

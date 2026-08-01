@@ -1,4 +1,4 @@
-*** C5-ambiguity-pick — ambiguous terms: oracle warns, picks the first (left) parse, computes; tnk hard-errors (fable-audit.md §3.4)
+*** C5-ambiguity-pick — ambiguous terms: oracle warns, picks the first (left) parse, computes; tnk hard-errors
 fmod C5AMBIG-MIXFIX is
   sort S .
   op a : -> S .

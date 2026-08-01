@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/diffmaude.sh — oracle-diff harness (docs/migration/correctness-goal.md §1.1).
+# tools/diffmaude.sh — oracle-diff harness for conformance fixtures.
 #
 # Usage: tools/diffmaude.sh <fixture.maude> [-v]
 #   -v            report the pinned oracle version and print normalized output on PASS
@@ -20,7 +20,7 @@
 #   Pre-C6c (TNK_STANDING_PRELUDE=0, kept for archaeology): a marker'd fixture
 #   gets $ORACLE_LIB/prelude.maude concatenated in front on the tnk side.
 #
-# Normalization (exact; §1.1 — NOTHING else may be stripped):
+# Normalization (exact — NOTHING else may be stripped):
 #   - `====…` separator lines
 #   - the tnk banner line, `Bye.`, `Maude>` prompts
 #   - timing-only text: the tail of `rewrites: N in …` / `states: N rewrites: M in …` lines

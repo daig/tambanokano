@@ -1,11 +1,11 @@
-//! Engine-relative typed indices (decision **D1**).
+//! Engine-relative typed indices.
 //!
 //! An [`Id<T>`] indexes into an [`crate::arena::Arena<T>`] owned by a single `Engine`. Ids from
 //! different engines must not be mixed, and a stable id must not outlive the slot it names. In
-//! **release** builds `Id<T>` is a bare `u32` and both invariants are unenforced (decision **D2**:
-//! stable ids + non-moving slot reuse trade detection for size). In **debug** builds the id also
-//! carries the arena's identity and the slot's *generation* at mint time (decision **D2 amendment**,
-//! Stage A2): [`Arena`](crate::arena::Arena) bumps a slot's generation when it frees it, so a stale
+//! **release** builds `Id<T>` is a bare `u32` and both invariants are unenforced (stable ids +
+//! non-moving slot reuse trade detection for size). In **debug** builds the id also
+//! carries the arena's identity and the slot's *generation* at mint time:
+//! [`Arena`](crate::arena::Arena) bumps a slot's generation when it frees it, so a stale
 //! handle (slot reused since the id was minted — a logical use-after-free) or a cross-arena/
 //! cross-engine handle **panics at access** instead of silently aliasing the wrong node.
 //!
@@ -29,7 +29,7 @@ struct IdMeta {
 }
 
 /// A stable handle to a `T` stored in an `Arena<T>`. Valid for the lifetime of that node
-/// (decision **D2**: the GC only frees unreachable nodes, so a live id never dangles).
+/// (the GC only frees unreachable nodes, so a live id never dangles).
 pub struct Id<T> {
     raw: u32,
     // Debug-only provenance for stale/cross-arena detection; compiled out in release so `Id<T>`
