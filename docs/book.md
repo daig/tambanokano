@@ -9,11 +9,11 @@
 
 > **The authority boundary**
 >
-> This book teaches TNK; it does not define TNK. The normative companion is [The TNK Language and System Reference](manual.md). When an explanation here and a contract clause there appear to disagree, the Reference is authoritative. Stable identifiers such as `TNK-SEARCH-002` name Reference clauses, not rules created by this book.
+> This book teaches TNK; it does not define TNK. The normative companion is [The TNK Language and System Reference](manual.md); its exhaustive [normative clause index](manual.md#appendix-l--normative-clause-index) is the durable entry point for contract lookup. When an explanation here and a contract clause there appear to disagree, the Reference is authoritative. Stable identifiers such as `TNK-SEARCH-002` name Reference clauses, not rules created by this book.
 
 TNK is an independent rewriting-logic system implemented by the tambanokano Rust workspace. Its source language inherits a substantial intellectual lineage from Maude, but neither Maude behavior nor Maude documentation defines TNK. You do not need to know Maude to read this book.
 
-## What this book is
+## Preface — What this book is
 
 The Reference answers questions such as “What does this arrow mean?”, “Is this result set complete?”, and “Which Session state survives an error?” This book answers a different set of questions:
 
@@ -95,6 +95,10 @@ cargo run --release -p tnk-repl -- -no-banner -no-prelude example.maude
 
 The flags use one leading hyphen. `-no-prelude` is intentional: the kernel, frontend, module, and Session libraries never load `prelude.maude` implicitly, and the executable only attempts to load it when that flag is absent. Examples that need a bundled or external library say so and show the required `load` command or capability profile.
 
+### Assumed setup
+
+Default-profile examples require Rust `1.90` or newer and a checkout containing `Cargo.toml`, `crates/`, and `share/`. They do not require an installed Maude executable. Hook-loaded examples additionally require the named TNK library and a tested prelude/capability bundle reachable through `MAUDE_LIB`; `smt-z3` examples require a provisioned Z3 backend. Shell commands assume a Unix-like environment and paths are relative to the workspace root unless stated otherwise; adapt environment-assignment syntax on other shells.
+
 A source file may contain modules followed by commands on later physical lines. The executable evaluates the file, prints nonempty results, and then reads further input. With nonterminal standard input at end-of-file, it exits the loop normally.
 
 ### Status and profile lines
@@ -165,18 +169,18 @@ The book does not repeat the complete command grammar, hook catalogue, feature m
 - **Part V — Symbolic reasoning and verification**
   - Chapter 14 — From matching to unification
   - Chapter 15 — Variants and narrowing
-  - Chapter 16 — SMT constraints
+  - Chapter 16 — Constraints and SMT
   - Chapter 17 — Invariants and temporal properties
   - Lab E — A complete verification argument
 - **Part VI — Hosting and extending TNK**
   - Chapter 18 — A Session is a state machine
   - Chapter 19 — Embedding TNK in Rust
   - Chapter 20 — Reflection, objects, and external systems
-- **Part VII — Engineering reliable TNK systems**
+- **Part VII — Engineering reliable TNK models**
   - Chapter 21 — Diagnostics, tracing, and debugging
-  - Chapter 22 — Termination, completeness, and resources
-  - Chapter 23 — Testing and evolving models
-  - Lab F — A hosted analysis tool
+  - Chapter 22 — Termination, completeness, and resource bounds
+  - Chapter 23 — Testing and evolving TNK models
+  - Capstone — From model to hosted analysis tool
 - **Appendices**
   - Appendix A — Choosing and adapting examples
   - Appendix B — Reading conventions
@@ -773,6 +777,10 @@ eq lhs = rhs .
 
 TNK matches `lhs` against a redex, instantiates `rhs`, and continues reducing according to the owning operator strategy. Good executable equations orient many surface terms toward a small, stable collection of normal forms.
 
+### First, predict the normal form
+
+Before running a command, write down the constructor value you expect and the equations that should justify it. Then compare the semantic value and sort—not incidental spacing or the aggregate rewrite counter—with that prediction. This habit turns `reduce` into a check of a model rather than a calculator whose output is accepted uncritically.
+
 ### A Peano addition example
 
 ```maude
@@ -964,6 +972,8 @@ reduce in PREDECESSOR : pred(z) .
 has no defining equation and remains `pred(z)` at kind `[Nat]`.
 
 Partiality does not synthesize an exception, `none`, or a special error term. If a model needs one of those outcomes, declare it explicitly.
+
+This stuck result is different from an invalid declaration. `pred(z)` is a well-sorted term at kind `[Nat]` in a successfully built module; it simply has no applicable equation. A declaration with an unknown sort, an ill-sorted equation side, or an invalid operator profile is rejected while the module is built and contributes no executable term at all.
 
 ### Memberships refine, not replace
 
@@ -1204,6 +1214,8 @@ Non-associative combinations of:
 form the CUI family. Idempotence identifies `f(x,x)` with `x` at supported canonicalization and matching boundaries. It does not make arbitrary non-ground unification under that symbol supported; `TNK-UNIFY-003` marks non-ground idempotent CUI unification Unsupported.
 
 One-sided identities need special care. On associative operators, `left id:` and `right id:` remove the identity only at the corresponding word end. On a commutative operator one side becomes both sides. A non-associative, non-commutative operator with only a one-sided identity remains free for ordinary construction and matching.
+
+Associativity combined with idempotence is not a supported theory family in this edition. Do not infer support for `[assoc idem]` or `[assoc comm idem]` from the separate AU/ACU and CUI implementations. If the intended value is a mathematical set, use a supported representation with explicit duplicate-elimination equations, or keep the operation in the non-associative CUI family and accept its binary shape.
 
 ### Iteration represents huge unary chains compactly
 
@@ -1471,6 +1483,8 @@ Under `TNK-RULE-001`, one rule transition:
 
 Only the rule application adds one unit of rule depth. Equation, membership, matching, and condition work can contribute to aggregate diagnostics without becoming extra graph edges.
 
+Equation normal form and rule normal form answer different questions. Equation normal form means the deterministic computation layer has no further equation or hook step at the positions selected by its strategy. Rule normal form means no admissible ordinary rule transition remains. A state can be equation-normal and still have many rule successors; every search node has exactly that shape.
+
 ### Rule labels are part of the modeling interface
 
 Labels make transitions inspectable and controllable:
@@ -1646,6 +1660,16 @@ Search asks about the transition relation rather than selecting one execution. T
 - semantically equal states share one node;
 - exploration proceeds in breadth-first discovery order.
 
+```mermaid
+flowchart LR
+    I["initial (depth 0)"] -->|request alice| A["alice waiting (depth 1)"]
+    I -->|request bob| B["bob waiting (depth 1)"]
+    A -->|request bob| C["both waiting (depth 2)"]
+    B -->|request alice| C
+```
+
+The converging arcs illustrate quotient-graph exploration: two paths can reach one canonical node. Breadth-first depth belongs to nodes; the predecessor chosen for `show path` is only one witness.
+
 ### Arrow meanings
 
 ```maude
@@ -1662,6 +1686,8 @@ The arrow selects candidate depths:
 | `=>!` | a terminal state with no ordinary successors |
 
 The first bound limits solutions; the second bounds rule depth. An omitted bound is not an implicit infinity proof—it asks the algorithm to continue, and an infinite graph may never exhaust.
+
+A bounded resumable search may leave this lazy frontier in the Session. `continue n .` asks the same search owner for up to `n` additional solutions; it is not a new depth bound and does not restart from the initial node. Starting another execution, selecting a module, or rebuilding a relevant dependency forfeits the portable right to resume that frontier.
 
 ### Find the protocol bug
 
@@ -2182,6 +2208,10 @@ A failed definition preserves the prior database, prior built dependents, curren
 
 A theory states what a generic component requires. A parameterized module uses those requirements. A view shows how a concrete target supplies them. Instantiation performs the substitution.
 
+> **Experimental boundary**
+>
+> The syntax is usable, but parameter instantiation, composed views, and several validation paths remain Experimental. A successful example demonstrates only the mappings and rebuild path it exercises. Do not infer that every accepted theory obligation is fully discharged, or that every rejected composition leaves the same diagnostic wording. Prefer explicit mappings to a plain named target when a reusable component is release-critical, and test rejection plus prior-state preservation.
+
 ### Define the interface as a theory
 
 ```maude
@@ -2357,6 +2387,15 @@ endv
 
 The view definition does not change the current module. Its source is the theory, not the generic `STACK` module.
 
+An identity view has no mappings because source and target names already agree:
+
+```maude
+view ItemIdentity from ITEM to ITEM is
+endv
+```
+
+It is useful when an instantiation requires a view value rather than a bare theory/module name. `ColorAsItem` is not an identity view: its explicit sort map changes `Item` to `Color`.
+
 ### Step 3: instantiate
 
 ```maude
@@ -2448,6 +2487,16 @@ u\sigma =_A v\sigma
 \]
 
 Here \(=_A\) means equality modulo the declared algebraic axioms, not arbitrary user equations.
+
+### Free and commutative examples
+
+The theory controls the shape of the answer before ACU introduces splitting:
+
+- **Free:** unifying `f(X, a)` with `f(b, Y)` has the single structural solution \(X \mapsto b,\;Y \mapsto a\).
+- **Commutative:** under a binary `[comm]` symbol, unifying `pair(X, Y)` with `pair(a, b)` admits the direct and swapped assignments.
+- **ACU:** associativity, commutativity, and identity let variables receive whole submultisets, so one subject can have a finite family of partitions.
+
+These are solver-theory solutions, not applications of user equations. Adding an equation such as `eq f(a) = b .` changes normalization but does not silently extend free unification with that equality.
 
 ### An ACU example
 
@@ -2743,7 +2792,7 @@ Returned solutions are sound and include the accumulated substitution for origin
 3. Add a second narrowing rule and retain paths.
 4. Explain how `fold` and `vfold` use different subsumption relations.
 
-## Chapter 16 — SMT constraints
+## Chapter 16 — Constraints and SMT
 
 **Feature status:** Optional native Z3 backend; default null backend is Stable and returns `Unknown`  
 **Profile:** `smt-z3` for decisions; loaded `smt` hook library  
@@ -2751,6 +2800,18 @@ Returned solutions are sound and include the accumulated substitution for origin
 **Reference map:** `TNK-SMT-*`, `TNK-VSAT-001`, `TNK-PROFILE-001`
 
 SMT search combines rewriting with formulas over Boolean, integer, and real values. It is distinct from algebraic unification: an SMT solver decides constraints in a background theory rather than finding substitutions modulo user-declared operator axioms.
+
+Three solver outcomes must be understood before any example:
+
+| Outcome | What it establishes |
+|---|---|
+| `Sat` | at least one assignment satisfies the translated constraint |
+| `Unsat` | no assignment satisfies it, but only when the selected backend decides the encountered fragment |
+| `Unknown` | this backend did not decide; it establishes neither satisfiability nor unsatisfiability |
+
+`BadDag` is different again: the term could not be translated as a supported constraint. Backend identity, loaded hooks, and formula fragment therefore belong in every SMT report.
+
+At the Session text boundary, `check` currently renders these backend statuses as `sat`, `unsat`, and `undecided`; the semantic distinctions are `Sat`, `Unsat`, and `Unknown`.
 
 ### Two build profiles, two legitimate outcomes
 
@@ -2870,7 +2931,7 @@ Choose the procedure by mathematical domain:
 
 ## Chapter 17 — Invariants and temporal properties
 
-**Feature status:** Optional hook-loaded LTL model checking; Stable algorithmic contract  
+**Feature status:** Optional hook-loaded LTL model checking  
 **Profile:** standing prelude plus `model-checker` library  
 **Prerequisites:** Chapters 10 and 16  
 **Reference map:** `TNK-LTL-*`, `TNK-SEARCH-*`
@@ -2881,6 +2942,8 @@ Reachability search asks whether some finite path reaches a state. LTL describes
 - liveness: something good eventually happens;
 - response: an event is eventually followed by another;
 - recurrence: an event happens infinitely often.
+
+This is not a satisfiability query. SMT or variant satisfiability asks whether some assignment or constructor instance satisfies one formula. Model checking fixes an initial transition system and asks whether all of its admitted infinite behaviors satisfy a temporal formula; a false result supplies a lasso-shaped behavior rather than a satisfying valuation.
 
 The loaded `model-checker` source depends on `BOOL`, `QID`, and related surfaces normally supplied by a standing prelude. Configure both roots explicitly, for example:
 
@@ -3109,6 +3172,20 @@ reduce in KEY-CHECK :
 
 The safe model returns `true`. Against the buggy model, the negated property has a counterexample.
 
+For the buggy module, the rendered result begins with a concrete lead-in and accepting cycle:
+
+```text
+result ModelCheckResult: counterexample(
+  {key < alice : idle > < bob : idle >, 'request}
+  {key < alice : waiting > < bob : idle >, 'enter}
+  {key < alice : inside > < bob : idle >, 'request}
+  {key < alice : inside > < bob : waiting >, 'enter},
+  {key < alice : inside > < bob : inside >, 'leave}
+  ...)
+```
+
+This is an abridged rendering: the comma separates the finite lead-in from the cycle and the omitted cycle states return to a previously seen state. The semantic evidence is the state/label lasso; line wrapping and internal automaton numbers are not part of the claim.
+
 ### Step 5: cross-check the proposition
 
 A false LTL result can come from a bad proposition definition. Test representative concrete states:
@@ -3186,6 +3263,20 @@ TNK is not only a command-line program. Its principal integration boundary is a 
 - at most one continuation.
 
 Independent `Session` values share no semantic state.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Ready: successful module build/load
+    Ready --> Ready: module or view update
+    Ready --> Saved: bounded resumable execution
+    Saved --> Saved: continue n
+    Saved --> Ready: exhaustion
+    Saved --> Ready: select, rebuild, or new execution
+    Ready --> Ready: rejected replacement preserves prior build
+```
+
+`Ready` includes the persistent module/view database and current-module selection. `Saved` adds one algorithm owner and its roots. A diagnostic is not a separate state by itself: the owning command's recovery contract determines which arrow, if any, occurred.
 
 ### The primary operation
 
@@ -3406,6 +3497,8 @@ The `color` argument is host presentation policy. With `false`, output contains 
 
 This exact-output assertion is appropriate only because the example is explicitly testing the Session presentation contract. A semantic regression test at a lower layer should assert a typed result instead.
 
+Treat `Eval.exit` and diagnostics as independent channels. `exit` is a host-visible quit request; a parse, build, or execution diagnostic normally remains text in `Eval.output` and does not imply `exit == true`. Likewise, the CLI can finish a readable source file with evaluation diagnostics without turning each diagnostic into a distinct process exit code. A host that requires fail-closed behavior should scan the Stable severity prefixes—or use a typed lower layer—and then apply its own process policy.
+
 ### A buffering adapter
 
 ```rust
@@ -3440,6 +3533,22 @@ session.set_stdin("first line\nsecond line\n");
 ```
 
 This replaces the scripted input consumed by later `erewrite` `getLine` requests. It does not replace the host's source-submission channel.
+
+### Resume one bounded operation
+
+```rust
+let first = session.eval(
+    "rewrite [1] in KEY-SAFE :
+       key < alice : idle > < bob : idle > .",
+    false,
+);
+assert!(!first.exit);
+
+let next = session.eval("continue 2 .", false);
+assert!(!next.exit);
+```
+
+The second call advances the owner saved by the first. Do not insert another execution, `select`, or relevant module/view rebuild between them. Presentation text can show the prefixes, but a host that must classify bounded versus exhausted work should own the typed continuation layer instead.
 
 ### Frontend pipeline
 
@@ -3531,6 +3640,15 @@ Rust module paths, exhaustive enum shapes, and source compatibility are Experime
 >
 > If your application needs typed search completion, wrap `Search`; do not parse Session prose. If it only needs a terminal transcript, own a Session; do not rebuild the command parser.
 
+### Common mistakes
+
+- Parsing `Eval.output` to recover typed completion or backend status.
+- Sharing one mutable Session among independent logical clients.
+- Sending importing source through the import-free frontend loader.
+- Moving intern, symbol, sort, or DAG IDs between owners.
+- Keeping an unrooted DAG across a GC-capable kernel call.
+- Treating `Eval.exit`, diagnostic text, and process exit status as one channel.
+
 ### Exercises
 
 1. Adapt the buffering host to maintain one Session per client ID.
@@ -3566,6 +3684,24 @@ When a loaded signature supplies the required hooks, TNK supports native metalev
 - lexical tokenization and token printing.
 
 The loaded facade defines the term-level interface. Native code performs the owned operation after resolving the hook to a known `MetaOp`.
+
+### A concrete reflected reduction
+
+With a tested prelude providing `META-LEVEL` and `NAT`, this complete source performs one reflective descent:
+
+```maude
+fmod META-DEMO is
+  protecting META-LEVEL .
+endfm
+
+reduce in META-DEMO :
+  metaReduce(
+    ['NAT],
+    '_+_['s_^2['0.Zero], 's_^3['0.Zero], 's_^4['0.Zero]]
+  ) .
+```
+
+The ordinary outer `reduce` evaluates a reflected request. `['NAT]` identifies the target module, the quoted application is owned term data, and the `metaReduce` hook builds and runs the target reduction in the receiving engine. The result is a `ResultPair` containing `'s_^9['0.Zero]` and `'NzNat`. A tool should validate that pair, keep quoted data at the reflection boundary, and reject any load diagnostics before trusting it.
 
 ### Unknown operations fail closed
 
@@ -3682,7 +3818,7 @@ Part VII applies these contracts to debugging, resource discipline, testing, and
 
 ---
 
-# Part VII — Engineering reliable TNK systems
+# Part VII — Engineering reliable TNK models
 
 Executable models can fail through wrong semantics, malformed source, incomplete exploration, missing capabilities, or exhausted resources. Reliable practice distinguishes those causes before changing the model.
 
@@ -3696,6 +3832,19 @@ Executable models can fail through wrong semantics, malformed source, incomplete
 A good debugging question is not “Why did TNK print this?” It is:
 
 > Which layer owns the failure, what state transition occurred, and what semantic claim is still justified?
+
+```mermaid
+flowchart LR
+    S[source bytes] --> L[lexer and command parser]
+    L --> T[term parser]
+    T --> M[module/view builder]
+    M --> C[canonical term]
+    C --> R[rule transition graph]
+    R --> A[analysis result]
+    A --> O[rendered output]
+```
+
+Debug from left to right and stop at the first broken invariant. A malformed source bubble cannot be repaired by changing a rule; a wrong canonical term invalidates every later reachability claim; a correct typed analysis can still be misreported by a presentation-only integration. Preserve the input and capability profile at each rung so minimization does not move the failure to another layer.
 
 ### Classify the owning boundary first
 
@@ -3874,7 +4023,7 @@ Turn trace back off
 3. Reduce a failing imported model to one self-contained module.
 4. Identify which output fields are semantic and which are presentation.
 
-## Chapter 22 — Termination, completeness, and resources
+## Chapter 22 — Termination, completeness, and resource bounds
 
 **Feature status:** Stable explicit boundary classifications  
 **Profile:** all  
@@ -4014,7 +4163,7 @@ Claim not justified:
 3. Design a worker protocol that distinguishes timeout, crash, diagnostic failure, and semantic result.
 4. Identify which terms a low-level search owner must keep rooted.
 
-## Chapter 23 — Testing and evolving models
+## Chapter 23 — Testing and evolving TNK models
 
 **Feature status:** Nonnormative engineering guidance; exercised features retain their Reference classifications  
 **Profile:** test every supported profile deliberately  
@@ -4215,7 +4364,7 @@ Coverage percentage is diagnostic. Mutation results and missing behavioral cells
 3. Convert an exact-order unifier test into a canonical set assertion.
 4. Specify a failure-preservation test for view replacement.
 
-## Lab F — A hosted analysis tool
+## Capstone — From model to hosted analysis tool
 
 **Feature status:** Stable Session ownership; typed completion requires lower-level API  
 **Profile:** default for the core lab  
@@ -4267,6 +4416,21 @@ search in KEY-SAFE :
   =>* REST:Conf
       < alice : inside > < bob : inside > .
 "#;
+
+const CONTROLLED: &str = r#"
+smod KEY-CONTROL is
+  protecting KEY-SAFE .
+  strat alice-enters @ Conf .
+  sd alice-enters :=
+    request[W <- alice] ;
+    enter[W <- alice] .
+endsm
+
+srewrite in KEY-CONTROL :
+  key < alice : idle > < bob : idle >
+  using alice-enters .
+select KEY-SAFE .
+"#;
 ```
 
 Keeping the model self-contained makes library resolution irrelevant for the default-profile lab.
@@ -4304,14 +4468,22 @@ fn main() {
     assert!(!result.exit);
     assert!(!has_diagnostic(&result));
 
+    let controlled = session.eval(CONTROLLED, false);
+    assert!(!controlled.exit);
+    assert!(!has_diagnostic(&controlled));
+    assert_eq!(session.current(), Some("KEY-SAFE"));
+
     println!("profile: default");
     println!("module: KEY-SAFE");
     println!("claim: never both inside");
     println!("transcript:\n{}", result.output);
+    println!("controlled-policy transcript:\n{}", controlled.output);
 }
 ```
 
 This is a human-facing analysis tool. It preserves the raw semantic record instead of scraping arbitrary prose.
+
+The controlled run demonstrates an operational policy; it is not used as the invariant proof. The unbounded finite search still analyzes the full ordinary transition relation. Ending the controlled submission with `select KEY-SAFE .` also makes the Session state explicit for subsequent requests.
 
 ### Step 5: state the machine-classification limit
 
@@ -4358,6 +4530,7 @@ Assert:
 - current module is `KEY-SAFE`;
 - the query returns without diagnostics;
 - the full reviewed search record contains no solution and finite exhaustion, if testing this exact Session presentation;
+- the controlled strategy reaches the intended state without diagnostics and leaves `KEY-SAFE` current;
 - a failed model replacement leaves `KEY-SAFE` executable.
 
 In a typed variant, assert the empty typed solution set and exhausted owner instead of text.
