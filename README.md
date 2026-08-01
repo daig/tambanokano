@@ -1,4 +1,24 @@
-# tambanokano
+<p align="center">
+  <img src="assets/tnk.png" alt="tambanokano" width="220">
+</p>
+
+<h1 align="center">tambanokano</h1>
+
+<p align="center">
+  <strong>TNK</strong> — a Rust runtime for rewriting logic and membership equational logic
+</p>
+
+<p align="center">
+  <a href="docs/book.md">Book</a>
+  ·
+  <a href="docs/manual.md">Reference</a>
+  ·
+  <a href="CHANGELOG.md">Changelog</a>
+  ·
+  <a href="LICENSE">MIT</a>
+</p>
+
+---
 
 tambanokano (TNK) is a Rust runtime for rewriting logic and membership equational logic. It provides a textual source and command surface for its documented feature set, plus reusable kernel, frontend, module, and session APIs.
 
