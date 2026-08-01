@@ -146,6 +146,7 @@ The complete list is [§24, Unsupported and intentionally absent behavior](docs/
 - [Language and System Reference](docs/manual.md) — normative syntax, semantics, APIs, feature states, diagnostics, resource limits, and command catalogue
 - [CHANGELOG](CHANGELOG.md) — release notes
 - [NOTICE](NOTICE) — licensing boundaries and redistributed companion libraries
+- [Developer issue index](docs/development/issues/README.md) — pending decisions, selected engineering work, known gaps, and intended features
 
 ## License
 

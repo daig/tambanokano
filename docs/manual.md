@@ -1506,6 +1506,8 @@ The category table defines semantic ownership; `Eval` does not currently carry a
 
 **TNK-RECOVERY-001 — Current invalid-input behavior.** The tables below record actual workspace-version-`0.1.0` behavior at known malformed, statically invalid, or unsupported input seams. This entire surface is **Experimental, tentative, and in flux**. It is diagnostic documentation, not a supported recovery API: it does not enlarge the accepted grammar, promise that a repaired declaration or retained statement will keep working, or grant compatibility to a missing diagnostic or panic. For the named cases, the tables describe the current implementation even where it deviates from `TNK-DOC-003`, `TNK-DOC-006`, `TNK-STMT-001`, or H.3.
 
+Developer planning is intentionally outside this Reference. This ledger states only the current user-visible diagnostic and state effects; it does not assign implementation priority or promise that an Unsupported or Experimental case will be implemented.
+
 **Practical rule:** submit only well-formed, statically valid, supported TNK input. Do not use skipped tokens, repaired declarations, dropped statements, inert hooks, silent commands, or process failure as a programming technique. Portable programs MUST NOT depend on any behavior in this section. If input satisfies the grammar and static requirements in Parts I–III, these invalid-input seams are avoidable.
 
 Here, **silent** means that `Session::eval` adds no diagnostic text for the named problem. A later recognized item may still produce its ordinary output.
@@ -1537,7 +1539,7 @@ Here, **silent** means that `Session::eval` adds no diagnostic text for the name
 | ordinary unification rejected by low-level unsupported-theory readiness | command echo only; no warning, unifier, `No unifier.`, or completion marker | no unifier stream or continuation is created |
 | `check` whose configured SMT backend returns `BadDag` | command echo only; no backend-answer line | the prior continuation has already been cleared; no satisfiability claim is made |
 
-These rows intentionally expose inconsistencies rather than synthesizing a general recovery principle. They are expected to change when invalid-input handling is made uniform.
+These rows expose current inconsistencies rather than synthesizing a general recovery principle. They are not compatibility guarantees; later releases may replace them with behavior consistent with H.3.
 
 # Appendix I — Rust API map
 
@@ -1636,6 +1638,8 @@ Loaded modules form an explicit runtime capability set:
 Missing optional libraries must produce a load/build/unsupported outcome. They must not silently replace a solver with a positive answer or claim a language feature is active.
 
 # Appendix K — Unsupported, incomplete, and deferred surfaces
+
+This appendix describes current product boundaries, not a development backlog. **Unsupported** and **deferred** do not promise future implementation; developer decisions and work records are maintained separately from this normative Reference.
 
 ### K.1 Explicitly Unsupported
 
