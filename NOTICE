@@ -1,0 +1,64 @@
+tambanokano — multi-license notice
+=================================
+
+This repository is a license aggregate. Do not treat the whole tree as a
+single-license work.
+
+1. tambanokano engine and original materials (MIT)
+-------------------------------------------------
+Unless a subdirectory says otherwise, original tambanokano source code and
+original project materials are licensed under the MIT License. See ./LICENSE.
+
+This includes, without limitation:
+
+  - crates/**                (Rust engine, frontend, session, REPL)
+  - tools/**                 (harness scripts)
+  - share/tnk/**             (tnk-authored Maude facades, e.g. variant-satisfiability)
+  - original project docs and spikes authored for this port
+
+2. Stock Maude library sources (GPLv2 or later)
+----------------------------------------------
+The following directory redistributes Maude interpreter library sources from
+SRI International under the GNU General Public License, version 2 or later:
+
+  share/maude-gpl/
+
+Current files:
+
+  - metaInterpreter.maude
+  - model-checker.maude
+  - smt.maude
+
+Each file retains its original SRI copyright header. The full GPL text is in
+share/maude-gpl/COPYING.
+
+These files are companion libraries loaded at runtime through the ordinary
+Maude `load` / `$MAUDE_LIB` mechanism. They are not compiled into the Rust
+crates and are not relicensed as MIT.
+
+If you redistribute them, you must do so under GPLv2-or-later and preserve
+their notices. You may omit share/maude-gpl entirely; features that `load`
+those libraries will then require an external Maude library install on
+`$MAUDE_LIB` instead.
+
+3. Third-party Rust dependencies
+--------------------------------
+Rust crate dependencies retain their own licenses (see each crate's
+Cargo.toml / crates.io metadata). Notable non-MIT runtime deps include:
+
+  - malachite (LGPL-3.0-only) — arbitrary-precision numbers in tnk-core
+  - optional z3 (its own license) — behind the smt-z3 feature
+
+4. Conformance fixtures
+-----------------------
+conformance/** contains tests and oracles. Some fixtures are transcribed from
+or compared against Maude and may include GPLv2 headers or excerpts for
+differential testing. They are not part of the runtime engine library pack in
+share/maude-gpl/. Treat any file that carries an SRI/GPL header as GPLv2+
+material.
+
+5. External prelude
+-------------------
+The standing `prelude.maude` is not shipped in this repository. Obtain it from
+a Maude install and point `$MAUDE_LIB` at that directory (in addition to
+share/maude-gpl and share/tnk when using the bundled companion libs).

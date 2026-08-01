@@ -35,6 +35,9 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# Companion libs: GPLv2 stock files + MIT tnk facades. External oracle prelude stays last so
+# `prelude.maude` resolves from the Maude install while `load smt` etc. hit the bundled copies.
+TNK_SHARE_LIB=${TNK_SHARE_LIB:-$ROOT/share/maude-gpl:$ROOT/share/tnk}
 ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
 ORACLE_BIN=${ORACLE_BIN:-maude}
 ORACLE_VERSION=${ORACLE_VERSION:-3.5.1}
@@ -164,7 +167,7 @@ else
     tnk_input=$tmpdir/tnk-input.maude
   fi
 fi
-( cd "$fixdir" && MAUDE_LIB="$ROOT:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+( cd "$fixdir" && MAUDE_LIB="$TNK_SHARE_LIB:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
     "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$tnk_input" </dev/null ) \
     >"$tmpdir/tnk.raw" 2>&1
 rc=$?

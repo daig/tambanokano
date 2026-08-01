@@ -1,11 +1,14 @@
-//! Built-in prelude modules, injected into the [`ModuleDb`](crate::db::ModuleDb) on demand.
+//! Built-in modules injected into the [`ModuleDb`](crate::db::ModuleDb) on demand.
 //!
-//! tnk has **no standing prelude** — every module comes from the source file — with ONE exception:
-//! `CONFIGURATION`, the object-system substrate that an `omod` auto-imports (Maude's
-//! `set oo include CONFIGURATION on`, `prelude.maude:3234`). When a module imports `CONFIGURATION`
-//! (directly, or via the `omod` auto-import the surface parser inserts) and the user has **not** defined
-//! it, [`ensure_builtins`] parses this built-in copy into the database so flattening can resolve it. A
+//! tambanokano keeps the engine prelude-free except for one API-compatible substrate:
+//! `CONFIGURATION`, which an `omod` auto-imports (Maude's `set oo include CONFIGURATION on`).
+//! When a module imports `CONFIGURATION` and the user has not defined it,
+//! [`ensure_builtins`] parses this built-in copy so flattening can resolve it. A
 //! user-defined `CONFIGURATION` (as `conformance/objects.maude` declares) is never overridden.
+//!
+//! The source below is an original, MIT-licensed declaration of that public interface
+//! (sorts, operators, and `special` hook names required for object-system interoperability).
+//! It is not a verbatim extract of Maude's `prelude.maude`.
 
 use tnk_frontend::lex::{Interner, tokenize};
 use tnk_frontend::surface::ast::{Import, ModuleExpr};
@@ -13,32 +16,42 @@ use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
 
-/// The object-configuration substrate — **verbatim** from Maude's `prelude.maude:3213-3231` (the
-/// `mod CONFIGURATION` block). Supplies `Oid`/`Cid`/`Object`/`Msg`/`Portal`/`Attribute`/`AttributeSet`,
-/// the object constructor `<_:_|_>` (its `ObjectConstructorSymbol` id-hook + `attributeSetSymbol`
-/// op-hook binding the AttributeSet `_,_`), the configuration soup `__`, the portal `<>`, and `getClass`.
-/// A plain `mod` (not `omod`), so its own `getClass` equation is not subject to object-pattern completion.
-pub const CONFIGURATION_SRC: &str = "\
+/// Object-system configuration substrate used when an `omod` (or an explicit import) needs
+/// `CONFIGURATION` and the session has not already defined it.
+///
+/// Public names and hook identifiers match the Maude object-system interface so stock modules
+/// and differential fixtures remain source-compatible. The module text itself is original to
+/// tambanokano (MIT).
+pub const CONFIGURATION_SRC: &str = r#"
 mod CONFIGURATION is
+  *** Object attributes (ACU set with empty identity).
   sorts Attribute AttributeSet .
   subsort Attribute < AttributeSet .
-  op none : -> AttributeSet  [ctor] .
+  op none : -> AttributeSet [ctor] .
   op _,_ : AttributeSet AttributeSet -> AttributeSet [ctor assoc comm id: none] .
 
+  *** Configuration soup: objects, messages, and the portal.
   sorts Oid Cid Object Msg Portal Configuration .
-  subsort Object Msg Portal < Configuration .
-  op <_:_|_> : Oid Cid AttributeSet -> Object [ctor object
-                                               special (
-                                                 id-hook ObjectConstructorSymbol
-                                                 op-hook attributeSetSymbol (_,_ : AttributeSet AttributeSet ~> AttributeSet))] .
+  subsorts Object Msg Portal < Configuration .
+
+  op <_:_|_> : Oid Cid AttributeSet -> Object
+    [ctor object special (
+      id-hook ObjectConstructorSymbol
+      op-hook attributeSetSymbol (_,_ : AttributeSet AttributeSet ~> AttributeSet))] .
+
   op none : -> Configuration [ctor] .
-  op __ : Configuration Configuration -> Configuration [ctor config assoc comm id: none] .
+  op __ : Configuration Configuration -> Configuration
+    [ctor config assoc comm id: none] .
   op <> : -> Portal [ctor portal] .
 
+  *** Class projection for completed object patterns.
   op getClass : Object -> Cid .
-  eq getClass(< O:Oid : C:Cid | A:AttributeSet >) = C:Cid .
+  var OidVar : Oid .
+  var CidVar : Cid .
+  var Attrs : AttributeSet .
+  eq getClass(< OidVar : CidVar | Attrs >) = CidVar .
 endm
-";
+"#;
 
 /// The built-in module source for `name`, if any. `CONFIGURATION` is the only built-in for now.
 fn builtin_src(name: &str) -> Option<&'static str> {

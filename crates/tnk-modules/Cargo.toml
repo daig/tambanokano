@@ -3,6 +3,7 @@ name = "tnk-modules"
 description = "tambanokano module system: the module database + import flattening (protecting/extending/including, summation, renaming) over the tnk-frontend pipeline"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

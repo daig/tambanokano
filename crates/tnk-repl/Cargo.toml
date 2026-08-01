@@ -3,6 +3,7 @@ name = "tnk-repl"
 description = "tambanokano REPL: an interactive shell over the module system — enter modules, reduce/match, show/select"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]

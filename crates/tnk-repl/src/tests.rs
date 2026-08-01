@@ -3021,10 +3021,13 @@ fn reflected_mixfix_term_map_survives_child_insert_view() {
         "META-LEVEL prelude loads: {}",
         prelude.output
     );
-    let stock = r.eval(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../metaInterpreter.maude"
-    )));
+    let stock = r.eval(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../share/maude-gpl/metaInterpreter.maude"
+        ))
+        .expect("read bundled metaInterpreter.maude"),
+    );
     assert!(
         !stock.exit && !stock.output.contains("error in module"),
         "stock meta-interpreter loads: {}",
@@ -3120,10 +3123,13 @@ fn reflected_term_map_matrix_survives_child_execution() {
         "META-LEVEL prelude loads: {}",
         prelude.output
     );
-    let stock = r.eval(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../metaInterpreter.maude"
-    )));
+    let stock = r.eval(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../share/maude-gpl/metaInterpreter.maude"
+        ))
+        .expect("read bundled metaInterpreter.maude"),
+    );
     assert!(
         !stock.exit && !stock.output.contains("error in module"),
         "stock meta-interpreter loads: {}",

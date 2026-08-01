@@ -7,7 +7,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 fixture=${1:-$ROOT/conformance/subsystems/T11-variant-satisfiability.maude}
 expected=${2:-$ROOT/conformance/subsystems/T11-variant-satisfiability.expected}
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
-ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/Maude/src/Main}
+TNK_SHARE_LIB=${TNK_SHARE_LIB:-$ROOT/share/maude-gpl:$ROOT/share/tnk}
+ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 
 [ -f "$fixture" ] || { echo "error: fixture not found: $fixture" >&2; exit 2; }
@@ -20,7 +21,7 @@ trap 'rm -rf "$tmp"' EXIT
 fixdir=$(cd "$(dirname "$fixture")" && pwd)
 (
   cd "$fixdir" || exit 2
-  MAUDE_LIB="$ROOT:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+  MAUDE_LIB="$TNK_SHARE_LIB:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
     "$TNK_BIN" -no-banner "$fixture" </dev/null
 ) >"$tmp/output" 2>&1
 rc=$?
