@@ -1,4 +1,4 @@
-*** A1e-cross-kind-overload-grouping — COV-002: same-name declarations with different range kinds
+*** A1e-cross-kind-overload-grouping — same-name declarations with different range kinds
 *** stay in distinct kernel symbols. Required result context selects each declaration and its equation.
 
 set show timing off .

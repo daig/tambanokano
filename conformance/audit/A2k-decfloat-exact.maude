@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A2k-decfloat-exact — TNK-007: precision-zero conversion covers denominators beyond u64 and all finite IEEE-754 magnitudes.
+*** Precision-zero decimal conversion covers denominators beyond u64 and all finite IEEE-754 magnitudes.
 set show timing off .
 red in CONVERSION : decFloat(0.1, 0) .
 red in CONVERSION : decFloat(0.00001, 0) .

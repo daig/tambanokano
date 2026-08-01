@@ -1,5 +1,5 @@
-//! Resumable rewriting sessions — `rewrite` (rule-fair) and, from Pillar A-ii, `frewrite`
-//! (position-fair).
+//! Resumable rewriting sessions: rule-fair `rewrite`, position-fair `frewrite`, and object-message-fair
+//! `erewrite`.
 //!
 //! A [`Rewriting`] owns its current term (kept live by a [`RootGuard`]) and the round-robin rule
 //! cursors, borrowing the [`Engine`] only per [`run`](Rewriting::run) call — so the REPL can store it
@@ -17,13 +17,12 @@ use std::collections::HashMap;
 #[derive(Clone, Copy)]
 enum Mode {
     /// `rewrite`: rule-fair — reduce to canonical, then apply the first rule at the top-down-first redex.
-    RuleFair,
+    Rule,
     /// `frewrite`: position-fair — `gas` rule applications per non-frozen position per traversal pass.
-    PositionFair { gas: u64 },
-    /// `erewrite`: object-message-fair — at a `config` soup, deliver queued messages object-by-object
-    /// (Pillar 2.5-B); at any other node, fall back to position-fair. `gas` is the per-position gas for
-    /// the non-config fallback (default 1).
-    ObjectMessageFair { gas: u64 },
+    Position { gas: u64 },
+    /// `erewrite`: at a `config` soup, deliver queued messages object-by-object; at any other node, fall
+    /// back to position-fair rewriting. `gas` is the per-position gas for the non-config fallback.
+    ObjectMessages { gas: u64 },
 }
 
 struct ObjectRunState {
@@ -40,10 +39,8 @@ pub enum ExternalRun {
     },
 }
 
-/// A resumable rewriting session (`rewrite` or `frewrite`). Owns the current term — pinned by a
-/// [`RootGuard`] so it survives GC across the reductions inside [`run`](Self::run) and while stored
-/// between REPL `continue`s — and the per-symbol round-robin rule cursors (Maude's `RuleTable::nextRule`),
-/// persisting across steps so a rewrite sequence cycles fairly through a symbol's rules.
+/// A resumable rewriting session. Owns and roots its current term across reductions and REPL
+/// `continue`s, and persists per-symbol round-robin rule cursors so each sequence cycles fairly.
 pub struct Rewriting {
     current: DagId,
     root: RootGuard,
@@ -57,9 +54,8 @@ pub struct Rewriting {
 }
 
 /// The outcome of one bounded [`Rewriting::run`]: the current term, whether a normal form was reached
-/// (`done`), and whether the term's least sort is known. `sort_known` is always `true` for `rewrite`
-/// (every step ends on a `reduce`); a bounded `frewrite` stop will leave a non-canonical term whose
-/// sort is not computed, so the REPL prints `result (sort not calculated): …` (A-ii).
+/// (`done`), and whether the term's least sort is known. A bounded `frewrite` stop can leave a
+/// non-canonical term whose sort has not been calculated.
 pub struct RewriteStep {
     pub term: DagId,
     pub done: bool,
@@ -74,7 +70,7 @@ impl Rewriting {
             root,
             cursors: HashMap::new(),
             done: false,
-            mode: Mode::RuleFair,
+            mode: Mode::Rule,
             object_run: None,
             next_external_request: 0,
             pending_external: None,
@@ -89,22 +85,22 @@ impl Rewriting {
             root,
             cursors: HashMap::new(),
             done: false,
-            mode: Mode::PositionFair { gas },
+            mode: Mode::Position { gas },
             object_run: None,
             next_external_request: 0,
             pending_external: None,
         }
     }
 
-    /// Construct an object-message-fair (`erewrite`) session rooted at `current` (Pillar 2.5-B), with
-    /// `gas` for the non-config fallback.
+    /// Construct an object-message-fair (`erewrite`) session rooted at `current`, with `gas` for the
+    /// non-config fallback.
     pub(crate) fn new_object_message_fair(root: RootGuard, current: DagId, gas: u64) -> Self {
         Rewriting {
             current,
             root,
             cursors: HashMap::new(),
             done: false,
-            mode: Mode::ObjectMessageFair { gas },
+            mode: Mode::ObjectMessages { gas },
             object_run: None,
             next_external_request: 0,
             pending_external: None,
@@ -122,7 +118,7 @@ impl Rewriting {
     }
     /// Whether this session uses the EXTERNAL object-message scheduler.
     pub fn uses_external_messages(&self) -> bool {
-        matches!(self.mode, Mode::ObjectMessageFair { .. })
+        matches!(self.mode, Mode::ObjectMessages { .. })
     }
 
     /// Run up to `bound` rule applications (`None` = unbounded, to a normal form); `continue m` calls
@@ -132,9 +128,9 @@ impl Rewriting {
             return self.completed_step();
         }
         match self.mode {
-            Mode::RuleFair => self.run_rule_fair(engine, bound),
-            Mode::PositionFair { gas } => self.run_position_fair(engine, bound, gas),
-            Mode::ObjectMessageFair { gas } => {
+            Mode::Rule => self.run_rule_fair(engine, bound),
+            Mode::Position { gas } => self.run_position_fair(engine, bound, gas),
+            Mode::ObjectMessages { gas } => {
                 assert!(
                     self.pending_external.is_none(),
                     "a suspended external request must be resumed explicitly"
@@ -171,7 +167,7 @@ impl Rewriting {
             };
         }
         match self.mode {
-            Mode::ObjectMessageFair { gas } => {
+            Mode::ObjectMessages { gas } => {
                 self.start_object_run(engine, bound, descent);
                 self.drive_object_run(engine, gas, descent, true)
             }
@@ -205,7 +201,7 @@ impl Rewriting {
         });
         engine.resolve_erewrite_external(pass, accepted);
         self.object_run = Some(state);
-        let Mode::ObjectMessageFair { gas } = self.mode else {
+        let Mode::ObjectMessages { gas } = self.mode else {
             unreachable!("only erewrite can suspend externally")
         };
         Some(self.drive_object_run(engine, gas, descent, true))
@@ -219,8 +215,8 @@ impl Rewriting {
         }
     }
 
-    /// `rewrite`: each step reduces `current` to canonical form (equationally — those rewrites count)
-    /// then applies one rule at the top-down-first redex (Maude's `ruleRewrite`).
+    /// `rewrite`: each step reduces `current` to canonical form, counting those equational rewrites,
+    /// then applies one rule at the top-down-first redex.
     fn run_rule_fair(&mut self, engine: &mut Engine, bound: Option<u64>) -> RewriteStep {
         let mut steps = 0u64;
         loop {
@@ -252,10 +248,10 @@ impl Rewriting {
         }
     }
 
-    /// `frewrite`: position-fair. Reduce once, then repeat traversal passes (each gives every non-frozen
-    /// position up to `gas` rule applications, reducing between) until the bound is hit or a pass makes
-    /// no progress (a normal form). A bounded stop leaves a non-canonical term — `sort_known = false`, so
-    /// the REPL prints `result (sort not calculated): …`, exactly as Maude does.
+    /// `frewrite`: position-fair. Reduce once, then repeat traversal passes, giving every non-frozen
+    /// position up to `gas` rule applications with reduction between them, until the bound is hit or a
+    /// pass makes no progress. A bounded stop leaves a non-canonical term with `sort_known = false`;
+    /// the REPL reports it as `result (sort not calculated): …`.
     fn run_position_fair(
         &mut self,
         engine: &mut Engine,
@@ -434,7 +430,7 @@ mod tests {
         engine.set_special(
             meta_hook,
             SpecialOp::Meta {
-                op: MetaOp::Deferred,
+                op: MetaOp::Unknown,
                 hooks: Rc::new(MetaHooks::default()),
             },
         );

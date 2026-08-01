@@ -1,4 +1,4 @@
-*** N-probe-01-vu-narrow-basic — minimal vu-narrow probe: one narrowing rule, bounded and unbounded
+*** N-probe-01-vu-narrow-basic — minimal vu-narrow case: one narrowing rule, bounded and unbounded
 *** searches, =>1 / =>* / =>! arrows, and a no-solution case.
 set show timing off .
 mod COUNT is

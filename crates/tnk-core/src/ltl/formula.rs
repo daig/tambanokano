@@ -1,13 +1,10 @@
-// M1 lands formula descent before M2-M7 consume it; keep the staged module warning-free.
-#![allow(dead_code)]
-
 use crate::dag::{DagId, DagNode};
 use crate::engine::{Engine, Runtime};
 use crate::root::RootGuard;
 use crate::symbol::SymbolId;
 use std::collections::HashMap;
 
-/// The eight symbols attached to Maude's `TemporalSymbol` base class.
+/// The eight temporal-logic operator hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemporalHooks {
     pub true_symbol: SymbolId,
@@ -50,6 +47,7 @@ pub(crate) struct LogicFormula {
 }
 
 impl LogicFormula {
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -139,7 +137,7 @@ impl BuiltFormula {
 }
 
 /// Minimal read-only DAG operations needed by temporal descent. Both implementations are statically
-/// dispatched; this lets M1 tests use `Engine` and later kernel hooks use the active `Runtime`.
+/// dispatched: focused tests use [`Engine`], while production hooks use the active [`Runtime`].
 pub(crate) trait FormulaDag {
     fn formula_node(&self, id: DagId) -> &DagNode;
     fn formula_hash(&self, id: DagId) -> u64;
@@ -423,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn temporal_binary_ops_and_constants_have_reference_flags() {
+    fn temporal_binary_ops_and_constants_set_node_flags() {
         let (mut engine, symbols) = setup();
         let true_dag = engine.make_const(symbols.hooks.true_symbol);
         let false_dag = engine.make_const(symbols.hooks.false_symbol);

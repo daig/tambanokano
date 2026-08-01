@@ -35,6 +35,6 @@ unify in ITER-EXAMPLE :
 
 *** NOTE: manual shows a single unifier here -- the all-EvenNat one -- but Maude 3.5.1
 *** returns the same 4 unifiers as plain unify; they are pairwise incomparable since
-*** OddNat and EvenNat are unrelated sorts, so the manual's shown output appears stale.
+*** OddNat and EvenNat are unrelated sorts, so the manual's shown output is not applicable.
 irredundant unify in ITER-EXAMPLE :
       s^1000000(X:OddNat) =? s^100000000001(Y:Int + Z:Int + W:Int) .

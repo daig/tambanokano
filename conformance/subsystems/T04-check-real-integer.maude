@@ -1,4 +1,4 @@
-*** T04-check-real-integer — mixed integer/real SMT checks lifted from the reference suite (Misc/smtTest.maude)
+*** T04-check-real-integer — mixed integer/real SMT checks
 set show timing off .
 load smt
 

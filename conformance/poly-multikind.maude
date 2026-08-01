@@ -1,12 +1,11 @@
-*** Increment-3 core: poly/Universal expansion over MORE THAN ONE kind. The M0 BOOL stack has a single
+*** Polymorphic Universal expansion over more than one kind. The BOOL stack has a single
 *** kind (Bool), so it only exercises the degenerate 1-instance case; this module adds a second,
 *** unrelated kind (Color) so `_==_` and `if_then_else_fi` each instantiate twice — proving distinct
 *** per-kind instances, correct dispatch, grammar disambiguation, and the `if`-result sort over a
 *** non-Bool kind.
 ***
-*** Oracle: reduce against Maude's BUILT-IN poly `==`/`if_then_else_fi` —
+*** reduce against Maude's BUILT-IN poly `==`/`if_then_else_fi`
 ***   fmod MK is protecting BOOL . sort Color . ops c0 c1 c2 : -> Color [ctor] . endfm
-***   ~/Downloads/Maude-3/maude -no-banner   with   `red in MK : <term> .`
 
 fmod MK is
   sort Bool .

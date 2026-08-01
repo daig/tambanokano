@@ -1,8 +1,7 @@
 //! `tnk-repl` — the terminal adapter over [`tnk_session::Session`].
 //!
-//! Semantic state, command evaluation, loading, reflection caches, and continuations live in
-//! `tnk-session`. This crate owns only terminal-facing policy: color selection and Maude-compatible
-//! output wrapping. The binary adds line editing, history, prompts, banners, and CLI arguments.
+//! Semantic state and command execution live in `tnk-session`; this crate adds color policy and fixed-width
+//! output wrapping. The binary adds line editing, prompts, history, banners, and CLI parsing.
 
 mod wrap;
 
@@ -35,7 +34,7 @@ impl Repl {
         self.session.current()
     }
 
-    /// Evaluate one input submission and apply Maude's terminal output wrapper exactly once.
+    /// Evaluate one submission and wrap terminal output exactly once.
     pub fn eval(&mut self, input: &str) -> Eval {
         let mut result = self.session.eval(input, self.color);
         result.output = wrap::auto_wrap(&result.output);

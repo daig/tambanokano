@@ -1,4 +1,4 @@
-*** U04-assoc-unification — lifted from the reference suite (Misc/assocUnification.maude)
+*** U04-assoc-unification
 *** PRELUDE
 set show timing off .
 

@@ -1,8 +1,7 @@
-*** B3.6 NA theory (atomic constants) + STRING + QID conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/string.maude < /dev/null
+*** NA theory (atomic constants), STRING, and QID conformance
 *** Strings/qids are atomic NA constants (NodeTerm::Na). StringOpSymbol does concat/length/substr/
 *** comparisons; quoted-ids match only themselves (the Na equality arm), tested via EqualitySymbol.
-*** A `Truth`/`Str` naming avoids the prelude's built-in Bool/String. Mirrors the engine.rs B3.6 test.
+*** A `Truth`/`Str` naming avoids the prelude's built-in Bool/String.
 fmod STRB is
   sorts Truth Zero NzNat Nat Str Qid .
   subsorts Zero NzNat < Nat .

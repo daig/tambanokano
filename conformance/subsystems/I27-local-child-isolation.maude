@@ -1,4 +1,4 @@
-*** I27-local-child-isolation — fresh Maude 3.5.1 local-manager probe.
+*** I27-local-child-isolation — local-manager child isolation.
 *** Two children receive different definitions under the same module name.
 *** PRELUDE
 set show timing off .

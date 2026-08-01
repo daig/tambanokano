@@ -1,4 +1,4 @@
-*** B3b-membership-order — TNK-008: memberships use descending component-local sort index; membership order is irrelevant, while edge order may change indices.
+*** Memberships use descending component-local sort index; declaration order is irrelevant.
 set show timing off .
 fmod B3B-MB-ORIGINAL is
   sorts A B D X Y .

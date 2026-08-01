@@ -1,5 +1,5 @@
-*** Operator evaluation-strategy (`strat`) conformance vs the reference binary.
-*** Covers lazy final-top strategies and TNK-001's general instruction stream: intermediate top
+*** Operator evaluation-strategy (`strat`) conformance.
+*** Covers lazy final-top strategies and the general instruction stream: intermediate top
 *** attempts, final-only `owise`, missing final zero normalization, and permutative semi-eagerness.
 
 fmod STRAT is

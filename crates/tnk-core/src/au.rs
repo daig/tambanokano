@@ -7,15 +7,10 @@
 //! sub-sequence can sit anywhere, leaving an ordered **prefix + suffix** residue (vs the ACU theory's
 //! order-free multiset residue) — so the rewrite splice is `prefix ++ rhs ++ suffix`.
 //!
-//! **Strategy (correctness-first, mirrors `acu`).** A complete backtracking enumeration of
-//! `(start, run-lengths)`, yielded **maximal-matched-first**, so a lone (linear) variable absorbs the
-//! whole remainder — Maude's collector strategy: `eq a X = b` on `a c c` gives `b` (X → `c c`), not
-//! `b c`. The simple case (ground subterms + linear variables + identity) takes a pure enumeration in
-//! `match_`; **aliens** (a non-ground subterm under the operator — `s M`, Maude's `NonGroundAlien`) and
-//! **non-linear** variables (`X X`) take a binding-aware backtracking path in `next` (an alien is
-//! matched recursively by its own automaton, which needs `&mut Runtime`). Same ordering convention
-//! throughout (var lengths ascending + a stable maximal-matched-first sort), so the alien binds to the
-//! **leftmost** position first — the order Maude's greedy matcher uses, fixing the reduce count.
+//! Matching backtracks over `(start, run-lengths)` and yields maximal matched spans first, so a lone
+//! linear variable absorbs the remainder. Ground and linear-variable patterns enumerate in `match_`;
+//! aliens and nonlinear variables use the binding-aware path in `next`. Run lengths increase within
+//! each stable maximal-span group, making alien matches leftmost-first.
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
@@ -47,8 +42,7 @@ enum AuElem {
         sort: SortId,
         take_identity: bool,
     },
-    /// An alien (non-ground, or theory-rooted) sub-pattern: matches exactly one subject element
-    /// recursively via its own automaton (Maude's `NonGroundAlien`).
+    /// A non-ground or theory-rooted sub-pattern matched recursively against one subject element.
     Alien(Term),
 }
 
@@ -76,8 +70,8 @@ impl AuLhs {
                         complex = true; // a repeated (non-linear) variable
                     }
                     seen_vars.push(v.index);
-                    // Maude's AU_Term::idPossible: a left identity may fill any position except the
-                    // final one; a right identity may fill any position except the first one.
+                    // A left identity may fill any non-final position; a right identity may fill any
+                    // non-initial position.
                     let take_identity = (left_identity.is_some() && position + 1 < nr_elements)
                         || (right_identity.is_some() && position > 0);
                     elements.push(AuElem::Var {
@@ -175,11 +169,8 @@ impl AuLhs {
         }
 
         let candidates: Vec<Candidate> = if command && ext {
-            // `xmatch` command over an AU node: Maude's FULL matcher (AU_Layer + SequencePartition)
-            // enumerates each matched portion in partition order, filtered by AU_ExtensionInfo::bigEnough
-            // (the matched portion must span >= 2 subject subterms). Fixes the `X Y <=? a b c`
-            // over-enumeration (20 → 10). No maximal-first
-            // re-sort — partition order *is* the reference order.
+            // Command `xmatch` enumerates partition-ordered matched portions spanning at least two
+            // subject elements. Keep partition order rather than applying the maximal-span sort.
             seq_partition_candidates(rt, sig, &seq, &self.elements, 2)
         } else {
             let n = seq.len();
@@ -394,18 +385,14 @@ impl Candidate {
     }
 }
 
-/// Sentinel for an unbounded part length (Maude's `UNBOUNDED`); `uplus` saturates at it.
+/// Sentinel for an unbounded part length; `uplus` saturates at it.
 const UNBOUNDED: i64 = i64::MAX;
 fn uplus(a: i64, b: i64) -> i64 {
     a.saturating_add(b)
 }
 
-/// A faithful port of Maude's `SequencePartition` (`Utility/sequencePartition.{hh,cc}`): enumerate every
-/// way to split `sequence_length` positions among ordered parts, each `[min_length, max_length]`
-/// (`max_length == UNBOUNDED` for a variable part), in Maude's exact order — the leftmost start that can
-/// legally move right is incremented first, so the *last* part's boundary varies slowest. This is the
-/// enumeration order the AU FULL matcher shows for `xmatch`; reproducing it byte-exactly is why we port
-/// the algorithm rather than approximate it.
+/// Enumerate splits of `sequence_length` among ordered bounded parts. The leftmost boundary that can
+/// move right advances first, so the final part varies slowest.
 struct SeqPartition {
     sequence_length: i64,
     parts: Vec<SeqPart>,
@@ -471,7 +458,8 @@ impl SeqPartition {
 
     fn main_solve(&mut self, find_first: bool) -> bool {
         let nr_parts = self.parts.len() as i64;
-        // On find_first we finish from the top (i = nrParts); otherwise from the incremented start.
+        // The first solution starts from the right boundary; later solutions resume from the part
+        // just advanced.
         let mut i: i64 = nr_parts;
         let mut next_start: i64 = self.sequence_length;
         if !find_first {
@@ -501,7 +489,7 @@ impl SeqPartition {
                 return false;
             }
         }
-        // finishPartition: move the starts of parts 0..i-1 to their leftmost legal positions.
+        // Move the starts of parts `0..i` to their leftmost legal positions.
         i -= 1;
         while i >= 0 {
             let sum_prev_min = self.parts[i as usize].sum_prev_min;
@@ -518,13 +506,9 @@ impl SeqPartition {
     }
 }
 
-/// Generate the AU FULL-matcher candidates for an extension `xmatch` in Maude's `SequencePartition`
-/// order, filtered by the `bigEnough` floor. The parts are `[leftExt] ++ elements ++ [rightExt]`, both
-/// extensions unbounded `[0, ∞)`; each variable element is `[0, ∞)` only when its pattern position may
-/// take the identity, otherwise `[1, ∞)`, and each ground is `[1, 1]`. A partition survives when its
-/// matched portion (the span of all `elements`) is at least `floor` subterms and each ground element
-/// structurally matches at its position; variable *sort* checks stay in [`AuSubproblem::next`] (a
-/// rejected candidate is simply skipped, preserving order). `elements` must be the pure path.
+/// Generate extension candidates in partition order. The outer extension parts are unbounded;
+/// identity-capable variables may be empty, other variables consume at least one element, and grounds
+/// consume exactly one. Candidates must meet `floor`; variable sort checks occur during replay.
 fn seq_partition_candidates(
     rt: &Runtime,
     sig: &Signature,
@@ -554,7 +538,7 @@ fn seq_partition_candidates(
         let matched_start = sp.start(1);
         let matched_end = sp.start(m as i64 + 1); // exclusive: start of the right extension
         if matched_end - matched_start < floor {
-            continue; // AU_ExtensionInfo::bigEnough — matched portion too small
+            continue; // matched portion is shorter than the required floor
         }
         let mut lengths = Vec::with_capacity(m);
         let mut ok = true;
@@ -618,11 +602,8 @@ struct AuRecorded {
 }
 
 impl AuSubproblem {
-    /// A **bare variable** matched with extension against an AU node (Maude's
-    /// `AU_DagNode::matchVariableWithExtension`): the single top variable spans a contiguous portion of
-    /// the subject, leaving an ordered prefix/suffix residue. The matched portion must be `bigEnough`
-    /// (>= 2 subterms). Enumerated in `SequencePartition` order (`xmatch X <=? a b c` → `a b`,
-    /// `(whole)`, `b c`).
+    /// Match a bare variable with extension against a contiguous subject portion, leaving ordered
+    /// prefix/suffix residue. The matched portion spans at least two elements and follows partition order.
     pub(crate) fn match_variable_with_extension(
         rt: &Runtime,
         sig: &Signature,
@@ -768,10 +749,8 @@ impl AuSubproblem {
         true
     }
 
-    /// Enumerate every contiguous match (with extension if `ext_allowed`), binding aliens recursively
-    /// and forcing non-linear repeats; var run-lengths ascending then a stable maximal-matched-first
-    /// sort, so the lone variable absorbs the remainder and an alien binds to its leftmost position —
-    /// the order Maude's greedy matcher fixes the reduce count by.
+    /// Enumerate contiguous matches, recursively binding aliens and enforcing nonlinear repeats.
+    /// Stable maximal-span ordering keeps collectors maximal and alien matches leftmost-first.
     fn enumerate_complex(
         &self,
         rt: &mut Runtime,
@@ -805,10 +784,8 @@ impl AuSubproblem {
     ) {
         let n = self.subject.len();
         if elem_idx == self.elements.len() {
-            // Record when the residue rule allows it — and the matched span is non-empty: a zero-width
-            // match (every variable bound to the identity, nothing consumed) is the identity no-op that
-            // would rewrite a term to itself forever. Mirrors the ACU `matched > 0` skip; a ground/alien
-            // always consumes ≥ 1, so this only ever drops the all-identity case.
+            // A zero-width all-identity match would rewrite a term to itself forever, so require a
+            // nonempty matched span. Grounds and aliens always consume at least one element.
             if (self.ext_allowed || pos == n) && pos > start {
                 let binds = self
                     .all_var_indices
@@ -977,8 +954,8 @@ mod tests {
         (e, s, a, b, c, nil, cat)
     }
 
-    /// `match X Y <=? a b c` over `[assoc id: nil]` — the 4 ordered prefix/suffix splits (== reference
-    /// binary), including the two where a variable binds the identity `nil`.
+    /// Two variables over three elements yield four ordered prefix/suffix splits, including identity
+    /// bindings.
     #[test]
     fn au_match_two_vars_four_solutions() {
         let (mut e, s, a, b, c, _nil, cat) = au_ctx();
@@ -1019,8 +996,7 @@ mod tests {
             let x = e.make_const(a);
             e.make_au(cat, vec![x, bc])
         };
-        // Nested same-symbol arguments splice LAZILY (as in make_acu): unreduced nested forms
-        // stay nested at construction; canonical equality holds at the reduce normal-form point.
+        // Nested same-symbol arguments remain nested until reduction establishes canonical equality.
         let abc_left = e.reduce(abc_left);
         let abc_right = e.reduce(abc_right);
         assert!(e.deep_equal(abc_left, abc_right), "(a b) c == a (b c)");
@@ -1047,9 +1023,8 @@ mod tests {
         assert!(!e.deep_equal(ab, ba), "AU is not commutative: a b != b a");
     }
 
-    /// C8: AU **alien** matching — `eq (s M) L = M L` peels successors off the head element. Reducing
-    /// `(s s a) b c` takes **2** rewrites (the alien `s M` binds the head, the lone variable `L` collects
-    /// the rest). Was a panic; the leftmost-alien/maximal-collector order is Maude's greedy order.
+    /// Alien matching peels successors from the head while the lone variable collects the remainder;
+    /// this input therefore takes two rewrites.
     #[test]
     fn au_alien_reduce() {
         use crate::term::Equation;
@@ -1080,8 +1055,8 @@ mod tests {
         assert!(e.deep_equal(r, abc), "(s s a) b c = a b c");
     }
 
-    /// C8: a **non-linear** AU variable — `eq X X = X` collapses an adjacent doubled run, so `a a a`
-    /// reduces to `a` in **2** rewrites. The repeated `X` must re-match the identical run; was a panic.
+    /// A **non-linear** AU variable — `eq X X = X` collapses an adjacent doubled run, so `a a a`
+    /// reduces to `a` in **2** rewrites. The repeated `X` must re-match the identical run.
     #[test]
     fn au_nonlinear_reduce() {
         use crate::term::Equation;

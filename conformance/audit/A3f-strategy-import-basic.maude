@@ -1,4 +1,4 @@
-*** A3f-strategy-import-basic — named strategy imports are visible through every import mode and transitively (TNK-005)
+*** Named strategy imports are visible through every import mode and transitively.
 mod A3F-COMMON is
   sort S .
   ops a b : -> S .

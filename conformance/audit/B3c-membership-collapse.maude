@@ -1,4 +1,4 @@
-*** B3c-membership-collapse — TNK-011: executable memberships whose lhs collapses under a
+*** Executable memberships whose lhs collapses under a
 *** supported identity/idempotence theory are offered at every compatible subject root. This fixture
 *** pins values, least sorts, counts, recursive cross-theory survivors, condition handling, direct/collapse
 *** ordering, identity re-entry, a noncollapse control, downstream sorted matching, and trace identity.

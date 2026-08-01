@@ -1,30 +1,23 @@
-//! Diophantine system solver for AC/ACU matching (Eker 2002, JAR 28(1)).
+//! Diophantine system solver for AC/ACU matching.
 //!
-//! A **close line-for-line port** of Maude's `Utility/diophantineSystem.{hh,cc}`. Given an
-//! `n`-component vector of positive integers `R` (row coefficients = variable multiplicities) and an
-//! `m`-component vector of positive integers `C` (column values = residual subject multiplicities),
+//! Given positive row coefficients `R` (variable multiplicities) and positive column values `C`
+//! (residual subject multiplicities),
 //! a solution is an `n×m` natural-number matrix `M` with `R * M = C` — `M[i,j]` is the number of
 //! copies of subject `j` assigned to variable `i`. Each row's sum is constrained to `[minSize,
 //! maxSize]` (a variable's binding size; the extension row is `[0, extBound]`).
 //!
-//! The **enumeration order is load-bearing**: it fixes the AC solution order, which fixes downstream
-//! `reduce`/`search`/`xmatch` rewrite counts. The algorithm sorts `R` descending by coefficient
-//! (ties broken by ascending `maxSize`), solves one row at a time backtracking, and within a row
-//! tries selections **smallest first** (`multisetSelect` / `multisetComplex`), the last row taking
-//! the remainder. A system is **simple** iff some `R_i == 1` with `maxSize >=` the largest column
-//! value (⇒ any natural number is a linear combination of any final segment of the sorted `R`, ruling
-//! out one cause of dead-ends); otherwise **complex**, keeping a per-row **solubility vector** to
-//! prune infeasible partial solutions early.
+//! Enumeration order is observable. Rows sort by descending coefficient, then ascending maximum size;
+//! the solver backtracks one row at a time and tries selections smallest first. The final row takes
+//! the remainder. Simple systems have a coefficient-one row capable of absorbing the largest column;
+//! complex systems retain a per-row solubility vector to prune infeasible partial solutions.
 //!
-//! This is a pure integer solver — no engine dependency — unit-tested against hand-derived sequences
-//! and the C++ reference (see the tests below).
+//! This is a pure integer solver with no engine dependency.
 
-/// Maude's `UNBOUNDED` sentinel (`macros.hh`: `INT_MAX`) — a stand-in for +infinity on a row's
-/// `maxSize`; [`precompute`](DiophantineSystem::precompute) substitutes the column sum for it.
+/// Sentinel representing an unbounded row `maxSize`; [`precompute`](DiophantineSystem::precompute)
+/// replaces it with the finite column sum for the current problem.
 pub(crate) const UNBOUNDED: i32 = i32::MAX;
 
-/// Maude's `DiophantineSystem::INSOLUBLE` — sentinel in a solubility vector for "no natural-number
-/// assignment exists".
+/// Sentinel in a solubility vector meaning that no natural-number assignment exists.
 const INSOLUBLE: i32 = -1;
 
 /// Per-column selection state within a row: the solution value is `base + extra` (`base` is 0 for
@@ -46,14 +39,14 @@ struct Soluble {
 
 /// One row of the system: a variable's coefficient and size bounds, plus match-time selection state.
 struct Row {
-    name: usize, // original insertion index (the key `solution(row, _)` maps through row_permute)
-    coeff: i32,  // R component (variable multiplicity)
-    min_size: i32, // minimum acceptable row sum
+    name: usize,      // caller insertion index, mapped through row_permute after sorting
+    coeff: i32,       // R component (variable multiplicity)
+    min_size: i32,    // minimum acceptable row sum
     min_product: i32, // coeff * min_size
-    min_leave: i32, // minimum sum that must be left for remaining (later) rows
-    max_size: i32, // maximum acceptable row sum
+    min_leave: i32,   // minimum sum that must be left for remaining (later) rows
+    max_size: i32,    // maximum acceptable row sum
     max_product: i32, // coeff * max_size
-    max_leave: i32, // maximum sum that may be left for remaining rows
+    max_leave: i32,   // maximum sum that may be left for remaining rows
     current_size: i32,
     current_max_size: i32,
     selection: Vec<Select>,
@@ -121,20 +114,13 @@ impl DiophantineSystem {
         }
     }
 
-    // Part of the faithful API surface (Maude's `rowCount`); the no-alien driver tracks the extension
-    // row by its known original index instead, so this is unused until the xmatch extension work.
-    #[allow(dead_code)]
-    pub(crate) fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
     #[cfg(test)]
     pub(crate) fn column_count(&self) -> usize {
         self.columns.len()
     }
 
-    /// `M[row, column]` of the current solution (`solve` must have returned `true`). `row` is the
-    /// **original** insertion index; it is mapped through `row_permute` to the sorted position.
+    /// `M[row, column]` of the current solution. `row` uses caller insertion order and is mapped
+    /// through `row_permute` to the sorted position.
     pub(crate) fn solution(&self, row: usize, column: usize) -> i32 {
         debug_assert!(self.closed && !self.failed, "no current solution");
         let s = &self.rows[self.row_permute[row]].selection[column];
@@ -293,7 +279,7 @@ impl DiophantineSystem {
                             new_max -= 1;
                             k += coeff;
                         }
-                        debug_assert!(new_max >= next_t_min + 1, "bad newMax");
+                        debug_assert!(new_max > next_t_min, "bad newMax");
                         next[ju].max = new_max;
                     }
                 } else {
@@ -556,7 +542,7 @@ impl DiophantineSystem {
                 }
             }
         } else {
-            // The non-selected part's solubility is that of the NEXT row (soluble2 in C++).
+            // The non-selected part uses the next row's solubility vector.
             let done = {
                 let (this_row, next_soluble) = split_row_and_soluble(&mut self.rows, row_nr);
                 Self::multiset_complex(this_row, &mut self.columns, next_soluble, false)
@@ -587,8 +573,8 @@ impl DiophantineSystem {
 
     /// Find a selection from a multiset (complex case): like `multiset_select`, but respecting the
     /// solubility constraints of the non-selected part (`soluble` = the next row's solubility vector).
-    /// A faithful emulation of the C++ `multisetComplex`, whose `backtrack:`/`forwards:` labels + gotos
-    /// become a two-mode state machine sharing `undone` (and re-scanning `j` from 0 on each entry).
+    /// The backtracking and forward scans form a two-mode state machine sharing `undone`; each entry
+    /// scans columns from zero so enumeration stays deterministic.
     fn multiset_complex(
         row: &mut Row,
         bag: &mut [i32],
@@ -684,7 +670,7 @@ impl DiophantineSystem {
     }
 }
 
-/// The two labels of `multisetComplex` (`backtrack:` / `forwards:`), emulated as a state machine.
+/// The backtracking and forward phases of complex-row selection, encoded as a state machine.
 enum Mode {
     Backtrack,
     Forwards,
@@ -697,13 +683,13 @@ fn split_row_and_soluble(rows: &mut [Row], row_nr: usize) -> (&mut Row, &[Solubl
     (&mut left[row_nr], &right[0].soluble)
 }
 
-/// `ceil(a / b)` for `b > 0`, matching Maude's `ceilingDivision` (handles negative `a`).
+/// `ceil(a / b)` for `b > 0`, including negative `a`.
 fn ceiling_division(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
     if a >= 0 { (a + b - 1) / b } else { -((-a) / b) }
 }
 
-/// `floor(a / b)` for `b > 0`, matching Maude's `floorDivision` (handles negative `a`).
+/// `floor(a / b)` for `b > 0`, including negative `a`.
 fn floor_division(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
     if a >= 0 { a / b } else { -(((-a) + b - 1) / b) }
@@ -713,16 +699,15 @@ fn floor_division(a: i32, b: i32) -> i32 {
 mod tests {
     use super::*;
 
-    /// Collect the full solution sequence as a `Vec` of `n×m` matrices (row-major by original row
-    /// index), driving `solve()` to exhaustion.
+    /// Collect every solution as row-major matrices in insertion order.
     fn all_solutions(sys: &mut DiophantineSystem, nr_rows: usize) -> Vec<Vec<Vec<i32>>> {
         let nr_cols = sys.column_count();
         let mut out = Vec::new();
         while sys.solve() {
             let mut m = vec![vec![0; nr_cols]; nr_rows];
-            for r in 0..nr_rows {
-                for c in 0..nr_cols {
-                    m[r][c] = sys.solution(r, c);
+            for (r, row) in m.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    *cell = sys.solution(r, c);
                 }
             }
             out.push(m);
@@ -730,9 +715,8 @@ mod tests {
         out
     }
 
-    /// `X + Y <=? a + b + c`, both variables of size 1..3. Hand-traced from the C++ `solveSimple`
-    /// (see module docs): minimal-X-size first, within a size by ascending column selection. This is
-    /// the load-bearing AC solution order.
+    /// `X + Y <=? a + b + c`, both variables of size 1..3: minimum X size first, then ascending
+    /// column selection within each size. This is the load-bearing AC solution order.
     #[test]
     fn two_vars_three_singletons_sequence() {
         let mut sys = DiophantineSystem::new(2, 3);
@@ -819,9 +803,7 @@ mod tests {
         sys.insert_row(3, 0, 4); // Y coeff 3
         sys.insert_column(12);
         let sols = all_solutions(&mut sys, 2);
-        // solution[row0=X_orig?].  Rows reported by ORIGINAL index: row0=X(coeff2), row1=Y(coeff3).
-        // 2*X + 3*Y = 12.  Enumerated by the sorted-desc-coeff outer loop (Y outer).
-        // Y smallest first: y=0 => x=6; y=2 => x=3; y=4 => x=0.
+        // Caller rows are X then Y; coefficient sorting enumerates Y outside X, smallest first.
         let expected = vec![
             vec![vec![6], vec![0]], // X=6, Y=0
             vec![vec![3], vec![2]], // X=3, Y=2

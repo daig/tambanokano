@@ -1,7 +1,8 @@
-//! Plotkin/PIG-PUG search for one constrained word equation.
+//! PigPug search for one constrained word equation. Each step compares the leading variables and
+//! branches among peeling one side from the other or equating them.
 //!
-//! Port of Maude's `Utility/pigPug*.cc` and `pigPug.hh`. Move order, stack updates,
-//! backtracking, cycle detection, and extraction order are intentionally kept explicit.
+//! Move order, stack updates, backtracking, cycle detection, and extraction order determine the
+//! observable solution order.
 
 use std::collections::{BTreeMap, BTreeSet};
 

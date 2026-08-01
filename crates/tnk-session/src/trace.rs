@@ -1,11 +1,6 @@
-//! The full Maude `trace` renderer: a [`TraceEvent`] stream → Maude's textual trace, gated by
-//! [`TraceFlags`]. The kernel records the structured stream (off by default, zero-cost); this layer
-//! renders it after `reduce` returns, reading the frontend's per-statement source metadata
-//! (`BuiltModule::{eq_traces,mb_traces}`) to print equation/membership bodies and condition fragments.
-//!
-//! Faithfulness is verified byte-for-byte (color off) against the reference binary — see the
-//! `conformance/trace-*.maude` fixtures and the REPL tests. The flag → section mapping mirrors Maude's
-//! `Interpreter::TRACE_*` (`Mixfix/userLevelRewritingContext.cc`, `Mixfix/trial.cc`):
+//! Render structured [`TraceEvent`] streams under [`TraceFlags`]. The kernel records events only while
+//! tracing; this layer uses statement metadata to render equations, rules, memberships, substitutions,
+//! conditions, and whole-term snapshots.
 //!
 //! | flag           | section it gates                                                          |
 //! |----------------|--------------------------------------------------------------------------|
@@ -25,11 +20,10 @@ use tnk_frontend::lex::Interner;
 use tnk_frontend::pretty::{print_pretty, print_term};
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 
-/// Maude's trace line header (`UserLevelRewritingContext::header`): eleven `*` and a space.
+/// Trace-line prefix: eleven `*` characters and a space.
 const HEADER: &str = "*********** ";
 
-/// The granular trace flags — Maude's `Interpreter::TRACE_*` sub-flags, set via `set trace [<option>]
-/// on|off`. `master` is the bare `set trace on|off`; the rest default as Maude does (all on but `whole`).
+/// Granular trace flags controlled by `set trace [<option>] on|off`.
 #[derive(Clone, Copy)]
 pub(crate) struct TraceFlags {
     /// `set trace on|off` — the master switch; when off, nothing is recorded or rendered.
@@ -41,15 +35,14 @@ pub(crate) struct TraceFlags {
     pub condition: bool,
     pub eq: bool,
     pub mb: bool,
-    /// `set trace rls` — whether rule (`rl`/`crl`) steps trace at all (Maude's `TRACE_RL`). Pillar A.
+    /// `set trace rls` — whether rule (`rl`/`crl`) steps are recorded.
     pub rl: bool,
     pub builtin: bool,
 }
 
 impl Default for TraceFlags {
     fn default() -> Self {
-        // Maude defaults (interpreter.hh:137): every section on except `whole`; the master starts off
-        // (`set trace on` turns it on).
+        // All sections except whole-term snapshots start enabled; the master switch starts off.
         TraceFlags {
             master: false,
             body: true,
@@ -66,8 +59,7 @@ impl Default for TraceFlags {
 }
 
 impl TraceFlags {
-    /// Apply `set trace [<option>] on|off`; `args` is the words after `trace`. Returns the error message
-    /// on bad syntax / an unsupported option (rule/strategy/select options are a Phase-2-of-project item).
+    /// Apply `set trace [<option>] on|off`; return an error for malformed syntax or an unsupported flag.
     pub(crate) fn apply(&mut self, args: &[&str]) -> Result<(), String> {
         let (opt, val) = match args {
             [v] => (None, *v),
@@ -100,7 +92,7 @@ impl TraceFlags {
         Ok(())
     }
 
-    /// Whether a statement of `kind` traces at all (Maude's `TRACE_EQ` / `TRACE_MB`).
+    /// Whether statements of this kind are enabled.
     fn stmt_enabled(&self, kind: StmtKind) -> bool {
         match kind {
             StmtKind::Equation => self.eq,
@@ -110,8 +102,7 @@ impl TraceFlags {
     }
 }
 
-/// Render the recorded [`TraceEvent`] stream to Maude's trace text under `flags`. Empty when nothing
-/// traced. The caller has already ensured recording matched `flags.master` (events are empty when off).
+/// Render the recorded events under `flags`; returns empty output when no enabled events exist.
 pub(crate) fn render_trace(
     m: &BuiltModule,
     i: &Interner,
@@ -155,7 +146,7 @@ struct Renderer<'a> {
     flags: TraceFlags,
     color: bool,
     out: String,
-    /// Maude's per-command `trialCount` (reset each reduce): incremented on each *rendered* trial start.
+    /// Per-command trial number, incremented for each rendered trial start.
     trial_counter: u32,
     /// Open (rendered) trial numbers, innermost last — so a `success/failure #N` pairs with its start
     /// across nesting (a condition may contain nested trials).
@@ -167,9 +158,8 @@ impl Renderer<'_> {
     /// stack, and append the rendered text. Only this method mutates `self.out`/`self.trial_*`; the
     /// per-kind helpers below are pure (`&self -> String`), which keeps the borrows simple.
     fn event(&mut self, ev: &TraceEvent) {
-        // `set trace condition off`: events recorded inside a condition (depth > 0) are dropped, mirroring
-        // Maude's `CONDITION_EVAL` sub-context trace flag. Applies uniformly to every event kind, so a
-        // trial's start and end (same depth) are dropped together — the trial stack stays balanced.
+        // Condition-disabled mode drops all events with nonzero condition depth, keeping paired trial events
+        // balanced because both carry the same depth.
         if ev.depth() > 0 && !self.flags.condition {
             return;
         }
@@ -273,7 +263,7 @@ impl Renderer<'_> {
         }
     }
 
-    // ---- equation / built-in rewrites (Maude `tracePreEqRewrite` + `tracePostEqRewrite`) ----
+    // ---- equation and built-in rewrites ----
 
     fn rewrite_eq(
         &self,
@@ -295,15 +285,14 @@ impl Renderer<'_> {
                 s.push_str(&self.substitution(&eqt.var_names, bindings));
             }
         } else {
-            // No statement labels yet, so always the unlabeled form.
+            // Equation trace metadata has no label field, so use the unlabeled form.
             s.push_str("(unlabeled equation)\n");
         }
         s.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
         s
     }
 
-    /// A rule step (Maude `tracePreRuleRewrite` + `tracePostRuleRewrite`): `*********** rule` + the rule
-    /// body + substitution + the `redex ---> result` tail — the rewrite counterpart of [`rewrite_eq`].
+    /// Render a rule body, substitution, and redex/result tail.
     fn rewrite_rule(
         &self,
         rule_id: u32,
@@ -342,8 +331,7 @@ impl Renderer<'_> {
             s.push_str(HEADER);
             s.push_str("equation\n");
         }
-        // The `(built-in equation for symbol …)` line is NOT body-gated (Maude prints it for equation==0
-        // regardless). The symbol is the redex's top symbol's canonical (mixfix) name, e.g. `_+_`.
+        // The built-in equation line is not gated by `body`. Use the redex's canonical top-symbol name.
         let name = self
             .m
             .engine
@@ -383,7 +371,7 @@ impl Renderer<'_> {
         s
     }
 
-    // ---- membership axioms (Maude `tracePreScApplication`) ----
+    // ---- membership axioms ----
 
     fn membership(
         &self,
@@ -407,8 +395,8 @@ impl Renderer<'_> {
         } else {
             s.push_str("(unlabeled membership axiom)\n");
         }
-        // `whole` for a membership is Maude's `Whole:` line; we don't reconstruct it (memberships fire at
-        // node construction, off the reduce frame stack), so it is `None` — documented limitation.
+        // Reduction-time membership events may carry a reconstructed whole-term snapshot; events emitted
+        // during node construction leave it absent.
         if self.flags.whole
             && let Some(w) = whole
         {
@@ -426,7 +414,7 @@ impl Renderer<'_> {
         s
     }
 
-    // ---- conditional sub-stream (Maude `trial.cc`) ----
+    // ---- conditional sub-stream ----
 
     fn trial_start(
         &self,
@@ -646,8 +634,8 @@ impl Renderer<'_> {
         }
     }
 
-    /// `Var --> binding` lines (Maude `printSubstitution`): each variable in index order, `(unbound)` for
-    /// an unbound fresh `:=` variable, or `empty substitution` when the statement has no variables.
+    /// `Var --> binding` lines: each variable in index order, `(unbound)` for an unbound fresh `:=`
+    /// variable, or `empty substitution` when the statement has no variables.
     fn substitution(&self, var_names: &[String], bindings: &[Option<DagId>]) -> String {
         if bindings.is_empty() {
             return "empty substitution\n".to_string();
@@ -663,7 +651,7 @@ impl Renderer<'_> {
         s
     }
 
-    /// Render a runtime DAG node (redex/result/binding/whole) — Maude-faithful, colored per the flag.
+    /// Render a runtime DAG node (redex, result, binding, or whole term) with the command's color policy.
     fn dag(&self, d: DagId) -> String {
         print_pretty(self.m, self.i, d, self.color)
     }

@@ -1,4 +1,4 @@
-*** I25-local-protocol-gaps — fresh Maude 3.5.1 local-manager probe.
+*** I25-local-protocol-gaps — local-manager protocol coverage.
 *** Covers showModule, showView, printTermToString, and frewriteTerm.
 *** PRELUDE
 set show timing off .

@@ -1,4 +1,4 @@
-*** V10-legacy-meta-variant-unify — lifted from the reference suite (Meta/legacyMetaVariantUnify.maude)
+*** Nat-family metaVariantUnify signatures and result indices.
 *** PRELUDE
 set show timing off .
 

@@ -1,4 +1,4 @@
-*** I28-reflected-view-term-maps — COV-003: upView -> insertView preserves rich op-to-term maps.
+*** I28-reflected-view-term-maps — upView -> insertView preserves rich op-to-term maps.
 *** The child executes two inherited NatW-shaped message maps plus structured-sort, kind-qualified,
 *** prefix/mixfix, literal-colon, and same-base/different-sort variable forms.
 *** PRELUDE

@@ -1,28 +1,18 @@
-//! Order-sorted unification core — the solved-form machinery under the `unify` command and the
-//! `metaUnify` descent family ( phase S1).
+//! Order-sorted unification core: the solved-form machinery used by the `unify` command and the
+//! `metaUnify` descent family.
 //!
-//! Ports the reference's layered protocol faithfully, **including enumeration order**:
+//! Unification proceeds in three layers:
 //!
-//! * [`UnifyContext`] — `src/Core/unificationContext.{hh,cc}`: the substitution (slot-indexed,
-//!   originals first, mid-solve fresh variables appended), fresh-variable creation at the kind
-//!   level, and the per-slot `VariableDagNode` tracking used for unsolving and cycle resolution.
-//! * [`PendingStack`] — `src/Core/pendingUnificationStack.{hh,cc}`: pushed multi-solution theory
-//!   problems, solved a whole theory at a time (termination requirement), theory choice by
-//!   `unificationPriority`, checkpoint/restore backtracking, compound-cycle detection, and the
-//!   incompleteness flag.
-//! * [`compute_solved_form`] — `DagNode::computeSolvedForm` dispatch plus the per-theory
-//!   `computeSolvedForm2` arms that resolve deterministically (variables, free, S/iter, and the
-//!   ground backstop); multi-solution theories (C/CUI in [`cui`], AC/ACU in [`acu`], and A/AU in
-//!   [`au`]) push onto the pending stack instead.
+//! * `UnifyContext` owns the slot-indexed substitution, appends fresh variables during solving, and
+//!   tracks variable nodes for unsolving and cycle resolution.
+//! * `PendingStack` owns resumable theory subproblems, checkpoints substitutions for backtracking,
+//!   detects compound cycles, and propagates incompleteness.
+//! * `compute_solved_form` dispatches deterministic variable, free, iteration, and ground cases.
+//!   C/CUI, AC/ACU, and A/AU problems that require enumeration are pushed onto the pending stack.
 //!
-//! Everything takes `&mut Engine` — solving builds nodes and creates per-sort variable symbols in
-//! Maude's demand order (observable through `dag_compare`). Fresh-variable *names* come from the
-//! central [`FreshVariableGenerator`]; their interned codes come from the session's [`NameCodes`]
-//! source, so name-code order matches the reference's token-encounter order.
-
-// Some solved-form accessors are consumed only by the later variant/narrowing drivers; keep the
-// dead-code allowance scoped to this module.
-#![allow(dead_code)]
+//! Solving takes `&mut Engine` because it constructs DAG nodes and creates per-sort variable symbols.
+//! Fresh names come from [`FreshVariableGenerator`], while [`NameCodes`] supplies their process-local
+//! interned codes.
 
 pub(crate) mod acu;
 pub(crate) mod au;
@@ -42,9 +32,8 @@ use crate::symbol::{IdentityId, SymbolId, Theory};
 use crate::term::Term;
 use std::collections::BTreeSet;
 
-/// Maude's deferred `BinarySymbol::hasUnequal{Left,Right}IdentityCollapse` sort check. Returns the
-/// first `(computed result, collapsed argument)` pair whose sorts differ. `identity_on_left` selects
-/// `f(identity, x)` rather than `f(x, identity)`.
+/// Check deferred unequal identity collapse sorts. Return the first `(computed result, collapsed
+/// argument)` pair whose sorts differ. `identity_on_left` selects `f(identity, x)`.
 pub fn unequal_identity_collapse(
     e: &Engine,
     symbol: SymbolId,
@@ -76,17 +65,16 @@ pub fn unequal_identity_collapse(
         })
 }
 
-/// Right-collapse counterpart used by Maude's lazy verbose sort diagnostic. Commutative operators
-/// perform only the left check because the two collapse positions are equivalent.
+/// Check right-side identity collapse for noncommutative symbols. A commutative symbol needs only
+/// the equivalent left-side check.
 pub fn unequal_right_identity_collapse(e: &Engine, symbol: SymbolId) -> Option<(SortId, SortId)> {
     (!e.symbol(symbol).is_commutative())
         .then(|| unequal_identity_collapse(e, symbol, false))
         .flatten()
 }
 
-/// Session name-code source: interns a fresh-variable name (`#1`, `%2`, …) and returns its code —
-/// the same code space user variables' base names were interned into (the frontend's `Interner`),
-/// so variable ordering (`dag_compare` on name codes) mirrors Maude's token-code order.
+/// Intern a generated variable name (`#1`, `%2`, …) in the same code space as input variable names.
+/// The shared code space makes `dag_compare` order all variable names consistently.
 pub trait NameCodes {
     fn code(&mut self, name: &str) -> u32;
 }
@@ -97,25 +85,24 @@ pub struct UnifyEnv<'a> {
     pub names: &'a mut dyn NameCodes,
 }
 
-/// A saved substitution snapshot (`Substitution::clone` in the reference) — restoring may shrink
-/// the slot count, discarding fresh variables created since the snapshot.
+/// A substitution checkpoint. Restoring it may shrink the slot count and discard fresh variables
+/// created after the checkpoint.
 pub(crate) type SavedSubst = Vec<Option<DagId>>;
 
 // ======================================================================================
-// UnifyContext — unificationContext.{hh,cc}
+// Unification context
 // ======================================================================================
 
-/// The unification substitution: slots `0..n_original` are the problem's original layout (including
-/// inactive narrowing gaps), and higher slots are fresh variables created mid-solve (always at the
-/// **kind** level). `None` = unbound or inactive. Mirrors `UnificationContext`.
+/// Slot-indexed bindings. Slots `0..n_original` preserve the problem's input layout, including
+/// inactive narrowing gaps; higher slots hold kind-level fresh variables created while solving.
+/// `None` denotes an unbound or inactive slot.
 pub(crate) struct UnifyContext {
     values: Vec<Option<DagId>>,
     n_original: usize,
     /// Kind error sort of each fresh variable (slot `n_original + i`).
     fresh_sorts: Vec<SortId>,
-    /// The `Var` dag node recorded for each slot bound through [`unification_bind`]
-    /// (`UnificationContext::variableDagNodes`) — needed to unsolve solved forms and to resolve
-    /// compound cycles.
+    /// The `Var` DAG node recorded whenever a slot is bound through [`unification_bind`]. Solvers
+    /// need it to restore equations from solved forms and to resolve compound cycles.
     variable_nodes: Vec<Option<DagId>>,
     family: VariableFamily,
     generator: FreshVariableGenerator,
@@ -147,30 +134,26 @@ impl UnifyContext {
     pub(crate) fn n_original(&self) -> usize {
         self.n_original
     }
-    pub(crate) fn family(&self) -> VariableFamily {
-        self.family
-    }
     pub(crate) fn value(&self, slot: usize) -> Option<DagId> {
         self.values[slot]
     }
-    /// Raw slot write (`Substitution::bind`) — `None` unbinds.
+    /// Write a slot directly; `None` unbinds it.
     pub(crate) fn bind(&mut self, slot: usize, value: Option<DagId>) {
         self.values[slot] = value;
     }
 
-    /// The kind error sort a fresh slot was created at (`getFreshVariableSort`).
+    /// Return the kind error sort at which a fresh slot was created.
     pub(crate) fn fresh_variable_sort(&self, slot: usize) -> SortId {
         self.fresh_sorts[slot - self.n_original]
     }
 
-    /// The tracked `Var` node for `slot`, if it was ever bound (`getVariableDagNode`).
+    /// Return the tracked `Var` node for `slot`, if that slot has ever been bound.
     pub(crate) fn variable_node(&self, slot: usize) -> Option<DagId> {
         self.variable_nodes.get(slot).copied().flatten()
     }
 
-    /// Create a fresh variable at `kind`'s error sort (`UnificationContext::makeFreshVariable`):
-    /// appends an unbound slot, names it `<prefix><n>` from the central generator, and returns its
-    /// `Var` node.
+    /// Create a fresh variable at `kind`'s error sort, append its unbound slot, and assign the next
+    /// generated `<prefix><n>` name.
     pub(crate) fn make_fresh_variable(&mut self, env: &mut UnifyEnv, kind: KindId) -> DagId {
         let sort = env.e.sorts().error_sort(kind);
         let index = self.values.len();
@@ -183,8 +166,8 @@ impl UnifyContext {
         env.e.make_var(sort, code, index as u32)
     }
 
-    /// Bind `variable` (a `Var` node, its own slot) to `value` and record the variable's dag for
-    /// that slot (`unificationBind`).
+    /// Bind `variable` to `value` in the variable's own slot and record its DAG node for later
+    /// unsolving and cycle resolution.
     pub(crate) fn unification_bind(&mut self, e: &Engine, variable: DagId, value: DagId) {
         debug_assert!(variable != value, "variable bound to itself");
         let index = var_index(e, variable).expect("unification_bind on a non-variable") as usize;
@@ -195,13 +178,13 @@ impl UnifyContext {
         self.variable_nodes[index] = Some(variable);
     }
 
-    /// Snapshot the substitution for backtracking (`savedSubstitution.clone(solution)`).
+    /// Snapshot all substitution slots for backtracking.
     pub(crate) fn clone_subst(&self) -> SavedSubst {
         self.values.clone()
     }
 
-    /// Restore from a snapshot (`restoreFromClone`): the slot count may shrink; fresh-variable
-    /// sorts and tracked variable dags accumulated since the snapshot are discarded.
+    /// Restore a checkpoint. The slot count may shrink, discarding fresh sorts and tracked variable
+    /// DAGs created after the checkpoint.
     pub(crate) fn restore_from_clone(&mut self, saved: &SavedSubst) {
         self.values = saved.clone();
         let n = self.values.len();
@@ -211,8 +194,7 @@ impl UnifyContext {
         }
     }
 
-    /// The raw binding slice (`Substitution` values), for `instantiate` and the driver's
-    /// sorted-solution clone.
+    /// Return the raw binding slice used by instantiation and sorted-solution snapshots.
     pub(crate) fn values(&self) -> &[Option<DagId>] {
         &self.values
     }
@@ -229,7 +211,7 @@ impl UnifyContext {
 }
 
 // ======================================================================================
-// Dag helpers over `Var` leaves
+// DAG helpers for `Var` leaves
 // ======================================================================================
 
 /// The substitution slot of a `Var` node, or `None` for any other node.
@@ -240,7 +222,7 @@ pub(crate) fn var_index(e: &Engine, id: DagId) -> Option<u32> {
     }
 }
 
-/// Variable identity (`VariableDagNode::equal`): per-sort symbol + name code.
+/// Variable identity: per-sort symbol plus name code.
 fn var_key(e: &Engine, id: DagId) -> (SymbolId, u32) {
     match &e.node(id).term {
         NodeTerm::Var { symbol, name, .. } => (*symbol, *name),
@@ -248,8 +230,7 @@ fn var_key(e: &Engine, id: DagId) -> (SymbolId, u32) {
     }
 }
 
-/// Follow a variable→variable binding chain to its representative
-/// (`VariableDagNode::lastVariableInChain`).
+/// Follow a variable-to-variable binding chain to its representative.
 pub(crate) fn last_variable_in_chain(e: &Engine, ctx: &UnifyContext, v: DagId) -> DagId {
     let mut v = v;
     loop {
@@ -264,8 +245,7 @@ pub(crate) fn last_variable_in_chain(e: &Engine, ctx: &UnifyContext, v: DagId) -
     }
 }
 
-/// Whether `id` contains no `Var` leaf (`DagNode::isGround` for unification dags — tnk computes
-/// it structurally instead of caching a flag; the walk is over problem-sized terms).
+/// Whether `id` contains no `Var` leaf. This structural walk is bounded by the problem term.
 pub(crate) fn is_ground(e: &Engine, id: DagId) -> bool {
     let mut stack = vec![id];
     while let Some(n) = stack.pop() {
@@ -278,9 +258,8 @@ pub(crate) fn is_ground(e: &Engine, id: DagId) -> bool {
     true
 }
 
-/// Collect the slot indices of every variable occurring in `id` (`DagNode::insertVariables`).
-/// `BTreeSet` mirrors the reference's ascending `NatSet` iteration order — the cycle DFS depends
-/// on it.
+/// Collect the slot indices of every variable occurring in `id`. Ascending `BTreeSet` iteration is
+/// required by the deterministic cycle DFS.
 pub(crate) fn insert_variables(e: &Engine, id: DagId, occurs: &mut BTreeSet<usize>) {
     let mut stack = vec![id];
     while let Some(n) = stack.pop() {
@@ -295,17 +274,16 @@ pub(crate) fn insert_variables(e: &Engine, id: DagId, occurs: &mut BTreeSet<usiz
 
 /// Instantiate `id` under `values`, maintaining canonical theory representations.
 ///
-/// `None` means unchanged. Rebuilding goes through the canonical `make_*` builders, matching
-/// Maude's `DagNode::instantiate(..., true)`.
+/// `None` means unchanged. Changed nodes are rebuilt through canonical `make_*` builders, so their
+/// top-level theory representation is normalized.
 pub fn instantiate(e: &mut Engine, values: &[Option<DagId>], id: DagId) -> Option<DagId> {
     instantiate_inner(e, values, id, true)
 }
 
 /// Instantiate `id` without normalizing a changed node at its top.
 ///
-/// This is Maude's `DagNode::instantiate(..., false)`: inserted AC/AU/CUI/S bindings remain shared
-/// nested children until the resulting term is reduced. Narrowing uses it when instantiating a final
-/// goal by the accumulated substitution.
+/// Inserted AC/AU/CUI/S bindings remain shared nested children until the resulting term is reduced.
+/// Narrowing uses this form when applying the accumulated substitution to a final goal.
 pub(crate) fn instantiate_preserving_representation(
     e: &mut Engine,
     values: &[Option<DagId>],
@@ -430,10 +408,9 @@ fn instantiate_inner(
     }
 }
 
-/// Replace one occurrence selected by a flattened child path and instantiate every sibling without
-/// normalizing its theory representation. Maude's variant/narrowing rebuilds use
-/// `instantiate(..., false)`: a binding headed by the enclosing AC/AU operator stays nested until
-/// ordinary reduction visits the successor. That representation is rewrite-count observable.
+/// Replace the occurrence selected by a flattened child path and instantiate every sibling without
+/// normalizing its theory representation. A binding headed by the enclosing AC/AU operator remains
+/// nested until reduction visits the successor, preserving rewrite-count-observable structure.
 pub(crate) fn replace_and_instantiate_preserving_representation(
     e: &mut Engine,
     dag: DagId,
@@ -571,26 +548,24 @@ pub(crate) fn replace_and_instantiate_preserving_representation(
 }
 
 // ======================================================================================
-// Screening — DagNode::computeBaseSortForGroundSubterms
+// Screening
 // ======================================================================================
 
-/// Result of screening a unificand for unimplemented theories.
+/// Result of screening a unificand for unsupported theories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Screen {
     Ground,
     NonGround,
-    /// A non-ground term sits under a top symbol whose unification theory is unimplemented.
-    Unimplemented,
+    /// A non-ground term occurs below a symbol with no unification algorithm.
+    UnsupportedTheory,
 }
 
-/// The symbol-level unification theory (Maude dispatches on the DagNode class; tnk's node rep for
-/// a one-sided-identity operator is `Free` — the frontend withholds one-sided ids from kernel
-/// collapse — so unification classifies by **symbol**, matching Maude's `CUI_Symbol` coverage).
+/// Classify unification theory by symbol rather than node representation. One-sided-identity
+/// operators use `Free` nodes but require CUI collapse alternatives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnifyTheory {
     Free,
-    /// C / CU / CUl / CUr / U / Ul / Ur (non-associative comm and/or identity and/or idem —
-    /// idem is screened out as unimplemented, like the reference).
+    /// C / CU / CUl / CUr / U / Ul / Ur. Idempotent symbols are rejected during screening.
     Cui,
     Acu,
     Au,
@@ -614,10 +589,9 @@ pub(crate) fn unify_theory(e: &Engine, symbol: SymbolId) -> UnifyTheory {
     }
 }
 
-/// Whether `symbol`'s unification theory is unimplemented (the
-/// `computeBaseSortForGroundSubterms` backstop set): CUI with `idem`, or associative with a
-/// one-sided identity.
-fn unimplemented_theory(e: &Engine, symbol: SymbolId) -> bool {
+/// Whether `symbol` has no unification algorithm: CUI with `idem`, or associative with a one-sided
+/// identity.
+fn unsupported_theory(e: &Engine, symbol: SymbolId) -> bool {
     let sym = e.symbol(symbol);
     match sym.theory() {
         Theory::Cui => sym.axioms.idem,
@@ -626,9 +600,8 @@ fn unimplemented_theory(e: &Engine, symbol: SymbolId) -> bool {
     }
 }
 
-/// Screen a unificand (`computeBaseSortForGroundSubterms(true)`): find non-ground terms under
-/// unimplemented-theory tops. `warned` collects each offending node in the reference's warning
-/// order (a node warns after its children's screening, once per node).
+/// Screen a unificand for non-ground terms below unsupported-theory symbols. `warned` collects each
+/// offending node in warning order: a node follows its children and appears once.
 pub fn screen_for_unification(e: &Engine, id: DagId, warned: &mut Vec<DagId>) -> Screen {
     match &e.node(id).term {
         NodeTerm::Var { .. } => Screen::NonGround,
@@ -636,9 +609,8 @@ pub fn screen_for_unification(e: &Engine, id: DagId, warned: &mut Vec<DagId>) ->
         term => {
             let symbol = e.node(id).symbol();
             let children: Vec<DagId> = e.node(id).children().collect();
-            // ACU children carry multiplicities; screening each distinct element once matches the
-            // reference (it walks the pair array). The repeat-expanded walk is equivalent here
-            // because screening is idempotent per subterm.
+            // ACU children may repeat according to multiplicity. Screening is idempotent per
+            // subterm, so repeated visits do not affect classification or warning order.
             let _ = term;
             let mut result = Screen::Ground;
             let mut warn_here = false;
@@ -651,12 +623,12 @@ pub fn screen_for_unification(e: &Engine, id: DagId, warned: &mut Vec<DagId>) ->
                     warn_here = true;
                 }
             }
-            if unimplemented_theory(e, symbol) {
+            if unsupported_theory(e, symbol) {
                 if warn_here {
                     warned.push(id);
-                    return Screen::Unimplemented;
+                    return Screen::UnsupportedTheory;
                 }
-                return result; // ground under an unimplemented top is fine
+                return result; // ground terms are valid below an unsupported unification symbol
             }
             result
         }
@@ -664,19 +636,19 @@ pub fn screen_for_unification(e: &Engine, id: DagId, warned: &mut Vec<DagId>) ->
 }
 
 // ======================================================================================
-// PendingStack — pendingUnificationStack.{hh,cc}
+// Pending theory stack
 // ======================================================================================
 
-/// `Symbol::unificationPriority` — governs which theory's problems are solved first, hence the
-/// enumeration order of unifiers. Disjunctions (controlling symbol `None`) always win; then the
-/// lowest number: CUI `comm + 2*(leftId + rightId)` (1–5), AC 10, ACU 20, everything else 100.
+/// Return the theory-solving priority that determines unifier enumeration order. Disjunctions are
+/// handled separately before real theories; lower values win: CUI
+/// `comm + 2*(has_left_identity + has_right_identity)` (1–5), AC 10, ACU 20, others 100.
 fn unification_priority(e: &Engine, symbol: SymbolId) -> i32 {
     let sym = e.symbol(symbol);
     match sym.theory() {
         Theory::Acu => 10 + 10 * i32::from(sym.identity().is_some()),
         Theory::Cui | Theory::Free => {
             if sym.axioms.idem {
-                100 // unimplemented
+                100 // unsupported
             } else {
                 i32::from(sym.axioms.comm)
                     + 2 * (i32::from(sym.left_identity().is_some())
@@ -687,8 +659,8 @@ fn unification_priority(e: &Engine, symbol: SymbolId) -> i32 {
     }
 }
 
-/// `Symbol::canResolveTheoryClash` — whether this theory can make its top disappear by collapse:
-/// AC/ACU and A/AU with an identity; the CUI family with a left or right identity.
+/// Whether a theory can remove its top by identity collapse: identity-bearing ACU/AU and CUI with
+/// a left or right identity.
 pub(crate) fn can_resolve_theory_clash(e: &Engine, symbol: SymbolId) -> bool {
     let sym = e.symbol(symbol);
     match sym.theory() {
@@ -728,7 +700,7 @@ struct ActiveSubproblem {
     sp: Option<UnifySubproblem>,
 }
 
-/// A checkpoint marker (`PendingUnificationStack::Marker`).
+/// Index of a pending-stack checkpoint.
 pub(crate) type Marker = usize;
 
 pub(crate) struct PendingStack {
@@ -763,8 +735,8 @@ impl PendingStack {
         }
     }
 
-    /// Push a multi-solution problem under `controlling` (`None` = disjunction). LIFO within a
-    /// theory via the intrusive `next_in_theory` list, exactly like the reference.
+    /// Push a multi-solution problem under `controlling` (`None` denotes a disjunction). Problems
+    /// are LIFO within each theory through the intrusive `next_in_theory` list.
     pub(crate) fn push(
         &mut self,
         controlling: Option<SymbolId>,
@@ -800,9 +772,8 @@ impl PendingStack {
         });
     }
 
-    /// `resolveTheoryClash`: neither side's theory owns `lhs =? rhs`. If only one side can
-    /// collapse away its top, it controls (marked); if both can, push a disjunction; if neither,
-    /// fail.
+    /// Resolve an equation whose sides have different theories. A sole collapsible side controls a
+    /// marked problem; two collapsible sides form a disjunction; two noncollapsible sides fail.
     pub(crate) fn resolve_theory_clash(&mut self, e: &Engine, lhs: DagId, rhs: DagId) -> bool {
         let (mut lhs, mut rhs) = (lhs, rhs);
         let mut controlling = Some(e.node(lhs).symbol());
@@ -826,7 +797,7 @@ impl PendingStack {
         self.stack.len()
     }
 
-    /// Blow away every problem pushed at or after `mark`, relinking theory lists.
+    /// Remove every problem pushed at or after `mark` and relink the theory lists.
     pub(crate) fn restore(&mut self, mark: Marker) {
         for i in (mark..self.stack.len()).rev() {
             let p = &self.stack[i];
@@ -840,8 +811,8 @@ impl PendingStack {
         self.stack.truncate(mark);
     }
 
-    /// Flag `symbol`'s theory as possibly incomplete (the A/AU depth bound). The warning *text*
-    /// stays with the driver (phase E); the flag itself is part of the result protocol.
+    /// Flag `symbol`'s theory as possibly incomplete because the A/AU solver reached its depth bound.
+    /// The driver owns user-facing diagnostics; the flag is part of the result protocol.
     pub(crate) fn flag_as_incomplete(&mut self, symbol: SymbolId) {
         self.incomplete.insert(symbol);
     }
@@ -850,9 +821,8 @@ impl PendingStack {
         !self.incomplete.is_empty()
     }
 
-    /// The master loop (`PendingUnificationStack::solve`): drive the top subproblem; on success
-    /// activate the next theory (all of its pending problems at once); on failure kill the top
-    /// and backtrack into the one below.
+    /// Drive the active subproblem. On success, activate the next theory and all of its pending
+    /// problems; on failure, remove it and backtrack into the preceding subproblem.
     pub(crate) fn solve(
         &mut self,
         env: &mut UnifyEnv,
@@ -886,8 +856,7 @@ impl PendingStack {
         find_first
     }
 
-    /// `chooseTheoryToSolve`: disjunctions first, else the lowest `unificationPriority` with
-    /// unsolved problems.
+    /// Choose disjunctions first, then the unsolved theory with the lowest priority.
     fn choose_theory_to_solve(&self, e: &Engine) -> Option<usize> {
         let mut best: Option<(i32, usize)> = None;
         for (i, t) in self.theory_table.iter().enumerate() {
@@ -904,10 +873,9 @@ impl PendingStack {
         best.map(|(_, i)| i)
     }
 
-    /// `makeNewSubproblem`: activate the chosen theory's whole pending set as one subproblem; when
-    /// no theory has problems, run the compound-cycle check and — if acyclic — instantiate all
-    /// bindings in a safe order (the solved form is complete). Returns whether a new subproblem
-    /// was pushed.
+    /// Activate the chosen theory's pending set as one subproblem. Once no theory problem remains,
+    /// reject compound cycles or instantiate all bindings in dependency order. Returns whether a
+    /// new subproblem was pushed.
     fn make_new_subproblem(&mut self, env: &mut UnifyEnv, ctx: &mut UnifyContext) -> bool {
         if let Some(i) = self.choose_theory_to_solve(env.e) {
             let controlling = self.theory_table[i].controlling;
@@ -977,7 +945,7 @@ impl PendingStack {
         }
     }
 
-    /// `killTopSubproblem`: pop and relink its problems back as unsolved.
+    /// Pop the active subproblem and relink its problems as unsolved.
     fn kill_top_subproblem(&mut self) {
         let a = self
             .subproblems
@@ -992,8 +960,8 @@ impl PendingStack {
         }
     }
 
-    /// `findCycle`: DFS from each original variable over binding occurrences; returns a variable
-    /// on a dependency cycle, or fills `variable_order` with a safe instantiation order.
+    /// Search binding dependencies from each input variable. Return a variable on a cycle, or fill
+    /// `variable_order` with a safe instantiation order.
     fn find_cycle(&mut self, e: &Engine, ctx: &UnifyContext) -> Option<usize> {
         let n = ctx.n_slots();
         self.variable_status.clear();
@@ -1042,7 +1010,7 @@ impl PendingStack {
     }
 }
 
-/// `Symbol::makeUnificationSubproblem` — one subproblem per controlling theory.
+/// Construct the solver state for one controlling theory.
 fn make_unification_subproblem(e: &Engine, symbol: SymbolId) -> UnifySubproblem {
     match unify_theory(e, symbol) {
         UnifyTheory::Cui => {
@@ -1061,10 +1029,10 @@ fn make_unification_subproblem(e: &Engine, symbol: SymbolId) -> UnifySubproblem 
     }
 }
 
-// ======================================================================================
-// Subproblems: closed enum (D3 house style)
-// ======================================================================================
+// Residual unification subproblems.
 
+// Solvers stay inline in the pending stack to avoid one allocation per theory subproblem.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum UnifySubproblem {
     Disjunction(DisjunctionSubproblem),
     CompoundCycle(CompoundCycleSubproblem),
@@ -1130,7 +1098,7 @@ impl UnifySubproblem {
 }
 
 // --------------------------------------------------------------------------------------
-// UnificationSubproblemDisjunction — unificationSubproblemDisjunction.cc
+// Disjunction subproblem
 // --------------------------------------------------------------------------------------
 
 /// A theory clash both sides might resolve: try lhs-controlling for every problem, then on
@@ -1196,12 +1164,12 @@ impl DisjunctionSubproblem {
 }
 
 // --------------------------------------------------------------------------------------
-// CompoundCycleSubproblem — compoundCycleSubproblem.cc
+// Compound-cycle subproblem
 // --------------------------------------------------------------------------------------
 
-/// Break a cross-theory dependency cycle. Phase 1 collapses a non-variable edge through an
-/// identity-bearing top symbol; phase 2 solves a cyclic identity against the next cycle variable.
-/// The latter is required when identities are compound terms that recursively contain the operator.
+/// Break a cross-theory dependency cycle by collapsing a non-variable edge through an identity-bearing
+/// top symbol, then solving a cyclic identity against the next cycle variable. The second step handles
+/// compound identities that recursively contain the operator.
 fn binary_identity(e: &Engine, symbol: SymbolId) -> Option<IdentityId> {
     let sym = e.symbol(symbol);
     (sym.decls().first()?.domain.len() == 2)
@@ -1323,11 +1291,10 @@ impl CompoundCycleSubproblem {
 }
 
 // ======================================================================================
-// computeSolvedForm — dagNode.cc dispatch + the deterministic theory arms
+// Solved-form dispatch and deterministic theory arms
 // ======================================================================================
 
-/// `DagNode::computeSolvedForm`: dispatch to the non-ground side's theory; two ground terms just
-/// compare equal.
+/// Dispatch to the non-ground side's theory; two ground terms succeed only when equal.
 pub(crate) fn compute_solved_form(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -1344,9 +1311,8 @@ pub(crate) fn compute_solved_form(
     env.e.deep_equal(lhs, rhs)
 }
 
-/// The per-theory `computeSolvedForm2` — `lhs` is non-ground. Dispatch mirrors the reference's
-/// virtual dispatch on the dag class, with the symbol-level correction for one-sided-identity
-/// operators (Free node rep, CUI unification theory).
+/// Dispatch a non-ground `lhs` to its symbol's unification theory. One-sided-identity operators use
+/// `Free` nodes but dispatch to the CUI solver.
 pub(crate) fn compute_solved_form2(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -1358,9 +1324,8 @@ pub(crate) fn compute_solved_form2(
         NodeTerm::Var { .. } => variable_solved_form2(env, lhs, rhs, ctx, pending),
         NodeTerm::S { .. } => s_solved_form2(env, lhs, rhs, ctx, pending),
         NodeTerm::Acu { .. } | NodeTerm::Au { .. } => {
-            // Same-symbol problems and variable rhs both become pending problems, solved a whole
-            // theory at a time (ACU_DagNode::computeSolvedForm2 shape; AU identical). Unreachable
-            // until S1c lifts the screening, but written to the reference shape.
+            // Same-symbol equations and variable right sides become pending problems so the entire
+            // ACU/AU theory batch is solved together.
             let symbol = env.e.node(lhs).symbol();
             if symbol == env.e.node(rhs).symbol() {
                 pending.push(Some(symbol), lhs, rhs, false);
@@ -1387,9 +1352,8 @@ pub(crate) fn compute_solved_form2(
                 free_solved_form2(env, lhs, rhs, ctx, pending)
             }
         }
-        // The backstop (dagNode.cc `computeSolvedForm2`): only reachable with a ground lhs —
-        // non-ground unimplemented tops were screened out — so the sole live case is
-        // `<ground> =? X`.
+        // The backstop is reachable only with a ground lhs because unsupported non-ground tops were
+        // screened out; the sole live case is `<ground> =? X`.
         NodeTerm::Na { .. } => backstop_solved_form2(env, lhs, rhs, ctx, pending),
     }
 }
@@ -1402,9 +1366,7 @@ enum VarRep {
 }
 
 fn as_variable_rep(e: &Engine, ctx: &UnifyContext, rhs: DagId) -> Option<VarRep> {
-    if var_index(e, rhs).is_none() {
-        return None;
-    }
+    var_index(e, rhs)?;
     let rep = last_variable_in_chain(e, ctx, rhs);
     let index = var_index(e, rep).unwrap() as usize;
     Some(match ctx.value(index) {
@@ -1413,8 +1375,7 @@ fn as_variable_rep(e: &Engine, ctx: &UnifyContext, rhs: DagId) -> Option<VarRep>
     })
 }
 
-/// `DagNode::computeSolvedForm2` backstop: `<ground> =? X` binds X's representative to the ground
-/// term (unpurified).
+/// Bind a free right-side variable representative to a ground `lhs` without purification.
 fn backstop_solved_form2(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -1438,7 +1399,7 @@ fn backstop_solved_form2(
 }
 
 // --------------------------------------------------------------------------------------
-// Variable theory — variableDagNode.cc
+// Variable theory
 // --------------------------------------------------------------------------------------
 
 fn variable_solved_form2(
@@ -1478,8 +1439,8 @@ fn variable_solved_form2(
     compute_solved_form2(env, rhs, lhs, ctx, pending)
 }
 
-/// `VariableDagNode::safeVirtualReplacement`: bind `old_var |-> new_var`, then resolve the
-/// implicit occurs-check problem if `new_var`'s existing binding contains `old_var`.
+/// Bind `old_var` to `new_var`, then resolve the implicit occurs-check problem if `new_var` already
+/// has a binding that contains `old_var`.
 fn safe_virtual_replacement(
     env: &mut UnifyEnv,
     old_var: DagId,
@@ -1513,7 +1474,7 @@ fn safe_virtual_replacement(
 }
 
 // --------------------------------------------------------------------------------------
-// Free theory — freeDagNode.cc
+// Free theory
 // --------------------------------------------------------------------------------------
 
 fn free_args(e: &Engine, id: DagId) -> Vec<DagId> {
@@ -1566,11 +1527,10 @@ enum Purification {
     Purified(DagId),
 }
 
-/// `FreeDagNode::purifyAndOccurCheck`: occurs-check `rep_var` through the free skeleton and
-/// variable-abstract alien (non-free, non-variable) subterms. Ground subterms may stay impure
-/// (they can't take part in cycles). Note the reference's asymmetry, preserved here: an alien met
-/// *before* any rebuild started is solved against its abstraction variable (it may be impure —
-/// binding directly could loop); an alien met *after* the rebuild started is bound directly.
+/// Occurs-check `rep_var` through the free skeleton and abstract alien subterms that are neither
+/// free applications nor variables. Ground subterms need no purification. Before rebuilding starts,
+/// solve an alien against its abstraction because direct binding could create a loop; after the
+/// first replacement, remaining aliens bind directly.
 fn purify_and_occur_check(
     env: &mut UnifyEnv,
     this: DagId,
@@ -1619,14 +1579,14 @@ fn purify_and_occur_check(
     Purification::PureAsIs
 }
 
-/// The kind of `s`'s `i`-th argument position (Maude's `Symbol::domainComponent`).
+/// Return the kind of argument position `i` for symbol `s`.
 fn domain_kind(e: &Engine, s: SymbolId, i: usize) -> KindId {
     e.sorts().kind_of(e.symbol(s).decls[0].domain[i])
 }
 
-/// The rebuild tail of `purifyAndOccurCheck`: argument `i` was replaced by `replacement`; process
-/// the remaining arguments (aliens now bound **directly** — the reference's second loop is
-/// deliberately asymmetric to the first) and rebuild.
+/// Complete a partially purified rebuild after replacing argument `i`. Remaining alien arguments
+/// bind directly to their abstractions before rebuilding the application.
+#[allow(clippy::too_many_arguments)]
 fn finish_purified(
     env: &mut UnifyEnv,
     s: SymbolId,
@@ -1672,7 +1632,7 @@ fn is_free_theory_node(e: &Engine, id: DagId) -> bool {
 }
 
 // --------------------------------------------------------------------------------------
-// S theory — S_DagNode.cc
+// Compact-iteration theory
 // --------------------------------------------------------------------------------------
 
 fn s_parts(e: &Engine, id: DagId) -> (SymbolId, Nat, DagId) {
@@ -1745,8 +1705,7 @@ mod tests {
     use crate::symbol::{IdentitySide, SymbolClass};
     use std::collections::HashMap;
 
-    /// A test name-code source: interns any name into a dense code space (the frontend's `Interner`
-    /// role). User-variable base names and fresh `#n` names share the space, as in the real session.
+    /// Intern every test variable name into one dense code space shared by input and generated names.
     #[derive(Default)]
     struct TestNames {
         map: HashMap<String, u32>,
@@ -1764,9 +1723,8 @@ mod tests {
         }
     }
 
-    /// Drive a full unsorted-solved-form enumeration (the pre-order-sorted driver skeleton): solve
-    /// each equation into one context, then stream solved forms via `pending.solve`. Returns one
-    /// snapshot of the ORIGINAL-variable bindings per solved form (empty if there is no unifier).
+    /// Enumerate unsorted solved forms by solving every equation in one context and then resuming the
+    /// pending stack. Each result contains the input-variable bindings; no unifier yields an empty set.
     fn all_solved_forms(
         env: &mut UnifyEnv,
         n_original: usize,
@@ -1924,10 +1882,8 @@ mod tests {
         let _ = x;
     }
 
-    /// CUI with a one-sided `left id:` — the U-ch13-10 shape. The operator is a **Free** node in
-    /// tnk (identity withheld from the kernel) but a CUI-unification-theory symbol, so this also
-    /// exercises the generic (Free-node) CUI arg/rebuild path. Two unsorted solved forms, matching
-    /// the reference's two unifiers (one via the free decomposition, one via the id collapse).
+    /// A one-sided-left-identity operator uses a positional `Free` node but dispatches to CUI
+    /// unification. This equation has two solved forms: free decomposition and identity collapse.
     #[test]
     fn cui_left_id_enumerates_two_forms() {
         let mut e = Engine::new();
@@ -1935,11 +1891,12 @@ mod tests {
         let elem = e.add_sort("Elem");
         e.add_subsort(elem, magma);
         e.close_sorts();
-        // op __ : Magma Magma -> Magma  (one-sided left id: e) — Free node rep in tnk.
+        // A one-sided left identity keeps the operator in the positional `Free` representation.
         let junc = e.add_op("__", vec![magma, magma], magma);
         let ec = e.add_op("e", vec![], elem);
         let ac = e.add_op("a", vec![], elem);
-        e.set_one_sided_identity(junc, IdentitySide::Left, ec);
+        e.reserve_one_sided_identity(junc, IdentitySide::Left, magma);
+        e.set_one_sided_identity_term(junc, Term::constant(ec));
         // Screening treats it as a CUI-unification symbol; sanity-check the classification.
         assert_eq!(unify_theory(&e, junc), UnifyTheory::Cui);
         let _ = SymbolClass::Standard;

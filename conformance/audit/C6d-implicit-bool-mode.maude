@@ -1,5 +1,5 @@
 *** PRELUDE
-*** C6d-implicit-bool-mode — TNK-009: implicit BOOL uses including mode in every module kind and reflection view.
+*** Implicit BOOL uses including mode in every module kind and reflected view.
 set show timing off .
 fmod C6D-FM is
   sort FS .

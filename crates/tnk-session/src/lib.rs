@@ -1,11 +1,9 @@
-//! `tnk-session` — reusable, host-owned Maude evaluation state.
+//! Reusable, host-owned TNK evaluation state.
 //!
-//! [`Session`] owns the persistent semantic state: it holds the persistent interner, the module database, the
-//! built (flattened) modules, and the current module, and turns one input submission into output via
-//! [`Session::eval`]. The `tnk-repl` crate is a thin terminal adapter that buffers
-//! multi-line input ([`Session::input_complete`]) and applies terminal wrapping to `eval`'s output. Everything below the dispatch
-//! is reused as-is: flatten + build (`tnk-modules`/`tnk-frontend`), `reduce_command`/`match_command`/
-//! `format_matchers`, and the pretty-printer.
+//! [`Session`] owns the persistent interner, module database, built modules, current module, and
+//! resumable command state. [`Session::eval`] evaluates one submission. The `tnk-repl` crate buffers
+//! multiline input through [`Session::input_complete`] and applies terminal wrapping to returned text.
+//! Evaluation is synchronous; an executing reduction or search has no cooperative cancellation token.
 
 mod interpreter;
 mod trace;
@@ -19,11 +17,11 @@ use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtResult};
 use tnk_frontend::build_term::VarIndex;
 use tnk_frontend::lex::{Interner, TokKind, Token, tokenize};
 use tnk_frontend::load::{
-    InternerNames, LoadedModule, ParsedCommandTerm, build_command_dag, build_logic_command_dag,
-    command_echo, command_variable_display_name, erewrite_command, format_matchers,
-    frewrite_command, match_command, maude_variable_name_rank, narrow_command, parse_command_term,
-    render_unifier, rewrite_command, search_command, smt_search_command, unify_command,
-    variant_command, variant_match_command, variant_unify_command,
+    InternerNames, LoadedModule, ParsedCommandTerm, UnifyReadiness, build_command_dag,
+    build_logic_command_dag, command_echo, command_variable_display_name, erewrite_command,
+    format_matchers, frewrite_command, match_command, maude_variable_name_rank, narrow_command,
+    parse_command_term, render_unifier, rewrite_command, search_command, smt_search_command,
+    unify_command, variant_command, variant_match_command, variant_unify_command,
 };
 use tnk_frontend::pretty::{print_pretty, print_pretty_with_variables};
 use tnk_frontend::sig::build_sig::canonical_name;
@@ -53,21 +51,18 @@ pub struct Session {
     db: ModuleDb,
     /// Flattened + built modules, keyed by name.
     modules: HashMap<String, LoadedModule>,
-    /// Validated view definitions (B-ii), keyed by name.
+    /// Validated view definitions, keyed by name.
     views: ViewDb,
-    /// Reflection-core search state retained across commands, including Maude's metalevel
-    /// variant-unification cache.
+    /// Reflection search state retained across commands, including variant-unification cursors.
     meta_state: MetaState,
-    /// The direct dependency set of every defined module **and** view, keyed by name (a module/view name →
-    /// the module/view names its flatten closure references directly). Maintained on every (re)definition
-    /// so that redefining a name can re-flatten its transitive dependents (A4c): a redefinition of `M`
-    /// leaves the *cached* build of an importer `N` referring to the old `M`, so we rebuild the importers.
+    /// Direct dependencies for each module and view. Redefinition triggers rebuilding every transitive
+    /// dependent so cached flattened modules cannot retain a replaced definition.
     deps: HashMap<String, HashSet<String>>,
     /// Module names in entry order (for `show modules`).
     order: Vec<String>,
     /// View names in entry order (for `show views`).
     view_order: Vec<String>,
-    /// The current module commands run against (Maude's selected module).
+    /// Module selected for unqualified commands.
     current: Option<String>,
     /// Per-call rendering choice supplied by the host; the Session does not choose terminal policy.
     render_color: bool,
@@ -75,16 +70,14 @@ pub struct Session {
     trace: TraceFlags,
     /// The last resumable session (`rewrite`/`frewrite` or `search`) and the module name it ran in, for
     /// `continue` (and `show path`/`show search graph`). A new execution command normally replaces or
-    /// clears it; a strategy rejected before execution retains the previous continuation. It stays valid
+    /// clears it; a strategy rejected before execution retains the saved continuation. It stays valid
     /// between commands because in-reduction GC is off, so the session's terms are never collected.
     last: Option<(String, Continuation)>,
-    /// Pending `stdin` for `erewrite`'s `getLine` (Pillar 2.5-C). Set via [`set_stdin`](Self::set_stdin)
-    /// (tests / piped input); moved into the running module's engine when an `erewrite` command starts.
+    /// Pending scripted/piped input for `erewrite`'s `getLine`, moved into the selected engine when an
+    /// `erewrite` command starts.
     stdin: String,
-    /// `set include BOOL on|off`: while on, every entered module gets an implicit
-    /// `including BOOL .` (the command's actual import mode; prelude.maude:3233 turns it on after BOOL
-    /// exists). The prelude's own early modules build while it is off. Default off — the engine/library
-    /// layer stays prelude-free; the standing prelude flips it via its own `set include` line.
+    /// `set include BOOL on|off`: inject `including BOOL .` into subsequently entered modules. Defaults off
+    /// so early prelude modules can establish BOOL before enabling it.
     include_bool: bool,
     /// Canonicalized paths already `load`ed — `sload` (skip-load) consults this and loads only once.
     loaded_files: std::collections::HashSet<std::path::PathBuf>,
@@ -94,8 +87,7 @@ pub struct Session {
     /// Local synchronous child interpreters. Each child is a complete independent Session and may own
     /// nested children of its own; IDs are scoped to this parent Session.
     interpreters: InterpreterRegistry,
-    /// Unequal identity-collapse notices already emitted by a lazy symbolic command. Maude
-    /// computes this property once per operator, so `set verbose on` prints each notice once.
+    /// Unequal identity-collapse notices already emitted; each operator reports at most once.
     reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId, bool)>,
     /// Source diagnostics already shown in this Session. Imported, renamed, instantiated, or
     /// dependent rebuilds may rediscover the same source declaration; they must not create warning storms.
@@ -103,6 +95,9 @@ pub struct Session {
 }
 
 /// A resumable session stored for `continue` / `show`.
+// A session owns at most one continuation; keeping the common rewrite state inline avoids an allocation
+// on every rewrite command.
+#[allow(clippy::large_enum_variant)]
 enum Continuation {
     /// A `rewrite`/`frewrite` session.
     Rewrite(Rewriting),
@@ -165,6 +160,12 @@ struct NarrowSession {
     path: bool,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
         Self {
@@ -191,7 +192,7 @@ impl Session {
         }
     }
 
-    /// Provide `stdin` input for `erewrite`'s `getLine` (Pillar 2.5-C) — the scripted/piped input stream.
+    /// Replace the scripted/piped input stream consumed by `erewrite` `getLine` requests.
     pub fn set_stdin(&mut self, input: impl Into<String>) {
         self.stdin = input.into();
     }
@@ -267,9 +268,8 @@ impl Session {
                 };
             }
             "load" | "sload" => {
-                // Filename = the raw text after the keyword on ITS line, to end of line (Maude:
-                // no `.` terminator). Comments may precede the load line in the chunk, so find
-                // the line whose first word is the keyword rather than slicing the raw input.
+                // Load paths occupy the rest of the keyword's physical line and use no dot terminator.
+                // Search by leading keyword because comments may precede the command in this chunk.
                 let path = input
                     .lines()
                     .map(str::trim)
@@ -320,19 +320,14 @@ impl Session {
             }
             items
         };
-        // Two commands on one line: Maude rejects the whole line (its command reader takes everything up to
-        // the terminating `.`, so trailing tokens make the command ill-formed). tnk buffers one physical
-        // submission at a time, so a *single-line* `red a . red b .` arrives here as several parsed items —
-        // reject the whole submission when any command is followed by another item. Commands on SEPARATE
-        // lines are separate submissions (each its own `dispatch_one`), so multi-command files are
-        // unaffected. A module/view followed by a trailing command is Maude-legal and
-        // left alone (the command is the last item — nothing follows it).
+        // Reject multiple commands on one physical line. Each line in a loaded file is dispatched
+        // separately; a module or view followed by one command remains valid.
         if items
             .iter()
             .enumerate()
             .any(|(k, it)| matches!(it, TopItem::Command(_)) && k + 1 < items.len())
         {
-            // The diagnostic text is stripped by the diff harness; the pin is that no results appear.
+            // Reject the entire statement group before dispatch so no partial command results are emitted.
             output.push_str("error: more than one command on a line.\n");
             return Eval {
                 output: output.trim_end().to_string(),
@@ -357,8 +352,7 @@ impl Session {
         }
     }
 
-    /// Define (or redefine) a module: insert into the DB, flatten its import closure, build it, and make
-    /// it current. Silent on success (as Maude is); flatten/build errors become output.
+    /// Define or replace a module, rebuild its closure, and select it. Success is silent.
     fn enter_module(&mut self, mut pm: PreModule, out: &mut String) {
         let name = pm.name.clone();
         // Implicit BOOL: `set include BOOL on` injects
@@ -377,8 +371,8 @@ impl Session {
         let imports = pm.imports.clone();
         let mut diagnostics = unsupported_memo_diagnostics(&pm, &self.interner);
 
-        // Build against a candidate database. A failed replacement must not poison the source DB or
-        // invalidate the previously built module, current selection, continuations, or metalevel DAGs.
+        // Build against a candidate database. A failed replacement must not mutate the source DB or
+        // invalidate the last successful build, current selection, continuations, or metalevel DAGs.
         let mut candidate_db = self.db.clone();
         candidate_db.insert(pm);
         tnk_modules::prelude::ensure_builtins(&imports, &mut candidate_db, &mut self.interner);
@@ -432,10 +426,8 @@ impl Session {
         }
     }
 
-    /// Install a module already decoded and compiled from a META-INTERPRETER `Module` value. Maude's
-    /// `insertModule` retains both the `MetaPreModule` source and the `MetaModule` built by
-    /// `downSignature`; rebuilding the reflected statements through surface token bubbles can lose
-    /// otherwise-valid overloads and makes a later `upModule` incomplete.
+    /// Install a META-INTERPRETER module with both decoded source and compiled form. Reconstructing its
+    /// statements through surface bubbles can lose overload resolution and make later reflection incomplete.
     fn enter_meta_module(&mut self, pm: PreModule, lm: LoadedModule, out: &mut String) {
         let name = pm.name.clone();
         self.last = None;
@@ -456,9 +448,8 @@ impl Session {
         self.rebuild_dependents(&name, out);
     }
 
-    /// Define (or redefine) a view (B-ii): validate it against the module DB and store it. Silent on
-    /// success (as Maude is); a validation error becomes output. A view is the argument of an
-    /// instantiation `M{V}` (B-iv); on its own it is just validated and shown (`show view`).
+    /// Validate and store a view. Success is silent; validation errors are emitted. A view can later serve
+    /// as an instantiation argument and is available to `show view`.
     fn enter_view(&mut self, v: ViewDecl, out: &mut String) {
         match validate_view(&v, &self.db, &self.views, &mut self.interner) {
             Ok(()) => {
@@ -471,8 +462,8 @@ impl Session {
                 }
                 self.views.insert(v);
                 self.meta_state.clear(); // view semantics participate in reflected module construction
-                // A redefined view leaves the cached builds of modules that instantiate with it stale
-                // (`M{V}` was flattened with the old view), so re-flatten its transitive dependents (A4c).
+                // A redefined view makes cached builds of modules that instantiate with it stale
+                // (`M{V}` was flattened using the replaced view), so re-flatten its transitive dependents.
                 self.rebuild_dependents(&name, out);
             }
             Err(e) => {
@@ -532,12 +523,8 @@ impl Session {
 
     /// Run a `reduce`/`match` command against the current module.
     fn run_command(&mut self, c: Command, out: &mut String) {
-        // A `[0]` component in a bracketed bound (`rewrite`/`frewrite`/`erewrite`/`search`) is illegal:
-        // Maude rejects it at parse ("bad token in / no parse for term|command") — before resolving the
-        // module — so the command produces no output, while the following legal commands still run
-        //. Every bound slot rejects a 0 (verified against the oracle: bound and
-        // gas for `frewrite [n, g]`/`erewrite`, and both solution/depth bounds for `search [n, m]`).
-        // `continue`'s bare number is a different grammar and DOES allow 0, so it is not checked here.
+        // Zero is invalid in bracketed execution bounds and gas fields; reject before module resolution.
+        // The bare `continue 0` cursor uses a separate grammar and remains valid.
         let zero_bound = match &c {
             Command::Rewrite { bound, .. } => *bound == Some(0),
             Command::Frewrite { bound, gas, .. } | Command::ERewrite { bound, gas, .. } => {
@@ -564,13 +551,11 @@ impl Session {
             _ => false,
         };
         if zero_bound {
-            // The diagnostic is stripped by the diff harness (a `parse error:` line); the pin is that the
-            // rejected command emits no echo/result.
+            // A rejected command emits no echo or result.
             out.push_str("parse error: a `[0]` bound is not allowed.\n");
             return;
         }
-        // An `in <MODULE> :` qualifier overrides the current module for this one command (Maude's
-        // `red in NAT : t .`); without it, the current module is used.
+        // `in <MODULE> :` overrides the selected module for this command only.
         let m_override = match &c {
             Command::Reduce { module, .. }
             | Command::Check { module, .. }
@@ -605,9 +590,9 @@ impl Session {
                 else {
                     return;
                 };
-                // Maude echoes the normalized, pretty-printed term. The tree was parsed once above and is
-                // reused by echo and execution; raw joining is only a fallback if echo DAG construction
-                // fails, in which case execution reports the build error.
+                // Echo the normalized, pretty-printed term. The parsed tree is shared by echo and execution;
+                // raw token joining is only a fallback when echo DAG construction fails, after which
+                // execution reports the build error.
                 let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
@@ -766,8 +751,8 @@ impl Session {
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
-                // The echo shows the bound exactly as written (`[n]` or `[n, g]`); Maude's default gas is
-                // one rule application per position per pass.
+                // Preserve the written bound form in the echo; omitted gas defaults to one application per
+                // position per pass.
                 let bound_str = match (bound, gas) {
                     (Some(n), Some(g)) => format!(" [{n}, {g}]"),
                     (Some(n), None) => format!(" [{n}]"),
@@ -813,8 +798,8 @@ impl Session {
                 let external_input = std::mem::take(stdin);
                 lm.built.engine.reset_counter();
                 lm.built.engine.reset_external();
-                // Interpreter objects are capabilities of one top-level `erewrite` command. A new
-                // command discards the prior configuration and Maude reuses child id 0.
+                // Interpreter objects are capabilities of one top-level `erewrite` command. Starting a new
+                // command discards the existing configuration and restarts child IDs at zero.
                 *interpreters = InterpreterRegistry::default();
                 lm.built.engine.set_external_input(external_input);
                 let echo = command_echo(lm, interner, &parsed, *render_color)
@@ -858,7 +843,7 @@ impl Session {
             }
             Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that, .. } => {
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
-                lm.built.engine.set_trace(false); // search is not traced (yet)
+                lm.built.engine.set_trace(false); // ordinary search tracing is unsupported
                 lm.built.engine.set_record_whole(false);
                 let Some(subject_parsed) =
                     parse_command_or_report(lm, &self.interner, &subject, out)
@@ -951,7 +936,7 @@ impl Session {
                     (Some(n), Some(m)) => format!(" [{n}, {m}]"),
                     (None, Some(m)) => format!(" [, {m}]"),
                 };
-                match smt_search_command(
+                if let Ok(command) = smt_search_command(
                     lm,
                     &mut self.interner,
                     &subject_parsed,
@@ -960,27 +945,23 @@ impl Session {
                     such_that.as_deref(),
                     max_depth,
                 ) {
-                    Ok(command) => {
-                        let mut session = SmtSearchSession {
-                            search: command.search,
-                            goal_variables: command.goal_variables,
-                            target_variable_count: command.target_variable_count,
-                            shown_total: 0,
-                        };
-                        let body = render_smt_search(
-                            &mut session,
-                            lm,
-                            &self.interner,
-                            self.render_color,
-                            max_solutions,
-                        );
-                        out.push_str(&format!(
-                            "smt-search{bound_str} in {cur} : {header} .\n{body}"
-                        ));
-                        self.last =
-                            Some((cur.clone(), Continuation::SmtSearch(Box::new(session))));
-                    }
-                    Err(_) => {}
+                    let mut session = SmtSearchSession {
+                        search: command.search,
+                        goal_variables: command.goal_variables,
+                        target_variable_count: command.target_variable_count,
+                        shown_total: 0,
+                    };
+                    let body = render_smt_search(
+                        &mut session,
+                        lm,
+                        &self.interner,
+                        self.render_color,
+                        max_solutions,
+                    );
+                    out.push_str(&format!(
+                        "smt-search{bound_str} in {cur} : {header} .\n{body}"
+                    ));
+                    self.last = Some((cur.clone(), Continuation::SmtSearch(Box::new(session))));
                 }
             }
             Command::Srewrite { depth_first, term, mut strategy, .. } => {
@@ -1033,14 +1014,10 @@ impl Session {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                     Ok(mut uc) => {
                         out.push_str(&format!("{irr}unify {bnd}in {cur} : {} .\n", uc.echo));
-                        if !uc.names_ok || !uc.problem.problem_okay() {
-                            // Screening failure (unimplemented theory) or an unsafe variable name —
-                            // Maude emits only the (stripped) warning, no Decision time / unifiers.
-                        } else {
+                        if uc.readiness == UnifyReadiness::Ready {
                             // Collect unifiers (up to the bound) while the engine is borrowed, then
                             // render — print_pretty needs the interner immutably afterwards.
                             let mut unifiers: Vec<Vec<DagId>> = Vec::new();
-                            let incomplete;
                             {
                                 let mut names = InternerNames(interner);
                                 let mut env = tnk_core::unify::UnifyEnv {
@@ -1053,11 +1030,9 @@ impl Session {
                                         None => break,
                                     }
                                 }
-                                incomplete = uc.problem.is_incomplete();
                             }
-                            let _ = incomplete; // the incomplete-warning text is phase-E (stripped)
-                            // `irredundant`: keep only the most-general unifiers (Maude's
-                            // UnifierFilter), in enumeration order, then renumber on display.
+                            // `irredundant` keeps only the most-general unifiers in enumeration order,
+                            // then display numbering starts at one.
                             if irredundant {
                                 unifiers =
                                     tnk_core::unify::filter::irredundant(&mut lm.built.engine, unifiers);
@@ -1338,7 +1313,7 @@ impl Session {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.set_trace(self.trace.master);
                     lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
-                    // `continue` reports the rewrites done in this continuation (Maude resets the count).
+                    // `continue` reports only rewrites performed after resuming, so start with a fresh counter.
                     lm.built.engine.reset_rewrites();
                     let body = render_rewriting(
                         lm,
@@ -1354,8 +1329,8 @@ impl Session {
                 }
                 Some((m, Continuation::Search(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
-                    // `continue` reports the rewrites done in this continuation (Maude resets the count),
-                    // so states generated now snapshot a fresh count.
+                    // Search continuation statistics count only work performed after resuming, so reset
+                    // before newly generated states snapshot their rewrite count.
                     lm.built.engine.reset_rewrites();
                     let body = render_search(
                         &mut session,
@@ -1573,8 +1548,8 @@ impl Session {
         }
     }
 
-    /// `set trace [<option>] on|off` — the full `trace` flag surface (master + body / substitution /
-    /// rewrite / whole / condition / eqs / mbs / builtin). Other `set` options are a follow-up.
+    /// Dispatch supported `set` controls: trace flags, include BOOL, timing diagnostics, breakdown, and
+    /// verbose mode. Memoization controls report their explicit unsupported warning.
     fn meta_set(&mut self, line: &str) -> Eval {
         let words: Vec<&str> = line
             .split_whitespace()
@@ -1621,8 +1596,8 @@ impl Session {
                 }
                 String::new()
             }
-            // Unimplemented directives remain inert. Commands with supported syntax but unavailable
-            // semantics are handled explicitly above instead of disappearing silently.
+            // Unknown directives remain inert. Recognized commands with unavailable semantics are handled
+            // explicitly above instead of disappearing silently.
             _ => String::new(),
         };
         Eval {
@@ -1881,9 +1856,8 @@ fn append_diagnostics(
     }
 }
 
-/// Maude defers binary-symbol sort checks until a symbolic command first needs them. Under
-/// `set verbose on`, an identity whose collapse lowers the result sort therefore reports once,
-/// immediately before that command's echo.
+/// Binary-symbol sort checks run lazily when a symbolic command first needs them. Under `set verbose on`,
+/// an identity whose collapse lowers the result sort reports once, immediately before that command's echo.
 fn append_verbose_identity_collapse_diagnostics(
     lm: &LoadedModule,
     module: &str,
@@ -1933,13 +1907,9 @@ fn append_block(out: &mut String, block: &str) {
     }
 }
 
-/// Join a token bubble back to text for the command echo (the `reduce in M : … .` / `match …` line),
-/// applying Maude's mixfix spacing rules (`prettyPrint.cc::printTokens`): no space before a `,` or a
-/// bracket, no space *after* an opening bracket, a single space elsewhere. This re-spaces the input
-/// tokens — `g ( g ( a ) )` → `g(g(a))`, `< z , s z >` → `< z, s z >` — to match the reference binary's
-/// echo on the common command forms. It preserves the input's surface form (numerals stay numerals,
-/// operands keep their order) rather than re-parsing, so the one place it can differ from Maude is
-/// redundant input parentheses (kept here; Maude's re-render drops them).
+/// Join command tokens with canonical mixfix spacing: no space before commas or brackets, none after an
+/// opening bracket, and one elsewhere. This preserves the input term rather than reparsing it, including
+/// redundant parentheses.
 fn join_tokens(toks: &[Token], i: &Interner) -> String {
     let mut out = String::new();
     let mut no_space = true; // suppress the leading space, and the space after an opening bracket
@@ -1971,10 +1941,8 @@ fn parse_command_or_report<'a>(
     }
 }
 
-/// Run a `rewrite`/`continue` session and render the `rewrites: … / result …` block (shared by the
-/// `rewrite` and `continue` commands). Runs `rw` for `bound` steps, renders any recorded trace, then the
-/// count and the result — `result (sort not calculated): …` when a bounded `frewrite` stop left a
-/// non-canonical term (Pillar A-ii).
+/// Drive a `rewrite`/`continue` session and render trace, rewrite count, and result. A bounded
+/// `frewrite` stop may report `result (sort not calculated)` because the term is not canonical.
 fn render_rewriting(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1988,6 +1956,7 @@ fn render_rewriting(
     render_rewrite_step(lm, i, flags, color, show_breakdown, step)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_external_rewriting(
     rw: &mut Rewriting,
     lm: &mut LoadedModule,
@@ -2412,8 +2381,6 @@ fn render_variant_unifiers(
     }
 }
 
-/// `Var --> value` lines for a search solution. The variable is rendered by its written name (Maude
-/// echoes a goal variable as written: a declared `X` prints `X`, an on-the-fly `X:Sort` prints
 fn rewrite_count_line(rewrites: u64) -> String {
     format!("rewrites: {rewrites}")
 }
@@ -2540,6 +2507,7 @@ fn render_narrow_folding_events(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_narrowing(
     session: &mut NarrowSession,
     lm: &mut LoadedModule,
@@ -2725,7 +2693,8 @@ fn render_narrowing_display(
     }
 }
 
-/// `X:Sort` — the colon form is part of the variable name once on-the-fly variables are supported).
+/// Render search bindings as `Var --> value` lines. Declared variables use their written names;
+/// on-the-fly `X:Sort` variables retain the sort suffix as part of the name.
 fn render_search_bindings(
     lm: &LoadedModule,
     i: &Interner,
@@ -2783,8 +2752,8 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
         let sort = lm.built.engine.sorts().name(lm.built.engine.sort_of(*term));
         let value = print_pretty(&lm.built, i, *term, color);
         out.push_str(&format!("state {sidx}, {sort}: {value}\n"));
-        // One arc per distinct successor state; all rules reaching it are listed on that single arc, each
-        // in its own parens (Maude merges arcs by target ).
+        // Group all rules with the same successor on one arc, listing each rule in its own
+        // parenthesized body.
         for (arc_n, (target, rules)) in arcs.iter().enumerate() {
             let bodies: String = rules
                 .iter()
@@ -2796,9 +2765,7 @@ fn render_graph(search: &Search, lm: &LoadedModule, i: &Interner, color: bool) -
     out.trim_end().to_string()
 }
 
-/// A `show view` rendering (B-ii): the `view N from T to M is … endv` form, sort maps then op maps. Close
-/// to the reference binary's layout (two-space indent); the exact-spacing fidelity of `show` is a REPL
-/// concern, like `show module`.
+/// Render `show view` with sort maps before operator maps and two-space indentation.
 fn render_view(v: &ViewDecl, i: &Interner) -> String {
     let mut s = format!(
         "view {} from {} to {} is\n",
@@ -2851,7 +2818,7 @@ fn render_view(v: &ViewDecl, i: &Interner) -> String {
     s
 }
 
-/// Render a module expression as text (for `show view`'s from/to). B-ii from/to are named modules.
+/// Render a module expression as text for `show view`'s from/to. These are normally named modules.
 fn module_expr_str(e: &ModuleExpr) -> String {
     match e {
         ModuleExpr::Named(n) => n.clone(),
@@ -2864,8 +2831,8 @@ fn module_expr_str(e: &ModuleExpr) -> String {
     }
 }
 
-/// A `show module` rendering: name + sorts + ops (name/arity). (Statements live in the engine, not the
-/// `BuiltModule`, so they are not counted here.)
+/// Render a compact module summary containing its name, sorted sort names, and sorted operator
+/// name/arities. Statements are intentionally omitted.
 fn render_module(name: &str, lm: &LoadedModule) -> String {
     let b = &lm.built;
     let mut sorts: Vec<&str> = b.sorts.keys().map(String::as_str).collect();

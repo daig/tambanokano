@@ -5,8 +5,8 @@
 //! no live id ever dangles, so we do not need generational tags in release builds.
 //!
 //! The arena exposes mark/sweep primitives so a theory-aware tracer (the DAG's GC) can drive
-//! reachability from a root set: [`Arena::clear_marks`] → mark roots transitively via
-//! [`Arena::mark`] → [`Arena::sweep`].
+//! reachability from a root set: `Arena::clear_marks` → mark roots transitively via
+//! `Arena::mark` → `Arena::sweep`.
 
 use crate::id::Id;
 
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(*a.get(recycled), 2);
     }
 
-    /// A handle minted by one arena, used on another, is caught in debug (cross-engine misuse — D1).
+    /// A handle minted by one arena, used on another, is caught in debug.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "cross-arena")]

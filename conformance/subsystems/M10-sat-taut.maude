@@ -10,7 +10,7 @@ fmod M-SAT-CHECK is
   ops a b c d e p q r : -> Formula [ctor] .
 endfm
 
-*** Minimal sibling-surface probes from the Phase-M plan.
+*** Minimal sibling-surface probes.
 *** Freeze SatSolverSymbol's own verbose statistics, including singular/plural/zero forms.
 set verbose on .
 red in M-SAT-CHECK : satSolve(True) .

@@ -1,4 +1,4 @@
-*** C4e-zero-bounds — [0] bound on rew/search; oracle rejects at parse, tnk runs 0 steps
+*** C4e-zero-bounds — [0] bound on rew/search; expected parity rejects at parse
 mod M is
   sort S .
   ops a b c : -> S .

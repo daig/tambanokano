@@ -1,9 +1,8 @@
 *** PRELUDE
 *** B2a-suchthat-counts — `such that` condition-evaluation rewrites are not counted
 *** Counter increments c(N); the bounded =>+ search keeps only odd N. Each solution's condition costs 2
-*** extra rewrites on the oracle (the `rem` and `=/=` reductions): per-solution rewrites 4/12/20 (oracle)
-*** vs 2/10/18 (tnk); states 2/4/6 agree. The condition is written with an explicit `= true` so the search
-*** echo is byte-identical on both sides (avoids the boolean-`such that` `= true` echo divergence).
+*** extra rewrites for the `rem` and `=/=` reductions. Expected parity: per-solution rewrites 4/12/20;
+*** states 2/4/6. The condition uses explicit `= true` so the search echo stays expected-parity.
 mod COUNTER is
   protecting NAT .
   sort Ct .

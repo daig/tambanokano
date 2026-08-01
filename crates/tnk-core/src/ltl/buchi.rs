@@ -297,10 +297,10 @@ impl<'a> GenBuchiAutomaton<'a> {
 
     pub(super) fn remap_nat_set(new_set: &mut NatSet, old_set: &NatSet, mapping: &[Option<usize>]) {
         for old in (0..mapping.len()).rev() {
-            if let Some(new) = mapping[old] {
-                if old_set.contains(old) {
-                    new_set.insert(new);
-                }
+            if let Some(new) = mapping[old]
+                && old_set.contains(old)
+            {
+                new_set.insert(new);
             }
         }
     }
@@ -311,14 +311,6 @@ impl<'a> GenBuchiAutomaton<'a> {
 
     pub(crate) fn fairness_set_count(&self) -> usize {
         self.nr_fairness_sets
-    }
-
-    pub(crate) fn initial_states(&self) -> &NatSet {
-        &self.initial_states
-    }
-
-    pub(crate) fn fairness_combination(&self, index: usize) -> &NatSet {
-        self.fairness_conditions.get(index)
     }
 
     pub(crate) fn transitions(&self, state: usize) -> &FairTransitionSet {
@@ -610,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn generalized_pipeline_matches_each_instrumented_reference_stage() {
+    fn generalized_pipeline_stage_forms_are_deterministic() {
         let context = BddContext::new(2);
         let (formula, top) = complex_formula();
         let mut automaton = GenBuchiAutomaton::new(&context, &formula, top);
@@ -634,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn degeneralization_and_each_collapse_match_instrumented_reference() {
+    fn degeneralization_and_collapse_are_deterministic_and_idempotent() {
         let context = BddContext::new(2);
         let (formula, top) = complex_formula();
         let mut generalized = GenBuchiAutomaton::new(&context, &formula, top);
@@ -653,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn constants_and_literal_polarities_match_reference_automata() {
+    fn constants_and_literal_polarities_build_expected_automata() {
         let zero_context = BddContext::new(0);
         let mut false_formula = LogicFormula::default();
         let false_top = false_formula.make_false();
@@ -689,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn left_folded_nary_boolean_matches_instrumented_reference() {
+    fn left_folded_nary_boolean_preserves_conjunction_order() {
         let context = BddContext::new(3);
         let mut formula = LogicFormula::default();
         let p = formula.make_proposition(0);

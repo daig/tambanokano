@@ -1,13 +1,11 @@
 //! The runtime term representation: a GC'd DAG of [`DagNode`]s.
 //!
-//! The closed theory set is an `enum` ([`NodeTerm`]), not a C++-style virtual
-//! hierarchy. Each node caches its least sort (computed at construction by the `engine`) and the
-//! equation-set epoch at which it was last proved canonical. Phase 0 implements only the
-//! **free-theory** arm.
+//! The `NodeTerm` enum distinguishes the supported theory representations. Each node
+//! caches its least sort, the equation-set epoch at which it was proved canonical, and an optional
+//! normal-form forward. All supported theory representations live behind the same node interface.
 //!
-//! Invariant-bearing fields are `pub(crate)`: only the engine may set a node's sort or its reduced
-//! epoch (public fields previously let callers mark an unreduced node "reduced" or
-//! desync the cached sort).
+//! Invariant-bearing fields are `pub(crate)`: only the engine may set a node's sort or reduced epoch,
+//! preventing callers from marking an unreduced node as reduced or desynchronizing the cached sort.
 
 use crate::id::Id;
 use crate::smt::SmtNumber;
@@ -18,45 +16,31 @@ pub type DagId = Id<DagNode>;
 
 #[derive(Debug)]
 pub struct DagNode {
-    /// Least sort of this node (Phase 0: the operator's range sort, or the kind's error sort if
-    /// arguments are ill-sorted). Computed once at construction.
+    /// Cached least sort. Construction computes the structural base sort; membership axioms may lower
+    /// it lazily when reduction reaches the node's normal-form point.
     pub(crate) sort: SortId,
     /// The `Engine` equation-set epoch at which this node was last proved canonical, or `0` if it
     /// has never been reduced. The engine treats the node as reduced only while this equals the
     /// current epoch, so adding equations invalidates stale results.
     pub(crate) reduced_epoch: u32,
-    /// This node's **normal form** when it is reduced (`reduced_epoch == eq_epoch`): `None` means the
-    /// node *is* its own normal form, `Some(nf)` forwards to a structurally different result it rewrote
-    /// to. This is the out-of-place counterpart of Maude's in-place rewrite (C7): our `reduce` abandons
-    /// a rewritten redex rather than mutating it, so a *shared* redex would be re-reduced once per
-    /// reference; the forward lets every reference deliver the already-computed result and skip the
-    /// re-reduction (matching Maude's `rewrites:` count). Metadata only — set via `get_mut`, exactly
-    /// like `sort`/`reduced_epoch` — so the node's *content* stays immutable and the render-after trace
-    /// keeps reading the redex it was handed. Meaningful only while `reduced_epoch == eq_epoch`; a stale
-    /// `Some` from an earlier epoch is never followed (the read is epoch-guarded) and is overwritten at
-    /// the node's next normal-form point. Marked by [`Runtime::mark_reachable`](crate::engine::Runtime)
-    /// as a pseudo-child, so it stays alive only while its forwarding node is alive (freed with it).
+    /// This node's normal form while `reduced_epoch` matches the equation epoch. `None` means the node is
+    /// canonical; `Some(nf)` forwards shared references to an out-of-place rewrite result. The target is
+    /// traced as a pseudo-child for GC and ignored once its epoch becomes stale.
     pub(crate) nf: Option<DagId>,
     pub(crate) term: NodeTerm,
 }
 
-/// Two structurally-identical nodes (same theory rep, same child ids, same scalar payload) — what the
-/// C7 construction-dedup memo keys on. Built bottom-up, so identical subtrees already share child ids,
-/// keeping the key shallow (no deep structural hashing). `sort` is *not* part of the key: a node's base
-/// sort is a function of its children's sorts, so two equal `NodeTerm`s necessarily share it.
+/// Key for construction-time structural deduplication. Children are already canonicalized bottom-up;
+/// sort is excluded because it is determined by the term and child sorts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum NodeTerm {
     /// A free-theory application `symbol(args...)`; `args.len()` equals the symbol's arity.
     Free { symbol: SymbolId, args: Vec<DagId> },
-    /// An **ACU** application (`assoc comm`, optionally `id:`): the operator's arguments as a
-    /// **canonical** multiset of `(element, multiplicity)` pairs — equal elements merged, identity
-    /// elements dropped, nested same-symbol applications flattened, and the pairs sorted by the
-    /// engine's total node order ([`Runtime::dag_compare`](crate::engine::Runtime)). A canonical ACU
-    /// node always holds ≥ 2 total arguments: a lone argument collapses to the element itself and the
-    /// empty multiset to the identity (so `args` here is never a single `(e, 1)`). `u32` multiplicity
-    /// matches Maude's `ArgVec<Pair>` (the red-black tree rep above `CONVERT_THRESHOLD` is a later
-    /// perf step). Built only by `make_acu` (a pure additive arm — GC, equality, and
-    /// reduction traverse it through the [`children`](DagNode::children) visitor unchanged).
+    /// An **ACU** application (`assoc comm`, optionally `id:`): a canonical multiset of
+    /// `(element, multiplicity)` pairs. Equal elements are merged, identities dropped, nested
+    /// applications flattened, and pairs sorted by the engine's total node order. A canonical node
+    /// contains at least two total arguments; singleton and empty multisets collapse. Multiplicities
+    /// use `u32`.
     Acu {
         symbol: SymbolId,
         args: Vec<(DagId, u32)>,
@@ -86,19 +70,15 @@ pub(crate) enum NodeTerm {
     },
     /// An **NA** (atomic built-in constant): a leaf carrying a [`NaValue`] (a string / quoted-id /
     /// float), built by the built-in seam (string/qid/float literals + results). Like the S `count`,
-    /// the `value` is scalar payload, not a child, so equality/order need theory-specific arms. Has no
-    /// children; matches only itself (Maude's `NA_DagNode`). Built only by `make_na`.
+    /// the `value` is scalar payload rather than a child, so equality and ordering use
+    /// representation-specific arms. Has no children and matches only itself. Built only by `make_na`.
     Na { symbol: SymbolId, value: NaValue },
-    /// A **variable** leaf (Maude's `VariableDagNode`) — the symbolic engine's genuine logic
-    /// variable; appears only in unification/variant/narrowing DAGs, never during ordinary
-    /// reduction. `symbol` is the per-sort variable symbol ([`Engine::variable_symbol`]
-    /// (crate::engine::Engine::variable_symbol), Maude's `Module::instantiateVariable`); the node's
-    /// cached `sort` equals that symbol's range sort. `name` is the interned **base-name token
-    /// code** (Maude's `NamedEntity::id()`): identity and canonical order among same-sort variables
-    /// (`variableDagNode.cc compareArguments` is `id() - id()`), resolved back to text by the
-    /// frontend for printing. `index` is the variable's slot in the owning problem's substitution
-    /// (`VariableDagNode::index`) — bookkeeping, deliberately **not** part of equality or order.
-    /// Built only by `make_var`.
+    /// A **variable** leaf used only by unification, variant, and narrowing DAGs. `symbol` is the
+    /// per-sort variable symbol created by [`Engine::variable_symbol`](crate::engine::Engine::variable_symbol);
+    /// the cached node sort equals that symbol's range sort. `name` is the interned base-name token
+    /// code and determines identity and canonical order among same-sort variables; the frontend
+    /// resolves it back to text. `index` is the variable's substitution slot and deliberately does
+    /// not participate in equality or ordering. Built only by `make_var`.
     Var {
         symbol: SymbolId,
         name: u32,
@@ -106,33 +86,26 @@ pub(crate) enum NodeTerm {
     },
 }
 
-/// The value of an atomic built-in constant ([`NodeTerm::Na`]). Strings/quoted-ids share an immutable
-/// reference-counted backing (cheap to clone); the float arm lands with `FLOAT` (B3.7). A **string** is a
-/// raw **byte** sequence (`Rc<[u8]>`), exactly Maude's `Rope` of `char`s — it is NOT required to be UTF-8
-/// (`substr("héllo", 1, 1)` is the lone byte `0xC3`). The derived `Eq`/`Ord`/`Hash` on the byte slice is
-/// byte-lexicographic, matching Maude's Rope comparison. A `Qid` stays `Rc<str>` (identifiers are text).
+/// The value of an atomic built-in constant (`NodeTerm::Na`). Strings and quoted identifiers share
+/// immutable reference-counted backing. Floats are stored by IEEE-754 bit pattern. A string is a raw
+/// byte sequence (`Rc<[u8]>`) and need not be valid UTF-8; comparison and hashing are byte-based.
+/// A quoted identifier remains text (`Rc<str>`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NaValue {
-    /// A string literal / result (the `<Strings>` `StringSymbol`) — a raw byte sequence.
+    /// A `<Strings>` literal or result stored as a raw byte sequence.
     Str(std::rc::Rc<[u8]>),
-    /// A quoted identifier (the `<Qids>` `QuotedIdentifierSymbol`).
+    /// A `<Qids>` quoted identifier stored without its leading quote.
     Qid(std::rc::Rc<str>),
-    /// An IEEE double, stored as its bit pattern (`f64::to_bits`) so `NaValue` keeps a total
-    /// `Eq`/`Ord`/`Hash` (the float ops convert via `from_bits`). Bitwise equality agrees with Maude's
-    /// value equality for all normal floats; it diverges only at the IEEE edge cases `+0.0`/`-0.0`
-    /// (distinct bits, value-equal) and `NaN` (value-unequal, bit-equal) — both unreachable here, since
-    /// float ops are free (never AC, so `dag_compare` is not exercised on floats) and `==` on floats is
-    /// not used (the float relational ops compare values directly).
+    /// An IEEE double stored as `f64::to_bits`, giving `NaValue` total `Eq`/`Ord`/`Hash`. Bitwise and
+    /// value equality differ only for signed zero and NaN; built-in equality handles floats by value,
+    /// while float operators reject NaN.
     Float(u64),
-    /// An exact SMT integer/rational literal (`SMT_NumberSymbol`).
+    /// An exact SMT integer/rational literal.
     SmtNum(std::rc::Rc<SmtNumber>),
 }
 
-/// Compare two string byte sequences exactly as Maude's `Rope::compare` does — as sequences of **signed**
-/// `char` (the C `int d = *p - *q`), so a high byte (0x80–0xFF, negative as a signed char) orders *before*
-/// an ASCII byte. Both the `_<_`/`_>_`/`_<=_`/`_>=_` string ops and the DAG canonical order
-/// ([`Runtime::dag_compare`](crate::engine::Runtime)) use this: unsigned byte-lexicographic would put high
-/// bytes last, diverging from the reference (`"\303" < "b"` is true in Maude, false unsigned).
+/// Compare two strings as sequences of signed bytes, placing 0x80–0xFF before ASCII. String relational
+/// operators and [`Runtime::dag_compare`](crate::engine::Runtime) share this order.
 pub(crate) fn rope_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.iter().map(|&x| x as i8).cmp(b.iter().map(|&x| x as i8))
 }
@@ -140,12 +113,8 @@ pub(crate) fn rope_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// A static empty child slice — the children of a leaf ([`NodeTerm::Na`]) without allocating.
 const NO_CHILDREN: &[DagId] = &[];
 
-/// A public, read-only view of a node's representation, for a consumer (the frontend pretty-printer,
-/// B4.6) that must render the **scalar payload** the generic [`symbol`](DagNode::symbol) /
-/// [`children`](DagNode::children) visitor cannot reach — the S-theory iter `count` and the `Na` constant
-/// value. [`App`](NodeRepr::App) covers *every* operator application (free / ACU / AU / CUI); the consumer
-/// renders it from `symbol()` + `children()`. This keeps [`NodeTerm`]/[`NaValue`] crate-private while
-/// exposing exactly what surface rendering needs.
+/// Public read-only node representation exposing scalar payloads that child traversal cannot: iteration
+/// counts, strings, quoted identifiers, floats, SMT numbers, and variables.
 #[derive(Debug)]
 pub enum NodeRepr<'a> {
     /// A free / ACU / AU / CUI operator application — render via `symbol()` + `children()`.
@@ -160,19 +129,16 @@ pub enum NodeRepr<'a> {
     Float(f64),
     /// An exact SMT integer/rational constant.
     SmtNum(&'a SmtNumber),
-    /// A variable ([`NodeTerm::Var`]): `name` is the interned base-name token code the frontend
+    /// A variable (`NodeTerm::Var`): `name` is the interned base-name token code the frontend
     /// resolves to text; the sort for the printed `name:Sort` form is the node's [`sort`](DagNode::sort).
     Var { name: u32 },
 }
 
 impl DagNode {
-    /// Visit each child once via a closure — the form a consumer uses when it wants to act on each
-    /// child *without materializing a collection* (the C++ `markArguments` visitor). Rather than
-    /// handing out a `&[DagId]`, it lets non-slice representations participate: ACU's
-    /// `(child, multiplicity)` pairs, the S-theory's `(count, arg)`, a red-black `ACU_TreeDagNode`
-    /// have no contiguous child array to borrow. (The GC marker currently uses
-    /// [`children`](Self::children)`().extend(..)` instead, whose slice fast-path is faster for the
-    /// free rep; both are equivalent traversals through this seam.)
+    /// Visit each child once without materializing a collection. A callback accommodates non-slice
+    /// representations such as ACU `(child, multiplicity)` pairs and compact iteration
+    /// `(count, argument)` nodes. The GC marker currently uses [`children`](Self::children) and its
+    /// free-node slice fast path; both APIs traverse the same logical children.
     pub fn for_each_child(&self, mut f: impl FnMut(DagId)) {
         match &self.term {
             // Free, AU, and CUI are all an ordered `Vec<DagId>` (a contiguous child slice).
@@ -195,12 +161,10 @@ impl DagNode {
         }
     }
 
-    /// Iterate this node's children. Returns an iterator (not a slice) so the non-slice reps fit:
-    /// equality and reduction enumerate children theory-agnostically, so a new arm is a pure addition
-    /// to this method rather than an edit to GC / equality / reduction. The ACU arm
-    /// yields the **flattened multiset with repeats, in canonical order** — so two canonical ACU nodes
-    /// are equal iff their `children()` sequences are pairwise equal, exactly the contract
-    /// [`crate::engine::Runtime::deep_equal`] relies on.
+    /// Iterate this node's logical children without requiring every representation to expose a
+    /// slice. Equality, reduction, and GC can therefore traverse nodes theory-agnostically. The ACU
+    /// arm yields the flattened multiset with repeats in canonical order, so canonical ACU nodes are
+    /// equal exactly when their child streams are pairwise equal.
     pub fn children(&self) -> ChildIter<'_> {
         match &self.term {
             NodeTerm::Free { args, .. }
@@ -210,7 +174,7 @@ impl DagNode {
                 pairs: args.iter(),
                 current: None,
             },
-            // The S successor's single child reuses the slice iterator via `from_ref` — no new arm.
+            // Reuse the slice iterator for the S successor's single child.
             NodeTerm::S { arg, .. } => ChildIter::Free(std::slice::from_ref(arg).iter()),
             // An atomic NA constant or a variable is a leaf — an empty child iterator.
             NodeTerm::Na { .. } | NodeTerm::Var { .. } => ChildIter::Free(NO_CHILDREN.iter()),
@@ -242,9 +206,7 @@ impl DagNode {
         }
     }
 
-    /// A read-only view exposing the scalar payload (`iter` count / `Na` value) the generic child visitor
-    /// cannot — for the frontend pretty-printer (B4.6). Operator applications are [`NodeRepr::App`]
-    /// (rendered from `symbol()` + `children()`); only S/NA carry extra payload.
+    /// Expose scalar payloads not represented by the generic child iterator.
     pub fn repr(&self) -> NodeRepr<'_> {
         match &self.term {
             NodeTerm::Free { .. }
@@ -303,7 +265,7 @@ impl Iterator for ChildIter<'_> {
 mod tests {
     use crate::engine::Engine;
 
-    /// The two traversal forms of the A5 seam agree, and a constant has no children.
+    /// The iterator and visitor traversal forms agree, and a constant has no children.
     #[test]
     fn children_iterator_and_visitor_agree() {
         let mut e = Engine::new();

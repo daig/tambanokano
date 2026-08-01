@@ -1,8 +1,5 @@
-*** The view-gap parser fix, self-contained (both engines run this file directly — no prelude clash):
-*** a parameterized view declaration (`view V{X :: T} from T to M{X}`) and a renaming over a STRUCTURED
-*** sort (`* (sort Box{ColorE} to ColorBox)`) both parse, so a parameterized module instantiated on a
-*** view + renamed builds and reduces. Same pattern QID-LIST uses on the builtin chain:
-*** protecting LIST{Qid} renamed by `sort NeList{Qid} to NeQidList`. Oracle: this file through Maude 3.
+*** Parameterized views and renaming of structured sorts parse, instantiate, and reduce.
+*** Covers the `LIST{Qid}`/`NeList{Qid}` shape used by the built-in module chain.
 
 fth ELT is sort Elt . endfth
 
@@ -25,7 +22,7 @@ view Boxed{X :: ELT} from ELT to BOX{X} is
   sort Elt to Box{X} .
 endv
 
-*** simple instantiation + a structured-sort renaming (the renaming() sort_name fix — the QID-LIST unblock)
+*** simple instantiation + a structured-sort renaming (the renaming() sort_name handling — the QID-LIST unblock)
 fmod COLOR-BOX is
   protecting BOX{ColorE} * (sort Box{ColorE} to ColorBox) .
 endfm

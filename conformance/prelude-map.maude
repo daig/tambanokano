@@ -1,10 +1,7 @@
-*** Container milestone (cont.) -- the real prelude's MAP{Nat, Nat}, over BOOL+NAT, verbatim from
-*** ~/Downloads/Maude-3/prelude.maude: BOOL 33-82, NAT 110-243, TRIV + Nat view, MAP 1498-1533.
+*** Stock prelude MAP{Nat, Nat}, over BOOL+NAT.
 *** Exercises two-parameter instantiation, the `[Y$Elt]` kind range (`op undefined : -> [Y$Elt]`, via
-*** inst_sort), and the `id:`-attribute parse fix (`_,_ [assoc comm id: empty prec 121]` keeps prec 121,
+*** inst_sort), and the `id:` attribute parse rule (`_,_ [assoc comm id: empty prec 121]` keeps prec 121,
 *** so a `_|->_` entry parses as a `_,_` argument). Lookup miss returns the kind-level `undefined`.
-***
-*** Oracle: stock Maude, `red in T :` with T = MAP{Nat, Nat}.
 
 fmod TRUTH-VALUE is
   sort Bool .

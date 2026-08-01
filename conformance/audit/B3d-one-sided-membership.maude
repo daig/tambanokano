@@ -1,4 +1,4 @@
-*** B3d-one-sided-membership — TNK-020: collapsing memberships over associative operators with a
+*** Collapsing memberships over associative operators with a
 *** one-sided identity. A left identity can fill every pattern position except the final one; a right
 *** identity can fill every position except the first. The opposite edge must not collapse.
 

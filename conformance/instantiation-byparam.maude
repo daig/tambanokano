@@ -1,4 +1,4 @@
-*** Axis-A5 kind 2: a by-parameter instantiation. PAIR{X :: TRIV} protects LIST{X}
+*** A by-parameter instantiation. PAIR{X :: TRIV} protects LIST{X},
 *** instantiating LIST by the enclosing parameter X, not a view; USEP grounds it
 *** with PAIR{ToN}, re-instantiating the bound X to the view ToN. Reductions fire
 *** through both PAIR's and LIST's instantiated equations.

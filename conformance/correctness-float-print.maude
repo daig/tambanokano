@@ -1,7 +1,6 @@
-*** Phase 1.5 / C9 — Maude-faithful float printing (`doubleToString`, Utility/macros.cc): 17 significant
+*** Maude-faithful float printing (`doubleToString`, Utility/macros.cc): 17 significant
 *** digits, the mantissa normalized to [1,10) with trailing zeros stripped (>=1 fractional digit), and a
-*** signed exponent shown only when nonzero.  Differential vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-float-print.maude < /dev/null
+*** signed exponent shown only when nonzero. Differential
 *** `float.maude` only uses format-coincident values (1.0/2.0/3.5/...) so it never exercised the
 *** scientific form; this fixture pins it: `1.0e+4`, sub-1 values (`2.5e-1`), the 17-digit rounding of
 *** 0.1 (`1.0000000000000001e-1`), and a long non-scientific mantissa (`sqrt 2`).

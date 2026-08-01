@@ -1,15 +1,14 @@
-//! Lexer: Maude tokenization + operator-name splitting.
+//! Tokenization and operator-name splitting.
 //!
-//! Maude tokens are separated by whitespace and by the **special-splitting** punctuation `( ) [ ] { } ,`
-//! (each its own token); everything else (letters, digits, `+ - < = : _ .` …) is part of a *maudeId*. The
-//! statement/command terminator `.` is a `.` followed by whitespace/EOF/punctuation — distinguished from a
-//! `.` inside a float (`1.5`) or a structured sort. Strings are `"…"`, quoted-ids start with `'`, and a
-//! backquote escapes a splitting char into a maudeId. (`lexer.ll` / `token.{hh,cc}` in the reference.)
+//! Tokens are separated by whitespace and by the **special-splitting** punctuation `( ) [ ] { } ,`
+//! (each its own token); all other characters can form an identifier token. The statement or command
+//! terminator `.` is a `.` followed by whitespace, EOF, punctuation, or a top-level keyword, and is
+//! distinguished from a `.` inside a float, structured sort, or operator. Strings are `"…"`,
+//! quoted identifiers start with `'`, and a backquote escapes a splitting character into an identifier.
 //!
 //! Line comments (`***`/`---` to end of line) and **bracketed** comments (`***( … )` / `---( … )`, balanced
-//! parens across newlines) are both handled. Tokens are interned ([`Interner`]) so equality is a `u32`
-//! compare. This slice is the functional-fragment subset; LaTeX/file-name lexer modes and the
-//! lexer↔parser bubble handshake (replaced by an explicit surface-parser API in B4.2) are follow-ups.
+//! parentheses across newlines) are both handled. Tokens are interned ([`Interner`]), making equality a
+//! `u32` comparison. Bubble collection is an explicit surface-parser operation rather than lexer state.
 
 use std::collections::HashMap;
 
@@ -53,9 +52,8 @@ impl Interner {
 }
 
 impl Sym {
-    /// The raw intern index — assigned in first-occurrence order, exactly Maude's `Token` name code.
-    /// The variable-vs-variable dag order is `id() - id()` on name codes (variableDagNode.cc), so this
-    /// is the rank a command-subject pseudo-variable carries into the kernel.
+    /// Raw intern index assigned in first-occurrence order. It is also the name-order rank carried
+    /// by command-subject pseudo-variables into the kernel.
     pub fn index(self) -> u32 {
         self.0
     }
@@ -79,26 +77,22 @@ pub enum TokKind {
     Dot,
     /// A natural-number literal `0 | [1-9][0-9]*`.
     Number,
-    /// A string literal `"…"` — a token that is *exactly* one string (its unescaped close-quote is the
-    /// last char). A string merely *glued into* a longer maudeId (`"x"y`, `foo"bar"`) is an `Ident`, not
-    /// a `Str` — Maude's `Token::computeSpecialProperty` (`token.cc:478`).
+    /// A string literal `"…"` whose unescaped closing quote is the token's final character. A string
+    /// glued into a longer identifier (`"x"y`, `foo"bar"`) is an `Ident`, not a `Str`.
     Str,
-    /// A float literal — Maude's `looksLikeFloat` forms (see [`is_float_literal`]): `1.5`, `-1.5`,
-    /// `5.0e-1`, and the abbreviated `1.`, `.5`, `1.e3`, `.5e2`, `1e3`, `Infinity`.
+    /// A float literal accepted by `is_float_literal`: `1.5`, `-1.5`, `5.0e-1`, and the abbreviated
+    /// forms `1.`, `.5`, `1.e3`, `.5e2`, `1e3`, and `Infinity`.
     Float,
-    /// A negative-integer literal `-[0-9]+` with a nonzero magnitude (Maude's `SMALL_NEG`): a `-` glued
-    /// to digits, lexed as one token. `-1.5` is a Float (checked first); a *spaced* `-` stays its own
-    /// token, so `5 - 7` is subtraction and `5 -7` fails to parse (just as in Maude).
+    /// A negative integer `-[0-9]+` with nonzero magnitude. The minus sign must be glued to the
+    /// digits. Float recognition takes precedence; a spaced `-` remains a separate token.
     NegNumber,
     /// A quoted identifier `'…`.
     Qid,
-    /// A glued rational literal `[-]num/den` (Maude's `RATIONAL`, [`is_rational_literal`]): `1/6`,
-    /// `-7/3`. A *spaced* `1 / 6` stays three tokens (the `_/_` division operator), so binary division
-    /// is unaffected — only a `/`-glued numeral pair reaches `classify` as one token, as in Maude.
+    /// A glued rational literal `[-]num/den`, recognized by `is_rational_literal`. A spaced
+    /// `1 / 6` remains three tokens and is parsed as binary division.
     Rational,
-    /// An `iter`-symbol input token `f^count` (Maude's `ITER_SYMBOL`, [`is_iter_token`]): `s_^10`,
-    /// `s_^18446744073709551616`. The text before the last `^` is the operator name, the trailing
-    /// (leading-nonzero) digits the iteration count.
+    /// An iteration-symbol token `f^count`, recognized by `is_iter_token`, such as `s_^10`. The text
+    /// before the final `^` is the operator name; the trailing nonzero-leading digits are the count.
     Iter,
 }
 
@@ -117,14 +111,14 @@ impl Token {
     }
 }
 
-/// A splitting punctuation char (its own token; not part of a maudeId).
+/// A splitting punctuation character (its own token; not part of an identifier).
 pub(crate) fn is_punct(c: char) -> bool {
     matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
 }
 
-/// Whether the maudeId built so far is a colon variable prefix `name:base`. `base` may still be empty
+/// Whether the identifier built so far is a colon-variable prefix `name:base`. `base` may still be empty
 /// while scanning the opening `[` of a kind-qualified variable (`A:[Maybe{Oid}]`). Quoted identifiers
-/// are operator names, never variables; punctuation following a Qid must remain syntax.
+/// are operator names, never variables; punctuation following one must remain syntax.
 fn colon_var_shape(text: &str) -> bool {
     matches!(
         text.rsplit_once(':'),
@@ -139,9 +133,7 @@ fn is_line_comment_start(chars: &[char], j: usize) -> bool {
         && chars.get(j + 2) == chars.get(j)
 }
 
-/// A top-level keyword that can begin a new statement/command/declaration — so a `.` immediately before
-/// one (on the same line) is a terminator. Maude's `SEEN_DOT` one-token lookahead, reduced to the
-/// functional-fragment keyword set.
+/// A top-level keyword that can follow a same-line terminating dot.
 fn is_top_level_keyword(w: &str) -> bool {
     matches!(
         w,
@@ -190,10 +182,8 @@ fn is_top_level_keyword(w: &str) -> bool {
 /// Whether `chars[i] == '.'` is a statement/command **terminator** rather than an ordinary token (a `.`
 /// inside a float `1.5`, a structured sort, or the `_._` operator).
 ///
-/// Maude's rule (the stateful `SEEN_DOT` lexer state) is one-token lookahead: a `.` terminates iff what
-/// follows it — skipping spaces/tabs — is end-of-line, EOF, a line comment, **or a top-level keyword**
-/// (a new statement/command, even on the same line, as in `sort N . op 0 : …`). A `.` followed by an
-/// ordinary token on the same line is the `_._` operator (`"ab" . "cd"`), not a terminator.
+/// A dot terminates when the next nonblank input is a newline, EOF, line comment, or top-level keyword.
+/// Before any ordinary token on the same line, it remains the `_._` operator.
 fn is_terminator_dot(chars: &[char], i: usize) -> bool {
     let mut j = i + 1;
     while matches!(chars.get(j), Some(' ') | Some('\t') | Some('\r')) {
@@ -216,10 +206,9 @@ fn is_terminator_dot(chars: &[char], i: usize) -> bool {
     is_top_level_keyword(&word)
 }
 
-/// A token is a STRING literal iff it starts with `"` and the matching *unescaped* close-quote is its
-/// LAST character — Maude's `Token::computeSpecialProperty` (`token.cc:478`). A token that merely
-/// *contains* a string (`"x"y`, `foo"bar"`) is an ordinary identifier, not a string constant. (The quote
-/// and backslash are ASCII, so byte-scanning is faithful even across multibyte string content.)
+/// A token is a string literal only when it starts with `"` and its matching unescaped close quote is
+/// the final character. A token containing a shorter quoted segment (`"x"y`, `foo"bar"`) is an
+/// identifier. ASCII quote and backslash bytes make byte scanning safe across multibyte content.
 fn is_string_literal(text: &str) -> bool {
     let bytes = text.as_bytes();
     if bytes.first() != Some(&b'"') {
@@ -236,9 +225,8 @@ fn is_string_literal(text: &str) -> bool {
     false // unterminated
 }
 
-/// The class of a scanned maudeId text. The order mirrors Maude's `Token::computeSpecialProperty`
-/// (`token.cc`): quoted-id / string, then `ITER_SYMBOL`, `FLOAT`, integer (`ZERO`/`SMALL_NEG`/
-/// `SMALL_NAT`), and finally `RATIONAL` — a token that is not any of these is an ordinary identifier.
+/// Classify scanned identifier text in precedence order: quoted identifier/string, iteration, float,
+/// integer, rational, then ordinary identifier.
 fn classify(text: &str) -> TokKind {
     if is_string_literal(text) {
         return TokKind::Str;
@@ -264,10 +252,9 @@ fn classify(text: &str) -> TokKind {
     TokKind::Ident
 }
 
-/// A glued rational literal — a faithful mirror of Maude's `Token::looksLikeRational` (`token.cc`): an
-/// optional leading `-`, a numerator (digits; a `0` numerator only as the unsigned `0/n`, never `-0/n`
-/// or `00/n`), a `/`, then a denominator that is digits with a nonzero leading digit (`den >= 1`, no
-/// leading zero). Examples: `1/6`, `2/4`, `-7/3`, `0/5`. Rejected: `1/0`, `1/06`, `-0/3`, `00/3`, `1/6/7`.
+/// A glued rational literal has an optional `-`, a decimal numerator, `/`, and a positive decimal
+/// denominator without a leading zero. Zero numerators must be exactly unsigned `0`. Examples:
+/// `1/6`, `2/4`, `-7/3`, `0/5`; rejected: `1/0`, `1/06`, `-0/3`, `00/3`, `1/6/7`.
 fn is_rational_literal(text: &str) -> bool {
     let (neg, rest) = match text.strip_prefix('-') {
         Some(r) => (true, r),
@@ -288,10 +275,8 @@ fn is_rational_literal(text: &str) -> bool {
     !den.is_empty() && den.bytes().all(|b| b.is_ascii_digit()) && den.as_bytes()[0] != b'0'
 }
 
-/// An `iter`-symbol input token `f^count` — a faithful mirror of Maude's `ITER_SYMBOL` branch of
-/// `Token::computeSpecialProperty` (`token.cc`): a non-empty operator-name prefix, a `^`, then a
-/// maximal run of trailing digits whose first digit is nonzero (so `f^0`/`f^01` are *not* iter tokens).
-/// The prefix may itself contain `_` (`s_^10`). `k` may be a bignum (`s_^18446744073709551616`).
+/// An iteration token `f^count` has a non-empty operator prefix, `^`, and a maximal trailing decimal
+/// count beginning with a nonzero digit. The prefix may contain `_`; the count may exceed `u64`.
 fn is_iter_token(text: &str) -> bool {
     let Some((prefix, digits)) = text.rsplit_once('^') else {
         return false;
@@ -302,10 +287,8 @@ fn is_iter_token(text: &str) -> bool {
         && digits.as_bytes()[0] != b'0'
 }
 
-/// A negative-integer literal: a `-` glued to one or more digits with a nonzero magnitude — Maude's
-/// `SMALL_NEG` (`mpz_set_str(s, 10)` succeeds and is `< 0`). `-1.5` has a `.` and is classified as a Float
-/// first; `-0`/`-00` (magnitude zero) is excluded — `0` is solely the declared zero constant (Maude maps
-/// it to `ZERO`), and a glued `-0` is a degenerate input.
+/// A negative-integer literal is `-` glued to decimal digits with nonzero magnitude. Floats are
+/// classified first; `-0` and `-00` are excluded because zero has its own token class.
 fn is_neg_integer(text: &str) -> bool {
     let Some(digits) = text.strip_prefix('-') else {
         return false;
@@ -315,14 +298,10 @@ fn is_neg_integer(text: &str) -> bool {
         && digits.bytes().any(|b| b != b'0')
 }
 
-/// A float literal — a faithful mirror of Maude's `looksLikeFloat` (`Utility/macros.cc`), so the lexer
-/// accepts exactly the forms the term builder can `float(String)`: an optional sign, then either
-/// `Infinity` or a mantissa/exponent that carries at least one digit AND a `.` or an `[eE]` exponent.
-/// Accepted: `1.5`, `-1.5`, `5.0e-1`, `2.0E+3`, and the abbreviated forms `1.`, `.5`, `1.e3`, `.5e2`,
-/// `1e3`, `Infinity`. Rejected (fall through to `Ident`, no parse — as Maude rejects them): a dangling
-/// exponent `1.5e`, a lone `.`, and a bare integer numeral `5` (that is a `Number`, handled earlier in
-/// [`classify`]). Tokens are whitespace-delimited, so `5.0 - 1.5` keeps `-` as its own token; only a
-/// sign written *attached* to the number (`-1.5`) reaches `classify` as a single token, as in Maude.
+/// A float literal has an optional sign followed by `Infinity` or a mantissa/exponent containing at
+/// least one digit and either a decimal point or `[eE]` exponent. Accepted forms include `1.5`,
+/// `-1.5`, `5.0e-1`, `1.`, `.5`, `1.e3`, `.5e2`, and `1e3`. A dangling exponent, lone point, or bare
+/// integer is not a float. Only a sign attached to the number is part of the token.
 fn is_float_literal(text: &str) -> bool {
     let t = text.strip_prefix(['+', '-']).unwrap_or(text);
     if t == "Infinity" {
@@ -355,9 +334,9 @@ fn is_float_literal(text: &str) -> bool {
     }
 }
 
-/// Tokenize Maude source into a [`Token`] stream (interning into `interner`). Handles whitespace, `***`/
-/// `---` line comments, the splitting punctuation, string literals, the terminator `.`, and maudeIds with
-/// backquote escaping.
+/// Tokenize module source into a [`Token`] stream, interning token text into `interner`. Handles
+/// whitespace, `***`/`---` comments, splitting punctuation, string literals, the terminator `.`, and
+/// identifier backquote escapes.
 pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
     // Guarantee the two mixfix fragment chars the `omod` class desugaring splices into synthesized
     // attribute names are interned. The surface parser only holds `&Interner`.
@@ -381,11 +360,9 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             i += 1;
             continue;
         }
-        // `***` / `---` comments. If the first non-blank character after the marker is `(`, it is a
-        // **bracketed** comment `***( … )` that runs until its parentheses balance — across newlines
-        // (Maude's `eatComment` parenMode, `lexerAux.cc`); a backquoted paren does not count. Otherwise it
-        // is a line comment to end of line. (The `***>`/`--->` echo forms have `>` as the first character,
-        // so they fall through to the line-comment case — never bracketed — just as in Maude.)
+        // `***` / `---` comments are bracketed across lines when the first nonblank character after
+        // the marker is `(`; parentheses balance, and backquoted parentheses do not count. Otherwise
+        // the comment ends with the line. Echo forms beginning `***>` or `--->` are line comments.
         let is_comment =
             |k: char| chars[i] == k && chars.get(i + 1) == Some(&k) && chars.get(i + 2) == Some(&k);
         if is_comment('*') || is_comment('-') {
@@ -441,15 +418,14 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             i += 1;
             continue;
         }
-        // A maudeId: a run of non-whitespace, non-punctuation chars (with backquote escaping), stopping at
-        // a terminator `.`. A string literal `"…"` is a `normal` char in Maude's grammar (`lexer.ll`), so
-        // it is consumed *into* the maudeId — a glued `foo"bar"`/`"x"y` stays one token; classify then
-        // sorts a lone-string token (`"hi"`) into `Str` and a glued one into `Ident`.
+        // Scan an identifier token until whitespace, punctuation, or a terminating dot. Quoted string
+        // syntax can remain embedded, so `foo"bar"` and `"x"y` each stay one identifier; a lone quoted
+        // token classifies as a string.
         let mut text = String::new();
         while i < n {
             let ch = chars[i];
-            // A string literal is a `normal`: consume the whole `"…"` (with `\`-escapes) and keep scanning,
-            // so it glues into the surrounding maudeId rather than splitting it (`a"b"c`, `"x"y` = 1 token).
+            // Consume a complete quoted segment and keep scanning so it can remain embedded in the
+            // surrounding identifier (`a"b"c` and `"x"y` are each one token).
             if ch == '"' {
                 text.push(ch);
                 i += 1;
@@ -573,9 +549,8 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
             }
             if ch == '`' && i + 1 < n {
                 let next = chars[i + 1];
-                // A backquote before a *split* char (`_`/`:`/punct) escapes it: the char joins this token.
-                // Token names normally discard that lexical escape. The one exception is Maude's
-                // object-attribute suffix `` `:_ ``: its backquote is part of the reflected operator Qid.
+                // Backquote escapes split characters into this token. The object-attribute suffix
+                // `` `:_ `` retains the backquote in its reflected operator identifier.
                 if next == '_' || next == ':' || is_punct(next) {
                     if text.starts_with('\'')
                         && next == ':'
@@ -587,12 +562,9 @@ pub fn tokenize(src: &str, interner: &mut Interner) -> Vec<Token> {
                     i += 2;
                     continue;
                 }
-                // A backquote before a *normal* char is an inter-token blank (Maude's op-name spacing).
-                // Inside a quoted identifier (`'`…) it is kept as content — `` 'c`d_ `` is one Qid — so a
-                // spelled-out multi-token Qid round-trips through the meta level. In a *bare* identifier it
-                // *separates* two tokens (`` hello`world `` ≡ the name `hello world`), exactly like a space:
-                // end this token here and resume scanning at the next char, so a term written either way
-                // (`hello world` or `` hello`world ``) tokenizes the same.
+                // Before a normal character, backquote denotes an inter-token blank. A quoted
+                // identifier retains it as content; a bare identifier ends here, making
+                // `` hello`world `` tokenize like `hello world`.
                 if text.starts_with('\'') {
                     text.push('`');
                     text.push(next);
@@ -626,17 +598,15 @@ pub enum Frag {
 
 /// Split an operator name's text into mixfix fragments at `_`: `_+_` → `[Hole, +, Hole]`; `s_` →
 /// `[s, Hole]`; `if_then_else_fi` → `[if, Hole, then, Hole, else, Hole, fi]`; a bare `gcd` → `[gcd]`
-/// (prefix-only). (A name whose tokens are split by punctuation — e.g. `<_,_>`, split at `,` — is
-/// assembled by the surface parser from the per-token results; B4.5.)
+/// (prefix-only). Names split by punctuation, such as `<_,_>`, are reassembled by the surface parser
+/// from these per-token fragments.
 pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
     let mut frags = Vec::new();
     let mut pending = String::new();
     let mut chars = name.chars().peekable();
     while let Some(ch) = chars.next() {
-        // A backquote before a *split* char (`_`/punct) escapes it — a *literal* part of the surrounding
-        // token, so `` _`[_ `` is one bracket op, not a structural `[`. A backquote before a normal char
-        // (including `:`) is an inter-token blank (Maude's op-name spacing, `` c`d_ `` / `` bal`:_ ``):
-        // it ends the current literal fragment, and the next char starts a fresh one.
+        // Backquote escapes split characters into the current fragment. Before a normal character it
+        // separates operator-name fragments.
         if ch == '`' {
             match chars.peek() {
                 Some(&next) if next == '_' || is_punct(next) => {
@@ -662,8 +632,8 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
         // separator that is always written space-delimited (`bal :_`, `<_:_|_>`), so in a *term* it is
         // its own token (`bal : n0` → `bal`, `:`, `n0` — `bal:n0` with no space would be a variable).
         // The name's tokens, however, get concatenated into the canonical string (`[bal][:_]` → `bal:_`),
-        // gluing the `:` to `bal`; splitting it back out here makes the grammar terminal `:` match the
-        // term's standalone `:` (object/message attribute ops `bal :_`/`turns :_`, Pillar 2.5).
+        // gluing `:` to `bal`; splitting it back out makes the grammar terminal `:` match the term's
+        // standalone colon in object/message attribute operators such as `bal :_` and `turns :_`.
         // The lexer reserves `:=` as one token (matching conditions, strategy definitions, and ordinary
         // user mixfix operators such as assignment). Keep the operator grammar on the same tokenization;
         // the generic colon branch below would otherwise split `_:=_` into the unmatchable `:` + `=`.
@@ -685,9 +655,9 @@ pub fn split_mixfix(name: &str, interner: &mut Interner) -> Vec<Frag> {
             if ch == '_' {
                 frags.push(Frag::Hole);
             } else if ch == ':' {
-                // A maximal run of `:` is ONE maudeId token in the main lexer (`::` in `X :: Y`),
-                // so it must be one fragment here too — split per-char, `_::_`'s two `:` fragments
-                // could never match a term's single `::` token, and printed with an inner space.
+                // A maximal run of `:` is one identifier token in the main lexer (`::` in `X :: Y`).
+                // It must therefore remain one fragment here: per-character fragments could neither
+                // match a term's single `::` token nor print without an inner space.
                 let mut run = String::from(":");
                 while chars.peek() == Some(&':') {
                     chars.next();
@@ -761,7 +731,7 @@ mod tests {
 
     /// A structured-sort colon variable keeps its braces in one token (`L:List{Nat}`, and the chained
     /// `X:Box{A}{B}`), so it matches the `ColonVar` grammar terminal — but a *plain* structured sort
-    /// (`List{Nat}`, no colon) still splits on the braces. `N:Nat` (unstructured) is one token as before.
+    /// (`List{Nat}`, no colon) still splits on the braces. `N:Nat` is one token.
     #[test]
     fn structured_colon_variable_is_one_token() {
         let (_i, t) = lex("hd(c(N:Nat, L:List{Nat}), X:Box{A}{B}) List{Nat}");
@@ -794,9 +764,8 @@ mod tests {
         );
     }
 
-    /// A bracketed comment `***( … )` / `---( … )` (the first non-blank after the marker is `(`) runs until
-    /// its parentheses balance — across newlines, with backquoted parens not counting; a plain `***`/`---`
-    /// comment runs to end of line. (Maude's `eatComment` parenMode.)
+    /// A bracketed `***( … )` or `---( … )` comment spans balanced parentheses across lines;
+    /// backquoted parentheses do not count. Plain `***` and `---` comments end at the newline.
     #[test]
     fn bracketed_and_line_comments() {
         let texts = |s| {
@@ -839,11 +808,9 @@ mod tests {
         );
     }
 
-    /// Maude's grammar admits a string literal as a `normal` char (`lexer.ll`: `normal = […|{string}]`),
-    /// so a string can be glued INTO a maudeId — `a"b"c`, `foo"bar"`, `"x"y` are each ONE identifier
-    /// token, while a bare `"hello"`/`""` is a `Str` constant (its unescaped close-quote is the last char —
-    /// `Token::computeSpecialProperty`, `token.cc:478`). Verified byte-identical to the reference binary:
-    /// `op a"b"c : -> S .` ⇒ `result S: a"b"c`. Bare strings around space/paren/comma still split.
+    /// A quoted string segment can occur inside one identifier token: `a"b"c`, `foo"bar"`, and
+    /// `"x"y` are identifiers, while a bare complete string is a `Str` constant. Strings separated
+    /// by whitespace or punctuation remain separate tokens.
     #[test]
     fn string_glued_into_identifier() {
         use TokKind::*;
@@ -855,7 +822,7 @@ mod tests {
             [("\"\"".into(), Str)],
             "the empty string is a Str"
         );
-        // A string glued into an identifier is ONE `Ident` token (Maude keeps the whole maudeId).
+        // A string segment glued to other text produces one `Ident` token.
         assert_eq!(t(r#"a"b"c"#), [("a\"b\"c".into(), Ident)]);
         assert_eq!(t(r#"foo"bar""#), [("foo\"bar\"".into(), Ident)]);
         assert_eq!(
@@ -865,7 +832,7 @@ mod tests {
         );
         // An escaped quote inside the string does not end it; the trailing `"` does.
         assert_eq!(t(r#""a\"b""#), [("\"a\\\"b\"".into(), Str)]);
-        // Bare strings separated by space/paren/comma still split (the only form real specs use).
+        // Bare strings separated by whitespace or punctuation remain separate tokens.
         assert_eq!(
             t(r#"len("hello")"#),
             [
@@ -875,8 +842,8 @@ mod tests {
                 (")".into(), Punct),
             ]
         );
-        // `"ab" . "cd"` is `_._` String concat: the middle `.` (followed by `"cd"`, not a keyword) is an
-        // ordinary `Ident` operator token, not a terminator — exactly as in `red "ab" . "cd" .`.
+        // In `"ab" . "cd"`, the middle `.` is followed by another token rather than a top-level keyword,
+        // so it remains the `_._` string-concatenation operator instead of terminating the command.
         assert_eq!(
             t(r#""ab" . "cd""#),
             [
@@ -887,15 +854,9 @@ mod tests {
         );
     }
 
-    /// Leading-zero numerals stay the broad `Number` kind. `classify` assigns `Number` to *every*
-    /// all-digit run (`0`, `00`, `01`, `007`, `123`) — mirroring Maude's two-stage design: flex first
-    /// lexes `00`/`01` as a single identifier (`maudeId`) token, and the term parser *then* re-classifies
-    /// it by text via `Token::specialProperty` (`mpz_set_str(text, 10)` → `ZERO` / `SMALL_NAT`). The
-    /// ZERO-vs-SMALL_NAT split — so `0` is the zero constant, all-zero runs `00`/`000` fail to parse, and
-    /// `01`/`007` reduce to the numbers `1`/`7` with leading zeros stripped — is reproduced *downstream*
-    /// at the grammar terminal (`cfparser/earley.rs`: `SmallNat` matches a `Number` token only when it has
-    /// a non-zero digit). Reclassifying a leading-zero run as `Ident` *here* would regress `01`→1 / `007`→7,
-    /// which the reference binary accepts. (Differentially verified vs `~/Downloads/Maude-3/maude`.)
+    /// `classify` leaves every all-digit run in the broad `Number` class. Grammar matching then rejects
+    /// all-zero multi-digit spellings while accepting leading-zero positive numerals and normalizing
+    /// their value.
     #[test]
     fn leading_zero_numerals_stay_number() {
         use TokKind::*;
@@ -913,7 +874,7 @@ mod tests {
         );
         assert_eq!(classify("007"), Number);
         assert_eq!(classify("123"), Number);
-        // A glued negative-zero is not a numeral at all — Maude excludes it (`-0` → no parse) and so do we.
+        // A glued negative zero is not a numeral and therefore remains an identifier.
         assert_eq!(classify("-0"), Ident);
     }
 
@@ -926,10 +887,8 @@ mod tests {
         assert_eq!(t[2].1, TokKind::Dot);
     }
 
-    /// Signed/exponent float literals and glued negative integers (`SMALL_NEG`). A `-` glued to a numeral
-    /// is part of the literal token (`-1.5` Float, `-7` NegNumber); a *spaced* `-` stays its own token, so
-    /// binary subtraction (`5.0 - 1.5`, `5 - 7`) is unaffected — and `5 -7` fails to parse just as Maude
-    /// rejects it. (Float gap found by the whole-conformance-suite sweep; C10 added the integer case.)
+    /// A glued sign belongs to its literal token; a spaced sign remains an operator. This keeps binary
+    /// subtraction distinct while recognizing signed floats and negative integers.
     #[test]
     fn signed_and_exponent_floats() {
         assert_eq!(classify("-1.5"), TokKind::Float);
@@ -937,7 +896,7 @@ mod tests {
         assert_eq!(classify("5.0e-1"), TokKind::Float);
         assert_eq!(classify("2.0E+3"), TokKind::Float);
         assert_eq!(classify("4.0"), TokKind::Float);
-        // A dotless `-N` is a negative-integer literal (Maude's `SMALL_NEG`), not a float.
+        // A dotless `-N` is a negative-integer literal rather than a float.
         assert_eq!(
             classify("-3"),
             TokKind::NegNumber,
@@ -949,10 +908,8 @@ mod tests {
             TokKind::Ident,
             "`-0` (magnitude zero) is not SMALL_NEG"
         );
-        // Abbreviated float forms Maude's `looksLikeFloat` ACCEPTS (verified against Maude 3.5.1:
-        // `reduce in FLOAT : 1. .` → `result FiniteFloat: 1.0`, `.5` → `5.0e-1`, `1.e3`/`1e3` → `1.0e+3`,
-        // `.5e2` → `5.0e+1`, `Infinity` → `result Float: Infinity`). The prior pins asserted Maude
-        // rejected `1.`/`.5` — it does not.
+        // Abbreviated float forms and their canonical values: `1.` → `1.0`, `.5` → `5.0e-1`,
+        // `1.e3`/`1e3` → `1.0e+3`, `.5e2` → `5.0e+1`; `Infinity` remains infinite.
         assert_eq!(classify("1."), TokKind::Float);
         assert_eq!(classify(".5"), TokKind::Float);
         assert_eq!(classify("1.e3"), TokKind::Float);
@@ -960,7 +917,7 @@ mod tests {
         assert_eq!(classify("1e3"), TokKind::Float);
         assert_eq!(classify("Infinity"), TokKind::Float);
         assert_eq!(classify("-Infinity"), TokKind::Float, "signed Infinity");
-        // …and the forms it still REJECTS (verified: `1.5e` → `bad token 1.5e`, lone `.` → parse error).
+        // A dangling exponent and a lone point remain identifiers.
         assert_eq!(
             classify("1.5e"),
             TokKind::Ident,
@@ -983,8 +940,8 @@ mod tests {
                 ("1.5", TokKind::Float)
             ]
         );
-        // A glued `-7` is one `NegNumber` token; a spaced `- 7` and `5 - 7` keep `-` separate. So `5 -7`
-        // lexes as `5`, `-7` (which then fails to parse, exactly as the reference binary rejects it).
+        // A glued `-7` is one `NegNumber`; spaced subtraction keeps `-` separate. Consequently
+        // `5 -7` tokenizes as `5`, `-7` and does not parse as subtraction.
         let toks = |s| lex(s).1;
         assert_eq!(
             toks("-7 quo 2"),

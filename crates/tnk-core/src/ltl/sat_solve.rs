@@ -6,7 +6,7 @@ use crate::engine::{Runtime, SatSolveStats, Signature};
 use crate::symbol::SatSolverHooks;
 
 /// Reduce one `satSolve(F)` redex. `None` means `F` is not a valid negative-normal-form LTL formula,
-/// matching the reference hook's fall-through to user equations.
+/// so the redex falls through to user equations.
 pub(crate) fn solve(
     runtime: &mut Runtime,
     sig: &Signature,

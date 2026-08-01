@@ -1,6 +1,4 @@
-*** AU (associative, not commutative, [id:]) conformance (Stage B1) vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/au.maude < /dev/null
-*** Mirrors crates/tnk-core/src/{au.rs,engine.rs} AU tests.
+*** Associative-with-identity matching and reduction
 
 fmod AU-MATCH is
   sort E .

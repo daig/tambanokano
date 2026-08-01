@@ -1,9 +1,7 @@
-*** Phase 1.5 / C3 — order-dependent equation + membership application matches the reference binary.
+*** Order-dependent equation + membership application.
 *** The first-DECLARED matching equation fires (declaration order, NOT specificity); comparable membership
 *** targets apply smallest-sort-first with no double count. Differential vs the binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-eq-mb-order.maude < /dev/null
-*** The contradictory-membership tiebreak (incomparable targets) and repeated-subterm sharing are separate
-*** documented residuals (C7), not exercised here.
+*** Incomparable membership targets and repeated-subterm sharing are covered by separate fixtures.
 fmod EQORD is
   sort S .
   ops a d b c : -> S [ctor] .

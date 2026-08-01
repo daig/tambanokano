@@ -1,4 +1,4 @@
-//! The META-LEVEL descent seam (Phase 3.1).
+//! The META-LEVEL descent seam.
 //!
 //! A descent function (`metaReduce`/`metaApply`/…) is a [`SpecialOp::Meta`](crate::symbol::SpecialOp)
 //! that, mid-reduction, down-translates its meta-term arguments into a real object module, runs an engine
@@ -6,10 +6,10 @@
 //! pipeline (parse/flatten/build) + the module database, which live *above* `tnk-core` — but the trigger
 //! is inside this crate's reduce loop. So the loop calls *up* through a trait object:
 //!
-//! * [`DescentOps`] is the seam, implemented in the frontend (`tnk_frontend::meta`). The reduce path
-//!   threads a `&mut dyn DescentOps` and [`try_special`](crate::engine) hands a `Meta` redex to it.
+//! * [`DescentOps`] is the seam, implemented by `tnk_modules::meta::MetaDescent` and used by
+//!   `tnk-session`. The reduce path threads a `&mut dyn DescentOps`; `try_special` hands a `Meta` redex to it.
 //! * [`MetaCtx`] is what the handler gets to read the redex's meta-terms and build the up-result *in the
-//!   current engine* — a public, minimal view over the otherwise crate-private [`Runtime`]/[`Signature`].
+//!   current engine* — a public, minimal view over the otherwise crate-private `Runtime`/`Signature`.
 //!   (Building the throwaway *object* sub-module is a separate `Engine` the handler owns; it never touches
 //!   `MetaCtx`.)
 //!
@@ -89,8 +89,8 @@ impl MetaCtx<'_> {
     pub fn make_na(&mut self, sym: SymbolId, value: NaValue) -> DagId {
         self.rt.make_na(self.sig, sym, value)
     }
-    /// Record the first actual ascent of a synthesized quoted identifier. Maude interns the complete
-    /// `name:Sort` payload lazily; META-level AC sets therefore compare these values by ascent order.
+    /// Record the first ascent of a synthesized quoted identifier. Complete `name:Sort` payloads are
+    /// ranked lazily, so META-level AC sets compare them by ascent order.
     pub fn rank_qid(&mut self, text: &str) {
         self.rt.register_qid_rank(text);
     }
@@ -150,8 +150,8 @@ impl MetaCtx<'_> {
             .find(|&range| self.sig.sorts().leq(range, domain))?;
         Some(self.rt.make_const_at_sort(self.sig, zero, sort))
     }
-    /// Build an `iter` successor with a **decimal** (unbounded) count — for a `Nat` result that does not
-    /// fit `u64` (the legacy `metaUnify` next-index). `None` if `count` is not a decimal numeral.
+    /// Build an `iter` successor with a **decimal** (unbounded) count, used when a Nat-family
+    /// `metaUnify` next-index does not fit `u64`. `None` if `count` is not a decimal numeral.
     pub fn make_iter_decimal(&mut self, sym: SymbolId, count: &str, arg: DagId) -> Option<DagId> {
         Some(
             self.rt
@@ -280,9 +280,8 @@ impl MetaCtx<'_> {
     pub fn symbol_is_command_variable(&self, sym: SymbolId) -> bool {
         matches!(self.sig.symbol(sym).class(), SymbolClass::Variable { .. })
     }
-    /// Add `n` to this engine's rewrite counter — a descent function reports the object-level reduction's
-    /// rewrites as part of its own (Maude's `metaReduce` count = the object rewrites + 1 for the descent
-    /// itself, the `+1` coming from the normal `try_special` increment).
+    /// Add `n` object-level rewrites to this engine's count. The enclosing special-operation dispatch
+    /// counts the descent rewrite separately.
     pub fn add_rewrites(&mut self, n: u64) {
         self.rt.add_rewrites(n);
     }
@@ -302,7 +301,7 @@ impl MetaCtx<'_> {
     pub fn rewrites(&self) -> u64 {
         self.rt.rewrites()
     }
-    /// Restore a previously observed count after an intentionally uncharged auxiliary computation.
+    /// Restore a saved count after an intentionally uncharged auxiliary computation.
     pub fn restore_rewrites(&mut self, count: u64) {
         self.rt.rewrite_count = count;
     }

@@ -4,19 +4,11 @@
 //! multi-solution (e.g. `X + Y <=? a + b + c` has 6 solutions), so the [`AcuSubproblem`] is a
 //! resumable enumerator driven through the [`crate::theory`] seam's `next()` stream.
 //!
-//! **Strategy (correctness-first).** We enumerate *every* solution by a direct backtracking
-//! distribution of the subject multiset among the pattern variables — not Maude's optimized
-//! bipartite + Diophantine solver (a later perf step). Two ordering rules make this reproduce the
-//! reference binary's *rewrite counts*, which depend on solution order even for confluent systems
-//! (verified empirically: `eq X+X=X` on `a+a+a+a` is 3 rewrites, not 1):
-//! - solutions are yielded **minimal-matched-size first**, so a repeated/over-large variable binds
-//!   the *smallest* multiset that works (Maude binds `X` to a single `a`, not to `a+a`);
-//! - the degenerate **matched-size-0** solution (every variable bound to the identity, no ground
-//!   part) is skipped — it is the identity no-op that would rewrite a term to itself.
+//! The no-alien path converts residual multiplicities into a lazy Diophantine system; non-ground
+//! aliens compose their own theory matchers through the shared subproblem stream. Enumeration is
+//! deterministic and minimal-matched-size first; the all-identity/no-residue no-op appears only when
+//! matching the identity itself requires it.
 //!
-//! Scope (this slice): ground subterms + variables (linear and non-linear) under the AC operator,
-//! with two-sided identity. **Alien** (non-ground, non-variable) subterms under the AC operator, the
-//! red-black tree representation, and lazy subproblems are follow-ups.
 
 use crate::acu_matcher::{AcuMatcher, MatcherVar};
 use crate::dag::{DagId, NodeTerm};
@@ -29,25 +21,22 @@ use crate::theory::{LhsAutomaton, RewriteMatchContext};
 use std::collections::HashSet;
 
 /// A compiled ACU left-hand side: the flattened pattern multiset partitioned into ground subterms
-/// (each consumes one structurally-equal subject element), **aliens** (non-ground non-variable
-/// subterms, each matched recursively by its own automaton — Maude's `NonGroundAlien`), and distinct
-/// variables.
+/// (each consumes one structurally equal subject element), **aliens** (non-ground, non-variable
+/// subterms matched recursively), and distinct variables.
 #[derive(Clone)]
 pub(crate) struct AcuLhs {
     symbol: SymbolId,
     /// Ground, free-matchable sub-patterns; each must match one structurally-equal subject element
     /// (the deterministic fast path — no sub-automaton needed).
     grounds: Vec<Term>,
-    /// Alien sub-patterns: a non-ground subterm (e.g. `s M` under `+`) or a theory-rooted subterm,
-    /// each compiled to its own [`LhsAutomaton`] and matched recursively against a subject element
-    /// (Maude's `ACU_LhsAutomaton::NonGroundAlien`). Structurally-equal aliens are merged with a
-    /// summed multiplicity, mirroring the canonical pattern multiset (`s M + s M` ⇒ one alien × 2).
+    /// Alien sub-patterns: non-ground or theory-rooted subterms, each matched recursively against a
+    /// subject element. Structurally equal aliens merge by summed multiplicity.
     aliens: Vec<AcuAlien>,
     /// Distinct variable occurrences under the operator (a repeated index is non-linear).
     vars: Vec<AcuVar>,
     identity: Option<IdentityId>,
-    /// `true` when this pattern is Maude's top-level repeated-variable special case
-    /// (`X + ... + X`, no grounds/aliens, no identity or condition-variable conflict).
+    /// Repeated-variable fast path: `X + ... + X` with no grounds, aliens, identity, or
+    /// condition-variable conflict.
     special_nonlinear: bool,
 }
 
@@ -67,17 +56,15 @@ struct AcuVar {
     /// How many times this variable index occurs in the pattern (the Diophantine coefficient).
     count: u32,
     sort: SortId,
-    /// Diophantine **lower bound** on the binding size: `0` if the variable can take the identity
-    /// (Maude's `takeIdentity`), else `1`. Computed at compile from the operator + variable sort.
+    /// Binding-size lower bound: zero when the variable can bind the identity, otherwise one.
     lower_bound: i32,
-    /// Diophantine **upper bound** on the binding size (Maude's `sortBound`): `1` for an element sort,
-    /// [`UNBOUNDED`] for a collector. Distinguishes stripper rows from collector rows.
+    /// Binding-size upper bound: one for an element sort, [`UNBOUNDED`] for a collector.
     upper_bound: i32,
 }
 
-/// Structural equality on patterns (same operator + recursively-equal args, or the same variable
-/// index) — the key that merges repeated aliens into one with a summed multiplicity, exactly as the
-/// canonical pattern multiset would. Author-shallow recursion (alien patterns are small).
+/// Structural equality for pattern multiset elements: operators compare recursively, variables by
+/// substitution index, and atomic values by payload. Repeated aliens merge under this relation and
+/// sum their multiplicities.
 fn term_eq(a: &Term, b: &Term) -> bool {
     match (a, b) {
         (Term::Var(x), Term::Var(y)) => x.index == y.index,
@@ -108,9 +95,8 @@ fn term_eq(a: &Term, b: &Term) -> bool {
 }
 
 impl AcuLhs {
-    /// Compile an ACU pattern, suppressing the repeated-variable fast path when its variable occurs
-    /// in the enclosing statement's condition. Maude then needs the general solution stream so a
-    /// failed condition can backtrack.
+    /// Compile an ACU pattern, disabling the repeated-variable fast path when its variable occurs in
+    /// the enclosing condition so failed fragments can backtrack into the general solution stream.
     pub(crate) fn compile_avoiding_nonlinear_vars(
         lhs: Term,
         sig: &Signature,
@@ -118,8 +104,7 @@ impl AcuLhs {
     ) -> Self {
         let symbol = lhs.top_symbol().expect("ACU lhs must be an application");
         let identity = sig.symbol(symbol).identity();
-        // Per-sort bounds for this operator's kind (Maude's `sortBound`), computed once: each top
-        // variable's Diophantine row `maxSize` (element vs collector) — see [`AcuVar`].
+        // Per-sort bounds determine whether each top-variable row is an element or collector.
         let sort_bounds = sig.acu_sort_bounds(symbol);
         let mut grounds: Vec<Term> = Vec::new();
         let mut aliens: Vec<AcuAlien> = Vec::new();
@@ -129,10 +114,8 @@ impl AcuLhs {
         while let Some(t) = stack.pop() {
             match t {
                 Term::Op { symbol: s, args } if s == symbol => {
-                    // `stack` is LIFO, so push arguments right-to-left. Maude records top
-                    // variables in left-to-right pattern order, and equal Diophantine rows retain
-                    // that order; it therefore determines which variable receives the first
-                    // canonical subject element during solution enumeration.
+                    // Push arguments right-to-left so the LIFO traversal retains pattern occurrence
+                    // order, which breaks ties between equal distribution rows.
                     stack.extend(args.into_iter().rev());
                 }
                 Term::Var(v) => match vars.iter_mut().find(|av| av.index == v.index) {
@@ -212,11 +195,9 @@ impl AcuLhs {
         subject: DagId,
         ext_allowed: bool,
     ) -> Option<AcuSubproblem> {
-        // **Collapse matching** (mirrors `au`): a subject not rooted at this operator is a one-element
-        // multiset — or the empty multiset if it is the operator's identity. So an ACU pattern `(E, S)`
-        // (e.g. SET's `_,_ [assoc comm id: empty]`) matches a singleton set `c` as `E = c, S = empty`,
-        // which arises whenever the pattern is an *argument* (`$intersect((E, S), …)` on a singleton),
-        // not only at the top. A collapsed subject is the whole multiset, so extension is off for it.
+        // A subject outside this operator is a singleton multiset, or empty when it is the identity.
+        // This permits collapsed matching in nested argument positions. A collapsed subject is the
+        // whole multiset, so extension is disabled for it.
         let mut subject_is_identity = false;
         let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
             NodeTerm::Acu { symbol, args } if *symbol == self.symbol => (args.clone(), ext_allowed),
@@ -243,11 +224,8 @@ impl AcuLhs {
             }
         }
 
-        // Symbolic instantiation copies bindings up to eager, so a retained ACU DAG can contain
-        // distinct entries that are structurally equal. Maude's AC matcher treats those entries as
-        // one multiset element; coalesce the residual here (without rewriting the retained DAG) before
-        // constructing the Diophantine columns. Keeping the first occurrence preserves enumeration
-        // order while making a nonlinear pattern such as `X * X` match two copied equal arguments.
+        // Symbolic instantiation can leave distinct, structurally equal entries inside an ACU
+        // node. Coalesce them for multiset matching while retaining first-occurrence order.
         let mut merged = Vec::with_capacity(multiset.len());
         for (element, multiplicity) in multiset {
             if let Some((_, count)) = merged
@@ -262,11 +240,9 @@ impl AcuLhs {
         let multiset = merged;
 
         let var_coeffs: Vec<u32> = self.vars.iter().map(|v| v.count).collect();
-        // No aliens: the whole match is a pure Diophantine distribution of the residual multiset among
-        // the top variables (+ an extension row). The [`AcuMatcher`] enumerates it **lazily** in
-        // Maude's order — the D2a fix (the naive path materialised every distribution eagerly). With
-        // aliens present we defer to the alien path in `next` instead (matching an alien builds binding
-        // nodes, so it needs `&mut Runtime` the immutable first phase does not have).
+        // Without aliens, lazily distribute the residual multiset among top variables and an optional
+        // extension row. Alien matching is deferred to `next` because it needs mutable runtime access
+        // to build binding nodes.
         let matcher = if self.aliens.is_empty() {
             let elements: Vec<DagId> = multiset.iter().map(|&(e, _)| e).collect();
             let mult: Vec<u32> = multiset.iter().map(|&(_, m)| m).collect();
@@ -398,11 +374,8 @@ fn enumerate_distributions(
         }
         let all_vars_filled = identity || var_total.iter().all(|&t| t > 0);
         let matched: u32 = coeffs.iter().zip(&var_total).map(|(&c, &t)| c * t).sum();
-        // The all-identity assignment (matched == 0, nothing consumed) is a real Maude match
-        // ONLY when the subject IS the identity element (`eq (S ; S) = S` fires once on `e`);
-        // on any other subject an empty match is not offered (oracle: `red a` under that eq is
-        // 0 rewrites). With grounds present, a zero VARIABLE contribution still consumed the
-        // grounds, which is a genuine match (`eq a + X = c` on `a`, X := e).
+        // The zero-consumption assignment is valid only for an identity subject. Grounds count as
+        // consumed even when every variable contributes the identity.
         if all_vars_filled && (has_grounds || matched > 0 || subject_is_identity) {
             out.push(Candidate {
                 to_var: chosen.iter().map(|s| s.to_var.clone()).collect(),
@@ -553,7 +526,7 @@ impl AcuSubproblem {
     /// Advance to the next solution, binding its variables into `subst` and recording its residue;
     /// `false` when exhausted. Builds binding nodes (so it needs `&mut Runtime`); a candidate whose
     /// binding violates a variable's sort is skipped. Dispatches to the alien path when the pattern has
-    /// alien subterms, else the proven no-alien variable-distribution path.
+    /// alien subterms, otherwise to the lazy no-alien Diophantine path.
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         if !self.aliens.is_empty() {
             for &idx in &self.bound {
@@ -609,10 +582,8 @@ impl AcuSubproblem {
         true
     }
 
-    /// Enumerate every solution of the alien + variable parts against the post-grounds multiset,
-    /// **greedy-first** (Maude's `ACU_GreedyMatcher` order): each alien is tried against the subject
-    /// elements in canonical order, taking the first match before the next. `base` seeds the scratch
-    /// substitution so existing (outer / non-linear) bindings are respected.
+    /// Enumerate alien and variable solutions greedily: try each alien against canonical subject
+    /// elements and retain match order. `base` preserves existing outer or nonlinear bindings.
     fn enumerate_aliens(
         &self,
         rt: &mut Runtime,
@@ -804,8 +775,7 @@ mod tests {
     /// Each solution: the variable bindings (by index) and the residue (extension) multiset.
     type Solutions = Vec<(Vec<Option<DagId>>, Vec<(DagId, u32)>)>;
 
-    /// Drive `match_` + `next` to collect every solution as `(variable bindings, residue)`. Mirrors
-    /// the reference binary's `match`/`xmatch` enumeration.
+    /// Collect every `match_`/`next` solution as `(variable bindings, residue)` in enumeration order.
     fn match_all(
         e: &mut Engine,
         pattern: Term,
@@ -828,11 +798,8 @@ mod tests {
         out
     }
 
-    /// The **naive** no-alien matcher (the pre-Diophantine algorithm), kept live as a test-gated
-    /// cross-check oracle per the AC-matcher plan's discipline. Replicates the old `match_` phase-1
-    /// (collapse / ground consumption) + eager `enumerate_distributions` + candidate→binding build,
-    /// returning the same `(bindings, residue)` stream. Used by [`differential_naive_vs_diophantine`]
-    /// to assert the new lazy path yields the identical solution multiset on small subjects.
+    /// Eagerly enumerate complete no-alien `(bindings, residue)` solution sets through explicit
+    /// multiset distributions.
     fn naive_match_all(
         e: &mut Engine,
         pattern: Term,
@@ -843,12 +810,12 @@ mod tests {
         let lhs = AcuLhs::compile_avoiding_nonlinear_vars(pattern, e.signature(), &HashSet::new());
         assert!(
             lhs.aliens.is_empty(),
-            "naive cross-check is for the no-alien path"
+            "eager distribution enumerator requires a no-alien pattern"
         );
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let (sig, rt) = e.parts_mut();
-        // Phase 1: collapse detection + ground consumption (identical to `match_`).
+        // Classify collapsed subjects and consume ground subterms before distributing variables.
         let mut subject_is_identity = false;
         let (mut multiset, ext): (Vec<(DagId, u32)>, bool) = match &rt.node(subject).term {
             NodeTerm::Acu { symbol, args } if *symbol == lhs.symbol => (args.clone(), ext_allowed),
@@ -932,9 +899,8 @@ mod tests {
         out
     }
 
-    /// Canonicalize a solution stream to a *set* of comparable name-tuples (per-variable binding
-    /// name-multiset + residue name-multiset), so two matchers' outputs can be compared ignoring
-    /// enumeration order and node identity.
+    /// Canonicalize a solution stream to an order- and node-identity-independent set of name tuples,
+    /// including each variable binding and the extension residue.
     fn solution_set(
         e: &Engine,
         sols: &Solutions,
@@ -956,8 +922,7 @@ mod tests {
             .collect()
     }
 
-    /// Decode a term into a sorted multiset of leaf-constant names (an AC binding `b+c` → `["b","c"]`,
-    /// a constant `a` → `["a"]`), so a solution's bindings can be compared against the reference.
+    /// Decode a term into a sorted multiset of leaf-constant names for solution-set comparisons.
     fn names(e: &Engine, id: DagId) -> Vec<String> {
         let node = e.node(id);
         let kids: Vec<DagId> = node.children().collect();
@@ -970,10 +935,8 @@ mod tests {
         }
     }
 
-    /// Differential cross-check (AC-matcher plan discipline): the new lazy Diophantine path and the
-    /// retained naive `enumerate_distributions` path must yield the **identical solution multiset** on
-    /// small subjects. Exercises several shapes: 2 collectors, a coefficient-2 variable, an element +
-    /// collector pair, the identity-collapse case, and extension.
+    /// Cover complete no-alien solution sets for two collectors, a repeated variable, an element and
+    /// collector pair, identity collapse, and extension matching.
     #[test]
     fn differential_naive_vs_diophantine() {
         // Build a small AC signature with an identity and an element sort, plus a plain-AC sibling.
@@ -1013,7 +976,7 @@ mod tests {
                 false,
                 2,
             ),
-            // E , S  (element + collector) over a,b,c — the D2a shape at small size.
+            // E , S  (element + collector) over a,b,c — the characteristic small case.
             (
                 Term::op(comma, vec![Term::var(0, elt), Term::var(1, set)]),
                 three,
@@ -1050,15 +1013,15 @@ mod tests {
             assert_eq!(
                 new_set,
                 naive_set,
-                "case {i}: Diophantine and naive matchers disagree (new={} naive={})",
+                "case {i}: lazy and eager solution sets differ (lazy={} eager={})",
                 new_sols.len(),
                 naive_sols.len()
             );
         }
     }
 
-    /// `match X + Y <=? a + b + c` over `[assoc comm]` — the exact 6-solution sequence of the
-    /// reference binary (every split of {a,b,c} into two non-empty ordered parts).
+    /// `match X + Y <=? a + b + c` over `[assoc comm]` has six solutions: every split of
+    /// `{a,b,c}` into two non-empty ordered parts.
     #[test]
     fn ac_match_two_vars_six_solutions() {
         let mut e = Engine::new();
@@ -1163,10 +1126,8 @@ mod tests {
         );
     }
 
-    /// C8: ACU **alien** matching end to end. `eq s M + N = s (M + N)` reduces `s z + s s z` to
-    /// `s s s z` in **2** rewrites — the count Maude's greedy matcher fixes by binding the alien `s M`
-    /// to the canonically-smaller element `s z` (binding it to `s s z` would take 3). Was a panic
-    /// (acu.rs:64); the greedy order comes straight from `ACU_GreedyMatcher`, not from tuning.
+    /// Alien matching is greedy: the canonically smaller match is tried first, fixing this reduction
+    /// at two rewrites rather than three.
     #[test]
     fn ac_alien_reduce_greedy_count() {
         use crate::term::Equation;

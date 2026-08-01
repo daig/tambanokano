@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "tnk-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "biodivine-lib-bdd",
  "malachite",
@@ -505,14 +505,14 @@ dependencies = [
 
 [[package]]
 name = "tnk-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tnk-core",
 ]
 
 [[package]]
 name = "tnk-modules"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tnk-core",
  "tnk-frontend",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "tnk-repl"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rustyline",
  "tnk-session",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "tnk-session"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "tnk-core",
  "tnk-frontend",

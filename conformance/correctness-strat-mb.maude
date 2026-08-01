@@ -1,12 +1,10 @@
-*** Phase 1.5 / C1 seam 3 — strat × membership, conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-strat-mb.maude < /dev/null
+*** Custom evaluation strategy × membership, conformance
 ***
 *** A custom evaluation strategy (`strat`) leaves some arguments unreduced, so they never reach a reduce
 *** normal-form point. Maude's `complexStrategy` still computes the TRUE SORT of every argument at the
 *** strat `0` step (FreeTheory/freeSymbol.cc), refining even the skipped ones — so their memberships
 *** apply (and count) and an overloaded operator's result sort reflects the refined argument sort.
-*** Mirrors the engine.rs C1 seam-3 test. (Distinct subterms only: a *repeated* reducible-membership
-*** subterm was a separate subject-DAG-sharing divergence at C1 time — C7, since resolved.)
+*** covered separately by the structure-sharing fixture.
 
 fmod STRAT-MB-WRAP is
   sorts Elem Sml Wr WrS .

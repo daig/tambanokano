@@ -1,5 +1,4 @@
-*** I13-meta-int-unify — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntUnify.maude; oracle verified 2026-07-23.
+*** I13-meta-int-unify
 *** PRELUDE
 set show timing off .
 set show advisories off .

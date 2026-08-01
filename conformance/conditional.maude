@@ -1,6 +1,5 @@
-*** B2.3a conditional-equation conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/conditional.maude < /dev/null
-*** Result sorts + rewrite counts; condition reductions count too. Mirrors the engine.rs B2.3a tests.
+*** Conditional-equation conformance
+*** Result sorts and rewrite counts; condition reductions count too.
 
 fmod CEQ-MAX is
   sorts Nat Truth .

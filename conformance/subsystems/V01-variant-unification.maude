@@ -1,4 +1,4 @@
-*** V01-variant-unification — lifted from the reference suite (Misc/variantUnification.maude)
+*** V01-variant-unification
 *** PRELUDE
 set show timing off .
 

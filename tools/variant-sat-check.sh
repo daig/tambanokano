@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Verify the native T6 facade against the pinned semantic contract. This is intentionally
-# value/sort-only: the Maude-2.7 prototype is reflective while tnk's implementation is native.
+# Verify the native variant-satisfiability facade against its pinned value-and-sort contract.
+# Reflective presentation details are intentionally outside this check.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -8,12 +8,13 @@ fixture=${1:-$ROOT/conformance/subsystems/T11-variant-satisfiability.maude}
 expected=${2:-$ROOT/conformance/subsystems/T11-variant-satisfiability.expected}
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
 TNK_SHARE_LIB=${TNK_SHARE_LIB:-$ROOT/share/maude-gpl:$ROOT/share/tnk}
-ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
+ORACLE_LIB=${ORACLE_LIB:-${MAUDE_LIB:-}}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 
 [ -f "$fixture" ] || { echo "error: fixture not found: $fixture" >&2; exit 2; }
 [ -f "$expected" ] || { echo "error: expected contract not found: $expected" >&2; exit 2; }
 [ -x "$TNK_BIN" ] || { echo "error: tnk binary not found: $TNK_BIN" >&2; exit 2; }
+[ -n "$ORACLE_LIB" ] || { echo "error: set ORACLE_LIB or MAUDE_LIB to the Maude library path" >&2; exit 2; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/tnk-var-sat.XXXXXX") || exit 2
 trap 'rm -rf "$tmp"' EXIT

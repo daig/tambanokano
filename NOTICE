@@ -14,7 +14,6 @@ This includes, without limitation:
   - crates/**                (Rust engine, frontend, session, REPL)
   - tools/**                 (harness scripts)
   - share/tnk/**             (tnk-authored Maude facades, e.g. variant-satisfiability)
-  - original project docs authored for this port
 
 2. Stock Maude library sources (GPLv2 or later)
 ----------------------------------------------
@@ -51,14 +50,84 @@ Cargo.toml / crates.io metadata). Notable non-MIT runtime deps include:
 
 4. Conformance fixtures
 -----------------------
-conformance/** contains tests and oracles. Some fixtures are transcribed from
-or compared against Maude and may include GPLv2 headers or excerpts for
-differential testing. They are not part of the runtime engine library pack in
-share/maude-gpl/. Treat any file that carries an SRI/GPL header as GPLv2+
-material.
+Source paths in this section are relative to the official Maude 3.5.1 source
+distribution unless noted.
+
+The following fixtures reproduce or excerpt `src/Main/prelude.maude` and are
+distributed under GPLv2-or-later:
+
+  - conformance/prelude-array.maude
+  - conformance/prelude-bool.maude
+  - conformance/prelude-list.maude
+  - conformance/prelude-map.maude
+  - conformance/prelude-meta.maude
+  - conformance/prelude-nat.maude
+  - conformance/prelude-set.maude
+  - conformance/prelude-tier2.maude
+  - conformance/objects.maude (the CONFIGURATION module)
+
+The following fixtures contain test or example material reproduced or adapted
+from the Maude distribution and are also distributed under GPLv2-or-later:
+
+  - conformance/audit/E1a-decompose-equality.maude
+    (`tests/Misc/initialEqualityPredicate.maude`)
+  - conformance/subsystems/I01 through I17
+    (`tests/Meta/metaIntApply.maude` through
+    `tests/Meta/metaIntVariantUnify2.maude`, in fixture-number order)
+  - conformance/subsystems/I18 through I21
+    (`tests/Meta/russianDollsFlat.maude` and
+    `tests/Meta/russianDollsNonFlat{,2,3}.maude`, in fixture-number order)
+  - conformance/subsystems/I23-meta-oo-list.maude
+    (`tests/Meta/meta-oo-list-2.maude`)
+  - conformance/subsystems/M07-reference-dekker.maude
+    (`tests/Misc/dekker.maude`)
+  - conformance/subsystems/N01 and N02 (`tests/Misc/narrow{,2}.maude`)
+  - conformance/subsystems/N03-meta-narrow.maude
+    (`tests/Meta/metaNarrow.maude`)
+  - conformance/subsystems/T01 through T07
+    (`tests/Misc/smtTest.maude`)
+  - conformance/subsystems/U01 through U08
+    (`tests/Misc/{unification,unification2,unification3,assocUnification,`
+    `AU_Unification,AU_IrredUnification,AU_and_A_UnificationEdgeCases,`
+    `CU_Unification}.maude`, in fixture-number order)
+  - conformance/subsystems/U09 through U11
+    (`tests/Meta/{metaUnify,legacyMetaUnify,checkUnifiers}.maude`, in
+    fixture-number order)
+  - conformance/subsystems/V01 through V05
+    (`tests/Misc/{variantUnification,variantMatching,`
+    `filteredVariantUnification,meseguerFiniteVariant,variantNarrowing}.maude`,
+    in fixture-number order)
+  - conformance/subsystems/V06 through V11
+    (`tests/Meta/{metaGetVariant,legacyMetaGetVariant,metaVariantUnify,`
+    `metaVariantUnify2,legacyMetaVariantUnify,metaVariantMatch}.maude`, in
+    fixture-number order)
+  - conformance/subsystems/V13 and V14
+    (`tests/Misc/{AU_Unification,CU_Unification}.maude`, in fixture-number
+    order)
+
+The Real-Time Maude-derived M08 and M09 subsystem fixtures retain their
+complete SRI/GPL source notices in-file and are GPLv2-or-later.
+
+The complete GPL text is in share/maude-gpl/COPYING. Other conformance
+fixtures remain under the repository default unless a file-specific notice
+states otherwise.
 
 5. External prelude
 -------------------
 The standing `prelude.maude` is not shipped in this repository. Obtain it from
 a Maude install and point `$MAUDE_LIB` at that directory (in addition to
 share/maude-gpl and share/tnk when using the bundled companion libs).
+
+6. Implementation lineage
+-------------------------
+Tambanokano's initial implementation was informed by source-level comparison
+and differential testing against Maude 3.5.1. That work covered the official
+Maude source areas `src/Core`, `src/Interface`, `src/FreeTheory`,
+`src/ACU_Theory`, `src/AU_Theory`, `src/CUI_Theory`, `src/Higher`,
+`src/Mixfix`, `src/StrategyLanguage`, `src/Meta`, `src/Temporal`, and
+`src/Utility`, plus `src/Main/prelude.maude`.
+
+This release-level record replaces machine-local checkout paths and unstable
+line-number citations in implementation and fixture comments. It records
+historical lineage, not an ongoing compatibility target or semantic authority.
+License classification remains as stated in sections 1 through 4 above.

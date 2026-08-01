@@ -1,4 +1,4 @@
-*** V-probe-01-idem-variants — minimal folding-variant-narrowing probe: one variant equation over an
+*** V-probe-01-idem-variants — minimal folding-variant-narrowing case: one variant equation over an
 *** AC operator; variant numbering and order are part of the pass criterion.
 set show timing off .
 fmod IDEM is

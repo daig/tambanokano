@@ -1,9 +1,7 @@
-*** Increment 4 — a bare boolean condition `if b` abbreviates `if b = true` (Maude's abbreviated
-*** condition; used pervasively in the prelude's order theories, e.g. `ceq X < Z = true if X < Y /\
-*** Y < Z`). Here the conditional equation `ceq f(X) = b if X == a` fires for `f(a)` (a == a = true)
-*** and not for `f(b)` (b == a = false). BOOL is inlined (true/false/== — the M0 substrate).
+*** A bare boolean condition `if b` abbreviates `if b = true`. The conditional equation fires only when
+*** its equality expression reduces to true.
 ***
-*** Oracle: `protecting BOOL .` + the Foo signature in stock Maude, `red in T : <term> .`.
+*** `protecting BOOL.` + the Foo signature in stock Maude, `red in T : <term>.`.
 
 fmod T is
   sort Bool .

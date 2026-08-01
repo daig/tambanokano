@@ -154,7 +154,7 @@ pub(crate) struct SSubproblem {
     symbol: SymbolId,
     base: DagId,
     state: SState,
-    /// Variable indices bound by the most recent solution (unbound before the next one — F-4).
+    /// Variable indices bound by the most recent solution and unbound before the next one.
     bound: Vec<u32>,
     /// Residue of the most recent solution: the rhs is wrapped in `s^residue` (`build_result`).
     residue: Nat,
@@ -167,9 +167,8 @@ pub(crate) struct SSubproblem {
 /// The per-pattern-shape enumerator state.
 enum SState {
     /// Variable + extension: bind `X = s^j(base)` for `j` descending from `next_j` to `floor`, residue
-    /// `diff − j`. Lazy because `diff` may be astronomically large. `floor` is 0 for a peeled `s^k X`
-    /// pattern and 1 for a bare variable (Maude's `S_Subproblem` `mustMatchAtLeast`, so the matched
-    /// portion keeps at least one successor).
+    /// `diff − j`. Lazy because `diff` may be astronomically large. A peeled `s^k X` pattern uses
+    /// floor 0; a bare variable uses floor 1 so the matched portion retains at least one successor.
     VarExt {
         index: u32,
         sort: SortId,
@@ -194,11 +193,10 @@ enum SState {
 }
 
 impl SSubproblem {
-    /// A **bare variable** matched with extension against an S node `s^n(base)` (Maude's
-    /// `S_DagNode::matchVariableWithExtension` → `S_Subproblem` with `mustMatchAtLeast = 1`): bind
-    /// `X = s^j(base)` for `j = n, n−1, …, 1`, leaving `residue = n − j` surplus successors. The floor of
-    /// 1 keeps at least one successor in the matched portion (so `xmatch X:Nat <=? 3` yields the whole
-    /// plus the `2` and `1` portions — not the bare `0`).
+    /// Match a **bare variable** with extension against an S node `s^n(base)`: bind
+    /// `X = s^j(base)` for `j = n, n−1, …, 1`, leaving `residue = n − j` surplus successors. The
+    /// floor of 1 keeps at least one successor in the matched portion, so
+    /// `xmatch X:Nat <=? 3` yields the whole, `2`, and `1` portions, but not the bare `0`.
     pub(crate) fn match_variable_with_extension(
         symbol: SymbolId,
         n: Nat,
@@ -293,8 +291,8 @@ impl SSubproblem {
                 } => match next_j.take() {
                     None => return false,
                     Some(j) => {
-                        // Descend to `floor` (0 for `s^k X`, 1 for a bare variable — Maude's
-                        // `mustMatchAtLeast`), so a bare variable never yields the zero-successor portion.
+                        // Descend to `floor`: 0 for `s^k X`, 1 for a bare variable, which must not
+                        // yield the zero-successor portion.
                         *next_j = if j == *floor {
                             None
                         } else {
@@ -317,9 +315,8 @@ impl SSubproblem {
                 continue; // this j violates the variable's sort; try the next (or finish)
             }
             if let Some(existing) = subst.get(index) {
-                // Non-linear S variable, pre-bound elsewhere: a solution exists only where the
-                // absorbed portion agrees with the existing binding (Maude's S_LhsAutomaton
-                // bound-variable path); nothing new is bound.
+                // A non-linear S variable may be bound elsewhere. The absorbed portion must agree
+                // with that existing binding; this occurrence adds no binding.
                 if !rt.deep_equal(existing, binding) {
                     continue;
                 }
@@ -342,7 +339,7 @@ impl SSubproblem {
     }
 
     /// Splice the instantiated `rhs` into the matched position: a whole match is just `rhs`; an
-    /// extension match wraps it in the residue successors (`s^residue(rhs)` — Maude's `partialConstruct`).
+    /// extension match wraps it in the residue successors as `s^residue(rhs)`.
     pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
         if self.matched_whole {
             rhs
@@ -415,8 +412,8 @@ mod tests {
         bindings.into_iter().map(|b| count_of(e, b)).collect()
     }
 
-    /// `xmatch s X <=? s s s 0` (== reference binary): 3 solutions, X absorbing `j = 2,1,0` successors
-    /// (descending — the first is the whole match).
+    /// `xmatch s X <=? s s s 0` yields three solutions with `X` absorbing 2, 1, and 0 successors;
+    /// descending order returns the whole match first.
     #[test]
     fn s_extension_enumerates_descending_absorptions() {
         let (mut e, nat, z, s) = ctx();

@@ -1,4 +1,4 @@
-*** ch13-11-right-id — unification modulo right identity (Ur): mirror of the left-id case (Maude manual §13.4.5)
+*** ch13-11-right-id — unification modulo right identity (Ur): counterpart to the left-id case (Maude manual §13.4.5)
 
 mod RIGHTID-UNIFICATION-EX is
  sorts Magma Elem .

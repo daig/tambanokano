@@ -1,7 +1,5 @@
-*** Pillar A-iv: `search` over a state-transition graph — the four arrows, `such that`, bounded `[n]`
-*** + `continue`. Byte-for-byte vs the reference (rate normalized):
-***   ~/Downloads/Maude-3/maude -no-banner conformance/search.maude < /dev/null
-***   ./target/debug/tnk-repl conformance/search.maude < /dev/null
+*** Search over a state-transition graph: four arrows, `such that`, bounds, and `continue`.
+*** Rate normalized.
 ***
 *** Branching system: a => {b, c}; b,c => d (hash-consed to ONE state); d => e (e is a normal form).
 ***   =>1  one step:        b, c                         (states 3, rewrites 2)

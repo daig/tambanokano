@@ -1,11 +1,8 @@
-//! `search` — the reachable-state graph and breadth-first reachability search (Pillar A-iv).
+//! `search` — the reachable-state graph and breadth-first reachability search.
 //!
-//! A [`Search`] builds Maude's `StateTransitionGraph` on the fly: each reduced state is **hash-consed**
-//! (structurally-equal states collapse to one node, so distinct paths to the same term share a state),
-//! and a lazy BFS discovers states in index order. [`next_solution`](Search::next_solution) yields the
-//! states matching the goal pattern (filtered by the reachability arrow + an optional `such that`
-//! condition), in discovery order, each tagged with the `(states, rewrites)` snapshot taken when the
-//! state was first reached — exactly the counts Maude reports per solution.
+//! A [`Search`] builds a reachable-state graph lazily. Structurally equal reduced states share one
+//! node, and BFS discovers nodes in index order. [`next_solution`](Search::next_solution) yields goal
+//! matches in discovery order; each solution records the current graph size and accepted rewrite count.
 //!
 //! Like [`Rewriting`](crate::rewrite::Rewriting), a `Search` owns its state graph (each state pinned by a
 //! [`RootGuard`]) and borrows the [`Engine`] only per call, so the REPL stores it between `continue`s.
@@ -198,9 +195,7 @@ impl StateGraph {
                 }
             };
             context.graph_replay_rewrites(tail_rewrites);
-            let Some(next) = next else {
-                return None;
-            };
+            let next = next?;
             context.graph_replay_rewrites(next.enumeration_rewrites);
             let (rule_id, successor) = (next.rule_id, next.term);
 
@@ -374,10 +369,9 @@ impl Search {
         self.graph.len()
     }
 
-    /// The next solution, lazily generating just enough of the BFS, or `None` when the (bounded)
-    /// reachable space is exhausted. `continue` calls this again for more. Generation is one successor at
-    /// a time so a bounded `search [n]` does only the work it needs (and `continue`'s rewrite snapshots
-    /// reflect the post-reset count) — matching Maude's lazy `findNextInterestingState`.
+    /// Return the next solution, generating only enough of the BFS to find it. `continue` resumes the
+    /// same expansion. One-successor quanta prevent bounded searches from doing unnecessary work and
+    /// preserve rewrite snapshots across counter resets.
     pub fn next_solution(&mut self, engine: &mut Engine) -> Option<Solution> {
         // State 0 is seeded (not discovered by expansion); test it once — handles `=>*`'s state-0 solution.
         if !self.tested_initial {
@@ -459,15 +453,13 @@ impl Search {
         }
     }
 
-    /// Match the goal (filtered by `such_that`) against state `s` and queue a [`Solution`] per match,
-    /// each tagged with the counts **at the moment the solution is found** — Maude's per-solution snapshot.
+    /// Match the goal, filtered by `such_that`, against state `s` and queue one [`Solution`] per
+    /// accepted match. Each solution records the current graph size and the rewrite count after its own
+    /// condition evaluation.
     ///
-    /// The snapshot is taken *live* (current `states` + `rewrites`) rather than from the state's discovery
-    /// counts, which matters in two ways: a `=>!` solution is found when its state is dequeued and
-    /// confirmed a normal form — *after* the frontier ahead of it was expanded (more states/rewrites than
-    /// at discovery) — and a `such that` solution's rewrite count includes the condition's own
-    /// reductions, which `eval_goal` snapshots per binding (B2a). For the plain `=>1`/`=>+`/`=>*`
-    /// cases the solution is found at discovery, so the live counts equal the old discovery snapshot.
+    /// A `=>!` state is tested only after successor exhaustion, so its counts include work performed
+    /// between discovery and normal-form confirmation. The other arrows test qualifying states when
+    /// they are discovered.
     fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
         let term = self.graph.state_dag(s).expect("search state exists");
         let states = self.graph.len();

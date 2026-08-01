@@ -1,4 +1,4 @@
-*** T03-check-real — rational-linear-arithmetic SMT checks lifted from the reference suite (Misc/smtTest.maude)
+*** T03-check-real — rational-linear-arithmetic SMT checks
 set show timing off .
 load smt
 

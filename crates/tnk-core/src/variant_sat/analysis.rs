@@ -407,10 +407,10 @@ fn productive_sorts(engine: &Engine, productions: &[Production], num_sorts: usiz
                 .iter()
                 .all(|sort| productive[sort.index()])
             {
-                for index in 0..num_sorts {
+                for (index, is_productive) in productive.iter_mut().enumerate().take(num_sorts) {
                     let sort = SortId::from_raw(index as u32);
-                    if !productive[index] && engine.sorts().leq(production.range, sort) {
-                        productive[index] = true;
+                    if !*is_productive && engine.sorts().leq(production.range, sort) {
+                        *is_productive = true;
                         changed = true;
                     }
                 }
@@ -438,7 +438,7 @@ fn dependency_graph(
         {
             continue;
         }
-        for result_index in 0..num_sorts {
+        for (result_index, dependencies) in graph.iter_mut().enumerate().take(num_sorts) {
             let result = SortId::from_raw(result_index as u32);
             if !engine.sorts().leq(production.range, result) {
                 continue;
@@ -448,8 +448,8 @@ fn dependency_graph(
                     continue;
                 }
                 let dependency = dependency.index();
-                if !graph[result_index].contains(&dependency) {
-                    graph[result_index].push(dependency);
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
                 }
             }
         }
@@ -590,6 +590,7 @@ fn stream_product(
 mod tests {
     use super::*;
     use crate::symbol::IdentitySide;
+    use crate::term::Term;
 
     fn acu_bag(constants: &[&str]) -> (Engine, SortId) {
         let mut engine = Engine::new();
@@ -688,7 +689,8 @@ mod tests {
         let identity = engine.add_op("e", vec![], sort);
         let atom = engine.add_op("a", vec![], sort);
         let append = engine.add_op("_._", vec![sort, sort], sort);
-        engine.set_one_sided_identity(append, IdentitySide::Left, identity);
+        engine.reserve_one_sided_identity(append, IdentitySide::Left, sort);
+        engine.set_one_sided_identity_term(append, Term::constant(identity));
         for constructor in [identity, atom, append] {
             engine.set_ctor(constructor);
         }

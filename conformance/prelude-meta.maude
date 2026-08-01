@@ -1,5 +1,4 @@
-*** Stage 1: the whole META-LEVEL tower (the real prelude through line 3166) loads with no errors;
-*** see the prelude_meta_through_repl test for what each reduce proves. Oracle: the reference binary.
+*** The stock META-LEVEL tower loads without errors.
 ***(
 
     This file is part of the Maude 3 interpreter.
@@ -3171,28 +3170,20 @@ red in META-MODULE : 'a ; 'b ; 'a .
 red in META-MODULE : getName(fmod 'FOO is nil sorts none . none none none none endfm) .
 red in META-MODULE : getRls(fmod 'FOO is nil sorts none . none none none none endfm) .
 
-*** Stage 2: the reflection core. metaReduce down-translates the meta-module argument (the import-
-*** expression form [Q]), reduces the down-translated subject term in it, and up-translates the result
-*** {term, type} — byte-identical (value + rewrite count) to the reference. The last two reduce exercise
-*** the <Qids> classification (a Qid's least sort depends on its text: '0.Zero is a Constant, 'NzNat a Sort).
+*** Reflection core: metaReduce translates into an object module, computes there, and translates the
+*** result back. Qid classification derives a least sort from the token text.
 red in META-LEVEL : metaReduce(['NAT], '0.Zero) .
 red in META-LEVEL : metaReduce(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]) .
 red in META-LEVEL : metaReduce(['BOOL], '_and_['true.Bool, 'false.Bool]) .
 red in META-TERM : getName('foo.Bar) .
 red in META-TERM : getType('foo.Bar) .
 
-*** Stage 3: inline down_module. The module argument now carries inline declarations (sorts, subsorts,
-*** ops with attributes, and equations), not only imports — so metaReduce builds the object module from a
-*** reconstructed PreModule + the ordinary flatten/build, then installs the inline equations by down-
-*** translating their meta-terms straight into the engine. BAR exercises an own equation over an imported
-*** type; LEN exercises subsorts, an AU `id(...)` operator, and a recursive AU-matching equation.
+*** Inline down_module accepts reflected sorts, subsorts, operators, attributes, and equations. LEN
+*** exercises an AU identity operator and recursive AU matching.
 red in META-LEVEL : metaReduce(fmod 'BAR is including 'NAT . sorts none . none op 'double : 'Nat -> 'Nat [none] . none eq 'double['N:Nat] = '_+_['N:Nat, 'N:Nat] [none] . endfm, 'double['s_^3['0.Zero]]) .
 red in META-LEVEL : metaReduce(fmod 'LEN is including 'NAT . sorts 'Elt ; 'Lst . subsort 'Elt < 'Lst . op 'nil : nil -> 'Lst [ctor] . op '__ : 'Lst 'Lst -> 'Lst [ctor assoc id('nil.Lst)] . op 'e : nil -> 'Elt [ctor] . op 'len : 'Lst -> 'Nat [none] . none eq 'len['nil.Lst] = '0.Zero [none] . eq 'len['__['X:Elt, 'L:Lst]] = '_+_['s_^1['0.Zero], 'len['L:Lst]] [none] . endfm, 'len['__['e.Elt, '__['e.Elt, 'e.Elt]]]) .
 
-*** Stage 3 (the rewriting/matching/search descent family). FOO is a system module with three labelled
-*** rules (a=>b, b=>c, a=>c). metaRewrite/metaFrewrite apply rules (rule-fair / position-fair) to a
-*** ResultPair; metaMatch returns the matching Substitution (or noMatch); metaSearch does breadth-first
-*** reachability to a ResultPair-with-substitution. Values + rewrite counts are the reference binary's.
+*** Rewriting, matching, and search descent over a reflected system module.
 red in META-LEVEL : metaRewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, unbounded) .
 red in META-LEVEL : metaRewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 1) .
 red in META-LEVEL : metaFrewrite(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, unbounded, 1) .
@@ -3212,26 +3203,21 @@ red in META-LEVEL : metaApply(mod 'G is including 'NAT . sorts none . none op 'f
 *** metaXmatch matches with extension at the top, returning a substitution-and-context MatchPair; the
 *** context is the bare hole for a whole-subject free or iterated match. metaXapply applies a labelled
 *** rule at any position outermost-first and returns a term/type/substitution/context Result4Tuple, the
-*** context marking where the rule fired. Values and rewrite counts are the reference binary's.
+*** context marking where the rule fired. Values and rewrite counts.
 red in META-LEVEL : metaXmatch(['NAT], 's_['N:Nat], 's_^5['0.Zero], nil, 0, unbounded, 0) .
 red in META-LEVEL : metaXmatch(['NAT], '_+_['X:Nat, 'Y:Nat], 's_^5['0.Zero], nil, 0, unbounded, 0) .
 red in META-LEVEL : metaXapply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['f['0.Zero]], 'unwrap, none, 0, unbounded, 0) .
 red in META-LEVEL : metaXapply(mod 'G is including 'NAT . sorts none . none op 'f : 'Nat -> 'Nat [ctor] . none none rl 'f['N:Nat] => 'N:Nat [label('unwrap)] . endm, 'f['f['0.Zero]], 'unwrap, none, 0, unbounded, 1) .
 
-*** metaSearchPath returns the breadth-first path to the nth solution as a Trace: one {term, type, rule}
-*** TraceStep per arc, the rule up-translated to its meta form. The first =>* solution to c is the direct
-*** a => c (the `ab` rule). Value (the trace structure) and rewrite count are the reference binary's; the
-*** up-translated rule's mixfix layout (the spacing around the [attrs] and trailing dot of `rl_=>_[_].`)
-*** is the format-attribute gap, the same rule rendering upModule will finish in Stage 4.
+*** metaSearchPath returns a breadth-first path as a Trace with one up-translated rule per arc. The
+*** direct `a => c` path also checks exact mixfix layout around attributes and the trailing rule dot.
 red in META-LEVEL : metaSearchPath(mod 'FOO is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . rl 'a.Elt => 'c.Elt [label('ab)] . endm, 'a.Elt, 'c.Elt, nil, '*, unbounded, 0) .
 *** H reaches c only via a => b => c (no direct a => c), so the first =>* path is two arcs — a folded
 *** two-step Trace. The `__` trace constructor's `format (d n d)` puts each TraceStep on its own line.
 red in META-LEVEL : metaSearchPath(mod 'H is nil sorts 'Elt . none op 'a : nil -> 'Elt [ctor] . op 'b : nil -> 'Elt [ctor] . op 'c : nil -> 'Elt [ctor] . none none rl 'a.Elt => 'b.Elt [label('r1)] . rl 'b.Elt => 'c.Elt [label('r2)] . endm, 'a.Elt, 'c.Elt, nil, '*, unbounded, 0) .
 
 *** ============================================================================
-*** Stage 4: the up*/query/parse layer. Named modules + a view, decomposed back
-*** to their meta-rep; the sort/kind lattice queries; metaParse/metaPrettyPrint;
-*** wellFormed. Oracle: the reference binary. (BOOL auto-import stays off.)
+*** Up-translation, module queries, parsing, pretty-printing, and well-formedness.
 *** ============================================================================
 
 fmod S4-FOO is
@@ -3313,7 +3299,6 @@ red in META-LEVEL : metaPrettyPrint(['NAT], '_+_['s_^2['0.Zero], 's_^3['0.Zero]]
 *** -- upView --
 red in META-LEVEL : upView('S4-V) .
 
-*** -- Stage 5: the symbolic/SMT/strategy descent is declared but INERT (kind-level) --
-*** These reduce to OUR kind-level term (the reference computes them — Phase 3.2/3.3/strategy backends).
+*** Strategy declaration and definition reflection.
 red in META-LEVEL : upStratDecls('S4-FOO, false) .
 red in META-LEVEL : upSds('S4-FOO, false) .

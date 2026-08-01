@@ -3,8 +3,7 @@
 *** distinct from the single literal cd_, and Maude keeps it -- as a backquote -- in the
 *** op's stored/meta name. The space form and the backquote form tokenize to the same name;
 *** an escaped special is unaffected.
-*** Oracle -- byte-for-byte, modulo the ====/Bye. framing:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/multitoken-op.maude < /dev/null
+*** Oracle output is compared byte-for-byte after removing Maude's banner and exit framing.
 fmod MULTITOK is
   sorts S .
   op a b : -> S [ctor] .

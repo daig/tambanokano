@@ -1,10 +1,7 @@
-*** Container milestone (cont.) -- the real prelude's EXT-BOOL + SET{Nat}, over BOOL+NAT, verbatim from
-*** ~/Downloads/Maude-3/prelude.maude: BOOL+EXT-BOOL 33-93, NAT 110-243, TRIV + the Nat view, SET 1177-1245.
+*** Stock prelude EXT-BOOL and SET{Nat}, over BOOL+NAT.
 *** Exercises the [Sort] kind notation -- EXT-BOOL's `var B : [Bool]`; ACU identity-collapse matching --
 *** SET recursions peel `E, S` down to a singleton; non-linear ACU matching -- `E in E, S`; the and-then
 *** / or-else short-circuits; and the assoc-list separator spacing `1, 2, 3`.
-***
-*** Oracle: stock Maude, `red in EXT-BOOL :` for the and-then/or-else, `red in T :` for T = SET{Nat}.
 
 fmod TRUTH-VALUE is
   sort Bool .

@@ -1,5 +1,5 @@
-*** A3m-recursive-parameterized-call — COV-001: lazy named-call recursion must not regress to bounded inline expansion.
-*** A 256-level decreasing parameter reaches the base definition, applies exactly one rule, and exhausts.
+*** A3m-recursive-parameterized-call — lazy named-call recursion reaches a deeply nested base case.
+*** A 256-level decreasing parameter applies exactly one rule, returns one solution, and exhausts.
 
 set show timing off .
 smod COV001-RECURSIVE-PARAMETERIZED is

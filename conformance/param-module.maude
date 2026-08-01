@@ -1,4 +1,4 @@
-*** B-iii: a parameterized module fmod M{X :: T}. The parameter X :: TRIV makes a parameter
+*** A parameterized module `fmod M{X :: T}`. The parameter `X :: TRIV` makes a parameter
 *** copy of TRIV, so the theory sort Elt becomes the parameter sort X$Elt; the body declares
 *** structured sorts Ctr{X} and NzCtr{X} and a structured subsort. Ground terms (zero, inc,
 *** put) reduce, and least sorts are computed over the structured sorts.

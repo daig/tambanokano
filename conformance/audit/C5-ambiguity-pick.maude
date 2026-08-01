@@ -1,4 +1,4 @@
-*** C5-ambiguity-pick — ambiguous terms: oracle warns, picks the first (left) parse, computes; tnk hard-errors
+*** C5-ambiguity-pick — ambiguous terms: expected parity warns, picks the first (left) parse, computes
 fmod C5AMBIG-MIXFIX is
   sort S .
   op a : -> S .

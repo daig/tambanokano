@@ -1,14 +1,11 @@
-//! `tnk-modules` — the tambanokano module system (B5, non-parameterized).
+//! `tnk-modules` — module/view storage, algebra, flattening, built-in module injection, and META-LEVEL
+//! descent.
 //!
-//! The frontend ([`tnk_frontend`]) turns one `fmod … endfm` into one isolated `Engine`. This crate adds
-//! the layer above it: a [`ModuleDb`](db::ModuleDb) of parsed modules and a **flattener** that resolves a
-//! module's transitive `protecting`/`extending`/`including` import closure (plus summation `+` and
-//! renaming `* (…)`) into ONE combined module, which the unchanged frontend pipeline then builds.
-//!
-//! Flattening is a **pure `PreModule → PreModule` transform** (decision #5 — not the C++ in-place
-//! "donation"): the import modes do not change which declarations are imported (a semantic-check
-//! annotation only), so all three flatten identically. [`load::load_program`] is the file-level entry,
-//! and the basis for the B5 REPL (`tnk-repl`) next round.
+//! [`ModuleDb`](db::ModuleDb) retains parsed modules. The flattener resolves imports, sums, renamings,
+//! parameterized instantiations, and views into one [`PreModule`](tnk_frontend::surface::ast::PreModule)
+//! for the frontend build pipeline. All import modes contribute the same flattened closure; their mode is
+//! retained for non-flat reflection.
+//! [`load::load_program`] builds a runnable program and is shared by batch loading and the session layer.
 
 pub mod db;
 pub mod flatten;

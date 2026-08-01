@@ -1,6 +1,5 @@
 *** Full-trace fixture: a built-in special-op step. The trace shows the equation header then the line
 *** "built-in equation for symbol _+_" with no body and no substitution, then the redex and result.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/trace-builtin.maude < /dev/null
 fmod NATB is
   sorts Truth Zero NzNat Nat .
   subsorts Zero NzNat < Nat .

@@ -1,5 +1,4 @@
 *** M02-ltl-operators — every primitive and derived LTL connective plus LTL-SIMPLIFIER
-*** Fresh unlabeled two-state probe; oracle-verified against Maude 3.5.1.
 *** PRELUDE
 set show timing off .
 load model-checker

@@ -1,6 +1,5 @@
-*** A1d-semantic-attribute-recovery — TNK-019: Maude validates semantic operator attributes before
-*** selecting a kernel theory. Invalid attributes are cleared atomically; declarations and the session
-*** survive. Diagnostics are normalized, so values, sorts, structure, and counts pin recovery semantics.
+*** Invalid semantic operator attributes are cleared atomically before selecting a kernel theory.
+*** Declarations and the session survive; values, sorts, structure, and counts pin recovery semantics.
 
 fmod A1D-ARITY is
   sort S .

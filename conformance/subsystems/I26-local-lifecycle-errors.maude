@@ -1,5 +1,5 @@
-*** I26-local-lifecycle-errors — fresh Maude 3.5.1 local-manager probe.
-*** Pins supported-target errors, deletion, stale IDs, and slot reuse.
+*** I26-local-lifecycle-errors — local-manager lifecycle errors.
+*** Pins supported-target errors, deletion, expired IDs, and slot reuse.
 *** PRELUDE
 set show timing off .
 set show advisories off .

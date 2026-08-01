@@ -1,7 +1,5 @@
-*** B2.2 membership-axiom conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/membership.maude < /dev/null
-*** The `result <Sort>:` line is the (membership-refined) least sort. Free-theory only this increment.
-*** Mirrors the engine.rs B2.2 tests.
+*** Membership-axiom conformance
+*** The `result <Sort>:` line is the membership-refined least sort.
 
 fmod MB-PAIR is
   sorts Nat Pair SymPair .

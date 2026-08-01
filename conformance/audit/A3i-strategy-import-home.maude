@@ -1,4 +1,4 @@
-*** A3i-strategy-import-home — imported sd lhs/body bubbles retain donor parsing semantics (TNK-005)
+*** Imported strategy-definition lhs/body bubbles retain donor parsing semantics.
 smod A3I-HOME-BASE is
   sort S .
   ops a b : -> S .

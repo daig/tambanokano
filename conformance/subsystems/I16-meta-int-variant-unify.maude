@@ -1,5 +1,4 @@
-*** I16-meta-int-variant-unify — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntVariantUnify.maude; oracle verified 2026-07-23.
+*** I16-meta-int-variant-unify
 *** PRELUDE
 set show timing off .
 

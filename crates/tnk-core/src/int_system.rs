@@ -1,19 +1,13 @@
-//! Minimal-solution enumeration for a homogeneous linear Diophantine system — Maude's `IntSystem`
-//! (`src/Utility/intSystem.{hh,cc}` + `intContejeanDevie.cc`), the **Contejean–Devie** algorithm,
-//! `int` version (optimized for the small multiplicities of unification).
+//! Minimal-solution enumeration for bounded homogeneous linear Diophantine systems.
 //!
 //! Given equations `E` over `n` non-negative integer variables and per-variable upper bounds, it
 //! enumerates the **minimal** solutions (the Hilbert basis of the solution cone under the bounds).
 //! ACU unification builds one such system per unification problem and reads the basis off in
-//! discovery order — that order is load-bearing (it fixes the AC-unifier enumeration order), so this
-//! is a line-faithful port of the reference search.
-
-// Consumed by the ACU unification subproblem (S1c), landing next; unit-tested standalone meanwhile.
-#![allow(dead_code)]
+//! discovery order. That order is load-bearing for AC-unifier enumeration and remains deterministic.
 
 use std::collections::BTreeSet;
 
-/// Maude's `UNBOUNDED` (`INT_MAX`) — a per-variable "no upper bound".
+/// Per-variable sentinel meaning “no upper bound.”
 pub(crate) const UNBOUNDED: i32 = i32::MAX;
 
 /// One search-tree node.
@@ -162,7 +156,7 @@ impl IntSystem {
     }
 
     /// Process the state at `sp`: run the forced-assignment checks, then expand by incrementing
-    /// non-frozen variables. Ported from the `retry:`/`skip:` control flow of the reference.
+    /// non-frozen variables through explicit `retry` and `skip` control flow.
     fn expand_state(&mut self, sp: usize) {
         'retry: loop {
             // Check that each equation still has a non-frozen coefficient that can move its residue
@@ -214,8 +208,7 @@ impl IntSystem {
             break;
         }
 
-        // State survived: expand by incrementing each eligible non-frozen variable. Save the state
-        // into `current` first (the reference swaps).
+        // Move the surviving state into scratch storage before expanding each eligible variable.
         std::mem::swap(&mut self.current, &mut self.states[sp]);
         for i in 0..self.nr_variables {
             if !self.current.frozen.contains(&i)
@@ -295,21 +288,15 @@ mod tests {
         assert_eq!(sols, vec![vec![1, 2]]);
     }
 
-    /// The AC unification system for `X + X + Y =? A + B + C` — variables X,Y (lhs, coeff on the
-    /// count of each rhs subject) against subjects A,B,C (each count 1). Here we model the classic
-    /// `f(X,Y) =? f(a,b)` shape: `X + Y = a + b` with a,b distinct columns is a matching system, but
-    /// for the minimal-basis check we use the homogeneous form and confirm the basis is non-empty and
-    /// minimal. (Full ACU-order validation is the fixture's job.)
+    /// Bounded `x + y = 2w` produces a nonempty set whose distinct solutions are mutually
+    /// non-dominating.
     #[test]
     fn two_var_two_subject() {
-        // X - a - b = 0 won't do (that's matching); use x + y = w with bounds to get a small basis.
         let mut sys = IntSystem::new(3);
         sys.insert_eqn(&[1, 1, -2]);
         sys.set_upper_bounds(&[2, 2, 1]);
         let sols = all_solutions(&mut sys);
-        // x + y = 2w, w<=1: w=1 needs x+y=2 → (2,0,1),(1,1,1),(0,2,1); w=0 → (0,0,0) excluded (not
-        // reached from the unit-seed search). Minimal ones (no domination): (2,0,1),(1,1,1),(0,2,1)
-        // are mutually non-dominating.
+        // The unit-seed search excludes the zero vector; the three remaining solutions are incomparable.
         assert!(!sols.is_empty());
         for a in &sols {
             for b in &sols {

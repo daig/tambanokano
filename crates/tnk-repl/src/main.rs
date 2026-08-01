@@ -1,61 +1,96 @@
-//! The `tnk-repl` binary: load an optional `.maude` file from `argv`, then drive [`Repl`] interactively
-//! with `rustyline`, buffering multi-line input until it is complete.
+//! The `tnk-repl` binary loads the optional prelude and input file, then feeds terminal or piped stdin
+//! through `rustyline`, buffering multiline submissions until complete.
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::io::IsTerminal;
+use std::process::ExitCode;
 use tnk_repl::Repl;
 
-fn main() -> rustyline::Result<()> {
-    // Flags: `-no-prelude` skips the standing prelude, `-no-banner` the banner
-    // line; the first non-flag argument is the file to load (as `maude file.maude` does).
-    let mut no_prelude = false;
-    let mut no_banner = false;
-    let mut file: Option<String> = None;
-    for a in std::env::args().skip(1) {
-        match a.as_str() {
-            "-no-prelude" => no_prelude = true,
-            "-no-banner" => no_banner = true,
-            other if file.is_none() => file = Some(other.to_string()),
-            other => eprintln!("ignoring extra argument `{other}`"),
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Options {
+    no_prelude: bool,
+    no_banner: bool,
+    file: Option<String>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+    let mut options = Options::default();
+    for arg in args {
+        match arg.as_str() {
+            "-no-prelude" => options.no_prelude = true,
+            "-no-banner" => options.no_banner = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option `{other}`"));
+            }
+            other if options.file.is_none() => options.file = Some(other.to_string()),
+            other => {
+                return Err(format!(
+                    "unexpected argument `{other}`; only one input file is supported"
+                ));
+            }
         }
     }
+    Ok(options)
+}
 
-    // Colorize results only when stdout is a terminal (so piped/redirected output stays plain).
+fn main() -> ExitCode {
+    let options = match parse_args(std::env::args().skip(1)) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(options: Options) -> Result<(), String> {
+    let file_source = options
+        .file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path).map_err(|error| format!("reading `{path}`: {error}"))
+        })
+        .transpose()?;
+    let prelude_source = if options.no_prelude {
+        None
+    } else {
+        match find_prelude() {
+            Some(path) => Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|error| format!("reading prelude `{}`: {error}", path.display()))?,
+            ),
+            None => {
+                eprintln!(
+                    "warning: prelude.maude not found (set MAUDE_LIB or use -no-prelude); continuing without"
+                );
+                None
+            }
+        }
+    };
+
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let mut repl = Repl::new(std::io::stdout().is_terminal());
-    if !no_banner {
+    if !options.no_banner {
         println!(
             "tambanokano REPL — enter modules, `reduce`/`match`, `show`/`select`; `quit` to exit."
         );
     }
-
-    // Standing prelude: load `prelude.maude` from `$MAUDE_LIB` (colon-separated dirs) or
-    // the CWD. Its own `set include BOOL on` line then enables the implicit-BOOL auto-import.
-    // The engine/library layer stays prelude-free — this is REPL plumbing only.
-    if !no_prelude {
-        match find_prelude() {
-            Some(p) => match std::fs::read_to_string(&p) {
-                Ok(src) => print_nonempty(&repl.eval(&src).output),
-                Err(e) => eprintln!("error reading prelude `{}`: {e}", p.display()),
-            },
-            None => {
-                eprintln!(
-                    "no prelude.maude found (set MAUDE_LIB or use -no-prelude); continuing without"
-                );
-            }
-        }
+    if let Some(source) = prelude_source {
+        print_nonempty(&repl.eval(&source).output);
+    }
+    if let Some(source) = file_source {
+        print_nonempty(&repl.eval(&source).output);
     }
 
-    // Optional file argument: load it (modules + commands), then go interactive.
-    if let Some(path) = file {
-        match std::fs::read_to_string(&path) {
-            Ok(src) => print_nonempty(&repl.eval(&src).output),
-            Err(e) => eprintln!("error reading `{path}`: {e}"),
-        }
-    }
-
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = DefaultEditor::new().map_err(|error| error.to_string())?;
     let mut buffer = String::new();
     loop {
         let prompt = if !stdin_is_terminal {
@@ -79,24 +114,21 @@ fn main() -> rustyline::Result<()> {
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) => buffer.clear(), // Ctrl-C: abandon the current input
-            Err(ReadlineError::Eof) => break,                  // Ctrl-D
-            Err(e) => {
-                eprintln!("error: {e}");
-                break;
-            }
+            Err(ReadlineError::Interrupted) => buffer.clear(),
+            Err(ReadlineError::Eof) => break,
+            Err(error) => return Err(error.to_string()),
         }
     }
     Ok(())
 }
 
-/// `prelude.maude` from `$MAUDE_LIB` (colon-separated directories) or the current directory.
+/// Finds `prelude.maude` in the platform path list from `MAUDE_LIB`, then in the current directory.
 fn find_prelude() -> Option<std::path::PathBuf> {
-    if let Ok(lib) = std::env::var("MAUDE_LIB") {
-        for dir in lib.split(':').filter(|d| !d.is_empty()) {
-            let p = std::path::Path::new(dir).join("prelude.maude");
-            if p.is_file() {
-                return Some(p);
+    if let Some(lib) = std::env::var_os("MAUDE_LIB") {
+        for dir in std::env::split_paths(&lib) {
+            let path = dir.join("prelude.maude");
+            if path.is_file() {
+                return Some(path);
             }
         }
     }
@@ -107,5 +139,38 @@ fn find_prelude() -> Option<std::path::PathBuf> {
 fn print_nonempty(s: &str) {
     if !s.is_empty() {
         println!("{s}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_options_and_file() {
+        assert_eq!(
+            parse_args([
+                "-no-banner".to_string(),
+                "input.maude".to_string(),
+                "-no-prelude".to_string(),
+            ]),
+            Ok(Options {
+                no_prelude: true,
+                no_banner: true,
+                file: Some("input.maude".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_options_and_extra_files() {
+        assert_eq!(
+            parse_args(["-no-baner".to_string()]),
+            Err("unknown option `-no-baner`".to_string())
+        );
+        assert_eq!(
+            parse_args(["one.maude".to_string(), "two.maude".to_string()]),
+            Err("unexpected argument `two.maude`; only one input file is supported".to_string())
+        );
     }
 }

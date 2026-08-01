@@ -1,6 +1,4 @@
-//! Phase-0 go/no-go benchmark (decisions D1/D2): reduce throughput and GC throughput on a Peano
-//! workload, using only `tnk-core`'s public API. Compare against the reference C++ Maude on
-//! `conformance/fib.maude`.
+//! Reduce and GC throughput benchmark over a Peano workload using only `tnk-core`'s public API.
 //!
 //! Usage: `cargo run --release --example peano [FIB_INDEX] [REPEATS] [GC_CHAIN]`
 

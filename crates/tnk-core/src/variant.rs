@@ -1,4 +1,4 @@
-//! Folding variant narrowing (S2): breadth-first one-step narrowing, variant-equation reducibility,
+//! Folding variant narrowing: breadth-first one-step narrowing, variant-equation reducibility,
 //! and term-only subsumption folding. The engine owns DAGs; a [`VariantSearch`] owns roots for every
 //! retained state and borrows the engine only while constructing or advancing a layer.
 
@@ -30,8 +30,8 @@ pub struct VariantEquation {
     pub variables: Vec<VarSpec>,
 }
 
-/// Compile a source `[variant]` equation with Maude's `PreEquation::check` variable layout:
-/// normalize the lhs first, then assign its variable slots by canonical DAG traversal.
+/// Compile a source `[variant]` equation by normalizing its left side and assigning variable slots in
+/// canonical DAG traversal order.
 pub fn compile_variant_equation(
     e: &mut Engine,
     id: u32,
@@ -134,8 +134,8 @@ struct RetainedVariantUnifier {
 
 /// Shared retention stream for object-level, metalevel, and narrowing variant unifiers.
 ///
-/// `insert` preserves Maude's online eviction order. Call [`Self::finish`] before exposing an
-/// upfront filtered result set; incremental callers can consume [`Self::pop_pending`] directly.
+/// `insert` preserves online eviction order. Call [`Self::finish`] before exposing an upfront-filtered
+/// result set; incremental callers can consume [`Self::pop_pending`] directly.
 pub struct FilteredVariantUnifierStream {
     filtered: bool,
     retained: Vec<RetainedVariantUnifier>,
@@ -366,6 +366,7 @@ pub struct VariantSearch {
 impl VariantSearch {
     /// Construct the initial variant: rename every original variable into the first protected family,
     /// reduce the renamed term, and retain the full accumulated substitution.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         env: &mut UnifyEnv,
         initial: DagId,
@@ -387,8 +388,7 @@ impl VariantSearch {
             } else {
                 VariableFamily::Narrow
             };
-        // Maude theory-normalizes/canonically walks the target before assigning its original variable
-        // slots. Reproduce that visible order, and move blocker-only variables above the target range.
+        // Assign target slots by canonical traversal and place blocker-only variables above that range.
         let original_order = variables_in_dag(env.e, initial);
         if original_order.len() != original_variables.len() {
             return Err("variant variable table does not match the command term".into());
@@ -865,7 +865,7 @@ pub(crate) struct VariantNarrowingStep {
 }
 
 /// One equation/rule-neutral variant-narrowing expansion. Every source shares one state-wide
-/// unifier filter; irreducibility blockers and accumulated substitutions use the same S2 screens.
+/// unifier filter; irreducibility blockers and accumulated substitutions use the same filters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
     env: &mut UnifyEnv,
@@ -1108,12 +1108,9 @@ struct RawNarrowing {
     interesting: Vec<DagId>,
 }
 
-/// Maude compiles every interesting binding into one UnifierFilter match before solving the
-/// accumulated theory subproblems. Our shared matcher drives each binding immediately, so checking
-/// an underconstrained AC binding first can enumerate millions of partitions before a later bare
-/// variable or free skeleton supplies the decisive prebindings. Reordering the pairs is logically
-/// immaterial because they share one substitution; deterministic and cheaply failing pairs first
-/// recreates the reference filter's effective constraint order.
+/// Subsumption pairs share one substitution, so deterministic and cheap failures are checked first.
+/// This establishes decisive bindings before potentially large AC partition streams without changing
+/// logical results.
 fn narrowing_subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
     if retained.len() != candidate.len() {
         return false;
@@ -1360,7 +1357,7 @@ pub fn xor_unifier_subsumes(
     }
     let mut pivot_row_for_column = vec![None; keys.len()];
     let mut pivot_row = 0;
-    for column in 0..keys.len() {
+    for (column, pivot_slot) in pivot_row_for_column.iter_mut().enumerate() {
         let Some(found) = (pivot_row..rows.len()).find(|&row| rows[row].0[column]) else {
             continue;
         };
@@ -1377,7 +1374,7 @@ pub fn xor_unifier_subsumes(
                 toggle_atom(e, &mut rows[row].1, atom);
             }
         }
-        pivot_row_for_column[column] = Some(pivot_row);
+        *pivot_slot = Some(pivot_row);
         pivot_row += 1;
     }
     if rows
@@ -1404,9 +1401,7 @@ pub fn xor_unifier_subsumes(
     let mut substitution = Subst::new();
     substitution.reset(variables.len() as u32);
     for (slot, key) in variables.iter().enumerate() {
-        let Some(index) = keys.iter().position(|candidate| candidate == key) else {
-            return None;
-        };
+        let index = keys.iter().position(|candidate| candidate == key)?;
         substitution.bind(slot as u32, assignments[index]);
     }
     let matches = patterns.iter().zip(candidate).all(|(pattern, &subject)| {
@@ -1626,9 +1621,8 @@ fn complete_state_unifier_detailed(
     }
 
     let mut unificands = pairs;
-    for slot in 0..specs.len() {
+    for (slot, &spec) in specs.iter().enumerate() {
         if !occurring.contains(&slot) {
-            let spec = specs[slot];
             let variable = env
                 .e
                 .make_var(spec.sort, spec.name, (state_base + slot) as u32);
@@ -1897,8 +1891,8 @@ fn dag_to_matching_term(e: &Engine, dag: DagId, variables: &mut Vec<(u32, SortId
     }
 }
 
-/// Convert a canonical runtime DAG back to a static command term while preserving its caller-assigned
-/// variable slots. This is used only for Maude's normalized command echo.
+/// Convert a canonical runtime DAG back to a static command term while preserving caller-assigned
+/// variable slots for normalized command echo.
 pub fn term_from_dag_slots(e: &Engine, dag: DagId) -> Term {
     match &e.node(dag).term {
         NodeTerm::Var { index, .. } => Term::var(*index, e.sort_of(dag)),
@@ -1933,16 +1927,14 @@ pub fn term_from_dag_slots(e: &Engine, dag: DagId) -> Term {
     }
 }
 
-/// Reindex every variable shared by a state's term/substitution by `(name, sort)`. Maude indexes the
-/// variant term first and then adds variables occurring only in the accumulated substitution.
+/// Reindex variables shared by a state's term and substitution, visiting the term first.
 fn reslot_state(
     e: &mut Engine,
     term: DagId,
     substitution: &[DagId],
 ) -> (DagId, Vec<DagId>, Vec<VarSpec>, Vec<DagId>, usize) {
-    // Maude's `indexVariables` mutates variable indices in place. Do not theory-normalize here:
-    // retained symbolic DAGs can deliberately contain copied, structurally equal AC arguments whose
-    // independent reduction state is observable in rewrite counts.
+    // Do not theory-normalize: copied, structurally equal AC arguments can carry independently
+    // observable reduction state.
     let substitution = substitution.to_vec();
     let mut keys = Vec::new();
     collect_variable_keys(e, term, &mut keys);
@@ -2222,9 +2214,8 @@ fn rebuild_variables_inner(
 
 /// Indexed version needed to map a state's slots into one local unification problem.
 ///
-/// Maude changes variable indices in place and does not normalize enclosing theory nodes. Preserve
-/// that representation here: final narrowing goals can deliberately contain shared, noncanonical
-/// AC/AU children produced by `instantiate(..., false)`.
+/// Remap slots without normalizing enclosing theory nodes, preserving shared or noncanonical AC/AU
+/// children in final narrowing goals.
 fn rebuild_slots(e: &mut Engine, dag: DagId, map: &[Option<u32>]) -> DagId {
     let slots: Vec<u32> = map.iter().map(|slot| slot.unwrap_or(0)).collect();
     e.remap_variable_slots_preserving_representation(dag, &slots)
@@ -2265,9 +2256,8 @@ fn positions_breadth_first(
     result
 }
 
-/// The variant-filter's `SUBSUMPTION_MODE` rebuild. Its temporary tuple variants are canonicalized
-/// eagerly, as Maude's variant folder does; object/narrowing successors use the representation-
-/// preserving path because their copied AC/AU structure remains rewrite-count observable.
+/// Canonical rebuild for temporary subsumption tuples. Object and narrowing successors instead use
+/// the representation-preserving path because copied AC/AU structure affects rewrite counts.
 fn replace_and_instantiate_canonical(
     e: &mut Engine,
     dag: DagId,

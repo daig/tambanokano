@@ -1,4 +1,4 @@
-*** U11-check-unifiers — lifted from the reference suite (Meta/checkUnifiers.maude)
+*** U11-check-unifiers
 *** PRELUDE
 set show timing off .
 set show advisories off .

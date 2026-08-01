@@ -1,9 +1,9 @@
 *** PRELUDE
-*** B2b-bang-snapshot — =>! per-solution snapshots differ; tnk explores lazily, Maude expands the frontier first
+*** B2b-bang-snapshot — =>! per-solution snapshots: lazy exploration vs frontier-first expansion
 *** Object level: M1 branches a=>{b,c}; b=>d (nf), c=>e=>f (nf). The FIRST =>! solution (d) prints
-***   states: 5  rewrites: 4 (oracle) vs states: 4  rewrites: 3 (tnk); the totals (6/5) agree.
-*** Meta level: metaSearch(['M1], ..., '!, ..., 0) reports rewrites: 6 (oracle) vs 5 (tnk); result term identical.
-*** The [Q] import-expression module form keeps the command echo clean (no inline-module grouping divergence).
+*** expected parity states: 5 rewrites: 4; totals (6/5) agree.
+*** Meta level: metaSearch(['M1], ..., '!, ..., 0) expected parity rewrites: 6; result term identical.
+*** The [Q] import-expression module form keeps the command echo clean.
 mod M1 is
   sort St .
   ops a b c d e f : -> St .

@@ -1,4 +1,4 @@
-*** A1c-unbound-rhs — unbound right-hand-side variable: both sides warn and leave the term unreduced.
+*** A1c-unbound-rhs — unbound right-hand-side variable: warns and leaves the term unreduced.
 *** Direct route first: the source statement is dropped without poisoning the module; `wrap(x)` stays
 *** unreduced and a following command remains usable.
 fmod UNBOUND is
@@ -10,7 +10,7 @@ endfm
 red in UNBOUND : wrap(x) .
 
 *** Parameterized route after: the build-at-instance deferral makes the instance the first checkpoint,
-*** so the unbound rhs is re-encountered when USEP instantiates PWRAP. Oracle again leaves it unreduced.
+*** so the unbound rhs is re-encountered when USEP instantiates PWRAP. Maude again leaves it unreduced.
 fth ELEM-TH is
   sort Elt .
 endfth

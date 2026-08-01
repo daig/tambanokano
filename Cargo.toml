@@ -1,4 +1,4 @@
-# tambanokano — a Rust rewrite of Maude (rewriting logic + membership equational logic).
+# tambanokano — a rewriting-logic and membership-equational-logic runtime.
 # Engine code is MIT (./LICENSE). Stock Maude companion libs in share/maude-gpl/ remain GPLv2+.
 # See ./NOTICE for the multi-license aggregate layout.
 [workspace]
@@ -12,13 +12,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 license = "MIT"
 publish = false
 
 [workspace.lints.rust]
-unsafe_code = "warn"        # D1/D2: arena+handles should keep `unsafe` rare and deliberate.
+unsafe_code = "warn"        # Arena handles keep unsafe code rare and explicit.
 
 [workspace.lints.clippy]
-# shared lints can be tightened as the codebase grows
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

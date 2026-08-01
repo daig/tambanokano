@@ -1,10 +1,9 @@
-*** Phase 1.5 / C8 — AU matching with "alien" subterms and non-linear variables, conformance vs the
-*** reference binary:  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-au-alien.maude < /dev/null
+*** AU matching with "alien" subterms and non-linear variables.
 ***
 *** AU = `assoc` (not commutative): lists / sequences. An alien (non-ground non-variable subterm under
 *** the operator, e.g. `s M`) matches one subject element recursively; a non-linear (repeated) variable
-*** must re-match the identical run. Was a loud panic (au.rs). The match order (leftmost-alien first /
-*** maximal-collector) is Maude's greedy order, fixing the reduce count. Mirrors the engine.rs C8 tests.
+*** must re-match the identical run. Leftmost-alien/maximal-collector order determines the
+*** deterministic rewrite count.
 
 fmod AU-ALIEN is
   sort E .

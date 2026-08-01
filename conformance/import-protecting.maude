@@ -1,5 +1,4 @@
-*** B5 module-system conformance: `protecting` a base module, then using both signatures.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/import-protecting.maude < /dev/null
+*** Module-system conformance: `protecting` a base module, then using both signatures.
 fmod NAT0 is
   sort N .
   op 0 : -> N [ctor] .

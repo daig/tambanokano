@@ -80,7 +80,6 @@ pub(super) struct InterpreterRegistry {
 struct LocalInterpreter {
     session: Box<Session>,
     transport: MetaTransport,
-    target: MetaEnvelope,
     target_token: Option<ExternalTargetToken>,
     modules: HashMap<String, MetaEnvelope>,
     views: HashMap<String, MetaEnvelope>,
@@ -154,7 +153,7 @@ impl<'a> LocalInterpreterManager<'a> {
             if name == "createInterpreter" && args.len() == 3 && request.name(args[2]) == "none" {
                 return self.create(request);
             }
-            // Malformed create/manager traffic is not consumed by the reference.
+            // Reject malformed manager traffic without consuming it.
             return ManagerAction::rejected();
         }
 
@@ -221,7 +220,6 @@ impl<'a> LocalInterpreterManager<'a> {
             LocalInterpreter {
                 session: Box::new(session),
                 transport,
-                target: target.clone(),
                 target_token: None,
                 modules: HashMap::new(),
                 views: HashMap::new(),
@@ -339,10 +337,10 @@ impl LocalInterpreter {
                 let Some(module_source) = session.db.get(&name).cloned() else {
                     return self.error(request, "Bad module.");
                 };
-                // A flat `upModule` can contain builtin `special`/`poly` declarations that are not
-                // reconstructible as ordinary surface attributes. Keep an equivalent non-flat form:
-                // the module's own declarations stay reflected while builtin declarations arrive through
-                // the cloned source imports each time a META handler down-translates it.
+                // A flat `upModule` can contain builtin `special`/`poly` declarations that cannot be
+                // reconstructed as ordinary surface attributes. Use a non-flat form instead: the module's
+                // own declarations stay reflected while builtin declarations arrive through the cloned
+                // source imports each time a META handler down-translates it.
                 let normalized = transport.transact(&[], |ctx, hooks, _| {
                     let qid = ctx.make_na(
                         *hooks.ops.get("qidSymbol")?,
@@ -503,9 +501,8 @@ impl LocalInterpreter {
             return self.error(request, "Nonexistent module.");
         };
         let cursor = cursor_spec(&request, message, name);
-        // A nonzero apply cursor proves that the preceding child rule result was consumed by the
-        // parent's protocol rule. Maude transfers that completed child rule into the breakdown only
-        // at this continuation boundary; the aggregate was already transferred with its reply.
+        // A nonzero apply cursor means the parent protocol consumed the preceding child result. Transfer
+        // that completed child rule at this continuation boundary; its aggregate moved with the reply.
         let completed_apply_rule = matches!(name, "applyRule" | "xapplyRule")
             && cursor.as_ref().is_some_and(|c| c.index > 0);
         let module_name = module_name.to_string();
@@ -579,6 +576,7 @@ impl LocalInterpreter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_module_operation(
     session: &mut Session,
     cursors: &mut VecDeque<CursorEntry>,
@@ -593,10 +591,8 @@ fn handle_module_operation(
     target: DagId,
     breakdown: &mut ExternalRewriteBreakdown,
 ) -> Option<(u64, DagId)> {
-    // A source-backed insertion already has the authoritative module in the child's database. Feed
-    // META descent an unreduced `upModule` reference so `MetaDescent::down_module` takes its lossless
-    // source path instead of round-tripping the reflected declaration DAG. Hand-written inserted modules
-    // are absent from the database and continue through the ordinary down-translation path.
+    // Source-backed insertions already exist in the child database. Pass an unreduced `upModule` so descent
+    // uses that source directly; hand-written insertions use ordinary reflected-DAG translation.
     let source_module = if session.db.get(module_name).is_some() {
         let qid = ctx.make_na(
             *hooks.ops.get("qidSymbol")?,
@@ -899,9 +895,8 @@ fn handle_module_operation(
             let mut call = vec![module];
             call.extend_from_slice(&args[3..]);
             let (result, work) = invoke_descent(session, ctx, hooks, op, call)?;
-            // `RewriteSearchState::transferCountTo` resets the cached state's counters after every
-            // reply. Each application therefore reports and transfers this request's work directly;
-            // it is not a cumulative recomputation to subtract through `account_cursor`.
+            // Application counters reset after each reply, so every application reports and transfers
+            // only this request's work; `account_cursor` must not treat it as a cumulative total.
             let _ = cursor?;
             let (reported, transfer) = (work, work);
             let children = ctx.children(result);
@@ -961,7 +956,6 @@ fn handle_module_operation(
                 MetaOp::Unify {
                     disjoint,
                     irredundant,
-                    legacy: false,
                 },
                 vec![module, *args.get(3)?, *args.get(4)?, *args.get(5)?],
             )?;
@@ -992,7 +986,7 @@ fn handle_module_operation(
                 hooks,
                 MetaOp::GetVariant {
                     irredundant,
-                    legacy: false,
+                    nat_family: false,
                 },
                 vec![
                     module,
@@ -1022,7 +1016,7 @@ fn handle_module_operation(
                 hooks,
                 MetaOp::VariantUnify {
                     disjoint,
-                    legacy: false,
+                    nat_family: false,
                 },
                 vec![
                     module,
@@ -1220,6 +1214,7 @@ fn invoke_srewrite_descent(
     Some((result, ctx.rewrites().saturating_sub(before)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn symbolic_counted_result(
     cursors: &mut VecDeque<CursorEntry>,
     cursor: &CursorSpec,
@@ -1240,6 +1235,7 @@ fn symbolic_counted_result(
     counted_reply(ctx, reply, requester, target, reported, transfer, children)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn symbolic_counted_whole_result(
     cursors: &mut VecDeque<CursorEntry>,
     cursor: &CursorSpec,
@@ -1509,6 +1505,7 @@ impl Session {
         Some((up_result, up_type))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rewrite_meta_term(
         &mut self,
         ctx: &mut MetaCtx,

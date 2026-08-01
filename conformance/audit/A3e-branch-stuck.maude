@@ -1,4 +1,4 @@
 *** PRELUDE
-*** A3e-branch-stuck (TNK-004) — an undecidable BranchSymbol condition normalizes every branch
+*** An undecidable BranchSymbol condition normalizes every branch
 *** before trying user equations; value, rewrite count, and least sort must match Maude 3.5.1.
 red in BOOL : if X:Bool then (true and false) else (false or true) fi .

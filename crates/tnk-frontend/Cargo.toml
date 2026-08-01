@@ -1,8 +1,9 @@
 [package]
 name = "tnk-frontend"
-description = "tambanokano frontend: Maude lexer, mixfix parser, and pretty-printer over the tnk-core kernel"
+description = "tambanokano frontend: lexer, mixfix parser, and pretty-printer over the tnk-core kernel"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -11,4 +12,3 @@ workspace = true
 
 [dependencies]
 tnk-core = { path = "../tnk-core" }
-# (no external interner — `lex::Interner` is a small in-crate Vec + HashMap; the only kernel dep is malachite)

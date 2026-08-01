@@ -1,9 +1,8 @@
-//! View definitions (Pillar B-ii): store + signature-validate `view V from T to M is … endv`.
+//! View storage and signature validation.
 //!
-//! A view maps a source theory `T` to a target module/theory `M` — it is the argument of a parameterized
-//! instantiation `M{V}` (B-iv). Validation covers the signature homomorphism before a view is stored:
-//! sort existence, connected-component preservation, and operator-map source/target profiles.
-//! Theory axioms remain proof obligations, as in Maude; they are not executed as validation tests.
+//! A view maps a source theory to a target module or theory for use in parameterized instantiation.
+//! Validation checks sort existence, connected-component preservation, and source/target operator
+//! profiles. Theory axioms remain proof obligations rather than executable validation tests.
 
 use std::collections::{HashMap, HashSet};
 use tnk_core::sort::SortId;
@@ -41,17 +40,13 @@ impl ViewDb {
     }
 }
 
-/// The base module/theory name of a view's `from`/`to`: a plain name, or the base of an instantiation
-/// target (`LIST{X}` → `LIST`, Axis-A2). Sums/renamings as a view target are a later increment.
+/// Extract the named base of a plain or instantiated view endpoint. Sum and renaming endpoints are not
+/// accepted by view validation.
 fn expr_base_name(e: &ModuleExpr) -> Result<&str, String> {
     match e {
         ModuleExpr::Named(n) => Ok(n),
         ModuleExpr::Instantiation(base, _) => expr_base_name(base),
-        _ => Err(
-            "a view's `from`/`to` must be a named module/theory or an instantiation \
-                  (sums/renamings are a later increment)"
-                .into(),
-        ),
+        _ => Err("a view's `from`/`to` must be a named module/theory or an instantiation".into()),
     }
 }
 
@@ -214,9 +209,7 @@ fn profile_text(profile: &OpProfile, module: &BuiltModule) -> String {
     )
 }
 
-/// Signature-validate a view against the module database. On success the view is well-formed enough to be
-/// stored and (later) used in an instantiation; on failure returns a diagnostic mirroring the reference
-/// binary's wording.
+/// Validate a view's signature homomorphism before storage or instantiation.
 pub fn validate_view(
     v: &ViewDecl,
     db: &ModuleDb,
@@ -245,7 +238,7 @@ pub fn validate_view(
         )
     })?;
 
-    // Flatten with the real view table: a target may itself be built from an earlier instantiation.
+    // Use the accumulated view table because the source may depend on an earlier instantiation.
     let from_flat = flatten(from_name, db, views, interner)?;
     let from_sorts: HashSet<&str> = from_flat.sorts.iter().map(String::as_str).collect();
 
@@ -309,8 +302,7 @@ pub fn validate_view(
     }
 
     let maps = op_map_specs(v, interner, &source);
-    // Every explicit source must resolve. A signature selector identifies the source symbol's
-    // connected-component profile, matching Maude's overload grouping.
+    // Every explicit source must resolve; a signature selector chooses one connected-component profile.
     for mapping in &maps {
         let found = source.op_profiles.iter().any(|profile| {
             profile_name(profile, &source) == mapping.source
@@ -462,7 +454,7 @@ mod tests {
         assert!(validate_view(&views[0], &db, &ViewDb::new(), &mut i).is_ok());
     }
 
-    /// Mapping a theory sort to a sort the target does not have is the binary's `failed to find sort` error.
+    /// Mapping a theory sort to a missing target sort reports both the sort and target module.
     #[test]
     fn missing_target_sort_rejected() {
         let (db, views, mut i) = setup(
@@ -522,7 +514,7 @@ mod tests {
         );
         assert!(
             validate_view(&views[0], &db, &ViewDb::new(), &mut i).is_ok(),
-            "Maude warns about the missing subsort image but keeps the view usable"
+            "missing subsort images remain usable"
         );
     }
 

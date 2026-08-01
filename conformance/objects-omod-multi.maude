@@ -1,9 +1,7 @@
-*** Pillar 2.5-E / erewrite: the object-message scheduler's TWO paths in one system. `reward` is a
-*** single-object message rule (Maude's fast path — object + message, same name); `pair` is a MULTI-object
+*** The object-message scheduler's two erewrite paths in one system. `reward` is a
+*** single-object message rule (fast path — object + message, same name); `pair` is a MULTI-object
 *** rule (message + two objects), which is NOT an object-message pair, so it takes the generic `leftOver`
-*** path (ConfigSymbol::leftOverRewrite). Before this, tnk's erewrite fired only the fast path, so `pair`
-*** never delivered under erewrite though it did under plain rewrite. Byte-identical to the reference:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-multi.maude < /dev/null
+*** path (ConfigSymbol::leftOverRewrite). Both paths must deliver under erewrite.
 
 set show advisories off .
 

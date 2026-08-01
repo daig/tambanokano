@@ -1,6 +1,5 @@
-*** COV-002 / OUT-003 retained probe: context-free selection picks the first range-kind profile.
-*** Maude prints the resulting ill-sorted application with `.B`; tnk currently prints `.[B]`.
-*** This file is intentionally outside exact-parity scoreboards until OUT-003 is classified.
+*** Cross-kind overload selection: context-free selection picks the first range-kind profile.
+*** Ill-sorted application print form expected parity uses `.B`.
 
 set show timing off .
 fmod COV002-ILL-SORTED-OUTPUT is

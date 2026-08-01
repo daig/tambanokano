@@ -1,5 +1,4 @@
-*** I12-meta-int-strategy — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntStrategy.maude; oracle verified 2026-07-23.
+*** I12-meta-int-strategy
 *** PRELUDE
 set show timing off .
 set show advisories off .

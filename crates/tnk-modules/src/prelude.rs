@@ -1,14 +1,7 @@
-//! Built-in modules injected into the [`ModuleDb`](crate::db::ModuleDb) on demand.
+//! Built-in modules injected into the [`ModuleDb`] on demand.
 //!
-//! tambanokano keeps the engine prelude-free except for one API-compatible substrate:
-//! `CONFIGURATION`, which an `omod` auto-imports (Maude's `set oo include CONFIGURATION on`).
-//! When a module imports `CONFIGURATION` and the user has not defined it,
-//! [`ensure_builtins`] parses this built-in copy so flattening can resolve it. A
-//! user-defined `CONFIGURATION` (as `conformance/objects.maude` declares) is never overridden.
-//!
-//! The source below is an original, MIT-licensed declaration of that public interface
-//! (sorts, operators, and `special` hook names required for object-system interoperability).
-//! It is not a verbatim extract of Maude's `prelude.maude`.
+//! The engine is prelude-free except for `CONFIGURATION`, which object modules import automatically.
+//! [`ensure_builtins`] installs this declaration only when the module database does not already contain one.
 
 use tnk_frontend::lex::{Interner, tokenize};
 use tnk_frontend::surface::ast::{Import, ModuleExpr};
@@ -16,12 +9,8 @@ use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
 
-/// Object-system configuration substrate used when an `omod` (or an explicit import) needs
-/// `CONFIGURATION` and the session has not already defined it.
-///
-/// Public names and hook identifiers match the Maude object-system interface so stock modules
-/// and differential fixtures remain source-compatible. The module text itself is original to
-/// tambanokano (MIT).
+/// Object-system configuration substrate used when `CONFIGURATION` is imported but not already defined.
+/// Its public sorts, operators, and hook identifiers support object-module parsing and execution.
 pub const CONFIGURATION_SRC: &str = r#"
 mod CONFIGURATION is
   *** Object attributes (ACU set with empty identity).
@@ -53,7 +42,7 @@ mod CONFIGURATION is
 endm
 "#;
 
-/// The built-in module source for `name`, if any. `CONFIGURATION` is the only built-in for now.
+/// Return the synthesized source of a built-in module. The current built-in set contains CONFIGURATION.
 fn builtin_src(name: &str) -> Option<&'static str> {
     match name {
         "CONFIGURATION" => Some(CONFIGURATION_SRC),
@@ -61,9 +50,7 @@ fn builtin_src(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Ensure any built-in prelude module named by `imports` is present in `db`, parsing and inserting the
-/// built-in copy when the user has not already defined it. Idempotent — a same-named module already in
-/// `db` (a user definition, or a previous injection) wins and is left untouched.
+/// Insert each required built-in module that is not already present. Existing definitions always win.
 pub fn ensure_builtins(imports: &[Import], db: &mut ModuleDb, interner: &mut Interner) {
     let mut names = Vec::new();
     for imp in imports {
@@ -71,7 +58,7 @@ pub fn ensure_builtins(imports: &[Import], db: &mut ModuleDb, interner: &mut Int
     }
     for name in names {
         if db.get(&name).is_some() {
-            continue; // already defined (user or prior injection)
+            continue;
         }
         let Some(src) = builtin_src(&name) else {
             continue;

@@ -1,5 +1,5 @@
 *** A two-parameter module MAP{K :: TRIV, V :: TRIV} instantiated by two distinct views (ToN, ToS); each
-*** parameter binds independently and the structured sorts use both arguments (Map{ToN,ToS}). Byte-identical.
+*** parameter binds independently and the structured sorts use both arguments (Map{ToN,ToS}).
 fth TRIV is sort Elt . endfth
 fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
 fmod STR is sort Str . op a : -> Str [ctor] . op b : -> Str [ctor] . endfm

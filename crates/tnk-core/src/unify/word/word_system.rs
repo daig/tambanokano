@@ -1,6 +1,5 @@
 //! DFS driver over [`WordLevel`] decision levels.
 //!
-//! Port of Maude's `Utility/wordSystem.{hh,cc}`.
 
 use super::word_level::WordLevel;
 use super::{FAILURE, INCOMPLETE, SUCCESS, Word};
@@ -8,13 +7,16 @@ use super::{FAILURE, INCOMPLETE, SUCCESS, Word};
 /// Resumable solver for a system of constrained word equations.
 pub(crate) struct WordSystem {
     current: Box<WordLevel>,
+    // Child levels already arrive boxed; retain their pointers instead of moving large solver states as
+    // the DFS stack grows.
+    #[allow(clippy::vec_box)]
     level_stack: Vec<Box<WordLevel>>,
     incompleteness_flag: u8,
 }
 
 impl WordSystem {
-    /// Construct a root level. Fresh abstract variables introduced by PIG-PUG begin at
-    /// `nr_variables`; `nr_equations` preallocates the indexed word-equation slots.
+    /// Construct a root level. Fresh abstract variables introduced by PigPug moves begin at
+    /// `nr_variables`; `nr_equations` preallocates indexed word-equation slots.
     pub(crate) fn new(
         nr_variables: usize,
         nr_equations: usize,

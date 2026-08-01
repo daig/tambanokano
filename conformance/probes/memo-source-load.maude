@@ -1,4 +1,4 @@
-*** Source-file `[memo]` warning probe for the V1 honest-behavior contract.
+*** Source-file `[memo]` attribute emits the unsupported-attribute warning and keeps the module usable.
 fmod MEMO-FILE is
   sort N .
   op z : -> N [ctor] .

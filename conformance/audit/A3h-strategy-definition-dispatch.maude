@@ -1,4 +1,4 @@
-*** A3h-strategy-definition-dispatch — kind overloads and lhs matching select every applicable sd (TNK-005)
+*** Kind overloads and lhs matching select every applicable strategy definition.
 smod A3H-DISTINCT is
   sorts S T .
   ops a b : -> S .

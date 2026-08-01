@@ -1,12 +1,9 @@
-// M2 lands the BDD facade before M3-M7 consume it; keep the staged module warning-free.
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 use std::fmt;
 
 use biodivine_lib_bdd::{Bdd as RawBdd, BddPointer, BddVariable, BddVariableSet};
 
-/// Engine-local BDD variable context. Variable `i` is proposition `i` throughout Phase M.
+/// Engine-local BDD variable context. Variable `i` denotes proposition `i`.
 pub(crate) struct BddContext {
     variables: BddVariableSet,
 }
@@ -42,6 +39,7 @@ impl BddContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn false_bdd(&self) -> Bdd {
         Bdd {
             raw: self.variables.mk_false(),
@@ -60,6 +58,7 @@ impl BddContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn not(&self, value: &Bdd) -> Bdd {
         self.assert_context(value);
         Bdd {
@@ -94,6 +93,7 @@ impl BddContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn equivalent(&self, lhs: &Bdd, rhs: &Bdd) -> bool {
         self.assert_pair(lhs, rhs);
         lhs == rhs
@@ -159,9 +159,8 @@ impl Bdd {
 }
 
 impl Bdd {
-    /// Extract the same high-first prime implicant as Maude's `Bdd::extractPrimeImplicant`
-    /// (`Utility/bdd.cc`). `None` denotes false; an empty vector denotes true. Literals are returned in
-    /// increasing proposition order as `(variable, positive)`.
+    /// Extract a high-first prime implicant. `None` denotes false; an empty vector denotes true.
+    /// Literals are returned in increasing proposition order as `(variable, positive)`.
     pub(crate) fn prime_implicant_literals(&self) -> Option<Vec<(usize, bool)>> {
         if self.is_false() {
             return None;
@@ -199,8 +198,8 @@ impl Bdd {
         result
     }
 
-    /// Whether the subfunction rooted at `node`, restricted by the given cube, is identically true.
-    /// This is the exact predicate used by the reference's `bdd_restrict(lo, pi) == bdd_true()`.
+    /// Whether the subfunction rooted at `node` becomes identically true under the given cube. The
+    /// prime-implicant walk uses this to detect a redundant decision variable.
     fn restricted_is_true(
         &self,
         node: BddNode,
@@ -415,14 +414,14 @@ mod tests {
     }
 
     #[test]
-    fn prime_implicant_matches_reference_high_first_restriction() {
+    fn high_first_prime_implicant_omits_redundant_decision() {
         let context = BddContext::new(3);
         let x = context.ithvar(0);
         let y = context.ithvar(1);
         let z = context.ithvar(2);
         let not_x = context.not(&x);
-        // x ? y : (y | z). The high branch yields `y`; restricting the low branch by `y`
-        // makes it true, so the reference omits x from the prime implicant.
+        // x ? y : (y | z). The high branch yields `y`, which also makes the low branch true,
+        // so the decision on x is unnecessary in the implicant.
         let formula = context.or(
             &context.and(&x, &y),
             &context.and(&not_x, &context.or(&y, &z)),

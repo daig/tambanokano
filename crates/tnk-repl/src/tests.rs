@@ -1,5 +1,5 @@
-//! `eval`-driven tests — the REPL with no terminal. Each feeds input submissions and asserts the output,
-//! re-validating the whole pipeline (parse → flatten → build → reduce/match → print) through the shell.
+//! `eval`-driven tests for the terminal-neutral REPL. Each test submits input and exercises the complete
+//! parse → flatten → build → execute → render pipeline.
 
 use super::*;
 
@@ -41,7 +41,7 @@ fn command_without_current_module() {
     assert!(r.eval("red foo .").output.contains("no current module"));
 }
 
-/// The module system end-to-end through the REPL: a diamond import reduces to the binary's value/count.
+/// A diamond import produces the expected value and accumulated rewrite count.
 #[test]
 fn import_diamond_through_repl() {
     let out = repl()
@@ -61,12 +61,9 @@ fn import_renaming_through_repl() {
     assert!(out.contains("rewrites: 2"), "count: {out}");
 }
 
-/// M2 milestone — the real prelude's `LIST{Nat}` (over BOOL+NAT) loads and every list operation
-/// reduces byte-identically to the reference. Proves AU **identity-collapse matching**: each recursion
-/// (`occurs`/`size`/`reverse`) peels `E L` off the front and must match the final singleton `c` as
-/// `c nil`. Values/sorts/counts are the reference binary's (`red in T : …`, `T = LIST{Nat}`).
+/// Loads `LIST{Nat}` and exercises AU identity collapse, matching, and parameter instantiation.
 #[test]
-fn prelude_list_m2_through_repl() {
+fn prelude_list_through_repl() {
     let out = repl().eval(conformance_file!("prelude-list.maude")).output;
     assert!(
         !out.contains("no parse") && !out.contains("error in module"),
@@ -109,10 +106,8 @@ fn prelude_list_m2_through_repl() {
     );
 }
 
-/// Container milestone (cont.) — the real prelude's EXT-BOOL + SET{Nat} load and reduce
-/// byte-identically. Proves the `[Sort]` kind notation (EXT-BOOL `var B : [Bool]`), ACU
-/// identity-collapse matching (SET recursions to a singleton), non-linear ACU matching (`E in (E, S)`),
-/// and the assoc-list separator spacing. Values/sorts/counts are the reference binary's.
+/// Loads EXT-BOOL and `SET{Nat}` and exercises kind syntax, ACU identity collapse, nonlinear matching, and
+/// associative-list rendering.
 #[test]
 fn prelude_set_through_repl() {
     let out = repl().eval(conformance_file!("prelude-set.maude")).output;
@@ -157,11 +152,7 @@ fn prelude_set_through_repl() {
     );
 }
 
-/// Helper for the prelude container fixtures: pair each `rewrites:`/`result` line into `[count] value`.
-/// Each `[rewrite-count] sort: value` result, with the **full** value — a `format`-attribute result spans
-/// continuation lines (a substitution's `_<-_` newline-indents each binding), captured up to the next
-/// command echo / `rewrites:` line, so the multi-line layout is compared verbatim against the reference.
-/// Per `srewrite`/`dsrewrite` command, the ordered solution values joined by ` ; ` (or `(no solution)`).
+/// Collect ordered strategy solution values per command, preserving multiline values.
 fn strategy_solutions(out: &str) -> Vec<String> {
     let mut res = Vec::new();
     let mut cur: Vec<String> = Vec::new();
@@ -196,10 +187,8 @@ fn strategy_solutions(out: &str) -> Vec<String> {
     res
 }
 
-/// Phase 2.4 — the core strategy language. `srewrite`/`dsrewrite` over `STRAT-CORE` exercising
-/// `idle`/`fail`/`all`/rule-by-label/`top`/`one`/`;`/`|`/`*`/`+`/`!`/`?:`(+`try`/`not`)/`match`/`amatch`:
-/// the solution values + order are byte-identical to the reference. (The per-solution `srewrite` rewrite
-/// count follows the BFS snapshot — so this pins the solution values/structure.)
+/// Exercise primitive actions, combinators, tests, named and recursive calls, parameters, and matchrew in
+/// fair and depth-first execution.
 #[test]
 fn strategy_core_through_repl() {
     let out = repl().eval(conformance_file!("strategy.maude")).output;
@@ -231,14 +220,12 @@ fn strategy_core_through_repl() {
             "b",             // one(r1 | r2) — only the first solution
             "b ; c",         // dsrewrite r1 | r2
             "d",             // dsrewrite (r1 | r2) ; r3
-            // Phase C — strategy definitions (`sd`) + calls. `go := r1 ; r3`, `go2 := go | r2`, and the
-            // recursive `reach := idle | ((r1|r2|r3|r4) ; reach)` (cycle-detected). `dsrewrite` for the
-            // multi-solution calls (the fair `srewrite` order is the BFS follow-on).
+            // Named definitions and calls, including a recursive reachability strategy. Depth-first
+            // execution terminates through cycle pruning.
             "d",             // srewrite go
             "d ; c",         // dsrewrite go2
             "a ; b ; d ; c", // dsrewrite reach — all states reachable from a (recursion terminates)
-            // Phase D — matchrew/amatchrew, conditional rules (equality + rewrite-condition substrategies),
-            // application substitution `L[x <- t]`, the `xmatch` test, and parameterized strategy calls.
+            // Matchrew forms, conditional rules, application substitutions, tests, and parameterized calls.
             "f(b, c)",                               // matchrew by X using r1, Y using r2
             "f(b, b) ; f(c, b)",                     // matchrew by X using (r1|r2), Y using r1
             "f(b, b) ; f(c, b) ; f(b, c) ; f(c, c)", // dsrewrite matchrew — full cartesian product
@@ -296,11 +283,7 @@ fn strategy_value_counts(out: &str) -> Vec<String> {
     res
 }
 
-/// Phase 2.4 — fair `srewrite` (and `dsrewrite`) solution ORDER **and** per-solution cumulative rewrite
-/// COUNT, byte-identical to Maude 3.5.1. These are the unequal-depth interleavings the old eager depth-first
-/// enumerator got wrong: the fair FIFO round-robin emits the shorter derivation first while DFS explores
-/// left-fully, and the per-solution count tracks the exact process schedule (a decompose step costs a turn
-/// but no rewrite; unions are n-ary). The process-queue + task-tree executor reproduces both.
+/// Pin fair FIFO and depth-first strategy order together with cumulative rewrite counts.
 #[test]
 fn strategy_fair_counts_through_repl() {
     let out = repl().eval(conformance_file!("strategy-fair.maude")).output;
@@ -326,9 +309,8 @@ fn strategy_fair_counts_through_repl() {
     );
 }
 
-/// TNK-021 — every command echo is executable source for the same strategy tree. Besides the
-/// precedence boundaries, right-nested `;`/`|` pin grouping that a flat left-associative echo would lose.
-/// Re-executing each emitted strategy must retain solution order and cumulative rewrite counts.
+/// Every strategy command echo must parse back to the same tree. The fixture covers precedence and
+/// right-nested sequence/union groupings, then compares solution order and rewrite counts after replay.
 #[test]
 fn strategy_echoes_round_trip_through_repl() {
     let mut r = repl();
@@ -439,25 +421,9 @@ fn prelude_results(out: &str) -> Vec<String> {
     results
 }
 
-/// META-LEVEL Stages 1–4. The whole reflective tower (META-TERM/CONDITION/STRATEGY/MODULE/VIEW/LEVEL,
-/// the real prelude) parses and builds with **no errors**; then the **entire descent surface** computes
-/// byte-identically (value, sort, **rewrite count**, and layout) to the reference: the reflection core
-/// (`metaReduce`/…/`metaSearchPath`, Stages 1–3.5) and the Stage-4 up*/query/syntax layer — the `up*`
-/// family (`upModule`/`up{Sorts,…,Rls}`/`upView`/`upTerm`/`downTerm`), the sort/kind queries
-/// (`sortLeq`/…/`maximalAritySet`), `metaParse`/`metaPrettyPrint`, and `metaWellFormed*`. (The `=>!`
-/// `metaSearch` count now matches the oracle — the B2b normal-form-confirmation snapshot fix; the
-/// `=>+` sol-1 count still pins tnk's BFS-snapshot value, a separate parallel-odometer divergence —
-/// value/sort/reachability match.)
-///
-/// Stage 1 (the parse/flatten fixes the meta-modules first exercise):
-///   * `'a ; 'b ; 'a` → `'a ; 'b` — the `op _,_ to _;_ [prec 43]` **mixfix renaming** over QID-SET
-///     (grammar-aware, applied to QID-SET's `_,_` occurrences) gives a working idempotent `_;_` (`N ; N`).
-///   * `getName(fmod 'FOO is nil sorts none . none none none none endfm)` → `'FOO` — the **module
-///     constructor** `fmod_is_sorts_.____endfm`, whose name carries `.`/`is`/`endfm` fragments, parses
-///     inside an equation (the `input_complete` chunker no longer mistakes those fragments for module
-///     delimiters) and the projection equation fires.
-///   * `getRls(…)` → `(none).RuleSet` — a bare **overloaded `none`** on the rhs, disambiguated by the
-///     lhs kind (kind-homogeneous equation parsing).
+/// End-to-end META-LEVEL coverage for reduction, rewriting, matching, application, search/path, reflection,
+/// sort/kind queries, well-formedness, parsing, and printing. Also covers grammar-sensitive mixfix renaming,
+/// module constructors inside equations, and kind-directed overload selection.
 #[test]
 fn prelude_meta_through_repl() {
     let out = repl().eval(conformance_file!("prelude-meta.maude")).output;
@@ -469,28 +435,20 @@ fn prelude_meta_through_repl() {
     assert_eq!(
         prelude_results(&out),
         vec![
-            // Stage 1 — the tower loads + the parse/flatten fixes (idempotent renamed `_;_`, the module
-            // constructor inside an equation, kind-homogeneous `none` rhs).
+            // META tower loading and grammar-sensitive module projections.
             "[1] NeSortSet: 'a ; 'b",
             "[1] Sort: 'FOO",
             "[1] RuleSet: (none).RuleSet",
-            // Stage 2 — the reflection core: `metaReduce` (down/up + object reduction) over the `[Q]` form,
-            // and `<Qids>`-classified `getName`/`getType`. Values, sorts, and rewrite counts are the
-            // reference binary's.
+            // Reduction through a named meta-module plus Qid-classified projections.
             "[2] ResultPair: {'0.Zero, 'Zero}",
             "[3] ResultPair: {'s_^5['0.Zero], 'NzNat}",
             "[3] ResultPair: {'false.Bool, 'Bool}",
             "[6] Sort: 'foo",
             "[7] Sort: 'Bar",
-            // Stage 3 — inline down_module: the module argument carries inline declarations (sorts,
-            // subsorts, attributed ops, equations), down-translated straight into the built engine. BAR
-            // (own eq over imported NAT) and LEN (subsorts + AU `id(...)` op + recursive AU-matching eq).
+            // Inline meta-modules with imports, subsorts, attributed operators, and equations.
             "[3] ResultPair: {'s_^6['0.Zero], 'NzNat}",
             "[8] ResultPair: {'s_^3['0.Zero], 'NzNat}",
-            // Stage 3 — the rewriting/matching/search family over the rule-bearing FOO (and `[NAT]`).
-            // Stage 3.5 — value, rewrite count, AND the `format`-attribute layout are now byte-identical to
-            // the reference: a substitution's `_<-_` (`format (n++i d d --)`) newline-indents each binding,
-            // and `rl_=>_[_].` (`format (… s … s …)`) spaces its `[attrs]`/`.`.
+            // Rewriting, matching, application, and search with formatted substitutions and rules.
             "[3] ResultPair: {'c.Elt, 'Elt}", // metaRewrite unbounded: a=>b=>c
             "[2] ResultPair: {'b.Elt, 'Elt}", // metaRewrite [1]: one step a=>b
             "[3] ResultPair: {'c.Elt, 'Elt}", // metaFrewrite gas 1: a=>b=>c
@@ -498,7 +456,7 @@ fn prelude_meta_through_repl() {
             "[2] Substitution?: (noMatch).Substitution?", // metaMatch: _+_ vs s^5 — no match
             "[2] ResultTriple: {'b.Elt, 'Elt, \n  'X:Elt <- 'b.Elt}", // metaSearch =>+ sol 0: a=>b
             "[3] ResultTriple: {'c.Elt, 'Elt, \n  'X:Elt <- 'c.Elt}", // metaSearch =>+ sol 1: a=>c (ab)
-            "[4] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}", // metaSearch =>! normal form c: snapshot at nf-confirmation (oracle rewrites: 4)
+            "[4] ResultTriple: {'c.Elt, 'Elt, (none).Substitution}", // normal form snapshot at confirmation
             // metaApply: the labelled rule `unwrap` (f(N) => N) at the top, its binding, or failure.
             "[2] ResultTriple: {'s_^3['0.Zero], 'NzNat, \n  'N:Nat <- 's_^3['0.Zero]}", // apply at top
             "[1] ResultTriple?: (failure).ResultTriple?", // solution 1 — past the last
@@ -510,17 +468,12 @@ fn prelude_meta_through_repl() {
             "[2] MatchPair?: (noMatch).MatchPair?",              // metaXmatch _+_ vs s^5 — no match
             "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- 'f['0.Zero], []}", // xapply at top
             "[2] Result4Tuple: {'f['0.Zero], 'Nat, \n  'N:Nat <- '0.Zero, 'f[[]]}", // xapply at inner f
-            // metaSearchPath: the path to the first =>* solution is one TraceStep {a, Elt, ab-rule}. Stage
-            // 3.5 closes the rule layout — `rl_=>_[_].`'s `format` spaces the `[label(…)]` and trailing `.`,
-            // so the up-translated rule prints `'c.Elt [label('ab)] .` byte-identically to the reference.
+            // metaSearchPath returns the witness TraceStep with its fully formatted source rule.
             "[3] TraceStep: {'a.Elt, 'Elt, rl 'a.Elt => 'c.Elt [label('ab)] .}",
-            // A two-step path (a => b => c) is a `__`-folded two-element Trace; `__`'s `format (d n d)`
-            // newlines each TraceStep — exercising the assoc-fold format path (and what upModule's
-            // declaration lists need). Byte-identical to the reference.
+            // A two-step path is an associative Trace whose format places each step on a new line.
             "[3] Trace: {'a.Elt, 'Elt, rl 'a.Elt => 'b.Elt [label('r1)] .}\n\
              {'b.Elt, 'Elt, rl 'b.Elt => 'c.Elt [label('r2)] .}",
-            // Stage 4 — the up*/query/parse layer. The sort/kind queries read the down-translated
-            // module's lattice; value + count are the reference binary's.
+            // Sort/kind queries over the down-translated module lattice.
             "[2] Bool: true",                      // sortLeq(Zero, Nat)
             "[2] Bool: false",                     // sameKind(Nat, Bool)
             "[2] Sort: 'NzNat",                    // leastSort(2 + 3)
@@ -573,11 +526,7 @@ fn prelude_meta_through_repl() {
             "[3] NeTypeList: '2 '+ '3", // metaPrettyPrint(2 + 3)
             // upView decomposes a view: header, from/to module exprs, and its sort/op maps.
             "[1] View: view 'S4-V from 'TRIV to 'NAT is\n  sort 'Elt to 'Nat .\n  none\n  none\nendv",
-            // Stage 5 — the symbolic/SMT/strategy descent is declared (the tower loads) but stays INERT:
-            // it reduces to OUR kind-level term, never misfiring, until the Phase-3.2/3.3 (D6/D7) and
-            // strategy (Phase 2.4) backends land. (These two pin our inert result, *not* the reference's —
-            // the reference computes `none` for a strat-free module. The symbolic/SMT ops go
-            // through the same exhaustive `=> None` arm.)
+            // Strategy reflection over a strategy-free module returns the two typed empty sets.
             "[1] StratDeclSet: (none).StratDeclSet",
             "[1] StratDefSet: (none).StratDefSet",
         ],
@@ -585,9 +534,7 @@ fn prelude_meta_through_repl() {
     );
 }
 
-/// LEXICAL's two quoted-identifier hooks dispatch through the upper-layer descent seam: `tokenize`
-/// constructs the real AU QidList (including punctuation/backquote canonicalization), and `printTokens`
-/// emits Maude's byte-level spacing/control semantics. Values and one-rewrite counts are the 3.5.1 oracle's.
+/// Exercise LEXICAL tokenization, punctuation/backquote canonicalization, and byte-level token printing.
 #[test]
 fn lexical_token_hooks_through_repl() {
     let mut r = repl();
@@ -652,10 +599,9 @@ red in META-LEVEL : metaParse(['LEXICAL-PARSE], 'A:List ; 'B:List, 'A 'B, anyTyp
     );
 }
 
-/// Modern (Qid-family) free order-sorted `metaUnify` indexes distinct maximal-lower-sort unifiers in
-/// Maude order, then returns the typed exhaustion sentinel. This deliberately excludes AU and variants.
+/// Qid-family free order-sorted unification follows sort order and ends with a typed exhaustion sentinel.
 #[test]
-fn modern_free_meta_unify_indices_through_repl() {
+fn free_meta_unify_indices_through_repl() {
     let mut r = repl();
     r.eval(conformance_file!("prelude-meta.maude"));
     let out = r
@@ -677,14 +623,12 @@ red in META-LEVEL : metaUnify(['FREE-MULTI], 'X:A =? 'Y:B, '%, 2) .
             "[2] UnificationPair: {\n  'X:A <- '#1:D ; \n  'Y:B <- '#1:D, '#}",
             "[2] UnificationPair?: (noUnifier).UnificationPair?",
         ],
-        "modern free metaUnify indices: {out}"
+        "free metaUnify indices: {out}"
     );
 }
 
-/// Container milestone — the real prelude's `MAP{Nat, Nat}` loads and reduces byte-identically. Proves
-/// two-parameter instantiation, the `[Y$Elt]` kind range (via `inst_sort`), and the `id:`-attribute
-/// parse fix (an `_,_ [assoc comm id: empty prec 121]` keeps its prec, so a `_|->_` entry parses as an
-/// argument). Values/sorts/counts are the reference binary's.
+/// Load `MAP{Nat, Nat}` and exercise two-parameter instantiation, kind ranges, identity attributes, lookup,
+/// and membership queries.
 #[test]
 fn prelude_map_through_repl() {
     let out = repl().eval(conformance_file!("prelude-map.maude")).output;
@@ -706,9 +650,7 @@ fn prelude_map_through_repl() {
     );
 }
 
-/// Container milestone — the real prelude's `ARRAY{Nat, Nat0}` loads and reduces byte-identically.
-/// Two-parameter (`X :: TRIV`, `Y :: DEFAULT`); the `_;_` array constructor; a missing index returns the
-/// DEFAULT element `0`. Values/sorts/counts are the reference binary's.
+/// Load `ARRAY{Nat, Nat0}` and exercise two-parameter default values for present and missing indices.
 #[test]
 fn prelude_array_through_repl() {
     let out = repl().eval(conformance_file!("prelude-array.maude")).output;
@@ -728,10 +670,8 @@ fn prelude_array_through_repl() {
     );
 }
 
-/// Variable aliases are module-local (Blocker B): `M` and its import `P` both declare a variable `A`
-/// at different sorts; `M`'s own equation must use `M`'s `A`, even though flattening collects `P`'s `A`
-/// first. Without module-local scoping the name-dedup mistypes `f(A, L)` → no parse (the real `LIST`'s
-/// `var A : List{X}` shadowed by BOOL-OPS' `vars A B C : Bool`). Values are the reference binary's.
+/// Variable aliases are module-local. When an importer and dependency declare the same variable name
+/// at different sorts, each equation resolves against its defining module.
 #[test]
 fn var_shadowing_through_repl() {
     let out = repl().eval(conformance_file!("var-shadowing.maude")).output;
@@ -747,9 +687,7 @@ fn var_shadowing_through_repl() {
     );
 }
 
-/// B-i: a theory loads through the REPL end-to-end — it becomes current, its `[nonexec]` axiom does NOT
-/// fire (`e < e` stays, 0 rewrites), and an ordinary theory equation does (`id(e) = e`, 1 rewrite).
-/// Values/counts are the reference binary's.
+/// A theory becomes current; `[nonexec]` axioms remain inert while ordinary theory equations execute.
 #[test]
 fn theory_nonexec_through_repl() {
     let out = repl()
@@ -765,7 +703,7 @@ fn theory_nonexec_through_repl() {
     assert!(out.contains("rewrites: 1"), "exec count: {out}");
 }
 
-/// B-i: a multi-line theory is buffered as ONE submission by `input_complete` (which recognizes
+/// A multi-line theory is buffered as ONE submission by `input_complete` (which recognizes
 /// `fth`/`endfth`), then entered and made current — the interactive multi-line boundary for theories.
 #[test]
 fn theory_entry_is_one_submission_and_current() {
@@ -785,8 +723,7 @@ fn theory_entry_is_one_submission_and_current() {
     assert_eq!(r.current(), Some("TRIV"));
 }
 
-/// B-ii: a view loads through the REPL — the target module still reduces, `show views` lists it, and
-/// `show view` renders its maps (byte-matching the reference binary's `show view`).
+/// A view loads through the REPL; the target still reduces and `show views` / `show view` expose it.
 #[test]
 fn view_through_repl() {
     let mut r = repl();
@@ -803,7 +740,7 @@ fn view_through_repl() {
     );
 }
 
-/// B-iii: a parameterized module builds and reduces through the REPL — it echoes as its bare base name
+/// A parameterized module builds and reduces through the REPL — it echoes as its bare base name
 /// (`CTR`, not `CTR{X}`) and its results print with structured sorts (`Ctr{X}` / least sort `NzCtr{X}`).
 #[test]
 fn parameterized_module_through_repl() {
@@ -822,7 +759,7 @@ fn parameterized_module_through_repl() {
     );
 }
 
-/// B-iv: parameterized-module instantiation through the REPL end-to-end — a single-parameter `BOX{ToColor}`
+/// Parameterized-module instantiation through the REPL end-to-end — a single-parameter `BOX{ToColor}`
 /// (structured instance sort `Box{ToColor}`, view-image sort `Hue`) and a multi-parameter `PR{VA, VB}`.
 #[test]
 fn instantiation_through_repl() {
@@ -838,11 +775,10 @@ fn instantiation_through_repl() {
     );
 }
 
-/// Axis-A5: chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (parameter bound to a
-/// richer theory) then a by-parameter / module-view second level, with the chained import's renaming
-/// collapsing the multi-level structured sort. This is the SORTABLE-LIST family's shape; here `USE{X ::
-/// ORD}` chains `LST{ORD}{X}` (renaming `Lst{ORD}{X}` back to `Lst{X}`), instantiated at `USE{OrdColor}`.
-/// Byte-identical to the reference; the prelude's `SORTABLE-LIST{Nat<}` now sorts identically too.
+/// Chained instantiation `M{ToTheory}{Arg}` binds a parameter to a richer theory, then applies a
+/// by-parameter/module view. The chained import renaming collapses the multilevel structured sort:
+/// `USE{X :: ORD}` instantiates `LST{ORD}{X}` at `USE{OrdColor}` while renaming `Lst{ORD}{X}` to
+/// `Lst{X}`.
 #[test]
 fn instantiation_chained_through_repl() {
     let out = repl()
@@ -859,7 +795,7 @@ fn instantiation_chained_through_repl() {
     );
 }
 
-/// Axis-A1: view operator maps applied at instantiation through the REPL — `op zero to term f0` (op→term)
+/// View operator maps applied at instantiation through the REPL — `op zero to term f0` (op→term)
 /// and `op wrap to box` (op→op), so `ARR{ToFL}`'s `d0`/`d1` reduce to the target's terms.
 #[test]
 fn view_opmap_through_repl() {
@@ -873,7 +809,7 @@ fn view_opmap_through_repl() {
     );
 }
 
-/// Axis-A4: a parameter theory that imports a module — the module-declared sort `Bool` is kept (not
+/// A parameter theory that imports a module — the module-declared sort `Bool` is kept (not
 /// renamed to `X$Bool`), so the parameterized module builds and the instance reduces.
 #[test]
 fn theory_module_sorts_through_repl() {
@@ -886,10 +822,8 @@ fn theory_module_sorts_through_repl() {
     );
 }
 
-/// M0/TNK-004 — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL, verbatim)
-/// loads and reduces byte-identically to Maude's built-in BOOL. Proves poly/Universal expansion,
-/// equality and BranchSymbol hooks, decided-condition laziness, stuck-branch normalization, and
-/// SystemTrue/SystemFalse anchors. Each value + count is the reference binary's.
+/// Load the BOOL stack and exercise polymorphic expansion, equality and branch hooks, lazy condition
+/// selection, stuck-branch normalization, and canonical truth anchors.
 #[test]
 fn prelude_bool_m0_through_repl() {
     let out = repl().eval(conformance_file!("prelude-bool.maude")).output;
@@ -934,10 +868,8 @@ fn prelude_bool_m0_through_repl() {
     );
 }
 
-/// Increment-3 core: poly/Universal expansion over TWO kinds (Bool + an unrelated Color). `_==_` and
-/// `if_then_else_fi` each instantiate per kind; this proves distinct per-kind dispatch, grammar
-/// disambiguation, and the `if`-result sort over a non-Bool kind. Values/counts are the reference
-/// binary's (built-in poly `==`/`if`, `red in MK : …`).
+/// Polymorphic/Universal expansion over two distinct kinds. Equality and conditional operators receive
+/// per-kind instances with correct grammar dispatch and non-Bool result sorts.
 #[test]
 fn poly_multikind_through_repl() {
     let out = repl()
@@ -956,9 +888,7 @@ fn poly_multikind_through_repl() {
         ],
         "multikind values: {out}"
     );
-    // The nested reduce is exactly 2 rewrites (inner Color-kind == → false, then the if selects c2).
-    // The header echoes with the redundant parens elided — `if c1 == c2 then …` — exactly as the
-    // reference binary prints it (==' s prec 51 makes them unnecessary).
+    // The nested reduce takes two rewrites. Canonical echo removes redundant condition parentheses.
     assert!(
         out.contains("reduce in MK : if c1 == c2 then c0 else c2 fi .")
             && out.contains("rewrites: 2\n"),
@@ -966,9 +896,8 @@ fn poly_multikind_through_repl() {
     );
 }
 
-/// Increment 4 — a bare boolean condition `if b` abbreviates `if b = true`. The conditional
-/// `ceq f(X) = b if X == a` fires for `f(a)` (a == a = true, 2 rewrites → b) and not for `f(b)`
-/// (b == a = false, 1 rewrite, stays). Values/counts are the reference binary's (`red in T : …`).
+/// A bare boolean condition abbreviates equality with `true`. The fixture pins both the successful and
+/// failed conditional-equation paths, including their rewrite counts.
 #[test]
 fn bare_condition_through_repl() {
     let out = repl()
@@ -993,14 +922,10 @@ fn bare_condition_through_repl() {
     );
 }
 
-/// M1 milestone — the real prelude's NAT (with its BOOL substrate) loads and every built-in reduces
-/// byte-identically to Maude's built-in NAT, incl. the increment-5 additions: the `~>` partial arrow
-/// (modExp parses), the ACU bitwise folds `xor`/`&`/`|` (multiplicity-aware — `5 xor 5 = 0`), the CUI
-/// `sd` (`|m−n|`, commutative), `modExp` (modpow), and the `>>`/`<<` shifts (incl. the bignum
-/// `1 << 64`). Each value/sort/count is the reference binary's (`red in NAT : …`); all cases are
-/// 2-operand or prefix N-ary, whose counts match exactly.
+/// Load the NAT stack and exercise arithmetic, modular exponentiation, ACU bitwise folds, symmetric
+/// difference, shifts, and bignum inputs.
 #[test]
-fn prelude_nat_m1_through_repl() {
+fn prelude_nat_through_repl() {
     let out = repl().eval(conformance_file!("prelude-nat.maude")).output;
     let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
     assert_eq!(
@@ -1046,9 +971,8 @@ fn prelude_nat_m1_through_repl() {
 /// `/0`/NaN don't reduce, but `log(0.0) = -Infinity` does), STRING/QID (`ascii`/`char`/`find`/case +
 /// STRING-OPS classification/trim; value-dependent `Char`/`String` sort; qid backquote-escaping),
 /// CONVERSION (float↔rat↔string + `decFloat`), INITIAL-EQUALITY-PREDICATE, RANDOM (MT19937 seed 0),
-/// COUNTER (stateful — inert under `reduce`, advancing under `rewrite`). One fixture defines the whole
-/// chain and reduces in each module via the `in <MODULE> :` qualifier; values, sorts, and rewrite counts
-/// are byte-identical to the reference binary's built-in modules.
+/// COUNTER (stateful — inert under `reduce`, advancing under `rewrite`). One fixture exercises the
+/// complete chain through module-qualified reductions.
 #[test]
 fn prelude_tier2_through_repl() {
     let out = repl().eval(conformance_file!("prelude-tier2.maude")).output;
@@ -1121,13 +1045,10 @@ fn prelude_tier2_through_repl() {
     );
 }
 
-/// The view-gap parser fix: a *parameterized* view declaration (`view V{X :: T} from T to M{X}`) and a
-/// renaming over a **structured** sort (`* (sort Box{ColorE} to ColorBox)`) both parse, so a parameterized
-/// module instantiated on a view + renamed builds and reduces. This is the pattern the metalevel's
-/// container helpers use on the builtin chain — `protecting LIST{Qid} * (sort NeList{Qid} to NeQidList)`
-/// (`QID-LIST`/`NAT-LIST`/`QID-SET`, verified byte-identical against the loaded prelude). Byte-identical to
-/// the reference. (Chained multi-level instantiation — `LIST{A}{B}`, the SORTABLE-LIST family — is the
-/// separate Axis-A5 residual in .)
+/// Parameterized views compose with structured-sort renamings during module instantiation. This case
+/// combines `view V{X :: T} from T to M{X}` with `* (sort Box{ColorE} to ColorBox)`; the instantiated
+/// module builds and reduces. Chained multilevel instantiation is covered separately by
+/// [`instantiation_chained_through_repl`].
 #[test]
 fn view_parameterized_through_repl() {
     let out = repl()
@@ -1147,8 +1068,8 @@ fn view_parameterized_through_repl() {
 /// The eq parser splits a statement body at the **last** top-level `=` and peels a trailing `[attrs]`
 /// only when its first inner token is an attribute keyword — so an equation with a `[_]`-list rhs
 /// (`eq rev([X] L) = rev(L) [X] .`) keeps its bracketed term, and one ending in `[owise]` is still
-/// recognised as an owise equation. (This is what the `[_]`-list modules `LIST*`/`SET*` need; it also
-/// fixed a Tier-2 regression where the `=[`-of-`_=[_]_` heuristic wrongly skipped a separator `= [`.)
+/// recognised as an owise equation. The separator-aware rule is required by the `[_]`-list modules
+/// `LIST*`/`SET*`; an `=[` inside `_=[_]_` must not cause a later `= [` separator to be skipped.
 #[test]
 fn eq_bracket_rhs_through_repl() {
     let out = repl()
@@ -1166,8 +1087,8 @@ fn eq_bracket_rhs_through_repl() {
     );
 }
 
-/// B-ii: a view buffers as one submission via `view`/`endv`, and a bad view (missing target sort) is a
-/// friendly error — the binary's diagnostic — not a panic, and does not abort the session.
+/// A view buffers as one submission via `view`/`endv`; a missing target sort reports a friendly error
+/// without panicking or aborting the session.
 #[test]
 fn bad_view_reports_error_through_repl() {
     let mut r = repl();
@@ -1193,11 +1114,8 @@ fn bad_view_reports_error_through_repl() {
     assert_eq!(r.current(), Some("OK"));
 }
 
-/// C7 structure sharing end-to-end through the REPL: a repeated reducible subterm reduces once
-/// (Maude's hash-consed subject/rhs DAG). Every result + count is the reference binary's. The strong
-/// C7-specific guard: this fixture's reference counts top out at 2, so a pre-C7 over-count (`f(a)` was
-/// 3, the deep chain and the triple were 4) would surface as a `rewrites: 3`/`4` line — assert there is
-/// none. (The dedup window is applied in `reduce_command`; forwarding makes the shared node reduce once.)
+/// Structure sharing through the REPL reduces a repeated subterm once. Fixture counts top out at two;
+/// any `rewrites: 3` or `rewrites: 4` record exposes an over-count.
 #[test]
 fn sharing_through_repl() {
     let out = repl()
@@ -1220,18 +1138,16 @@ fn sharing_through_repl() {
     assert!(out.contains("result E: b + b"), "ACU share: {out}");
     assert!(
         !out.contains("rewrites: 3"),
-        "C7: no pre-fix over-count (f(a) was 3): {out}"
+        "no sharing over-count (f(a) was 3): {out}"
     );
     assert!(
         !out.contains("rewrites: 4"),
-        "C7: no pre-fix over-count (chain/triple were 4): {out}"
+        "no sharing over-count (chain/triple were 4): {out}"
     );
 }
 
-/// C13: a long result is line-wrapped through `eval` exactly as Maude's stdout wrapper (`auto_wrap`) —
-/// every line stays within 79 columns and wrapped lines carry the 4-space indent. (The differential
-/// suite pins this byte-identical to the reference binary, incl. `fib(22)`'s ~190-line numeral; this
-/// pins that `eval` applies the wrap end-to-end, and that short output is left untouched.)
+/// A long result is wrapped to 79 columns with four-space continuation indentation. This pins
+/// end-to-end wrapping while ensuring short output remains untouched.
 #[test]
 fn long_result_is_line_wrapped() {
     let mut r = repl();
@@ -1322,7 +1238,7 @@ fn unknown_import_reported() {
     );
 }
 
-/// A Peano module (matches the reference binary's rendering exactly: `s_` mixfix, infix `_+_`).
+/// Peano naturals with prefix successor and infix addition.
 const PEANO: &str = "fmod PEANO is sort Nat . op 0 : -> Nat [ctor] . op s_ : Nat -> Nat [ctor] . \
      op _+_ : Nat Nat -> Nat . vars N M : Nat . eq N + 0 = N . eq N + s M = s (N + M) . endfm";
 
@@ -1349,8 +1265,7 @@ fn trace_shows_rewrite_steps() {
     assert!(!plain.contains("***********"), "no trace when off: {plain}");
 }
 
-/// The full equation trace (body + substitution + redex/result) is byte-identical to the reference
-/// binary (`~/Downloads/Maude-3/maude` on the same module + `set trace on .`).
+/// The full equation trace orders the body, substitution, redex, and result.
 #[test]
 fn trace_full_equation_block() {
     let mut r = repl();
@@ -1478,11 +1393,8 @@ fn trace_condition_off_and_backtrack() {
     );
 }
 
-/// A membership axiom traces as a sort narrowing: `mb lhs : sort .` + substitution + `oldSort: term
-/// becomes newSort`. `cmb` fires as a membership but its trial uses the `cmb …` body. With `set trace
-/// whole on` each step also shows Maude's `Whole:` line — the full root term with the constrained
-/// subject in place (C1: memberships fire inside the reduce loop, so the frame stack is available to
-/// reconstruct it; closes full-trace deviation #2). Byte-exact vs the reference binary.
+/// Membership traces show sort narrowing, substitutions, and source/target sorts. Conditional memberships
+/// retain their statement body; `set trace whole on` includes the reconstructed root in a `Whole:` line.
 #[test]
 fn trace_membership_and_cmb() {
     let mut r = repl();
@@ -1518,9 +1430,8 @@ fn trace_membership_and_cmb() {
     );
 }
 
-/// The command echo (`reduce in M : … .`) re-spaces the input tokens with Maude's rules — no space
-/// before a `,` or bracket, none after an opening bracket — so nested-paren / comma terms echo compactly
-/// (matching the reference binary), instead of the old space-between-every-token form.
+/// Command echoes omit spaces before commas and brackets and after opening brackets, keeping nested terms
+/// compact and reparsable.
 #[test]
 fn command_echo_spacing() {
     let mut r = repl();
@@ -1540,16 +1451,13 @@ fn command_echo_spacing() {
     );
 }
 
-/// C9 / C10 / C11: the command echo prints the *normalized, pretty-printed* parsed term (Maude's
-/// "normalize, then print"), so float / rational / negative-integer special constants collapse to their
-/// canonical surface form in the `reduce in M : … .` line — byte-for-byte as the reference binary echoes
-/// them. (The reduced *result* printing is pinned by the `conform_render` fixtures; this pins the echo,
-/// which is REPL-only.)
+/// Command echo normalizes and pretty-prints the parsed term, so float, rational, and negative-integer
+/// constants use canonical surface forms.
 #[test]
-fn faithful_special_constant_echo() {
-    // C9 — a float echo reformats via doubleToString (`100.0` → `1.0e+2`), not the raw input token.
+fn special_constant_echo_is_canonical() {
+    // Float echoes use canonical scientific notation (`100.0` becomes `1.0e+2`).
     let mut r = repl();
-    r.eval(conformance_file!("correctness-float-print.maude")); // enters FLTB (+ runs its reds)
+    r.eval(conformance_file!("correctness-float-print.maude"));
     let e = r.eval("red 100.0 * 100.0 .").output;
     assert!(
         e.contains("reduce in FLTB : 1.0e+2 * 1.0e+2 ."),
@@ -1557,10 +1465,10 @@ fn faithful_special_constant_echo() {
     );
     assert!(e.contains("result Flt: 1.0e+4"), "float result: {e}");
 
-    // C11 — a rational echo is the compact `num/den`; a `0/N` (Zero numerator) is not a rational, so it
+    // A rational echo is the compact `num/den`; a `0/N` (Zero numerator) is not a rational, so it
     // stays spaced.
     let mut r = repl();
-    r.eval(conformance_file!("rat.maude")); // enters RATB
+    r.eval(conformance_file!("rat.maude"));
     let q = r.eval("red 6 / 4 .").output;
     assert!(q.contains("reduce in RATB : 6/4 ."), "rational echo: {q}");
     assert!(q.contains("result NzRat: 3/2"), "rational result: {q}");
@@ -1570,10 +1478,9 @@ fn faithful_special_constant_echo() {
         "0/N stays spaced: {z}"
     );
 
-    // C10 — a glued `-7` echoes compactly and reduces; a spaced `- 3` also echoes the compact `-3`; and
-    // `5 -7` fails to parse, exactly as the reference binary rejects it.
+    // Glued and spaced negative numerals echo compactly; `5 -7` remains an invalid subtraction form.
     let mut r = repl();
-    r.eval(conformance_file!("correctness-glued-minus.maude")); // enters INTB
+    r.eval(conformance_file!("correctness-glued-minus.maude"));
     let g = r.eval("red -7 quo 2 .").output;
     assert!(
         g.contains("reduce in INTB : -7 quo 2 ."),
@@ -1586,16 +1493,11 @@ fn faithful_special_constant_echo() {
         "spaced minus echoes compact: {s}"
     );
     let bad = r.eval("red 5 -7 .").output;
-    assert!(
-        bad.contains("no parse"),
-        "`5 -7` is rejected like the binary: {bad}"
-    );
+    assert!(bad.contains("no parse"), "`5 -7` is rejected: {bad}");
 }
 
-/// Multi-fragment `:=` backtracking: when the search backtracks *through* a deterministic fragment
-/// (`g(X) = ok`) to re-solve an earlier matching fragment, Maude re-visits the deterministic fragment
-/// (`re-solving` then `failure for condition fragment`). Trace-only — the result/count are unaffected.
-/// Byte-exact vs the reference binary (verified separately); this pins the events in CI.
+/// Backtracking through a deterministic `:=` condition fragment revisits that fragment after an
+/// earlier matching fragment is re-solved. This affects trace events, not the result or rewrite count.
 #[test]
 fn trace_multi_fragment_backtrack_resolves_deterministic() {
     let mut r = repl();
@@ -1607,8 +1509,8 @@ fn trace_multi_fragment_backtrack_resolves_deterministic() {
     );
     r.eval("set trace on .");
     let out = r.eval("red f(a ; b ; c) .").output;
-    // The split (a, b c) passes g(X)=ok but fails test(b c)=tt, so the solver backtracks through the
-    // deterministic g(X)=ok fragment — which Maude (and now we) re-solve and fail.
+    // The split `(a, b c)` passes `g(X) = ok` but fails `test(b c) = tt`, so backtracking revisits the
+    // deterministic `g(X) = ok` fragment and records its failure.
     assert!(
         out.contains(
             "*********** re-solving condition fragment\n\
@@ -1648,9 +1550,8 @@ fn run_session(input: &str) -> String {
     out
 }
 
-/// The `conformance/trace-*.maude` fixtures load through the REPL's stdin loop and
-/// produce the expected trace. The byte-exact match against the reference binary is verified separately
-/// (the doc-comment diff command); this is the in-repo regression guard.
+/// The trace fixtures load through the REPL's stdin loop and exercise equation, built-in, membership,
+/// and conditional trace streams.
 #[test]
 fn trace_fixtures_run_through_repl() {
     let eq = run_session(conformance_file!("trace-eq.maude"));
@@ -1684,8 +1585,7 @@ fn trace_fixtures_run_through_repl() {
     );
 }
 
-/// TNK-011 end to end: the retained collapse-membership fixture reaches the downstream value and its
-/// traced collapsed application preserves the original statement id/body, identity binding, and Whole line.
+/// Collapse-membership traces preserve the source statement, identity binding, and whole-subject line.
 #[test]
 fn collapsing_membership_fixture_through_repl() {
     let out = repl()
@@ -1711,9 +1611,7 @@ fn collapsing_membership_fixture_through_repl() {
     );
 }
 
-/// Pillar A-i: `rl` + `rewrite`/`continue` through the REPL, byte-matching the reference binary
-/// (`conformance/rewrite.maude`). Reduce-then-rule-fair, the bound, the top-down `f(a)` traversal (7
-/// steps), and the resumable `continue` (which resets the count).
+/// `rewrite` and `continue` enforce bounds, traverse top-down, and reset rewrite counts on resume.
 #[test]
 fn rewrite_command_through_repl() {
     let out = repl().eval(conformance_file!("rewrite.maude")).output;
@@ -1738,8 +1636,8 @@ fn rewrite_command_through_repl() {
     );
 }
 
-/// `set trace on` + `rewrite` renders the rule step exactly as the reference: `*********** rule` + the
-/// rule body + `empty substitution` + the `redex ---> result` tail.
+/// `set trace on` with `rewrite` renders a `*********** rule` header, the rule body, the substitution,
+/// and the `redex ---> result` tail.
 #[test]
 fn traced_rewrite_renders_rule_blocks() {
     let s = run_session(
@@ -1758,10 +1656,8 @@ fn traced_rewrite_renders_rule_blocks() {
     assert!(s.contains("rewrites: 2\nresult S: c"), "tail:\n{s}");
 }
 
-/// Pillar A-ii: `frewrite` (position-fair) + frozen arguments, byte-matching the reference
-/// (`conformance/frewrite.maude`). The essential fairness property (a bound spreads across positions,
-/// unlike greedy `rewrite`), the unbounded normal form, the `(sort not calculated)` bounded stop, and
-/// frozen-argument skipping.
+/// Position-fair `frewrite` differs from greedy `rewrite`, respects frozen arguments, and reports bounded
+/// non-normal results without a calculated sort.
 #[test]
 fn frewrite_command_through_repl() {
     let out = repl().eval(conformance_file!("frewrite.maude")).output;
@@ -1787,8 +1683,7 @@ fn frewrite_command_through_repl() {
     );
 }
 
-/// Pillar A-iii: conditional rules (`crl`) with equality / matching / sort-test fragments, byte-matching
-/// the reference (`conformance/crl.maude`). First-applicable selection with condition backtracking.
+/// Conditional rules backtrack across equality, matching, and sort-test fragments.
 #[test]
 fn crl_command_through_repl() {
     let out = repl().eval(conformance_file!("crl.maude")).output;
@@ -1810,8 +1705,8 @@ fn crl_command_through_repl() {
     );
 }
 
-/// A traced `crl` renders the rule trial / condition-fragment / backtrack stream exactly as the
-/// reference: trial #1 fails its `X = a` fragment, then trial #2's `Y := X` succeeds and the rule fires.
+/// A traced `crl` renders its rule trial, condition fragments, and backtracking: trial #1 fails its
+/// `X = a` fragment, then trial #2 binds `Y := X` and fires the rule.
 #[test]
 fn traced_crl_backtrack() {
     let s = run_session(
@@ -1845,9 +1740,7 @@ fn traced_crl_backtrack() {
     );
 }
 
-/// Pillar A-iv: `search` over the state-transition graph, byte-matching the reference
-/// (`conformance/search.maude`). The four arrows, hash-consing (b,c collapse onto one d state),
-/// `such that`, and a lazy bounded `[1]` + `continue` (c generated post-reset shows rewrites 1).
+/// Search covers all four arrows, shared states, `such that`, bounded enumeration, and `continue`.
 #[test]
 fn search_command_through_repl() {
     let out = repl().eval(conformance_file!("search.maude")).output;
@@ -1874,7 +1767,7 @@ fn search_command_through_repl() {
     assert!(out.contains("search [1] in NDET : a =>+ X .\n\nSolution 1 (state 1)\nstates: 2  rewrites: 1\nX --> b\n\nSolution 2 (state 2)\nstates: 3  rewrites: 1\nX --> c"), "bounded+continue:\n{out}");
 }
 
-/// `show path N` and `show search graph` for the last search, byte-matching the reference.
+/// `show path N` and `show search graph` render transition history and the reachable-state graph.
 #[test]
 fn search_show_path_and_graph() {
     let s = run_session(
@@ -1900,9 +1793,7 @@ fn search_show_path_and_graph() {
     );
 }
 
-/// Pillar A-v: the rewrite-condition fragment `crl ... if t => p` (a nested =>* reachability search),
-/// byte-matching the reference (`conformance/rewrite-cond.maude`). =>* semantics (0-step match), the
-/// search rewrite count, and a fresh variable bound from the reached state.
+/// Rewrite-condition fragments perform nested reachability search, including zero-step matches and fresh bindings.
 #[test]
 fn rewrite_condition_through_repl() {
     let out = repl().eval(conformance_file!("rewrite-cond.maude")).output;
@@ -1921,8 +1812,8 @@ fn rewrite_condition_through_repl() {
         out.contains("rewrite in REACH : f(stuck) .\nrewrites: 0\nresult S: f(stuck)"),
         "unreachable:\n{out}"
     );
-    // The target pattern s(Y) binds Y from a reached state — matching the reference byte-for-byte (Y = z,
-    // 2 rewrites). The exact `=>` search order is Maude's; we reproduce it (verified across cases).
+    // The target `s(Y)` binds `Y` from the reached state; the chosen `=>` path yields `Y = z` after two
+    // rewrites.
     assert!(
         out.contains("rewrite in BIND : f(s(s(z))) .\nrewrites: 2\nresult N: g(z)"),
         "binding:\n{out}"
@@ -2010,9 +1901,8 @@ fn rule_in_fmod_is_rejected() {
     );
 }
 
-/// A single `eval` of a file that mixes a module, a `set trace on .` meta-command, and a traced command
-/// — previously the mid-stream `set` broke the whole-file parse (it is now split into per-statement
-/// dispatch). The `show`/`continue` etc. across statements share the persistent REPL state.
+/// A single `eval` handles a file containing a module, a `set trace on .` meta-command, and a traced
+/// command. Statement dispatch preserves REPL state across `show`, `continue`, and related commands.
 #[test]
 fn eval_mixed_file_with_meta_commands() {
     let out = repl()
@@ -2050,11 +1940,9 @@ fn input_complete_boundaries() {
     assert!(!r.input_complete("   \n  "), "whitespace");
 }
 
-/// Extract the conformance-relevant outcome lines from an objects-system run: every line that is **not**
-/// a command echo (the `rewrite`/`reduce`/`search` line and any wrapped continuation, ending at the
-/// trailing ` .`). What remains — `result …`, `rewrites:`, `states:`, `Solution …`, the `Var --> v`
-/// bindings — is exactly what we compare byte-for-byte to the reference. The echo's
-/// `__`-parenthesization and ordering is a known rendering divergence abstracted by every fixture.
+/// Extract non-echo outcome lines from an object-system run. Command echoes, including wrapped
+/// continuations through the trailing ` .`, are removed; result, rewrite/state count, solution, and
+/// binding lines remain for assertions.
 fn objects_outcomes(out: &str) -> Vec<String> {
     let mut lines = out.lines().peekable();
     let mut keep = Vec::new();
@@ -2078,14 +1966,8 @@ fn objects_outcomes(out: &str) -> Vec<String> {
     keep
 }
 
-/// Pillar 2.5-A — object-message **configurations** under plain `rewrite`/`search` (no `erewrite`, no
-/// external IO). Loads the real prelude `CONFIGURATION` (`<_:_|_>` resolving its `ObjectConstructorSymbol`
-/// id-hook; the `config`/`obj`/`portal` op attributes recorded onto the kernel symbol) plus a bank and a
-/// ping-pong system, and pins the outcome of each command **byte-identically to the reference**
-/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects.maude`). The message-vs-object multiset
-/// order is the load-bearing case: Maude orders ACU elements arity-first (`orderInt`), so the arity-2
-/// `ping(p1, p2)` prints *before* the arity-3 objects — `dag_compare` now matches (it ordered by raw
-/// `SymbolId` before, which is why this is the test that locks the fix in).
+/// Exercise object-message configurations under ordinary rewrite and search, including configuration
+/// hooks, class lookup, and arity-first canonical ordering of messages and objects.
 #[test]
 fn objects_through_repl() {
     let out = repl().eval(conformance_file!("objects.maude")).output;
@@ -2121,9 +2003,7 @@ fn objects_through_repl() {
             "Solution 1 (state 1)",
             "states: 2  rewrites: 1",
             "C:Configuration --> < p1 : Player | turns : 1 > < p2 : Player | turns : 0 >",
-            // erewrite (object-message-fair, Pillar 2.5-B). The `msg`-flagged credit/ping/pong engage the
-            // ConfigSymbol scheduler. BANK: one pass delivers BOTH credits (the bound counts passes), 4
-            // rewrites (2 credits x rule+`+`).
+            // `erewrite` uses the object-message scheduler. Both credits are delivered in one pass.
             "rewrites: 4",
             "result Configuration: < a : Account | bal : 50 > < b : Account | bal : 125 >",
             // BANK, two credits to ONE account: `a` evolves 0->5->12 within the pass; the lone object
@@ -2136,15 +2016,12 @@ fn objects_through_repl() {
             "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
             "    turns : 1 >",
         ],
-        "objects outcomes (echoes/rate aside) must match the reference: {out}"
+        "object outcomes (echoes/rate aside): {out}"
     );
 }
 
-/// Pillar 2.5-C (synchronous STD-STREAM) — `erewrite` EXTERNAL-mode standard-stream output. With a `<>`
-/// portal in the soup, a `write(stdout, me, str)` message to the `stdout` manager (`StreamManagerSymbol`)
-/// emits `str` and replies `wrote(me, stdout)` **synchronously** (no reactor). The side-channel writes
-/// surface after the echo, before `rewrites:` — exactly as Maude interleaves them. GREET writes one line;
-/// TICKER writes three sequentially (each waits for the `wrote` reply). Byte-identical to the reference.
+/// External `erewrite` processes standard-stream messages synchronously and emits side-channel output in
+/// request/reply order.
 #[test]
 fn objects_io_through_repl() {
     let mut r = repl();
@@ -2176,7 +2053,7 @@ fn objects_io_through_repl() {
             "rewrites: 5",
             "result Configuration: <> < e : Echoer | n : 0 >",
         ],
-        "STD-STREAM stdout writes + stdin getLine + erewrite outcomes must match the reference: {out}"
+        "STD-STREAM stdout writes + stdin getLine + erewrite outcomes: {out}"
     );
 }
 
@@ -2211,15 +2088,8 @@ fn erewrite_parse_failure_preserves_pending_stdin() {
     );
 }
 
-/// Pillar 2.5-E — the object-oriented **surface language** (`omod`/`class`/`subclass`/`msg`). Each `omod`
-/// desugars to CONFIGURATION-based Core-Maude (`class C` → sort + `subsort C < Cid` + constant `op C`;
-/// attribute `a : S` → `op a :_ : S -> Attribute`; `subclass` → subsort; `msg` → `[ctor msg]` op) and
-/// auto-imports the **built-in** CONFIGURATION. Object-pattern completion (`ooTransform.cc`) is the
-/// load-bearing part: the `credit` rule names only `bal` yet fires on a `Savings` object that also carries
-/// `rate` (a fresh `Atts:AttributeSet` variable captures it) and whose class `Savings` is a **subclass** of
-/// the rule's `Account` (the class constant is rewritten to a fresh class-sorted variable, so `V:Account`
-/// matches `Savings`). Byte-identical to the reference
-/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects-omod.maude`).
+/// Object-oriented modules desugar classes, subclasses, attributes, and messages into CONFIGURATION.
+/// Pattern completion preserves unmatched attributes and permits superclass rules to match subclass objects.
 #[test]
 fn objects_omod_through_repl() {
     let out = repl().eval(conformance_file!("objects-omod.maude")).output;
@@ -2255,16 +2125,12 @@ fn objects_omod_through_repl() {
             "result Configuration: pong(p2, p1) < p1 : Player | turns : 2 > < p2 : Player |",
             "    turns : 1 >",
         ],
-        "omod/class/subclass/msg + object-pattern completion outcomes must match the reference: {out}"
+        "omod/class/subclass/msg + object-pattern completion outcomes: {out}"
     );
 }
 
-/// Pillar 2.5-E — object-pattern completion **attribute edge cases** (`ooTransform.cc`), beyond the
-/// class-constant→variable + fresh-variable cases above: (1) a rule whose RHS omits an attribute its LHS
-/// matched — completion copies the pattern attribute back, so `applyRate` updates `bal` yet preserves
-/// `rate`; (2) a rule whose RHS sets an attribute its LHS did not match (`last`) — completion adds a fresh
-/// kind-variable attribute to the LHS pattern, so the rule fires only on objects already carrying it.
-/// Byte-identical to `~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-attrs.maude`.
+/// Object-pattern completion preserves RHS-omitted attributes and constrains RHS-added attributes to objects
+/// that already carry them.
 #[test]
 fn objects_omod_attrs_through_repl() {
     let out = repl()
@@ -2285,16 +2151,11 @@ fn objects_omod_attrs_through_repl() {
             "rewrites: 1",
             "result Object: < lg : Logger | count : 1, last : 7 >",
         ],
-        "object-pattern completion attribute edge cases must match the reference: {out}"
+        "object-pattern completion attribute edge cases: {out}"
     );
 }
 
-/// Pillar 2.5-E / erewrite — the object-message scheduler's **two paths**. `reward` is a single-object
-/// message rule (Maude's fast path: object + message, same name); `pair` is a MULTI-object rule (message +
-/// two objects), which is not an object-message pair, so it takes the generic **leftOver** path
-/// (`ConfigSymbol::leftOverRewrite`). tnk previously fired only the fast path, so a multi-object rule never
-/// delivered under `erewrite` though it did under plain `rewrite`. Byte-identical to the reference
-/// (`~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-multi.maude`).
+/// The object-message scheduler handles both its single-object fast path and generic multi-object path.
 #[test]
 fn objects_omod_multi_through_repl() {
     let out = repl()
@@ -2315,15 +2176,11 @@ fn objects_omod_multi_through_repl() {
             "rewrites: 1",
             "result Configuration: < a : Member | pts : 1 > < b : Member | pts : 1 >",
         ],
-        "erewrite object-message fast path + multi-object leftOver path must match the reference: {out}"
+        "erewrite object-message fast path + multi-object leftOver path: {out}"
     );
 }
 
-/// Pillar 2.5-E: `oth` (object THEORY) — the theory analogue of `omod`. It shares the `omod`
-/// class/subclass/msg desugaring (gated on the object-oriented flag, not module-vs-theory), auto-imports
-/// CONFIGURATION, and builds; `getClass` (from CONFIGURATION) resolves an object's class, and a subclass
-/// instance returns its own class. Byte-identical to
-/// `~/Downloads/Maude-3/maude -no-banner conformance/objects-oth.maude`.
+/// Object theories share object-module desugaring and return the concrete class of subclass instances.
 #[test]
 fn objects_oth_through_repl() {
     let out = repl().eval(conformance_file!("objects-oth.maude")).output;
@@ -2341,17 +2198,12 @@ fn objects_oth_through_repl() {
             "rewrites: 1",
             "result Square: Square",
         ],
-        "oth (object theory) class/subclass/msg build + getClass must match the reference: {out}"
+        "oth (object theory) class/subclass/msg build + getClass: {out}"
     );
 }
 
-/// Pillar 2.5-E / META-LEVEL: an object module round-trips through the meta level byte-identically to the
-/// reference. `upModule` of an `omod` yields a plain completed `mod` (Maude strips the OO fiction) whose
-/// message op carries `[ctor msg]`, whose attribute op is named `` 'bal`:_ `` (the backtick-blank Maude
-/// keeps in a spaced mixfix name — reconstructed by `meta_op_name`), and whose rule shows the completed
-/// form (`'V:Account`, `'Atts:AttributeSet` spliced in). `metaRewrite` over it delivers the message and
-/// reduces the balance, the result again spelling the attribute op `` 'bal`:_ ``. Verified byte-identical
-/// against `~/Downloads/Maude-3/maude` (see the diff in the commit).
+/// Object modules round-trip through `upModule` and `metaRewrite`, preserving completed patterns and spaced
+/// mixfix attribute names.
 #[test]
 fn objects_omod_meta_through_repl() {
     let mut r = repl();
@@ -2392,11 +2244,8 @@ fn objects_omod_meta_through_repl() {
     );
 }
 
-/// Pillar 2.5-E / META-LEVEL: an object THEORY's rule is object-pattern-completed and up-translates
-/// byte-identically. `upModule` of an `oth` yields a `th` whose rule shows the completed form
-/// (`'V:Acct` for the class constant, a fresh `'Atts:AttributeSet`, the attribute op spelled `` 'bal`:_ ``).
-/// Verified byte-identical against the reference (an `oth`'s non-`[nonexec]` axioms execute + complete, as
-/// in Maude, so they are retained and shown).
+/// Object theories up-translate completed rules with class variables, residual attributes, and exact
+/// attribute-operator spelling.
 #[test]
 fn objects_oth_meta_through_repl() {
     let mut r = repl();
@@ -2434,18 +2283,16 @@ fn objects_oth_meta_through_repl() {
     }
 }
 
-/// META-LEVEL up*: a module's own `[nonexec]` axioms are retained by `upEqs`/`upMbs`/`upRls` (build skips
-/// them — a proof obligation carries no engine trace — so up-translation parses their bubbles on demand),
-/// in **declaration order**, and equation/membership `[label …]`s are retained too (the label rode along).
-/// Byte-verified against the reference: nonexec eq/mb/cmb/rule with labels, exec-before-nonexec ordering,
-/// and an executable equation's own label.
+/// `upEqs`/`upMbs`/`upRls` retain a module's own `[nonexec]` axioms and labels in declaration order.
+/// Non-executable statements have no engine traces, so up-translation parses their stored bubbles on
+/// demand. Executable equation labels are retained as well.
 #[test]
 fn meta_nonexec_up_through_repl() {
     let mut r = repl();
-    r.eval(conformance_file!("prelude-meta.maude")); // load the META-LEVEL tower
+    r.eval(conformance_file!("prelude-meta.maude"));
     let out = r
         .eval(concat!(
-            // an executable eq declared BEFORE a nonexec eq — declaration order must survive up-translation.
+            // Declare the executable equation first to exercise declaration-order retention.
             "fth ORDA is\n",
             "  sorts Elt .\n",
             "  op a : -> Elt [ctor] .\n",
@@ -2454,7 +2301,7 @@ fn meta_nonexec_up_through_repl() {
             "  eq f(X) = X .\n",
             "  eq g(X) = X [nonexec label gx] .\n",
             "endfth\n",
-            // an EXECUTABLE equation label is retained too (previously dropped).
+            // Executable equation labels are retained.
             "fmod LBL is\n",
             "  sorts S .  op a : -> S [ctor] .  op f : S -> S .  var X : S .\n",
             "  eq f(X) = X [label fx] .\n",
@@ -2465,14 +2312,14 @@ fn meta_nonexec_up_through_repl() {
             "  mb a : T [nonexec label mbax] .\n",
             "  cmb p(X) : T if X : T [nonexec label cmbax] .\n",
             "endfth\n",
-            // a nonexec rule (label from the leading `[rax] :`), then an executable rule.
+            // A non-executable labelled rule followed by an executable rule.
             "mod RLX is\n",
             "  sorts S .  ops a b : -> S [ctor] .  op f : S -> S .  var X : S .\n",
             "  rl [rax] : f(X) => X [nonexec] .\n",
             "  rl f(a) => b .\n",
             "endm\n",
             "red in META-LEVEL : upEqs('ORDA, false) .\n",
-            "red in META-LEVEL : upEqs('ORDA, true) .\n", // flat form (no imports ⇒ same result) — exercises the flat merge path
+            "red in META-LEVEL : upEqs('ORDA, true) .\n", // Exercises the flat merge with no imports.
             "red in META-LEVEL : upEqs('LBL, false) .\n",
             "red in META-LEVEL : upMbs('MBX, false) .\n",
             "red in META-LEVEL : upRls('RLX, false) .\n",
@@ -2510,12 +2357,10 @@ fn meta_nonexec_up_through_repl() {
     );
 }
 
-/// Multi-token operator names (residual: the inter-token blank in an op name). An op name may carry a blank
-/// between two text tokens — `op a b`, `op c d_`, `op _e f_` — and it is load-bearing: `c d_` is the mixfix
-/// `c`, `d`, `_`, distinct from the single literal `cd_`. tnk now preserves it (canonical name keeps it as a
-/// backquote, `` c`d_ ``), so such ops lex, parse, reduce, and print byte-identically to the reference; the
-/// space form (`a b`) and the backquote form (`` a`b ``) tokenize to the same name, and an escaped special
-/// (`` _`[_`] ``) is unaffected. Verified against `conformance/multitoken-op.maude`.
+/// Multi-token operator names preserve load-bearing inter-token blanks as backquotes in their canonical
+/// spelling. `op c d_` remains distinct from `op cd_`; space and backquote spellings tokenize to the same
+/// name, and escaped special names remain unaffected. These operators lex, parse, reduce, and print
+/// through the REPL.
 #[test]
 fn multitoken_op_through_repl() {
     let out = repl().eval(conformance_file!("multitoken-op.maude")).output;
@@ -2544,14 +2389,12 @@ fn multitoken_op_through_repl() {
     );
 }
 
-/// META round-trip of multi-token op names: `upModule` spells the inter-token blank as a backquote
-/// (`` 'a`b ``, `` 'c`d_ ``), matching the reference, and `metaReduce` over a hand-written meta term whose
-/// head is such a Qid (`` 'c`d_['a`b.S] ``) lexes the backquote, resolves the op, and reduces. Byte-verified
-/// against the reference.
+/// META round-trips preserve multi-token operator names. `upModule` encodes inter-token blanks as
+/// backquotes, and `metaReduce` resolves and reduces hand-written meta terms that use those Qids.
 #[test]
 fn multitoken_op_meta_through_repl() {
     let mut r = repl();
-    r.eval(conformance_file!("prelude-meta.maude")); // the META-LEVEL tower
+    r.eval(conformance_file!("prelude-meta.maude")); // Defines `upModule` and `metaReduce`.
     let out = r
         .eval(concat!(
             "fmod MT is\n",
@@ -2585,10 +2428,9 @@ fn multitoken_op_meta_through_repl() {
     );
 }
 
-/// A signature-owned compound identity survives the complete metalevel module round-trip. `upModule`
-/// emits the identity as a structural meta-term, and feeding that module directly to `metaReduce`
-/// down-translates the identity against the rebuilt target symbols so construction collapses it. Exact
-/// shapes and rewrite count were transcribed from Maude 3.5.1.
+/// A signature-owned compound identity survives a complete metalevel module round-trip. `upModule` emits
+/// the identity as a structural meta-term; feeding that module to `metaReduce` resolves its target symbols
+/// and collapses the identity during construction.
 #[test]
 fn compound_identity_meta_roundtrip_through_repl() {
     let mut r = repl();
@@ -2774,10 +2616,10 @@ fn meta_variant_repl() -> Repl {
     r
 }
 
-/// Oracle sequence from Maude 3.5.1: this pins incremental numbering, the `%` family layer,
-/// continuation state, plain variant-unifier order, and complete variant matching end to end.
+/// Pins incremental numbering, fresh-family selection, continuation state, unifier order, and complete
+/// variant matching end to end.
 #[test]
-fn variant_sequences_and_continuation_match_oracle() {
+fn variant_sequences_and_continuation_follow_contract() {
     let mut r = repl();
     r.eval(
         r#"
@@ -2856,11 +2698,10 @@ endfm
     );
 }
 
-/// Oracle-indexed cache sequences from Maude 3.5.1. Besides the returned variants/unifiers/matcher,
-/// the counts distinguish forward resume, equal-index reuse, backward restart, terminal-state deletion,
-/// and exact four-entry MRU eviction; recomputing every request or retaining all historical answers fails.
+/// Cache sequences distinguish forward resume, equal-index reuse, backward restart, terminal-state
+/// deletion, and exact four-entry MRU eviction.
 #[test]
-fn meta_variant_index_cache_matches_oracle() {
+fn meta_variant_index_cache_preserves_contract() {
     let mut get = meta_variant_repl();
     let get_command =
         |n| format!("red metaGetVariant(['XOR], upTerm(X:XOR + cst1), empty, '#, {n}) .");
@@ -2978,10 +2819,10 @@ fn meta_variant_index_cache_matches_oracle() {
     );
 }
 
-/// Maude 3.5.1 returns `noUnifierIncomplete` after the two reported associative unifiers; exhaustion
-/// must preserve the unifier's incompleteness bit rather than silently returning plain `noUnifier`.
+/// Associative unifier exhaustion preserves the incompleteness bit after two results rather than returning
+/// plain `noUnifier`.
 #[test]
-fn meta_variant_incomplete_result_matches_oracle() {
+fn meta_variant_incomplete_result_preserves_incompleteness() {
     let mut r = meta_variant_repl();
     let output = r
         .eval(
@@ -3002,16 +2843,14 @@ red metaVariantUnify(['A-UNIF], upTerm(A:List B:List) =?
 "#,
         )
         .output;
-    assert_eq!(one_rewrite_count(&output), 4, "oracle count: {output}");
+    assert_eq!(one_rewrite_count(&output), 4, "rewrite count: {output}");
     assert!(
         output.contains("result UnificationPair?: (noUnifierIncomplete).UnificationPair?"),
         "associative incompleteness: {output}"
     );
 }
 
-/// TNK-018: a child interpreter receives a view through the real `upView -> down_view -> insertView`
-/// path. The reflected op-to-term sources carry typed variables but no separate variable-declaration
-/// field; both mixfix variable positions must still recover as operator holes.
+/// Reflected op-to-term maps recover both mixfix variable positions when inserted into a child interpreter.
 #[test]
 fn reflected_mixfix_term_map_survives_child_insert_view() {
     let mut r = repl();
@@ -3104,7 +2943,7 @@ erewrite in TNK18-DRIVER :
     );
     assert!(
         output.contains("rewrites: 7"),
-        "oracle-compatible count: {output}"
+        "reflected view rewrite count: {output}"
     );
     assert!(
         output.contains("insertedView(me, interpreter(0))") && output.contains("pending: nil"),
@@ -3112,8 +2951,7 @@ erewrite in TNK18-DRIVER :
     );
 }
 
-/// COV-003: the full reflected-view matrix must survive `upView -> insertView`, instantiate a
-/// parameterized client in the child, and execute every mapped form rather than merely accepting it.
+/// A reflected view's complete term-map matrix survives child insertion and executes every mapped form.
 #[test]
 fn reflected_term_map_matrix_survives_child_execution() {
     let mut r = repl();
@@ -3167,8 +3005,7 @@ fn reflected_term_map_matrix_survives_child_execution() {
     );
 }
 
-/// COV-002 / OUT-003: retain tnk's known context-free cross-kind suffix spelling without
-/// ratifying it as an accepted divergence. Maude prints `.B`; tnk currently prints `.[B]`.
+/// Context-free cross-kind output retains its classified suffix spelling.
 #[test]
 fn cross_kind_ill_sorted_suffix_remains_classified() {
     let output = repl()

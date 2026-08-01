@@ -1,4 +1,4 @@
-*** V07-legacy-meta-get-variant — lifted from the reference suite (Meta/legacyMetaGetVariant.maude)
+*** Nat-family metaGetVariant signature and parent indices.
 *** PRELUDE
 set show timing off .
 

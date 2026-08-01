@@ -111,6 +111,7 @@ fn remap_condition(fragment: &ConditionFragment, slots: &[u32]) -> ConditionFrag
 }
 
 /// Normalize/index a narrowing rule with the same lhs-first layout used by variant equations.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_narrowing_rule(
     e: &mut Engine,
     id: u32,
@@ -343,9 +344,9 @@ impl RuleVariantUnifierSearch {
         let pair_target = env.e.make_node(pair_symbol, vec![lhs_target, state_target]);
         let mut blocker_map = state_map;
         let mut next_blocker_slot = specs.len() as u32;
-        for slot in 0..blocker_map.len() {
+        for (slot, mapped) in blocker_map.iter_mut().enumerate() {
             if !state_slots.contains(&slot) {
-                blocker_map[slot] = next_blocker_slot;
+                *mapped = next_blocker_slot;
                 next_blocker_slot += 1;
             }
         }
@@ -544,8 +545,7 @@ fn apply_rule_unifier(
     );
     e.count_narrowing_step();
     let reduced = e.reduce(rebuilt);
-    let prepared = prepare_variant_narrowing_state(e, reduced, &accumulated);
-    prepared
+    prepare_variant_narrowing_state(e, reduced, &accumulated)
 }
 
 /// Search arrow selected by `=>1`, `=>+`, `=>*`, or `=>!`.
@@ -739,6 +739,7 @@ impl StateExpansion {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn next(
         &mut self,
         env: &mut UnifyEnv,
@@ -858,9 +859,8 @@ impl NarrowSearch {
 
     /// Construct one graph from a disjunction of independently scoped initial states.
     ///
-    /// Maude rejects variable sharing between disjuncts, then indexes and freshens every disjunct
-    /// independently. Consequently each root starts at `#1`, and its accumulated substitution has
-    /// only that root's source variables.
+    /// Disjuncts may not share variables. Each is indexed and freshened independently, so every root
+    /// restarts numbering above `base` and its accumulated substitution contains only that root's variables.
     #[allow(clippy::too_many_arguments)]
     pub fn new_many(
         env: &mut UnifyEnv,
@@ -1057,7 +1057,7 @@ impl NarrowSearch {
         }
     }
 
-    /// Next state which should be tested against the goal. State ids are Maude's creation-order ids.
+    /// Next state to test against the goal. State ids follow creation order.
     pub fn next_interesting_state(&mut self, env: &mut UnifyEnv) -> Option<usize> {
         for index in self.untried_initials.by_ref() {
             if self.states[index].alive {
@@ -1377,9 +1377,9 @@ impl NarrowSearch {
     }
 }
 
-/// Map the variable slots of an existing DAG into the shared `(name, sort)` namespace used by a
-/// synthetic unification pair. Unlike converting the state back through [`Term`], this lets the pair
-/// retain the state's already-reduced sub-DAGs and therefore Maude's rewrite accounting.
+/// Map an existing DAG's variable slots into the shared `(name, sort)` namespace of a synthetic
+/// unification pair. This preserves already-reduced sub-DAGs and their rewrite accounting instead of
+/// converting the state through [`Term`].
 fn dag_to_keyed_slot_map(
     e: &Engine,
     dag: DagId,

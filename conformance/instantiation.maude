@@ -1,4 +1,4 @@
-*** B-iv: parameterized-module instantiation M{V}. A view V supplies the concrete sorts for a
+*** Parameterized-module instantiation M{V}. A view V supplies the concrete sorts for a
 *** parameter; the instance substitutes the parameter sort X$Elt by the view's sort image and
 *** names structured sorts Box{X} as Box{V}, importing the view's target module.
 

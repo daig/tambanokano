@@ -1,5 +1,4 @@
-*** T05-smt-search — all non-debug object-level SMT search and restriction cases lifted from the reference suite (Misc/smtTest.maude)
-*** F4 owns the eight omitted debugger commands: source lines 230-234 and 237-239. The ordinary setup search at line 236 is retained.
+*** T05-smt-search — ordinary object-level SMT search, continuation, and restriction cases.
 set show timing off .
 load smt
 
@@ -63,7 +62,7 @@ cont 2 .
 cont 1 .
 cont 1 .
 
-*** Retained non-debug setup command from the source's second debugger block.
+*** Non-debug SMT-search setup command.
 smt-search [4] f(J) =>* f(K) such that J = K .
 
 *** Violations of SMT-search restrictions.

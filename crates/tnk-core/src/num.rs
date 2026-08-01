@@ -1,11 +1,8 @@
 //! Arbitrary-precision arithmetic behind a thin wrapper (`malachite`, pure Rust).
 //!
-//! The kernel never names `malachite` directly — the S-theory successor count
-//! ([`crate::dag::NodeTerm::S`]) and the built-in numeric operators (`NAT`/`INT`) go through [`Nat`]
-//! (and later `Int`/`Rat`), so the bignum backend stays swappable and the exposed op surface is exactly
-//! what the prelude needs. `Float` stays IEEE `f64` (not wrapped here). The op set mirrors Maude's
-//! `mpz_class` usage in `BuiltIn/{succSymbol,numberOpSymbol,ACU_NumberOpSymbol}.cc` — it grows as each
-//! consumer lands (this slice is what the S theory needs; NAT/INT arithmetic is added with those ops).
+//! Compact successor counts and built-in natural, integer, and rational operators use [`Nat`],
+//! [`Int`], and [`Rat`], keeping backend values out of the DAG API. Floating-point operations use
+//! IEEE `f64`.
 
 use malachite::base::num::arithmetic::traits::{
     CheckedSub, DivRem, DivisibleBy, Gcd, Lcm, ModPow, Pow, UnsignedAbs,
@@ -15,10 +12,9 @@ use malachite::base::num::conversion::traits::{FromStringBase, RoundingFrom, ToS
 use malachite::base::rounding_modes::RoundingMode;
 use malachite::{Integer, Natural, Rational};
 
-/// A non-negative arbitrary-precision integer (Maude's `Natural`). `Clone`/`Eq`/`Ord`/`Debug` are
-/// derived from the backend so [`NodeTerm`](crate::dag::NodeTerm) and the compact static
-/// [`Term::Iter`](crate::term::Term::Iter) can carry an iteration count as scalar data rather than
-/// allocating one unary node per successor. The backend remains private.
+/// A non-negative arbitrary-precision integer. `Clone`/`Eq`/`Ord`/`Debug` are derived from the
+/// backend so `NodeTerm` and [`Term::Iter`](crate::term::Term::Iter) can carry an iteration count as
+/// scalar data rather than allocating one unary node per successor. The backend remains private.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
 pub struct Nat(Natural);
 
@@ -31,7 +27,7 @@ impl Nat {
     pub fn one() -> Self {
         Nat(Natural::ONE)
     }
-    /// From a machine integer (numerals built in tests / by the future parser).
+    /// From a machine integer (used by parsed numerals and programmatic engine clients).
     pub(crate) fn from_u64(n: u64) -> Self {
         Nat(Natural::from(n))
     }
@@ -43,9 +39,8 @@ impl Nat {
     pub fn add(&self, other: &Nat) -> Nat {
         Nat(&self.0 + &other.0)
     }
-    /// `self - other`, or `None` if it would go negative — `Natural` subtraction is partial (monus).
-    /// The S-theory residue `s^(n-k)` uses this with `n >= k` already checked; for `NAT` a `None` is
-    /// the built-in op's "fall through to user equations" case (a signed result needs `Int`, B3.5).
+    /// `self - other`, or `None` when the natural-number result would be negative. Callers may then
+    /// fall through to another overload or a user equation.
     pub(crate) fn checked_sub(&self, other: &Nat) -> Option<Nat> {
         (&self.0).checked_sub(&other.0).map(Nat)
     }
@@ -86,8 +81,8 @@ impl Nat {
     pub(crate) fn shr(&self, amount: u64) -> Nat {
         Nat(&self.0 >> amount)
     }
-    /// `self ^ exp mod modulus` (Maude's `modExp` — efficient modular exponentiation). The caller
-    /// guards `modulus != 0` (`modExp`'s third argument is `NzNat`).
+    /// Efficiently compute `self ^ exp mod modulus`. The caller guarantees `modulus != 0`;
+    /// `modExp` declares its third argument as `NzNat`.
     pub(crate) fn mod_pow(&self, exp: &Nat, modulus: &Nat) -> Nat {
         Nat((&self.0).mod_pow(&exp.0, &modulus.0))
     }
@@ -104,10 +99,10 @@ impl Nat {
     }
 }
 
-/// A signed arbitrary-precision integer (Maude's `Integer`), the `INT` built-ins' value type. A numeral
-/// is `0`, `s^n(0)` (positive), or `-(s^n(0))` (negative), so an [`Int`] decomposes into a sign and a
-/// [`Nat`] [magnitude](Int::magnitude). `quo`/`rem` truncate toward zero (Maude's convention — the
-/// remainder takes the dividend's sign), which is malachite's `DivRem` (not `DivMod`, which floors).
+/// A signed arbitrary-precision integer used by the `INT` built-ins. A numeral is `0`, `s^n(0)`
+/// (positive), or `-(s^n(0))` (negative), so an [`Int`] decomposes into a sign and a [`Nat`]
+/// [magnitude](Int::magnitude). `quo` and `rem` truncate toward zero, and the remainder takes the
+/// dividend's sign; malachite provides this through `DivRem` rather than the floor-based `DivMod`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct Int(Integer);
 
@@ -141,9 +136,9 @@ impl Int {
     pub(crate) fn mul(&self, other: &Int) -> Int {
         Int(&self.0 * &other.0)
     }
-    /// `self << amount` / `self >> amount` (INT `_<<_` / `_>>_`): **arithmetic** shifts on the signed
-    /// value — `>>` floors toward −∞ (GMP `mpz_fdiv_q_2exp`: `-8 >> 1 = -4`, `-1 >> k = -1` for any k),
-    /// `<<` is exact scaling (`-5 << 2 = -20`). Malachite's `Integer` shifts have exactly these semantics.
+    /// `self << amount` / `self >> amount` for signed `INT` values. Right shift is arithmetic and
+    /// rounds toward −∞ (`-8 >> 1 = -4`, `-1 >> k = -1`); left shift scales exactly
+    /// (`-5 << 2 = -20`).
     pub(crate) fn shl(&self, amount: u64) -> Int {
         Int(&self.0 << amount)
     }
@@ -151,8 +146,8 @@ impl Int {
         Int(&self.0 >> amount)
     }
 
-    /// `(self / other, self % other)`, **truncated toward zero** (remainder takes the dividend's sign —
-    /// Maude `quo`/`rem`). The caller guards `other != 0`.
+    /// `(self / other, self % other)`, truncated toward zero, with the remainder taking the dividend's
+    /// sign. The caller guarantees `other != 0`.
     pub(crate) fn div_rem(&self, other: &Int) -> (Int, Int) {
         let (q, r) = (&self.0).div_rem(&other.0);
         (Int(q), Int(r))
@@ -162,21 +157,19 @@ impl Int {
         Int((&self.0).pow(exp))
     }
 
-    /// Base-`base` rendering with a leading `-` for negatives (Maude's `string(Int, base)` — `mpz_get_str`,
-    /// lowercase digits). `base` in 2..=36.
+    /// Render in base `base` with lowercase digits and a leading `-` for negative values.
+    /// `base` must be in 2..=36.
     pub(crate) fn to_string_base(&self, base: u8) -> String {
         self.0.to_string_base(base)
     }
-    /// Parse a signed integer written in `base` (Maude's `rat(String, base)` on an integer); `None` if the
-    /// text is not a valid base-`base` integer.
+    /// Parse a signed base-`base` integer, returning `None` for invalid text.
     pub(crate) fn from_string_base(base: u8, s: &str) -> Option<Int> {
         Integer::from_string_base(base, s).map(Int)
     }
 
-    /// Signed bitwise `_&_` / `_|_` / `_xor_` / `~_` (INT's `ACU_NumberOpSymbol` folds + `NumberOpSymbol
-    /// (~)`). malachite's `Integer` uses two's-complement semantics with infinite sign extension —
-    /// exactly Maude's GMP `mpz` bit ops — so `~x = -(x+1)` and a negative operand sign-extends. For
-    /// non-negative operands these agree with the [`Nat`] magnitude versions (NAT rides the same fold).
+    /// Signed bitwise `_&_`, `_|_`, `_xor_`, and `~_` use two's-complement semantics with infinite
+    /// sign extension. Thus `~x = -(x+1)` and negative operands sign-extend; non-negative operands
+    /// agree with the corresponding [`Nat`] magnitudes.
     pub(crate) fn bitand(&self, other: &Int) -> Int {
         Int(&self.0 & &other.0)
     }
@@ -207,9 +200,8 @@ impl ExactRational {
     }
 }
 
-/// The exact rational value of a finite `f64` as `(signed numerator, positive denominator)` — Maude's
-/// `rat(FiniteFloat)` (`mpq_set_d`: a double is `m · 2^e` exactly). `None` for NaN / infinite. The result
-/// is fully reduced (malachite's `Rational` is canonical).
+/// Return the exact rational value of a finite `f64` as a signed numerator and positive denominator.
+/// NaN and infinities return `None`; the result is fully reduced.
 pub(crate) fn rational_of_f64(f: f64) -> Option<(Int, Nat)> {
     let r = Rational::try_from(f.abs()).ok()?; // magnitude; the sign is reapplied below
     let (num, den) = r.into_numerator_and_denominator();
@@ -217,17 +209,15 @@ pub(crate) fn rational_of_f64(f: f64) -> Option<(Int, Nat)> {
     Some((Int(if f < 0.0 { -num } else { num }), Nat(den)))
 }
 
-/// The `f64` nearest to the rational `num / den` (round-to-nearest-even) — Maude's `float(Rat)`
-/// (`mpq_get_d`). `den` must be non-zero (the rational `_/_` constructor guarantees it).
+/// Return the nearest `f64` to `num / den` using round-to-nearest-even. `den` must be nonzero.
 pub(crate) fn f64_of_rational(num: &Int, den: &Nat) -> f64 {
     let r = Rational::from_integers(num.0.clone(), Integer::from(den.0.clone()));
     f64::rounding_from(&r, RoundingMode::Nearest).0
 }
 
-/// Parse a string to an `f64` (Maude's `float(String)`): accepted iff it passes Maude's
-/// `looksLikeFloat` (Utility/macros.cc) — `[sign] ("Infinity" | digits with a `.` and/or an
-/// `e[sign]digits` exponent)`. Bare integers (`"5"`), `"NaN"`, `"nan"`, `"inf"`, dangling exponents
-/// (`"1.5e"`) and a lone `.` all stay unreduced — Rust's laxer `from_str` must not decide this.
+/// Parse the supported float surface: `[sign] ("Infinity" | digits with a `.` and/or an
+/// `e[sign]digits` exponent)`. Bare integers, NaN spellings, abbreviated infinity spellings,
+/// dangling exponents, and a lone decimal point remain unreduced; `f64::from_str` alone is too broad.
 pub(crate) fn parse_double(s: &str) -> Option<f64> {
     if !looks_like_float(s) {
         return None;
@@ -266,11 +256,9 @@ fn looks_like_float(s: &str) -> bool {
     }
 }
 
-/// Render an `f64` exactly as Maude's `doubleToString` (`Utility/macros.cc`): 17 significant digits, the
-/// mantissa normalized to `[1, 10)` with at least one fractional digit and trailing zeros stripped, and a
-/// signed exponent shown only when nonzero — `1.0e+2`, `2.5e-1`, `3.14159265358979`, `-1.5`. `inf`/`nan`
-/// print as `Infinity`/`-Infinity`/`NaN`. Shared by the pretty-printer (display) and the `string(Float)`
-/// conversion, so both agree byte-for-byte.
+/// Render an `f64` with 17 significant digits, a mantissa normalized to `[1, 10)` with at least one
+/// fractional digit and no trailing zeros, and a signed exponent only when nonzero. Infinity and
+/// NaN use the language spellings. The pretty-printer and `string(Float)` share this function.
 pub fn double_to_string(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -281,8 +269,7 @@ pub fn double_to_string(f: f64) -> String {
     if f == 0.0 {
         return "0.0".to_string(); // also catches -0.0
     }
-    // 16 fractional digits ⇒ 17 significant digits, mantissa in [1, 10), correctly rounded — the same
-    // value `ecvt(d, 17, …)` produces. Rust's `{:e}` writes `D.DDD…eE` (lowercase, no `+`, no padding).
+    // Emit 17 significant digits with a normalized scientific mantissa.
     let sci = format!("{:.*e}", 16, f.abs());
     let (mantissa, exp) = sci
         .split_once('e')
@@ -291,7 +278,7 @@ pub fn double_to_string(f: f64) -> String {
     let (int_part, frac) = mantissa
         .split_once('.')
         .expect("a `.16e` mantissa has a decimal point");
-    // Strip trailing zeros but keep at least one fractional digit (Maude's `next > 4` guard).
+    // Strip trailing zeros while retaining at least one fractional digit.
     let frac = frac.trim_end_matches('0');
     let frac = if frac.is_empty() { "0" } else { frac };
     let body = match exp {

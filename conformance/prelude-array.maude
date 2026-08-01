@@ -1,9 +1,6 @@
-*** Container milestone (cont.) -- the real prelude's ARRAY{Nat, Nat0}, over BOOL+NAT, verbatim from
-*** ~/Downloads/Maude-3/prelude.maude: BOOL 33-82, NAT 110-243, TRIV + Nat view, DEFAULT theory + Nat0
-*** view, ARRAY 1535-1566. Two-parameter (X :: TRIV, Y :: DEFAULT); the `_;_ [assoc comm id: empty]`
+*** Stock prelude ARRAY{Nat, Nat0}, over BOOL+NAT.
+*** Two-parameter (X :: TRIV, Y :: DEFAULT); the `_;_ [assoc comm id: empty]`
 *** array constructor; a missing index returns the DEFAULT element `0` (not a kind term, unlike MAP).
-***
-*** Oracle: stock Maude, `red in T :` with T = ARRAY{Nat, Nat0}.
 
 fmod TRUTH-VALUE is
   sort Bool .

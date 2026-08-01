@@ -1,6 +1,5 @@
-//! AC / ACU unification — Maude's `ACU_UnificationSubproblem2`
-//! (`src/ACU_Theory/ACU_UnificationSubproblem2.cc`). Order-faithful, including the enumeration
-//! order (which fixes the AC-unifier order and hence the `#n` numbering).
+//! AC / ACU unification with deterministic enumeration order, including stable fresh-variable
+//! numbering.
 //!
 //! Shape: each `f(…) =? f(…)` (or `f(…) =? X`) contributes a **signed-multiplicity multiset
 //! equation** over distinct abstracted subterms (variables kept as chain representatives, never
@@ -26,10 +25,10 @@ use std::collections::BTreeSet;
 struct Entry {
     /// The solution vector: `element[i]` = how many of abstract-variable `i` this element assigns.
     element: Vec<i32>,
-    /// Subterms covered by every element discovered **before** this one (= covered by the elements
-    /// that follow it in `basis` iteration order) — the coverage-feasibility oracle for `next_selection`.
+    /// Subterms covered by every earlier-discovered basis element, used for coverage-feasibility
+    /// pruning during selection.
     remainder: BTreeSet<usize>,
-    /// Discovery-order id (0,1,2,…) — the BDD variable / `AllSat` bit for the identity path.
+    /// Discovery-order id used as the BDD variable for identity-aware selection.
     index: usize,
 }
 
@@ -43,7 +42,7 @@ pub(crate) struct AcuSubproblem {
     /// The recorded multiset equations (each padded to `subterms.len()` at solve time).
     unifications: Vec<Vec<i32>>,
     marked_subterms: BTreeSet<usize>,
-    /// Hilbert basis in iteration order (reverse discovery — Maude's `push_front` list).
+    /// Hilbert basis in reverse discovery order.
     basis: Vec<Entry>,
     upper_bounds: Vec<i32>,
     need_to_cover: BTreeSet<usize>,
@@ -61,10 +60,9 @@ pub(crate) struct AcuSubproblem {
     maximal_selections: Option<AllSat>,
 }
 
-/// The `(element, multiplicity)` multiset of an ACU node in Maude's pre-index variable order.
-/// Variables sharing a sort share a `VariableSymbol`, so their name codes order them.  Variables
-/// of different sorts are ordered by distinct symbols created before indexing; their assigned slot
-/// order records that comparison even when tnk's per-variable symbol ids do not.
+/// Return the `(element, multiplicity)` pairs of an ACU node in the ordering used before variable
+/// slots are assigned. Same-sort variables compare by name code; cross-sort variables compare by
+/// slot, which records the established variable-sort order. Nonvariables use canonical DAG order.
 fn acu_pairs(e: &Engine, id: DagId) -> Vec<(DagId, u32)> {
     let mut pairs = match &e.node(id).term {
         NodeTerm::Acu { args, .. } => args.clone(),
@@ -85,8 +83,8 @@ fn acu_pairs(e: &Engine, id: DagId) -> Vec<(DagId, u32)> {
     pairs
 }
 
-/// Maude's virtual `Symbol::isStable`: free, NA, and S symbols are stable; binary-theory symbols
-/// are stable exactly when they have no identity collapse. Genuine variable symbols are unstable.
+/// A symbol is stable when it is not a variable symbol and cannot collapse through an identity.
+/// Distinct stable top symbols cannot coexist in one basis element.
 pub(super) fn is_stable(e: &Engine, sym: SymbolId) -> bool {
     let symbol = e.symbol(sym);
     !matches!(
@@ -136,7 +134,7 @@ impl AcuSubproblem {
             .is_some_and(|identity| e.is_identity(identity, id))
     }
 
-    // ---- addUnification ------------------------------------------------------------------
+    // ---- equation accumulation ------------------------------------------------------------
 
     pub(crate) fn add_unification(
         &mut self,
@@ -152,7 +150,6 @@ impl AcuSubproblem {
         for m in &mut self.multiplicities {
             *m = 0;
         }
-        // RHS.
         if e.node(rhs).symbol() == self.top {
             for (elem, mult) in acu_pairs(e, rhs) {
                 self.set_multiplicity(e, ctx, elem, -(mult as i32));
@@ -163,7 +160,6 @@ impl AcuSubproblem {
                 self.marked_subterms.insert(i);
             }
         }
-        // LHS (always our top symbol).
         for (elem, mult) in acu_pairs(e, lhs) {
             self.set_multiplicity(e, ctx, elem, mult as i32);
         }
@@ -173,9 +169,9 @@ impl AcuSubproblem {
         }
     }
 
-    /// `setMultiplicity`: resolve a variable to its chain representative (no eager substitution;
-    /// identity binding ⇒ eliminated), then add `multiplicity` to that subterm's entry (creating it
-    /// in first-encounter order). Returns the subterm index, or `None` for an identity variable.
+    /// Resolve a variable to its chain representative without eagerly substituting it, eliminate
+    /// identity-bound representatives, and add `multiplicity` to the subterm's entry. New entries
+    /// follow first-encounter order. Returns `None` when the representative takes the identity.
     fn set_multiplicity(
         &mut self,
         e: &Engine,
@@ -280,8 +276,8 @@ impl AcuSubproblem {
         false
     }
 
-    /// `unsolve`: turn an existing in-theory solved form `X = f(…)` at slot `index` back into an
-    /// equation so it is solved simultaneously with the current batch.
+    /// Turn an existing in-theory solved form `X = f(…)` at slot `index` back into an equation so
+    /// the entire theory batch is solved simultaneously.
     fn unsolve(&mut self, e: &Engine, ctx: &mut UnifyContext, index: usize) {
         let variable = ctx
             .variable_node(index)
@@ -408,8 +404,8 @@ impl AcuSubproblem {
                 continue;
             }
             let remainder = self.accumulator.clone();
-            for i in 0..n {
-                if dio_sol[i] != 0 {
+            for (i, &multiplicity) in dio_sol.iter().enumerate() {
+                if multiplicity != 0 {
                     self.accumulator.insert(i);
                 }
             }
@@ -423,7 +419,7 @@ impl AcuSubproblem {
         if !self.need_to_cover.is_subset(&self.accumulator) {
             return false;
         }
-        disc.reverse(); // push_front semantics: iteration order = reverse discovery
+        disc.reverse(); // selection iterates the basis in reverse discovery order
         self.basis = disc;
         self.totals = vec![0; n];
         self.uncovered = self.need_to_cover.clone();
@@ -440,8 +436,8 @@ impl AcuSubproblem {
         })
     }
 
-    /// Maude's `nextSelection`: greedy include-first DFS over the basis (reverse-discovery order),
-    /// with coverage (`remainder`/`uncovered`) and upper-bound pruning.
+    /// Enumerate selections with an include-first DFS over the reverse-discovery basis order,
+    /// pruning branches that cannot restore coverage or that exceed an upper bound.
     fn next_selection(&mut self, find_first: bool) -> bool {
         let n_sub = self.subterms.len();
         let mut forward = find_first;
@@ -522,16 +518,15 @@ impl AcuSubproblem {
             legal
         } else {
             let mut m = legal.clone();
-            for i in 0..nr {
-                // notBigger = ithvar(i) OR NOT(legal restricted to ithvar(i)=true)
-                let restricted = legal.var_restrict(handles[i], true);
+            for (i, &handle) in handles.iter().take(nr).enumerate() {
+                // An excluded element is maximal only if including it would make the selection illegal.
+                let restricted = legal.var_restrict(handle, true);
                 m = m.and(&ithvar(i).or(&restricted.not()));
             }
             m
         };
-        // BuDDy's `AllSat(maximal, 0, -1)` treats an empty basis as one empty assignment. The BDD
-        // crate needs a dummy variable to represent the constant formula; exclude it from the
-        // assignment range (`first > last`) or its two values replay the same empty selection.
+        // An empty basis still has one empty selection. The BDD needs a dummy variable for a
+        // constant formula; excluding it from the assignment range prevents duplicate selections.
         let (first, last) = if nr == 0 {
             (1, 0)
         } else {
@@ -540,8 +535,7 @@ impl AcuSubproblem {
         AllSat::new(maximal, first, last)
     }
 
-    /// Maude's `computeLegalSelections`: upper-bound (bounded-sum) and need-to-cover constraints
-    /// over the basis-element BDD variables.
+    /// Encode upper-bound sums and required-subterm coverage over the basis-element BDD variables.
     fn compute_legal_selections(
         &self,
         vars: &BddVariableSet,
@@ -581,8 +575,7 @@ impl AcuSubproblem {
         conjunction
     }
 
-    /// Maude's `nextSelectionWithIdentity`: the next maximal assignment from `AllSat`, filtered onto
-    /// the basis by element index.
+    /// Decode the next maximal `AllSat` assignment into basis indices in element-index order.
     fn next_selection_with_identity(&mut self) -> bool {
         let all = self
             .maximal_selections
@@ -594,17 +587,17 @@ impl AcuSubproblem {
         let asg: Vec<i8> = all.assignment().to_vec();
         self.selection.clear();
         for k in 0..self.basis.len() {
-            if asg[self.basis[k].index as usize] == 1 {
+            if asg[self.basis[k].index] == 1 {
                 self.selection.push(k);
             }
         }
         true
     }
 
-    // ---- buildSolution -------------------------------------------------------------------
+    // ---- solution materialization ---------------------------------------------------------
 
-    /// If a variable subterm is assigned exactly this one basis element (multiplicity 1) and nothing
-    /// else, reuse that original variable instead of a fresh one (`reuseVariable`).
+    /// Reuse a variable subterm when exactly one selected basis element assigns it with
+    /// multiplicity one and no other selected element assigns it.
     fn reuse_variable(&self, e: &Engine, selection_index: usize) -> Option<usize> {
         let b = self.selection[selection_index];
         for i in 0..self.subterms.len() {
@@ -629,18 +622,17 @@ impl AcuSubproblem {
         let kind = env.e.sorts().kind_of(range_sort(env.e, self.top));
         let selection_size = self.selection.len();
         // A fresh variable per selected basis element (reuse where possible), in selection order.
-        // This is ACU_UnificationSubproblem2::buildSolution's direct walk over `selection`; any
-        // identity-path ordering difference belongs in basis/AllSat enumeration, not in a
-        // post-selection permutation of fresh-variable slots.
+        // Selection order fixes fresh-variable slot order. Walk `selection` directly; any ordering
+        // choice belongs to basis or `AllSat` enumeration, not a post-selection permutation.
         let mut fresh_variables: Vec<Option<DagId>> = vec![None; selection_size];
         let mut reused: BTreeSet<usize> = BTreeSet::new();
-        for i in 0..selection_size {
+        for (i, fresh) in fresh_variables.iter_mut().enumerate() {
             match self.reuse_variable(env.e, i) {
                 Some(sub) => {
-                    fresh_variables[i] = Some(self.subterms[sub]);
+                    *fresh = Some(self.subterms[sub]);
                     reused.insert(sub);
                 }
-                None => fresh_variables[i] = Some(ctx.make_fresh_variable(env, kind)),
+                None => *fresh = Some(ctx.make_fresh_variable(env, kind)),
             }
         }
         // Materialize each subterm's assignment.
@@ -664,13 +656,13 @@ impl AcuSubproblem {
                 fresh_variables[last_element].unwrap()
             } else {
                 let mut pairs: Vec<(DagId, u32)> = Vec::new();
-                for j in 0..selection_size {
-                    let m = self.basis[self.selection[j]].element[i];
+                for (&selected, fresh) in self.selection.iter().zip(&fresh_variables) {
+                    let m = self.basis[selected].element[i];
                     if m > 0 {
-                        pairs.push((fresh_variables[j].unwrap(), m as u32));
+                        pairs.push(((*fresh).unwrap(), m as u32));
                     }
                 }
-                env.e.make_acu(self.top, pairs) // canonicalizes (sortAndUniquize)
+                env.e.make_acu(self.top, pairs) // orders arguments and merges multiplicities
             };
             let subterm = self.subterms[i];
             if var_index(env.e, subterm).is_some() {
@@ -693,10 +685,9 @@ fn range_sort(e: &Engine, sym: SymbolId) -> crate::sort::SortId {
     e.symbol(sym).decls()[0].range
 }
 
-/// Maude's `BinarySymbol::hasUnequalLeftIdentityCollapse` (`leftIdentitySortCheck`): return
-/// the first `(computed result, collapsed argument)` sort pair for which `f(e, x) = x`
-/// changes sort. Besides gating ACU's maximal-selection optimization, the REPL uses the
-/// pair for Maude's byte-visible `set verbose on` diagnostic.
+/// Return the first `(computed result, collapsed argument)` sort pair for which `f(e, x) = x`
+/// changes sort. The result controls ACU maximal-selection pruning and supplies the verbose
+/// identity-collapse diagnostic.
 pub fn unequal_left_identity_collapse(
     e: &Engine,
     top: SymbolId,
@@ -704,7 +695,7 @@ pub fn unequal_left_identity_collapse(
     super::unequal_identity_collapse(e, top, true)
 }
 
-/// The operator's two-sided identity DAG (`getIdentityDag`).
+/// Build the operator's two-sided identity DAG.
 fn identity_dag(e: &mut Engine, top: SymbolId) -> DagId {
     let identity = e
         .symbol(top)
@@ -745,8 +736,8 @@ mod tests {
         let set = e.add_sort("Set");
         e.close_sorts();
         let f = e.add_op_ac("f", vec![set, set], set, None);
-        // Runtime AC canonicalization sees slot 0 before slot 1.  The unifier must instead recover
-        // VariableTerm normalization, where the shared VariableSymbol compares the name codes.
+        // AC canonicalization places slot 0 before slot 1, while pre-index ordering places
+        // same-sort variables by name code.
         let x = e.make_var(set, 20, 0);
         let y = e.make_var(set, 10, 1);
         let term = e.make_ac(f, vec![x, y]);

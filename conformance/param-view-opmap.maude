@@ -1,7 +1,7 @@
-*** B-iv / Axis-A1: view operator maps. A view may map a theory operator to another operator
+*** View operator maps. A view may map a theory operator to another operator
 *** via "op wrap to box", or to a target term via "op zero to term f0". At instantiation the
 *** maps are substituted into the parameterized module's statements, so the theory operators
-*** the body uses become the target's operators/terms. Self-contained; byte-identical to binary.
+*** the body uses become the target's operators/terms.
 fth DFLT is
   sort Elt .
   op zero : -> Elt .

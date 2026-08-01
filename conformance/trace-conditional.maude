@@ -3,8 +3,6 @@
 *** equation steps, a success-or-failure-for-condition-fragment section, then a trial success/failure
 *** line, and finally the firing equation step. The second reduce backtracks: trial 1 of the first ceq
 *** fails, trial 2 of the second ceq succeeds. The trial counter resets per command.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/trace-conditional.maude < /dev/null
-*** The set trace condition off behaviour is exercised by the tnk-repl tests.
 fmod CEQ-MAX is
   sorts Nat Truth .
   ops tt ff : -> Truth [ctor] .

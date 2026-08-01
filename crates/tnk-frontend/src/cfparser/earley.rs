@@ -1,6 +1,4 @@
-//! The Earley recognizer (Maude's `pass1`, DRP bypassed): build the item sets for a token stream and
-//! report whether it parses to the start nonterminal. The chart it produces is walked by the forest
-//! extractor (B4.4b) to build terms.
+//! Earley recognition for a token stream. The resulting chart feeds parse-forest extraction.
 
 use super::compile::CompiledGrammar;
 use super::{EffortExceeded, ParseEffort};
@@ -54,8 +52,7 @@ type ItemSet = HashSet<Item, BuildHasherDefault<ItemHasher>>;
 type Waiting = HashMap<Nt, Vec<Item>, BuildHasherDefault<ItemHasher>>;
 
 /// The Earley chart: one item set per token position `0..=n` (`sets[j]` = items recognized just before
-/// token `j`; `sets[n]` is the final set). `present[j]` is the same content as a set, for O(1) membership
-/// (the forest extractor's prefix check, B4.4b). Retained for forest extraction.
+/// token `j`; `sets[n]` is final. `present[j]` mirrors the set for constant-time forest-prefix checks.
 #[derive(Debug)]
 pub struct Chart {
     pub sets: Vec<Vec<Item>>,
@@ -74,11 +71,8 @@ impl Chart {
         self.root_items(g, start).next().is_some()
     }
 
-    /// The furthest token index a valid partial parse reached — the largest set index that received any
-    /// item. Sets fill contiguously (set `j` gains items only when a token was scanned into it from set
-    /// `j-1`, or via predict/complete triggered by such a scan), so this is "one past the last token of a
-    /// valid partial parse" — Maude's `badTokenIndex` (`Parser/parser.hh`), reported by `metaParse` as the
-    /// `noParse(n)` failure position.
+    /// Furthest token index reached by a valid partial parse. Item sets fill contiguously, so this is
+    /// one past the last accepted token and becomes the `noParse(n)` failure position.
     pub fn furthest(&self) -> usize {
         (0..self.sets.len())
             .rev()
@@ -86,8 +80,8 @@ impl Chart {
             .unwrap_or(0)
     }
 
-    /// The completed top-level items for `start` (origin 0, fully matched) in the final set — the roots of
-    /// the parse forest. More than one ⇒ ambiguous (B4.4b).
+    /// Completed top-level items for `start` (origin 0, fully matched) in the final chart set. More than
+    /// one root means the parse is ambiguous.
     pub fn root_items<'a>(
         &'a self,
         g: &'a CompiledGrammar,
@@ -102,9 +96,9 @@ impl Chart {
 }
 
 /// Does grammar terminal `t` match input token `tok`? A specific token matches by interned `Sym`; a
-/// built-in class matches by lexical kind. `SMALL_NAT` excludes the value-zero numeral (`0`, `00`):
-/// Maude splits `ZERO` from `SMALL_NAT`, and a successor symbol's numeral production accepts only
-/// positives — `0` is solely the declared zero constant, so excluding it here avoids a spurious parse.
+/// built-in class matches by lexical kind. `SMALL_NAT` excludes zero-valued spellings because successor
+/// numeral productions accept only positive values. Zero parses through the declared zero constant, so
+/// excluding it here prevents a second parse.
 fn terminal_matches(t: Terminal, tok: &Token, i: &Interner) -> bool {
     match t {
         Terminal::Tok(s) => tok.sym == s,
@@ -223,9 +217,8 @@ pub fn parse(
     })
 }
 
-/// Completer: a finished production of nonterminal `N` (`item`, spanning `[item.origin, j)`) advances
-/// every waiting item in `sets[item.origin]` whose dot sits before `N` and whose gather bound for that
-/// hole is `>= N`'s precedence (Maude's `pass1.cc:164` gate).
+/// Completer: a finished production of nonterminal `N` spanning `[origin, j)` advances each waiting
+/// item at `origin` whose next hole accepts `N`'s precedence.
 fn complete(
     g: &CompiledGrammar,
     sets: &mut [Vec<Item>],

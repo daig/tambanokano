@@ -1,4 +1,4 @@
-*** Pillar 2.5-E: object-pattern completion attribute edge cases (ooTransform.cc), beyond the
+*** Object-pattern completion attribute edge cases, beyond the
 *** class-constant->variable + fresh-AttributeSet-variable cases in objects-omod.maude:
 ***   - MISSING-ATTRIBUTE COPY: a rule whose RHS omits an attribute its LHS matched. Completion copies the
 ***     pattern attribute back onto the RHS, so applyRate updates bal but PRESERVES rate.
@@ -6,8 +6,7 @@
 ***     fresh kind-variable attribute to the LHS pattern (last : L:[Nat]), so the rule matches only objects
 ***     that already carry that attribute, and the RHS overwrites it.
 ***
-*** Oracle -- byte-for-byte, modulo the ====/Bye. framing:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod-attrs.maude < /dev/null
+*** Oracle output is compared byte-for-byte after removing Maude's banner and exit framing.
 
 set show advisories off .
 

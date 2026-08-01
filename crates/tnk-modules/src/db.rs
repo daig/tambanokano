@@ -1,7 +1,5 @@
-//! The module database: parsed [`PreModule`]s keyed by name, the input to [`flatten`](crate::flatten).
-//!
-//! For B5 this is built once from a loaded source; the REPL (next round) will hold it and insert modules
-//! incrementally, re-flattening importers on demand.
+//! Parsed modules keyed by name. Batch loading populates the table in source order; interactive sessions
+//! update it incrementally and rebuild affected importers.
 
 use std::collections::HashMap;
 use tnk_frontend::surface::ast::PreModule;
@@ -17,8 +15,7 @@ impl ModuleDb {
         Self::default()
     }
 
-    /// Insert a module (overwriting any previous module of the same name, as the REPL re-entering a
-    /// module would).
+    /// Insert or replace a module by name.
     pub fn insert(&mut self, pm: PreModule) {
         self.modules.insert(pm.name.clone(), pm);
     }

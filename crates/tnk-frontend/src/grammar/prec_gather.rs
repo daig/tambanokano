@@ -1,8 +1,5 @@
-//! Port of `MixfixModule::computePrecAndGather` (`mixfixModule.cc`): OBJ3 default precedence + gather
-//! for a mixfix operator, and the resolution of a user-supplied `prec`/`gather` to numeric bounds.
-//!
-//! The numbers are the load-bearing, observable part of disambiguation, so this follows the C++
-//! arithmetic exactly. Constants live in [`super`] (`ANY`/`PREFIX_GATHER`/`UNARY_PREC`/`INFIX_PREC`).
+//! Compute default and user-supplied precedence/gather bounds for mixfix operators. The arithmetic is
+//! observable through parser disambiguation.
 
 use super::{ANY, INFIX_PREC, UNARY_PREC};
 use crate::lex::Frag;
@@ -22,11 +19,8 @@ pub struct PrecGather {
 /// - `is_assoc`: whether the operator carries the `assoc` axiom (selects the right-associating default
 ///   gather `(e E)` for a bare binary infix).
 ///
-/// Maude's sort-structure bias (`mayAssoc`, mixfixModule.cc ~1492-1512) is **deferred to B4.5**: it only
-/// perturbs the gather of a *non-assoc* bare binary infix operator whose two argument positions differ in
-/// whether the range sort may appear there, and it is a verified no-op on the B4.4 milestone modules
-/// (`_<_` is cross-kind → UNDEFINED; `_-_` is homogeneous → both sides associable → no bias). Porting it
-/// faithfully needs every declaration of the operator (a frontend table B4.5 adds).
+/// Includes default bare-operator precedence and associative infix bias. Cross-profile bias is omitted
+/// because this function receives one declaration profile.
 pub fn compute(
     frags: &[Frag],
     nr_args: usize,
@@ -38,7 +32,7 @@ pub fn compute(
     let left_bare = matches!(frags.first(), Some(Frag::Hole));
     let right_bare = matches!(frags.last(), Some(Frag::Hole));
 
-    // Default precedence: bare ops get the OBJ3 unary/infix default; pure-prefix mixfix gets 0.
+    // Bare operators use unary/infix defaults; pure prefix mixfix uses zero.
     let prec = user_prec.unwrap_or({
         if left_bare || right_bare {
             if nr_args == 1 { UNARY_PREC } else { INFIX_PREC }
@@ -87,7 +81,7 @@ mod tests {
     use super::*;
     use crate::lex::{Frag, Interner};
 
-    /// Build mixfix `frags` from a name, sharing an interner (mirrors `split_mixfix`).
+    /// Build mixfix `frags` from a name with the shared interner used by [`split_mixfix`].
     fn frags(name: &str, i: &mut Interner) -> Vec<Frag> {
         crate::lex::split_mixfix(name, i)
     }

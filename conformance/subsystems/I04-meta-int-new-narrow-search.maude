@@ -1,5 +1,4 @@
-*** I04-meta-int-new-narrow-search — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntNewNarrowSearch.maude; oracle verified 2026-07-23.
+*** I04-meta-int-new-narrow-search
 *** PRELUDE
 set show timing off .
 set show advisories off .

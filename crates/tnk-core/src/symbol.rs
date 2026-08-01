@@ -1,11 +1,8 @@
 //! Operator symbols.
 //!
-//! Phase 0 carried a name and a single sort declaration (`domain -> range`). Stage B1 adds the
-//! **equational axioms** an operator is declared with (`assoc`/`comm`/`id:`), which select the
-//! operator's *theory* — the term representation and matching algorithm used for it. Per decision
-//! **D3** the theory is a closed `enum` (no `Symbol`-is-a-`Theory` inheritance); the axioms are plain
-//! data on the symbol and [`Symbol::theory`] classifies them. Ad-hoc overloading (multiple
-//! declarations + sort diagram) and the remaining attributes are layered on later by composition.
+//! A symbol owns its overloaded sort declarations, structural axioms and identities, evaluation
+//! attributes, and optional built-in hook. The closed `Theory` enum classifies structural behavior;
+//! parsing remains the frontend's responsibility.
 //!
 //! Fields are `pub(crate)`; read access is through getters.
 
@@ -27,9 +24,8 @@ pub(crate) struct Identity {
     pub(crate) sort: SortId,
 }
 
-/// The equational axioms an operator is declared with (Maude's `assoc`/`comm`/`id:` attributes).
-/// `idem` (and the assoc-only / comm-only theories) are later B1 sub-steps; this slice handles the
-/// **ACU** combination (`assoc comm`, optionally with a two-sided identity).
+/// The structural axioms declared on an operator. Two-sided and one-sided identities are stored
+/// separately because they may be arbitrary ground terms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Axioms {
     pub assoc: bool,
@@ -37,14 +33,13 @@ pub(crate) struct Axioms {
     /// Idempotence (`f(a, a) = a`) — only meaningful for the commutative, non-associative CUI theory
     /// in this slice (`idem` cannot combine with `assoc`).
     pub idem: bool,
-    /// Iteration (`iter`, B3): a unary "stacked successor" operator (`s_`) whose node stores the
-    /// iteration count compactly (the **S theory**). Mutually exclusive with assoc/comm/idem.
+    /// Iteration: a unary stacked successor whose DAG node stores the count compactly.
     pub iter: bool,
 }
 
-/// Which equational theory an operator belongs to — selects its `DagNode` representation and its
-/// matching automaton (a closed enum, enum-dispatched). This slice implements
-/// [`Free`](Theory::Free), [`Acu`](Theory::Acu), and [`Au`](Theory::Au); `Cui`/`S`/`Na` are later.
+/// Which equational theory selects an operator's canonical DAG representation and matching automaton.
+/// This closed set covers free, ACU, AU, CUI, and iterated-successor operators; atomic built-in constants
+/// use [`NodeTerm::Na`](crate::dag::NodeTerm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Theory {
     /// No structural axioms: `symbol(args...)` matched by direct structural recursion.
@@ -58,30 +53,26 @@ pub(crate) enum Theory {
     /// Commutative (with optional identity and/or idempotence), **not** associative: a binary node
     /// with canonically-ordered arguments, matched modulo C(+U+I).
     Cui,
-    /// Iteration (`iter`, B3): a unary successor `s_` stored as `s^count(arg)` with a bignum `count`,
-    /// matched modulo the stacked-successor extension (`s^k` matches `s^n` for `k <= n`).
+    /// Iterated successor represented as `s^count(arg)` and matched by count prefix.
     S,
 }
 
 /// One operator declaration: argument sorts (`domain`) → `range`, plus whether it is a constructor
 /// (`[ctor]`). An operator may carry several declarations (ad-hoc / subsort overloading); the least
 /// sort of an application is resolved across all of them (`Signature::compute_sort`). `ctor` is
-/// carried now and consumed when the constructor diagram lands (a later B2 sub-step).
+/// reduction-inert metadata consumed by constructor-sensitive symbolic analyses.
 #[derive(Debug, Clone)]
 pub(crate) struct OpDeclaration {
     pub domain: Vec<SortId>,
     pub range: SortId,
-    /// `[ctor]` flag (B2.4). Metadata for functional reduction — a `[ctor]` operator reduces exactly as
-    /// a non-`ctor` one (verified against the binary); it marks the operator as a constructor for the
-    /// later sufficient-completeness / constructor-diagram analysis.
+    /// `[ctor]` flag. Constructors use ordinary reduction; constructor-theory checks consume this
+    /// metadata for analyses such as variant-satisfiability eligibility and decomposition.
     pub ctor: bool,
 }
 
-/// One normalized instruction in an operator's equational evaluation strategy.
-///
-/// Maude's source `strat` uses 1-based argument numbers and `0` for an attempt at the
-/// application root. The signature normalizes that surface list once, so the reduction hot path
-/// never has to reinterpret magic integers.
+/// One normalized instruction in an operator's equational evaluation strategy. Surface `strat`
+/// entries use 1-based argument numbers and `0` for a root attempt; the signature converts them
+/// once into zero-based [`EvalStep::Argument`] and [`EvalStep::Top`] values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvalStep {
     Argument(u32),
@@ -93,18 +84,18 @@ pub(crate) enum EvalStep {
 pub(crate) enum EvalStrategy {
     /// An ordinary fixed-arity strategy, including its final [`EvalStep::Top`].
     Sequence(Vec<EvalStep>),
-    /// Associative operators cannot distinguish their two declared positions after flattening.
-    /// Maude therefore normalizes every top-first/non-lazy strategy on A/AC symbols to
-    /// `0, <all physical arguments>, 0`; the argument portion is expanded by the frame accessor.
+    /// Associative operators cannot retain their two declared positions after flattening. A
+    /// top-first, non-lazy strategy therefore expands dynamically to a root attempt, every physical
+    /// argument, and another root attempt.
     PermutativeSemiEager,
 }
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub(crate) name: String,
-    /// Operator declarations (≥ 1; the first is the original). Overloads share name + arity; sort
-    /// resolution walks them **in declaration order**, so order is load-bearing for the
-    /// non-preregular least-sort tie-break.
+    /// Operator declarations (≥ 1; the first is the first registered). Overloads share name + arity;
+    /// sort resolution walks them **in declaration order**, so order determines the non-preregular
+    /// least-sort tie-break.
     pub(crate) decls: Vec<OpDeclaration>,
     /// The structural axioms this operator is declared with.
     pub(crate) axioms: Axioms,
@@ -118,75 +109,61 @@ pub struct Symbol {
     /// A **one-sided** identity (`left id:` / `right id:`), recorded for construction and symbolic
     /// collapse with the same general identity-term representation.
     pub(crate) one_sided_id: Option<(IdentitySide, IdentityId)>,
-    /// Normalized nonstandard equational evaluation strategy (`strat (…)`). `None` is Maude's
-    /// standard strategy: reduce every physical argument left-to-right, then try at the root.
-    /// A custom sequence retains interleaved root attempts; associative semi-eager strategies use a
-    /// dynamic form because a flattened runtime node can have more arguments than its binary
-    /// declaration.
+    /// Normalized nonstandard equational evaluation strategy (`strat (…)`). `None` reduces every
+    /// physical argument left-to-right before trying the root. A custom sequence retains interleaved
+    /// root attempts; associative semi-eager strategies use a dynamic form because a flattened
+    /// runtime node can have more arguments than its binary declaration.
     pub(crate) strategy: Option<EvalStrategy>,
-    /// Frozen arguments (`frozen` / `frozen (…)`, Pillar A): the 0-based argument positions that
+    /// Frozen arguments (`frozen` / `frozen (…)`): the 0-based argument positions that
     /// `rewrite`/`frewrite`/`search` must **not** rewrite within. `None` = no frozen args; `Some([])` =
     /// all arguments frozen (`[frozen]`); `Some([0,2])` = those positions. Inert for equational `reduce`.
     pub(crate) frozen: Option<Vec<u32>>,
-    /// Built-in reduction rule (`special (id-hook …)`, B3), if any — tried before user equations.
+    /// Built-in reduction rule (`special (id-hook …)`), if any — tried before user equations.
     pub(crate) special: Option<SpecialOp>,
-    /// Object-system role flags (`config`/`obj`/`msg`/`portal` operator attributes), Pillar 2.5. Inert
-    /// for `reduce`/`rewrite`/`frewrite`/`search` — the `config` ACU `__` rewrites as an ordinary ACU
-    /// soup. Consumed by the `erewrite` object-message scheduler (Phase 2.5-B) to partition the soup.
+    /// Object-system role flags (`config`/`obj`/`msg`/`portal`). Ordinary reduction and rewriting treat
+    /// the configuration as an ACU soup; the `erewrite` scheduler uses these flags to partition objects,
+    /// messages, and portals.
     pub(crate) oo: OoFlags,
-    /// Classification for the decompose-equality stability analysis (Maude's `SymbolType` basic
-    /// types, collapsed to what `.=.` consults). `Standard` is every ordinary user operator.
+    /// Classification used by decompose-equality stability analysis. `Standard` covers ordinary user
+    /// operators.
     pub(crate) class: SymbolClass,
 }
 
-/// Which side a one-sided identity collapses on (`left id:` / `right id:`) — the symbolic-engine
-/// mirror of the frontend's `IdSide` (two-sided identities live in [`Symbol::identity`] instead).
+/// Which side a one-sided identity collapses on (`left id:` / `right id:`). Two-sided identities use
+/// the symbol's ordinary identity field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentitySide {
     Left,
     Right,
 }
 
-/// The `.=.`-relevant slice of Maude's `SymbolType` basic types: a symbol is *equationally stable*
-/// (its top cannot change under instantiation, axioms, or equational rewriting — the precondition
-/// for `CommutativeDecomposeEqualitySymbol` to decompose or decide `false`) only when it is
-/// `Standard`, has no `special`, no identity element, and no equations indexed at it.
+/// Classification consulted by decompose equality. A symbol is equationally stable only when it is
+/// `Standard`, has no special hook or identity, and has no equations indexed at it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SymbolClass {
     #[default]
     Standard,
-    /// A command-subject variable realized as a fresh nullary constant (`build_subject_dag`):
-    /// Maude's `VariableSymbol` — never stable, never ground. `rank` is the variable's interned
-    /// name-token index (Maude's `Token` code): same-sort variables order by `id() - id()` on name
-    /// codes (variableDagNode.cc `compareArguments`), which `dag_compare` mirrors.
+    /// A command-subject variable represented by a fresh nullary constant. It is never stable or
+    /// ground. `rank` is the interned name-token index used to order same-sort variables.
     Variable { rank: u32 },
-    /// The per-sort variable symbol backing genuine unification variables
-    /// ([`Var`](crate::dag::NodeRepr::Var) leaves) — Maude's `VariableSymbol` as created by
-    /// `Module::instantiateVariable(sort)`. Created lazily in demand order (command parse →
-    /// mid-solve fresh kinds → unifier extraction), so its `SymbolId` creation index mirrors
-    /// Maude's symbol-index compare between distinct variable symbols. Distinct from
-    /// [`Variable`](Self::Variable): that realizes a command-*subject* variable as a pseudo
-    /// nullary constant; this one heads no `Free` node — it gives `Var` leaves a total `symbol()`
-    /// and a range sort. Never stable, never ground.
+    /// The per-sort symbol backing genuine unification-variable leaves. It gives each variable a
+    /// total symbol and range sort but never heads a `Free` node. It is never stable or ground.
     SortVariable,
-    /// A builtin marker-class symbol whose id-hook attaches no [`SpecialOp`] (`s_`'s `SuccSymbol`,
-    /// `<Floats>`/`<Strings>`/`<Qids>`, `true`/`false`, the object constructor): non-`STANDARD` in
-    /// Maude's `SymbolType`, hence never equationally stable (verified: NAT's builtin `s X .=. s Y`
-    /// stays unreduced in the oracle while a user `[iter ctor]` op decomposes).
+    /// A built-in marker class whose identity hook attaches no [`SpecialOp`], including successor,
+    /// literal-family, Boolean, and object-constructor symbols. Marker symbols are not equationally
+    /// stable.
     Marker,
-    /// An `SMT_NumberSymbol` pseudo-constructor. It is an NA marker rather than an inert ordinary
-    /// constant; the frontend gives it integer/rational literal productions.
+    /// An SMT numeric-literal pseudo-constructor. It uses the atomic NA representation rather than an
+    /// inert ordinary constant; the frontend gives it integer/rational literal productions.
     SmtNumber,
 }
 
-/// The object-system role of an operator — Maude's `SymbolType` `CONFIG`/`OBJECT`/`MESSAGE`/`PORTAL`
-/// bits (`symbolType.hh`), set from the `config`/`obj`/`msg`/`portal` operator attributes
-/// (`obj`≡`object`, `msg`≡`message`, `config`≡`configuration`). The roles are independent bits (an op
-/// could in principle carry more than one), matching the C++ flag word. The `erewrite` scheduler keys
-/// its soup partition on these — **not** on the `Object`/`Msg` sorts.
+/// Object-system roles set by the `config`, `obj`/`object`, `msg`/`message`, and `portal`
+/// operator attributes. Roles are independent bits. The `erewrite` scheduler partitions the
+/// configuration using these flags rather than the `Object` and `Msg` sorts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OoFlags {
-    /// `config` — the configuration multiset constructor (`__`), built as a `ConfigSymbol` in C++.
+    /// `config` — the configuration multiset constructor.
     pub(crate) config: bool,
     /// `obj`/`object` — the object constructor (`<_:_|_>`).
     pub(crate) object: bool,
@@ -197,8 +174,8 @@ pub(crate) struct OoFlags {
 }
 
 impl Symbol {
-    /// Whether argument position `arg` (0-based) is frozen — a rule may not rewrite within it
-    /// (Pillar A). See [`Symbol::frozen`].
+    /// Whether argument position `arg` (0-based) is frozen, preventing rule rewrites below it.
+    /// See [`Symbol::frozen`].
     pub(crate) fn is_frozen_arg(&self, arg: usize) -> bool {
         match &self.frozen {
             None => false,
@@ -212,8 +189,8 @@ impl Symbol {
     }
 }
 
-/// Symbols attached to Maude's `ModelCheckerSymbol`. Temporal connectives are grouped in the shared
-/// formula-descent contract; the remaining hooks construct satisfaction tests and lasso results.
+/// Symbols attached to the model-checker hook. Temporal connectives share one formula-descent
+/// contract; the remaining hooks construct satisfaction tests and lasso results.
 #[derive(Debug, Clone)]
 pub struct ModelCheckerHooks {
     pub temporal: crate::ltl::TemporalHooks,
@@ -228,8 +205,8 @@ pub struct ModelCheckerHooks {
     pub true_term: SymbolId,
 }
 
-/// Symbols attached to Maude's `SatSolverSymbol`. The temporal hooks recognize negative-normal-form
-/// formulae; the remaining hooks construct `model(lead-in, cycle)` or the attached `false` result.
+/// Hooks for SAT solving. Temporal hooks recognize negative-normal-form formulae; the remainder build
+/// `model(lead-in, cycle)` or the configured false result.
 #[derive(Debug, Clone)]
 pub struct SatSolverHooks {
     pub temporal: crate::ltl::TemporalHooks,
@@ -239,23 +216,17 @@ pub struct SatSolverHooks {
     pub false_term: SymbolId,
 }
 
-/// A built-in operator's reduction rule: Maude's `special (id-hook …)` seam
-/// as a typed enum resolved at module-build time and dispatched by `match` in symbol reduction — not
-/// C++'s attached member-function pointers. `term-hook`/`op-hook` references are resolved to
-/// [`SymbolId`]s. This slice has the BOOL operators; NAT/INT arithmetic variants are added with those
-/// ops. (Until the parser lands the hooks are supplied programmatically via `Engine::set_special`.)
+/// A built-in operator's typed reduction hook. The frontend resolves `term-hook` and `op-hook`
+/// references to [`SymbolId`]s at module-build time; programmatic clients can attach the same hooks
+/// directly.
 #[derive(Debug, Clone)]
 pub enum SpecialOp {
-    /// `_==_` / `_=/=_` (Maude's `EqualitySymbol`): reduce both arguments, compare them structurally,
-    /// rewrite to `eq` if equal else `neq` (the `equalTerm`/`notEqualTerm` constants, swapped for
-    /// `=/=`).
+    /// `_==_` / `_=/=_`: reduce both arguments, compare them structurally, and return the configured
+    /// equality or inequality constant.
     Equality { eq: SymbolId, neq: SymbolId },
-    /// `_.=._` (Maude's `CommutativeDecomposeEqualitySymbol`, INITIAL-EQUALITY-PREDICATE): the
-    /// initial-model equality predicate. On symbolic (non-ground) arguments it *decomposes* over
-    /// equationally-stable constructors — free/iter/comm/assoc/AC — into conjunctions/disjunctions
-    /// of smaller `.=.` problems, decides `false` where the tops provably differ, and otherwise
-    /// stays unreduced. `siblings[k]` is this polymorph's instance at kind `k` (tnk expands `poly`
-    /// ops eagerly per kind, so the table is total at build time — Maude instantiates lazily).
+    /// Initial-model equality `_.=._`. Symbolic arguments decompose over equationally stable
+    /// constructors into smaller conjunctions or disjunctions; provably distinct tops yield false,
+    /// and undecidable cases remain unreduced. `siblings[k]` is the per-kind polymorphic instance.
     DecomposeEquality {
         eq: SymbolId,
         neq: SymbolId,
@@ -263,36 +234,34 @@ pub enum SpecialOp {
         disj: Option<SymbolId>,
         siblings: std::rc::Rc<[Option<SymbolId>]>,
     },
-    /// `if_then_else_fi` (Maude's `BranchSymbol`): reduce the condition and select the branch whose
-    /// position matches it among `tests` (the `term-hook` constants, e.g. `[true, false]`). A selected
-    /// branch is returned unreduced and the dead branches are never visited. If no test matches, every
+    /// For `if_then_else_fi`, reduce the condition and select the branch whose `tests` position matches.
+    /// The selected branch remains unreduced; dead branches are skipped. If no test matches, every
     /// branch is normalized before user equations are tried on the rebuilt conditional.
     Branch { tests: Vec<SymbolId> },
-    /// `_+_` / `_*_` / `gcd` / `lcm` / `min` / `max` / `_xor_` / `_&_` / `_|_` (Maude's
-    /// `ACU_NumberOpSymbol`): fold the **numeric** operands of the ACU multiset (with multiplicity),
-    /// rebuilding from the result number and any non-numeric residue operands.
+    /// `_+_` / `_*_` / `gcd` / `lcm` / `min` / `max` / `_xor_` / `_&_` / `_|_`: fold the
+    /// **numeric** operands of an ACU multiset, respecting multiplicity, then rebuild from the result
+    /// number and any non-numeric residue operands.
     AcuNumberOp { op: NumOp, nat: NatHooks },
-    /// `_quo_` / `_rem_` / `_^_` / `_<<_` / `_>>_` / `_<_` / `_<=_` / `_>_` / `_>=_` / `_divides_`
-    /// (Maude's `NumberOpSymbol`): a free op over numeric arguments. Relational ops (`bool_` present)
-    /// rewrite to a Bool constant; arithmetic ops to a Nat. A non-numeric argument, division by zero, or
-    /// a would-be-negative result falls through to user equations (`None`).
+    /// `_quo_` / `_rem_` / `_^_` / `_<<_` / `_>>_` / `_<_` / `_<=_` / `_>_` / `_>=_` /
+    /// `_divides_`: evaluate a free operator over numeric arguments. Relational operations return a Bool;
+    /// arithmetic operations build a Nat or Int according to `nat.minus`. Non-numeric arguments, zero
+    /// divisors, unrepresentable results, and negative results without a minus hook fall through.
     NumberOp {
         op: NumOp,
         nat: NatHooks,
         bool_: Option<BoolHooks>,
     },
-    /// `sd` (Maude's `CUI_NumberOpSymbol`): a **commutative** 2-argument op over numeric arguments —
-    /// symmetric difference `sd(m, n) = |m − n|`. The two operands come from the CUI node; the result is
-    /// a Nat. A non-numeric argument falls through (`None`).
+    /// `sd`: a commutative binary numeric operation computing symmetric difference
+    /// `sd(m, n) = |m − n|`. It returns a Nat; a non-numeric argument falls through to user
+    /// equations.
     CuiNumberOp { op: NumOp, nat: NatHooks },
-    /// `-_` (Maude's `MinusSymbol`): integer negation. `-(s^n(0))` is the canonical negative (no
-    /// rewrite); `-(-x)` reduces to `x` and `-0` to `0`. `nat.minus` is this operator.
+    /// `-_`: integer negation. `-(s^n(0))` is already canonical; `-(-x)` reduces to `x`, and `-0`
+    /// reduces to `0`. `nat.minus` identifies this operator.
     Minus { nat: NatHooks },
-    /// `_+_` (concat) / `length` / `substr` / `ascii` / `char` / `find` / `rfind` / `upperCase` /
-    /// `lowerCase` / `_<_`/`_<=_`/`_>_`/`_>=_` over strings (Maude's `StringOpSymbol`): operate on
-    /// `NodeTerm::Na` string values. `str_sym` builds string/char results; `nat` (length/substr/ascii/
-    /// find), `bool_` (comparisons), and `not_found` (the `notFound` constant for find/rfind) are the
-    /// result-type hooks.
+    /// `_+_` (concat) / `length` / `substr` / `ascii` / `char` / `find` / `rfind` /
+    /// `upperCase` / `lowerCase` / comparisons over strings. These operate on `NodeTerm::Na`
+    /// string values. `str_sym` builds string and character results; `nat`, `bool_`, and
+    /// `not_found` provide operation-specific result hooks.
     StringOp {
         op: StrOp,
         str_sym: SymbolId,
@@ -300,32 +269,30 @@ pub enum SpecialOp {
         bool_: Option<BoolHooks>,
         not_found: Option<SymbolId>,
     },
-    /// Float arithmetic / functions / comparisons (Maude's `FloatOpSymbol`): operate on `NodeTerm::Na`
-    /// float (`f64`) values. `float_sym` builds float results; `bool_` is the comparison result hook.
+    /// Float arithmetic, functions, and comparisons over `NodeTerm::Na` `f64` values. `float_sym`
+    /// builds float results; `bool_` provides comparison results.
     FloatOp {
         op: FltOp,
         float_sym: SymbolId,
         bool_: Option<BoolHooks>,
     },
-    /// `random : Nat -> Nat` (Maude's `RandomOpSymbol`): the n-th 32-bit output of MT19937 (Mersenne
-    /// Twister) seeded with 0 — a deterministic pure function of `n`.
+    /// `random : Nat -> Nat`: the `n`th 32-bit output of MT19937 (Mersenne Twister) seeded with
+    /// zero, making the operation a deterministic pure function of `n`.
     Random { nat: NatHooks },
-    /// `counter : -> [Nat]` (Maude's `CounterSymbol`): a **stateful rule-special** — inert under `reduce`
-    /// (left as the kind constant), but each `rewrite`/`frewrite` step that meets a `counter` redex yields
-    /// the next natural (0, 1, 2, …), reset per top-level rewriting command. Handled in the rewrite
-    /// traversal, not `try_special`.
+    /// `counter : -> [Nat]`: a stateful rule-special that is inert under `reduce`. Each
+    /// `rewrite`/`frewrite` step at a counter redex yields the next natural, starting at zero and
+    /// resetting for each top-level rewriting command. The rewrite traversal handles it directly.
     Counter { nat: NatHooks },
-    /// `string : Qid -> String` / `qid : String ~> Qid` (Maude's `QuotedIdentifierOpSymbol`): convert
-    /// between a quoted identifier and its text. `qid_sym`/`str_sym` build the respective NA results.
+    /// `string : Qid -> String` / `qid : String ~> Qid`: convert between a quoted identifier and
+    /// its text. `qid_sym` and `str_sym` build the respective atomic results.
     QidOp {
         op: QidOp,
         qid_sym: SymbolId,
         str_sym: SymbolId,
     },
-    /// The CONVERSION module's cross-type coercions (`float`/`rat`/`string`/`decFloat`, under Maude's
-    /// `FloatOpSymbol`/`StringOpSymbol` with conversion codes). Each `op` uses the subset of hooks it
-    /// needs: `float_sym` builds floats, `str_sym` strings, `nat` reads/builds numerals, `division` the
-    /// rational `_/_`, `dec_float` the `<_,_,_>` triple.
+    /// Cross-type coercions from the CONVERSION module (`float`, `rat`, `string`, and `decFloat`).
+    /// Each `op` uses only the hooks it needs: `float_sym` builds floats, `str_sym` strings, `nat`
+    /// numerals, `division` rational applications, and `dec_float` decomposition triples.
     Conversion {
         op: ConvOp,
         float_sym: Option<SymbolId>,
@@ -334,10 +301,7 @@ pub enum SpecialOp {
         division: Option<SymbolId>,
         dec_float: Option<SymbolId>,
     },
-    /// `_/_` (Maude's `DivisionSymbol`): canonicalise a rational `I / N` to lowest terms — divide by
-    /// `gcd(|I|, N)`, reducing to the integer `I/g` when the denominator becomes 1. RAT's arithmetic
-    /// (`+`/`*`/…) is **equation-defined** in the prelude (a module-loading milestone, B5), so this is
-    /// the only RAT kernel op. `0/N` is left to the user equation `0/Q = 0`.
+    /// Canonicalize `_/_` to lowest terms, returning an integer when the denominator becomes one.
     Division { nat: NatHooks },
 
     /// Native LTL model checking over the module's ordinary rewrite state graph.
@@ -346,31 +310,26 @@ pub enum SpecialOp {
     },
     /// Native LTL satisfiability solving over the generalized Büchi automaton.
     SatSolve { hooks: std::rc::Rc<SatSolverHooks> },
-    /// A solver-language operator recognized from `SMT_Symbol`. T1 deliberately leaves it
-    /// reduction-inert; T2's DAG translator consumes the typed operator.
+    /// Solver-language operator consumed by the SMT translator and inert under ordinary reduction.
     Smt { op: SmtOp },
-    /// An **upper-layer descent hook**. META-LEVEL's `metaReduce`/`metaApply`/… use it to down-translate,
-    /// compute in an object module, and up-translate; LEXICAL's `tokenize`/`printTokens` use the same seam
-    /// because token interning lives above the kernel. Hook symbols are resolved from the operator's
-    /// `op-hook` list into [`MetaHooks`]; `op` selects the behavior. Strategy-meta descent remains
-    /// declared-but-inert through [`MetaOp::Deferred`].
+    /// An upper-layer META-LEVEL or LEXICAL descent hook. The frontend resolves hook symbols and the
+    /// host layer performs the operation. Unknown hook codes use [`MetaOp::Unknown`].
     Meta {
         op: MetaOp,
         hooks: std::rc::Rc<MetaHooks>,
     },
     /// The local synchronous meta-interpreter manager. The kernel only recognizes the external target;
-    /// request decoding and child-session ownership stay behind [`ExternalManager`](crate::descent::ExternalManager)
-    /// in the host layer.
+    /// request decoding and child-session ownership stay behind `LocalInterpreterManager` in the host
+    /// layer.
     InterpreterManager,
-    /// A standard-stream **external-object manager** (Maude's `StreamManagerSymbol`): the 0-ary `Oid`
-    /// constant `stdin`/`stdout`/`stderr` (Pillar 2.5-C). In `erewrite`'s EXTERNAL mode, with a `<>`
-    /// portal in the soup, a message targeting this constant is handled by the manager — `stdout`/`stderr`
-    /// `write(self, me, str)` emits `str` to the stream and replies `wrote(me, self)` **synchronously**;
-    /// `stdin` `getLine` is reactor-async (a later sub-step). The hooks are the message symbols the manager
-    /// consumes/produces, resolved from the op's `op-hook` list.
+    /// A standard-stream external-object manager: the zero-arity `Oid` constant
+    /// `stdin`, `stdout`, or `stderr`. In `erewrite`'s EXTERNAL mode, with a `<>` portal in the soup,
+    /// `write(self, me, str)` emits to the selected output stream and replies `wrote(me, self)`;
+    /// `getLine(self, me, prompt)` reads the scripted input buffer and replies `gotLine(me, self, line)`.
+    /// Hook symbols are resolved from the operator's `op-hook` list.
     StreamManager {
         stream: StdStream,
-        /// `<Strings>` (the `stringSymbol` op-hook) — builds the `gotLine` payload from a read line.
+        /// The `<Strings>` constructor hook builds the `gotLine` payload from a read line.
         string_sym: Option<SymbolId>,
         write_msg: Option<SymbolId>,
         wrote_msg: Option<SymbolId>,
@@ -379,7 +338,7 @@ pub enum SpecialOp {
     },
 }
 
-/// Which standard stream a [`SpecialOp::StreamManager`] drives (Maude's `StreamManagerSymbol` data).
+/// The standard stream driven by [`SpecialOp::StreamManager`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdStream {
     Stdin,
@@ -387,9 +346,7 @@ pub enum StdStream {
     Stderr,
 }
 
-/// Which upper-layer operation a [`SpecialOp::Meta`] performs: META-LEVEL descent functions, symbolic
-/// variant/narrowing functions, SMT operations, and LEXICAL's two token conversion hooks. Strategy
-/// descent remains [`MetaOp::Deferred`] until its backend lands.
+/// Upper-layer META-LEVEL and LEXICAL operations dispatched through [`SpecialOp::Meta`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaOp {
     Reduce,
@@ -404,7 +361,8 @@ pub enum MetaOp {
     SearchPath,
     Check,
     SmtSearch,
-    /// Native variant satisfiability over a reflected FVP/OS-compact constructor theory.
+    /// Native variant satisfiability over a reflected constructor theory with the finite variant
+    /// property and order-sorted compactness.
     VariantSat {
         validity: bool,
         explicit_sorts: bool,
@@ -446,29 +404,26 @@ pub enum MetaOp {
     Tokenize,
     /// LEXICAL's `printTokens : QidList -> String` hook.
     PrintTokens,
-    /// Order-sorted unification descent (S1f). `disjoint` splits the solution across the two sides'
-    /// variables (`UnificationTriple`); `irredundant` filters to the most-general unifiers; `legacy`
-    /// selects the older `Nat`-family signature (result `{Substitution, Nat}` instead of
-    /// `{Substitution, Qid}`).
+    /// Order-sorted unification descent. `disjoint` splits the solution across the two sides'
+    /// variables (`UnificationTriple`); `irredundant` filters to the most-general unifiers.
     Unify {
         disjoint: bool,
         irredundant: bool,
-        legacy: bool,
     },
-    /// Incremental folding-variant generation. `irredundant` selects the final survivor set; `legacy`
-    /// selects the older `Nat` fresh-family input/result signature.
+    /// Incremental folding-variant generation. `irredundant` selects the final survivor set;
+    /// `nat_family` selects `Nat` fresh-variable indices instead of Qid family names.
     GetVariant {
         irredundant: bool,
-        legacy: bool,
+        nat_family: bool,
     },
-    /// Variant unification. `disjoint` splits lhs/rhs bindings; `legacy` selects `Nat` family values.
+    /// Variant unification. `disjoint` splits lhs/rhs bindings; `nat_family` selects `Nat` indices.
     VariantUnify {
         disjoint: bool,
-        legacy: bool,
+        nat_family: bool,
     },
     /// Complete-set variant matching (the current Qid-family signature).
     VariantMatch,
-    /// Legacy `metaNarrow`; `metaNarrow2` is recognized separately but intentionally inert.
+    /// `metaNarrow`; `state_only` identifies the separately recognized, inert `metaNarrow2`.
     Narrow {
         state_only: bool,
     },
@@ -482,23 +437,22 @@ pub enum MetaOp {
     Srewrite {
         depth_first: bool,
     },
-    /// Strategy descent — declared so the tower loads, but inert (kind-level).
-    Deferred,
+    /// Unrecognized hook code; evaluation remains inert.
+    Unknown,
 }
 
 /// The meta-representation symbols a [`SpecialOp::Meta`] descent function needs, resolved from its
-/// operator's `op-hook`/`term-hook` list at module-build time and keyed by hook purpose
-/// (`qidSymbol`, `metaTermSymbol`, `succSymbol`, …). The down/up maps look these up to read and build
-/// meta-terms. (Populated in the reflection-core stage; empty while descent is inert.)
+/// operator's `op-hook`/`term-hook` list at module-build time and keyed by hook purpose. The down/up
+/// maps use these ids to decode and construct meta-terms.
 #[derive(Debug, Clone, Default)]
 pub struct MetaHooks {
     pub ops: std::collections::HashMap<String, SymbolId>,
     pub terms: std::collections::HashMap<String, SymbolId>,
 }
 
-/// The float operation a [`SpecialOp::FloatOp`] performs (Maude's `FloatOpSymbol` codes): IEEE `f64`
-/// arithmetic, the unary functions (`floor`/`ceiling`/`exp`/`log`/`sqrt`/trig), `rem`/`^`/`min`/`max`,
-/// and comparisons. (`float`/`rat` conversions are CONVERSION ops, handled separately.)
+/// An IEEE `f64` operation performed by [`SpecialOp::FloatOp`]: arithmetic, unary functions
+/// (`floor`, `ceiling`, `exp`, `log`, `sqrt`, and trigonometry), `rem`, exponentiation, min/max,
+/// or comparison. Float/rational conversions use [`SpecialOp::Conversion`] instead.
 #[derive(Debug, Clone, Copy)]
 pub enum FltOp {
     // Unary.
@@ -552,8 +506,7 @@ pub enum ConvOp {
     DecFloat,
 }
 
-/// The quoted-identifier conversion a [`SpecialOp::QidOp`] performs (Maude's `QuotedIdentifierOpSymbol`
-/// codes `string`/`qid`).
+/// A quoted-identifier conversion performed by [`SpecialOp::QidOp`]: text extraction or parsing.
 #[derive(Debug, Clone, Copy)]
 pub enum QidOp {
     /// `string : Qid -> String` — the identifier text (without the leading quote).
@@ -562,8 +515,8 @@ pub enum QidOp {
     Qid,
 }
 
-/// The string operation a [`SpecialOp::StringOp`] performs (Maude's `StringOpSymbol` codes): concat /
-/// length / substr / ascii / char / find / rfind / case-mapping / comparisons.
+/// A string operation performed by [`SpecialOp::StringOp`]: concatenation, length, slicing,
+/// character conversion, search, case mapping, character classes, trimming, or comparison.
 #[derive(Debug, Clone, Copy)]
 pub enum StrOp {
     Concat,
@@ -630,9 +583,8 @@ pub struct BoolHooks {
     pub false_: SymbolId,
 }
 
-/// The arithmetic / relational operation a numeric built-in performs (Maude packs these as a 2-char
-/// `CODE` int in `numberOpSymbol.cc`; a typed enum here — decision #6). The arithmetic ops return a
-/// `Nat`, the relational ops a `Bool`.
+/// Arithmetic or relational behavior of a numeric built-in. Arithmetic variants return a Nat or Int
+/// according to the attached [`NatHooks`]; relational variants return Bool.
 #[derive(Debug, Clone, Copy)]
 pub enum NumOp {
     // ACU (fold the multiset) — `_+_` `_*_` `gcd` `lcm` `min` `max`.
@@ -689,12 +641,12 @@ impl Symbol {
         self.inconsistent_constructor_axioms
     }
 
-    /// The operator's equational theory, classified from its [`Axioms`]:
-    /// `assoc & comm` → [`Acu`](Theory::Acu); `assoc` only → [`Au`](Theory::Au); `comm`, `id:`, or
-    /// `idem` (any subset, non-assoc) → [`Cui`](Theory::Cui) — Maude's CUI_Theory covers all {C,U,I}
-    /// combinations, and an `id:`-only / `idem`-only op must still collapse (A3c) — else
-    /// [`Free`](Theory::Free). Non-comm CUI ops keep positional argument order everywhere; only the
-    /// collapse axioms apply.
+    /// The operator's equational theory, classified from its [`Axioms`]. Associative-commutative
+    /// operators use [`Acu`](Theory::Acu), associative-only operators use [`Au`](Theory::Au), and
+    /// non-associative operators with commutativity, identity, or idempotence use
+    /// [`Cui`](Theory::Cui). Operators with none of those axioms use [`Free`](Theory::Free).
+    /// Non-commutative CUI operators preserve positional argument order; only their collapse axioms
+    /// apply.
     pub(crate) fn theory(&self) -> Theory {
         if self.axioms.iter {
             return Theory::S; // `iter` is mutually exclusive with assoc/comm (checked at registration)
@@ -734,13 +686,13 @@ impl Symbol {
         })
     }
 
-    /// Whether this operator has an identity on exactly one side (`AU_Symbol::oneSidedId`) — an
-    /// associative operator with one is an unimplemented unification theory.
+    /// Whether this operator has an identity on exactly one side. Associative one-sided identity
+    /// unification is unsupported.
     pub(crate) fn one_sided_identity(&self) -> bool {
         self.one_sided_id.is_some()
     }
 
-    /// The operator's built-in reduction rule (`special (id-hook …)`), if any (B3).
+    /// The operator's built-in reduction rule, if any.
     pub(crate) fn special(&self) -> Option<&SpecialOp> {
         self.special.as_ref()
     }
@@ -752,8 +704,8 @@ impl Symbol {
         self.class
     }
 
-    /// Whether every declaration of this operator is a constructor (`[ctor]`). Metadata — it does not
-    /// affect reduction; recorded for the later constructor analysis (B2.4).
+    /// Whether every declaration of this operator is a constructor (`[ctor]`). This does not affect
+    /// reduction; constructor-sensitive symbolic analyses consume the metadata.
     pub(crate) fn is_constructor(&self) -> bool {
         self.decls.iter().all(|d| d.ctor)
     }

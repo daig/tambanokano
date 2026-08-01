@@ -1,4 +1,4 @@
-*** T07-meta-smt-search — all metaSmtSearch cases lifted from the reference suite (Misc/smtTest.maude)
+*** T07-meta-smt-search — all metaSmtSearch cases
 *** PRELUDE
 set show timing off .
 load smt
@@ -32,7 +32,7 @@ red metaSmtSearch(['MULTI],
                   nil,
                   '*, 1, 1, 0) .
 
-*** Reflected inline-module regression: eligibility must be recomputed after down-translating rules.
+*** Reflected inline-module eligibility must be recomputed after down-translating rules.
 red metaSmtSearch(upModule('MULTI, false),
                   upTerm(f(-2, X)),
                   'Z:State,

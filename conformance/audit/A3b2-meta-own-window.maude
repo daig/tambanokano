@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A3b2-meta-own-window — META up* own-statement window after the A3b statement-order flip:
+*** META up* own-statement window:
 *** upEqs/upRls(_, false) must return ONLY the module's own statements (the LEADING slice of the
 *** flattened vectors), with cross-module statement overlap present.
 mod A3B2-BASE is
@@ -22,6 +22,5 @@ endfm
 
 reduce in A3B2-META : upEqs('A3B2-EXT, false) .
 reduce in A3B2-META : upRls('A3B2-EXT, false) .
-*** flat=true probe uses rules only: the oracle's implicit-BOOL injection (finding C6a) would put
-*** BOOL's equations into upEqs('A3B2-EXT, true), coupling this fixture to C6a; BOOL has no rules.
+*** The flat=true case uses rules so implicit BOOL injection cannot add equations and affect this fixture.
 reduce in A3B2-META : upRls('A3B2-EXT, true) .

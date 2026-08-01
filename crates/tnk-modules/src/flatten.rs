@@ -1,13 +1,9 @@
 //! Flatten an import closure into one combined [`PreModule`] — a pure `PreModule → PreModule` transform.
 //!
-//! Resolve a module's transitive imports (depth-first, **imports before the importer** — matching Maude's
-//! donation order, which is what makes rewrite counts conform), merging every module's declarations into
-//! one accumulator. Each module is included **exactly once** (a `visited` set keyed by the canonical
-//! module expression) so diamonds (`M` imports `A` and `B`, both importing `BASE`) don't duplicate `BASE`.
-//! Sorts and variable names are de-duplicated (the frontend's `add_sort` and per-variable grammar
-//! production don't dedup); ops/subsorts/statements are appended (the frontend's `(name, arity)` map folds
-//! same-name op declarations into overloads). The combined module's own `imports` is empty — it is fully
-//! resolved — so the unchanged frontend `build_loaded_module` builds it directly.
+//! Resolve transitive imports depth-first, visiting imports before their importer and merging declarations
+//! into one accumulator. Each module is included once, so import diamonds do not duplicate their shared
+//! base. Sort and variable names are deduplicated; operators, subsorts, and statements retain declaration
+//! order. The result has no imports and can be compiled directly.
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Interner, Token, tokenize};
@@ -45,18 +41,17 @@ struct Acc {
     statements: Vec<Statement>,
     strat_decls: Vec<tnk_frontend::surface::ast::StratDecl>,
     strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
-    /// Per-statement **home** module name, parallel to [`statements`](Self::statements) (D1a import-reparse
-    /// point-fix). `Some(name)` for a plain named-module donation (its statement re-parses in that module's
-    /// own grammar if the flattened grammar makes it ambiguous); `None` for a renamed/instantiated/parameter-
-    /// copy donation (whose bubbles are already rewritten in-place, so they parse against the flattened
-    /// grammar as before). The root's own statements carry `Some(root_name)`, which the loader treats as
-    /// "self" (flattened grammar). Kept in lockstep with `statements` through every merge and rotation.
+    /// Per-statement **home** module name, parallel to [`statements`](Self::statements). `Some(name)` marks
+    /// a plain named-module donation whose statement may need reparsing in that module's own grammar when
+    /// the flattened grammar is ambiguous. `None` marks a renamed, instantiated, or parameter-copy
+    /// donation whose bubbles were already rewritten for the flattened grammar. Root statements carry
+    /// `Some(root_name)`, which the loader treats as "self". Kept in lockstep with `statements`.
     statement_homes: Vec<Option<String>>,
 }
 
 impl Acc {
-    /// Merge a declaration bundle: new sorts/var-names once each, everything else appended. `home` tags
-    /// every one of `d`'s statements with its origin module (see [`Acc::statement_homes`]).
+    /// Merge a declaration bundle, retaining each new sort and variable name once and appending every
+    /// other declaration. `home` tags all statements in `d` in lockstep with the statement list.
     fn add(&mut self, d: FlatDecls, home: Option<&str>) {
         for s in d.sorts {
             if self.sort_set.insert(s.clone()) {
@@ -78,8 +73,10 @@ impl Acc {
                 });
             }
         }
-        self.statement_homes
-            .extend(std::iter::repeat(home.map(str::to_string)).take(d.statements.len()));
+        self.statement_homes.extend(std::iter::repeat_n(
+            home.map(str::to_string),
+            d.statements.len(),
+        ));
         self.statements.extend(d.statements);
         self.strat_decls.extend(d.strat_decls);
         self.strat_defs.extend(d.strat_defs);
@@ -134,17 +131,10 @@ fn own_decls(pm: &PreModule) -> FlatDecls {
     }
 }
 
-/// Inline a module's **shadowed** statement variables as single-token colon variables at their
-/// declared sort (`A` ↦ `A:List{X}`). Variable aliases are **module-local** in Maude, but our flattener
-/// re-parses statements against one *shared* var namespace where [`Acc::add`] keeps the first
-/// declaration of each name. So when a module's own variable collides with an **earlier-collected**
-/// import's same-named variable at a *different* sort, the module's declaration is dropped and its
-/// statements would mistype: the real `LIST` declares `var A : List{X}`, but `protecting NAT → BOOL →
-/// BOOL-OPS` brings `vars A B C : Bool` first, so `append(A, L)` sees `A : Bool` in a `List` position →
-/// no parse. We inline *only* such shadowed variables (imports are always collected before a module's
-/// own decls, so the shadower is already in `prior`), leaving every non-colliding variable bare so
-/// traces/printing are unchanged. Same device as the instantiation path, here with no bindings/op maps;
-/// the declarations are kept (for bare variables in commands).
+/// Inline statement variables shadowed by earlier imports as single-token colon variables at their
+/// declared sort (`A` ↦ `A:List{X}`). Module-local aliases otherwise collide in the flattened grammar's
+/// shared variable namespace, where [`Acc::add`] retains the first declaration. Only colliding variables
+/// are inlined; non-colliding names remain bare and declarations remain available to commands.
 fn inline_shadowed_vars(d: &mut FlatDecls, prior: &Acc, i: &mut Interner) {
     let mut declared: HashMap<&str, &str> = HashMap::new();
     for v in &prior.vars {
@@ -188,7 +178,7 @@ fn inline_shadowed_vars(d: &mut FlatDecls, prior: &Acc, i: &mut Interner) {
 }
 
 /// Flatten module `name`'s import closure into one combined [`PreModule`] named `name` (empty imports).
-/// `views` resolves any parameterized instantiation `M{V}` reached in the closure (B-iv).
+/// `views` resolves any parameterized instantiation `M{V}` reached in the closure.
 pub fn flatten(
     name: &str,
     db: &ModuleDb,
@@ -198,12 +188,12 @@ pub fn flatten(
     flatten_with_homes(name, db, views, interner).map(|(pm, _)| pm)
 }
 
-/// Like [`flatten`], but also return the per-statement **home** module names (parallel to the returned
-/// module's `statements`) — the D1a import-reparse point-fix input. An imported statement whose parse the
-/// flattened grammar makes ambiguous is re-parsed against its home module's own grammar
-/// ([`crate::load::flatten_and_build`] → [`tnk_frontend::load::build_loaded_module_homed`]). `None` means
-/// "no distinct home" (renamed/instantiated donation, or the root's own statements) — use the flattened
-/// grammar, exactly the pre-fix behavior.
+/// Like [`flatten`], but also return the per-statement **home** module names, parallel to the returned
+/// module's `statements`. Imported statements can be parsed against their defining grammar through
+/// [`crate::load::flatten_and_build`] and
+/// [`tnk_frontend::load::build_loaded_module_homed`]. Named root statements carry `Some(root_name)`,
+/// which the loader treats as self; `None` marks transient roots or donations without a distinct home and
+/// uses the flattened grammar.
 pub fn flatten_with_homes(
     name: &str,
     db: &ModuleDb,
@@ -216,12 +206,8 @@ pub fn flatten_with_homes(
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
     let root = db.get(name);
-    // Maude's statement order: the ROOT's own statements are inserted FIRST (process() runs before
-    // importStatements()), then each import donates post-order (deepest first, self-last) — so a chain
-    // GRAND ← MID ← TOP yields [TOP, GRAND, MID]. collect_named appended the root's own statements
-    // last (the donation order, correct for every *imported* module); rotate that own block to the
-    // front. Declarations keep import-first order (least-sort tiebreaks read declaration order). The
-    // parallel `statement_homes` rotates in lockstep so each statement keeps its home tag.
+    // Root statements precede imported statements; imports donate post-order, deepest first. Move the
+    // root-owned block to the front while preserving declaration order and rotating home tags in lockstep.
     if let Some(pm) = root {
         acc.statements.rotate_right(pm.statements.len());
         acc.statement_homes.rotate_right(pm.statements.len());
@@ -233,10 +219,8 @@ pub fn flatten_with_homes(
         .unwrap_or((ModuleKind::Functional, false, false, false));
     let homes = std::mem::take(&mut acc.statement_homes);
     let mut d = acc.into_decls();
-    // Imported variable aliases participate in the root grammar only when no visible nullary operator
-    // redeclares the same token. Root-owned variables are then restored authoritatively. This mirrors
-    // Maude's declaration priority for META-INTERPRETER clients importing constants `M : -> Module` and
-    // `V : -> View` over older aliases with those names.
+    // Imported variable aliases participate only when no visible nullary operator redeclares the token.
+    // Root-owned variables are then restored authoritatively.
     if let Some(pm) = root {
         let own_var_names: HashSet<String> = pm
             .vars
@@ -333,10 +317,9 @@ pub fn flatten_pre(
     }
     let mut own = own_decls(pm);
     inline_shadowed_vars(&mut own, &acc, interner);
-    // The transient's own statements parse against the flattened (down-translated) grammar — meta's
-    // established behavior — so tag them `None` (no distinct home). `flatten_pre` discards homes anyway.
+    // Transient statements parse against the flattened, down-translated grammar, so they have no distinct
+    // statement home. Rotate them ahead of imported statements because the transient is the root module.
     acc.add(own, None);
-    // The transient IS the root module: its own statements go first (same rotation as `flatten`).
     acc.statements.rotate_right(pm.statements.len());
     acc.statement_homes.rotate_right(pm.statements.len());
     acc.strat_decls.rotate_right(pm.strat_decls.len());
@@ -377,16 +360,14 @@ fn import_module_bases<'a>(expr: &'a ModuleExpr, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Whether an import expression imports (in module position) a **theory** (`fth`/`th`). A plain module
-/// importing a theory is illegal (C4a): Maude recovers by ignoring the import.
+/// Whether a module-position import targets a theory. A plain module ignores theory imports.
 fn import_targets_theory(expr: &ModuleExpr, db: &ModuleDb) -> bool {
     let mut bases = Vec::new();
     import_module_bases(expr, &mut bases);
     bases.iter().any(|n| db.get(n).is_some_and(|m| m.is_theory))
 }
 
-/// Strategy declarations and definitions are donated only into strategy modules/theories. Maude rejects
-/// an ordinary `mod`/`fmod` import of an `smod`/`sth` as a whole, including its ordinary declarations.
+/// Strategy declarations and definitions are donated only into strategy modules and theories.
 fn import_targets_strategy(expr: &ModuleExpr, db: &ModuleDb) -> bool {
     let mut bases = Vec::new();
     import_module_bases(expr, &mut bases);
@@ -395,7 +376,7 @@ fn import_targets_strategy(expr: &ModuleExpr, db: &ModuleDb) -> bool {
         .any(|name| db.get(name).is_some_and(|module| module.is_strategy))
 }
 
-/// Whether an import expression directly names the importing module `name` (a self-import, C4c).
+/// Whether an import expression directly names the importing module `name` (a self-import).
 fn import_names_self(expr: &ModuleExpr, name: &str) -> bool {
     let mut bases = Vec::new();
     import_module_bases(expr, &mut bases);
@@ -437,11 +418,8 @@ fn arg_leaves_free_param(
     }
 }
 
-/// Whether importing `expr` would leave a free (unbound) parameter — a parameterized module instantiated
-/// only by a theory-view at its grounding (last) level (C4b). Maude refuses to import a module with free
-/// parameters. Only the last level of an instantiation chain grounds the parameter (`BOX{ToT2}{C2}` is
-/// grounded by `C2`), so only the last level is inspected; a renamed instance (`unchain` = `None`) is not
-/// gated here.
+/// Whether importing an instantiation leaves a free parameter. Only the final argument layer can ground
+/// a chain; a renamed expression without an instantiation chain is not gated here.
 fn import_leaves_free_param(
     expr: &ModuleExpr,
     db: &ModuleDb,
@@ -483,13 +461,11 @@ fn collect_named(
         add_parameter_copy(param, theory, db, views, acc, interner)?;
     }
     // The module's own parameters are in scope for its imports: an import `LIST{X}` of a parameter `X`
-    // is a *by-parameter* instantiation (Axis-A5 kind 2) — `X` is not a view. Standalone (here) its
+    // is a *by-parameter* instantiation — `X` is not a view. Standalone (here) its
     // parameters stay free, so the imports are collected unsubstituted with `X` in scope.
     let scope: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     for imp in &pm.imports {
-        // Import hygiene. A module importing ITSELF is a mutually-recursive import:
-        // Maude marks the module unusable due to unpatchable errors, so flattening fails and it is never
-        // built (C4c). Checked first, before the theory/free-param recoveries.
+        // Self-imports are mutually recursive and make the module unusable.
         if import_names_self(&imp.expr, name) {
             return Err(format!(
                 "mutually recursive import of module `{name}` ignored"
@@ -498,15 +474,11 @@ fn collect_named(
         if !pm.is_strategy && import_targets_strategy(&imp.expr, db) {
             continue;
         }
-        // A plain module (`fmod`/`mod`) importing a THEORY (`fth`/`th`) is not allowed: Maude recovers by
-        // IGNORING the import — the module stays, minus the theory's contents (its axioms never run) (C4a).
-        // Only the module-imports-theory direction is illegal: a theory importing a theory/module, and a
-        // theory used as a parameter bound (via `add_parameter_copy`, not this loop), are legitimate.
+        // Plain modules ignore theory imports. The reverse direction and parameter bounds remain valid.
         if !pm.is_theory && import_targets_theory(&imp.expr, db) {
             continue;
         }
-        // Importing a module instance that still has FREE parameters — a theory-target view leaves the
-        // parameter free — is not allowed: Maude marks the importer unusable due to unpatchable errors (C4b).
+        // Importing an instance with a parameter left free makes the importer unusable.
         if import_leaves_free_param(&imp.expr, db, views, &scope) {
             return Err(format!(
                 "cannot import module `{}` because it has free parameters",
@@ -515,23 +487,18 @@ fn collect_named(
         }
         collect_expr(&imp.expr, db, views, acc, visited, interner, &scope)?;
     }
-    let pm = db.get(name).expect("present"); // re-borrow after the parameter-copy recursion
+    let pm = db.get(name).expect("present");
     let mut own = own_decls(pm);
-    inline_shadowed_vars(&mut own, acc, interner); // module-local aliases vs imports (see fn doc)
-    // A plain named-module donation: tag its statements with `name` as their home so the loader can
-    // re-parse them in this module's own grammar if the flattened grammar makes them ambiguous (D1a).
-    acc.add(own, Some(name)); // the module's own declarations, after its imports
+    inline_shadowed_vars(&mut own, acc, interner);
+    // Append own declarations after imports. Statements from a plain named module retain `name` as their
+    // home so the loader can reparse them when the flattened grammar is ambiguous.
+    acc.add(own, Some(name));
     Ok(())
 }
 
-/// Add a parameter copy of theory `theory` under parameter name `param`: flatten the theory and rename
-/// every one of its sorts `s` to the parameter sort `param$s` (Maude's `makeParameterCopy`), so the
-/// importing module's body can refer to `X$Elt` and to parameterized sorts. The renaming runs in a fresh
-/// scope (a parameter copy is independent of any unrenamed import of the same theory).
-///
-/// Only **theory-declared** sorts are renamed (A4): a sort the theory gets from an imported *module*
-/// (`protecting BOOL` → `Bool`) keeps its name (Maude only qualifies theory-declared sorts as `X$s`), so the
-/// body's references to it resolve to the shared module sort.
+/// Add a parameter copy of `theory` under `param`: flatten the theory and qualify each theory-owned sort
+/// `s` as `param$s`. Imported module sorts keep their shared names. The fresh scope is independent of any
+/// unrenamed import of the same theory.
 fn add_parameter_copy(
     param: &str,
     theory: &str,
@@ -569,8 +536,8 @@ fn add_parameter_copy(
         }
     }
     let renamed = apply_renaming(decls, &items, interner)?;
-    // A parameter copy's statements are renamed in-place; parse them against the flattened grammar as
-    // before (no distinct home) — D1a is scoped to plain named imports.
+    // Parameter-copy statements are rewritten for the flattened grammar and therefore have no distinct
+    // statement home; only plain named imports retain homes.
     acc.add(renamed, None);
     Ok(())
 }
@@ -578,7 +545,7 @@ fn add_parameter_copy(
 /// The set of a parameter theory's own sorts — theory-declared sorts, excluding those inherited from an
 /// imported *module* ([`module_origin_sorts`]). These are exactly the `s` renamed to `param$s` by
 /// [`add_parameter_copy`]; equivalently, the `s` for which `X$s` is a genuine parameter sort. Any other
-/// `X$…` occurrence in a parameterized module's body is a "fake" parameter sort (A4d).
+/// `X$…` occurrence in a parameterized module's body is a "fake" parameter sort.
 fn theory_param_sorts(
     theory: &str,
     db: &ModuleDb,
@@ -686,7 +653,7 @@ fn module_origin_expr_sorts(
             import_module_bases(base, &mut bases);
             if bases
                 .iter()
-                .any(|name| db.get(*name).is_some_and(|module| !module.is_theory))
+                .any(|name| db.get(name).is_some_and(|module| !module.is_theory))
             {
                 collect_expression_sorts(expr, db, views, interner, out)
             } else {
@@ -770,8 +737,7 @@ fn collect_expr(
                 .iter()
                 .any(|item| renames_free_parameter_sort(item, scope))
             {
-                // Maude ignores an attempt to rename a sort owned by an enclosing parameter (`Y$Elt`):
-                // the parameter binding, not the import renaming, owns that name (A4e).
+                // An enclosing parameter owns its qualified sorts, so import renaming does not rename them.
                 let effective: Vec<_> = items
                     .iter()
                     .filter(|item| !renames_free_parameter_sort(item, scope))
@@ -781,8 +747,8 @@ fn collect_expr(
             } else {
                 apply_renaming(tmp.into_decls(), items, interner)?
             };
-            // Renamed donation: bubbles are rewritten in-place, parse against the flattened grammar (D1a
-            // scoped to plain named imports).
+            // Renamed donation: bubbles are rewritten in-place and parse against the flattened grammar,
+            // unlike plain named imports.
             acc.add(renamed, None);
             Ok(())
         }
@@ -791,11 +757,9 @@ fn collect_expr(
             if !visited.insert(canonical_key(expr)) {
                 return Ok(());
             }
-            // A **renamed** parameterized module instantiated — `(M * R){V}` (finding C3a; the shape stock
-            // `linear.maude` uses). Instantiate the inner module expression, then apply the renaming to the
-            // result: `R` targets `M`'s module-level sorts/ops, which survive the parameter substitution
-            // (a rename of a parameter-theory sort becomes a no-op post-substitution, matching the oracle's
-            // "ignore the mapping" — cf. A4e).
+            // For an instantiated renamed module `(M * R){V}`, instantiate the inner module first, then
+            // apply `R` to module-level sorts and operators. Parameter-theory sort mappings are no-ops
+            // after substitution.
             if let ModuleExpr::Rename(inner, items) = &**base {
                 let mut tmp = Acc::default();
                 let mut tmp_visited = HashSet::new();
@@ -809,19 +773,15 @@ fn collect_expr(
                     interner,
                     scope,
                 )?;
-                // The rename's structured names reference the INNER module's parameters
-                // (`sort Array{X,Y} to Vector{Y}` over ARRAY{X :: TRIV, Y :: TRIV}); the
-                // instance's sorts carry the ARGUMENT names (`Array{Nat,Int0}`), so substitute
-                // the parameters positionally into the items before matching (stock
-                // linear.maude's VECTOR/MATRIX shape).
+                // Rename items use the inner module's parameter names while instance sorts use argument
+                // names. Substitute parameters positionally before matching structured names.
                 let items = subst_rename_item_params(inner, args, db, items);
                 let renamed = apply_renaming(tmp.into_decls(), &items, interner)?;
                 acc.add(renamed, None);
                 return Ok(());
             }
-            let (mname, arg_lists) = unchain(expr).ok_or(
-                "the base of an instantiation must be a named module (a sum base is a follow-up)",
-            )?;
+            let (mname, arg_lists) = unchain(expr)
+                .ok_or("the base of an instantiation must be a named module, not a sum")?;
             instantiate(mname, &arg_lists, db, views, acc, visited, interner, scope)
         }
     }
@@ -1023,7 +983,7 @@ fn instantiate(
             .map(|a| canonical_key(a))
             .collect::<Vec<_>>()
             .join("}{");
-        // The parameter theory's genuine sorts — so a fake `X$Foo` in the body survives (A4d).
+        // The parameter theory's genuine sorts — so a fake `X$Foo` in the body survives.
         bindings.insert(
             param.name.clone(),
             ParamBinding {
@@ -1064,7 +1024,7 @@ fn instantiate(
         apply_view_op_recon(&mut decls, mname, db, views, &op_recon, interner)?;
     }
     // Instantiated donation: variables/sorts inlined into the bubbles, so parse against the flattened
-    // grammar (no distinct home) — D1a is scoped to plain named imports.
+    // grammar; instantiated donations have no distinct source home.
     let instantiated = instantiate_decls(decls, &bindings, &op_subst, interner);
     acc.add(instantiated, None);
     Ok(())
@@ -1145,8 +1105,8 @@ fn rewrite_strategy_bubbles(
 /// parameter-theory operators and the module's variables are in scope) and re-emit each mapped operator
 /// application in the target operator's syntax ([`ViewOpSubst`]). Runs on the *source* bubbles (bare
 /// variables, source ops), so the subsequent [`instantiate_decls`] pass still inlines variables/sorts and
-/// applies the textual `op_subst`. A condition fragment that does not parse as a single term is left
-/// unchanged (a mixfix map inside an eq/rule condition is not reconstructed — no current use).
+/// applies the textual `op_subst`. Condition fragments that do not parse as single terms remain unchanged;
+/// mixfix maps inside those fragments are not reconstructed.
 fn apply_view_op_recon(
     d: &mut FlatDecls,
     mname: &str,
@@ -1216,7 +1176,7 @@ fn apply_view_op_recon(
 /// structured sorts (`Base{X} ↦ Base{<view_name>}`): the view name `V` for a view argument, or the
 /// enclosing parameter name `p` for a by-parameter argument. A view binding maps each theory sort through
 /// `sort_image` (`Elt ↦ Nat`); a [`by_param`](Self::by_param) binding instead prefix-renames `X$s ↦
-/// view_name$s` (the parameter survives, renamed — Axis-A5 kind 2).
+/// view_name$s` (the parameter survives under its enclosing name).
 struct ParamBinding {
     view_name: String,
     /// The **final** argument name — the same as `view_name` for a single-level argument, but for a chain
@@ -1230,14 +1190,14 @@ struct ParamBinding {
     /// The parameter theory's own sorts — the sorts `s` for which `X$s` is a *genuine* parameter sort
     /// (theory-declared, excluding module-origin sorts, exactly what [`add_parameter_copy`] renames).
     /// Gates the `X$s` substitution in [`inst_sort`]: a "fake" parameter sort `X$Foo` (`Foo` not a theory
-    /// sort — declared directly in the parameterized module's body) must survive instantiation unchanged
-    /// (A4d). `None` means "do not gate" — used for the internal bindings of nested-view resolution, whose
-    /// consulted sorts are view-map targets (never fake `$`-sorts), preserving the prior behavior there.
+    /// sort — declared directly in the parameterized module's body) must survive instantiation unchanged.
+    /// `None` disables the gate for nested-view bindings because their view-map target sorts cannot be
+    /// fake parameter sorts.
     theory_sorts: Option<HashSet<String>>,
 }
 
 /// One instantiation argument resolved to its parameter binding plus the module expression to import for
-/// it (Axis-A2/A5). A view argument carries `target = Some(<to-module expression>)`; a **by-parameter**
+/// it. A view argument carries `target = Some(<to-module expression>)`; a **by-parameter**
 /// argument (an enclosing parameter passed straight through) carries `target = None` — nothing is imported
 /// (the enclosing module's parameter copy already supplied `p$s`).
 struct ArgResolution {
@@ -1438,9 +1398,8 @@ fn op_maps_of(
     Ok((op_subst, op_recon))
 }
 
-/// Parse an op→term from-pattern `name ( a1 , a2 , … )` into the operator name and its argument variables'
-/// base-names (the text before any `:sort` suffix), in order. `None` if it is not a prefix application of
-/// single-token argument variables (a mixfix source, or a non-variable argument — the follow-up case).
+/// Parse an op-to-term source pattern `name(a1, a2, …)` whose arguments are single-token variables.
+/// Returns `None` for mixfix sources or non-variable arguments, which this mapping form does not support.
 fn op_pattern_formals(from: &[Token], i: &Interner) -> Option<(String, Vec<String>)> {
     if from.len() < 3 || i.resolve(from[1].sym) != "(" || i.resolve(from[from.len() - 1].sym) != ")"
     {
@@ -1551,20 +1510,12 @@ fn subst_params_in_expr(
         ),
         ModuleExpr::Rename(inner, items) => {
             use tnk_frontend::surface::ast::RenameItem;
-            // Substitute parameters in the renaming's sort/op *names* too (not just `inner`): a chained
-            // import's renaming `sort List{STO}{X} to List{X}` must become `List{STO}{Nat<} to List{Nat<}`
-            // when the enclosing module is instantiated, so its FROM matches the chain-named instance sort
-            // `List{STO}{Nat<}` (which `WSL{STO}{Nat<}` produces) and its TO collapses it to `List{Nat<}`.
-            // SHADOWING: a rename written over a parameterized module (`(ARRAY * (sort
-            // Array{X,Y} to Vector{Y})){Nat, X}`) names the INNER module's own parameters in
-            // its items; an enclosing parameter with the same name (VECTOR's X) must not be
-            // substituted into them — the rename semantically applies BEFORE instantiation
-            // (the positional substitution happens at the instantiate-then-rename site).
-            // …but ONLY when the inner spine is an UNINSTANTIATED parameterized module
-            // (`Rename(Named(ARRAY), …)` under an outer instantiation): a rename over an
-            // already-instantiated inner (`Rename(Instantiation(LIST,[X]), sort Lst{X} to …)`,
-            // the chained-import form) names chain sorts whose brace args ARE the enclosing
-            // parameters and must keep substituting.
+            // Substitute enclosing parameters in renaming item names so chained spellings match instance
+            // sorts (`List{STO}{X}` becomes `List{STO}{Nat<}`). A rename directly over an uninstantiated
+            // parameterized module instead names that module's own parameters; those names are shielded
+            // from same-named enclosing parameters because renaming precedes positional instantiation.
+            // Once the inner spine is instantiated, its brace arguments belong to the enclosing scope and
+            // are substituted.
             let inner_params: HashSet<&str> = if spine_has_instantiation(inner) {
                 HashSet::new()
             } else {
@@ -1653,7 +1604,7 @@ fn subst_param_name(name: &str, names: &HashMap<String, String>) -> String {
 }
 
 /// Apply the instantiation substitution to a module's own declarations: rewrite every sort name through
-/// [`inst_sort`], and rewrite the view's operator maps (A1) into the statement bubbles — each reference to
+/// [`inst_sort`], and rewrite the view's operator maps into the statement bubbles — each reference to
 /// a mapped theory operator `f` becomes the target operator `g` or term `t`.
 fn instantiate_decls(
     mut d: FlatDecls,
@@ -1701,7 +1652,7 @@ fn instantiate_decls(
             *identity = subst_bubble(identity, bindings, op_subst, &no_vars, i);
         }
     }
-    // Rewrite statement bubbles: the views' operator maps (A1); each declared variable inlined as a
+    // Rewrite statement bubbles: each view operator map; each declared variable inlined as a
     // single-token colon variable at its instantiated sort (`H ↦ H:List{ToN}`); and parameter-sort
     // substitution inside glued source colon variables (`E:X$Elt ↦ E:Box{ToColor}`). The colon-variable
     // form keeps the sort a single token that re-parses against the instance's sorts — essential because a
@@ -1792,7 +1743,7 @@ fn inst_sort_bubble(
 }
 
 /// Rewrite a statement bubble under an instantiation. A token that is a mapped source operator becomes its
-/// target token(s) (op→op / op→term, A1). A bare declared-variable token becomes a single-token colon
+/// target token(s) (op→op / op→term). A bare declared-variable token becomes a single-token colon
 /// variable at its instantiated sort (`H ↦ H:List{ToN}`, from `var_inline`). A glued source colon variable
 /// `name:sort` has its sort instantiated (`E:X$Elt ↦ E:Box{ToColor}`). Each rewritten variable stays one
 /// token, so it re-parses as an on-the-fly variable of the instance sort; a `name:sort` whose sort is
@@ -1953,9 +1904,8 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
     if let Some((param, s)) = name.split_once('$')
         && let Some(b) = bindings.get(param)
     {
-        // A "fake" parameter sort `X$Foo` — `Foo` not a sort of `X`'s theory — is just a sort name that
-        // happens to contain `$`; Maude qualifies only theory sorts, so it survives instantiation
-        // unchanged (A4d). `theory_sorts == None` (nested-view internal bindings) skips this gate.
+        // A name `X$Foo` where `Foo` is not a sort of X's theory is an ordinary sort name and survives
+        // instantiation. Nested-view internal bindings omit this ownership gate.
         if let Some(ts) = &b.theory_sorts
             && !ts.contains(s)
         {
@@ -2045,8 +1995,7 @@ fn canonical_key(expr: &ModuleExpr) -> String {
             format!("({} * ({}))", canonical_key(inner), parts.join(", "))
         }
         ModuleExpr::Instantiation(base, args) => {
-            // The canonical instance name `M{A, …}` — Maude's `makeParameterInstanceName`. Each argument
-            // is itself a module expression (a view name, a nested instantiation, or a parameter name).
+            // Canonical instance name `M{A, …}`; each argument is itself a module expression.
             let parts: Vec<String> = args.iter().map(canonical_key).collect();
             format!("{}{{{}}}", canonical_key(base), parts.join(","))
         }
@@ -2115,7 +2064,7 @@ fmod TOP is protecting L . protecting R . endfm
         assert_eq!(flat.sorts, ["S"]);
     }
 
-    /// B-iii: a parameter `X :: TRIV` makes a parameter copy of `TRIV` — the theory sort `Elt` becomes the
+    /// A parameter `X :: TRIV` makes a parameter copy of `TRIV` — the theory sort `Elt` becomes the
     /// parameter sort `X$Elt` in the flattened module, alongside the module's own structured sort, and no
     /// formal parameters remain.
     #[test]
@@ -2141,7 +2090,7 @@ fmod TOP is protecting L . protecting R . endfm
         );
     }
 
-    /// B-iv: instantiation `BOX{V}` resolves to the parameter sort's view image and the structured sort's
+    /// Instantiation `BOX{V}` resolves to the parameter sort's view image and the structured sort's
     /// instance name — `X$Elt ↦ Hue` (the view's `sort Elt to Hue`) and `Box{X} ↦ Box{V}`. The view's
     /// target module's sorts (`Hue`) are imported.
     #[test]
@@ -2186,7 +2135,7 @@ fmod TOP is protecting L . protecting R . endfm
         assert_eq!(wrap.range, "Box{V}");
     }
 
-    /// Axis-A2/A5: a nested instantiation `BOX{BoxV{ToColor}}` resolves the parameterized-view argument
+    /// A nested instantiation `BOX{BoxV{ToColor}}` resolves the parameterized-view argument
     /// `BoxV{ToColor}` to a derived ground view (target `BOX{ToColor}`, sort image `Elt ↦ Box{ToColor}`),
     /// so the flattened module carries both element-level instances of `Box` and both `wrap` overloads —
     /// `wrap : Hue -> Box{ToColor}` (the inner target) and `wrap : Box{ToColor} -> Box{BoxV{ToColor}}`.
@@ -2229,7 +2178,7 @@ fmod TOP is protecting L . protecting R . endfm
         );
     }
 
-    /// Axis-A5 kind 2: a parameterized module `PAIR{X :: TRIV}` that protects `LIST{X}` by the *enclosing
+    /// A parameterized module `PAIR{X :: TRIV}` protects `LIST{X}` by the *enclosing
     /// parameter* `X`. Flattened **standalone** it stays parameterized — the `LIST{X}` import is a
     /// by-parameter instantiation, so `LIST`'s `E$Elt` / `List{E}` are renamed to `X$Elt` / `List{X}`.
     #[test]

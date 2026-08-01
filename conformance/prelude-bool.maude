@@ -1,11 +1,6 @@
-*** M0 milestone plus TNK-004 — the real prelude's BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL),
-*** copied verbatim from ~/Downloads/Maude-3/prelude.maude (lines 33-82). Exercises poly/Universal
-*** expansion, equality hooks, and both the decided and stuck paths of `if_then_else_fi`.
-***
-*** Oracle: the reduces below run byte-identically against Maude's BUILT-IN BOOL — i.e.
-***   ~/Downloads/Maude-3/maude -no-banner   with   `red in BOOL : <term> .`
-*** (the modules can't be redefined verbatim in stock Maude — they clash with its preloaded prelude,
-*** so the reference is run against the built-in BOOL, our defs being that same source verbatim).
+*** Stock prelude BOOL stack (TRUTH-VALUE → BOOL-OPS → TRUTH → BOOL).
+*** Exercises poly/Universal expansion, equality hooks, and both the decided and stuck paths of
+*** `if_then_else_fi`. Reduces match expected parity against built-in BOOL.
 
 fmod TRUTH-VALUE is
   sort Bool .

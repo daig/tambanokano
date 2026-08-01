@@ -1,8 +1,8 @@
 //! Symbolic root rewriting modulo SMT.
 //!
-//! States are `(term, accumulated constraint, path-local fresh counter)` triples. Expansion is
-//! breadth-first and deliberately does not hash-cons states: two paths reaching the same term under
-//! different constraints remain distinct, matching Maude's `SMT_RewriteSequenceSearch`.
+//! States are `(term, accumulated constraint, path-local fresh counter)` triples. Breadth-first
+//! expansion does not hash-cons states, because paths reaching the same term under distinct
+//! constraints remain distinct.
 
 use crate::dag::DagId;
 use crate::engine::{Engine, RawSmtGoalMatch, RawSmtSuccessor};

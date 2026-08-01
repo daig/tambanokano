@@ -1,6 +1,5 @@
-*** B2.3d matching-condition (:=) conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/match-cond.maude < /dev/null
-*** `s M := N` matches the pattern `s M` against (the reduced) N, binding M. Mirrors the engine.rs tests.
+*** Matching-condition (`:=`) conformance
+*** `s M := N` matches the pattern `s M` against (the reduced) N, binding M.rs tests.
 
 fmod MATCH-COND is
   sorts Nat .

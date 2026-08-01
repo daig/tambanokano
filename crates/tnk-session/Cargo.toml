@@ -3,6 +3,7 @@ name = "tnk-session"
 description = "tambanokano reusable host-owned session: persistent modules, views, evaluation, and continuations"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

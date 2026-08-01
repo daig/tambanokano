@@ -1,10 +1,8 @@
-//! Built-in operator reduction (the `special (id-hook …)` seam, B3).
+//! Built-in reduction for operators carrying `special (id-hook …)`.
 //!
-//! [`Runtime::try_special`] is the `impl Runtime` arm that [`try_rewrite_top`](crate::engine) dispatches
-//! a [`SpecialOp`] to — Maude's `eqRewrite`, tried *before* user equations and falling through (`None`)
-//! on no-match. A successful return is exactly **one** rewrite: `try_special` never touches the rewrite
-//! counter, so the existing `reduce` Phase-2 increment fires once when `try_rewrite_top` returns `Some`
-//! (identical to a user-equation rewrite); the returned node is then re-reduced by the outer loop.
+//! [`Runtime::try_special`] dispatches a [`SpecialOp`] before user equations and falls through
+//! (`None`) on no-match. A successful return is exactly one rewrite: `try_special` does not touch the
+//! counter, so the enclosing top-rewrite path increments once and then re-reduces the returned node.
 
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
@@ -86,8 +84,7 @@ impl Runtime {
                 crate::ltl::model_check::check_rewrite_system(self, sig, descent, id, hooks)
             }
             SpecialOp::SatSolve { hooks } => crate::ltl::sat_solve::solve(self, sig, id, hooks),
-            // T1 recognizes solver-language operators but deliberately leaves them inert. T2 translates
-            // these typed hooks into the selected `SmtEngine`; ordinary `reduce` must not evaluate them.
+            // SMT operators are translated by the configured solver backend, not ordinary reduction.
             SpecialOp::Smt { .. } => None,
             SpecialOp::QidOp {
                 op,
@@ -109,9 +106,8 @@ impl Runtime {
         }
     }
 
-    /// `string : Qid -> String` / `qid : String ~> Qid` (Maude's `QuotedIdentifierOpSymbol`): convert
-    /// between a quoted identifier (stored without its leading `'`) and its text. `qid` is partial — a
-    /// string that is not a single identifier token (empty or containing whitespace) does not reduce.
+    /// Convert `string : Qid -> String` and the partial `qid : String ~> Qid`. Quoted identifiers are
+    /// stored without the leading `'`; strings that are not one identifier token do not reduce.
     fn reduce_qid_op(
         &mut self,
         sig: &Signature,
@@ -132,11 +128,9 @@ impl Runtime {
                 Some(self.make_na(sig, str_sym, NaValue::Str(q.as_bytes().into())))
             }
             QidOp::Qid => {
-                // `qid` normalizes the string to Maude's canonical token name at construction
-                // (Token::ropeToPrefixNameCode): whitespace/backquote runs become one backquote,
-                // specials get a preceding backquote. So `qid("a b")` and `qid("a`b")` build the
-                // SAME node ("a`b"), `string` returns the canonical text, and the printer is verbatim.
-                // A qid is text: a non-UTF-8 byte string is not a valid identifier, so it falls through.
+                // Canonicalize whitespace and backquote runs to one backquote and escape specials.
+                // Thus `qid("a b")` and `qid("a`b")` build the same node ("a`b"), `string` returns the
+                // canonical text, and the printer is verbatim. Non-UTF-8 text is not a valid identifier.
                 let s = self.as_str(arg)?;
                 let canonical = normalize_qid_name(std::str::from_utf8(&s).ok()?);
                 Some(self.make_na(sig, qid_sym, NaValue::Qid(canonical.into())))
@@ -244,7 +238,7 @@ impl Runtime {
                 }
                 self.make_rational(sig, nat, division, num, den)
             }
-            // `string : Float -> String` — the float's canonical decimal string (Maude's `doubleToString`).
+            // `string : Float -> String` — emit the float's canonical decimal form.
             ConvOp::FloatToString => {
                 let s = num::double_to_string(self.as_float(kids[0])?);
                 Some(self.make_na(sig, str_sym?, NaValue::Str(s.into_bytes().into())))
@@ -282,9 +276,8 @@ impl Runtime {
         }
     }
 
-    /// Fire a `counter` redex (Maude's `CounterSymbol`) at `node` during rewriting: if `node` is a
-    /// counter op, yield the next natural and advance the counter, counting one rewrite. `None` if `node`
-    /// is not a counter. Called from the `rewrite`/`frewrite` traversals — never from `reduce`.
+    /// Fire a `counter` redex at `node` during rewriting: yield the next natural, advance the counter,
+    /// and count one rewrite. Non-counter nodes return `None`; reduction never calls this path.
     pub(crate) fn try_counter(&mut self, sig: &Signature, node: DagId) -> Option<DagId> {
         let symbol = self.node(node).symbol();
         let nat = match sig.symbol(symbol).special() {
@@ -303,8 +296,8 @@ impl Runtime {
         self.counter_value = 0;
     }
 
-    /// `random : Nat -> Nat` (Maude's `RandomOpSymbol`): the n-th output of MT19937 seeded with 0. A
-    /// non-numeral argument falls through.
+    /// `random : Nat -> Nat`: return the n-th output of MT19937 seeded with 0. A non-numeral argument
+    /// falls through.
     fn reduce_random(&mut self, sig: &Signature, id: DagId, nat: &NatHooks) -> Option<DagId> {
         let arg = self.node(id).children().next().expect("random is unary");
         let n = self.as_nat(arg, nat)?.to_u64()?;
@@ -323,9 +316,8 @@ impl Runtime {
         }
     }
 
-    /// `_==_` / `_=/=_` (Maude's `EqualitySymbol`): both arguments are already reduced (standard
-    /// strategy), so compare them structurally (modulo the axioms) and rewrite to the `eq`/`neq`
-    /// constant. Always applies (equality never falls through).
+    /// `_==_` / `_=/=_`: compare already-reduced arguments structurally modulo axioms and rewrite to
+    /// the configured `eq` or `neq` constant. Equality never falls through.
     fn reduce_equality(
         &mut self,
         sig: &Signature,
@@ -340,8 +332,7 @@ impl Runtime {
                 kids.next().expect("_==_ is binary"),
             )
         };
-        // Floats compare by IEEE value, not bit pattern: `- 0.0 == 0.0` is true (Maude's
-        // FloatDagNode compares the doubles; NaN never occurs — the float ops gate it out).
+        // Floats compare by IEEE value rather than bit pattern: `-0.0 == 0.0`; NaNs are never built.
         let equal = match (self.as_float(l), self.as_float(r)) {
             (Some(a), Some(b)) => a == b,
             _ => self.deep_equal(l, r),
@@ -350,12 +341,9 @@ impl Runtime {
         Some(self.make_const(sig, chosen))
     }
 
-    /// `_.=._` (Maude's `CommutativeDecomposeEqualitySymbol`,
-    /// `src/Mixfix/commutativeDecomposeEqualitySymbol.cc` ported line-for-line): the initial-model
-    /// equality predicate. Equal reduced dags → `true`; unequal ground dags → `false`; otherwise
-    /// decompose over equationally-stable tops (free / iter / comm / assoc / AC) or decide `false`
-    /// where tops provably differ; `None` (stay unreduced, user equations may apply) when nothing is
-    /// provable — e.g. `X .=. Y` for distinct variables.
+    /// Initial-model equality for `_.=._`. Equal reduced DAGs yield `true`, unequal ground DAGs yield
+    /// `false`; otherwise decompose equationally stable tops or decide `false` where tops provably
+    /// differ. Return `None` when nothing is provable, such as for distinct variables `X .=. Y`.
     #[allow(clippy::too_many_arguments)]
     fn reduce_decompose_equality(
         &mut self,
@@ -405,10 +393,9 @@ impl Runtime {
         None
     }
 
-    /// Whether `id` contains no variable anywhere (Maude's `determineGround`, uncached — `.=.`
-    /// subjects are small). tnk realizes command-subject variables as [`SymbolClass::Variable`]
-    /// constants, so groundness is a class walk; a genuine `Var` leaf (symbolic-engine DAGs) is
-    /// likewise caught via its `SortVariable`-classed symbol.
+    /// Whether `id` contains no variable. Command-subject variables are
+    /// [`SymbolClass::Variable`] constants, so this is a class walk; genuine symbolic-engine `Var`
+    /// leaves are detected through their `SortVariable` symbol class.
     fn dag_is_ground(&self, sig: &Signature, id: DagId) -> bool {
         if matches!(
             sig.symbol(self.node(id).symbol()).class,
@@ -426,9 +413,7 @@ impl Runtime {
             .any(|c| self.deep_equal(c, smaller))
     }
 
-    /// The `.=.` polymorph instance for the kind of `sort` (Maude's
-    /// `instantiatePolymorph(polymorphIndex, kindIndex)`; tnk's per-kind eager expansion makes it a
-    /// table lookup).
+    /// Return the per-kind polymorphic `.=.` instance for `sort`.
     fn dec_sibling(
         &self,
         sig: &Signature,
@@ -441,12 +426,10 @@ impl Runtime {
             .flatten()
     }
 
-    /// Build one decomposed `.=.` pair, sharing the node with any content-equal pair already built
-    /// in this decomposition. Maude gets this sharing from compare-based ACU normalization; tnk's
-    /// `make_acu` merges distinct nodes only once both are reduced, and a fresh pair that reduces to
-    /// itself never triggers the parent's re-canonicalization — so without this, `f(X,Y) .=. f(Y,X)`
-    /// would decompose to an `_and_` whose two structurally-equal arguments stay unmerged and the
-    /// prelude's idempotence equation cannot match.
+    /// Build one decomposed `.=.` pair, sharing it with any content-equal pair already built in this
+    /// decomposition. `make_acu` merges distinct nodes only after both are reduced; a fresh self-normal
+    /// pair never triggers parent recanonicalization. Without explicit sharing, `f(X,Y) .=. f(Y,X)`
+    /// would produce two structurally equal `_and_` arguments that cannot match idempotence.
     fn make_dec_pair(
         &mut self,
         sig: &Signature,
@@ -463,10 +446,10 @@ impl Runtime {
         p
     }
 
-    /// The theory-decomposition arms of `CommutativeDecomposeEqualitySymbol::decompose`. `None` =
-    /// no decomposition possible (stay unreduced). Both tops are `ls == rs` and equationally stable
-    /// (hence: no identity element — the AU/ACU/CUI arms only ever see pure assoc / pure AC / pure
-    /// comm(+idem) nodes).
+    /// Decompose equationally stable applications according to their shared operator theory. `None`
+    /// leaves the equality unreduced. Identity-bearing nodes collapse before this point, so the
+    /// AU/ACU/CUI cases see only pure associativity, pure AC, or commutativity with optional idempotence.
+    #[allow(clippy::too_many_arguments)]
     fn decompose(
         &mut self,
         sig: &Signature,
@@ -571,9 +554,9 @@ impl Runtime {
     }
 
     /// AU (pure assoc) arm: peel provably-pairable arguments from both ends, prove inequality where
-    /// the peel exposes it, and decompose the peels + remainder into a conjunction. Port of
-    /// `associativeDecompose` (the peel loops bound by the shorter side — the C++ `maxEnd` read past
-    /// the shorter vector is unreachable-by-construction there and plain-bounded here).
+    /// the peel exposes it, and decompose the peels + remainder into a conjunction. The peel loops are
+    /// bounded by the shorter side.
+    #[allow(clippy::too_many_arguments)]
     fn associative_decompose(
         &mut self,
         sig: &Signature,
@@ -704,7 +687,7 @@ impl Runtime {
 
     /// ACU (pure AC) arm: cancel common subterms between the argument multisets; prove inequality
     /// by the stable-or-ground cardinality/pairing arguments; if cancellation made progress,
-    /// decompose to a smaller `.=.`. Port of `acDecompose`.
+    /// decompose to a smaller `.=.`.
     fn ac_decompose(
         &mut self,
         sig: &Signature,
@@ -754,9 +737,9 @@ impl Runtime {
         }
     }
 
-    /// Port of `acProvablyUnequal`: try to prove two argument multisets can never be made equal
-    /// under substitution, axioms, and equational rewriting. As a side effect, cancels common
-    /// subterms from both multisets (kept by the caller for the decompose-on-progress path).
+    /// Prove that two argument multisets can never be made equal under substitution, axioms, and
+    /// equational rewriting. As a side effect, cancel common subterms from both multisets; the caller
+    /// retains them for the decompose-on-progress path.
     fn ac_provably_unequal(
         &self,
         sig: &Signature,
@@ -765,12 +748,11 @@ impl Runtime {
     ) -> bool {
         // Cancel equal subterms (min multiplicity) from each side. Elements within one canonical
         // multiset are pairwise distinct, so at most one partner exists.
-        for i in 0..left.len() {
-            let ld = left[i].0;
+        for (ld, lm) in left.iter_mut() {
             for (rd, rm) in right.iter_mut() {
-                if *rm > 0 && self.deep_equal(ld, *rd) {
-                    let common = left[i].1.min(*rm);
-                    left[i].1 -= common;
+                if *rm > 0 && self.deep_equal(*ld, *rd) {
+                    let common = (*lm).min(*rm);
+                    *lm -= common;
                     *rm -= common;
                     break;
                 }
@@ -834,11 +816,10 @@ impl Runtime {
         false
     }
 
-    /// `if_then_else_fi` (Maude's `BranchSymbol`) selector: with the condition already reduced by the
-    /// intrinsic strategy, return the branch matching a hooked `tests` constant. The outer reduce loop
-    /// then abandons the old frame and normalizes only that selected result. If no test matches, this
-    /// returns `None`; BranchSymbol's strategy continues through every branch before its final
-    /// user-equation attempt.
+    /// Select an `if_then_else_fi` branch after reducing its condition. A hooked `tests` constant
+    /// chooses the corresponding branch; the outer reduce loop then normalizes only that result.
+    /// If no test matches, return `None` so the intrinsic strategy can visit every branch before its
+    /// final user-equation attempt.
     fn reduce_branch(&self, id: DagId, tests: &[SymbolId]) -> Option<DagId> {
         let kids: Vec<DagId> = self.node(id).children().collect();
         let cond_sym = self.node(kids[0]).symbol();
@@ -882,10 +863,8 @@ impl Runtime {
         }
     }
 
-    /// Build the numeral for `n`: `0` / `s^|n|(0)` / `-(s^|n|(0))` (Maude's `succSymbol->makeNatDag` and
-    /// `MinusSymbol`). The sort follows the node (`0 : Zero`, `s^n(0) : NzNat`, `-(s^n(0)) : NzInt`). A
-    /// **negative** `n` with no `minus` hook (NAT) returns `None` — the op falls through to user
-    /// equations (a signed result needs INT).
+    /// Build the numeral for `n`: `0`, `s^|n|(0)`, or `-(s^|n|(0))`. The node determines the sort.
+    /// A negative value without a `minus` hook returns `None`, because a signed result requires INT.
     fn make_int(&mut self, sig: &Signature, nat: &NatHooks, n: Int) -> Option<DagId> {
         if n.is_zero() {
             return Some(self.make_const(sig, nat.zero));
@@ -901,8 +880,8 @@ impl Runtime {
         }
     }
 
-    /// `-_` (Maude's `MinusSymbol`): `-(-x) = x`, `-0 = 0`; `-(s^n(0))` is the canonical negative (no
-    /// rewrite). The argument is already reduced (standard strategy).
+    /// Reduce unary minus: `-(-x) = x`, `-0 = 0`; `-(s^n(0))` is canonical. The standard strategy
+    /// has already reduced the argument.
     fn reduce_minus(&self, id: DagId, nat: &NatHooks) -> Option<DagId> {
         let arg = self.node(id).children().next().expect("-_ is unary");
         match &self.node(arg).term {
@@ -914,10 +893,9 @@ impl Runtime {
         }
     }
 
-    /// `ACU_NumberOpSymbol` (`_+_`/`_*_`/`gcd`/`lcm`/`min`/`max`): fold the **numeric** operands of the
-    /// ACU multiset (each `(element, multiplicity)`), rebuilding from the result and any non-numeric
-    /// residue. Needs `>= 2` numeric operands (counting multiplicity) to fire — else there is nothing
-    /// to combine (`None` → user equations / normal form), which also prevents a rebuild loop.
+    /// Fold numeric operands in the ACU multiset for `_+_`, `_*_`, `gcd`, `lcm`, `min`, and `max`,
+    /// rebuilding the numeric result with any residue. At least two numeric operands, counting
+    /// multiplicity, are required to fire; otherwise the built-in falls through without rebuilding.
     fn reduce_acu_number_op(
         &mut self,
         sig: &Signature,
@@ -957,10 +935,9 @@ impl Runtime {
         }
     }
 
-    /// `NumberOpSymbol` (`_-_`/`_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_`/`_>_`/`_>=_`/`_divides_`): a free op
-    /// over numeric arguments. A non-numeric argument, a zero divisor, a negative result with no `minus`
-    /// hook, or a too-large/negative exponent falls through (`None`). Relational ops rewrite to a Bool
-    /// constant (`bool_`); arithmetic ops to a Nat/Int.
+    /// Reduce a free numeric operator over already-reduced operands. A non-numeric argument, zero
+    /// divisor, negative result without a `minus` hook, or unrepresentable exponent falls through.
+    /// Relational operators build a Bool constant; arithmetic operators build a Nat or Int.
     fn reduce_number_op(
         &mut self,
         sig: &Signature,
@@ -1003,7 +980,7 @@ impl Runtime {
                 if a[1].is_zero() {
                     return None; // division by zero ⇒ fall through to user equations
                 }
-                let (q, r) = a[0].div_rem(&a[1]); // truncated toward zero (Maude quo/rem)
+                let (q, r) = a[0].div_rem(&a[1]); // Truncate toward zero; the remainder keeps the dividend's sign.
                 self.make_int(sig, nat, if matches!(op, NumOp::Quo) { q } else { r })
             }
             NumOp::Pow => {
@@ -1051,9 +1028,8 @@ impl Runtime {
         }
     }
 
-    /// `CUI_NumberOpSymbol` (`sd`): a **commutative** 2-argument numeric op. `sd(m, n) = |m − n|` — read
-    /// the two (already-reduced) operands from the CUI node and build the non-negative difference. A
-    /// non-numeric argument falls through (`None`).
+    /// Reduce the commutative `sd` operator, where `sd(m, n) = |m − n|`. The operands are already
+    /// reduced; a non-numeric operand falls through.
     fn reduce_cui_number_op(
         &mut self,
         sig: &Signature,
@@ -1081,9 +1057,9 @@ impl Runtime {
         }
     }
 
-    /// Read one line from the pending `stdin` buffer for `getLine` (Pillar 2.5-C): up to and **including**
-    /// the next `\n` (the reference returns the newline), or the rest if there is no trailing `\n`, or `""`
-    /// when the buffer is empty (EOF). Consumes what it returns from [`external_in`](crate::engine).
+    /// Read one line from the pending scripted `stdin` buffer for `getLine`: up to and **including** the
+    /// next `\n`, or the rest when there is no trailing newline, or `""` at EOF. Consumes the returned
+    /// bytes from [`external_in`](crate::engine).
     pub(crate) fn read_line(&mut self) -> String {
         match self.external_in.find('\n') {
             Some(i) => self.external_in.drain(..=i).collect(),
@@ -1091,8 +1067,8 @@ impl Runtime {
         }
     }
 
-    /// `StringOpSymbol` (concat / length / substr / comparisons): operate on string `NodeTerm::Na`
-    /// values, building a string (`str_sym`), a Nat (`nat`), or a Bool (`bool_`) result.
+    /// Reduce string concatenation, indexing, classification, and comparison operators over
+    /// `NodeTerm::Na` values, building string, Nat, or Bool results as required.
     #[allow(clippy::too_many_arguments)]
     fn reduce_string_op(
         &mut self,
@@ -1114,13 +1090,12 @@ impl Runtime {
                 v.extend_from_slice(&b);
                 Some(make_str(self, v))
             }
-            // `length : String -> Nat` — the **byte** count (Maude's Rope length).
+            // `length : String -> Nat` — the byte count.
             StrOp::Length => {
                 let len = self.as_str(kids[0])?.len();
                 self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(len as u64)))
             }
-            // `substr : String Nat Nat -> String` — a **byte** slice with skip/take clamping (start beyond
-            // the end ⇒ empty; overlong length ⇒ truncated), exactly like the char form but over bytes.
+            // `substr : String Nat Nat -> String` — a byte slice with skip/take clamping.
             StrOp::Substr => {
                 let nat = nat?;
                 let a = self.as_str(kids[0])?;
@@ -1140,7 +1115,7 @@ impl Runtime {
                     _ => None, // not a single byte
                 }
             }
-            // `char : Nat ~> Char` — the one-**byte** string for a code `0..=255` (256+ falls through: A2f).
+            // `char : Nat ~> Char` — the one-**byte** string for a code `0..=255`; 256+ falls through.
             StrOp::Char => {
                 let n = self.as_int(kids[0], nat?)?;
                 if n.is_negative() {
@@ -1152,9 +1127,9 @@ impl Runtime {
                 }
                 Some(make_str(self, vec![code as u8]))
             }
-            // `find` / `rfind : String String Nat -> FindResult` — C++ `std::string::find`/`rfind`
-            // semantics over the byte sequence (≡ char index for ASCII): first/last occurrence of `pat`
-            // starting at an index `>= start` (find) / `<= start` (rfind), else the `notFound` constant.
+            // `find` / `rfind : String String Nat -> FindResult` search the raw byte sequence:
+            // first/last occurrence of `pat` starting at an index `>= start` / `<= start`, or the
+            // `notFound` constant. Byte and character indices coincide for ASCII.
             StrOp::Find | StrOp::Rfind => {
                 let nat = nat?;
                 let (s, pat) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
@@ -1174,7 +1149,7 @@ impl Runtime {
                     None => Some(self.make_const(sig, not_found?)),
                 }
             }
-            // `upperCase` / `lowerCase` — ASCII case mapping (C `toupper`/`tolower`, byte-wise).
+            // `upperCase` / `lowerCase` map ASCII case byte by byte.
             StrOp::UpperCase => {
                 let s = self.as_str(kids[0])?;
                 Some(make_str(self, s.to_ascii_uppercase()))
@@ -1183,8 +1158,8 @@ impl Runtime {
                 let s = self.as_str(kids[0])?;
                 Some(make_str(self, s.to_ascii_lowercase()))
             }
-            // `isX : Char -> Bool` — the C `ctype` class of a single **byte** (else fall through). A byte
-            // ≥ 128 maps to a non-ASCII `char`, which every `is_ascii_*` check rejects (in no C-locale class).
+            // `isX : Char -> Bool` classifies a single byte and falls through for other strings.
+            // Bytes above 127 are outside every supported ASCII class.
             StrOp::IsClass(class) => {
                 let s = self.as_str(kids[0])?;
                 let b = match s.as_ref() {
@@ -1212,7 +1187,7 @@ impl Runtime {
                 let h = bool_?;
                 Some(self.make_const(sig, if res { h.true_ } else { h.false_ }))
             }
-            // `trim` / `trimStart` / `trimEnd : String -> String` — strip C-whitespace **bytes**.
+            // `trim` / `trimStart` / `trimEnd` strip ASCII whitespace bytes, including vertical tab.
             StrOp::Trim | StrOp::TrimStart | StrOp::TrimEnd => {
                 let s = self.as_str(kids[0])?;
                 let (mut lo, mut hi) = (0, s.len());
@@ -1230,7 +1205,7 @@ impl Runtime {
             }
             StrOp::Lt | StrOp::Le | StrOp::Gt | StrOp::Ge => {
                 let (a, b) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
-                // Maude's `Rope::compare`: signed-byte lexicographic (a high byte sorts before ASCII).
+                // Signed-byte lexicographic order places high bytes before ASCII.
                 let ord = crate::dag::rope_cmp(&a, &b);
                 let res = match op {
                     StrOp::Lt => ord.is_lt(),
@@ -1256,8 +1231,8 @@ impl Runtime {
         }
     }
 
-    /// `FloatOpSymbol` (arithmetic / negation / abs / sqrt / comparisons): operate on `f64` values,
-    /// building a float (`float_sym`) or a Bool (`bool_`) result via IEEE semantics.
+    /// Reduce floating-point arithmetic, functions, and comparisons over `f64`, building a float or
+    /// Bool result with IEEE semantics.
     fn reduce_float_op(
         &mut self,
         sig: &Signature,
@@ -1283,7 +1258,7 @@ impl Runtime {
             let h = bool_?;
             return Some(self.make_const(sig, if res { h.true_ } else { h.false_ }));
         }
-        // Arithmetic / functions → Float (IEEE `f64`, Maude's C `libm`).
+        // Arithmetic and functions use IEEE `f64`.
         let v = match op {
             FltOp::Neg => -a,
             FltOp::Abs => a.abs(),
@@ -1300,8 +1275,7 @@ impl Runtime {
             FltOp::Atan => a.atan(),
             _ => {
                 let b = self.as_float(kids[1])?;
-                // `/`/`rem` by zero is **undefined** in Maude — it does not reduce, even though IEEE
-                // would give ±inf (`1.0 / 0.0` stays `[Float]`, 0 rewrites).
+                // Division and remainder by zero are undefined and do not reduce.
                 if matches!(op, FltOp::Div | FltOp::Rem) && b == 0.0 {
                     return None;
                 }
@@ -1310,7 +1284,7 @@ impl Runtime {
                     FltOp::Sub => a - b,
                     FltOp::Mul => a * b,
                     FltOp::Div => a / b,
-                    FltOp::Rem => a % b, // C `fmod` (remainder takes the dividend's sign)
+                    FltOp::Rem => a % b, // The remainder keeps the dividend's sign.
                     FltOp::Pow => a.powf(b),
                     FltOp::Min => a.min(b),
                     FltOp::Max => a.max(b),
@@ -1319,21 +1293,19 @@ impl Runtime {
                 }
             }
         };
-        // NaN never reduces — a Maude Float value is never NaN (floatOpSymbol.cc gates every result on
-        // `!isNaN`): partial ops off their domain (`sqrt(-1.0)`, `log(-1.0)`, `asin(2.0)`) AND the
-        // indeterminate arithmetic forms (`Infinity - Infinity`, `Infinity * 0.0`, `Infinity / Infinity`,
-        // `Infinity rem 2.0`) all stay in the kind `[Float]`. (`log(0.0)` = -inf is *not* NaN, so it
-        // reduces; total ops keep inf results.)
+        // NaN never reduces. Partial operations outside their domain (`sqrt(-1.0)`, `log(-1.0)`,
+        // `asin(2.0)`) and indeterminate arithmetic (`Infinity - Infinity`, `Infinity * 0.0`,
+        // `Infinity / Infinity`, `Infinity rem 2.0`) stay in kind `[Float]`. `log(0.0)` is negative
+        // infinity rather than NaN and therefore reduces; total operations retain infinite results.
         if v.is_nan() {
             return None;
         }
         Some(make_f(self, v))
     }
 
-    /// `_/_` (Maude's `DivisionSymbol`): canonicalise `I / N` to lowest terms. Divide both by
-    /// `g = gcd(|I|, N)`: when the denominator becomes 1, reduce to the integer `I/g`; when `g > 1`,
-    /// rebuild the reduced rational. An already-canonical `I/N` (`g == 1`, `N > 1`) or a zero numerator
-    /// does not rewrite (`0/N` is the user equation `0/Q = 0`, not a kernel op).
+    /// Canonicalize `_/_` to lowest terms. Divide numerator and denominator by
+    /// `g = gcd(|I|, N)`; collapse denominator one to an integer, otherwise rebuild only when `g > 1`.
+    /// A zero numerator is handled by a user equation rather than this built-in.
     fn reduce_division(&mut self, sig: &Signature, id: DagId, nat: &NatHooks) -> Option<DagId> {
         let symbol = self.node(id).symbol();
         let kids: Vec<DagId> = self.node(id).children().collect();
@@ -1359,10 +1331,8 @@ impl Runtime {
     }
 }
 
-/// Maude's `CommutativeDecomposeEqualitySymbol::isEquationallyStable`: the symbol cannot disappear
-/// or change by instantiation (not a variable, no identity-collapse axiom), by equational rewriting
-/// (no equations indexed at it), or by built-in rewriting (`STANDARD` basic type — no [`SpecialOp`]
-/// and not a marker-class builtin).
+/// Whether a symbol is stable under instantiation, equations, and built-in rewriting: it is neither
+/// a variable nor identity-collapse symbol, has no indexed equations, and carries no special hook.
 fn equationally_stable(sig: &Signature, s: SymbolId) -> bool {
     let sym = sig.symbol(s);
     sym.class == SymbolClass::Standard
@@ -1371,10 +1341,9 @@ fn equationally_stable(sig: &Signature, s: SymbolId) -> bool {
         && !sig.has_equations(s)
 }
 
-/// A string's canonical Maude token name (`Token::ropeToPrefixNameCode`, `qid(String)`'s conversion):
-/// a run of whitespace/backquote characters becomes a single backquote separator before the next
-/// fragment, and each special char `( ) [ ] { } ,` is preceded by a backquote. `"a b"` and `` "a`b" ``
-/// both canonicalize to `` a`b ``, so the qids they build are identical.
+/// Canonicalize string bytes into a quoted-identifier token name. Runs of whitespace or backquotes
+/// become one backquote separator before the next fragment, and each special character
+/// `( ) [ ] { } ,` is backquote-escaped. `"a b"` and `` "a`b" `` both become `` a`b ``.
 fn normalize_qid_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut need_bq = false;
@@ -1396,18 +1365,18 @@ fn normalize_qid_name(s: &str) -> String {
     out
 }
 
-/// Whether `c` is C-locale whitespace (`isspace`: space, tab, newline, CR, vertical tab, form feed) —
-/// the trim ops' delimiter. Rust's `is_ascii_whitespace` omits the vertical tab, so spell it out.
+/// Whether `c` is one of the whitespace delimiters used by string trimming: space, tab, newline,
+/// carriage return, vertical tab, or form feed.
 fn is_c_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}')
 }
 
-/// Whether the character `c` is in the C `ctype` class `class` (STRING-OPS predicates), tested per byte in
-/// the C locale: a non-ASCII char (byte > 127) is in no class, which the `is_ascii_*` checks give for free.
+/// Whether `c` belongs to `class`. Classification is byte-oriented; non-ASCII bytes belong to no
+/// supported class.
 fn char_in_class(c: char, class: CharClass) -> bool {
     match class {
         CharClass::Control => c.is_ascii_control(),
-        CharClass::Printable => c == ' ' || c.is_ascii_graphic(), // C `isprint`: graphic or space
+        CharClass::Printable => c == ' ' || c.is_ascii_graphic(),
         CharClass::Space => is_c_space(c),
         CharClass::Blank => c == ' ' || c == '\t',
         CharClass::Graphic => c.is_ascii_graphic(),
@@ -1421,7 +1390,7 @@ fn char_in_class(c: char, class: CharClass) -> bool {
     }
 }
 
-/// A conversion base as a `u8` in 2..=36, or `None` (out of range / too large) — Maude's base argument.
+/// A conversion base as a `u8` in 2..=36, or `None` when out of range or too large.
 fn conv_base(n: Nat) -> Option<u8> {
     u8::try_from(n.to_u64()?)
         .ok()
@@ -1450,10 +1419,10 @@ fn exact_float_denominator_exponent(mag: f64) -> u32 {
     }
 }
 
-/// Decompose a float for `decFloat(f, prec)` into `(sign, digits, exp)` with value `sign · 0.digits ·
-/// 10^exp` (Maude's `DecFloat`). `sign` is 1 / -1 / 0; `prec > 0` rounds to that many significant digits;
-/// `prec == 0` gives the **exact** full decimal expansion (`|f| = num/2^k` ⇒ digits `num·5^k`, exp
-/// `len − k`) across the complete finite IEEE-754 range.
+/// Decompose `decFloat(f, prec)` into `(sign, digits, exp)` with value
+/// `sign · 0.digits · 10^exp`. `sign` is 1, -1, or 0; `prec > 0` rounds to that many significant
+/// digits, while `prec == 0` returns the exact finite decimal expansion
+/// (`|f| = num/2^k` gives digits `num·5^k` and exponent `len − k`).
 fn dec_float_parts(f: f64, prec: usize) -> Option<(i32, String, i64)> {
     if f == 0.0 {
         return Some((0, "0".repeat(prec.max(1)), 0));
@@ -1476,9 +1445,9 @@ fn dec_float_parts(f: f64, prec: usize) -> Option<(i32, String, i64)> {
     }
 }
 
-/// The n-th 32-bit output (0-indexed) of MT19937 seeded with 0 — Maude's `random(n)`. The generator is
-/// re-run from the seed each call (a pure function of `n`); conformance `n` is small. Standard MT19937
-/// constants (Matsumoto–Nishimura); the seed init is the 2002 `init_genrand`.
+/// Return the zero-indexed `n`th 32-bit output of MT19937 seeded with zero for `random(n)`.
+/// Each call restarts the generator, making the result a pure function of `n`; initialization uses
+/// the standard 2002 MT19937 seeding recurrence.
 fn mt19937_nth(n: u64) -> u32 {
     const N: usize = 624;
     const M: usize = 397;
@@ -1509,8 +1478,8 @@ fn mt19937_nth(n: u64) -> u32 {
     out
 }
 
-/// First index `>= start` where `needle` occurs in `hay` (C++ `std::string::find`). An empty needle
-/// matches at `start` (when in range); `npos` is `None`.
+/// First index `>= start` where `needle` occurs in `hay`. An empty needle matches at `start` when in
+/// range; absence is `None`.
 fn byte_find(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if needle.is_empty() {
         return (start <= hay.len()).then_some(start);
@@ -1521,8 +1490,8 @@ fn byte_find(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     (start..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// Last index `<= pos` where `needle` occurs in `hay` (C++ `std::string::rfind`). An empty needle matches
-/// at `min(pos, len)`; `npos` is `None`.
+/// Last index `<= pos` where `needle` occurs in `hay`. An empty needle matches at `min(pos, len)`;
+/// absence is `None`.
 fn byte_rfind(hay: &[u8], needle: &[u8], pos: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(pos.min(hay.len()));
@@ -1542,7 +1511,7 @@ fn acu_fold_first(op: NumOp, n: &Int, m: u32) -> Int {
         NumOp::Gcd | NumOp::Lcm | NumOp::Min | NumOp::Max => Int::from_nat(&n.magnitude()),
         // Bitwise: `xor` cancels in pairs (even multiplicity ⇒ 0); `&`/`|` are idempotent (m ⩾ 1 ⇒ n).
         // The value is kept **signed** (INT folds over two's complement; NAT operands are non-negative).
-        NumOp::Xor if m % 2 == 0 => Int::from_nat(&Nat::zero()),
+        NumOp::Xor if m.is_multiple_of(2) => Int::from_nat(&Nat::zero()),
         NumOp::Xor | NumOp::And | NumOp::Or => n.clone(),
         _ => unreachable!("non-ACU number op `{op:?}` in the ACU fold"),
     }
@@ -1559,7 +1528,7 @@ fn acu_fold(op: NumOp, acc: &Int, n: &Int, m: u32) -> Int {
         NumOp::Min => core::cmp::min(acc.clone(), n.clone()),
         NumOp::Max => core::cmp::max(acc.clone(), n.clone()),
         // Signed two's-complement bit folds; an even-multiplicity `xor` operand leaves `acc` unchanged.
-        NumOp::Xor if m % 2 == 0 => acc.clone(),
+        NumOp::Xor if m.is_multiple_of(2) => acc.clone(),
         NumOp::Xor => acc.bitxor(n),
         NumOp::And => acc.bitand(n),
         NumOp::Or => acc.bitor(n),

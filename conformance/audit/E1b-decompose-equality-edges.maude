@@ -1,4 +1,4 @@
-*** E1b-decompose-equality-edges — `.=.` stability edges, oracle-pinned:
+*** E1b-decompose-equality-edges — `.=.` stability edges, expected parity:
 *** builtin `s_` (SuccSymbol, non-STANDARD) does NOT decompose while a user `[iter]` op does; ops with
 *** an identity element are unstable (no decompose); float zeros normalize (-0.0 parses as 0.0, so
 *** `.=.` sees equal dags); `true`/`false` are marker-class (no decompose); free-ctor decompose

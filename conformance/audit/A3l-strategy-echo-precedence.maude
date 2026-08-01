@@ -1,5 +1,4 @@
-*** A3l-strategy-echo-precedence — TNK-021: command echo retains every precedence-critical strategy
-*** parenthesis. The emitted command must denote the parsed strategy rather than merely execute it once.
+*** Command echo preserves every parenthesis needed to retain strategy semantics.
 
 smod A3L-STRATEGY-ECHO is
   sort S .

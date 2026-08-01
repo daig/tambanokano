@@ -1,4 +1,4 @@
-*** U10-legacy-meta-unify — lifted from the reference suite (Meta/legacyMetaUnify.maude)
+*** Nat-family meta-unification signatures and result indices.
 *** PRELUDE
 set show timing off .
 set show advisories off .

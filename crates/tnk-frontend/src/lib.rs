@@ -1,12 +1,12 @@
 //! `tnk-frontend` — the tambanokano frontend.
 //!
-//! Turns `.maude` module text into `tnk-core` engine state (and back via the
-//! pretty-printer). A two-level pipeline: a fixed surface syntax (modules,
-//! declarations, commands) over a hand-written [`lex`]er, then a per-module
-//! **mixfix** grammar built from the signature and parsed by a plain Earley
-//! parser. The frontend is the **sole owner of surface syntax**
-//! (prec/gather/mixfix tokens) — `tnk-core` stores only semantics — so it
-//! records its own `SymbolSyntax` tables as it drives the kernel's constructor API.
+//! Parses module text into `tnk-core` engine state and renders engine terms through the
+//! pretty-printer. A two-level pipeline parses fixed surface syntax (modules,
+//! declarations, commands) with the hand-written [`lex`]er, then parses terms with a
+//! per-module **mixfix** grammar and a plain Earley parser. The frontend owns surface
+//! syntax (precedence, gather bounds, and mixfix tokens), while `tnk-core` stores the
+//! executable semantics. Frontend `SymbolSyntax` tables retain the information needed
+//! by the grammar and pretty-printer.
 //!
 
 pub mod build_term;

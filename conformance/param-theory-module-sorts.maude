@@ -1,8 +1,8 @@
-*** B-iv / Axis-A4: a parameter theory that imports a MODULE. The theory ORD protects B (a module
+*** A parameter theory that imports a module. Theory ORD protects B (a module
 *** with sort Bool) and includes TRIV (sort Elt). When ORD is used as a parameter X, the parameter
 *** copy must qualify only the THEORY-declared sort (Elt -> X$Elt) and KEEP the module-declared sort
 *** Bool unchanged -- otherwise the body's "-> Bool" references a renamed X$Bool that does not exist.
-*** The instantiation ToNN maps Elt -> N and cmp -> le. Byte-identical to the binary.
+*** The instantiation ToNN maps Elt -> N and cmp -> le.
 fth TRIV is sort Elt . endfth
 
 fmod B is

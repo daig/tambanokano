@@ -1,7 +1,6 @@
-*** Tier 2 conformance: the built-in data types + leaf special ops, extracted verbatim from
-*** Maude 3's prelude.maude. Oracle: the same modules in `~/Downloads/Maude-3/maude`. Reduces use
-*** the `in <MODULE> :` qualifier so one fixture covers INT/RAT/FLOAT/STRING/QID/CONVERSION/etc.
-*** NOTE: byte-identical to the reference (values, sorts, rewrite counts) — see prelude_tier2_* tests.
+*** Tier 2 conformance: the built-in data types + leaf special ops from the Maude prelude.
+*** Reduces use the `in <MODULE> :` qualifier so one fixture covers
+*** INT/RAT/FLOAT/STRING/QID/CONVERSION/etc. Values, sorts, and rewrite counts match expected parity.
 
 fmod TRUTH-VALUE is
   sort Bool .

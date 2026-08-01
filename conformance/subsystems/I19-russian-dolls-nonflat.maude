@@ -1,5 +1,4 @@
-*** I19-russian-dolls-nonflat — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/russianDollsNonFlat.maude; oracle verified 2026-07-23.
+*** I19-russian-dolls-nonflat
 *** PRELUDE
 set show timing off .
 set show advisories off .

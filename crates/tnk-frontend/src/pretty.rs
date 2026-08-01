@@ -1,14 +1,12 @@
 //! The pretty-printer: a reduced `DagNode` → surface text. Two products share one core walk:
 //! - [`print_raw`] — a **round-trippable** plain rendering (`parse∘print = id`): emits forms our parser
 //!   reads back (decimal numerals, compact `f^N(t)` for iter counts ≥ 2, `- 3` spaced for negation).
-//! - [`print_pretty`] (B4.6c) — a **Maude-faithful** rendering with optional ANSI syntax coloring, for
-//!   interactive use (and, uncolored, for the textual diff against the reference binary).
+//! - [`print_pretty`] — canonical interactive rendering with optional ANSI syntax coloring.
 //!
-//! The walk is the inverse of the B4.3 grammar + B4.4 parser: parenthesization is the exact inverse of the
-//! Earley prec/gather gate — a subterm of precedence `prec` is wrapped iff the position's gather bound
-//! `required_prec < prec` (plus Maude's `LEFT_BARE`/`RIGHT_BARE` adjacency "capture" cases). Ported from
-//! `Mixfix/dagNodePrint.cc::prettyPrint`. Reads only the frontend's [`SymbolSyntax`] tables + the public
-//! kernel accessors (`DagNode::{repr,symbol,children}`).
+//! The walk is the inverse of the per-module mixfix grammar and parser: parenthesization inverts the
+//! Earley prec/gather gate. A subterm of precedence `prec` is wrapped iff the position's gather bound
+//! satisfies `required_prec < prec`, with `LEFT_BARE`/`RIGHT_BARE` adjacency capture. The implementation
+//! reads only [`SymbolSyntax`] tables and public kernel accessors.
 
 use crate::grammar::{PREFIX_GATHER, prec_gather};
 use crate::lex::{Frag, Interner, Sym, tokenize};
@@ -26,9 +24,8 @@ use tnk_core::term::Term;
 /// (`MAX_PREC = 127`), so `required_prec < prec` and `capture <= gather` never fire against it.
 const UNBOUNDED: u32 = u32::MAX;
 
-/// An adjacency-capture context (Maude's `leftCapture`/`rightCapture` + their component): the precedence
-/// of the token abutting a subterm on one side, and the kind that token belongs to. `NONE` = no abutting
-/// token (a top-level or parenthesized position).
+/// Adjacency-capture context: precedence and kind of the token abutting one side of a subterm.
+/// `NONE` represents a top-level or parenthesized position.
 #[derive(Clone, Copy)]
 struct Cap {
     prec: u32,
@@ -39,8 +36,8 @@ const NONE_CAP: Cap = Cap {
     kind: None,
 };
 
-/// The syntactic category of an emitted token. The raw printer ignores it; the pretty printer (B4.6c)
-/// colors by it.
+/// The syntactic category of an emitted token. The raw printer ignores it; the pretty printer uses it
+/// for coloring.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cat {
     /// An operator name fragment / prefix name.
@@ -97,9 +94,8 @@ pub fn print_raw(m: &BuiltModule, i: &Interner, d: DagId) -> String {
     .render(d)
 }
 
-/// Render `d` for interactive display: Maude-faithful forms (`s_^n(0)`, `-3`) with optional ANSI syntax
-/// coloring. With `color = false` this is the Maude-faithful plain rendering used to diff against the
-/// reference binary's printed output.
+/// Render `d` for interactive display using compact iterations and negated numerals, with optional
+/// ANSI syntax coloring.
 pub fn print_pretty(m: &BuiltModule, i: &Interner, d: DagId, color: bool) -> String {
     Printer {
         m,
@@ -183,10 +179,8 @@ pub fn print_qid_tokens_with_options(
     result
 }
 
-/// Render a static [`Term`] (an equation/membership LHS/RHS pattern, with variables) — the inverse of the
-/// same mixfix grammar, sharing the DAG printer's prec/gather walk (Maude's `MixfixModule::prettyPrint`
-/// vs `dagNodePrint` split). A `Term::Var` prints as its name from `vars` (index → name, the statement's
-/// [`VarIndex`](crate::build_term::VarIndex) order); used by the trace to render `eq lhs = rhs .`.
+/// Render a static [`Term`] through the same precedence/gather walk as DAG rendering. Variables use
+/// statement-local names from `vars`; traces use this for equation and membership bodies.
 pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], color: bool) -> String {
     Printer {
         m,
@@ -199,10 +193,10 @@ pub fn print_term(m: &BuiltModule, i: &Interner, t: &Term, vars: &[String], colo
     .print_term_top(t)
 }
 
-/// The shared printer. `m`/`i`/flags are immutable; the output buffer is threaded as a `&mut String`
-/// parameter so the recursive walk can read `self` freely while appending. `faithful` selects
-/// Maude-faithful leaf forms over round-trippable ones; `color` enables ANSI syntax coloring; `vars`
-/// names the variables for a [`Term`] walk (empty for the DAG walk).
+/// The shared printer. `m`, `i`, and flags are immutable; recursive layout receives the output buffer
+/// separately so it can read `self` while appending. One mode selects compact interactive leaf forms
+/// instead of parser-oriented forms; `color` enables ANSI syntax coloring; `vars` supplies variable names
+/// for a [`Term`] walk and is empty for a DAG walk.
 struct Printer<'a> {
     m: &'a BuiltModule,
     i: &'a Interner,
@@ -227,11 +221,10 @@ enum Item<'t> {
     },
 }
 
-/// One pending unit of output on the explicit work-stack. The recursive descent of the former
-/// `print`/`print_app`/… is replaced by this stack, so a very deep subject — e.g. `s^17711(0)` from
-/// `fib(22)`, a plain-`ctor` tower — can't overflow the *call* stack (the same iterative treatment A1 gave
-/// `reduce`/`deep_equal`; the depth now lives in this heap `Vec`). `Text` is a colored emission; `Space` is
-/// a raw inter-token space (Maude never colors whitespace); `Visit` is expanded by [`Printer::layout`].
+/// One pending unit of output on the explicit work stack. Replacing recursive `print`/`print_app` descent
+/// with this stack means a deep subject such as `fib(22)`'s `s^17711(0)` tower cannot overflow the call
+/// stack. `Text` is colored output, `Space` is raw inter-token space, and `Visit` is expanded by
+/// [`Printer::layout`].
 enum Work<'a, 't> {
     Text {
         cat: Cat,
@@ -281,14 +274,13 @@ impl<'a> Printer<'a> {
         out
     }
 
-    /// Drive the explicit work-stack: pop a unit and emit text / a space, or expand a node into more work.
-    /// [`layout`](Self::layout) yields a node's pieces in forward order; they are pushed *reversed* so a
-    /// LIFO `pop` replays them — and, transitively, their children — in emission order. The recursion depth
-    /// of the former walk now lives in this heap `Vec`, so an arbitrarily deep subject can't overflow the
-    /// call stack.
+    /// Drive the explicit work stack: pop a unit and emit text or expand a node into more work.
+    /// [`layout`](Self::layout) yields a node's pieces in forward order; pushing them in reverse lets a
+    /// LIFO `pop` replay them and their descendants in emission order. Keeping traversal state in this
+    /// heap `Vec` makes arbitrarily deep subjects stack-safe.
     fn run_stack<'t>(&self, out: &mut String, start: Item<'t>) {
-        // The top-level term's range is not known from any context (Maude prints it with `rangeKnown`
-        // false), so an ambiguous top constant is disambiguated.
+        // No context supplies the top-level term's range, so an ambiguous top-level constant receives a
+        // sort qualifier.
         let mut stack: Vec<Work<'a, 't>> = vec![Work::Visit {
             item: start,
             req_prec: UNBOUNDED,
@@ -337,8 +329,8 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// The META `QidList` counterpart of [`run_stack`](Self::run_stack): default spaces stay in text
-    /// chunks for the lexer to discard, while explicit format controls become first-class Qids.
+    /// The META `QidList` variant of [`run_stack`](Self::run_stack): default spaces stay in text chunks
+    /// for the lexer to discard, while explicit format controls become first-class Qids.
     fn run_qid_stack<'t>(&self, start: Item<'t>) -> Vec<QidChunk> {
         let mut stack: Vec<Work<'a, 't>> = vec![Work::Visit {
             item: start,
@@ -400,8 +392,9 @@ impl<'a> Printer<'a> {
         chunks
     }
 
-    /// Lay out ONE node into its forward piece sequence — emitting `Text`/`Space` and pushing each child as
-    /// a `Visit` (no recursion into children). Ports the dispatch of the former `print`/`print_term`.
+    /// Lay out one node into its forward piece sequence, emitting `Text`/`Space` and pushing each child as
+    /// a `Visit` without recursing into children.
+    #[allow(clippy::too_many_arguments)]
     fn layout<'t>(
         &self,
         item: Item<'t>,
@@ -425,17 +418,17 @@ impl<'a> Printer<'a> {
                 });
             }
             Item::Term(Term::Op { symbol, args }) => {
-                // A `nat_succ` tower over `nat_zero` folds to its decimal — `f(2)`, not `f(s s 0)`.
-                // Static terms may mix ordinary unary `Op` layers with compact `Iter` runs; Maude folds
-                // both when printing.
+                // A `nat_succ` tower over `nat_zero` folds to decimal form: `f(2)`, not `f(s s 0)`.
+                // Static terms may mix ordinary unary `Op` layers with compact `Iter` runs; both
+                // contribute to the rendered decimal.
                 if let Some(dec) = self.term_nat_decimal(*symbol, args) {
                     out.push(Work::Text {
                         cat: Cat::Lit,
                         text: Cow::Owned(dec),
                     });
                 } else {
-                    // A `Term` (pattern, in a trace) has no inferred sort to disambiguate with, so its
-                    // children keep `range_known` true (Maude does not disambiguate inside statement printing).
+                    // A trace pattern has no inferred sort for disambiguation, so its children retain
+                    // `range_known = true` and are not qualified independently.
                     let children: Vec<Item> = args.iter().map(Item::Term).collect();
                     self.layout_app(*symbol, &children, req_prec, lcap, rcap, true, out);
                 }
@@ -451,7 +444,7 @@ impl<'a> Printer<'a> {
                     self.layout_iter(*symbol, &count, Item::Term(arg), req_prec, lcap, rcap, out);
                 }
             }
-            // A built-in literal renders exactly as its DAG leaf would.
+            // A built-in `Term` literal uses the DAG leaf renderer.
             Item::Term(Term::Na { symbol, value }) => {
                 let text = match value {
                     NaValue::Str(s) => render_string(s),
@@ -485,9 +478,10 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Lay out one DAG node: a leaf (numeral / string / qid / float), an `iter`, or an application (with the
-    /// faithful minus/rational special cases). The `&node` borrow is released — owned leaf data, then a
-    /// freshly-fetched child list — before the `&self` layout calls.
+    /// Lay out one DAG node: a leaf (numeral, string, qid, or float), an `iter`, or an application,
+    /// including compact interactive minus and rational forms. Node borrows are released before child
+    /// layout by extracting owned leaf data and then fetching a fresh child list.
+    #[allow(clippy::too_many_arguments)]
     fn layout_dag<'t>(
         &self,
         d: DagId,
@@ -520,9 +514,8 @@ impl<'a> Printer<'a> {
                     text: self.smt_number_text(symbol, number),
                     constant: true,
                 }),
-                // A genuine variable leaf (symbolic-engine DAGs): `base:Sort`, the form Maude
-                // prints for a `VariableDagNode` (only fresh `#n`/`%n`/`@n` variables survive into
-                // printed unifiers, and those always print with their sort).
+                // A symbolic variable leaf renders as `base:Sort`. Only generated `#n`, `%n`, and `@n`
+                // variables survive into printed unifiers, and each carries its sort.
                 NodeRepr::Var { name } => {
                     let base = node
                         .variable_index()
@@ -552,9 +545,9 @@ impl<'a> Printer<'a> {
                 self.layout_literal(d, text, constant && self.options.with_sorts, out);
             }
             Some(Leaf::Iter { count, arg }) => {
-                // A Nat numeral is a pseudo literal. In an unknown-range context Maude qualifies it only
-                // if two kinds provide integer syntax (for example NAT plus SMT integers), or a nullary
-                // user operator has the same numeric spelling.
+                // A natural numeral is a pseudo-literal. In an unknown-range context it needs a qualifier
+                // only when multiple kinds provide integer syntax or a nullary user operator has the same
+                // numeric spelling.
                 let need_disambig = self.options.with_sorts
                     || (!top_level
                         && !range_known
@@ -574,8 +567,8 @@ impl<'a> Printer<'a> {
             }
             None => {
                 let children: Vec<DagId> = self.m.engine.node(d).children().collect();
-                // Maude-faithful negation: `-(s^n(0))` → the compact `-n` (Maude's `handleMinus`). The raw
-                // printer instead lets the normal `- arg` mixfix handle it (which re-parses).
+                // Interactive mode prints a negated positive numeral compactly; raw mode uses normal mixfix
+                // negation so its output reparses.
                 if self.faithful
                     && self.options.number
                     && self.m.minus_sym == Some(symbol)
@@ -585,9 +578,8 @@ impl<'a> Printer<'a> {
                     self.layout_literal(d, format!("-{dec}"), self.options.with_sorts, out);
                     return;
                 }
-                // Maude-faithful rational: a `DivisionSymbol` node over integer numerals (Maude's `isRat`)
-                // → the compact `num/den`. A zero numerator is the `Zero` constant, not a numeral, so
-                // `0 / 5` falls through to the generic mixfix spacing — matching the reference binary.
+                // A rational division node over integer numerals prints compactly as `num/den`. Zero
+                // uses a distinct constant rather than a numeral, so `0 / 5` keeps generic spacing.
                 if self.options.rational
                     && self.m.division_sym == Some(symbol)
                     && children.len() == 2
@@ -596,9 +588,8 @@ impl<'a> Printer<'a> {
                     self.layout_literal(d, rat, self.options.with_sorts, out);
                     return;
                 }
-                // Disambiguation (Maude `dagNodePrint.cc`): an ad-hoc-overloaded symbol whose range is not
-                // determined by context prints `(t).Sort` so the output round-trips. `with-sorts` forces
-                // the same qualification for every constant.
+                // An ad-hoc-overloaded symbol whose range is not determined by context receives a
+                // `(term).Sort` qualification so output round-trips. `with-sorts` qualifies all constants.
                 let need_disambig = (!range_known && self.ambiguous(symbol))
                     || (self.options.with_sorts && children.is_empty());
                 let arg_rk = self.range_of_args_known(symbol, range_known, need_disambig);
@@ -715,11 +706,8 @@ impl<'a> Printer<'a> {
         };
         let has_hole = syn.frags.iter().any(|f| matches!(f, Frag::Hole));
         if !has_hole {
-            // Constant (a value → `Lit`) or prefix operator (`name(a, b, …)` → `Op` name). The name can be
-            // several fragments when it lexes with punctuation (`[]`, `{}`, `<>` — split on `[`/`]`/…) or
-            // with an inter-token blank (a multi-token name `a b`), so emit them all with Maude's default
-            // spacing (a space before each fragment except at the start, before a `,`, and around brackets)
-            // — `[]` stays glued, `a b` keeps its blank.
+            // Constants and prefix operators can span multiple lexical fragments. Emit default spacing:
+            // preserve glued brackets and inter-token blanks in names.
             let cat = if children.is_empty() {
                 Cat::Lit
             } else {
@@ -758,7 +746,7 @@ impl<'a> Printer<'a> {
                 text: Cow::Borrowed("("),
             });
         }
-        // A surrounding paren blocks inherited capture (Maude inherits left/right capture only unparenthesized).
+        // Parentheses block inherited left and right adjacency capture.
         let (lcap, rcap) = if paren {
             (NONE_CAP, NONE_CAP)
         } else {
@@ -879,10 +867,9 @@ impl<'a> Printer<'a> {
             return;
         }
 
-        // Maude's mixfix spacing (`prettyPrint.cc::printTokens`). Default (no `format` attribute): a space
-        // precedes each fragment EXCEPT at the very start, before a `,`, around brackets `()[]{}`, and
-        // between an ordinary literal label and its following `:` (`result:_` prints `result: value`).
-        // Colons between holes remain spaced, so the type constructor `_ : _` is unaffected.
+        // Default mixfix spacing inserts a space before each fragment except at the start, before a
+        // comma, around brackets, or between a literal label and its following colon. Colons between
+        // argument holes remain spaced.
         // Thus `<_,_>` prints `< M, N >`, not `< M , N >`. With a
         // `format` attribute (the META result/declaration constructors — `_<-_`, `rl_=>_[_].`, …): one
         // directive word per **gap** (before each fragment, plus a trailing one), where `d` is exactly that
@@ -968,9 +955,8 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// The adjacency-capture contexts for the `k`-th argument hole (Maude `dagNodePrint.cc:435-458`): a
-    /// bare end abuts this op's token (`rc`/`lc` = this op's precedence + the arg's kind), and the outer
-    /// capture flows through the opposite side.
+    /// Adjacency-capture contexts for argument hole `k`: a bare end abuts this operator's token, and
+    /// outer capture flows through the opposite side.
     #[allow(clippy::too_many_arguments)]
     fn hole_caps(
         &self,
@@ -1002,10 +988,8 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Whether `symbol` must be disambiguated when its range is not known from context (Maude's
-    /// `ambiguous`): another symbol shares its name *and* domain kinds, so the argument kinds alone do not
-    /// select it. (Maude additionally disambiguates built-in literal lookalikes via the `PSEUDO` flags —
-    /// a separate concern not needed by hand-rolled overloading.)
+    /// Whether `symbol` needs a range qualifier when context does not provide one: another symbol shares
+    /// its name and domain kinds, so arguments alone cannot select the declaration.
     fn ambiguous(&self, symbol: SymbolId) -> bool {
         self.m
             .overload
@@ -1013,9 +997,8 @@ impl<'a> Printer<'a> {
             .is_some_and(|f| f & crate::sig::syntax::OVL_DOMAIN != 0)
     }
 
-    /// Whether the arguments of `symbol` have a known range (Maude's `rangeOfArgumentsKnown`): true unless
-    /// `symbol` is ad-hoc overloaded and neither the context's range nor a just-emitted disambiguation pins
-    /// the operator — in which case the arguments must each be unambiguous, so their range is unknown.
+    /// Whether argument ranges are known. Ad-hoc overloading leaves them unknown unless context or an
+    /// emitted range qualifier pins the operator.
     fn range_of_args_known(
         &self,
         symbol: SymbolId,
@@ -1030,8 +1013,7 @@ impl<'a> Printer<'a> {
         f & OVL_RANGE == 0 && (range_known || range_disambiguated)
     }
 
-    /// Maude's parent-side capture test: a bare end of this op would be captured by an abutting token of
-    /// the same kind whose precedence the end's gather bound admits.
+    /// Whether an abutting same-kind token can capture a bare operator end under its gather bound.
     fn captures(&self, syn: &SymbolSyntax, gather: &[u32], lcap: Cap, rcap: Cap) -> bool {
         let sorts = self.m.engine.sorts();
         let nr_args = syn.domain.len();
@@ -1043,10 +1025,9 @@ impl<'a> Printer<'a> {
                 && rcap.kind == Some(sorts.kind_of(syn.domain[nr_args - 1])))
     }
 
-    /// Lay out `symbol^count(arg)`. A SuccSymbol numeral over the zero base becomes its decimal;
-    /// every count ≥ 2 uses Maude's compact `f^N(arg)` name in both printer modes, so rendering a
-    /// million-count iter node is independent of `N`. Count 1 uses the operator's ordinary syntax:
-    /// a mixfix successor prints `s arg`, while a genuine prefix operator prints `g(arg)`.
+    /// Lay out `symbol^count(arg)`. A successor over zero becomes decimal. Counts of at least two use
+    /// compact `f^N(arg)` form; count one uses the operator's ordinary mixfix or prefix syntax.
+    #[allow(clippy::too_many_arguments)]
     fn layout_iter<'t>(
         &self,
         symbol: SymbolId,
@@ -1126,8 +1107,8 @@ impl<'a> Printer<'a> {
         });
     }
 
-    /// Nonzero Nat pseudo literals in META command arguments retain their source-style bare spelling.
-    /// Zero is an ordinary constant and still receives Maude's `(0).Zero` disambiguation when required.
+    /// Nonzero Nat literals in META command arguments remain bare. Zero is an ordinary constant and
+    /// receives `(0).Zero` disambiguation when required.
     fn is_nonzero_nat_item(&self, item: Item<'_>) -> bool {
         match item {
             Item::Dag(d) => {
@@ -1199,18 +1180,15 @@ impl<'a> Printer<'a> {
         number.to_maude(kind)
     }
 
-    /// The compact `num/den` text of a `DivisionSymbol` rational special constant (Maude's
-    /// `DivisionSymbol::isRat` + `getRat`): the denominator is a positive natural numeral, and the
-    /// numerator a positive numeral or a negated one. `None` (→ generic mixfix) otherwise — notably for a
-    /// `Zero` numerator (`0 / 5`), which Maude prints spaced.
+    /// Return compact `num/den` text when the denominator is a positive numeral and the numerator is a
+    /// positive or negated numeral. Zero numerators fall back to generic mixfix rendering.
     fn rational_text(&self, num: DagId, den: DagId) -> Option<String> {
         let d = self.pos_nat_decimal(den)?;
         let n = self.signed_numeral(num)?;
         Some(format!("{n}/{d}"))
     }
 
-    /// The decimal of a strictly-positive natural numeral `s^count(0)` (count ≥ 1); `None` for the `Zero`
-    /// constant or any non-numeral (Maude's `SuccSymbol::isNat` on a nonzero value).
+    /// Return the decimal value of a strictly positive `s^count(0)` numeral.
     fn pos_nat_decimal(&self, d: DagId) -> Option<String> {
         let node = self.m.engine.node(d);
         match node.repr() {
@@ -1311,7 +1289,7 @@ fn emit_gap<'a, 't>(word: Option<&str>, default_space: bool, out: &mut Vec<Work<
             'i' => out.push(Work::Indent),
             '+' => out.push(Work::IndentDelta(1)),
             '-' => out.push(Work::IndentDelta(-1)),
-            _ => {} // `d` with no default space, or an unmodelled directive (filtered upstream)
+            _ => {} // `d` with no default space, or a directive excluded by format selection
         }
     }
 }
@@ -1320,8 +1298,7 @@ fn emit_gap<'a, 't>(word: Option<&str>, default_space: bool, out: &mut Vec<Work<
 const ANSI_RESET: &str = "\x1b[0m";
 
 impl Cat {
-    /// The ANSI SGR color for this category (a conventional syntax-highlighting palette; Maude's own
-    /// scheme colors by *reduction status* instead — a future alternative mode).
+    /// ANSI SGR color for the terminal syntax-highlighting palette.
     fn ansi(self) -> &'static str {
         match self {
             Cat::Op => "\x1b[33m",    // operators: yellow
@@ -1343,8 +1320,7 @@ fn flush_qid_text(chunks: &mut Vec<QidChunk>, text: &mut String) {
     }
 }
 
-/// Render a quoted identifier with its leading `'` and Maude's token-name escapes. Raw punctuation
-/// gets a backtick; punctuation already carrying its canonical backtick is not escaped twice.
+/// Render a quoted identifier with a leading `'` and canonical token-name escapes.
 fn render_qid(q: &str) -> String {
     let mut out = String::with_capacity(q.len() + 1);
     out.push('\'');
@@ -1379,10 +1355,8 @@ fn render_qid(q: &str) -> String {
     out
 }
 
-/// A string constant (raw bytes) rendered with surrounding quotes and Maude's escaping (`Token::
-/// ropeToString`): a printable ASCII byte (0x20–0x7E) verbatim (with `"` and `\` backslash-escaped), the
-/// named control escapes `\a \b \f \n \r \t \v`, and EVERY other byte (0x00–0x06, 0x0E–0x1F, 0x7F, and
-/// all of 0x80–0xFF) as a 3-digit octal `\ooo`. The output is pure ASCII — no raw control/high bytes.
+/// Render raw string bytes in quotes. Printable ASCII is emitted directly except for quote and
+/// backslash; named control characters use short escapes, and every other byte uses three-digit octal.
 pub fn render_string(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1411,8 +1385,7 @@ pub fn render_string(s: &[u8]) -> String {
     out
 }
 
-/// Render a float exactly as Maude's `doubleToString` — delegated to the kernel so the pretty-printer and
-/// the `string(Float)` conversion render identically (see [`tnk_core::double_to_string`]).
+/// Render a float through the kernel's canonical formatter, shared with `string(Float)`.
 pub fn render_float(f: f64) -> String {
     tnk_core::double_to_string(f)
 }
@@ -1424,8 +1397,7 @@ mod tests {
     use crate::load::{load_source, parse_command_term, reduce_command};
     use crate::surface::ast::Command;
 
-    /// Round-trip: every milestone command's reduced result, raw-printed and re-reduced, is `deep_equal`
-    /// to the original result. Drives the existing load/reduce harness.
+    /// Round-trip every fixture command's reduced result through raw printing and reparsing.
     fn round_trips(src: &str) {
         let mut loaded = load_source(src).expect("load");
         let cmds: Vec<(usize, Vec<crate::lex::Token>)> = loaded
@@ -1433,7 +1405,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term, .. } => (*m, term.clone()),
-                _ => panic!("milestone uses only reduce"),
+                _ => panic!("fixture uses only reduce"),
             })
             .collect();
         for (idx, (m, term)) in cmds.iter().enumerate() {
@@ -1484,8 +1456,7 @@ mod tests {
         round_trips(file!("int.maude"));
     }
 
-    // B4.5a: round-trip the broader loadable set — exercises the raw printer on `<_,_>` / `_;_` / ACU
-    // residues / prefix ops / membership-lowered sorts, beyond the milestone's forms.
+    // Exercise raw printing for object syntax, ACU residues, prefix operators, and lowered memberships.
     #[test]
     fn peano_round_trips() {
         round_trips(file!("peano.maude"));
@@ -1511,9 +1482,7 @@ mod tests {
         round_trips(file!("overload.maude"));
     }
 
-    /// Maude-faithful (uncolored) rendering of each command's result equals the reference binary's printed
-    /// term (`~/Downloads/Maude-3/maude -no-banner conformance/<f>.maude < /dev/null`). A strictly stronger
-    /// check than the B4.4 conformance: it pins the printed form exactly, incl. ACU element *order*.
+    /// Assert exact uncolored result rendering, including ACU order.
     fn renders_as(src: &str, expected: &[&str]) {
         let mut loaded = load_source(src).expect("load");
         let cmds: Vec<(usize, Vec<crate::lex::Token>)> = loaded
@@ -1521,7 +1490,7 @@ mod tests {
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term, .. } => (*m, term.clone()),
-                _ => panic!("milestone uses only reduce"),
+                _ => panic!("fixture uses only reduce"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
@@ -1536,34 +1505,28 @@ mod tests {
     }
 
     #[test]
-    fn iter_renders_like_binary() {
+    fn iter_results_render_expected_forms() {
         renders_as(file!("iter.maude"), &["0", "s 0", "s 0", "s 0", "s 0"]);
     }
-    /// An ad-hoc-overloaded constant (`nil` in two kinds) prints disambiguated as `(nil).Sort` at top
-    /// level so it round-trips; a unique constant (`a`) stays bare. Byte-identical to the reference.
+    /// An ad-hoc-overloaded constant (`nil` in two kinds) renders as `(nil).Sort` at top level so it can
+    /// be reparsed, while a unique constant (`a`) remains bare.
     #[test]
-    fn disambiguated_constant_renders_like_binary() {
+    fn disambiguates_top_level_overloaded_constants() {
         renders_as(
             file!("correctness-disambig.maude"),
             &["(nil).A", "(nil).B", "a"],
         );
     }
     #[test]
-    fn bool_renders_like_binary() {
+    fn bool_results_render_expected_forms() {
         renders_as(
             file!("bool.maude"),
             &["tt", "ff", "tt", "0", "s_^2(0)", "0"],
         );
     }
     #[test]
-    fn nat_renders_like_binary() {
-        // Every command matches the binary, including the last: the residue prints `x + 5`, exactly as
-        // the reference does. The kernel's `dag_compare` now orders ACU elements by Maude's
-        // `Symbol::orderInt` key — **arity first** (`orderInt = symbolCount | (arity << 24)`,
-        // `Interface/symbol.{hh,cc}`), then creation index — so the nullary `x` sorts before the unary
-        // `s^5(0)` (`5`), giving `x + 5`. (Before that fix it printed `5 + x`, a documented cosmetic
-        // discrepancy; aligning the order made the object-configuration soups byte-identical too,
-        // Pillar 2.5-A.)
+    fn nat_results_render_expected_forms() {
+        // ACU order places the nullary `x` before the unary numeral, yielding the residue `x + 5`.
         renders_as(
             file!("nat.maude"),
             &[
@@ -1572,7 +1535,7 @@ mod tests {
         );
     }
     #[test]
-    fn int_renders_like_binary() {
+    fn int_results_render_expected_forms() {
         renders_as(
             file!("int.maude"),
             &[
@@ -1581,7 +1544,7 @@ mod tests {
         );
     }
 
-    /// The colored pretty form carries ANSI escapes and strips back to the plain Maude-faithful form.
+    /// The colored interactive form contains ANSI escapes and strips to the uncolored form.
     #[test]
     fn colored_strips_to_plain() {
         let mut loaded = load_source(file!("nat.maude")).expect("load");
@@ -1626,8 +1589,8 @@ mod tests {
         out
     }
 
-    /// The Term printer renders a pattern (variables + prefix/mixfix ops) byte-identically to the DAG
-    /// printer's mixfix layout — the basis for the trace's `eq lhs = rhs .` line.
+    /// The `Term` printer uses the DAG printer's mixfix layout for patterns containing variables and
+    /// prefix or mixfix operators. Trace rendering uses this path for `eq lhs = rhs .`.
     #[test]
     fn term_printer_renders_patterns() {
         let loaded = load_source(

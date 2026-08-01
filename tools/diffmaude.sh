@@ -13,22 +13,18 @@
 #
 # Oracle:  MAUDE_LIB=$ORACLE_LIB maude -no-banner -no-advise <fixture> </dev/null
 # tnk:     target/release/tnk-repl
-#   Post-C6c (TNK_STANDING_PRELUDE=1, the default since the C6c fix landed):
-#   tnk is invoked directly with MAUDE_LIB=$ORACLE_LIB -no-banner; fixtures
-#   WITHOUT the `*** PRELUDE` marker get -no-prelude (self-contained), marker'd
-#   fixtures run on the standing prelude — symmetrical with the oracle.
-#   Pre-C6c (TNK_STANDING_PRELUDE=0, kept for archaeology): a marker'd fixture
-#   gets $ORACLE_LIB/prelude.maude concatenated in front on the tnk side.
+#   Fixtures without `*** PRELUDE` run with `-no-prelude`; marked fixtures use the standing prelude,
+#   matching the oracle environment.
 #
 # Normalization (exact — NOTHING else may be stripped):
 #   - `====…` separator lines
 #   - the tnk banner line, `Bye.`, `Maude>` prompts
 #   - timing-only text: the tail of `rewrites: N in …` / `states: N rewrites: M in …` lines
 #     (counts stay), and the standalone `Decision time:` line
-#   - diagnostic bodies are deliberately OUT OF parity (`DIAGNOSTIC_PARITY=ignore`):
+#   - diagnostic bodies are deliberately OUT OF parity:
 #     `Warning:` / `Advisory:` blocks and symmetric tnk `warning:` / `error:` / `parse error:` /
 #     `error in module` blocks are stripped through the next recognizable output line.
-#     S1 parity still includes incompleteness/exhaustion result forms; warning prose is not contractual.
+#     Incompleteness and exhaustion result forms remain contractual; warning prose does not.
 #   Everything else — echoes, result/Solution lines, sorts, counts, bindings,
 #   traces — compares byte-exact.
 
@@ -38,12 +34,19 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # Companion libs: GPLv2 stock files + MIT tnk facades. External oracle prelude stays last so
 # `prelude.maude` resolves from the Maude install while `load smt` etc. hit the bundled copies.
 TNK_SHARE_LIB=${TNK_SHARE_LIB:-$ROOT/share/maude-gpl:$ROOT/share/tnk}
-ORACLE_LIB=${ORACLE_LIB:-$HOME/code/maude-lang/maude/src/Main}
+ORACLE_LIB=${ORACLE_LIB:-}
+if [ -z "$ORACLE_LIB" ] && [ -n "${MAUDE_LIB:-}" ]; then
+  IFS=: read -r -a maude_lib_dirs <<< "$MAUDE_LIB"
+  for dir in "${maude_lib_dirs[@]}"; do
+    if [ -n "$dir" ] && [ -f "$dir/prelude.maude" ]; then
+      ORACLE_LIB=$dir
+      break
+    fi
+  done
+fi
 ORACLE_BIN=${ORACLE_BIN:-maude}
 ORACLE_VERSION=${ORACLE_VERSION:-3.5.1}
-DIAGNOSTIC_PARITY=${DIAGNOSTIC_PARITY:-ignore}
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
-TNK_STANDING_PRELUDE=${TNK_STANDING_PRELUDE:-1}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 
 fixture=${1:-}
@@ -59,12 +62,8 @@ if [ ! -x "$TNK_BIN" ]; then
   echo "error: tnk binary not found at $TNK_BIN (cargo build --release first)" >&2
   exit 2
 fi
-if [ ! -f "$ORACLE_LIB/prelude.maude" ]; then
-  echo "error: oracle prelude not found at $ORACLE_LIB/prelude.maude" >&2
-  exit 2
-fi
-if [ "$DIAGNOSTIC_PARITY" != "ignore" ]; then
-  echo "error: DIAGNOSTIC_PARITY must be 'ignore' (warning prose is outside the parity contract)" >&2
+if [ -z "$ORACLE_LIB" ] || [ ! -f "$ORACLE_LIB/prelude.maude" ]; then
+  echo "error: set ORACLE_LIB, or include a directory containing prelude.maude in MAUDE_LIB" >&2
   exit 2
 fi
 IFS= read -r oracle_version < <("$ORACLE_BIN" --version 2>/dev/null)
@@ -136,9 +135,8 @@ normalize() {
 }
 
 # ---- oracle side -----------------------------------------------------------
-# BOTH_NO_PRELUDE=1: run BOTH binaries prelude-free (the legacy prelude-* fixtures define their
-# own copies of prelude modules from scratch — with a standing prelude the oracle refuses to
-# redefine its protected modules, so the designed comparison is prelude-free on both sides).
+# BOTH_NO_PRELUDE=1: run both binaries prelude-free. The prelude-copy fixtures define protected
+# modules from scratch, so the comparison must begin without a standing prelude.
 oracle_flags=()
 [ "${BOTH_NO_PRELUDE:-0}" = "1" ] && oracle_flags+=(-no-prelude)
 ( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
@@ -148,32 +146,31 @@ rc=$?
 if [ $rc -eq 124 ]; then
   echo "TIMEOUT(oracle) $fixture"
   exit 3
+elif [ $rc -ne 0 ]; then
+  echo "error: oracle exited with status $rc for $fixture" >&2
+  cat "$tmpdir/oracle.raw" >&2
+  exit 2
 fi
 
 # ---- tnk side --------------------------------------------------------------
-tnk_input=$fixture
 tnk_flags=()
 if [ "${BOTH_NO_PRELUDE:-0}" = "1" ]; then
   tnk_flags+=(-no-prelude)
-elif [ "$TNK_STANDING_PRELUDE" = "1" ]; then
-  # TNK_ASSUME_PRELUDE=1: treat every fixture as prelude-dependent (the legacy-corpus sweep —
-  # those fixtures predate the marker convention; the oracle always has its prelude standing).
-  if [ "${TNK_ASSUME_PRELUDE:-0}" != "1" ] && ! grep -q '^\*\*\* PRELUDE' "$fixture"; then
-    tnk_flags+=(-no-prelude)
-  fi
-else
-  if grep -q '^\*\*\* PRELUDE' "$fixture"; then
-    cat "$ORACLE_LIB/prelude.maude" "$fixture" >"$tmpdir/tnk-input.maude"
-    tnk_input=$tmpdir/tnk-input.maude
-  fi
+elif [ "${TNK_ASSUME_PRELUDE:-0}" != "1" ] && ! grep -q '^\*\*\* PRELUDE' "$fixture"; then
+  # TNK_ASSUME_PRELUDE=1 supports fixture sets that omit the marker.
+  tnk_flags+=(-no-prelude)
 fi
 ( cd "$fixdir" && MAUDE_LIB="$TNK_SHARE_LIB:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
-    "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$tnk_input" </dev/null ) \
+    "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$fixture" </dev/null ) \
     >"$tmpdir/tnk.raw" 2>&1
 rc=$?
 if [ $rc -eq 124 ]; then
   echo "TIMEOUT(tnk) $fixture"
   exit 4
+elif [ $rc -ne 0 ]; then
+  echo "error: tnk exited with status $rc for $fixture" >&2
+  cat "$tmpdir/tnk.raw" >&2
+  exit 2
 fi
 
 # ---- compare ---------------------------------------------------------------

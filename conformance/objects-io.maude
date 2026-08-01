@@ -1,10 +1,8 @@
-*** Pillar 2.5-C (synchronous STD-STREAM): erewrite EXTERNAL-mode standard-stream output. The `<>` portal
+*** Synchronous standard-stream output under external-mode erewrite. The `<>` portal
 *** enables external IO; a `write(stdout, me, str)` message targeting the `stdout` manager (StreamManagerSymbol)
 *** emits `str` to stdout and replies `wrote(me, stdout)` synchronously -- no reactor. The side-channel writes
 *** print after the command echo, before `rewrites:`. CONFIGURATION + a minimal NAT/STRING + a minimal
-*** STD-STREAM (the real op-hook shape, incl. stringSymbol -- the reference crashes without it) are inlined.
-***
-*** Oracle: ~/Downloads/Maude-3/maude -no-banner conformance/objects-io.maude < /dev/null
+*** STD-STREAM (the real op-hook shape, incl. stringSymbol) are inlined.
 
 set show advisories off .
 
@@ -35,8 +33,7 @@ fmod STRING is
 endfm
 
 *** A minimal STD-STREAM: the `stdout`/`stdin` managers (StreamManagerSymbol) with the real op-hook shape,
-*** plus the write/wrote and getLine/gotLine messages. (The stringSymbol op-hook is required -- the
-*** reference crashes without it.)
+*** plus the write/wrote and getLine/gotLine messages. (The stringSymbol op-hook is required.)
 mod STD-IO is
   protecting STRING .  protecting CONFIGURATION .
   op write : Oid Oid String -> Msg [ctor msg] .
@@ -82,7 +79,7 @@ mod TICKER is
 endm
 
 *** stdin getLine -> gotLine (reads the line incl. its newline), echoed straight to stdout. Reads two
-*** lines (a counter), each getLine awaiting the previous wrote. Run with piped stdin (two lines).
+*** lines (a counter), each getLine awaiting the prior write. Run with piped stdin (two lines).
 mod ECHO is
   protecting STD-IO .  protecting NAT .
   sort EId .  subsort EId < Oid .

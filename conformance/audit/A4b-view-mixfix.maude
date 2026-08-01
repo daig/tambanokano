@@ -1,4 +1,4 @@
-*** A4b-view-mixfix — op→op views across the {prefix,mixfix}^2 matrix; only prefix→prefix builds in tnk, incl. op _#_ to _+_
+*** A4b-view-mixfix — op→op views across the {prefix,mixfix}^2 matrix; only prefix→prefix builds, incl. op _#_ to _+_
 fth THP is sort Elt . op f : Elt Elt -> Elt . endfth
 fth THM is sort Elt . op _#_ : Elt Elt -> Elt . endfth
 fmod TGT is

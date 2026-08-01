@@ -1,6 +1,5 @@
 //! One resumable level in the system-of-word-equations search.
 //!
-//! Port of Maude's `Utility/wordLevel*.cc` and `wordLevel.hh`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};

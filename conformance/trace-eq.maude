@@ -1,10 +1,5 @@
 *** Full-trace fixture: a user equation step. The trace shows the equation header, the eq body via the
-*** Term printer, the variable substitution, then the redex and its result. It is byte-identical
-*** to the reference binary, color off. Diff with:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/trace-eq.maude < /dev/null
-*** Drive the same through our REPL by feeding the lines on stdin:
-***   cat conformance/trace-eq.maude | cargo run -q -p tnk-repl
-*** The set trace sub-flags are exercised by the tnk-repl tests.
+*** Term printer, the variable substitution, then the redex and its result.
 fmod PEANO is
   sort Nat .
   op 0 : -> Nat [ctor] .

@@ -1,18 +1,13 @@
-//! The order-sorted unification driver — Maude's `UnificationProblem`
-//! (`src/Higher/unificationProblem.cc`): it drives the solved-form core ([`super`]) and the
-//! sort-solving BDDs ([`crate::sort_bdds`]) to enumerate order-sorted unifiers **in reference
-//! order**.
+//! Order-sorted unification driver.
 //!
-//! Enumeration is two-level, exactly as `findNextUnifier`:
-//!   * **outer** — distinct unsorted solved forms from the pending stack (`pending.solve`);
-//!   * **inner** — distinct maximal sort assignments per unsorted form (`AllSat` over the
-//!     `maximal` BDD).
+//! The driver combines the solved-form core in [`super`] with sort-solving BDDs from
+//! `crate::sort_bdds`. Enumeration has two levels:
+//! * distinct unsorted solved forms produced by the pending stack;
+//! * distinct maximal sort assignments for each solved form.
 //!
-//! Per unsorted form (`findOrderSortedUnifiers`): collect the free variables, give each a BDD
-//! block, build the `unifier` BDD (each free variable's sort ≤ its declared sort; each bound
-//! variable's *generalized sort* ≤ its declared sort), restrict to maximal assignments, and rename
-//! the free variables to the `#1,#2,…` family (slot order, reset per form). Per assignment
-//! (`bindFreeVariables`): decode each free variable's sort and instantiate.
+//! For each unsorted form, collect free variables, allocate a BDD block per variable, constrain
+//! generalized sorts by declarations, retain maximal assignments, and rename free variables into
+//! the `#1,#2,…` family. Then decode each maximal assignment and instantiate.
 
 use super::{
     PendingStack, Screen, UnifyContext, UnifyEnv, compute_solved_form, instantiate, is_ground,
@@ -27,7 +22,7 @@ use crate::sort_bdds::{AllSat, SortBdds};
 use biodivine_lib_bdd::Bdd;
 
 /// The declared sort and interned base-name code of one original problem variable, reordered after
-/// each unificand is theory-normalized (Maude's `Term::normalize(true)` → `indexVariables` order).
+/// theory normalization into canonical variable order.
 #[derive(Clone, Copy)]
 pub struct VarSpec {
     pub sort: SortId,
@@ -42,16 +37,16 @@ pub struct UnifyProblem {
     /// it occupies a slot (and therefore shifts fresh variables) but is not a problem variable.
     var_specs: Vec<Option<VarSpec>>,
     family: VariableFamily,
-    /// Fresh-variable base number (the `metaUnify` counter; 0 for the object-level command). A
-    /// `Nat` internally (Maude's is a bignum), constructed from the `u64` API parameter.
+    /// Fresh-variable base number (`0` for an object-level command), stored as an arbitrary-precision
+    /// natural.
     base: Nat,
-    /// New slot → caller's pre-normalization slot. Maude assigns original slots only after
-    /// theory-normalizing each unificand; callers use this to render substitution keys in that order.
+    /// New slot to caller's pre-normalization slot. Callers use the order produced after theory
+    /// normalization to render substitution keys.
     original_order: Vec<usize>,
     ctx: UnifyContext,
     pending: PendingStack,
-    /// `false` if a unificand sits under an unimplemented-theory top (the screen); the driver yields
-    /// no unifiers and the caller suppresses the `Decision time`/unifier output (warning only).
+    /// `false` if a unificand occurs below an unsupported-theory symbol; the driver yields no unifiers
+    /// and the caller suppresses the `Decision time`/unifier output.
     problem_okay: bool,
     /// `false` if the many-sorted solve failed outright (no unifier at all).
     viable: bool,
@@ -77,18 +72,16 @@ struct FreeVar {
     name: u32,
 }
 
-/// Normalize each unificand before assigning its visible variable slots. Commutative normalization
-/// can reorder a term's variables (`c(f(X,Y), Z)` visits `Z` before `Y`), and Maude performs exactly
-/// this pass in `UnificationProblem` before it creates the substitution.
+/// Normalize each unificand before assigning visible variable slots. Canonical commutative order can
+/// change variable traversal order, which in turn determines substitution keys and enumeration.
 fn normalize_and_reindex(
     e: &mut Engine,
     mut equations: Vec<(DagId, DagId)>,
     specs: Vec<VarSpec>,
 ) -> (Vec<(DagId, DagId)>, Vec<VarSpec>, Vec<usize>) {
-    // Variable symbols are instantiated while the parser builds a term bottom-up. Consequently,
-    // the first variable sort seen by a right-to-left postorder walk fixes the relative symbol
-    // order of variables of different sorts. Recover that order before normalization, then let the
-    // engine reconcile it with VariableSymbols materialized by earlier commands in this module.
+    // Bottom-up term construction creates per-sort variable symbols as variables are encountered.
+    // The first sort seen by a right-to-left postorder walk therefore fixes cross-sort symbol order.
+    // Record that order before normalization and reconcile it with symbols already in the signature.
     let mut variable_sort_order = Vec::new();
     for &(lhs, rhs) in &equations {
         for root in [lhs, rhs] {
@@ -102,15 +95,14 @@ fn normalize_and_reindex(
                     }
                     continue;
                 }
-                // LIFO + source/canonical child order gives the parser's right-to-left construction
-                // order.  This is used only to rank VariableSymbols, not to assign slots.
+                // LIFO traversal over stored child order reconstructs right-to-left variable-symbol
+                // creation order. This ranks variable sorts but does not assign slots.
                 work.extend(node.children());
             }
         }
     }
-    // Freeze and recover the module-level per-sort VariableSymbol order before canonical
-    // normalization and before the solver creates kind-level fresh variables. This order also
-    // governs original slot assignment and final AC/ACU substitution element order.
+    // Fix the signature's per-sort variable-symbol order before canonical normalization or fresh
+    // variable creation. It also governs input slot assignment and AC/ACU substitution element order.
     e.rank_variable_sorts(&mut variable_sort_order);
 
     for (lhs, rhs) in &mut equations {
@@ -147,9 +139,8 @@ fn normalize_and_reindex(
                         let (ai, bi) = (*ai as usize, *bi as usize);
                         let (asort, bsort) = (e.sort_of(a), e.sort_of(b));
                         if asort == bsort {
-                            // CUI_Term/ACU_Term normalize variables by their Maude token-name codes
-                            // before `indexVariables`. The frontend supplies ranks from the standing
-                            // prelude token table; meta/core callers naturally pass their own codes.
+                            // Same-sort variables use their interned name codes before slot indexing.
+                            // `VarSpec::name` supplies the caller's ordering code.
                             return specs[ai].name.cmp(&specs[bi].name);
                         }
                         let ra = variable_sort_order
@@ -188,11 +179,9 @@ fn normalize_and_reindex(
 }
 
 impl UnifyProblem {
-    /// Build a problem from `equations` (already-built dags with `Var` leaves at the original
-    /// slots) and their `var_specs` (declared sort + base-name code per slot). `family`/`base`
-    /// select the fresh-variable family and starting number (`#`/0 for the object-level command;
-    /// the `metaUnify` counter otherwise). Screens for unimplemented theories and runs the
-    /// many-sorted solve, mirroring the reference constructor.
+    /// Build a problem from DAG equations and their slot-indexed variable specifications. `family` and
+    /// `base` select fresh-name allocation; construction screens unsupported theories and performs the
+    /// many-sorted solve.
     pub fn new(
         env: &mut UnifyEnv,
         equations: Vec<(DagId, DagId)>,
@@ -200,8 +189,7 @@ impl UnifyProblem {
         family: VariableFamily,
         base: &str,
     ) -> UnifyProblem {
-        // The fresh-variable base counter — a decimal string so `metaUnify`'s bignum `Nat` base
-        // (Maude's `mpz`) survives; the object command and the current-signature descent pass "0".
+        // Keep the fresh-variable base as an unbounded decimal value. Object commands pass zero.
         let (equations, var_specs, original_order) =
             normalize_and_reindex(env.e, equations, var_specs);
         let n_original = var_specs.len();
@@ -220,12 +208,12 @@ impl UnifyProblem {
             order_sorted: None,
         };
 
-        // Screen every unificand for non-ground unimplemented-theory tops (the reference bails on
-        // UNIMPLEMENTED). The warning text is phase-E; the effect (no unifiers) is what matters.
+        // Reject every unificand with a non-ground unsupported-theory root. This case has no unifiers;
+        // the command driver owns the warning text.
         let mut warned = Vec::new();
         for &(l, r) in &prob.equations {
-            if screen_for_unification(env.e, l, &mut warned) == Screen::Unimplemented
-                || screen_for_unification(env.e, r, &mut warned) == Screen::Unimplemented
+            if screen_for_unification(env.e, l, &mut warned) == Screen::UnsupportedTheory
+                || screen_for_unification(env.e, r, &mut warned) == Screen::UnsupportedTheory
             {
                 prob.problem_okay = false;
                 return prob;
@@ -274,8 +262,8 @@ impl UnifyProblem {
         };
         let mut warned = Vec::new();
         for &(l, r) in &prob.equations {
-            if screen_for_unification(env.e, l, &mut warned) == Screen::Unimplemented
-                || screen_for_unification(env.e, r, &mut warned) == Screen::Unimplemented
+            if screen_for_unification(env.e, l, &mut warned) == Screen::UnsupportedTheory
+                || screen_for_unification(env.e, r, &mut warned) == Screen::UnsupportedTheory
             {
                 prob.problem_okay = false;
                 return prob;
@@ -290,12 +278,9 @@ impl UnifyProblem {
         prob
     }
 
-    /// Build a narrowing-only problem over an absolute substitution layout.
-    ///
-    /// `active_specs` gives `(absolute_slot, spec)` pairs for variables that occur in the already
-    /// remapped unificands. Slots not listed are inactive gaps: they remain unbound, take no part in
-    /// free-variable or sort processing, but count in `n_original` so solver-created variables begin
-    /// at the same module-wide index as Maude's `NarrowingUnificationProblem`.
+    /// Build a narrowing-only problem over an absolute substitution layout. `active_specs` lists
+    /// variables present in the remapped unificands. Omitted slots are inactive gaps, but still count
+    /// toward `n_original` so solver-created variables start after the module-wide input layout.
     pub fn new_for_variant(
         env: &mut UnifyEnv,
         mut equations: Vec<(DagId, DagId)>,
@@ -335,8 +320,8 @@ impl UnifyProblem {
         };
         let mut warned = Vec::new();
         for &(l, r) in &prob.equations {
-            if screen_for_unification(env.e, l, &mut warned) == Screen::Unimplemented
-                || screen_for_unification(env.e, r, &mut warned) == Screen::Unimplemented
+            if screen_for_unification(env.e, l, &mut warned) == Screen::UnsupportedTheory
+                || screen_for_unification(env.e, r, &mut warned) == Screen::UnsupportedTheory
             {
                 prob.problem_okay = false;
                 return prob;
@@ -372,9 +357,8 @@ impl UnifyProblem {
         self.order_sorted.as_ref().map_or(0, |os| os.free.len())
     }
 
-    /// The **next** fresh-variable index as a decimal string — `base + nrFreeVariables` — Maude's
-    /// `lastVarIndex` for the legacy `metaUnify`/`metaDisjointUnify` result's `Nat` component. A string
-    /// (not a `u64`) because the base is an unbounded `Nat`.
+    /// The next fresh-variable index as a decimal string, `base + nr_free_variables()`, for
+    /// Nat-family `metaUnify` and `metaDisjointUnify` results. The base is an unbounded `Nat`.
     pub fn last_var_index_decimal(&self) -> String {
         self.base
             .add(&Nat::from_u64(self.nr_free_variables() as u64))
@@ -430,8 +414,8 @@ impl UnifyProblem {
         Some(self.bind_free_variables_full(env))
     }
 
-    /// `findOrderSortedUnifiers`: build the `unifier`/`maximal` BDDs for the current unsorted solved
-    /// form and set `order_sorted` (or leave it `None` if this form has no order-sorted unifier).
+    /// Build the unifier and maximality BDDs for the current unsorted solved form. Leave
+    /// `order_sorted` empty when the form has no order-sorted unifier.
     fn find_order_sorted_unifiers(&mut self, env: &mut UnifyEnv) {
         let template = self.ctx.values().to_vec();
         let n_actual = template.len();
@@ -446,8 +430,8 @@ impl UnifyProblem {
         }
         let mut raws: Vec<Raw> = Vec::new();
         let mut total_bits: u16 = 0;
-        for slot in 0..n_actual {
-            if template[slot].is_none() {
+        for (slot, binding) in template.iter().enumerate() {
+            if binding.is_none() {
                 let sort = if slot < self.n_original {
                     let Some(spec) = self.var_specs[slot] else {
                         continue;
@@ -501,9 +485,8 @@ impl UnifyProblem {
             };
             let sort = spec.sort;
             let kind = sig.sorts().kind_of(sort);
-            // A bound variable declared at the kind/error sort is source-general: every
-            // generalized sort in this kind satisfies it. Besides avoiding a useless BDD, this
-            // prevents composing very large static terms merely to prove a tautology.
+            // A bound variable declared at its kind's error sort accepts every generalized sort in
+            // that kind. Skip the tautological BDD and its potentially large static composition.
             if template[i].is_some() && sort == sig.sorts().error_sort(kind) {
                 continue;
             }
@@ -533,9 +516,8 @@ impl UnifyProblem {
             .map(|r| (r.kind, real_to_bdd[r.slot].unwrap()))
             .collect();
         let maximal = sb.maximal_from_unifier(&unifier, &free_blocks);
-        // AllSat over [real0, real0 + total_bits - 1] (reference `secondBase .. nextBddVariable-1`).
-        // With no free variables the range is empty (real0 ≥ 2 for any module with sorts, so no
-        // underflow) — AllSat then yields exactly one empty assignment (the ground unifier).
+        // Enumerate the real-variable block range. With no free variables it is empty, and `AllSat`
+        // yields exactly one empty assignment for the ground unifier.
         let last_real = real0 + total_bits - 1;
         let all_sat = AllSat::new(maximal, real0, last_real);
 
@@ -562,8 +544,8 @@ impl UnifyProblem {
         });
     }
 
-    /// `bindFreeVariables`: decode each free variable's assigned sort from the current AllSat
-    /// assignment, build the `#k` variable of that sort, and instantiate the bound active slots.
+    /// Decode each free variable's sort from the current `AllSat` assignment, create its `#k`
+    /// variable, and instantiate the bound active slots.
     fn bind_free_variables_full(&mut self, env: &mut UnifyEnv) -> Vec<Option<DagId>> {
         let os = self.order_sorted.as_ref().unwrap();
         let asg = os.all_sat.assignment();
@@ -615,10 +597,10 @@ impl UnifyProblem {
     }
 }
 
-/// `DagNode::computeGeneralizedSort2`: the sort of `id` as a BDD bit-vector over the free
-/// variables' real blocks. Ground subterms use their concrete sort; a free variable uses its
-/// block; applications compose; the S successor case-splits on the argument sort. A free function
-/// over `&Engine` (not `&mut UnifyEnv`) so it can run while the driver holds `sig` borrowed.
+/// Compute the sort of `id` as a BDD bit-vector over the free variables' real blocks. Ground
+/// subterms use concrete sorts, free variables use their blocks, applications compose their child
+/// sorts, and compact iteration case-splits on its argument sort. This takes `&Engine` so it can run
+/// while the driver holds the signature borrowed.
 fn generalized_sort(
     e: &Engine,
     sig: &crate::engine::Signature,
@@ -674,8 +656,8 @@ fn generalized_sort(
     }
 }
 
-/// `S_Symbol::computeGeneralizedSort2`: for each possible argument sort index `i`, compute the
-/// ground iterated output sort (`compute_s_sort` for the count) and case-split symbolically.
+/// For each possible compact-iteration argument sort, compute the ground output sort and select it
+/// symbolically with the argument's generalized-sort bits.
 fn s_generalized_sort(
     e: &Engine,
     sig: &crate::engine::Signature,
@@ -716,8 +698,7 @@ fn s_generalized_sort(
     result
 }
 
-/// Bits to index `n` values (mirror of `sort_bdds::calculate_nr_bits`, kept local so the driver
-/// can size blocks without a SortBdds instance).
+/// Number of bits required to index `n` values.
 fn calc_bits(n: usize) -> u16 {
     let mut bits = 1u16;
     let mut representable = 2usize;
@@ -764,7 +745,7 @@ mod tests {
         }
     }
 
-    /// `U-probe-01-maximal-sorts` first problem: `X:S1 =? Y:S2` with `A B < S1`, `A B < S2`,
+    /// Cross-sort unification: `X:S1 =? Y:S2` with `A B < S1`, `A B < S2`,
     /// `S1 S2 < T`. Two unifiers, one per maximal lower bound (A, B), each binding X and Y to the
     /// same fresh `#1` variable of that sort. End-to-end: var-var solve → generalized sort →
     /// antichain maximality → fresh naming → instantiate.
@@ -908,7 +889,7 @@ mod tests {
         assert!(problem.problem_okay());
         let order = problem.original_variable_order().to_vec();
         let binding = problem.find_next(&mut env).expect("collapse unifier");
-        let mut original = vec![None; 3];
+        let mut original = [None; 3];
         for (new_slot, old_slot) in order.into_iter().enumerate() {
             original[old_slot] = Some(binding[new_slot]);
         }
@@ -932,10 +913,9 @@ mod tests {
         );
     }
 
-    /// CUI normalization happens before `indexVariables`: a commutative node whose name-code order
-    /// differs from parser encounter order must determine the visible substitution slots. This is
-    /// the object-level `f(X, Y) =? f(U, V)` CU case with the standing-prelude name order
-    /// `X < Y` and `V < U`; Maude therefore prints/binds the keys as `X, Y, V, U`.
+    /// CUI normalization precedes slot indexing, so canonical name-code order can differ from parser
+    /// encounter order. With `X < Y` and `V < U`, this equation orders substitution keys as
+    /// `X, Y, V, U`.
     #[test]
     fn cui_normalization_defines_original_variable_slots() {
         let mut e = Engine::new();
@@ -1077,8 +1057,8 @@ mod tests {
         let aname = names.code("A");
         let yname = names.code("Y");
         let bname = names.code("B");
-        // Deliberately instantiate Set's VariableSymbol first.  Maude's bottom-up parser creates
-        // Elt's symbol first for f(X, A), and normalization must recover A, X, B, Y slot order.
+        // Instantiate Set's variable symbol first to oppose the equation's right-to-left construction
+        // order. Normalization must rank Elt first and recover A, X, B, Y slots.
         let x = e.make_var(set, xname, 0);
         let a = e.make_var(elt, aname, 1);
         let y = e.make_var(set, yname, 2);

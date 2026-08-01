@@ -1,4 +1,4 @@
-*** T02-check-integer — integer SMT checks lifted from the reference suite (Misc/smtTest.maude)
+*** T02-check-integer — integer SMT checks
 set show timing off .
 load smt
 

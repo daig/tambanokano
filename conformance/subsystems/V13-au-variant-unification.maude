@@ -1,4 +1,4 @@
-*** V13-au-variant-unification — lifted from the reference suite (Misc/AU_Unification.maude)
+*** V13-au-variant-unification
 *** PRELUDE
 ***
 ***	Tests for associative-identity unification.
@@ -22,7 +22,7 @@ variant unify X =? Y X /\ Z Y  =? A B .
 
 variant unify X =? Y X /\  Z C =? C  /\ Z Y =? A B .
 
-*** both sides go to one variable
+*** each side goes to one variable
 
 variant unify X =? Y X /\ A C =? C  /\ Z Y =? A B .
 

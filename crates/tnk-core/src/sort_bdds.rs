@@ -1,41 +1,32 @@
-//! The order-sorted-unification sort computation — Maude's `SortBdds` (`src/Core/sortBdds.cc`),
-//! the per-symbol sort functions (`src/Core/sortTable.cc`, linear algorithm),
-//! generalized-sort composition (`operatorCompose` / `DagNode::computeGeneralizedSort`), the
-//! maximal-sort-assignment constraint (`src/Higher/unificationProblem.cc findOrderSortedUnifiers`),
-//! and the `AllSat` enumeration walk (`src/Utility/allSat.cc`) — on `biodivine-lib-bdd`.
+//! Reduced ordered binary decision diagram (ROBDD) reasoning for order-sorted unification.
 //!
-//! Production port of the S0 BDD spike (GO).
+//! This module builds per-symbol sort functions, composes generalized sorts, constrains maximal sort
+//! assignments, and enumerates satisfying assignments with `biodivine-lib-bdd`.
 //!
-//! **BuDDy-isms and their biodivine replacements** (all validated in the spike):
-//!   * `bdd_replace` upward block remap → [`SortBdds::shift_block`], an **order-preserving**
-//!     `unsafe rename_variables` on a clone (the one `unsafe`; precondition: the target block sits
-//!     above every variable of the source BDD, so blocks shift as units — see the fn doc).
-//!   * `bdd_replace` downward remap (maximality) → the functional form
-//!     `exists B . (f ∧ (B ↔ B'))` via one `binary_op_with_exists`.
-//!   * `bdd_veccompose` (operator compose / apply-leq) → sequential [`Bdd::substitute`], sound
-//!     because substituted functions never mention a pending scratch variable.
-//!   * `bdd_appall(_, _, nand, vars)` → the native fused [`Bdd::binary_op_with_for_all`].
+//! Core operations:
+//! - [`SortBdds::shift_block`] performs an order-preserving upward variable-block remap using
+//!   `rename_variables`; its safety precondition requires the target block to sit above every
+//!   variable in the input BDD's support.
+//! - Downward remapping for maximality uses
+//!   `exists B . (f ∧ (B ↔ B'))` through `binary_op_with_exists`.
+//! - Operator composition substitutes functions sequentially; substituted functions never mention a
+//!   pending scratch variable.
+//! - Universal relation checks use the fused `Bdd::binary_op_with_for_all`.
 //!
-//! **Design deviation from Maude (recorded).** Maude caches `SortBdds` per *module* and grows the
-//! global BuDDy variable count per unification problem. biodivine's variable set is fixed-size, so
-//! tnk builds a `SortBdds` **per problem** (relations + lazy sort functions), sized to the real
-//! capacity the driver computes once it has collected the problem's free variables. This is pure
-//! perf (relation rebuild ~µs–ms per the spike, off any observable budget) and cannot affect
-//! results: the `maximal` BDD contains only the real (per-free-variable) variables, and ROBDDs are
-//! canonical, so the AllSat enumeration order is layout-independent. Layout (spike-matching):
-//! `[scratch1: maxbits][scratch2: maxbits][domain: maxdom][real: real_capacity]` — `maxdom`, the
-//! widest operator domain, is computed up front via `Signature::symbols_iter`.
+//! **Ownership and layout.** biodivine variable sets are fixed-size, so each unification problem owns a
+//! `SortBdds` (relations plus lazy sort functions) sized after the driver has collected its free
+//! variables. Rebuilding the relations affects only performance, not results: the `maximal` BDD contains
+//! only real per-free-variable variables, and canonical ROBDDs make AllSat order layout-independent.
+//! The variable layout is
+//! `[scratch1: maxbits][scratch2: maxbits][domain: maxdom][real: real_capacity]`; `maxdom`, the widest
+//! operator domain, is computed up front through `Signature::symbols_iter`.
 //!
-//! **Driver integration (`unify/problem.rs`):** the driver walks each solved DAG to compute generalized
-//! sorts and collect free variables, builds the per-problem maximality BDD, then owns [`AllSat`] while
-//! emitting the maximal order-sorted refinements. This module supplies the backend primitives:
-//! [`SortBdds::make_variable_bdd`], [`SortBdds::operator_compose`],
-//! [`SortBdds::apply_leq_relation`], [`SortBdds::get_remapped_leq_relation`],
-//! [`SortBdds::make_index_vector`], and [`SortBdds::maximal_from_unifier`].
-//!
-//! A few Maude-compatible primitives remain unit-test/reference surfaces rather than direct production
-//! call sites; keep their dead-code allowance scoped to this backend module.
-#![allow(dead_code)]
+//! The unification driver walks each solved DAG to compute generalized sorts and collect free
+//! variables, builds the per-problem maximality BDD, then owns [`AllSat`] while emitting maximal
+//! order-sorted refinements. This module supplies [`SortBdds::make_variable_bdd`],
+//! [`SortBdds::operator_compose`], [`SortBdds::apply_leq_relation`],
+//! [`SortBdds::get_remapped_leq_relation`], [`SortBdds::make_index_vector`], and
+//! [`SortBdds::maximal_from_unifier`] for that flow.
 
 use crate::engine::Signature;
 use crate::sort::{KindId, SortId};
@@ -45,7 +36,7 @@ use biodivine_lib_bdd::{
 };
 use std::collections::HashMap;
 
-/// Bits needed to index `nr_indices` values (0..nr_indices-1), minimum 1 — `calculateNrBits`.
+/// Bits needed to index `nr_indices` values (`0..nr_indices`), with a minimum of one bit.
 fn calculate_nr_bits(nr_indices: usize) -> u16 {
     let mut nr_bits = 1u16;
     let mut representable = 2usize;
@@ -58,7 +49,7 @@ fn calculate_nr_bits(nr_indices: usize) -> u16 {
 
 /// Precomputed per-kind BDD relations, indexed by [`KindId`] (position in the module's kind list).
 struct KindBdds {
-    /// Bit width of a sort index in this kind (`SortBdds::getNrVariables`).
+    /// Bit width of a sort index in this kind.
     bits: u16,
     /// `valid(s1) ∧ valid(s2) ∧ s1 > s2` with s1's block at scratch1 and s2's at scratch2 (the
     /// strict-subsort relation over local sort indices).
@@ -67,7 +58,7 @@ struct KindBdds {
     leq: Vec<Bdd>,
 }
 
-/// A per-problem sort-BDD instance (see the module deviation note).
+/// Sort relations and lazy operator sort functions sized for one unification problem.
 pub(crate) struct SortBdds {
     universe: BddVariableSet,
     vars: Vec<BddVariable>,
@@ -81,8 +72,7 @@ pub(crate) struct SortBdds {
     kinds: Vec<KindBdds>,
     /// Lazy per-symbol sort function (`Vec<Bdd>` over the domain block), built on first use.
     sort_fns: HashMap<SymbolId, Vec<Bdd>>,
-    /// Cache of remapped leq relations, keyed by (declared sort, first real bit) — Maude's
-    /// `cachedLeqRelations`.
+    /// Cache of remapped `≤` relations keyed by declared sort and first real bit.
     remapped_leq: HashMap<(SortId, u16), Bdd>,
     /// Cache of remapped gt relations (second argument shifted to a real block), keyed by
     /// (kind index, first real bit).
@@ -164,7 +154,8 @@ impl SortBdds {
         sb
     }
 
-    /// The bit width of a sort index in `kind` (`getNrVariables`).
+    /// The bit width of a sort index in `kind`.
+    #[cfg(test)]
     pub(crate) fn nr_variables(&self, kind: KindId) -> u16 {
         self.kinds[kind.index()].bits
     }
@@ -188,7 +179,7 @@ impl SortBdds {
         }
     }
 
-    /// `makeIndexVector`: a constant-bit BDD vector encoding a local sort index.
+    /// A constant-bit BDD vector encoding a local sort index.
     pub(crate) fn make_index_vector(&self, bits: u16, index: u32) -> Vec<Bdd> {
         (0..bits)
             .map(|k| {
@@ -232,30 +223,20 @@ impl SortBdds {
         self.universe.mk_dnf(&cubes)
     }
 
-    /// Clone a cached relation and shift one variable block upward by an **order-preserving**
-    /// relabel (`bdd_replace`). Sound because `to` is above every variable of `b`: real blocks sit
-    /// above both scratch blocks and the domain block, so the shift preserves the variable order and
-    /// the ROBDD canonical form (validated identical to a direct DNF rebuild in the spike). This is
-    /// the module's only `unsafe`.
-    // The one deliberate `unsafe` in this module (workspace policy `unsafe_code = "warn"`): an
-    // order-preserving BDD variable relabel, its precondition documented above and validated in the
-    // S0 spike. The alternative — rebuilding the relation from its DNF at the target
-    // block — is 2.6–13× slower and adds no safety (the relabel provably yields the same canonical
-    // ROBDD). Allowed here, at the single call, rather than downgrading the crate-wide lint.
+    /// Shift one BDD variable block upward with an order-preserving relabel. Real blocks sit above
+    /// scratch and domain blocks, so this preserves variable order and canonical form.
     #[allow(unsafe_code)]
     fn shift_block(&self, b: &Bdd, from: u16, bits: u16, to: u16) -> Bdd {
         let mut b = b.clone();
         let map: HashMap<BddVariable, BddVariable> = (0..bits)
             .map(|j| (self.vars[(from + j) as usize], self.vars[(to + j) as usize]))
             .collect();
-        // SAFETY: order-preserving block shift (`to` above all of `b`'s support), so the relabel
-        // yields the identical canonical ROBDD — see the fn doc.
+        // SAFETY: `to` is above the BDD support, so this block relabel preserves variable order.
         unsafe { b.rename_variables(&map) };
         b
     }
 
-    /// `getRemappedLeqRelation(sort, firstReal)`: `valid(x) ∧ x ≤ sort` with `x` at the free
-    /// variable's real block. Cached like Maude's `cachedLeqRelations`.
+    /// Build or reuse `valid(x) ∧ x ≤ sort` over a free variable's real block.
     pub(crate) fn get_remapped_leq_relation(
         &mut self,
         sig: &Signature,
@@ -290,8 +271,8 @@ impl SortBdds {
         remapped
     }
 
-    /// `applyLeqRelation`: `bdd_veccompose(leq[kind][li] over scratch1, args)` via a sequential
-    /// substitute chain. Sound because `args` never mention scratch1.
+    /// Substitute `args` into `leq[kind][li]`, whose variables occupy the first scratch block.
+    /// Sequential substitution is sound because `args` never mention that block.
     pub(crate) fn apply_leq_relation(&self, kind: KindId, li: u32, args: &[Bdd]) -> Bdd {
         let mut b = self.kinds[kind.index()].leq[li as usize].clone();
         for (i, g) in args.iter().enumerate() {
@@ -300,10 +281,7 @@ impl SortBdds {
         b
     }
 
-    /// The (lazily built) sort function of `symbol` — `SortTable::linearComputeSortFunctionBdds`.
-    /// Maude computes both the recursive (sort-diagram) and linear algorithms and asserts equality;
-    /// ROBDDs are canonical, so the linear result alone is behaviorally identical (the S1 oracle
-    /// fixtures are the empirical check).
+    /// Lazily build the result-sort function for `symbol` as BDDs over its domain-sort indices.
     pub(crate) fn sort_function(&mut self, sig: &Signature, symbol: SymbolId) -> &[Bdd] {
         if !self.sort_fns.contains_key(&symbol) {
             let f = self.build_sort_fn(sig, symbol);
@@ -320,8 +298,7 @@ impl SortBdds {
         let arity = sym.decls[0].domain.len();
 
         if arity == 0 {
-            // Constant: its single non-error (least) sort — Maude's `singleNonErrorSort`, computed
-            // by the same reverse fold the n-ary case does, degenerated to a domain-free ite chain.
+            // A constant selects its least non-error declared range through a domain-free fold.
             let mut least = sorts.error_sort(range_kind);
             for decl in sym.decls.iter().rev() {
                 if !sorts.leq(least, decl.range) {
@@ -337,7 +314,7 @@ impl SortBdds {
             .iter()
             .map(|&d| sorts.kind_of(d))
             .collect();
-        // Start from the constant ERROR_SORT (local index 0) function.
+        // Start with the error sort (local index 0) as the constant result function.
         let mut f = self.make_index_vector(rbits, 0);
         for decl in sym.decls.iter().rev() {
             // All arguments ≤ the declaration's domain sorts.
@@ -368,8 +345,8 @@ impl SortBdds {
         self.shift_block(&self.kinds[kind.index()].leq[li as usize], 0, bits, first)
     }
 
-    /// `operatorCompose`: `bdd_veccompose` of the sort function with the argument bit vectors (over
-    /// real variables). Substitutes each domain-block variable by the corresponding input bit.
+    /// Compose an operator's sort function with argument bit vectors over real variables by
+    /// substituting each domain-block variable with its corresponding input bit.
     pub(crate) fn operator_compose(
         &mut self,
         sig: &Signature,
@@ -390,7 +367,7 @@ impl SortBdds {
             .collect()
     }
 
-    /// `makeVariableBdd`: the literal bit vector for a free variable's real block.
+    /// The literal bit vector for a free variable's real block.
     pub(crate) fn make_variable_bdd(&self, first_real: u16, bits: u16) -> Vec<Bdd> {
         (0..bits)
             .map(|k| {
@@ -400,9 +377,9 @@ impl SortBdds {
             .collect()
     }
 
-    /// `findOrderSortedUnifiers`' maximality step: restrict `unifier` to assignments where no free
-    /// variable's sort can be raised (per the strict-subsort gt relation) while staying satisfying.
-    /// `free_blocks` lists each free variable's `(kind, first_real_bit)`.
+    /// Restrict `unifier` to assignments where no free variable's sort can be raised through the
+    /// strict-subsort relation while preserving satisfiability. `free_blocks` lists each free
+    /// variable's `(kind, first_real_bit)`.
     pub(crate) fn maximal_from_unifier(
         &mut self,
         unifier: &Bdd,
@@ -418,11 +395,11 @@ impl SortBdds {
             //   exists block . (unifier ∧ (block ↔ scratch1))
             let mut iff_conj = self.universe.mk_true();
             let mut block_vars = Vec::with_capacity(bits);
-            for j in 0..bits {
+            for (j, &scratch) in scratch1.iter().take(bits).enumerate() {
                 let bv = self.vars[first as usize + j];
                 block_vars.push(bv);
                 let l = self.universe.mk_literal(bv, true);
-                let r = self.universe.mk_literal(scratch1[j], true);
+                let r = self.universe.mk_literal(scratch, true);
                 iff_conj = iff_conj.and(&l.iff(&r));
             }
             let renamed =
@@ -449,7 +426,7 @@ impl SortBdds {
     }
 }
 
-/// The `nand` op for the maximality universal quantifier (`bdd_appall(_, _, bddop_nand, _)`).
+/// Three-valued NAND used by the universal maximality check.
 fn nand_op(l: Option<bool>, r: Option<bool>) -> Option<bool> {
     match (l, r) {
         (Some(false), _) | (_, Some(false)) => Some(true),
@@ -458,16 +435,12 @@ fn nand_op(l: Option<bool>, r: Option<bool>) -> Option<bool> {
     }
 }
 
-// ======================================================================================
-// AllSat — port of src/Utility/allSat.cc
-// ======================================================================================
+// AllSat
 
 const UNDEFINED: i8 = -1;
 
-/// Enumerates the satisfying assignments of a BDD over `[first_variable, last_variable]`, in the
-/// reference walk order (low-branch-first DFS, don't-care set in variable-index order, binary
-/// counting over don't-cares, node-stack backtrack). The enumeration order IS the observable
-/// order-sorted unifier order (the S1 pass criterion).
+/// Enumerate satisfying assignments over the selected variable range using low-branch-first DFS,
+/// ordered don't-cares, binary expansion, and stack backtracking. This order determines unifier order.
 pub(crate) struct AllSat {
     formula: Bdd,
     first_variable: usize,
@@ -577,7 +550,7 @@ mod tests {
     use crate::engine::Engine;
     use crate::sort::SortId;
 
-    /// Build the S0 spike's number tower through the engine:
+    /// Build the test number tower through the engine:
     /// `[K] Rat Int NzRat Nat NzInt Zero NzNat` with `+` subsort-overloaded, and return the engine
     /// plus the sort ids and the `+` symbol.
     fn number_tower() -> (Engine, Vec<SortId>, SymbolId) {
@@ -598,7 +571,7 @@ mod tests {
         e.add_subsort(nznat, nat);
         e.add_subsort(nznat, nzint);
         e.close_sorts();
-        // op _+_ : with subsort overloads, declared most-specific first (Maude order).
+        // Subsort overloads are declared most-specific first.
         let plus = e.add_op("+", vec![nznat, nznat], nznat);
         e.add_op_decl(plus, vec![nat, nat], nat);
         e.add_op_decl(plus, vec![int, int], int);
@@ -606,8 +579,8 @@ mod tests {
         (e, vec![rat, int, nzrat, nat, nzint, zero, nznat], plus)
     }
 
-    /// The BDD sort function agrees pointwise with the engine's own least-sort computation
-    /// (`Signature::compute_sort`) over every argument-sort combination — the core validity check.
+    /// The BDD sort function returns [`Signature::compute_sort`] for every argument-sort
+    /// combination.
     #[test]
     fn sort_function_matches_compute_sort() {
         let (e, _sorts, plus) = number_tower();
@@ -645,10 +618,9 @@ mod tests {
         }
     }
 
-    /// The `U-probe-01-maximal-sorts` shape: `A B < S1`, `A B < S2`, `S1 S2 < T`. A fresh variable
-    /// constrained by `≤ S1 ∧ ≤ S2` (no GLB — A and B are both maximal lower bounds) has two
-    /// maximal sort assignments, A and B. This exercises the multi-solution maximality step;
-    /// enumerate via unifier→maximal→AllSat and compare (set + count) against a direct computation.
+    /// A non-lattice sort shape: `A B < S1`, `A B < S2`, `S1 S2 < T`. A fresh variable
+    /// constrained by `≤ S1 ∧ ≤ S2` has no greatest lower bound: A and B are both maximal lower
+    /// bounds. The unifier-to-maximal-to-AllSat flow must enumerate exactly those two assignments.
     #[test]
     fn maximal_enumeration_antichain() {
         let mut e = Engine::new();
@@ -723,8 +695,7 @@ mod tests {
         );
     }
 
-    /// The rename-remap path yields the identical canonical BDD as building the relation directly at
-    /// the real position via `mk_dnf`.
+    /// Order-preserving block renaming preserves the relation's canonical BDD representation.
     #[test]
     fn rename_remap_is_canonical() {
         let (e, sorts, _) = number_tower();

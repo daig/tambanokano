@@ -1,4 +1,4 @@
-*** Axis-A2/A5: a parameterized view (BoxV) instantiated by a module-view (ToColor),
+*** A parameterized view (BoxV) instantiated by a module-view (ToColor),
 *** used as the argument of a nested module instantiation BOX{BoxV{ToColor}}.
 *** The element sort of the outer BOX is Box{ToColor}, so wrap/peek are ad-hoc
 *** overloaded across the Hue / Box{ToColor} / Box{BoxV{ToColor}} kinds.

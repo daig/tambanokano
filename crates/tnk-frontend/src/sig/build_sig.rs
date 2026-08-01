@@ -1,9 +1,7 @@
-//! `build_module`: drive the `tnk-core` `Engine`'s constructor API from a [`PreModule`], and record the
-//! frontend's [`SymbolSyntax`] / name→id tables. Order is forced by three kernel contracts: sorts closed
-//! before ops; **all** op declarations before any node is built; `special` hooks resolved to ids. So:
-//! sorts → close → **pass A** declare every op (theory-dispatched) + record syntax → **pass A2** record the
-//! built-in anchors (succ/zero/string/float/qid) once all names resolve → **pass B** attach
-//! ctor/strat/special. Statements are left raw (parsed in B4.4, which needs the grammar).
+//! Build a `tnk-core` [`Engine`] from a [`PreModule`] while recording frontend
+//! syntax and name-resolution tables. Kernel invariants force the order: close sorts; declare every
+//! operator and syntax profile; resolve built-in anchor symbols; then attach constructor, strategy,
+//! frozen, object-role, and `special` attributes. Statements remain raw until the module grammar exists.
 
 use crate::lex::{Frag, Interner, Sym, Token, is_punct, split_mixfix};
 use crate::sig::syntax::{BuiltModule, IdentitySpec, OpProfile, SymbolSyntax};
@@ -31,9 +29,8 @@ struct EffectiveAxioms {
 }
 
 impl EffectiveAxioms {
-    /// Mirror Maude's `MixfixModule::validateAttributes`: structural attributes are checked against
-    /// the source declaration's arity and connected components before a theory-specific symbol is
-    /// selected. `None` denotes a polymorphic position.
+    /// Validate structural attributes against operator arity and connected components before choosing a
+    /// theory-specific representation. `None` denotes a polymorphic position.
     fn for_profile(attrs: &Attrs, domain: &[Option<KindId>], range: Option<KindId>) -> Self {
         fn same_component_or_all_polymorphic(kinds: &[Option<KindId>]) -> bool {
             if kinds.iter().all(Option::is_none) {
@@ -127,12 +124,8 @@ impl ConstructorAxiomProfile {
     }
 }
 
-/// The canonical mixfix name of an op. Source blanks between name tokens become Maude backquotes:
-/// `[s_]`→`"s_"`, `[c, d_]`→``"c`d_"``, `[<_, ,, _>]`→`"<_,_>"`.
-/// An operator name may be **parenthesized to quote** a name that would otherwise clash with a keyword or
-/// the terminator `.` — Maude's `op (op_:_->_[_].) : …` (the META-MODULE constructor whose name starts with
-/// the `op` keyword and ends in `.`). The outer parens are a quoting wrapper, not part of the name, so they
-/// are stripped: the canonical name (and thus its grammar production and `sym_by_profile` key) is
+/// Canonical mixfix name. Source blanks become backquotes, punctuation fragments glue, and outer
+/// parentheses used to quote keyword-like names are stripped.
 pub fn canonical_name(name: &[Token], i: &Interner) -> String {
     let mut out = String::new();
     let mut previous = None;
@@ -176,16 +169,14 @@ fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
     &toks[1..toks.len() - 1]
 }
 
-/// Resolve a sort name, handling the **kind** form `[S]` — the top (error) sort of S's connected
-/// component, `error_sort(kind_of(S))` (`var B : [Bool]`, `op undefined : -> [Y$Elt]`). A plain name is
-/// a direct lookup. The `[S]` form requires `close_sorts()` to have run (kinds exist), so it is used for
-/// op domains/ranges and variable sorts (Pass A onward), never for subsorts (resolved before close).
+/// Resolve a sort name, including the kind form `[S]`, which denotes the error sort of S's connected
+/// component. Plain names use direct lookup. Kind resolution requires closed sorts, so callers use this
+/// for operator profiles and variables after subsorts have been resolved.
 fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) -> R<SortId> {
     if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        // Single-sort `[S]` or multi-sort `[A, B]` (the kind of the component that contains A and B —
-        // `kindNameDecember2022`). Every listed sort is in the same connected component, so its kind is
-        // the same; resolve the first (depth-aware, so a structured sort `Map{X,Y}` is not split at its
-        // inner `,`).
+        // A bracket can contain one sort (`[S]`) or several (`[A, B]`) naming the same connected
+        // component. Resolve the first complete sort name; depth-aware splitting keeps a structured sort
+        // such as `Map{X,Y}` intact.
         let first = first_kind_component(inner);
         let inner_id = sorts
             .get(first)
@@ -246,12 +237,11 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut name_to_sym: HashMap<String, SymbolId> = HashMap::new();
     let mut syntax: HashMap<SymbolId, SymbolSyntax> = HashMap::new();
     let mut op_profiles: Vec<OpProfile> = Vec::new();
-    // Symbol identity is the **kind-profile** (name + domain/range connected components), not just
-    // (name, arity): subsort overloading (same components, different sorts — `_+_ : NzNat Nat -> NzNat`
-    // and `_+_ : Nat Nat -> Nat`) adds a declaration to the *same* symbol, but **ad-hoc** overloading
-    // across different components (`wrap : Hue -> Box{ToColor}` and `wrap : Box{ToColor} -> Box{V}` from a
-    // nested instantiation) makes **distinct** symbols, as in Maude — the argument kind, not the range,
-    // selects the declaration group.
+    // Symbol identity is the **kind profile**: name plus domain and range connected components.
+    // Subsort overloads in the same components, such as `_+_ : NzNat Nat -> NzNat` and
+    // `_+_ : Nat Nat -> Nat`, share a symbol. Ad-hoc overloads across components, such as
+    // `wrap : Hue -> Box{ToColor}` and `wrap : Box{ToColor} -> Box{V}`, produce distinct symbols.
+    // The argument kind selects the declaration group.
     let mut sym_by_profile: HashMap<(String, Vec<KindId>, KindId), SymbolId> = HashMap::new();
     // Each source declaration maps to its kernel symbol(s): one for an ordinary op, or — for a
     // `poly`/`Universal` op — one per kind (the per-kind expansion below). Later passes iterate it by the
@@ -265,25 +255,21 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     let mut constructor_axiom_profiles: HashMap<SymbolId, ConstructorAxiomProfile> = HashMap::new();
     let mut constructor_flags: HashMap<SymbolId, bool> = HashMap::new();
 
-    // Pass A: declare every op (theory-dispatched), record name→id + syntax. A `poly` op is expanded
-    // here — necessarily after `close_sorts`, which is what creates the kinds/error sorts. Each
-    // polymorphic position (the `poly` list: arguments 1-based, range `0`) becomes its kind's error
-    // (top) sort, yielding one concrete declaration per kind — exactly Maude's `instantiatePolymorph`,
-    // but eager over all kinds rather than lazy over used ones (reduction-identical; cf. `show module`).
-    // `Universal` is never resolved as a sort: the `poly` list drives the substitution, so it can
-    // never reach `sort_id` to become "unknown".
+    // Declare every operator and expand each polymorphic declaration eagerly over all kinds after sort
+    // closure. Listed positions use that kind's error sort; `Universal` never reaches ordinary sort
+    // lookup.
     //
-    // Keep the established constants-first partition: it preserves symbol-index ordering while the
-    // identity post-pass now handles every forward/compound reference.
+    // Partition constants before nonconstants to preserve symbol-index ordering. The later identity
+    // attachment pass resolves forward and compound identity references.
     let mut decl_order: Vec<usize> = (0..pm.ops.len()).collect();
     decl_order.sort_by_key(|&idx| !pm.ops[idx].domain.is_empty());
     for &idx in &decl_order {
         let od = &pm.ops[idx];
         let cname = canonical_name(&od.name, interner);
         let arity = od.domain.len();
-        // Maude validates semantic attributes before choosing a theory-specific symbol. The raw
-        // spelling remains on `od.attrs` for source reflection; only the effective attributes below
-        // drive compiled syntax, identity attachment, and kernel theory selection.
+        // Validate semantic attributes before selecting a theory-specific symbol. The raw attributes stay
+        // on `od.attrs` for surface rendering; only the effective attributes below control compiled syntax,
+        // identity attachment, and kernel theory selection.
 
         // The (domain, range) profile(s) this declaration expands to.
         let mut profiles: Vec<(Vec<SortId>, SortId)> = match &od.attrs.poly {
@@ -325,9 +311,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             }
         };
 
-        // A partial (`~>`) declaration is kind-level in every position: Maude's parser replaces each
-        // domain and range sort by its connected component's error sort. This is what lets a partial
-        // operator consume kind-level arguments as well as leave an undefined result at the result kind.
+        // Partial declarations are kind-level in every position, so they accept kind-level arguments and
+        // may produce an undefined result at the result kind.
         if od.partial {
             for (domain, range) in profiles.iter_mut() {
                 for sort in domain {
@@ -337,9 +322,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             }
         }
 
-        // Reconstruct Maude's pre-instantiation kind profile. A `poly` position is still an absent
-        // (`null`) sort when attributes are validated; validating each concrete expansion separately
-        // would incorrectly retain attributes on only some instances.
+        // Validate structural attributes against the pre-expansion profile, where polymorphic positions
+        // remain absent. Per-instance validation would retain attributes inconsistently.
         let first_profile = profiles
             .first()
             .expect("an operator declaration produces at least one profile");
@@ -412,10 +396,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 let mut gather = od.attrs.gather.clone();
                 let mut format = od.attrs.format.clone();
                 if holes != 0 && holes != domain.len() {
-                    // Underscore count ≠ arity: Maude warns and clears the mixfix syntax
-                    // (entry.cc "number of underscores does not match number of arguments"),
-                    // leaving the prefix form usable; prec/gather/format go with it. The
-                    // warning text itself is deferred diagnostics (roadmap phase E).
+                    // A mismatched hole count leaves the declaration available in prefix form and clears
+                    // attributes that apply only to valid mixfix syntax.
                     frags = vec![Frag::Tok(interner.intern(&cname))];
                     prec = None;
                     gather = None;
@@ -476,7 +458,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         op_syms[idx] = decl_syms;
     }
 
-    // Pass A2: record the built-in anchors (now every name resolves).
+    // Record the built-in anchors after every name resolves.
     let mut nat_succ = None;
     let mut nat_zero = None;
     let mut string_sym = None;
@@ -524,10 +506,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         }
     }
 
-    // Pass B: attach ctor / strat / special. A `poly` op's per-kind instances share the same
-    // attributes — including the special op, whose hooks resolve to the same constants for every kind
-    // (this is the re-attach-per-instance Maude does in `instantiatePolymorph`) — so resolve `special`
-    // once and apply to each instance.
+    // Attach constructor, strategy, and built-in attributes after every symbol profile exists. Polymorphic
+    // instances share one resolved attribute set.
     // A symbol can be reached by more than one declaration. Two kinds occur: (a) a later decl *upgrades*
     // an earlier one's special — NAT's `_+_` (no `minus`) and INT's `_+_` (with `minus`) share a symbol
     // (Nat/Int are one kind), and the later (INT) must win; (b) an ad-hoc re-import re-adds an *identical*
@@ -558,9 +538,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             )?,
             None => None,
         };
-        // `_.=._`'s decompose needs its own polymorph instance at each argument kind. Pass A expanded
-        // the `poly` op eagerly one instance per kind *in kind order*, so `op_syms[idx]` IS the
-        // kind-indexed sibling table.
+        // Polymorphic expansion creates one `_.=._` instance per kind in kind order, making
+        // `op_syms[idx]` the sibling table used by decomposition.
         if let Some(SpecialOp::DecomposeEquality { siblings, .. }) = &mut special {
             let n = engine.sorts().num_kinds();
             *siblings = (0..n).map(|k| op_syms[idx].get(k).copied()).collect();
@@ -575,10 +554,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             let range = resolve_sort(&engine, &sorts, &od.range)?;
             engine.set_qid_class(data.first().map(String::as_str), range);
         }
-        // Marker-class builtins (id-hooks that attach no SpecialOp: `s_`, `<Floats>`/`<Strings>`/
-        // `<Qids>`, `true`/`false`, the object constructor) are non-`STANDARD` in Maude's SymbolType,
-        // which the `.=.` stability analysis must see (a builtin `s X .=. s Y` stays unreduced while a
-        // user `[iter]` op decomposes — oracle-verified).
+        // Marker-only built-ins must remain distinguishable from ordinary symbols for `.=.` stability:
+        // built-in successors stay unreduced, while user-defined iteration operators may decompose.
         let marker = matches!(
             od.attrs.special.as_ref().and_then(|s| s.id_hook.as_ref()),
             Some((class, _))
@@ -596,13 +573,12 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 engine.set_strategy(sym, strat);
             }
             if let Some(frozen) = &od.attrs.frozen {
-                // Maude keeps the declaration but atomically ignores an invalid `frozen` attribute.
-                // Its warning text remains part of the deferred diagnostics surface.
+                // An invalid `frozen` attribute is ignored atomically; diagnostics are emitted at the
+                // frontend/session boundary.
                 let _ = engine.set_frozen(sym, frozen);
             }
-            // Object-system role flags (`config`/`obj`/`msg`/`portal`, Pillar 2.5). Mirror Maude's
-            // `SymbolType` CONFIG/OBJECT/MESSAGE/PORTAL bits onto the kernel symbol. Inert for the
-            // existing rewriting modes; the `erewrite` scheduler (Phase 2.5-B) keys on them.
+            // Store CONFIG/OBJECT/MESSAGE/PORTAL roles on the kernel symbol. They are metadata for
+            // ordinary rewriting and drive object/message partitioning in `erewrite`.
             if od.attrs.config || od.attrs.object || od.attrs.message || od.attrs.portal {
                 engine.set_oo_flags(
                     sym,
@@ -621,10 +597,9 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         }
     }
 
-    // Ad-hoc overloading flags for print disambiguation (Maude's `entry.cc`): for each symbol, whether
-    // another symbol shares its name (`ADHOC`), its name + domain kinds (`DOMAIN`), or its name + range
-    // kind (`RANGE`). Two symbols of the same name are necessarily in different connected components (same
-    // components ⇒ one symbol with subsort-overloaded declarations), so this is the cross-kind overloading.
+    // Overload flags record whether another symbol shares the name, domain-kind profile, or range
+    // kind. Symbols with the same name in one connected component share a declaration group, so these
+    // flags describe only cross-kind overloading used by print disambiguation.
     let overload = compute_overload_flags(&engine, &syntax);
 
     // Resolve declared variables `(name, sort)` for the grammar builder + `build_term`.
@@ -656,8 +631,8 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         syntax,
         op_profiles,
         vars,
-        statements: Vec::new(), // moved in by the caller (B4.4); kept out of `&PreModule`
-        eq_traces: Vec::new(),  // populated by load_statements (full-trace metadata)
+        statements: Vec::new(), // loaded separately after the module grammar is available
+        eq_traces: Vec::new(),  // populated with source-form trace metadata by load_statements
         mb_traces: Vec::new(),
         rl_traces: Vec::new(),
         oo_completion_diagnostics: Vec::new(),
@@ -687,10 +662,9 @@ fn compute_overload_flags(
     syntax: &HashMap<SymbolId, SymbolSyntax>,
 ) -> HashMap<SymbolId, u8> {
     use crate::sig::syntax::{OVL_ADHOC, OVL_DOMAIN, OVL_RANGE};
-    // Group symbols by (name, ARITY), recording each one's domain/range *kinds*: a k-argument
-    // application can only be confused with other k-argument declarations of the same name, so a
-    // different-arity overload (META-LEVEL's 4-arg vs 3-arg metaParse) must not force
-    // disambiguation — Maude echoes `metaParse(M, none, Q, T)` with a bare `none`.
+    // Group symbols by `(name, arity)`, recording domain and range kinds. Only declarations with the
+    // same arity can compete for an application, so a different-arity overload does not force range
+    // disambiguation; for example, the four-argument `metaParse(M, none, Q, T)` can keep `none` bare.
     type Profile = (SymbolId, Vec<KindId>, KindId);
     let mut by_name: HashMap<(&str, usize), Vec<Profile>> = HashMap::new();
     for (&sym, syn) in syntax {
@@ -772,8 +746,8 @@ fn op_hook_sym(
     i: &Interner,
 ) -> Option<SymbolId> {
     let (_, sig) = spec.op_hooks.iter().find(|(p, _)| p == purpose)?;
-    // Use the same canonicalization as an operator declaration. A backquoted blank in a hook signature
-    // (`op_to`term_.`) tokenizes as two adjacent maudeIds and must retain that boundary in the symbol key.
+    // Use operator-declaration canonicalization. A backquoted blank in a hook signature
+    // (`op_to`term_.`) produces adjacent identifier tokens whose boundary must remain in the symbol key.
     let colon = sig.iter().position(|t| i.resolve(t.sym) == ":")?;
     let name = canonical_name(&sig[..colon], i);
     name_to_sym.get(&name).copied()
@@ -835,11 +809,7 @@ fn special_op(
     };
     let code = data.first().map(String::as_str);
     let op = match class.as_str() {
-        // Markers (no reduction rule): the constant/successor literals, and the `true`/`false`
-        // boolean anchors (`SystemTrue`/`SystemFalse` — Maude's `trueSymbol`/`falseSymbol`). A marker
-        // carries no behaviour; `true`/`false` stand for themselves. They are *recorded* (Pass A2) so
-        // later passes — bare boolean conditions (`if pred` ⇒ `pred = true`), sort-test predicates —
-        // can reference the canonical truth constants.
+        // Marker hooks do not reduce. Literal anchors remain registered for condition and hook lookup.
         "SuccSymbol"
         | "StringSymbol"
         | "FloatSymbol"
@@ -847,11 +817,9 @@ fn special_op(
         | "SystemTrue"
         | "SystemFalse"
         | "SMT_NumberSymbol" => return Ok(None),
-        // `<_:_|_>` (CONFIGURATION's `ObjectConstructorSymbol`, Pillar 2.5). A marker: the object
-        // constructor is an ordinary free symbol for reduction/rewriting (its third argument is the
-        // ACU `AttributeSet`, matched by the existing engine). The C++ symbol adds object-pattern
-        // matching optimizations (via the `attributeSetSymbol` op-hook) that the `erewrite` scheduler
-        // will exploit (Phase 2.5-B); for plain rewrite/search nothing special is needed.
+        // CONFIGURATION's object constructor is an ordinary free symbol for reduction and rewriting.
+        // Its AttributeSet hook informs object-pattern completion; object/message scheduling uses the
+        // role flags attached above.
         "ObjectConstructorSymbol" => return Ok(None),
         "MinusSymbol" => SpecialOp::Minus {
             nat: nat_hooks(spec, name_to_sym, succ_zero, i)?,
@@ -862,15 +830,15 @@ fn special_op(
         "SMT_Symbol" => SpecialOp::Smt {
             op: smt_op(code.ok_or("SMT_Symbol code")?, arity)?,
         },
-        // `_==_`/`_=/=_`: structural equality of the two reduced arguments (ground or not — Maude
-        // decides `X == Y` as `false` for distinct variables too).
+        // `_==_`/`_=/=_` compare the two reduced arguments structurally, including nonground arguments;
+        // distinct variables compare unequal.
         "EqualitySymbol" => SpecialOp::Equality {
             eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("equalTerm")?,
             neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("notEqualTerm")?,
         },
         // The initial-equality predicate `_.=._`: decides ground/provably-unequal cases and
         // *decomposes* symbolic ones over stable constructors into `_and_`/`_or_` of smaller
-        // problems. The per-kind sibling-instance table is filled by Pass B (it needs `op_syms`).
+        // problems. The per-kind sibling-instance table is attached after polymorphic expansion.
         "CommutativeDecomposeEqualitySymbol" => SpecialOp::DecomposeEquality {
             eq: term_hook_sym(spec, "equalTerm", name_to_sym, i).ok_or("equalTerm")?,
             neq: term_hook_sym(spec, "notEqualTerm", name_to_sym, i).ok_or("notEqualTerm")?,
@@ -1046,9 +1014,8 @@ fn special_op(
         // tnk-session; the kernel binding only makes the no-local-object scheduler branch offer messages
         // to the host-owned ExternalManager seam.
         "InterpreterManagerSymbol" => SpecialOp::InterpreterManager,
-        // `stdin`/`stdout`/`stderr` (CONFIGURATION/STD-STREAM's `StreamManagerSymbol`, Pillar 2.5-C): a
-        // standard-stream external-object manager. The id-hook data selects the stream; the op-hooks name
-        // the `write`/`wrote` (and `getLine`/`gotLine`) message symbols the manager consumes/produces.
+        // `stdin`/`stdout`/`stderr`: standard-stream external-object managers. The id-hook selects the
+        // stream, and op-hooks identify the write/reply and line-input message symbols.
         "StreamManagerSymbol" => SpecialOp::StreamManager {
             stream: match code {
                 Some("stdin") => StdStream::Stdin,
@@ -1062,16 +1029,14 @@ fn special_op(
             get_line_msg: op_hook_sym(spec, "getLineMsg", name_to_sym, i),
             got_line_msg: op_hook_sym(spec, "gotLineMsg", name_to_sym, i),
         },
-        // An id-hook class this port has not implemented (MatrixOpSymbol, LoopSymbol, ...): declare the
-        // operator WITHOUT a special binding. The module loads and everything else in it works; the op
-        // itself stays inert (graceful-degrade stance).
+        // Unsupported id-hook classes (MatrixOpSymbol, LoopSymbol, ...) are declared without a special
+        // binding. Their operators remain inert while the rest of the module remains executable.
         _other => return Ok(None),
     };
     Ok(Some(op))
 }
 
-/// Map Maude's `SMT_Symbol` data attachment to the exact C++ operator enum. The `-` spelling is
-/// overloaded and therefore resolved by arity.
+/// Map an `SMT_Symbol` attachment code and arity to the typed operation. Arity disambiguates `-`.
 fn smt_op(code: &str, arity: usize) -> R<SmtOp> {
     Ok(match (code, arity) {
         ("true", 0) => SmtOp::True,
@@ -1103,9 +1068,7 @@ fn smt_op(code: &str, arity: usize) -> R<SmtOp> {
     })
 }
 
-/// Map a `MetaLevelOpSymbol` code (the descent function name) to its [`MetaOp`]. Reflection, SMT,
-/// and symbolic variant/narrowing functions have dedicated variants; strategy descent maps to
-/// [`MetaOp::Deferred`] (declared, inert).
+/// Map a `MetaLevelOpSymbol` code to its upper-layer operation.
 fn meta_op(code: &str) -> MetaOp {
     match code {
         "metaReduce" => MetaOp::Reduce,
@@ -1167,70 +1130,63 @@ fn meta_op(code: &str) -> MetaOp {
         "metaUpView" => MetaOp::UpView,
         "metaUpTerm" => MetaOp::UpTerm,
         "metaDownTerm" => MetaOp::DownTerm,
-        // Order-sorted unification descent (S1f). Current signature (variable-family `Qid` 3rd arg) and
-        // legacy signature (fresh-variable-count `Nat` 3rd arg) carry distinct id-hook codes.
+        // Both signature families share this dispatch; the third argument selects the result shape.
         "metaUnify" => MetaOp::Unify {
             disjoint: false,
             irredundant: false,
-            legacy: false,
         },
         "metaDisjointUnify" => MetaOp::Unify {
             disjoint: true,
             irredundant: false,
-            legacy: false,
         },
         "metaIrredundantUnify" => MetaOp::Unify {
             disjoint: false,
             irredundant: true,
-            legacy: false,
         },
         "metaIrredundantDisjointUnify" => MetaOp::Unify {
             disjoint: true,
             irredundant: true,
-            legacy: false,
         },
         "legacyMetaUnify" => MetaOp::Unify {
             disjoint: false,
             irredundant: false,
-            legacy: true,
         },
         "legacyMetaDisjointUnify" => MetaOp::Unify {
             disjoint: true,
             irredundant: false,
-            legacy: true,
         },
-        // Folding variant descent (S2), current Qid-family and legacy Nat-family signatures.
+        // Folding variants support Qid-family and Nat-indexed signatures.
         "metaGetVariant" => MetaOp::GetVariant {
             irredundant: false,
-            legacy: false,
+            nat_family: false,
         },
         "metaGetIrredundantVariant" => MetaOp::GetVariant {
             irredundant: true,
-            legacy: false,
+            nat_family: false,
         },
         "legacyMetaGetVariant" => MetaOp::GetVariant {
             irredundant: false,
-            legacy: true,
+            nat_family: true,
         },
         "legacyMetaGetIrredundantVariant" => MetaOp::GetVariant {
             irredundant: true,
-            legacy: true,
+            nat_family: true,
         },
         "metaVariantUnify" => MetaOp::VariantUnify {
             disjoint: false,
-            legacy: false,
+            nat_family: false,
         },
         "metaVariantDisjointUnify" => MetaOp::VariantUnify {
             disjoint: true,
-            legacy: false,
+            nat_family: false,
         },
         "legacyMetaVariantUnify" => MetaOp::VariantUnify {
             disjoint: false,
-            legacy: true,
+            nat_family: true,
         },
         "legacyMetaVariantDisjointUnify" => MetaOp::VariantUnify {
             disjoint: true,
-            legacy: true,
+            nat_family: true,
         },
         "metaVariantMatch" => MetaOp::VariantMatch,
         "metaNarrow" => MetaOp::Narrow { state_only: false },
@@ -1238,16 +1194,15 @@ fn meta_op(code: &str) -> MetaOp {
         "metaNarrowingApply" => MetaOp::NarrowingApply,
         "metaNarrowingSearch" => MetaOp::NarrowingSearch { path: false },
         "metaNarrowingSearchPath" => MetaOp::NarrowingSearch { path: true },
-        // Remaining strategy descent is declared but inert.
-        _ => MetaOp::Deferred,
+        // Unknown descent hook ids remain inert.
+        _ => MetaOp::Unknown,
     }
 }
 
-/// Find and resolve the **canonical** META-LEVEL hook set: the one descent op that carries the full
-/// `op-hook` list rather than a `shareWith` reference (it is `metaReduce`). All other descent ops
-/// (`metaRewrite`/`metaApply`/…) declare `op-hook shareWith (metaReduce …)` and reuse this set, so the
-/// down/up maps see the constructors (`qidSymbol`/`resultPairSymbol`/`assignmentSymbol`/…) regardless of
-/// declaration order. `None` if the module declares no such op (a module without `metaReduce`).
+/// Find and resolve the canonical META-LEVEL hook set: the descent operator with the full `op-hook` list,
+/// `metaReduce`. Other descent operators (`metaRewrite`, `metaApply`, and others) declare only
+/// `op-hook shareWith (metaReduce …)` and reuse this set, so down/up maps see all representation
+/// constructors regardless of declaration order. Returns `None` when the module has no `metaReduce`.
 fn find_canonical_meta_hooks(
     pm: &PreModule,
     sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
@@ -1475,8 +1430,7 @@ mod tests {
         build_module(&s.modules[0], &mut i).expect("build ok")
     }
 
-    /// B4.2 done-when: the parsed signature is the same one the hand-built B3.4 test constructs — proven by
-    /// reducing through the attached special ops (no equations needed; arithmetic is built-in).
+    /// A source-built signature attaches arithmetic operations and reduces their applications.
     #[test]
     fn nat_signature_reduces_via_special_ops() {
         let src = "\
@@ -1528,9 +1482,9 @@ endfm
         assert!(m.engine.deep_equal(r, tt_node), "2 < 3 = tt");
     }
 
-    /// Maude clears a nonbinary `assoc` flag before theory selection, retaining a free operator. The
-    /// compiled syntax must use that same effective flag or the grammar would still accept a flattened
-    /// associative argument list for a free ternary application.
+    /// A nonbinary `assoc` declaration compiles as a free operator. Its syntax must use the same effective
+    /// flag, or the grammar would incorrectly accept a flattened associative argument list for a ternary
+    /// application.
     #[test]
     fn nonbinary_assoc_compiles_as_free_theory() {
         let mut module = build(

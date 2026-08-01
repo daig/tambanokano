@@ -1,4 +1,4 @@
-*** B5: module summation `A + B` — the importer sees both modules' signatures.
+*** Module summation `A + B`: the importer sees both modules' signatures.
 fmod A is
   sort SA . ops a1 a2 : -> SA [ctor] . op fa : SA -> SA . eq fa(a1) = a2 .
 endfm

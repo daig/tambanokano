@@ -1,7 +1,7 @@
-*** Regression: the eq parser splits at the LAST top-level `=` and peels a trailing `[attrs]` only when
+*** The eq parser splits at the LAST top-level `=` and peels a trailing `[attrs]` only when
 *** it really is attributes — so an equation with a `[_]`-list rhs (`= rev(L) [X]`) and one ending in
 *** `[owise]` both parse (a `[_]`-list term is not mistaken for an attribute group, and `= [..]` is not
-*** mistaken for the `=[` of `_=[_]_`). Self-contained; oracle is this file through Maude 3.
+*** mistaken for the `=[` of `_=[_]_`).
 
 fmod BLIST is
   sorts Elt BList .

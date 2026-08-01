@@ -1,8 +1,7 @@
-*** B3.7 FLOAT built-in ops conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/float.maude < /dev/null
+*** FLOAT built-in operations conformance
 *** Floats are atomic NA constants (f64). FloatOpSymbol does arithmetic / negation / abs / sqrt /
 *** comparisons — all FREE ops (float arithmetic is not associative, so floats are never AC). Each is
-*** 1 rewrite. Mirrors the engine.rs B3.7 test. A `Truth`/`Flt` naming avoids the prelude's Bool/Float.
+*** 1 rewrite. A `Truth`/`Flt` naming avoids the prelude's Bool/Float.
 fmod FLTB is
   sorts Truth Flt .
   ops tt ff : -> Truth [ctor] .

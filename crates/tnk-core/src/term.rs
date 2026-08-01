@@ -1,9 +1,9 @@
-//! Patterns ([`Term`]), substitutions, equational matching, and instantiation for the free theory.
+//! Static terms, substitutions, matching, and instantiation.
 //!
-//! A [`Term`] is the *static* pattern form used in equation/rule left- and right-hand sides — the
-//! C++ `Term` (static) vs `DagNode` (runtime) duality. Phase 0 matching is a direct recursive
-//! structural match over the free theory with sort-checked variable binding; the compiled
-//! discrimination-net `LhsAutomaton` (A2) is a Phase-1 performance optimization.
+//! A [`Term`] is the static form used in equation and rule sides, distinct from the runtime
+//! [`DagNode`](crate::dag::DagNode). Matching dispatches through the crate-private `LhsAutomaton`:
+//! all-free patterns use direct structural matching, while theory-rooted and cross-theory patterns use
+//! their compiled, resumable automata.
 
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
@@ -14,8 +14,7 @@ use crate::symbol::{SymbolId, Theory};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// A pattern variable: an index into the enclosing statement's substitution, plus its sort.
-/// `Eq`/`Hash` (structural) let an rhs be scanned for a repeated subterm (C7 `rhs_shares`).
+/// A pattern variable: its substitution index and sort.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Var {
     pub index: u32,
@@ -27,9 +26,8 @@ enum InstantiatedBase<'a> {
     Dag(DagId),
 }
 
-/// A static term / pattern. `Eq`/`Hash` are **structural** (two syntactically-identical terms compare
-/// equal), used to detect a repeated subterm in an equation's rhs (the engine's `term_has_repeated_subterm`)
-/// so the C7 dedup memo is enabled only for rhs's that actually share — `fib`'s `s(N + M)` does not.
+/// A static term or pattern. Structural equality and hashing let the engine detect repeated rhs
+/// subterms and enable construction deduplication only when useful.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Var(Var),
@@ -45,10 +43,9 @@ pub enum Term {
         count: Nat,
         arg: Box<Term>,
     },
-    /// A built-in atomic literal — a string / quoted-id / float constant (the `NA` theory). Its `symbol`
-    /// is the pseudo-constructor (`<Strings>`/`<Qids>`/`<Floats>`); the `value` carries the payload a
-    /// plain `Op` constant cannot (two `<Floats>` constants differ only by value). A leaf — ground, and
-    /// matched only by an equal `Na` subject (Maude's `NA_Term`).
+    /// A built-in atomic literal: a string, quoted identifier, float, or SMT number. `symbol` is its
+    /// pseudo-constructor and `value` distinguishes constants that share that symbol. It is a ground
+    /// leaf and matches only a subject with the same symbol and value.
     Na {
         symbol: SymbolId,
         value: NaValue,
@@ -102,21 +99,21 @@ impl Term {
         }
     }
 
-    /// Parse an arbitrary-size decimal count and build [`Term::iter`]. Returns `None` for a malformed
-    /// decimal; callers that lexed an iteration token can turn this into their source-level diagnostic.
+    /// Parse an arbitrary-size decimal count and build [`Term::iter`]. Returns `None` for malformed
+    /// input so callers can produce the appropriate parse diagnostic.
     pub fn iter_decimal(symbol: SymbolId, count: &str, arg: Term) -> Option<Self> {
         Some(Self::iter(symbol, Nat::from_decimal(count)?, arg))
     }
     /// A float literal (`<Floats>`), stored as IEEE bits like [`NaValue::Float`].
     pub fn float(symbol: SymbolId, value: f64) -> Self {
-        // "don't allow IEEE-754 -0.0" (floatTerm.cc) — mirror the dag-level normalization.
+        // Normalize -0.0 exactly as the DAG constructor does.
         let value = if value == 0.0 { 0.0 } else { value };
         Term::Na {
             symbol,
             value: NaValue::Float(value.to_bits()),
         }
     }
-    /// A string literal (`<Strings>`) — a raw byte sequence (Maude strings are bytes, not UTF-8).
+    /// A string literal (`<Strings>`) stored as raw bytes rather than UTF-8 text.
     pub fn string(symbol: SymbolId, value: &[u8]) -> Self {
         Term::Na {
             symbol,
@@ -161,15 +158,10 @@ impl Term {
         }
     }
 
-    /// Whether the recursive free matcher [`Runtime::match_pattern`] can match this pattern: every
-    /// `Op` in it — root and descendants — must be a **free-theory** operator. A theory-rooted
-    /// (ACU/AU/CUI) `Op` is matched only by its own automaton; handed to `match_pattern` it returns a
-    /// *silent* non-match on the theory subject (`match_pattern`'s `Op` arm yields `false` for any
-    /// `Acu`/`Au`/`Cui` node). So a theory `Op` buried inside a free-matched (sub)pattern — a theory
-    /// subterm under a free operator, or a theory-rooted *ground* subterm under a theory operator —
-    /// would make its equation quietly never fire. Such patterns need the cross-theory `Sequence`
-    /// composition (a B1 follow-up) and are rejected **loudly** at compile time until then, mirroring
-    /// the alien-under-AC assert. Variables match any subject, so they are always fine.
+    /// Whether this pattern can use the deterministic all-free matcher. A theory-rooted operator anywhere
+    /// in the tree returns `false`, causing [`LhsAutomaton`](crate::theory::LhsAutomaton) to route the
+    /// pattern through a per-theory or free-with-aliens automaton instead. Variables and atomic literals
+    /// are valid leaves on the all-free path.
     pub(crate) fn is_free_matchable(&self, sig: &Signature) -> bool {
         match self {
             Term::Var(_) => true,
@@ -187,7 +179,7 @@ impl Term {
     }
 }
 
-/// An unconditional (Phase-0) equation `lhs = rhs` with `nr_vars` distinct variables.
+/// An unconditional equation `lhs = rhs` with `nr_vars` distinct variables.
 #[derive(Debug, Clone)]
 pub struct Equation {
     pub lhs: Term,
@@ -195,9 +187,8 @@ pub struct Equation {
     pub nr_vars: u32,
 }
 
-/// An (unconditional) membership axiom `mb lhs : sort` — asserts that any term matching `lhs` has
-/// (at least) sort `sort`, refining its least sort *downward* (B2.2). `nr_vars` is the distinct-variable
-/// count of `lhs`, as for [`Equation`]. Conditional membership (`cmb`) gains a condition in B2.3.
+/// An unconditional membership axiom that refines matching terms to `sort`.
+/// `nr_vars` is the number of distinct variables in `lhs`.
 #[derive(Debug, Clone)]
 pub struct Membership {
     pub lhs: Term,
@@ -224,11 +215,10 @@ pub enum ConditionFragment {
         subject: Term,
         fresh_vars: Vec<u32>,
     },
-    /// `lhs => pattern` (a **rewrite** condition, legal **only** in a rule `crl` — Pillar A-v): holds iff
-    /// `lhs`, instantiated and reduced, can reach (via `=>*`, zero or more rule steps) a state matching
-    /// `pattern`, binding its **fresh** variables `fresh_vars`. The reachable states are searched
-    /// breadth-first (the first match wins; a later fragment's failure retries the next reachable state),
-    /// and each rule step counts as a rewrite.
+    /// `lhs => pattern` — a rewrite condition legal only in a rule `crl`: holds when an instance of
+    /// `lhs` reaches a state matching `pattern`, binding its fresh variables. Reachable states are
+    /// breadth-first, a later-fragment failure resumes with the next state, and every rule step counts
+    /// as a rewrite.
     Rewrite {
         lhs: Term,
         pattern: Term,
@@ -236,14 +226,13 @@ pub enum ConditionFragment {
     },
 }
 
-/// A substitution: variable index → bound DAG node. Reused across match attempts via [`reset`].
+/// A substitution from variable index to bound DAG node, reused across match attempts via [`reset`].
 ///
 /// [`reset`]: Subst::reset
 ///
-/// `Clone` is the speculative-backtracking primitive for cross-theory matching: an ACU/AU matcher
-/// trying an alien sub-pattern against a subject element checkpoints the substitution before the
-/// attempt and restores it on backtrack (Maude's `local.copy(solution)` / `scratch.copy(local)` in
-/// `ACU_GreedyMatcher`). The bindings are a flat `Vec<Option<DagId>>`, so a clone is cheap.
+/// Cross-theory matchers clone the substitution to checkpoint speculative alien matches, then restore
+/// the clone on backtracking. The flat `Vec<Option<DagId>>` representation makes each checkpoint one
+/// contiguous binding-array copy.
 #[derive(Debug, Default, Clone)]
 pub struct Subst {
     bindings: Vec<Option<DagId>>,
@@ -273,7 +262,7 @@ impl Subst {
         self.bindings[index as usize] = Some(id);
     }
     /// Clear variable `index`. A multi-solution matcher (ACU) unbinds the variables it set before
-    /// computing the next solution, so a stale binding from a prior solution can't leak (F-4).
+    /// computing the next solution, so a binding from the prior solution cannot leak.
     pub(crate) fn unbind(&mut self, index: u32) {
         self.bindings[index as usize] = None;
     }
@@ -283,14 +272,12 @@ impl Runtime {
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
     /// [`Subst::reset`] to the pattern's variable count). Returns `true` on success. On failure
     /// `subst` may hold partial bindings, so callers reset before each attempt. Sort checks consult
-    /// the (shared) signature; binding/equality walk the runtime's DAG arena — the A4 split.
+    /// the (shared) signature; binding/equality walk the runtime's DAG arena.
     ///
-    /// Recurses on *pattern* depth only (the `Op` arm descends `pat.args`; a `Var` binds without
-    /// descending, and the non-linear case defers to the iterative [`Engine::deep_equal`]). Pattern
-    /// depth is author-controlled and small for hand-written equations, so — unlike the old
-    /// subject-depth recursion in `reduce` (A1) — this cannot overflow on deep runtime terms. A
-    /// machine-generated equation with a pathologically deep lhs would still recurse; that path is
-    /// superseded by A3's compiled, iterative `LhsAutomaton`.
+    /// Recurses on *pattern* depth only: the `Op` arm descends through `pat.args`, a `Var` binds
+    /// directly, and non-linear equality uses iterative [`Engine::deep_equal`]. Subject depth
+    /// therefore does not consume call-stack space. A pathologically deep generated pattern can
+    /// still exhaust the native stack.
     #[must_use]
     pub(crate) fn match_pattern(
         &self,
@@ -350,12 +337,9 @@ impl Runtime {
         }
     }
 
-    /// Match the **free skeleton** of `pat` against `subject`, binding the free variables and recording
-    /// each **theory-rooted** sub-pattern (an "alien" under a free operator — e.g. `a X` under `f`) as a
-    /// `(pattern, subject)` pair into `aliens` rather than matching it here (it is multi-solution and
-    /// matched later by its own automaton, composed into a [`Subproblem::Sequence`]). Returns `false`
-    /// if the free structure / variable sorts don't match. Used by the C8 free-with-aliens path; an
-    /// all-free pattern leaves `aliens` empty and behaves exactly like [`match_pattern`](Self::match_pattern).
+    /// Match a free-rooted pattern while collecting theory-rooted child patterns for separate,
+    /// resumable matching. The free skeleton binds deterministically; the collected pairs compose into
+    /// a [`Subproblem::Sequence`].
     pub(crate) fn match_skeleton(
         &self,
         sig: &Signature,
@@ -416,20 +400,11 @@ impl Runtime {
         }
     }
 
-    /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
+    /// Structural equality of two DAG nodes.
     ///
-    /// Iterative (explicit pair-stack) for the same reason as [`Engine::reduce`]: the recursive form
-    /// descended on *subject* depth and overflowed on deep terms (e.g. a non-linear pattern over a
-    /// million-deep chain).
-    ///
-    /// Compares top symbols and walks children through the [`DagNode::children`] visitor rather than
-    /// matching a specific `NodeTerm` arm: same-symbol + pairwise-equal-children is the
-    /// free-theory equality. It also serves the canonically-ordered representations whose identity is
-    /// fully carried by the child sequence (ACU, *provided* `children` yields the whole ordered
-    /// multiset, repeats included). A theory whose node carries scalar payload that is *not* a child
-    /// id — e.g. the S-theory's successor `count` — will need theory-specific equality here, exactly
-    /// as matching stays per-theory ([`match_pattern`](Self::match_pattern) keeps its own `NodeTerm`
-    /// arm).
+    /// Iterative (explicit pair stack) so a deeply nested runtime term cannot overflow the call stack.
+    /// Canonical theory nodes compare through their ordered child stream; representations with scalar
+    /// identity, such as an iterated successor's count, are checked explicitly below.
     #[must_use]
     pub(crate) fn deep_equal(&self, a: DagId, b: DagId) -> bool {
         let mut stack: Vec<(DagId, DagId)> = vec![(a, b)];
@@ -470,8 +445,8 @@ impl Runtime {
                 }
                 continue;
             }
-            // A variable's identity is its name-token code (Maude `VariableDagNode::equal`:
-            // symbol + id); the substitution `index` is bookkeeping. A leaf, like Na.
+            // Variable leaves compare by symbol (checked above) and name-token code. Their substitution
+            // `index` is bookkeeping and does not participate in identity.
             if let (NodeTerm::Var { name: vx, .. }, NodeTerm::Var { name: vy, .. }) =
                 (&nx.term, &ny.term)
             {
@@ -493,9 +468,9 @@ impl Runtime {
         true
     }
 
-    /// Resolve Maude `TermBag` left-to-right sharing candidates to already-reduced sub-DAGs of the
-    /// matched equation subject. Only reduced nodes are reusable: sharing a lazy lhs occurrence into
-    /// an eager rhs position would incorrectly skip its reduction.
+    /// Resolve candidate terms to exact, already-reduced sub-DAGs of the matched equation subject.
+    /// Only nodes stamped with the current equation epoch are reusable; reusing an unreduced lhs
+    /// occurrence in an eager rhs position would incorrectly skip its reduction.
     pub(crate) fn find_reduced_instances<'t>(
         &self,
         sig: &Signature,
@@ -616,11 +591,10 @@ impl Runtime {
 
     /// Build a DAG instance of `term` under `subst` (the rhs of a matched equation).
     ///
-    /// Recurses on *rhs* depth only (author-controlled, small), so like [`Engine::match_pattern`] it
-    /// is not exposed to the deep-subject overflow A1 fixed. Note its freshly built children live in
-    /// the native-stack `arg_ids` local, so it must not be a GC safe point (see the `ReduceFrame`
-    /// safe-point contract in `engine`). Allocates into the runtime's arena while the (shared)
-    /// signature stays borrowed — the A4 split that lets a rewrite instantiate without cloning the rhs.
+    /// Recurses on *rhs* depth only, independent of matched-subject depth. Freshly built children live
+    /// only in the native-stack `arg_ids` local until their parent is allocated, so this function must
+    /// not cross a GC safe point during that interval. It allocates in the runtime arena while the
+    /// shared signature remains borrowed, avoiding an rhs clone during rewriting.
     pub(crate) fn instantiate(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
         match term {
             Term::Var(v) => subst
@@ -643,8 +617,8 @@ impl Runtime {
         }
     }
 
-    /// Instantiate an rhs while reusing exact, already-reduced lhs subterms saved by the equation
-    /// matcher, mirroring Maude's `TermBag`/protected-variable path.
+    /// Instantiate an rhs while replacing exact terms listed in `reuse` with their saved,
+    /// already-reduced lhs DAGs.
     pub(crate) fn instantiate_reusing(
         &mut self,
         sig: &Signature,
@@ -674,12 +648,10 @@ impl Runtime {
         }
     }
 
-    /// [`instantiate`](Self::instantiate) with Maude's `RhsBuilder` CSE: each **textually repeated**
-    /// compound subterm of the rhs is built once and reused (so it reduces once and counts once —
-    /// the `< g(X), g(X) >` case), while *distinct* rhs subterms that merely instantiate to
-    /// equal values stay separate nodes and count separately — RAT's
-    /// `(I * M + J * N) / (N * M)` on `1/6 + 1/6` reduces `1 * 6` twice, exactly like Maude (a
-    /// value-keyed dedup window here undercounted by one).
+    /// Instantiate an rhs with syntax-keyed common-subexpression reuse. Each syntactically repeated
+    /// compound subterm is built once and shared, so reducing that shared instance increments the
+    /// rewrite count once. Distinct rhs subterms remain separate even when substitution gives them
+    /// equal values, preserving one reduction count per distinct occurrence.
     pub(crate) fn instantiate_cse(&mut self, sig: &Signature, term: &Term, subst: &Subst) -> DagId {
         self.instantiate_cse_with_reuse(sig, term, subst, &[])
     }
@@ -743,8 +715,8 @@ impl Runtime {
         if let Some((_, dag)) = reuse.iter().find(|(candidate, _)| *candidate == term) {
             return *dag;
         }
-        let shared = matches!(term, Term::Op { .. } | Term::Iter { .. })
-            && repeated.iter().any(|r| *r == term);
+        let shared =
+            matches!(term, Term::Op { .. } | Term::Iter { .. }) && repeated.contains(&term);
         if shared && let Some(&(_, d)) = memo.iter().find(|(k, _)| *k == term) {
             return d;
         }
@@ -905,9 +877,8 @@ mod tests {
         );
     }
 
-    /// Two structurally-equal chains `g^200000(a)` with *distinct* node ids: the recursive
-    /// `deep_equal` descended on subject depth and overflowed the stack on deep terms
-    /// (e.g. a non-linear pattern `h(X, X)` over deep arguments). The iterative pair-stack must not.
+    /// Iterative equality compares structurally equal `g^200000(a)` chains with distinct node ids
+    /// without recursing on runtime-term depth.
     #[test]
     fn deep_equal_iterative_on_deep_terms() {
         fn chain(e: &mut Engine, a: SymbolId, g: SymbolId, n: u32) -> DagId {

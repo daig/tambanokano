@@ -1,55 +1,19 @@
-//! META-LEVEL descent (Phase 3.1) — the [`DescentOps`] implementation.
+//! META-LEVEL and LEXICAL descent implementation.
 //!
-//! A descent redex (`metaReduce`/…) hands control here via the kernel's [`MetaCtx`] seam. [`MetaDescent`]
-//! holds the module database + interner, so it can **down**-translate the meta-module argument into a real
-//! object [`LoadedModule`] (a `PreModule` reconstructed from the meta-term, then the ordinary
-//! flatten+build pipeline), down-translate the subject meta-term into that module, run the engine
-//! operation, and **up**-translate the result back into the meta-level engine (via `ctx`).
+//! A [`MetaOp`] redex enters through the kernel's [`MetaCtx`] seam. [`MetaDescent`] combines the
+//! module/view databases, shared interner, and session state needed to down-translate a meta-module into
+//! an ordinary [`LoadedModule`], decode terms in that module, run the requested engine operation, and
+//! construct the up-translated result in the caller's engine.
 //!
-//! Scope (Stages 1–5 — the whole META-LEVEL surface): base unification, folding-variant descent, and
-//! narrowing descent are implemented; SMT and strategy descent remain deferred until their backends land.
+//! Supported groups include reduction, rewriting, matching, application and search; unification,
+//! variants and narrowing; SMT checking/search and variant satisfiability; module/sort queries and
+//! well-formedness; module/view/term reflection; syntax and lexical operations; and strategic rewriting
+//! plus strategy declaration/definition reflection. Inline and named meta-modules share the normal
+//! flatten-and-build path. Flat reflection inlines an import closure; non-flat reflection uses the
+//! module's own declarations and imports.
 //!
-//! * **The rewriting/matching/search family** (Stage 3) computes over a down-translated object module —
-//!   `metaReduce`/`metaNormalize` (→ `ResultPair`), `metaRewrite`/`metaFrewrite` (rule-/position-fair),
-//!   `metaMatch`/`metaXmatch` (→ `Substitution?`/`MatchPair?` + the hole context), `metaApply`/`metaXapply`
-//!   (a labelled rule at the top / any position → `ResultTriple?`/`Result4Tuple?`),
-//!   `metaSearch`/`metaSearchPath` (BFS reachability → `ResultTriple?` / the witness `Trace`). The module
-//!   argument may be an **import expression** (`[Q]`) *or* a module with **inline declarations** —
-//!   `down_module` reconstructs the full `PreModule`, runs the ordinary flatten+build, then installs the
-//!   inline statements via `down_term_to_term` (a `Term`-producing down-translation).
-//! * **The `up*` family** (Stage 4) decomposes a *named* built module back to its meta-rep:
-//!   `upModule`/`upImports`/`upSorts`/`upSubsortDecls`/`upOpDecls`/`upMbs`/`upEqs`/`upRls` (mirroring
-//!   `down_sorts`/`down_ops`/`install_*`), `upView`, and the term wrappers `upTerm`/`downTerm` (over the
-//!   *current* module via the [`MetaCtx`](tnk_core::descent::MetaCtx) name resolver). `flat = true` inlines
-//!   the whole import closure; `false` lists imports + only the module's own declarations (the suffix of the
-//!   flat build's trace vectors). `up_pattern` collapses successor chains to `'s_^n[…]`; `up_rule`/
-//!   `up_condition` reconstruct conditional rules/equations.
-//! * **The sort/kind queries** (Stage 4) read the down-translated module's lattice: `sortLeq`/`sameKind`/
-//!   `leastSort`/`lesserSorts`/`glbSorts`/`completeName`/`getKind(s)`/`maximal`/`minimalSorts`/
-//!   `maximalAritySet`. **Syntax** (Stage 4): `metaParse` (reuse the grammar + Earley parser → `ResultPair?`/
-//!   `noParse`), `metaPrettyPrint`/`metaPrintToString` (the format-aware `print_pretty` → `QidList`/`String`),
-//!   and `metaWellFormed{Module,Term,Substitution}` (structural checks → `Bool`).
-//!
-//! Every implemented descent function conforms on **value, sort, rewrite count, *and* layout** (Stage 3.5
-//! taught `print_pretty` the `format` attribute). Unification, variants, narrowing, SMT checking/search,
-//! strategic rewriting, and strategy declaration/definition reflection have dedicated [`MetaOp`] variants;
-//! exhaustive dispatch forces an explicit choice whenever a new descent operation is added.
-//!
-//! The strategy language supports both search modes, named strategy-module composition, the core
-//! combinators, tests, and matchrew/amatchrew. `xmatchrew` and conditional `csd` remain explicit
-//! resolution-time boundaries. `upModule`, `upStratDecls`, and `upSds` reflect source or flattened strategy
-//! payloads, including the covered sum/renaming/instantiation forms. The remaining strategy-meta gap is the
-//! parse/print pair (`metaParseStrategy`/`metaPrettyPrintStrategy`), which needs the inverse
-//! Strategy↔[`StratExpr`] translation without losing surface sugar.
-//!
-//! Other residuals are orthogonal corners, each riding its own subsystem: the Stage-3
-//! compute corners (conditional-rule `metaApply`, conditioned `metaMatch`, the partial substitution, the
-//! AC-residue `metaXmatch` context, the exhausted-search count); and the Stage-4 boundaries (flat-mode
-//! builtin imports — `special`/`poly` op hooks *and* the imported builtin module's statements, both leaving
-//! a flat `up*` over a builtin closure partial/inert, the inverse of [`down_attrs`]' boundary; the
-//! multi-attribute `ctor`-order ACU divergence; non-`mixfix` print options; and structured
-//! module-expression / op→term view maps). Own `[nonexec]` axioms + equation/membership labels *are* now
-//! retained (parsed on demand — build installs no trace; see [`parse_statement_trace`](tnk_frontend::load)).
+//! Dispatch covers every [`MetaOp`]. Inputs outside a handler's current contract leave the redex
+//! unreduced; finite enumerations use their protocol-specific failure constructors.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -93,6 +57,15 @@ use crate::flatten::{flatten, flatten_pre, flatten_with_homes};
 use crate::view::ViewDb;
 
 const META_CACHE_CAPACITY: usize = 4;
+
+type MetaXapplySolution = (
+    Vec<usize>,
+    usize,
+    Vec<DagId>,
+    DagId,
+    Option<(Vec<DagId>, Vec<DagId>)>,
+);
+/// Last transferred symbolic rewrite subcounts for a resumable cached engine.
 #[derive(Default)]
 struct SymbolicRewriteCheckpoint {
     variant_narrowing: u64,
@@ -129,6 +102,8 @@ struct ReflectedModule {
     flat: bool,
 }
 
+/// Session state for resumable metalevel searches and recognized module reflections.
+/// Rooted DAG keys are discarded when the owning [`MetaCtx`] changes.
 #[derive(Default)]
 pub struct MetaState {
     caches: Vec<MetaCache>,
@@ -137,8 +112,7 @@ pub struct MetaState {
 }
 
 impl MetaState {
-    /// Drop cached descent states before the REPL replaces the outer module engine that owns their
-    /// structurally keyed meta-term DAGs.
+    /// Drop all cached searches and reflected-module roots tied to the current metalevel context.
     pub fn clear(&mut self) {
         self.caches.clear();
         self.reflected_modules.clear();
@@ -192,7 +166,10 @@ impl MetaState {
         let MetaCache::Get(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn take_variant_unify(
@@ -207,7 +184,10 @@ impl MetaState {
         let MetaCache::Unify(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn take_narrow_apply(
@@ -222,7 +202,10 @@ impl MetaState {
         let MetaCache::NarrowApply(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn take_narrow_search(
@@ -237,22 +220,28 @@ impl MetaState {
         let MetaCache::NarrowSearch(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
-    fn take_legacy_narrow(
+    fn take_narrow_result(
         &mut self,
-        key: &MetaLegacyNarrowCacheKey,
+        key: &MetaNarrowResultCacheKey,
         ctx: &MetaCtx,
         requested: usize,
-    ) -> Option<MetaLegacyNarrowCache> {
+    ) -> Option<MetaNarrowResultCache> {
         let index = self.caches.iter().position(
-            |entry| matches!(entry, MetaCache::LegacyNarrow(cache) if cache.key.matches(key, ctx)),
+            |entry| matches!(entry, MetaCache::NarrowResult(cache) if cache.key.matches(key, ctx)),
         )?;
-        let MetaCache::LegacyNarrow(cache) = self.caches.remove(index) else {
+        let MetaCache::NarrowResult(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn take_srewrite(
@@ -267,7 +256,10 @@ impl MetaState {
         let MetaCache::Srewrite(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache.last_solution.is_some_and(|last| last > requested)).then_some(cache)
+        cache
+            .last_solution
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn take_smt_search(
@@ -282,10 +274,10 @@ impl MetaState {
         let MetaCache::SmtSearch(cache) = self.caches.remove(index) else {
             unreachable!("cache kind checked above")
         };
-        (!cache
+        cache
             .last_solution_index
-            .is_some_and(|last| last > requested))
-        .then_some(cache)
+            .is_none_or(|last| last <= requested)
+            .then_some(cache)
     }
 
     fn variant_sat_result(&self, key: &MetaVariantSatCacheKey, ctx: &MetaCtx) -> Option<bool> {
@@ -308,7 +300,7 @@ enum MetaCache {
     Unify(MetaVariantUnifyCache),
     NarrowApply(MetaNarrowApplyCache),
     NarrowSearch(MetaNarrowSearchCache),
-    LegacyNarrow(MetaLegacyNarrowCache),
+    NarrowResult(MetaNarrowResultCache),
     Srewrite(MetaSrewriteCache),
     SmtSearch(MetaSmtSearchCache),
     VariantSat(MetaVariantSatCache),
@@ -464,7 +456,7 @@ struct MetaNarrowSearchCache {
 }
 
 #[derive(Clone)]
-struct MetaLegacyNarrowCacheKey {
+struct MetaNarrowResultCacheKey {
     module: DagId,
     subject: DagId,
     goal: DagId,
@@ -472,7 +464,7 @@ struct MetaLegacyNarrowCacheKey {
     max_depth: Option<usize>,
 }
 
-impl MetaLegacyNarrowCacheKey {
+impl MetaNarrowResultCacheKey {
     fn matches(&self, other: &Self, ctx: &MetaCtx) -> bool {
         self.search_type == other.search_type
             && self.max_depth == other.max_depth
@@ -482,8 +474,8 @@ impl MetaLegacyNarrowCacheKey {
     }
 }
 
-struct MetaLegacyNarrowCache {
-    key: MetaLegacyNarrowCacheKey,
+struct MetaNarrowResultCache {
+    key: MetaNarrowResultCacheKey,
     _key_roots: Vec<tnk_core::root::RootGuard>,
     loaded: LoadedModule,
     search: tnk_core::narrow::NarrowSearch,
@@ -526,8 +518,8 @@ struct MetaSrewriteCache {
     rewrite_checkpoint: u64,
 }
 
-/// The descent handler: the module database/views (to resolve a meta-module's imports), the interner
-/// (to build the object module), and the REPL-owned state for Maude's cross-command variant cache.
+/// Executes metalevel descent against module/view databases with session-scoped caches and reflection
+/// state.
 pub struct MetaDescent<'a> {
     pub interner: &'a mut Interner,
     pub db: &'a ModuleDb,
@@ -565,7 +557,7 @@ struct MetaGetVariantCacheKey {
     family: Option<tnk_core::fresh::VariableFamily>,
     base: String,
     irredundant: bool,
-    legacy: bool,
+    nat_family: bool,
 }
 
 impl MetaGetVariantCacheKey {
@@ -573,7 +565,7 @@ impl MetaGetVariantCacheKey {
         self.family == other.family
             && self.base == other.base
             && self.irredundant == other.irredundant
-            && self.legacy == other.legacy
+            && self.nat_family == other.nat_family
             && ctx.deep_equal(self.module, other.module)
             && self.roots.len() == other.roots.len()
             && self
@@ -605,7 +597,7 @@ struct MetaVariantUnifyCacheKey {
     family: Option<tnk_core::fresh::VariableFamily>,
     base: String,
     disjoint: bool,
-    legacy: bool,
+    nat_family: bool,
     matching: bool,
     filtered: bool,
     delayed: bool,
@@ -616,7 +608,7 @@ impl MetaVariantUnifyCacheKey {
         self.family == other.family
             && (self.matching || self.base == other.base)
             && self.disjoint == other.disjoint
-            && self.legacy == other.legacy
+            && self.nat_family == other.nat_family
             && self.filtered == other.filtered
             && self.delayed == other.delayed
             && self.matching == other.matching
@@ -682,10 +674,9 @@ impl MetaVariantUnifyCache {
         if !self.upfront {
             let rewrites = env.e.rewrites();
             if self.stream.pending_len() > pending_before {
-                // Direct `metaVariantUnify` transfers work accumulated while skipping rejected
-                // candidates only when it returns a survivor. Leave a terminal failed call beyond
-                // the checkpoint: direct descent drops it, while the interpreter-manager path
-                // reports and transfers it (metaVariantUnify.cc:101-112; miVariantUnify.cc:129-141).
+                // Direct descent charges work skipped before each surviving candidate. A terminal failure
+                // leaves additional work beyond the checkpoint; interpreter-managed accounting transfers
+                // that tail when reporting exhaustion.
                 self.rewrite_charge += rewrites.saturating_sub(self.rewrite_checkpoint);
                 self.rewrite_checkpoint = rewrites;
             }
@@ -817,8 +808,8 @@ impl<'a> MetaDescent<'a> {
         }
     }
 
-    /// Use the external interpreter manager's rewrite-count contract. Unlike direct meta descent,
-    /// its terminal filtered-unifier reply reports work spent proving that no next result exists.
+    /// Enable interpreter-managed rewrite accounting. A terminal filtered-unifier failure then reports
+    /// work spent proving exhaustion; direct descent reports only through the last surviving candidate.
     pub fn with_interpreter_manager_accounting(mut self) -> Self {
         self.interpreter_manager_accounting = true;
         self
@@ -839,7 +830,7 @@ impl DescentOps for MetaDescent<'_> {
             // the STRUCTURAL AXIOMS ONLY (AC order, id/idem collapse — no user equations).
             MetaOp::Reduce => self.meta_reduce(ctx, hooks, redex),
             MetaOp::Normalize => self.meta_normalize(ctx, hooks, redex),
-            // The rewriting/matching/search family (Stage 3): down/up + the engine's rewrite/match/search.
+            // Rewriting, matching, application, and search.
             MetaOp::Rewrite => self.meta_rewrite(ctx, hooks, redex, false),
             MetaOp::Frewrite => self.meta_rewrite(ctx, hooks, redex, true),
             MetaOp::Match => self.meta_match(ctx, hooks, redex),
@@ -857,7 +848,7 @@ impl DescentOps for MetaDescent<'_> {
                 explicit_sorts,
             } => self.meta_variant_sat(ctx, hooks, redex, validity, explicit_sorts),
             MetaOp::VariantSatWellFormed => self.meta_variant_sat_well_formed(ctx, hooks, redex),
-            // Stage 4 — the sort/kind queries (down the module, read the sort lattice).
+            // Sort and kind queries.
             MetaOp::SortLeq => self.meta_sort_leq(ctx, hooks, redex),
             MetaOp::SameKind => self.meta_same_kind(ctx, hooks, redex),
             MetaOp::LeastSort => self.meta_least_sort(ctx, hooks, redex),
@@ -869,11 +860,11 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::MaximalSorts => self.meta_maximal_sorts(ctx, hooks, redex),
             MetaOp::MinimalSorts => self.meta_minimal_sorts(ctx, hooks, redex),
             MetaOp::MaximalAritySet => self.meta_maximal_arity_set(ctx, hooks, redex),
-            // Stage 4 — wellformedness checks.
+            // Well-formedness checks.
             MetaOp::WellFormedModule => self.meta_well_formed_module(ctx, hooks, redex),
             MetaOp::WellFormedTerm => self.meta_well_formed_term(ctx, hooks, redex),
             MetaOp::WellFormedSubstitution => self.meta_well_formed_subst(ctx, hooks, redex),
-            // Stage 4 — the up* family (decompose a built module back to its meta-rep).
+            // Module and term reflection.
             MetaOp::UpModule => self.meta_up_module(ctx, hooks, redex),
             MetaOp::UpImports => self.meta_up_imports(ctx, hooks, redex),
             MetaOp::UpSorts => self.meta_up_part(ctx, hooks, redex, UpPart::Sorts),
@@ -893,7 +884,7 @@ impl DescentOps for MetaDescent<'_> {
                 Some(down_term_ctx(ctx, hooks, meta).unwrap_or(default))
             }
             MetaOp::UpView => self.meta_up_view(ctx, hooks, redex),
-            // Stage 4 — syntax: parse a token list / pretty-print a term in a module's grammar.
+            // Parse and pretty-print against a module's syntax.
             MetaOp::Parse => self.meta_parse(ctx, hooks, redex),
             MetaOp::PrettyPrint => self.meta_pretty_print(ctx, hooks, redex, false),
             MetaOp::PrintToString => self.meta_pretty_print(ctx, hooks, redex, true),
@@ -901,8 +892,7 @@ impl DescentOps for MetaDescent<'_> {
             // interner, while their inputs/results remain ordinary String/Qid NA nodes in this engine.
             MetaOp::Tokenize => self.lexical_tokenize(ctx, hooks, redex),
             MetaOp::PrintTokens => self.lexical_print_tokens(ctx, hooks, redex),
-            // Stage 5 — strategy syntax reflection. The shared up-mappers are also used by
-            // `upModule`, keeping standalone `upStratDecls`/`upSds` structurally identical.
+            // Strategy declaration/definition reflection shares the same mappers as `upModule`.
             MetaOp::UpStratDecls | MetaOp::UpSds => {
                 let kids = ctx.children(redex);
                 let name = qid_text(ctx, *kids.first()?)?;
@@ -919,37 +909,36 @@ impl DescentOps for MetaDescent<'_> {
                     ),
                 }
             }
-            // Order-sorted unification descent (S1f).
             MetaOp::Unify {
                 disjoint,
                 irredundant,
-                legacy,
-            } => self.meta_unify(ctx, hooks, redex, disjoint, irredundant, legacy),
-            // S2 variant operations have distinct dispatch identities so they cannot silently fall through
+            } => self.meta_unify(ctx, hooks, redex, disjoint, irredundant),
+            // Variant operations have distinct dispatch identities so they cannot silently fall through
             // to an unrelated descent function. Their concrete handlers are wired with the variant engine.
             MetaOp::GetVariant {
                 irredundant,
-                legacy,
-            } => self.meta_get_variant(ctx, hooks, redex, irredundant, legacy),
-            MetaOp::VariantUnify { disjoint, legacy } => {
-                self.meta_variant_unify(ctx, hooks, redex, disjoint, legacy)
-            }
+                nat_family,
+            } => self.meta_get_variant(ctx, hooks, redex, irredundant, nat_family),
+            MetaOp::VariantUnify {
+                disjoint,
+                nat_family,
+            } => self.meta_variant_unify(ctx, hooks, redex, disjoint, nat_family),
             MetaOp::VariantMatch => self.meta_variant_match(ctx, hooks, redex),
             MetaOp::NarrowingApply => self.meta_narrowing_apply(ctx, hooks, redex),
             MetaOp::NarrowingSearch { path } => self.meta_narrowing_search(ctx, hooks, redex, path),
             MetaOp::Narrow { state_only: false } => self.meta_narrow(ctx, hooks, redex),
-            // The retired v1 state-enumeration surface is recognized but intentionally inert.
+            // `metaNarrow2` is recognized but inert.
             MetaOp::Narrow { state_only: true } => None,
             MetaOp::Srewrite { depth_first } => self.meta_srewrite(ctx, hooks, redex, depth_first),
-            MetaOp::Deferred => None,
+            MetaOp::Unknown => None,
         }
     }
 }
 
 impl MetaDescent<'_> {
-    /// Execute the `(n+1)`-th META-INTERPRETER strategy result while retaining the completed search.
-    /// Strategy search computes its solution stream eagerly; the cache transfers only the cumulative
-    /// prefix through result `n`, then transfers the remaining tail when exhaustion is requested.
+    /// Return the `(n+1)`-th strategic rewrite result while retaining the completed search.
+    /// The search computes its solution stream eagerly. The cache charges only the cumulative prefix
+    /// through result `n`, then charges the remaining tail when a caller requests exhaustion.
     fn meta_srewrite(
         &mut self,
         ctx: &mut MetaCtx,
@@ -1025,9 +1014,8 @@ impl MetaDescent<'_> {
 }
 
 impl MetaDescent<'_> {
-    /// `metaCheck(M, T)` → `(true).Bool` when the decoded Boolean SMT formula is satisfiable and
-    /// `(false).Bool` when it is unsatisfiable. An unavailable solver, an indeterminate answer, or a
-    /// non-SMT Boolean DAG leaves the descent redex unreduced, matching Maude's undecided/error path.
+    /// `metaCheck(M, T)` reduces to `(true).Bool` for satisfiable formulas and `(false).Bool` for
+    /// unsatisfiable formulas. Unavailable, indeterminate, or non-SMT inputs leave the redex unreduced.
     ///
     /// Solver translation and checking do not perform object rewrites. The successful descent itself is
     /// therefore the only rewrite charged by `try_special`; reductions of the two meta arguments have
@@ -1187,10 +1175,10 @@ impl MetaDescent<'_> {
         up_bool(ctx, result)
     }
 
-    /// The stock facade passes named modules as `upModule('M, true)`. The general up-map cannot
-    /// materialize a flat module containing builtin `special`/`poly` declarations, so that child
-    /// deliberately stays unreduced. Consume the named request directly here; ordinary reflected
-    /// module constructors and `[M]` import expressions still use the general down-map.
+    /// Resolve `upModule(Q, flat)` variant-satisfiability arguments directly from the module database
+    /// after validating the Boolean `flat` argument. This supports named builtin modules whose
+    /// `special`/`poly` declarations cannot be encoded by the general reflection path. Explicit reflected
+    /// constructors and `[M]` import expressions still use [`Self::down_module`].
     fn down_variant_sat_module(
         &mut self,
         ctx: &mut MetaCtx,
@@ -1207,8 +1195,8 @@ impl MetaDescent<'_> {
         self.down_module(ctx, hooks, module)
     }
 
-    /// `metaReduce(M, T)` → `{up(t'), up(leastSort(t'))}` where `t'` is `down(T)` reduced in `down(M)`.
-    /// The object reduction's rewrite count is folded into the current command's total (Maude's count).
+    /// `metaReduce(M, T)` returns the reduced term and its least sort. Object rewrites contribute to the
+    /// current command's total.
     fn meta_reduce(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         if kids.len() != 2 {
@@ -1225,12 +1213,9 @@ impl MetaDescent<'_> {
         Some(ctx.app(rp, vec![ut, us]))
     }
 
-    /// `metaNormalize(M, T)` → `{up(t'), up(leastSort(t'))}` where `t'` is `down(T)` normalized modulo the
-    /// module's **structural axioms only** — AC/ACU ordering, `id:`/`idem` collapse, `iter` fold — with **no
-    /// user equations applied**. `down_term` constructs the dynamic DAG; `normalize_for_unify` performs
-    /// Maude's eager `Term::normalize(true)` pass, including flattening nested associative applications
-    /// whose children are not reduction-stamped. The inverse temptation is `meta_reduce`, which additionally
-    /// runs user equations. No object rewrites are counted (Maude does not `addInCount` here).
+    /// `metaNormalize(M, T)` returns the term normalized by structural axioms only: associative flattening
+    /// and ordering, identity/idempotence collapse, and iteration folding. It does not apply user equations
+    /// or charge object rewrites.
     fn meta_normalize(
         &mut self,
         ctx: &mut MetaCtx,
@@ -1267,7 +1252,7 @@ impl MetaDescent<'_> {
         let bound = down_bound(ctx, hooks, *kids.get(2)?);
         loaded.built.engine.reset_rewrites();
         let result = if position_fair {
-            // `metaFrewrite`'s 4th argument is the per-position gas (Maude's `frewrite`).
+            // The fourth argument is per-position gas.
             let gas = down_nat64(ctx, *kids.get(3)?)?;
             let mut rw = loaded.built.engine.frewrite(subj, gas);
             rw.run(&mut loaded.built.engine, bound).term
@@ -1282,23 +1267,22 @@ impl MetaDescent<'_> {
         Some(ctx.app(rp, vec![ut, us]))
     }
 
-    /// `metaMatch(M, P, S, C, n)` → the `(n+1)`-th solution's `Substitution` of matching pattern `P`
-    /// against the reduced subject `S` at the top, or `noMatch` (`Substitution?`). The condition `C`
-    /// currently must be `nil` (an empty condition); a non-empty such-that is a follow-on.
+    /// `metaMatch(M, P, S, C, n)` returns the `(n+1)`th top-match substitution, or `noMatch`.
+    /// Non-empty `C` conditions are currently unsupported and produce no descent result.
     fn meta_match(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
         let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
-        // The condition (such-that) is handled only when empty for now.
+        // Only the empty such-that condition is supported.
         if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
             return None;
         }
         let sol_nr = down_nat64(ctx, *kids.get(4)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let subj = loaded.built.engine.reduce(subj); // Maude matches against the reduced subject
+        let subj = loaded.built.engine.reduce(subj); // Match against the reduced subject.
         ctx.add_rewrites(loaded.built.engine.rewrites());
         // Capture the (n+1)-th solution's bindings while the matcher stream borrows the engine.
         let bindings = nth_match(&mut loaded.built.engine, pattern, nr, subj, false, sol_nr);
@@ -1316,13 +1300,11 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
-    /// `metaUnify`/`metaDisjointUnify`/`metaIrredundant{,Disjoint}Unify(M, UP, Qid, n)` → the `(n+1)`-th
-    /// unifier of the problem `UP` in `M`, up-translated as a `UnificationPair` `{Substitution, familyQid}`
-    /// (or a `UnificationTriple` `{Subst_lhs, Subst_rhs, familyQid}` for the disjoint variants), or
-    /// `noUnifier`/`noUnifierIncomplete`. The result's fresh-variable family is Maude's
-    /// `variableFamilyToUse`: `'#` unless the hint argument is `'#`, then `'%` (unificationProblem.cc:61).
-    /// `disjoint` renames the two sides' variables apart and splits the solution; `irredundant` keeps only
-    /// the most-general unifiers (Maude's `UnifierFilter`) before indexing.
+    /// Return the `(n+1)`-th unifier for `metaUnify`, `metaDisjointUnify`, or their irredundant forms.
+    /// With a Qid third argument, the result pair/triple ends in the selected fresh-family Qid; with a Nat
+    /// third argument, it ends in the next free-variable index. Exhaustion returns
+    /// `noUnifier`/`noUnifierIncomplete`. Disjoint forms rename the two sides apart; irredundant forms
+    /// filter to most-general unifiers before indexing.
     fn meta_unify(
         &mut self,
         ctx: &mut MetaCtx,
@@ -1330,25 +1312,21 @@ impl MetaDescent<'_> {
         redex: DagId,
         disjoint: bool,
         irredundant: bool,
-        _declared_legacy: bool,
     ) -> Option<DagId> {
         use tnk_core::fresh::VariableFamily;
         use tnk_core::unify::UnifyEnv;
         use tnk_core::unify::problem::{UnifyProblem, VarSpec};
 
         let kids = ctx.children(redex);
-        // The current and legacy prelude declarations have the same name and arity, so this port's
-        // name/arity symbol table folds them onto one symbol and the later attachment is last-wins.
-        // Select the overload from the observable 3rd argument instead: Qid is current, Nat is legacy.
-        let legacy = !matches!(ctx.repr(*kids.get(2)?), NodeRepr::Qid(_));
+        // Qid-family and Nat-family declarations share a name and arity, so the symbol table carries a
+        // single hook. Select the result shape from the observable third argument.
+        let nat_family = !matches!(ctx.repr(*kids.get(2)?), NodeRepr::Qid(_));
 
-        // 3rd argument. Current signature: a variable-family Qid whose result family is Maude's
-        // `variableFamilyToUse` ('#' unless the hint IS '#', then '%'), and the `ok` family for the
-        // safe-name check is the hint itself. Legacy signature: a `Nat` base for fresh-variable numbering
-        // in family '#' — the result carries the *next* free index (a `Nat`) instead of a family Qid, and
-        // the safe-name check has no reserved family (NONE).
-        let (used_family, base, ok_family) = if legacy {
-            // The base is an unbounded `Nat` (Maude's `mpz`); keep it as a decimal string.
+        // A Qid argument selects a fresh variable family and returns that family as a Qid. A Nat argument
+        // supplies an unbounded base for `#`-family numbering and returns the next free index as a Nat.
+        // Nat-family safe-name checking has no reserved input family.
+        let (used_family, base, ok_family) = if nat_family {
+            // Preserve the unbounded natural base as decimal text.
             let base = down_nat_decimal(ctx, *kids.get(2)?)?;
             (VariableFamily::Unify, base, None)
         } else {
@@ -1366,11 +1344,10 @@ impl MetaDescent<'_> {
             VariableFamily::Narrow => "@",
         };
         let sol_nr = down_nat64(ctx, *kids.get(3)?)? as usize;
-        // A `check`-style meta program asks for indices 0,1,2,… by repeatedly rebuilding the same
-        // redex. Cache an exponentially grown current-API prefix for this outer reduce command: each
-        // growth still enumerates from scratch, but the total work is O(n), not O(n²). Legacy counters
-        // and irredundant filtering retain their existing one-shot paths.
-        let cache_key = if !legacy && !irredundant {
+        // A meta-level consumer may request indices 0, 1, 2, … by repeatedly rebuilding the same redex.
+        // Cache an exponentially grown Qid-family prefix: each growth enumerates from scratch, but total
+        // work remains O(n). Nat-family counters and irredundant filtering use one-shot enumeration.
+        let cache_key = if !nat_family && !irredundant {
             Some(MetaUnifyCacheKey {
                 module: *kids.first()?,
                 roots: meta_unification_roots(ctx, hooks, *kids.get(1)?)?,
@@ -1410,10 +1387,8 @@ impl MetaDescent<'_> {
         )?;
         let n_vars = specs_raw.len();
 
-        // Maude's meta down-conversion splits a variable qid (`L:Bag`) and gives the kernel the bare
-        // name's existing token code (`L`), not the compound qid's code. This preserves the session-wide
-        // variable order used by term canonicalization. For disjoint unification, rhs names are made
-        // distinct with `Token::flaggedCode`'s reserved bit while retaining that order.
+        // Split variable qids such as `L:Bag` and derive ordering from the bare name's token code. Disjoint
+        // rhs variables set the reserved flag bit while retaining that order.
         const FLAGGED_CODE_BIT: u32 = 0x4000_0000;
         let codes: Vec<u32> = (0..n_vars)
             .map(|k| {
@@ -1455,11 +1430,8 @@ impl MetaDescent<'_> {
             })
             .collect();
 
-        // Safe-name check (Maude's `variableNameConflict`): a problem variable named like the fresh
-        // family (`#1` when the used family is `#`) is unsafe → no reduction (advisory only).
-        // The `ok` family is the *hint* argument (Maude passes `incomingVariableFamily`): a problem
-        // variable that looks like a fresh variable of any *other* family will clash with the fresh
-        // variables this call generates.
+        // A problem variable that looks like a generated fresh name conflicts unless it belongs to the
+        // accepted incoming family. Conflicts leave the meta operation unreduced.
         let namegen = tnk_core::fresh::FreshVariableGenerator::new();
         for (name, _) in &specs_raw {
             let bare = name.split(':').next().unwrap_or("");
@@ -1473,7 +1445,7 @@ impl MetaDescent<'_> {
         let mut collected: Vec<Vec<DagId>> = Vec::new();
         let mut exhausted = false;
         let incomplete;
-        let last_var_index; // legacy result's `Nat` = base + nrFreeVariables of the chosen unifier
+        let last_var_index; // Nat-family result: base + free variables in the selected unifier
         let original_order;
         {
             let mut names = InternerNames(self.interner);
@@ -1484,7 +1456,7 @@ impl MetaDescent<'_> {
             let mut prob = UnifyProblem::new(&mut env, equations, specs, used_family, &base);
             original_order = prob.original_variable_order().to_vec();
             if !prob.problem_okay() {
-                return None; // unimplemented-theory screen — no reduction
+                return None; // unsupported-theory screen: no reduction
             }
             if irredundant {
                 while let Some(u) = prob.find_next(&mut env) {
@@ -1526,8 +1498,7 @@ impl MetaDescent<'_> {
             return render_cached_meta_unifier(ctx, hooks, cache, self.interner, sol_nr);
         }
 
-        // The result's third component: a family `Qid` (current) or the next free-variable index `Nat`
-        // (legacy `base + nrFreeVariables`).
+        // The third component is a family Qid or the Nat-family next free-variable index.
         let result = match unifiers.get(sol_nr) {
             None => {
                 let hook = match (disjoint, incomplete) {
@@ -1547,7 +1518,7 @@ impl MetaDescent<'_> {
                     bindings_original[old_slot] = bindings[new_slot];
                 }
                 let bindings = &bindings_original;
-                let third = if legacy {
+                let third = if nat_family {
                     up_nat_big(ctx, &last_var_index)?
                 } else {
                     ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(family_root.into()))
@@ -1574,7 +1545,7 @@ impl MetaDescent<'_> {
                         &rhs_names,
                         rhs_b,
                     );
-                    let hook = if legacy {
+                    let hook = if nat_family {
                         "legacyUnificationTripleSymbol"
                     } else {
                         "unificationTripleSymbol"
@@ -1590,9 +1561,9 @@ impl MetaDescent<'_> {
                         &names,
                         bindings,
                     );
-                    // The current `{_,_}:Substitution Qid` UnificationPair coincides with `matchPairSymbol`
-                    // at the kind level (metaUp.cc); the legacy `{_,_}:Substitution Nat` is its own symbol.
-                    let hook = if legacy {
+                    // `{_,_}:Substitution Qid` shares `matchPairSymbol`; the Nat-indexed pair has a
+                    // dedicated constructor.
+                    let hook = if nat_family {
                         "legacyUnificationPairSymbol"
                     } else {
                         "matchPairSymbol"
@@ -1734,8 +1705,8 @@ impl MetaDescent<'_> {
             rewrite_charge += rewrites.saturating_sub(cache.rewrite_checkpoint);
             cache.rewrite_checkpoint = rewrites;
             let Some(state) = next else {
-                // The reference counts at most the one narrowing step it returns, not the
-                // intermediate solutions skipped while seeking a later ordinal.
+                // A reply charges at most one successful narrowing step: skipped steps are excluded, and
+                // a failure excludes every successful step visited while seeking the requested ordinal.
                 ctx.add_rewrites(rewrite_charge.saturating_sub(successful_steps));
                 let (variant_narrowing, _) = take_symbolic_subcounts(
                     &cache.loaded.built.engine,
@@ -1851,9 +1822,8 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
-    /// Frozen v1 `metaNarrow` served by the v3 narrowing graph. The adapter composes the final
-    /// goal unifier into the reached state and returns only bindings for variables introduced by
-    /// the goal, reproducing the legacy `ResultTriple` contract.
+    /// `metaNarrow` searches the narrowing graph, composes the final goal unifier into the reached state,
+    /// and returns a `ResultTriple` containing only bindings for variables introduced by the goal.
     fn meta_narrow(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         use tnk_core::narrow::{
             NarrowFold, NarrowGoal, NarrowOptions, NarrowSearch, NarrowSearchType,
@@ -1872,7 +1842,7 @@ impl MetaDescent<'_> {
             _ => return None,
         };
         let max_depth = down_bound(ctx, hooks, kids[4]).map(|bound| bound as usize);
-        let key = MetaLegacyNarrowCacheKey {
+        let key = MetaNarrowResultCacheKey {
             module: kids[0],
             subject: kids[1],
             goal: kids[2],
@@ -1881,7 +1851,7 @@ impl MetaDescent<'_> {
         };
         let sol_nr = down_nat64(ctx, kids[5])? as usize;
 
-        let mut cache = if let Some(cache) = self.state.take_legacy_narrow(&key, ctx, sol_nr) {
+        let mut cache = if let Some(cache) = self.state.take_narrow_result(&key, ctx, sol_nr) {
             cache
         } else {
             let mut loaded = self.down_module(ctx, hooks, kids[0])?;
@@ -1992,7 +1962,7 @@ impl MetaDescent<'_> {
                 .into_iter()
                 .map(|dag| ctx.root(dag))
                 .collect();
-            MetaLegacyNarrowCache {
+            MetaNarrowResultCache {
                 key: key.clone(),
                 _key_roots: key_roots,
                 loaded,
@@ -2043,7 +2013,7 @@ impl MetaDescent<'_> {
 
         let solution = &cache.solutions[sol_nr].solution;
         let alpha =
-            legacy_narrowing_alpha_map(&mut cache.loaded.built.engine, self.interner, solution);
+            narrowing_result_alpha_map(&mut cache.loaded.built.engine, self.interner, solution);
         let state_term = cache.search.state(solution.state).0;
         let term =
             instantiate_narrowing_solution(&mut cache.loaded.built.engine, state_term, solution);
@@ -2083,11 +2053,12 @@ impl MetaDescent<'_> {
             vec![term_meta, type_meta, substitution_meta],
         );
         cache.last_solution = Some(sol_nr);
-        self.state.insert(MetaCache::LegacyNarrow(cache));
+        self.state.insert(MetaCache::NarrowResult(cache));
         Some(result)
     }
 
-    /// Variant-based narrowing search and its history-preserving path form.
+    /// Variant-based narrowing search. Equal and forward ordinal requests resume the structurally keyed
+    /// search; backward requests restart it. The path form retains and returns the complete step trace.
     fn meta_narrowing_search(
         &mut self,
         ctx: &mut MetaCtx,
@@ -2173,8 +2144,8 @@ impl MetaDescent<'_> {
                 })
                 .collect();
 
-            // Maude indexes source variables by the canonical subject DAG, then appends goal-only
-            // variables. This remains visible in the initial renaming and every accumulated substitution.
+            // Index source variables by canonical subject-DAG order, then append variables found only in the
+            // goal. Initial renaming and accumulated substitutions expose this order.
             let mut variable_order =
                 tnk_core::variant::variables_in_dag(&loaded.built.engine, subject);
             for slot in tnk_core::variant::variables_in_dag(&loaded.built.engine, goal) {
@@ -2494,16 +2465,15 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
-    /// `metaGetVariant(M, T, TL, F, n)` returns the `n`th folding variant of `T`. Maude retains the
-    /// live search in its four-entry structural meta-operation cache: equal indices reuse the current
-    /// result, forward indices resume it, and a backward request discards it and starts over.
+    /// `metaGetVariant(M, T, TL, F, n)` returns the `n`th folding variant of `T`. Equal indices reuse the
+    /// cached result, forward indices resume the live search, and backward requests restart it.
     fn meta_get_variant(
         &mut self,
         ctx: &mut MetaCtx,
         hooks: &MetaHooks,
         redex: DagId,
         irredundant: bool,
-        legacy: bool,
+        nat_family: bool,
     ) -> Option<DagId> {
         use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
         use tnk_core::unify::problem::VarSpec;
@@ -2513,7 +2483,7 @@ impl MetaDescent<'_> {
         if kids.len() != 5 {
             return None;
         }
-        let (incoming_family, base) = if legacy {
+        let (incoming_family, base) = if nat_family {
             (None, down_nat_decimal(ctx, kids[3])?)
         } else {
             (
@@ -2531,7 +2501,7 @@ impl MetaDescent<'_> {
             family: incoming_family,
             base: base.clone(),
             irredundant,
-            legacy,
+            nat_family,
         };
         let sol_nr = down_nat64(ctx, kids[4])? as usize;
 
@@ -2685,8 +2655,8 @@ impl MetaDescent<'_> {
                 &names,
                 &variant.substitution,
             );
-            let family = if legacy {
-                legacy_variant_next_index(
+            let family = if nat_family {
+                nat_family_variant_next_index(
                     ctx,
                     &cache.loaded.built.engine,
                     self.interner,
@@ -2702,7 +2672,7 @@ impl MetaDescent<'_> {
                 None => ctx.app(*hooks.ops.get("noParentSymbol")?, vec![]),
             };
             let more = up_bool(ctx, variant.more_in_layer)?;
-            let hook = if legacy {
+            let hook = if nat_family {
                 "legacyVariantSymbol"
             } else {
                 "variantSymbol"
@@ -2723,14 +2693,14 @@ impl MetaDescent<'_> {
         hooks: &MetaHooks,
         redex: DagId,
         disjoint: bool,
-        legacy: bool,
+        nat_family: bool,
     ) -> Option<DagId> {
         use tnk_core::fresh::{FreshVariableGenerator, VariableFamily};
         use tnk_core::unify::problem::VarSpec;
         use tnk_core::variant::{VariantMode, VariantSearch};
 
         let kids = ctx.children(redex);
-        let (incoming_family, base, filtered, delayed, sol_nr) = if legacy {
+        let (incoming_family, base, filtered, delayed, sol_nr) = if nat_family {
             if kids.len() != 5 {
                 return None;
             }
@@ -2765,7 +2735,7 @@ impl MetaDescent<'_> {
             family: incoming_family,
             base: base.clone(),
             disjoint,
-            legacy,
+            nat_family,
             matching: false,
             filtered,
             delayed,
@@ -3005,8 +2975,8 @@ impl MetaDescent<'_> {
             for (new_slot, &old_slot) in cache.canonical_order.iter().enumerate() {
                 bindings_original[old_slot] = result_bindings[new_slot];
             }
-            let third = if legacy {
-                legacy_unifier_next_index(
+            let third = if nat_family {
+                nat_family_unifier_next_index(
                     ctx,
                     &cache.loaded.built.engine,
                     self.interner,
@@ -3045,7 +3015,7 @@ impl MetaDescent<'_> {
                     &rhs_names,
                     rhs_b,
                 );
-                let hook = if legacy {
+                let hook = if nat_family {
                     "legacyUnificationTripleSymbol"
                 } else {
                     "unificationTripleSymbol"
@@ -3065,7 +3035,7 @@ impl MetaDescent<'_> {
                     &names,
                     &bindings_original,
                 );
-                let hook = if legacy {
+                let hook = if nat_family {
                     "legacyUnificationPairSymbol"
                 } else {
                     "matchPairSymbol"
@@ -3105,7 +3075,7 @@ impl MetaDescent<'_> {
             family: Some(incoming_family),
             base: "0".to_string(),
             disjoint: false,
-            legacy: false,
+            nat_family: false,
             matching: true,
             filtered,
             delayed,
@@ -3398,8 +3368,8 @@ impl MetaDescent<'_> {
     }
 
     /// `metaSmtSearch(M, S, P, C, kind, fresh, B, n)` performs resumable symbolic rewriting modulo SMT.
-    /// The cache key intentionally excludes only the requested solution number, matching Maude's
-    /// `MetaOpCache`; each newly consumed solution charges one outer rewrite.
+    /// The cache key excludes only the requested solution number; each consumed solution charges one outer
+    /// rewrite.
     fn meta_smt_search(
         &mut self,
         ctx: &mut MetaCtx,
@@ -3642,8 +3612,7 @@ impl MetaDescent<'_> {
         }
         let result = match sol {
             Some(s) => {
-                // Maude reports the rewrite count *at* the solution state (the snapshot), not the total
-                // exploration (BFS may have visited siblings first).
+                // Charge the solution state's rewrite snapshot, not later sibling exploration.
                 ctx.add_rewrites(s.rewrites);
                 let state = search.state_term(s.state)?;
                 let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, state);
@@ -3666,11 +3635,9 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
-    /// `metaApply(M, T, L, σ, n)` → the `(n+1)`-th application of a rule labelled `L` at the **top** of the
-    /// reduced `T` (extending the partial substitution σ) → `{up(reduced rhs), up(type), up(σ ∪ match)}`,
-    /// or `failure` (`ResultTriple?`). The rule application itself counts one rewrite (Maude's accounting),
-    /// on top of the subject and result reductions. The labelled rules must currently be unconditional;
-    /// the partial substitution is installed into the matcher before it enumerates completions.
+    /// `metaApply(M, T, L, σ, n)` returns the `(n+1)`th top application of rule `L` to reduced `T`,
+    /// extending σ. The application adds one rewrite beyond subject and result reductions. Labelled rules
+    /// must currently be unconditional.
     fn meta_apply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
@@ -3749,11 +3716,9 @@ impl MetaDescent<'_> {
         Some(result)
     }
 
-    /// `metaXmatch(M, P, S, C, minD, maxD, n)` → the `(n+1)`-th **extension** match of `P` against the
-    /// reduced `S` at the top → `{substitution, context}` (`MatchPair`), or `noMatch`. When the match
-    /// consumes the whole subject (a free/iterated top, or every AC argument bound) the context is the bare
-    /// hole `[]`; a *partial* AC match (a proper sub-multiset, leaving a residue context `op([], …)`) is a
-    /// follow-on — it stays inert rather than report a wrong context. `C` must be `nil`.
+    /// `metaXmatch(M, P, S, C, minD, maxD, n)` returns the `(n+1)`th top extension match and its context.
+    /// Whole-subject matches use the bare hole `[]`. Partial AC matches remain inert rather than returning
+    /// an invalid residue context. `C` must be `nil`.
     fn meta_xmatch(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
@@ -3891,13 +3856,7 @@ impl MetaDescent<'_> {
             max_d,
             &mut positions,
         );
-        let mut all: Vec<(
-            Vec<usize>,
-            usize,
-            Vec<DagId>,
-            DagId,
-            Option<(Vec<DagId>, Vec<DagId>)>,
-        )> = Vec::new();
+        let mut all: Vec<MetaXapplySolution> = Vec::new();
         for path in &positions {
             let subterm = subterm_at(&loaded.built.engine, subj, path);
             for (ri, (lhs, _, names, nr)) in rules.iter().enumerate() {
@@ -4025,10 +3984,9 @@ impl MetaDescent<'_> {
         })
     }
 
-    // ---- Stage 4: sort/kind queries (down the module, read the sort lattice) ----
+    // ---- sort and kind queries ----
 
-    /// `sortLeq(M, T1, T2)` → `Bool` — `T1 <= T2` (same kind *and* subsort, mirroring Maude's
-    /// `s1->component() == s2->component() && leq(s1, s2)`).
+    /// `sortLeq(M, T1, T2)` is true exactly when both types share a kind and `T1` is a subsort of `T2`.
     fn meta_sort_leq(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4059,8 +4017,8 @@ impl MetaDescent<'_> {
         up_bool(ctx, r)
     }
 
-    /// `leastSort(M, T)` → the `Type` of the least sort of the down-translated term (no reduction —
-    /// our `down_term` computes the sort at construction, Maude's `computeTrueSort`).
+    /// `leastSort(M, T)` returns the construction-time least sort of the down-translated term without
+    /// reducing it.
     fn meta_least_sort(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4143,8 +4101,7 @@ impl MetaDescent<'_> {
         Some(up_sort_set(ctx, hooks, &loaded.built, &glb))
     }
 
-    /// `completeName(M, T)` → the resolved `Type` (a valid sort/kind name maps to itself; Maude's
-    /// `downType`→`upType`). `None` if `T` is not a type of `M`.
+    /// `completeName(M, T)` returns the resolved type when `T` names a sort or kind of `M`.
     fn meta_complete_name(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4186,8 +4143,7 @@ impl MetaDescent<'_> {
         Some(up_sort_set(ctx, hooks, &loaded.built, &errs))
     }
 
-    /// `maximalSorts(M, K)` → the `SortSet` of `K`'s maximal sorts (those with no proper supersort).
-    /// `None` unless `K` is a kind (Maude requires `k->index() == Sort::KIND`).
+    /// `maximalSorts(M, K)` returns the maximal sorts of kind `K`, or remains inert unless `K` is a kind.
     fn meta_maximal_sorts(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4233,10 +4189,8 @@ impl MetaDescent<'_> {
         Some(up_sort_set(ctx, hooks, &loaded.built, &minimal))
     }
 
-    /// `maximalAritySet(M, Q, D, S)` → the `TypeListSet` of maximal argument-sort lists of operator `Q`
-    /// (arity = |D|, each argument in `D`'s component) whose range is `<= S` — Maude's `getMaximalOpDeclSet`.
-    /// A domain is maximal when no other candidate's argument sorts are all `>=` it. `None` if `Q` is not an
-    /// operator of that profile.
+    /// `maximalAritySet(M, Q, D, S)` returns maximal argument-sort lists of arity `|D|` whose components
+    /// match `D` and whose range is at most `S`. A domain is maximal when no candidate is pointwise greater.
     fn meta_maximal_arity_set(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4295,7 +4249,7 @@ impl MetaDescent<'_> {
         })
     }
 
-    /// `wellFormed(M)` → `Bool` — whether the module meta-term builds (Maude's `downModule != 0`).
+    /// `wellFormed(M)` reports whether the module meta-term builds.
     fn meta_well_formed_module(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4307,9 +4261,8 @@ impl MetaDescent<'_> {
         up_bool(ctx, ok)
     }
 
-    /// `wellFormed(M, T)` → `Bool` — whether `T` down-translates to a well-formed term of `M` (each
-    /// application's argument kinds matching the operator's domain). The module itself must build (else
-    /// inert, as Maude's `downModule == 0` path).
+    /// `wellFormed(M, T)` reports whether `T` builds with argument kinds matching each operator domain.
+    /// An invalid module leaves the operation inert.
     fn meta_well_formed_term(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4325,9 +4278,8 @@ impl MetaDescent<'_> {
         up_bool(ctx, ok)
     }
 
-    /// `wellFormed(M, S)` → `Bool` — whether every assignment `'X:Sort <- value` of substitution `S` has a
-    /// well-formed value whose kind matches the variable's sort (Maude's `downSubstitution` +
-    /// `dagifySubstitution`, including the kind-clash rejection). The module must build (else inert).
+    /// `wellFormed(M, S)` checks each substitution value and its kind against the variable sort. An invalid
+    /// module leaves the operation inert.
     fn meta_well_formed_subst(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4340,12 +4292,10 @@ impl MetaDescent<'_> {
         up_bool(ctx, ok)
     }
 
-    // ---- Stage 4: the up* family (decompose a named, built module back to its meta-rep) ----
+    // ---- module reflection ----
 
-    /// `upModule(Q, flat)` → the `Module` meta-rep of the module named `Q`. `flat = true` inlines the whole
-    /// import closure (a `nil` import list); `flat = false` lists the imports and emits only the module's
-    /// own declarations (Maude's `getNrImported*` suffix). The argument order mirrors the module
-    /// constructor `fmod_is_sorts_.____endfm` / `mod_is_sorts_._____endm`.
+    /// `upModule(Q, flat)` reflects module `Q`. Flat mode inlines the import closure and emits a nil import
+    /// list; non-flat mode lists imports and only root-owned declarations.
     fn meta_up_module(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4361,10 +4311,10 @@ impl MetaDescent<'_> {
         Some(module)
     }
 
-    /// Build the canonical reflection of a source-backed module and retain the compiled source module
-    /// used to produce it. The paired value lets `down_module_impl` recognize an unchanged `upModule`
-    /// result and preserve the source module's symbol/variable creation order instead of rebuilding that
-    /// unobservable order from META-LEVEL's declaration sets.
+    /// Build the canonical reflection of a database module and retain the compiled module used to produce
+    /// it. The paired value lets `down_module_impl` recognize an unchanged `upModule` result and preserve
+    /// symbol/variable creation order instead of reconstructing that unobservable order from declaration
+    /// sets.
     fn up_module_named(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4375,8 +4325,7 @@ impl MetaDescent<'_> {
         let mut p = self.module_pieces(hooks, name, flat)?;
 
         let name_qid = ctx.make_na(hooks.ops["qidSymbol"], NaValue::Qid(name.into()));
-        // A parameterized module's header carries its parameter list (`'LIST{'X :: 'TRIV}`); the flat form
-        // and a non-parameterized module use the bare name Qid (Maude's `upHeader`).
+        // Parameterized non-flat headers carry their parameter list; other forms use the bare name Qid.
         let header = if flat || p.params.is_empty() {
             name_qid
         } else {
@@ -4621,10 +4570,10 @@ impl MetaDescent<'_> {
         }
     }
 
-    /// `metaParse(M, VS, QL, T?)` → `{up(parsed term), up(least sort)}` (`ResultPair`) of parsing the
-    /// token list `QL` in `M`'s grammar, or `noParse(n)` at the first unparseable token. The parse does not
-    /// reduce. `VS` supplies typed variables whose names may be abbreviated in `QL` (`'A:List` lets token
-    /// `'A` parse as that variable); an explicit type on a token remains authoritative.
+    /// `metaParse(M, VS, QL, T?)` → `{up(parsed term), up(least sort)}` (`ResultPair`) after parsing the
+    /// token list `QL` in `M`'s grammar, or `noParse(n)` at the furthest token reached by a valid partial
+    /// parse. Parsing does not reduce. `VS` supplies typed variables whose names may be abbreviated in
+    /// `QL` (`'A:List` lets `'A` name that variable); an explicit token type remains authoritative.
     fn meta_parse(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
@@ -4663,9 +4612,7 @@ impl MetaDescent<'_> {
                 }
             }
             Err(_) => {
-                // The unparseable-token position: the furthest token a valid partial parse reached
-                // (Maude's `badTokenIndex`), so `'a 'b` over a module where `a` parses but nothing follows
-                // reports `noParse(1)`, not `noParse(0)`.
+                // Report the furthest token reached by a valid partial parse.
                 let pos = command_parse_furthest(&loaded, self.interner, &tokens);
                 let n = up_nat(ctx, pos as u64)?;
                 ctx.app(*hooks.ops.get("noParseSymbol")?, vec![n])
@@ -4719,10 +4666,10 @@ impl MetaDescent<'_> {
         ))
     }
 
-    /// `tokenize(S)` scans a raw byte string with LEXICAL's deliberately small lexer (not the source
-    /// lexer): whitespace, controls, and otherwise-invalid bytes are skipped; punctuation is returned as
-    /// backquoted Qids. Invalid UTF-8 inside an identifier cannot inhabit the existing `Qid(Rc<str>)`
-    /// representation, so the partial hook safely stays unreduced rather than replacing bytes lossily.
+    /// `tokenize(S)` scans raw bytes with LEXICAL's dedicated scanner, separate from the module-language
+    /// lexer. Whitespace, controls, and unrecognized bytes are skipped; punctuation splits unless
+    /// backquoted and is returned as a Qid. An identifier containing invalid UTF-8 leaves the partial hook
+    /// unreduced because Qids store UTF-8 text.
     fn lexical_tokenize(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4748,9 +4695,9 @@ impl MetaDescent<'_> {
         ))
     }
 
-    /// `printTokens(QL)` is the inverse-oriented token-list formatter from
-    /// `QuotedIdentifierOpSymbol::printQidList`: its spacing state and the `\n`/`\t`/`\s`/`\\` control
-    /// Qids are observable String bytes and intentionally differ from the ordinary term pretty-printer.
+    /// `printTokens(QL)` formats a token list with punctuation-sensitive spacing. The
+    /// `\n`/`\t`/`\s`/`\\` control Qids emit observable String bytes; this byte-level format is separate
+    /// from the ordinary term pretty-printer.
     fn lexical_print_tokens(
         &mut self,
         ctx: &mut MetaCtx,
@@ -4763,11 +4710,10 @@ impl MetaDescent<'_> {
         Some(ctx.make_na(*hooks.ops.get("stringSymbol")?, NaValue::Str(output.into())))
     }
 
-    /// Build the decomposition pieces of module `name`: the (flat or own) surface sorts/subsorts/ops + the
-    /// import list + the trace index ranges for memberships/equations/rules. `flat` selects the whole
-    /// import closure (from the flattened `PreModule`) vs. the module's own declarations (`db.get(name)`)
-    /// with imports listed separately; the own statement traces are the suffix of the flat build's trace
-    /// vectors (flatten appends a module's own statements after its imports).
+    /// Build reflected pieces for module `name`: surface declarations, imports, and membership/equation/
+    /// rule trace ranges. `flat` selects the complete flattened declaration set with no imports; otherwise
+    /// only the module-owned declarations are returned and imports stay explicit. Root-owned statements
+    /// occupy the prefix of the flattened statement and trace vectors.
     fn module_pieces(&mut self, hooks: &MetaHooks, name: &str, flat: bool) -> Option<ModulePieces> {
         let pm = self.db.get(name)?.clone();
         let (flat_pm, statement_homes) =
@@ -5008,11 +4954,9 @@ impl MetaDescent<'_> {
         m: DagId,
         retain_source: bool,
     ) -> Option<(Option<PreModule>, LoadedModule)> {
-        if !retain_source {
-            if let Some((name, flat)) = self.state.reflected_source(ctx, m) {
-                let loaded = self.module_pieces(hooks, &name, flat)?.loaded;
-                return Some((None, loaded));
-            }
+        if !retain_source && let Some((name, flat)) = self.state.reflected_source(ctx, m) {
+            let loaded = self.module_pieces(hooks, &name, flat)?.loaded;
+            return Some((None, loaded));
         }
         let ctor = ctx.name(ctx.top(m)).to_string();
         // A source-backed `upModule(Q, flat)` may remain unreduced when its reflected surface contains a
@@ -5031,12 +4975,11 @@ impl MetaDescent<'_> {
         // Constructor layout: [0]=Header(Qid), [1]=ImportList, [2]=SortSet, [3]=SubsortDeclSet,
         // [4]=OpDeclSet, [5]=MembAxSet, [6]=EquationSet, [7]=RuleSet (system only), [8,9]=Strat* (smod).
         let (name, params) = down_header(ctx, hooks, *kids.first()?)?;
-        // `upModule` erases declaration order into idempotent AC declaration sets. A reflected module is
-        // therefore not generally `deep_equal` to the value obtained after META-LEVEL normalizes those
-        // sets: duplicate imported declarations have disappeared. At the insertion boundary, recognize
-        // that normalized value as an exact source-backed reflection. Reusing the source module preserves
-        // object-completion provenance and statement metadata, but its executable rules must adopt the
-        // reflected RuleSet's canonical order: child interpreters rebuild dependents from this source.
+        // `upModule` stores declarations in idempotent AC sets. Normalization may remove duplicate imported
+        // declarations, so a normalized reflection is not generally DAG-equal to a freshly built one.
+        // At insertion, compare modulo those sets and reuse the database module to retain object-completion
+        // and statement metadata. Its executable rules still adopt the reflected RuleSet's canonical order
+        // because child interpreters rebuild dependents from the retained module.
         let mut source_op_order = None;
         if self.db.get(&name).is_some() {
             for flat in [true, false] {
@@ -5088,8 +5031,8 @@ impl MetaDescent<'_> {
                                 .copied()
                                 .unwrap_or(usize::MAX)
                         });
-                        // The Rust signature builder resolves identities eagerly; retain the reflected
-                        // order within each arity class while making nullary identities available first.
+                        // The signature builder resolves identities eagerly. Retain reflected order within
+                        // each arity class while making nullary identities available first.
                         source.ops.sort_by_key(|op| !op.domain.is_empty());
                         reorder_source_rules(
                             &mut source,
@@ -5267,26 +5210,16 @@ impl MetaDescent<'_> {
             return None;
         }
         let kids = ctx.children(view);
-        let Some(header) = kids.first().copied() else {
-            return None;
-        };
-        let Some((name, params)) = down_header(ctx, hooks, header) else {
-            return None;
-        };
-        let Some(from) = kids
+        let header = kids.first().copied()?;
+        let (name, params) = down_header(ctx, hooks, header)?;
+        let from = kids
             .get(1)
             .copied()
-            .and_then(|node| down_module_expr(ctx, hooks, node))
-        else {
-            return None;
-        };
-        let Some(to) = kids
+            .and_then(|node| down_module_expr(ctx, hooks, node))?;
+        let to = kids
             .get(2)
             .copied()
-            .and_then(|node| down_module_expr(ctx, hooks, node))
-        else {
-            return None;
-        };
+            .and_then(|node| down_module_expr(ctx, hooks, node))?;
 
         let sort_maps = flatten_set(
             ctx,
@@ -5423,7 +5356,7 @@ fn qualify_view_variables(
         {
             qualified.extend(tokenize(&format!("{text}:{sort}"), interner));
         } else {
-            qualified.push(token.clone());
+            qualified.push(*token);
         }
     }
     qualified
@@ -5636,11 +5569,9 @@ fn qidset_texts(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Vec<String
         .collect()
 }
 
-/// The scanner used only by LEXICAL's `tokenize`. This mirrors `Mixfix/tokenizer.ll`, whose grammar is
-/// intentionally not the source lexer: comments and dots have no special meaning, bad/control bytes are
-/// skipped, and `( ) [ ] { } ,` split unless backquoted. The returned spellings use this port's existing
-/// Qid payload convention: syntactic backquotes before punctuation are removed (the Qid renderer restores
-/// them), while backquotes joining ordinary characters remain semantic name separators.
+/// Scanner backing LEXICAL `tokenize`, separate from module-language tokenization. Comments and dots have
+/// no special meaning; bad/control bytes are skipped; punctuation splits unless backquoted. Returned Qids
+/// omit syntactic backquotes before punctuation while retaining semantic backquote separators.
 fn lexical_tokens(input: &[u8]) -> Option<Vec<String>> {
     fn control(b: u8) -> bool {
         b < b' ' || b == 0x7f
@@ -5703,8 +5634,8 @@ fn lexical_tokens(input: &[u8]) -> Option<Vec<String>> {
             };
             token.extend_from_slice(&input[at..end]);
             at = end;
-            // A backquote joins two `normal` atoms inside one normalSeq. It remains part of the token's
-            // canonical spelling (unlike source-level operator-name blank handling).
+            // A backquote joins two `normal` atoms inside one normalSeq and remains in the token's
+            // canonical spelling. Module-syntax operator-name blank handling follows different rules.
             while input.get(at) == Some(&b'`') {
                 let Some(end) = normal_atom(input, at + 1) else {
                     break;
@@ -5715,10 +5646,10 @@ fn lexical_tokens(input: &[u8]) -> Option<Vec<String>> {
             }
         }
         if at == start {
-            at += 1; // tokenizer.ll's catch-all rule discards one otherwise-unrecognized byte
+            at += 1; // Discard one unrecognized byte.
             continue;
         }
-        // Token::fixUp removes backslash-newline continuations after the flex match.
+        // Remove backslash-newline continuations after scanning.
         let mut fixed = Vec::with_capacity(token.len());
         let mut i = 0;
         while i < token.len() {
@@ -5734,7 +5665,7 @@ fn lexical_tokens(input: &[u8]) -> Option<Vec<String>> {
     Some(result)
 }
 
-/// Maude 3.5.1's byte-valued `QuotedIdentifierOpSymbol::printQidList`.
+/// Render lexical tokens as bytes with punctuation-sensitive spacing.
 fn print_lexical_tokens(words: &[String]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut need_space = false;
@@ -5743,8 +5674,7 @@ fn print_lexical_tokens(words: &[String]) -> Vec<u8> {
         if let [c] = bytes
             && matches!(c, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',')
         {
-            // The live oracle follows its C++ predicate literally: every punctuation except `{` takes
-            // this branch. Thus `a (b )c`, `a ,b`, but `a{ b }c`.
+            // Every punctuation mark except `{` takes this branch: `a (b )c`, `a ,b`, but `a{ b }c`.
             if *c != b'{' {
                 if need_space {
                     output.push(b' ');
@@ -5781,8 +5711,7 @@ fn print_lexical_tokens(words: &[String]) -> Vec<u8> {
                     need_space = true;
                     continue;
                 }
-                // ANSI Qids and reset append `Tty::ctrlSequence()`. In the non-TTY evaluation mode used
-                // by both command runners that sequence is empty, and spacing state is unchanged.
+                // ANSI-control Qids emit no bytes in this non-TTY formatter and leave spacing unchanged.
                 b'!' | b'?' | b'u' | b'f' | b'x' | b'h' | b'p' | b'r' | b'g' | b'y' | b'b'
                 | b'm' | b'c' | b'w' | b'P' | b'R' | b'G' | b'Y' | b'B' | b'M' | b'C' | b'W'
                 | b'o' => continue,
@@ -5953,7 +5882,7 @@ fn down_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId, i: &mut Interner) -> O
         {
             // printing / metadata / memo — no effect on reduction; safe to drop.
         } else {
-            return None; // a semantic attribute we do not yet reconstruct for an own-op
+            return None; // unknown semantic attributes make the reflected operator unsupported
         }
     }
     Some(a)
@@ -6265,7 +6194,7 @@ fn install_eqs(
         let kids = ctx.children(stmt);
         let mut vars = VarIndex::new();
 
-        // Build order lhs → condition → rhs, sharing one variable index (matches Maude's numbering).
+        // Build lhs, condition, then rhs while sharing one variable index.
         let (lhs, rhs, condition, attrs) = if sym == eq {
             let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars);
             let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars);
@@ -6389,10 +6318,8 @@ fn reflected_pattern_key(
                         )
                     })
                     .collect();
-                // The source engine's ACU node is already flattened, but its children were ordered by
-                // tnk's source-symbol approximation. Maude orders the reflected meta-term by the Qid/
-                // meta-application keys that it actually emits. Re-sort commutative children in that
-                // observable order before this key drives RuleSet installation.
+                // The source DAG uses symbol-based child order; reflected RuleSets use the emitted Qid and
+                // application keys. Re-sort commutative children by the latter before installation.
                 if engine.symbol_is_commutative(symbol) {
                     args.sort_by(|left, right| {
                         compare_reflected_pattern_keys(
@@ -6566,9 +6493,8 @@ fn compare_reflected_key_nodes(
     }
 }
 
-/// Apply the AC-canonical order of an `upModule` RuleSet to a source-built executable rule table.
-/// Deferred `upModule` payloads bypass an actual meta-term/down-term round trip, but that shortcut must
-/// not retain source declaration order: Maude's external interpreter sees the canonical RuleSet order.
+/// Apply reflected RuleSet order to a source-built executable rule table. Deferred payloads bypass the
+/// meta-term round trip but must still use canonical RuleSet order.
 fn reorder_rules_like_reflection(
     hooks: &MetaHooks,
     m: &mut BuiltModule,
@@ -6633,9 +6559,8 @@ fn reorder_rules_like_reflection(
     canonical_ids
 }
 
-/// Reorder the executable rule declarations in a retained source module to the canonical order of its
-/// reflected `RuleSet`. Imported modules are rebuilt from these sources in a child interpreter, so
-/// preserving the original rule order here would undo the executable-table reordering above.
+/// Reorder retained source rules to their reflected RuleSet order so child interpreters preserve the
+/// executable-table ordering.
 fn reorder_source_rules(
     source: &mut PreModule,
     rule_slots: &[usize],
@@ -6703,11 +6628,8 @@ fn install_rules(
     let join = hooks.ops.get("ruleSetSymbol").copied();
     let rl = hooks.ops.get("rlSymbol").copied();
     let crl = hooks.ops.get("crlSymbol").copied();
-    // A meta RuleSet is AC: its iteration order is the semantic rule order. The source `Term` traces
-    // used by tnk do not retain Maude's eager AC/ACU pattern normalization, so tnk's meta-DAG order can
-    // disagree for completed object rules (and choose a different conditional rule first). Rebuild only
-    // each lhs as a symbolic normalized DAG to recover Maude's order; keep the original statement DAGs
-    // for decoding so this ordering pass cannot alter their variables or payload.
+    // A meta RuleSet is AC, so its iteration order is semantic. Source traces retain unnormalized patterns;
+    // rebuild each lhs as a normalized symbolic DAG for ordering while decoding from the original statement.
     let qid = hooks.ops["qidSymbol"];
     let meta_term = hooks.ops["metaTermSymbol"];
     let meta_arg = hooks.ops["metaArgSymbol"];
@@ -6798,8 +6720,8 @@ fn install_rules(
                 }
             })
             .collect();
-        // Reflected modules install statements after `build_loaded_module`; retain the same
-        // dedicated SMT descriptor as the source loader, including `[nonexec]` rules.
+        // Statements are installed after `build_loaded_module`. Register their dedicated SMT descriptors,
+        // including `[nonexec]` rules, so restriction checks inspect the complete reflected rule set.
         m.engine.add_smt_rule(
             lhs.clone(),
             rhs.clone(),
@@ -7290,8 +7212,7 @@ fn down_module_expr(ctx: &MetaCtx, hooks: &MetaHooks, e: DagId) -> Option<Module
     None
 }
 
-/// Decode the syntactic attribute overrides allowed on an operator renaming. These are deliberately
-/// narrower than declaration attributes: Maude renamings carry only precedence, gather, and format.
+/// Decode the precedence, gather, and format overrides allowed on an operator renaming.
 fn down_renaming_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Attrs> {
     let empty = hooks.ops.get("emptyAttrSetSymbol").copied();
     let join = hooks.ops.get("attrSetSymbol").copied();
@@ -7465,9 +7386,8 @@ fn build_app(head: &str, args: Vec<DagId>, target: &mut BuiltModule) -> Option<D
     Some(target.engine.make_node(sym, args))
 }
 
-/// Encode an operator's canonical name as the text of its META `Qid`. Maude's Qid token encoding
-/// prefixes each splitting punctuation token (`(`, `)`, `[`, `]`, `{`, `}`, `,`) with a backtick.
-/// Genuine inter-token blanks are already backticks in [`canonical_name`] and pass through.
+/// Encode an operator name as a META Qid, prefixing splitting punctuation with backticks. Canonical
+/// inter-token blanks are already backticks and pass through.
 fn meta_op_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut escaped = false;
@@ -7491,8 +7411,7 @@ fn meta_op_name(name: &str) -> String {
     out
 }
 
-/// Mark the reserved class-attribute suffix exactly as Maude's `attributeSuffix` (`` `:_ ``). Ordinary
-/// user operators may have the same surface `name:_` shape and must retain their unescaped colon.
+/// Mark the reserved class-attribute suffix as `` `:_ `` without changing ordinary `name:_` operators.
 fn meta_attribute_name(name: &str, is_attribute: bool) -> String {
     let mut encoded = meta_op_name(name);
     if is_attribute && encoded.ends_with(":_") && !encoded.ends_with("`:_") {
@@ -7695,7 +7614,7 @@ fn up_arglist(ctx: &mut MetaCtx, hooks: &MetaHooks, args: Vec<DagId>) -> DagId {
     }
 }
 
-// ---- Stage 4: upTerm / downTerm (over the *current* module, read/built via the MetaCtx resolver) ----
+// ---- Object-term translation over the module selected by MetaCtx ----
 
 /// The snapshot of an object DAG node needed to up-translate it, taken with immutable `MetaCtx` reads
 /// before the (mutable) result build — so `up_term_ctx` can recurse without a borrow conflict.
@@ -7705,10 +7624,8 @@ enum NodeShape {
     Iter(String, Vec<DagId>), // the iter head `name`/`name^count` + the single argument
 }
 
-/// `upTerm`: up-translate an object DAG `t` of the **current** module into its meta-`Term`. Unlike
-/// [`up_term`] (which reads a `BuiltModule`), this reads `t` straight from the engine `ctx` is reducing in
-/// — the argument is already eagerly reduced by the ambient. Handles constants, applications, the `iter`
-/// successor form, and NA literals (string/qid/float), exactly as the reference's `upTerm`.
+/// Up-translate an already-reduced object DAG from the current engine into a meta `Term`. Handles
+/// constants, applications, iterated successors, and nonalgebraic literals.
 fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
     let qid = hooks.ops["qidSymbol"];
     let sort = ctx.sort_name(ctx.sort_of(t)).to_string();
@@ -7798,10 +7715,8 @@ fn up_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> DagId {
     }
 }
 
-/// `downTerm`: down-translate a meta-`Term` into a DAG in the **current** module (resolving operators by
-/// name + arity via the [`MetaCtx`] resolver). The inverse of [`up_term_ctx`]: a constant `'c.S`, an
-/// application `'f[args]`, the iterated `'s_^n[t]`. `None` if any operator/constant is unresolvable (the
-/// caller falls back to `downTerm`'s default argument, as Maude does).
+/// Down-translate a meta `Term` into the current module. Unresolvable operators and constants return
+/// `None`, allowing the caller's default argument to win.
 fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId> {
     let meta_term = hooks.ops.get("metaTermSymbol").copied();
     // Snapshot the head + children with immutable reads before building.
@@ -7827,17 +7742,13 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
     };
     match shape {
         DShape::Const(text) => {
-            let Some((name, sort)) = text.rsplit_once('.') else {
-                return None;
-            };
+            let (name, sort) = text.rsplit_once('.')?;
             let name = strip_op_blanks(name);
             let sort = strip_op_blanks(sort);
             if let Some(constant) = ctx.constant_at_sort(&name, &sort) {
                 return Some(constant);
             }
-            let Some(sym) = ctx.resolve_op(&name, 0) else {
-                return None;
-            };
+            let sym = ctx.resolve_op(&name, 0)?;
             Some(ctx.app(sym, vec![]))
         }
         DShape::App(head, arg_dags) => {
@@ -7849,18 +7760,13 @@ fn down_term_ctx(ctx: &mut MetaCtx, hooks: &MetaHooks, t: DagId) -> Option<DagId
                 && let Ok(n) = count.parse::<u64>()
             {
                 let name = strip_op_blanks(base);
-                let Some(sym) = ctx.resolve_op_for_args(&name, &args) else {
-                    return None;
-                };
+                let sym = ctx.resolve_op_for_args(&name, &args)?;
                 return Some(ctx.make_iter(sym, n, *args.first()?));
             }
             let name = strip_op_blanks(&head);
             // Resolve by the actual argument sorts. A flat (≥3-arg) reflected ACU/AU application still
             // selects its binary associative declaration; `ctx.app` canonicalizes the flat argument list.
-            let sym = ctx.resolve_op_for_args(&name, &args);
-            let Some(sym) = sym else {
-                return None;
-            };
+            let sym = ctx.resolve_op_for_args(&name, &args)?;
             Some(ctx.app(sym, args))
         }
     }
@@ -7887,7 +7793,7 @@ pub fn up_sort(ctx: &mut MetaCtx, hooks: &MetaHooks, source: &BuiltModule, t: Da
     ctx.make_na(qid, NaValue::Qid(sort.into()))
 }
 
-// ---- Stage 4: sort/kind query helpers (down a meta `Type`, up a `Bool`/`Type`/`SortSet`) ----
+// ---- Sort and kind queries ----
 
 /// Down-translate a meta `Type` (`'Sort` or `'[Kind]`) into the object module's [`SortId`]. A bracketed
 /// `'[Max,…]` is a kind → the component's error sort (resolved from the first maximal sort named); a bare
@@ -7969,9 +7875,8 @@ fn up_sort_set(ctx: &mut MetaCtx, hooks: &MetaHooks, m: &BuiltModule, sorts: &[S
     }
 }
 
-/// Whether DAG `t` (in `m`) is a well-formed term: every application's argument-kinds match the operator's
-/// declared domain. Our kernel builds permissively at the kind level, so this is the explicit check
-/// `wellFormed(M, T)` needs (Maude's `downTerm` returning 0 on an ill-typed term).
+/// Check every application's argument kinds against its declared domain. Construction is permissive at
+/// kind level, so `wellFormed(M, T)` performs this explicit validation.
 fn term_well_formed(m: &BuiltModule, t: DagId) -> bool {
     let sym = m.engine.node(t).symbol();
     let kids: Vec<DagId> = m.engine.node(t).children().collect();
@@ -8034,7 +7939,7 @@ fn subst_well_formed(
     true
 }
 
-// ---- Stage 4: the up* family helpers (decompose surface decls + traces into the meta-rep) ----
+// ---- Declaration projections into the meta representation ----
 
 /// Which declaration-set an individual `up*` projection emits.
 #[derive(Clone, Copy)]
@@ -8047,10 +7952,8 @@ enum UpPart {
     Rls,
 }
 
-/// The decomposition of a built module. Flat signature declarations are import-first and statements are
-/// root-own-first; the boundary fields preserve that distinction so reflection can collapse duplicates
-/// internal to an imported closure while leaving duplicate root declarations for META-LEVEL's set
-/// equations to consume (and count), matching Maude's up-map.
+/// Up-translate strategy declarations to a `StratDeclSet`; each element records its name, domain, subject
+/// sort, and empty attribute set.
 fn up_strat_decls_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -8278,6 +8181,8 @@ fn up_strat_defs_dag(
     ))
 }
 
+/// Decomposition used by module reflection. Signature declarations are import-first and statements
+/// root-first; boundary fields deduplicate imports while retaining root/import overlaps.
 struct ModulePieces {
     kind: ModuleKind,
     is_theory: bool,
@@ -8300,23 +8205,17 @@ struct ModulePieces {
     mb_own_end: usize,
     eq_own_end: usize,
     rl_own_end: usize,
-    /// Source statement slots and engine rule ids for this module's own executable rules, plus their
-    /// canonical reflected order. Used when retaining an exact source-backed non-flat reflection.
+    /// `PreModule` statement slots and engine rule IDs for this module's executable rules, plus their
+    /// canonical reflected order. Used when retaining a recognized non-flat database reflection.
     own_rule_slots: Vec<usize>,
     own_rule_ids: Vec<u32>,
     canonical_own_rule_ids: Vec<u32>,
     loaded: LoadedModule,
 }
 
-/// Up-translate a statement list to its per-kind traces, in **declaration order**, interleaving executable
-/// statements (which carry an engine trace) with `[nonexec]` axioms (which do not — [`load_statements`]
-/// (tnk_frontend::load) skips them, since a proof obligation is applied by neither reduction nor
-/// completion). Each executable statement of a kind takes the next entry of its trace vector starting at
-/// `starts` (the whole vector — `(0,0,0)` — for the flat closure, or the own-statement suffix for the
-/// non-flat form, since flatten appends a module's own statements after its imports in order); each nonexec
-/// axiom is parsed on demand from its bubble against the built module. A nonexec statement that fails to
-/// parse is skipped (the up result omits it but stays otherwise faithful — the meta layer's inert-on-
-/// failure contract).
+/// Partition statements into membership, equation, and rule traces in declaration order. Executable
+/// statements clone the engine traces selected by `trace_refs`; `[nonexec]` statements are parsed on
+/// demand because they have no engine trace. Statements whose trace cannot be recovered are omitted.
 fn merge_statement_traces(
     stmts: &[Statement],
     loaded: &LoadedModule,
@@ -8376,11 +8275,10 @@ struct UpOp {
     name: String,
     identity: Option<DagId>,
     decl: OpDecl,
-    /// Whether this declaration used source-level `[ditto]`; `decl.attrs` is expanded below, but Maude
-    /// does not copy declaration-local presentation metadata such as `format` onto the reflected overload.
+    /// Whether this declaration used `[ditto]`. Expanded semantic attributes exclude declaration-local
+    /// presentation metadata such as `format`.
     ditto: bool,
-    /// Root-owned declarations stay verbatim; only declarations inherited through the flat import
-    /// closure are pre-uniquized by Maude before its up-map builds the META-LEVEL set.
+    /// Root-owned declarations stay verbatim; inherited declarations are uniquized before reflection.
     own: bool,
 }
 
@@ -8394,8 +8292,7 @@ fn resolve_source_operator(lm: &LoadedModule, name: &str, domain: &[String]) -> 
         .resolve_operator_for_sorts(name, &argument_sorts)
 }
 
-/// Whether two source declarations compile into the same Maude symbol: name/arity and every
-/// domain/range connected component agree. This is the profile across which `[ditto]` inherits.
+/// Whether two declarations compile into one symbol: name, arity, and domain/range components agree.
 fn same_compiled_op_profile(
     lm: &LoadedModule,
     interner: &Interner,
@@ -8443,10 +8340,8 @@ fn up_set(ctx: &mut MetaCtx, elems: Vec<DagId>, empty: SymbolId, join: SymbolId)
         _ => ctx.app(join, elems),
     }
 }
-/// Collapse duplicate elements donated by the already-flattened import closure, while retaining every
-/// root-owned declaration. Maude uniquizes each imported module's declaration sets before donating them,
-/// then appends the root declarations; an overlap at that final boundary remains in the raw up-map result
-/// and is consumed (with an observable rewrite) by META-LEVEL's idempotence equation.
+/// Deduplicate declarations within the flattened import closure while retaining every root declaration.
+/// A root/import overlap remains for META-LEVEL's idempotence equation to consume.
 fn retain_import_set_elements(ctx: &MetaCtx, elems: Vec<(DagId, bool)>) -> Vec<DagId> {
     let mut imported: HashMap<u64, Vec<DagId>> = HashMap::new();
     let mut retained = Vec::with_capacity(elems.len());
@@ -8468,10 +8363,8 @@ fn retain_import_set_elements(ctx: &MetaCtx, elems: Vec<(DagId, bool)>) -> Vec<D
     retained
 }
 
-/// Up-translate a parameterized-module header to `_{_}(name, ParameterDeclList)` (`headerSymbol`): each
-/// parameter `X :: T` becomes `_::_('X, upModuleExpr(T))` (`parameterDeclSymbol`), joined by `_,_`
-/// (`parameterDeclListSymbol`) — Maude's `upHeader`/`upParameterDecls`. `None` if the header symbols are
-/// absent (a META-LEVEL predating parameterized headers).
+/// Up-translate a parameterized header and its parameter declarations. Returns `None` when the required
+/// header symbols are absent.
 fn up_header(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -8688,10 +8581,8 @@ fn up_subsorts_dag(
             }
         }
 
-        // A structured import can re-donate an unchanged source declaration block. Drop such a fully
-        // redundant imported chain, but retain a chain that contributes any new edge in its entirety:
-        // overlaps inside `subsorts A ... < B ...` are observable duplicate declarations in Maude
-        // (META-LEVEL's idempotence equation consumes and counts them). Root declarations are always kept.
+        // Drop a fully redundant imported chain. Retain any chain contributing a new edge in its entirety,
+        // including duplicate edges consumed by META-LEVEL's idempotence equation. Always retain root chains.
         if !own
             && !chain_elems.iter().any(|&elem| {
                 imported.get(&ctx.dag_hash(elem)).is_none_or(|bucket| {
@@ -8724,8 +8615,7 @@ fn up_subsorts_dag(
     )
 }
 
-/// Up-translate operator declarations to an `OpDeclSet` (`__`-joined `op N : D -> R [A] .`, sorted by
-/// canonical name as Maude orders its symbol table), including polymorph and builtin-hook attributes.
+/// Up-translate operator declarations in canonical-name order, including polymorph and hook attributes.
 fn up_ops_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -8737,9 +8627,8 @@ fn up_ops_dag(
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut elems = Vec::with_capacity(sorted.len());
     for op in sorted {
-        // `ditto` inherits the operator's full (symbol-wide) attribute set from its primary declaration —
-        // the same-name non-`ditto` op. Maude's `upModule` emits the *expanded* attributes on every subsort
-        // overload (`[assoc ctor id(…) prec(25)]`), not the bare `[ctor ditto]` the source carries.
+        // `[ditto]` inherits the symbol-wide attributes from its primary declaration. Reflection emits
+        // expanded attributes on every subsort overload rather than the source's bare `[ctor ditto]`.
         let attr_op = if op.ditto {
             ops.iter()
                 .find(|candidate| {
@@ -8845,8 +8734,7 @@ fn up_attrs(
     flag("commSymbol", a.comm, ctx, &mut elems);
     flag("idemSymbol", a.idem, ctx, &mut elems);
     flag("iterSymbol", a.iter, ctx, &mut elems);
-    // Object-system attributes (Pillar 2.5): `config`/`object`/`msg`/`portal`. An `omod`'s desugared ops
-    // carry these (e.g. `msg` on message operators), and Maude's `upModule` emits them on the plain `mod`.
+    // Object-system attributes carried by desugared object-module operators and emitted by `upModule`.
     flag("configSymbol", a.config, ctx, &mut elems);
     flag("objectSymbol", a.object, ctx, &mut elems);
     flag("msgSymbol", a.message, ctx, &mut elems);
@@ -8912,9 +8800,8 @@ fn up_attrs(
     ))
 }
 
-/// `MetaLevelOpSymbol::getOpAttachments` emits its resolved constructor attachments in the order of
-/// Maude's `metaLevelSignature.cc`, not in the order written in `prelude.maude`. `HookList` is
-/// associative but deliberately noncommutative, so this order survives reflection and reinsertion.
+/// Resolved metalevel constructor attachments emit in this canonical order rather than declaration
+/// order. `HookList` is associative but noncommutative, so reflection and reinsertion preserve it.
 const META_LEVEL_OP_HOOK_ORDER: &[&str] = &[
     "qidSymbol",
     "metaTermSymbol",
@@ -9214,7 +9101,7 @@ fn hook_signature_parts(
         .enumerate()
         .skip(colon + 1)
         .find_map(|(index, token)| matches!(text(token), "->" | "~>").then_some(index))?;
-    let join = |tokens: &[Token]| tokens.iter().map(|token| text(token)).collect::<String>();
+    let join = |tokens: &[Token]| tokens.iter().map(&text).collect::<String>();
     let consume_type = |start: usize, limit: usize| -> Option<usize> {
         if start >= limit {
             return None;
@@ -9275,9 +9162,8 @@ fn hook_signature_parts(
     Some((name, domain, range))
 }
 
-/// Reflect the operator actually attached to an `op-hook`. Hook signatures select a symbol, but Maude
-/// serializes that symbol's first compiled declaration; kind positions are represented by component sort
-/// 1 (`MixfixModule::hookSort`) rather than by the kind Qid itself.
+/// Reflect the symbol selected by an `op-hook`. Use its first declaration and represent kind positions by
+/// component sort 1.
 fn reflected_hook_signature(
     lm: &LoadedModule,
     name: &str,
@@ -9363,8 +9249,8 @@ fn up_nat(ctx: &mut MetaCtx, n: u64) -> Option<DagId> {
     }
 }
 
-/// [`up_nat`] for an unbounded decimal count (the legacy `metaUnify` next-index `Nat`, which may exceed
-/// `u64`): `s_^count(0)`, or `0` when `count` is `"0"`.
+/// Build an unbounded Nat-family `metaUnify` index that may exceed `u64`: `s_^count(0)`, or `0` when
+/// `count` is `"0"`.
 fn up_nat_big(ctx: &mut MetaCtx, count: &str) -> Option<DagId> {
     let zero = ctx.app(ctx.resolve_op("0", 0)?, vec![]);
     if count == "0" {
@@ -9386,10 +9272,8 @@ fn up_nat_list(ctx: &mut MetaCtx, hooks: &MetaHooks, positions: &[u32]) -> Optio
     })
 }
 
-/// Up-translate the membership traces in `range` to a `MembAxSet` (`mb`/`cmb` joined by `__`).
-/// Build a statement `AttrSet` from its retained attributes — the `owise`/`nonexec` flags and an optional
-/// `label(Q)` — joined ACU (`none` when empty, the `[none]` an unattributed statement prints). The set is
-/// order-independent; Maude renders it in its own ACU order (a fixture pins the common `[nonexec label('l)]`).
+/// Build a statement `AttrSet` from the enabled `owise`, `variant`, `narrowing`, and `nonexec` flags plus
+/// an optional `label(Q)`. The returned set uses the protocol's order-independent ACU representation.
 fn stmt_attr_set(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -9424,6 +9308,8 @@ fn stmt_attr_set(
     )
 }
 
+/// Up-translate membership traces to a `MembAxSet` (`mb`/`cmb` joined by `__`), preserving `nonexec` and
+/// optional `label(Q)` attributes.
 fn up_membs_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -9461,8 +9347,8 @@ fn up_membs_dag(
     ))
 }
 
-/// Up-translate the equation traces to an `EquationSet` (`eq`/`ceq` joined by `__`), each carrying its
-/// `[owise]`/`[nonexec]`/`[label('l)]` attributes (`[none]` if plain).
+/// Up-translate equation traces to an `EquationSet` (`eq`/`ceq` joined by `__`), preserving enabled
+/// `owise`, `variant`, `nonexec`, and optional `label(Q)` attributes.
 fn up_eqs_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -9510,8 +9396,8 @@ fn up_eqs_dag(
     ))
 }
 
-/// Up-translate the rule traces in `range` to a `RuleSet` (`rl`/`crl` joined by `__`); a labelled rule
-/// carries `label(Q)`, others `[none]`.
+/// Up-translate rule traces to a `RuleSet` (`rl`/`crl` joined by `__`), preserving `narrowing`, `nonexec`,
+/// and optional `label(Q)` attributes.
 fn up_rls_dag(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -9613,10 +9499,10 @@ fn instantiate_narrowing_solution(
     tnk_core::unify::instantiate(engine, &values, term).unwrap_or(term)
 }
 
-/// Legacy narrowing names the goal match's variables by the reached state's variable ordinals.
-/// The v3 goal unifier may alpha-permute those variables (for example `@1 -> %2`,
-/// `@2 -> %1`), so compose the inverse ordinal-preserving alpha map into the adapter result.
-fn legacy_narrowing_alpha_map(
+/// The `metaNarrow` result names goal-match variables by reached-state ordinals. The goal unifier may
+/// alpha-permute those variables (for example `@1 -> %2`, `@2 -> %1`), so compose the inverse
+/// ordinal-preserving alpha map into the result.
+fn narrowing_result_alpha_map(
     engine: &mut Engine,
     interner: &mut Interner,
     solution: &tnk_core::narrow::NarrowingSolution,
@@ -9684,10 +9570,9 @@ fn meta_rule_variable_names(
         .collect()
 }
 
-/// Up-translate a solution substitution: each bound variable `'X:Sort` to an assignment
-/// `'X:Sort <- up(value)`, joined by `_;_`; an all-ground (no-variable) match is the empty `none`. The
-/// variable's meta name is the full `X:Sort` text (a `VarIndex` key or a rule trace's `var_names`), so the
-/// round-trip is exact. A binding with no value (`None`) is skipped (an unconstrained variable).
+/// Up-translate a solution substitution: each bound variable `'X:Sort` becomes
+/// `'X:Sort <- up(value)`, joined by `_;_`; an all-ground match is the empty `none`. Full typed variable
+/// names come from a `VarIndex` key or rule trace, and bindings with no value are omitted as unconstrained.
 fn up_substitution(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -9716,6 +9601,7 @@ fn up_substitution(
 
 /// SMT-search substitutions contain only non-SMT variables from the target pattern. SMT target
 /// variables are represented by equalities in the final constraint instead.
+#[allow(clippy::too_many_arguments)]
 fn up_smt_substitution(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -10017,6 +9903,7 @@ fn up_context(
 }
 
 /// As [`up_context`], but `matched` can be a proper associative portion of the node at `path`.
+#[allow(clippy::too_many_arguments)]
 fn up_context_with_portion(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -10039,6 +9926,7 @@ fn up_context_with_portion(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn up_context_impl(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -10095,7 +9983,7 @@ fn up_context_impl(
         matched.is_none_or(|portion| source.engine.deep_equal(children[head], portion));
     let up_args: Vec<DagId> =
         if rest.is_empty() && source.engine.symbol_is_assoc(sym) && matched_whole_child {
-            // AC/AU extension context: Maude places the residue first and the hole last.
+            // AC/AU extension contexts place residue arguments before the final hole.
             let mut args: Vec<DagId> = children
                 .iter()
                 .enumerate()
@@ -10137,9 +10025,8 @@ fn up_parsed_pattern(
     up_pattern_inner(ctx, hooks, source, term, names, false, false)
 }
 
-/// Up-translate a statement pattern after applying the eager theory normalization that Maude performs
-/// before reflecting compiled statements. In particular, AC/ACU arguments are flattened and ordered
-/// using variable name token codes rather than the source parser's left-to-right argument order.
+/// Up-translate a statement pattern after eager theory normalization: flatten AC/ACU arguments and order
+/// variables by name-token code rather than parser position.
 fn up_normalized_pattern(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
@@ -10236,9 +10123,8 @@ fn up_pattern_inner(
                 NaValue::Qid(format!("{name}.{}", source.engine.sorts().name(sort)).into()),
             )
         }
-        // Iter-chain collapse: a successor chain `s(s(…x))` (nested unary `iter` ops, as a rule side stores
-        // it) prints as `'s_^n[up(x)]` — the compact `S`-symbol form, matching how `up_term` ups a DAG's
-        // iter node and what the reference emits.
+        // Iter-chain collapse: a successor chain `s(s(…x))` stored as nested unary `iter` operations prints
+        // as `'s_^n[up(x)]`, the compact representation also used for DAG iteration nodes.
         Term::Op { symbol, args } if Some(*symbol) == source.nat_succ && args.len() == 1 => {
             let mut count = 1u64;
             let mut inner = &args[0];
@@ -10274,13 +10160,9 @@ fn up_pattern_inner(
         }
         Term::Op { symbol, args } => {
             let name = meta_symbol_name(source, *symbol);
-            // Flatten a nested associative operator to Maude's `makeTerm` normal form (`__(a, __(b,c))` ->
-            // `__(a,b,c)`) — tnk's parser stores ACU/AU patterns binary-nested. Associativity is irrelevant
-            // to matching, so this normalizes only the meta form. We deliberately DON'T reorder ACU
-            // arguments here: a user-written term (`N + M`) is stored in source order, which is already the
-            // reference's order (Maude sorts by `Term::compare`, whose variable tie-break is interning-order
-            // name codes — the same source order); an *added* attribute set is instead ordered at
-            // construction (`oo_complete::canonicalize_attr_set`).
+            // Flatten nested associative patterns into the meta form. Preserve source order unless
+            // commutative canonicalization is explicitly requested; added attribute sets are ordered when
+            // constructed.
             let mut flat: Vec<&Term> = Vec::new();
             if flatten_associative && source.engine.symbol_is_assoc(*symbol) {
                 flatten_assoc_args(*symbol, args, &mut flat);
@@ -10288,10 +10170,8 @@ fn up_pattern_inner(
                 flat.extend(args.iter());
             }
             if canonicalize_commutative && source.engine.symbol_is_commutative(*symbol) {
-                // Static AC/C terms undergo `Term::normalize(false)` before compilation: immediate
-                // arguments are ordered by Maude's arity-first term order, but nested associative
-                // applications are not flattened. Preserve source order for equal arities; its variable
-                // tie-break already follows token encounter order.
+                // Order immediate static AC/C arguments by arity. Preserve source order for equal arities,
+                // whose variable tie-break follows token encounter order.
                 flat.sort_by_key(|term| match term {
                     Term::Var(_) | Term::Na { .. } => 0,
                     Term::Iter { .. } => 1,
@@ -10319,8 +10199,7 @@ fn up_pattern_inner(
     }
 }
 
-/// Flatten a nested associative application `f(a, f(b, c), …)` into its argument sequence `[a, b, c, …]`
-/// (Maude's `AU/ACU_Term` flat representation), recursing through same-symbol arguments.
+/// Flatten nested same-symbol associative applications into one argument sequence.
 fn flatten_assoc_args<'t>(symbol: SymbolId, args: &'t [Term], out: &mut Vec<&'t Term>) {
     for a in args {
         match a {
@@ -10333,27 +10212,16 @@ fn flatten_assoc_args<'t>(symbol: SymbolId, args: &'t [Term], out: &mut Vec<&'t 
     }
 }
 
-/// The declared range-sort name of operator `symbol` (its `SymbolSyntax`), for a constant's `'c.Sort`.
-fn sort_name_of(source: &BuiltModule, symbol: SymbolId) -> String {
-    source
-        .syntax
-        .get(&symbol)
-        .map(|s| source.engine.sorts().name(s.range).to_string())
-        .unwrap_or_default()
-}
-
-/// Up-translate a rule (from its trace) to a meta `Rule` — `rl lhs => rhs [label] .`, or `crl lhs => rhs if
-/// cond [label] .` for a conditional rule (the condition up-mapped by [`up_condition`]).
+/// Up-translate a rule trace to `rl` or `crl`, preserving its condition and its `narrowing`, `nonexec`,
+/// and optional `label(Q)` attributes.
 fn up_rule(
     ctx: &mut MetaCtx,
     hooks: &MetaHooks,
     source: &BuiltModule,
     trace: &RlTrace,
 ) -> Option<DagId> {
-    // Compiled rule terms are associative-normalized before Maude reflects them. The frontend trace
-    // retains its binary parse tree, so flatten same-symbol associative spines explicitly here; leaving
-    // them nested changes RuleSet AC order and, after insertModule, the observable conditional-rule
-    // exploration/count schedule.
+    // Rule traces retain binary associative parse trees. Flatten those spines before reflection so RuleSet
+    // order and conditional-rule scheduling use normalized patterns.
     let up_lhs = up_pattern_inner(ctx, hooks, source, &trace.lhs, &trace.var_names, true, true);
     let up_rhs = up_pattern_inner(ctx, hooks, source, &trace.rhs, &trace.var_names, true, true);
     let attrs = stmt_attr_set(
@@ -10582,34 +10450,6 @@ fn nth_match(
         count += 1;
     }
     None
-}
-
-/// The `(n+1)`-th **extension** match of `pattern` against `subj` — its bindings and whether the matched
-/// portion is the *whole* subject (so the context is the bare hole `[]`). `None` if there are fewer than
-/// `n+1` solutions.
-fn nth_xmatch(
-    engine: &mut Engine,
-    pattern: Term,
-    nr: u32,
-    subj: DagId,
-    n: usize,
-) -> Option<(Vec<DagId>, bool)> {
-    let mut found = None;
-    {
-        let mut sols = engine.match_solutions(pattern, nr, subj, true);
-        let mut count = 0;
-        while sols.advance() {
-            if count == n {
-                let bindings: Vec<DagId> = (0..nr)
-                    .map(|k| sols.binding(k).expect("the matcher binds every variable"))
-                    .collect();
-                found = Some((bindings, sols.matched_portion()));
-                break;
-            }
-            count += 1;
-        }
-    }
-    found.map(|(b, portion)| (b, engine.deep_equal(portion, subj)))
 }
 
 fn variant_family_root(family: tnk_core::fresh::VariableFamily) -> &'static str {
@@ -10875,8 +10715,7 @@ fn down_variant_options(ctx: &MetaCtx, options: DagId) -> (bool, bool) {
     (filtered, delayed)
 }
 
-/// Flatten a META-LEVEL `TermList`. Its associative constructor is already flattened in the DAG;
-/// a bare `Term` is the singleton-list representation used by Maude.
+/// Flatten a META-LEVEL `TermList`; a bare `Term` represents a singleton list.
 fn down_term_list_roots(ctx: &MetaCtx, hooks: &MetaHooks, list: DagId) -> Option<Vec<DagId>> {
     let top = ctx.top(list);
     let children = ctx.children(list);
@@ -10915,8 +10754,8 @@ fn up_nat_big_exact(ctx: &mut MetaCtx, count: &str) -> Option<DagId> {
     }
 }
 
-/// Legacy variant results carry the greatest fresh-variable index rather than a family Qid.
-fn legacy_variant_next_index(
+/// Nat-family variant results carry the greatest fresh-variable index rather than a family Qid.
+fn nat_family_variant_next_index(
     ctx: &mut MetaCtx,
     engine: &Engine,
     interner: &Interner,
@@ -10949,7 +10788,7 @@ fn legacy_variant_next_index(
     up_nat_big_exact(ctx, &greatest)
 }
 
-fn legacy_unifier_next_index(
+fn nat_family_unifier_next_index(
     ctx: &mut MetaCtx,
     engine: &Engine,
     interner: &Interner,

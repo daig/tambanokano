@@ -1,4 +1,2 @@
 /target
 **/*.rs.bk
-**/.diffmaude-command.*/
-/dev-docs/

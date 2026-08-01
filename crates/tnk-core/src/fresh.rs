@@ -1,5 +1,4 @@
-//! The central fresh-variable generator (S1 constraint: ONE generator before
-//! a second consumer exists) — Maude's `FreshVariableSource` (src/Mixfix/freshVariableSource.cc).
+//! Central fresh-variable generation.
 //!
 //! Three families, one per symbolic layer, each printing as `<char><n>`:
 //! `#n` (family 0, unification), `%n` (family 1, variants), `@n` (family 2, narrowing).
@@ -7,7 +6,7 @@
 //! `base_number` exists for the meta level (`metaUnify(_, _, _, 'X, N)` resumes numbering above `N`)
 //! and is a bignum there, so it is a [`Nat`] here.
 //!
-//! The name-classification predicates mirror the reference exactly, including the corners:
+//! Name-classification predicates preserve the reserved-prefix boundary, including these corners:
 //! a printed index never starts with `0` (so `#0`, `#01` are NOT generatable names and never
 //! conflict), and `belongs_to_family` accepts any all-digit tail (it classifies family membership
 //! for protection purposes, not generatability).
@@ -36,8 +35,7 @@ impl VariableFamily {
         }
     }
 
-    /// The family a one-character root name (`#`/`%`/`@`) denotes — Maude's
-    /// `FreshVariableSource::getFamily`.
+    /// The family denoted by a one-character root name (`#`, `%`, or `@`).
     pub fn of_root(name: &str) -> Option<VariableFamily> {
         match name {
             "#" => Some(Self::Unify),
@@ -57,13 +55,13 @@ impl VariableFamily {
     }
 }
 
-/// Fresh-variable name source for one symbolic operation (Maude constructs one
-/// `FreshVariableSource` per problem, optionally with a meta-supplied base number).
+/// Fresh-variable name source for one symbolic operation, optionally resuming above a caller-supplied
+/// base number.
 #[derive(Debug, Default)]
 pub struct FreshVariableGenerator {
     base_number: Nat,
-    /// Per-family cache of generated names, indexed by the fresh index (names are handed out
-    /// densely in practice; the reference keeps the same per-family index→name cache).
+    /// Per-family cache indexed by fresh index. A sparse request fills every preceding entry so
+    /// generated names remain densely cached.
     caches: [Vec<String>; 3],
 }
 
@@ -72,11 +70,8 @@ impl FreshVariableGenerator {
         Self::default()
     }
 
-    /// A generator whose printed numbers start above `base_number` (the meta level's fresh-counter
-    /// resumption; crate-internal because [`Nat`] is — the meta descent layer lives in this crate).
-    /// First consumer: `metaUnify`'s counter argument (S1); constructed here with the family
-    /// machinery so the numbering contract has exactly one home.
-    #[allow(dead_code)]
+    /// A generator whose printed numbers start above `base_number`, used when META-LEVEL operations
+    /// resume a supplied fresh-variable counter.
     pub(crate) fn with_base(base_number: Nat) -> Self {
         FreshVariableGenerator {
             base_number,
@@ -94,11 +89,9 @@ impl FreshVariableGenerator {
         &cache[index]
     }
 
-    /// Whether `name` could collide with a fresh variable this generator may produce — used to
-    /// protect user variables that look like `#5` when a problem's own variables enter the mix.
-    /// Variables of `ok_family` are exempt (they are OURS, from an earlier stage of the same
-    /// pipeline). Mirror of `variableNameConflict`: the name must be `<prefix><digits>` with a
-    /// nonzero first digit and its printed number must exceed `base_number`.
+    /// Whether `name` could collide with a fresh variable this generator may produce. Variables from
+    /// `ok_family` are exempt because they belong to an earlier stage of the same pipeline. A conflict
+    /// is `<prefix><digits>` with a nonzero first digit and a number above `base_number`.
     pub fn variable_name_conflict(&self, name: &str, ok_family: Option<VariableFamily>) -> bool {
         let mut chars = name.chars();
         let Some(family) = chars.next().and_then(VariableFamily::of_prefix) else {
@@ -120,8 +113,8 @@ impl FreshVariableGenerator {
         }
     }
 
-    /// Whether `name` is classified into `family` (prefix matches and the tail is all digits —
-    /// deliberately accepting a leading zero, like the reference's `belongsToFamily`).
+    /// Whether `name` belongs to `family`: its prefix matches and its tail is all digits. Leading zeroes
+    /// are accepted because this classifies reserved-prefix ownership rather than generatability.
     pub fn belongs_to_family(name: &str, family: VariableFamily) -> bool {
         let mut chars = name.chars();
         if chars.next() != Some(family.prefix()) {
@@ -131,9 +124,9 @@ impl FreshVariableGenerator {
         !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
     }
 
-    /// If `name` is a name we could generate, the `(index, family)` that generates it
-    /// (`isFreshVariableName`): the printed number must not start with `0`, and `index` is the
-    /// printed number minus one. Numbers too large to have been generated return `None`.
+    /// If `name` is generatable, return its `(index, family)`. The printed number must not start with
+    /// zero; `index` is that number minus one. Values too large for the machine-indexed cache return
+    /// `None`.
     pub fn parse_fresh_name(name: &str) -> Option<(usize, VariableFamily)> {
         let mut chars = name.chars();
         let family = chars.next().and_then(VariableFamily::of_prefix)?;
@@ -146,7 +139,7 @@ impl FreshVariableGenerator {
         }
         let printed = Nat::from_decimal(digits)?;
         let index = printed.checked_sub(&Nat::one()).expect("printed >= 1");
-        // The reference discards indices above INT_MAX ("we never generate such names").
+        // Reject indices that cannot address the machine-indexed name cache.
         let index = index.to_usize()?;
         Some((index, family))
     }
@@ -163,7 +156,6 @@ mod tests {
         assert_eq!(g.fresh_name(1, VariableFamily::Unify), "#2");
         assert_eq!(g.fresh_name(0, VariableFamily::Variant), "%1");
         assert_eq!(g.fresh_name(2, VariableFamily::Narrow), "@3");
-        // Cached: re-request returns the same text.
         assert_eq!(g.fresh_name(0, VariableFamily::Unify), "#1");
         // Sparse request fills the cache densely below it.
         assert_eq!(g.fresh_name(4, VariableFamily::Unify), "#5");

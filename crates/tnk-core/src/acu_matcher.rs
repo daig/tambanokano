@@ -1,24 +1,20 @@
-//! Lazy ACU solution enumerator for the **no-alien** case, driven by the [`DiophantineSystem`].
+//! Lazy ACU solution enumerator for the **no-alien** case, driven by [`DiophantineSystem`].
 //!
-//! This is the Phase-2 port of Maude's `ACU_Subproblem` restricted to the (very common) case where
-//! the pattern's non-ground subterms are all **top variables** (no non-ground *aliens*). In that case
-//! the whole bipartite-graph layer collapses away and matching is a pure Diophantine problem: one row
-//! per top variable (coefficient = its multiplicity, size bounds from its sort's identity-capability
-//! and `sortBound`), one column per residual subject element, plus one **extension** row when matching
-//! with a residue. The general solver enumerates solutions **lazily in Maude's order**. A repeated
-//! sole variable in extension mode instead takes Maude's `ACU_NonLinearLhsAutomaton` fast path:
-//! every divisible subject multiplicity contributes to one maximal binding.
+//! When every non-ground pattern subterm is a top variable, matching reduces to a Diophantine
+//! system: one row per top variable (coefficient = multiplicity, size bounds from the variable sort
+//! and identity capability), one column per residual subject element, plus one extension row when
+//! matching with a residue. Solutions are enumerated lazily. A repeated sole variable in extension
+//! mode takes a dedicated fast path in which every divisible subject multiplicity contributes to one
+//! maximal binding.
 //!
-//! Element variables (`upperBound == 1`, e.g. SET's `E : X$Elt`) are *not* special-cased into
-//! bipartite pattern nodes as Maude does; a Diophantine row with `maxSize == 1` produces the identical
-//! accepted-solution order (rows sort *ascending by maxSize*, so element variables enumerate outer,
-//! collectors inner — exactly Maude's patterns-outer/Diophantine-inner order) with no extra cost.
+//! Element variables (`upper_bound == 1`) use an ordinary Diophantine row. Rows sort by ascending
+//! maximum size, so element variables enumerate outside collector variables without a separate
+//! bipartite pattern representation.
 //!
-//! The special cases (`ACU_NonLinearLhsAutomaton`, `noVariableCase`, the empty-multiset "trivial
-//! system", and identity-first collapse gating) are ported faithfully; extension uses the
-//! existing matcher (oracle-verified: `a + b + d` under `eq a + X = c` leaves the two-element residue
-//! `b + d`), with the degenerate all-identity/all-extension no-op skipped unless the subject *is* the
-//! identity or the pattern has ground subterms (the B1 gating).
+//! Empty-multiset and no-variable matches use finite modes without constructing a system. Extension
+//! matching retains the unmatched subject portion: matching `a + X` against `a + b + d` leaves
+//! `b + d`. A degenerate all-identity/all-extension no-op is skipped unless the subject is the
+//! identity or the pattern has ground subterms.
 
 use crate::dag::DagId;
 use crate::diophantine::{DiophantineSystem, UNBOUNDED};
@@ -40,15 +36,13 @@ pub(crate) struct MatcherVar {
 
 /// The enumeration mode, decided once at [`AcuMatcher::new`] from the residual multiset + variables.
 enum Mode {
-    /// No unbound top variables (Maude's `noVariableCase`): a single potential solution — the whole
-    /// residual multiset is the residue (extension), or a whole match if it is empty.
+    /// No unbound top variables: at most one solution, with the residual multiset as extension or
+    /// an empty residual as a whole match.
     NoVar { done: bool },
-    /// Non-empty variable set but empty residual multiset (Maude's "no subjects" trivial system): bind
-    /// every variable to the identity (one solution) iff every variable is identity-capable (already
-    /// checked at construction, else [`Mode::Done`]).
+    /// Variables with an empty residual bind to identity exactly once when every variable permits it.
     Trivial { done: bool },
     /// The general Diophantine system. `subject_map[col]` is the element index of column `col`;
-    /// `ext_row` is the extension row's original index (`= nr_vars`) when matching with a residue.
+    /// `ext_row` is the extension row's insertion index (`nr_vars`) when matching with a residue.
     System {
         sys: DiophantineSystem,
         subject_map: Vec<usize>,
@@ -68,10 +62,10 @@ pub(crate) struct AcuMatcher {
     has_grounds: bool,
     subject_is_identity: bool,
     vars: Vec<MatcherVar>,
-    /// The residual subject elements (post-grounds), aligned with the Diophantine columns' source.
+    /// Residual subject elements after ground consumption, aligned with the Diophantine columns.
     elements: Vec<DagId>,
-    /// The residual subject multiset as `(element, multiplicity)` pairs (post-grounds, nonzero) — the
-    /// residue for the [`Mode::NoVar`] case and the source of the Diophantine columns.
+    /// The nonzero residual `(element, multiplicity)` pairs. This is the [`Mode::NoVar`] residue and
+    /// supplies the Diophantine columns.
     residual: Vec<(DagId, u32)>,
     mode: Mode,
     /// Whether the sole repeated-variable extension fast path is eligible, and whether its one
@@ -115,14 +109,9 @@ impl AcuMatcher {
             .map(|(i, &m)| (i, m))
             .collect();
 
-        // The **lone-variable collector** (Maude's LONE_VARIABLE / `forcedLoneVariableCase`): a single
-        // count-1 top variable absorbs the *whole* remainder as one matched-whole solution — a
-        // correctness rule, not just ordering (`eq a + X = b` on `a + c + c` gives `b`, not `b + c`).
-        // This is achieved by suppressing the extension row (so the sole Diophantine row takes
-        // everything). It is gated OFF when the operator has an identity: then the variable may take
-        // the identity, and Maude enumerates the empty assignment first with the rest as extension
-        // residue (`eq a + X = c [id: e]` on `a + b` gives `b + c`, X := e). This mirrors the naive
-        // matcher's `lone_linear` condition exactly (the B1 identity-first gating).
+        // A lone count-one collector absorbs the whole remainder in one matched-whole solution.
+        // Suppressing the extension row enforces this. With an identity, the variable may instead
+        // bind identity first and leave the remainder as residue, so this fast path is disabled.
         let lone_linear =
             vars.len() == 1 && vars[0].coeff == 1 && !(ext_allowed && identity.is_some());
         let ext_allowed = ext_allowed && !lone_linear;
@@ -142,7 +131,7 @@ impl AcuMatcher {
             for v in &vars {
                 sys.insert_row(v.coeff as i32, v.lower_bound, v.upper_bound);
             }
-            // Extension row (original index `nr_vars`, inserted last), unbounded residue model.
+            // Insert the unbounded residue row after all variable rows.
             if ext_allowed {
                 sys.insert_row(1, 0, UNBOUNDED);
             }
@@ -195,10 +184,8 @@ impl AcuMatcher {
         }
         self.bound.clear();
 
-        // Maude compiles a top-level `X + ... + X` pattern with no other arguments into
-        // `ACU_NonLinearLhsAutomaton`. Unlike the general Diophantine stream, it returns one maximal
-        // quotient match: on a flat `a*a*b*b`, `X*X` binds `X := a*b` in one step. If an outer match
-        // already bound X, the specialized automaton falls back to the general matcher.
+        // A sole repeated variable with no other pattern arguments has one maximal quotient match:
+        // `X*X` over `a*a*b*b` binds `X := a*b`. An existing outer binding uses the general matcher.
         if self.special_nonlinear && !self.special_attempted {
             self.special_attempted = true;
             let index = self.vars[0].index;
@@ -228,10 +215,10 @@ impl AcuMatcher {
         }
     }
 
-    /// `ACU_NonLinearLhsAutomaton`: match a sole variable of coefficient `m >= 2` against every
-    /// assignable subject entry with multiplicity at least `m`. An element-sort variable takes the
-    /// first such entry; a limit/pure collector takes all of them, dividing each multiplicity by `m`
-    /// and leaving each remainder in the extension.
+    /// Match a sole variable of coefficient `m >= 2` against assignable subject entries with
+    /// multiplicity at least `m`. An element-sort variable takes the first such entry; a collector
+    /// takes every assignable entry, dividing each multiplicity by `m` and leaving the remainders in
+    /// the extension.
     fn finish_nonlinear(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         let variable = self.vars[0].clone();
         debug_assert!(variable.coeff >= 2);
@@ -291,9 +278,9 @@ impl AcuMatcher {
         true
     }
 
-    /// `noVariableCase`: 0 unbound variables. The residue is the whole residual multiset (extension);
-    /// without extension a non-empty residue is a failure, and the degenerate empty no-op (no grounds,
-    /// non-identity subject) is not offered.
+    /// Finish a match with no unbound variables. The residual multiset becomes the extension;
+    /// without extension a non-empty residue fails, and a degenerate empty no-op with neither
+    /// grounds nor an identity subject is omitted.
     fn finish_no_var(&mut self) -> bool {
         let total: u32 = self.residual.iter().map(|&(_, m)| m).sum();
         if total == 0 {
@@ -306,7 +293,7 @@ impl AcuMatcher {
             return false; // leftover with no extension
         }
         // Extension with a non-empty residue. Skip the degenerate "match nothing, leave everything"
-        // unless grounds matched something or the subject is the identity (the B1 gating).
+        // unless grounds matched something or the subject is the identity.
         if !self.has_grounds && !self.subject_is_identity {
             return false;
         }
@@ -391,7 +378,7 @@ impl AcuMatcher {
                 continue; // sort violation (or an identity-free variable forced empty): next solution
             }
             // The degenerate empty match (nothing matched by variables, no grounds, subject not the
-            // identity) is the no-op — not a real rewrite (the B1 identity-first gating).
+            // identity) is a no-op rather than a rewrite.
             if matched == 0 && !self.has_grounds && !self.subject_is_identity {
                 continue;
             }

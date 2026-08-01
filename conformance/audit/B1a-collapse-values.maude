@@ -1,7 +1,7 @@
 *** B1a-collapse-values — collapse-at-top under id: yields different VALUES, not just counts
 *** eq a <op> X = c fires by collapsing X to the identity, matching a lone `a` (with residue via extension).
-*** ACU: red a -> c (oracle) vs a (tnk); red a + b -> b + c (oracle) vs c (tnk).
-*** AU (assoc id:, no comm) and CUI (comm id:, no assoc) analogs diverge the same way.
+*** ACU expected parity: red a -> c; red a + b -> b + c.
+*** AU (assoc id:, no comm) and CUI (comm id:, no assoc) analogs follow the same shape.
 *** The collapse fires one-shot (ground `a` LHS keeps it terminating; no `eq X Y = c`/`red nil` shape).
 fmod ACU-COLLAPSE is
   sort E .

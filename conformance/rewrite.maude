@@ -1,7 +1,4 @@
-*** Pillar A-i: rules (rl) + the `rewrite` command (rule-fair), bound, and `continue`.
-*** Verified byte-for-byte against the reference (modulo the `====` separators + `Bye.`):
-***   ~/Downloads/Maude-3/maude -no-banner conformance/rewrite.maude < /dev/null
-***   ./target/debug/tnk-repl conformance/rewrite.maude < /dev/null
+*** Rule-fair `rewrite`, bounds, and `continue`.
 ***
 *** Rules thread the constants a => b => c => d; f(d) => a re-wraps. `rewrite` reduces (no eqs here)
 *** then applies the top-down-first rule, so:

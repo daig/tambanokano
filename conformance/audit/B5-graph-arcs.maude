@@ -1,9 +1,9 @@
 *** PRELUDE
-*** B5-graph-arcs — show search graph merges arcs differently and renders rule-text NAT literals differently
+*** B5-graph-arcs — show search graph arc merging and rule-text NAT literal rendering
 *** SG has two labelled rules r1, r2 that both rewrite a to f(2) — the same successor state. After the search,
-*** show search graph prints on the oracle ONE merged arc listing both rules; tnk prints two separate arcs.
-*** The rule text also diverges: the oracle renders the RHS as f(2), tnk as f(s s 0) (the state term f(2) agrees).
-*** No comment line precedes the show command (that would trip a separate tnk command-parser bug).
+*** show search graph expected parity: ONE merged arc listing both rules.
+*** Rule text expected parity: RHS rendered as f(2) (the state term f(2) agrees).
+*** No comment line precedes the show command.
 mod SG is
   protecting NAT .
   sort St .

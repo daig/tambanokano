@@ -1,9 +1,7 @@
-*** B3.8 RAT — the DivisionSymbol kernel op conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/rat.maude < /dev/null
+*** RAT DivisionSymbol kernel conformance
 *** `_/_` (DivisionSymbol) canonicalises `I / N` to lowest terms (divide by gcd; denominator 1 ->
 *** the integer). RAT's arithmetic (+, *, quo, ...) is EQUATION-DEFINED in the prelude on top of INT,
-*** so it is a module-loading milestone (post-B4 parser), not a kernel op. `0/N` is the user equation
-*** `0/Q = 0`, so it does not reduce here. Mirrors the engine.rs B3.8 test.
+*** so this fixture exercises module-loaded equations rather than a dedicated kernel operation.
 fmod RATB is
   sorts Zero NzNat Nat NzInt Int NzRat Rat .
   subsorts Zero NzNat < Nat .

@@ -1,6 +1,6 @@
 *** A user-typed colon variable over a structured (parameterized-style) sort, L:List{Nat}, written inline
 *** in an equation and a match command. The braces are part of the one-token variable, so it resolves to a
-*** variable of sort List{Nat}. Byte-identical to the reference.
+*** variable of sort List{Nat}.
 fmod M is
   sorts Nat List{Nat} .
   op 0 : -> Nat [ctor] .

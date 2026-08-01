@@ -1,10 +1,10 @@
-*** I24-manager-pass-boundary — bounded form of the I22 walking skeleton.
+*** I24-manager-pass-boundary — bounded manager-pass session.
 *** Pins mailbox pickup order and per-request child-count transfer.
 *** PRELUDE
 set show timing off .
 set show advisories off .
 
-*** Phase I-S0 walking skeleton: local create/insert/select-reduce/reply/delete.
+*** Create, insert, select, reduce, reply, and delete.
 
 load metaInterpreter
 set include BOOL off .

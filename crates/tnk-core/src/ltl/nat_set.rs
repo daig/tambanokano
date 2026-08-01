@@ -3,10 +3,8 @@ use std::fmt;
 
 const BITS_PER_WORD: usize = u64::BITS as usize;
 
-/// Dense natural-number set with Maude's `NatSet` representation and ordering.
-///
-/// The first machine word stays inline; `tail[0]` represents elements 64..127. Trailing zero
-/// words are never retained, because their presence would change Maude's map ordering.
+/// Dense natural-number set with an inline first machine word. `tail[0]` represents elements
+/// 64–127. Trailing zero words are removed so structurally equal sets compare identically.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct NatSet {
     first: u64,
@@ -18,6 +16,7 @@ impl NatSet {
         self.first == 0 && self.tail.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.first.count_ones() as usize
             + self
@@ -51,6 +50,7 @@ impl NatSet {
             .all(|(&other, &this)| this | other == this)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
         self.first & other.first == 0
             && self
@@ -81,11 +81,6 @@ impl NatSet {
         for (this, &that) in self.tail.iter_mut().zip(&other.tail) {
             *this |= that;
         }
-    }
-
-    pub(crate) fn without(mut self, element: usize) -> Self {
-        self.remove(element);
-        self
     }
 
     pub(crate) fn remove(&mut self, element: usize) {

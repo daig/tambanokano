@@ -1,4 +1,4 @@
-*** B-i: a theory imports a module via protecting and another theory via including, and those
+*** A theory imports a module via protecting and another theory via including, and those
 *** imports flatten into it exactly as for a module: the imported ops/equations are visible and,
 *** when not nonexec, executable inside the theory.
 fth TRIV is

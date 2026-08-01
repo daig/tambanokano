@@ -1,12 +1,8 @@
-//! The per-module **mixfix CF grammar**, built from the signature (B4.3) and consumed by the Earley
-//! parser (B4.4). A direct port of Maude's `Mixfix/makeGrammar.cc` + `MixfixModule::computePrecAndGather`
-//! (`mixfixModule.cc`), adapted to typed nonterminals/terminals instead of Maude's signed-int encoding.
+//! Per-module typed mixfix grammar consumed by the Earley parser.
 //!
-//! The grammar is *signature-driven*: each connected component (kind) gets a family of nonterminals
-//! ([`NtType`]), each operator a set of productions ([`build`]), and OBJ3 default precedence/gather is
-//! computed per operator ([`prec_gather`]). The **emission order** (component productions before symbol
-//! productions) is observable — it decides which parse is found first on ambiguous input — so [`build`]
-//! reproduces Maude's order.
+//! Grammar construction is signature-driven: each kind gets a nonterminal family, each operator gets
+//! productions, and default precedence/gather is computed per operator. Emission order is observable
+//! on ambiguous input, so component productions precede symbol productions.
 
 pub mod build;
 pub mod prec_gather;
@@ -16,29 +12,27 @@ use tnk_core::smt::SmtType;
 use tnk_core::sort::{KindId, SortId};
 use tnk_core::symbol::SymbolId;
 
-// OBJ3 precedence/gather constants — Maude `mixfixModule.hh` `enum Precedence`.
+// Mixfix precedence and gather constants.
 /// The most permissive gather bound / maximum precedence (`&` resolves to this).
 pub const ANY: u32 = 127;
 pub const MAX_PREC: u32 = 127;
-/// Prefix-form argument gather — lets `_,_` work inside `f(a, b)` (Maude's comment).
+/// Prefix-form argument gather; permits `_,_` inside `f(a, b)`.
 pub const PREFIX_GATHER: u32 = 95;
-/// OBJ3 default precedence for a bare unary operator (`s_`, `-_`).
+/// Default precedence for a bare unary operator (`s_`, `-_`).
 pub const UNARY_PREC: u32 = 15;
-/// OBJ3 default precedence for a bare binary infix operator (`_+_`).
+/// Default precedence for a bare binary infix operator (`_+_`).
 pub const INFIX_PREC: u32 = 41;
 
-/// A grammar nonterminal. Maude numbers these as negative ints (fixed ones, plus per
-/// connected-component × [`NtType`]); we use a typed enum since only the production *emission order*,
-/// not the numbering, is observable.
+/// A typed grammar nonterminal. Production emission order, rather than numeric identity, is observable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Nt {
-    /// The universal start symbol; every kind's term lifts to it (`TERM ::= <kind>Term`, Maude's `TERM`).
+    /// Universal start symbol; every kind's term lifts to it.
     Term,
-    /// A per-connected-component (kind), per-type nonterminal (Maude's `nonTerminal(component, type)`).
+    /// A per-kind, per-type nonterminal.
     Comp(KindId, NtType),
 }
 
-/// The kind-relative nonterminal families (Maude's `enum NonTerminalType`, simple/non-complex subset).
+/// Kind-relative nonterminal families.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum NtType {
     /// A term of this kind (`<FooTerm>`).
@@ -54,22 +48,20 @@ pub enum NtType {
 pub enum Terminal {
     /// A specific token (operator-name fragment, punctuation, sort name). Matched by `Sym` equality.
     Tok(Sym),
-    /// Any natural-number literal token (Maude's `SMALL_NAT`); matched by [`crate::lex::TokKind::Number`].
+    /// Any natural-number literal token.
     SmallNat,
-    /// Any float literal token (Maude's `FLOAT_NT`).
+    /// Any float literal token.
     Float,
-    /// Any negative-integer literal token (Maude's `SMALL_NEG`); matched by [`crate::lex::TokKind::NegNumber`].
+    /// Any negative-integer literal token.
     SmallNeg,
-    /// Any glued rational literal token `[-]num/den` (Maude's `RATIONAL`); matched by
-    /// [`crate::lex::TokKind::Rational`]. Only emitted for a module that has a `DivisionSymbol` (RAT).
+    /// Any glued rational token `[-]num/den`; emitted only when a division symbol exists.
     Rational,
-    /// An `iter`-symbol input token `f^count` (Maude's `ITER_SYMBOL`), matched by
-    /// [`crate::lex::TokKind::Iter`] whose base name (the text before the `^`) equals the held `Sym`
-    /// (the interned canonical op name, e.g. `s_`). The trailing digits are the iteration count.
+    /// An iteration token `f^count` whose base name matches the held symbol. The trailing digits are
+    /// the iteration count.
     IterSymbol(Sym),
-    /// Any string literal token (Maude's `STRING_NT`).
+    /// Any string literal token.
     Str,
-    /// Any quoted-identifier token (Maude's `QUOTED_ID`).
+    /// Any quoted-identifier token.
     Qid,
     /// An **on-the-fly variable** written with an explicit sort, `name:sort` (one token, e.g. `X:Nat`):
     /// matches any identifier token whose suffix after the last `:` is this sort's name. The held `Sym`
@@ -91,8 +83,8 @@ impl GSym {
     }
 }
 
-/// The semantic action attached to a production — the functional subset of Maude's ~70 `MixfixParser`
-/// actions, carrying the resolved symbol/sort the tree-walker ([`crate::build_term`], B4.4b) needs.
+/// The semantic action attached to a production, carrying the resolved symbol or sort needed by the
+/// term-tree builder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     /// No term built (sort-name productions).
@@ -103,18 +95,13 @@ pub enum Action {
     MakeTerm(SymbolId),
     /// Build a variable of this sort from the matched token.
     MakeVariable(SortId),
-    /// Build compact `s^n(0)` from a decimal numeral, for the successor `symbol`
-    /// (Maude's `MAKE_NATURAL`).
+    /// Build compact `s^n(0)` from a decimal numeral for the successor `symbol`.
     MakeNatural(SymbolId),
-    /// Build a negative integer `-(s^n(0))` from a `SMALL_NEG` token, for the minus `symbol` (Maude's
-    /// `MAKE_INTEGER` → `MinusSymbol::makeIntTerm`).
+    /// Build a negative integer `-(s^n(0))` from one negative-integer token.
     MakeInteger(SymbolId),
-    /// Build compact `f^n(t)` for the `iter` `symbol` (Maude's `MAKE_ITER`): the token carries the
-    /// arbitrary-size count `n`, and the one nonterminal child is the base term `t`.
+    /// Build compact `f^n(t)` for an iteration symbol; the token carries an arbitrary-size count.
     MakeIter(SymbolId),
-    /// Build a glued rational literal `[-]num/den` (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`):
-    /// `division / num_or_minus(num) den`, where a non-negative numerator is `s^num(0)` and a negative one
-    /// is `minus(s^|num|(0))`. Carries the `DivisionSymbol` and the `MinusSymbol` (for a negative numerator).
+    /// Build a glued rational `[-]num/den`, using the division and unary-minus symbols.
     MakeRational {
         division: SymbolId,
         minus: SymbolId,
@@ -127,7 +114,7 @@ pub enum Action {
     MakeFloat(SymbolId),
     MakeString(SymbolId),
     MakeQid(SymbolId),
-    /// A flattened associative-list element (Maude's `ASSOC_LIST`); collected + reversed by build_term.
+    /// A flattened associative-list element, collected and reversed by `build_term`.
     AssocList,
 }
 
@@ -136,11 +123,10 @@ pub enum Action {
 pub struct Production {
     pub lhs: Nt,
     pub rhs: Vec<GSym>,
-    /// The production's own precedence (Maude's `Rule::prec`); a call accepts it iff `prec <= maxPrec`.
+    /// Production precedence; accepted when `prec <= max_prec`.
     pub prec: u32,
-    /// One gather bound per **nonterminal** in `rhs`, in left-to-right order (Maude stores it in each
-    /// rhs `Pair.prec`). A completed sub-production of precedence `p` may fill the `i`-th nonterminal
-    /// hole iff `gather[i] >= p`.
+    /// Gather bounds for nonterminal positions from left to right. A child of precedence `p` may fill
+    /// position `i` when `gather[i] >= p`.
     pub gather: Vec<u32>,
     pub action: Action,
 }
@@ -152,8 +138,8 @@ impl Production {
     }
 }
 
-/// A per-module mixfix grammar: the productions plus a stable start symbol ([`Nt::Term`]). Built by
-/// [`build::build_grammar`]; consumed by the Earley parser (B4.4).
+/// A per-module mixfix grammar: productions plus a stable [`Nt::Term`] start symbol. Built by
+/// [`build::build_grammar`] and consumed by the Earley parser.
 #[derive(Debug, Default)]
 pub struct Grammar {
     pub productions: Vec<Production>,

@@ -1,5 +1,4 @@
-*** I23-meta-oo-list — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/meta-oo-list-2.maude; oracle verified 2026-07-23.
+*** I23-meta-oo-list
 *** PRELUDE
 set show timing off .
 

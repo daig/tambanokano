@@ -1,4 +1,4 @@
-*** V09-meta-variant-unify2 — lifted from the reference suite (Meta/metaVariantUnify2.maude). NOTE: tnk-side runs hit the 60s harness timeout until S2 — the test searches unifiers via unbounded recursion on metaVariantUnify, inert until S2 (by design; a timeout is an honest FAIL).
+*** Variant-unification delay and filtering cases.
 *** PRELUDE
 set show timing off .
 

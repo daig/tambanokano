@@ -1,4 +1,4 @@
-*** U01-unification — lifted from the reference suite (Misc/unification.maude)
+*** U01-unification
 *** PRELUDE
 set show advise off .
 set show timing off .

@@ -1,17 +1,15 @@
-//! The surface (recursive-descent) parser: `.maude` token stream → [`Source`] (functional modules +
-//! commands). Term-carrying parts are collected as raw token **bubbles** (terminator-delimited), handed
-//! to the mixfix parser later (B4.4). This replaces Maude's flex/bison `lexBubble` global handshake with
-//! an explicit cursor + `collect_until` (decision: no hidden lexer↔parser state).
+//! Recursive-descent parsing of a surface token stream into [`Source`] modules and commands.
+//! Term-carrying parts are collected as terminator-delimited raw token bubbles and handed to the
+//! per-module mixfix parser, keeping lexer and parser state explicit.
 
 use crate::lex::{Interner, TokKind, Token};
 use crate::surface::ast::*;
 
 pub type PResult<T> = Result<T, String>;
 
-/// The retained trailing attributes of a statement: the execution-relevant `[owise]`/`[nonexec]` flags and
-/// the `[label …]` name (kept for META up-translation — `upEqs`/`upMbs` render it, matching the reference).
-/// Other attributes (`metadata`, `print`, `format`, …) are parsed but not retained — see
-/// [`Parser::stmt_attrs`].
+/// The retained trailing attributes of a statement: the execution-relevant `[owise]`/`[nonexec]` flags
+/// and the `[label …]` name used by reflective equation and membership rendering. Other attributes
+/// (`metadata`, `print`, `format`, …) are parsed but not retained; see [`Parser::stmt_attrs`].
 #[derive(Debug, Default, Clone)]
 struct StmtAttrs {
     owise: bool,
@@ -19,9 +17,9 @@ struct StmtAttrs {
     variant: bool,
     narrowing: bool,
     label: Option<String>,
-    /// The tokens of a `[print …]` attribute's content (the strings/variables after `print`), captured for
-    /// validation: a print variable must resolve to a variable of the statement (Maude rejects an unknown
-    /// token and drops the statement, C4f). Empty when there is no `print` attribute.
+    /// The tokens in a `[print …]` attribute after `print`, retained for validation. Every non-string
+    /// token must resolve to a variable of the statement; otherwise the statement is rejected. Empty
+    /// when there is no `print` attribute.
     print: Vec<Token>,
 }
 
@@ -52,11 +50,8 @@ fn top_level_find(toks: &[Token], i: &Interner, kw: &str, last: bool) -> Option<
     found
 }
 
-/// Locate the statement-level `=` in an equation bubble. It is normally the first top-level `=`;
-/// choosing the last one misclassifies unparenthesized mixfix operators in the right-hand side (for
-/// example `eq p = while Q = 0 do … od`). The one exceptional shape needed by Maude's built-in syntax
-/// is `_=[_]_` on the left: when the first `=` opens a bracketed argument and another separator follows
-/// that argument, use the latter. If no later `=` exists, the bracket starts an ordinary right-hand side.
+/// Locate the statement-level equation separator. Normally this is the first top-level `=`. For a
+/// left-side `_=[_]_` term, use the separator after its bracketed argument.
 fn equation_separator(toks: &[Token], i: &Interner) -> Option<usize> {
     let first = top_level_find(toks, i, "=", false)?;
     if toks.get(first + 1).map(|token| token.text(i)) == Some("[")
@@ -114,9 +109,7 @@ fn peel_stmt_attrs(body: &mut Vec<Token>, i: &Interner) -> StmtAttrs {
     {
         return sa; // a `[_]`-list / `{_}`-set term, not attributes
     }
-    // `label`/`metadata` each take one following argument token; capture the label name (for META
-    // up-translation), skip metadata's, and ignore everything else token-by-token. `print` captures its
-    // following string/variable list (until the next attribute keyword) for later validation (C4f).
+    // Capture label and print arguments; metadata and other attributes are consumed without payload.
     let mut want_arg: Option<&str> = None;
     let mut in_print = false;
     for t in &body[open + 1..body.len() - 1] {
@@ -168,11 +161,10 @@ fn peel_irreducible_suffix(body: &mut Vec<Token>, i: &Interner) -> PResult<Vec<T
     Ok(blockers)
 }
 
-/// A `[print …]` attribute is well-formed iff each of its non-string items resolves to a variable of the
-/// statement: an on-the-fly typed variable (a token carrying `:`, self-declaring) or a bare name that is a
-/// declared `var`/`vars` of the module. Maude rejects any other token ("bad token X") and DROPS the whole
-/// statement — a bare name that only appears on-the-fly in the body is *not* accepted
-/// (C4f; a declared-but-unused variable IS accepted — Maude only warns, so it stays valid here).
+/// A `[print …]` attribute is well-formed iff each non-string item resolves to a statement variable:
+/// either an on-the-fly typed variable (a self-declaring token containing `:`) or a bare name declared
+/// by the module's `var`/`vars`. Any other token invalidates the statement. A bare name declared only
+/// on the fly in the statement body is not accepted here; a declared but unused variable is accepted.
 fn print_attr_error(print: &[Token], m: &PreModule, i: &Interner) -> Option<String> {
     print.iter().find_map(|t| {
         if t.kind == TokKind::Str {
@@ -268,10 +260,8 @@ impl<'a> Parser<'a> {
             Err(format!("expected `.`, found {:?}", self.peek_text()))
         }
     }
-    /// An optional `in <MODULE-EXPR> :` qualifier after a command keyword (Maude's `red in NAT : t .`).
-    /// The module expression runs to the `:` that precedes the term — module names / instantiations have
-    /// no top-level `:` (a colon variable `X:Nat` lexes as one token, so its `:` is invisible here). The
-    /// tokens are concatenated (module names contain no spaces: `NAT`, `META-LEVEL`, `LIST{Nat}`).
+    /// Parse an optional `in <MODULE-EXPR> :` qualifier. The module expression ends at the top-level
+    /// colon before the command term.
     fn opt_in_module(&mut self) -> PResult<Option<String>> {
         if !self.at("in") {
             return Ok(None);
@@ -290,9 +280,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The two synthetic tokens for Maude's class-attribute suffix `` `:_ ``.
-    /// [`tokenize`](crate::lex::tokenize) pre-interns both fragments because the surface parser holds
-    /// only `&Interner`.
+    /// Synthetic tokens for the class-attribute suffix `` `:_ ``.
     fn attribute_suffix(&self, line: u32) -> [Token; 2] {
         let fragment = |text| Token {
             sym: self
@@ -305,10 +293,8 @@ impl<'a> Parser<'a> {
         [fragment(":"), fragment("_")]
     }
 
-    /// Desugar `class C` into a sort `C`, a subsort `C < Cid`, and the honorary class constant
-    /// `op C : -> C [ctor]` (Maude's `processClassSorts`/`processClassOps`). In a theory the class constant
-    /// is implicitly a parameter constant, so a parameter copy renames it `C` → `X$C`. `ctoks` is the
-    /// complete structured class name (for example `List { X }`), reused as the constant's mixfix name.
+    /// Desugar a class into its sort, `C < Cid`, and constructor constant. In a theory the constant is
+    /// a parameter constant. `ctoks` preserves structured class syntax.
     fn desugar_class(&self, m: &mut PreModule, ctoks: Vec<Token>, cname: &str) {
         m.sorts.push(cname.to_string());
         // `C < Cid`: a two-group chain (`[[C], [Cid]]`), as the `subsort` parser builds it.
@@ -327,9 +313,7 @@ impl<'a> Parser<'a> {
         });
     }
 
-    /// Desugar a class attribute `a : S` into `op a`:_ : S -> Attribute [ctor gather (&)]` (Maude's
-    /// `processClassOps`: the `attributeSuffix` ``"`:_"``, range `Attribute`, `gather (&)`). `atok` is the
-    /// attribute name's own token; the mixfix name is `[a, :, _]` (canonical `a:_`, re-split to `a :_`).
+    /// Desugar an attribute into `op a`:_ : S -> Attribute [ctor gather (&)]`.
     fn desugar_attribute(&self, m: &mut PreModule, atok: Token, asort: String) {
         let mut name = vec![atok];
         name.extend(self.attribute_suffix(atok.line));
@@ -549,9 +533,8 @@ impl<'a> Parser<'a> {
 
     // ---- top level ----
 
-    /// Parse one top-level item — a module or a (module-untagged) command — or `None` at end of input.
-    /// The REPL drives this directly (a command binds to its persistent current module); `parse_source`
-    /// loops over it and re-applies Maude's most-recently-entered-module tagging.
+    /// Parse one top-level item, or `None` at EOF. Commands remain untagged until the caller associates
+    /// them with its current module.
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
         let Some(txt) = self.peek_text() else {
             return Ok(None);
@@ -751,9 +734,8 @@ impl<'a> Parser<'a> {
                 })
             }
             "frewrite" | "frew" => {
-                // `frewrite [n]` (rewrite bound) or `frewrite [n, g]` (bound + gas). The two-number form
-                // reuses the search-style `[n, m]` parse: `(bound, gas)` (the gas was
-                // stuck at the default 1).
+                // `frewrite [n]` sets the rewrite bound; `frewrite [n, g]` sets the bound and gas.
+                // The two-number form uses the search-bound parser and returns `(bound, gas)`.
                 self.advance();
                 let (bound, gas) = self.opt_search_bound()?;
                 let module = self.opt_in_module()?;
@@ -872,10 +854,9 @@ impl<'a> Parser<'a> {
                 TopItem::Command(Command::Continue { bound })
             }
             "set" => {
-                // An interpreter directive, e.g. `set include BOOL off .` (prelude:31). A no-op for
-                // us: we never auto-import a module (every import is explicit in the source), and
-                // interactive `set` (e.g. `set trace on`) is intercepted by the REPL before the
-                // parser runs. Consume through the `.` and parse the next item.
+                // A source directive such as `set include BOOL off .` does not alter loading: imports are
+                // explicit, and interactive `set` commands are handled by the REPL before parsing.
+                // Consume through the terminator and continue with the next item.
                 self.advance(); // `set`
                 while !self.at_dot() && self.peek_text().is_some() {
                     self.advance();
@@ -884,10 +865,8 @@ impl<'a> Parser<'a> {
                 return self.parse_top_item();
             }
             _ => {
-                // Top-level junk: Maude warns "unexpected token" and skips it token-by-token, then
-                // continues — a run of junk (`junkalpha junkbeta …`) is consumed and
-                // the next real construct (a module / command) still parses. Skip this token and retry; the
-                // per-token warning is phase-E diagnostics, so the skip is silent here.
+                // Recover from unknown top-level input one token at a time so the next module or command
+                // remains parseable. This fallback itself is intentionally silent.
                 self.advance();
                 return self.parse_top_item();
             }
@@ -901,7 +880,7 @@ impl<'a> Parser<'a> {
             match item {
                 TopItem::Module(m) => src.modules.push(m),
                 TopItem::View(v) => src.views.push(v),
-                // A command runs against the most recently entered module (Maude's current module).
+                // A source-file command uses the most recently entered module.
                 TopItem::Command(c) => {
                     let m = src
                         .modules
@@ -933,7 +912,7 @@ impl<'a> Parser<'a> {
         let is_object = matches!(kw, "omod" | "oth");
         self.advance(); // fmod / mod / fth / th / smod / sth / omod / oth
         let name = self.name()?;
-        // Optional formal parameters `{X :: T, …}` (B-iii). The stored name stays the bare base.
+        // Optional formal parameters `{X :: T, …}`. The stored name stays the bare base.
         let params = if self.at("{") {
             self.param_list()?
         } else {
@@ -958,10 +937,8 @@ impl<'a> Parser<'a> {
             strat_decls: Vec::new(),
             strat_defs: Vec::new(),
         };
-        // An object module auto-imports `CONFIGURATION` (Maude's `set oo include CONFIGURATION on`),
-        // supplying the object constructor `<_:_|_>`, `Cid`/`Attribute`/`AttributeSet`, and the soup `__`.
-        // Applied first (Maude adds oo-includes ahead of the user's imports); the built-in `CONFIGURATION`
-        // is injected into the module DB on demand (`tnk_modules::prelude`). Modes don't affect flattening.
+        // Object modules import `CONFIGURATION` first, supplying object, attribute, and soup operators.
+        // The module database injects this built-in source on demand.
         if is_object {
             m.imports.push(Import {
                 mode: ImportMode::Including,
@@ -983,7 +960,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// A formal parameter list `{X :: T, Y :: T', …}` (B-iii). `::` lexes as one token (`:` is not
+    /// A formal parameter list `{X :: T, Y :: T', …}`. `::` lexes as one token (`:` is not
     /// splitting punctuation). The theory is a plain named theory.
     fn param_list(&mut self) -> PResult<Vec<Parameter>> {
         self.eat("{")?;
@@ -1003,18 +980,11 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// A sort name, possibly **structured** (B-iii): a base identifier optionally followed by `{ … }` of
-    /// comma-separated sort-name arguments — `Pair{X}`, `Map{X,Y}`, `List{List{X}}`. Reassembled into the
-    /// canonical no-space spelling Maude uses internally (`List{X}`), which then flows through `build_sig`
-    /// as an ordinary sort name string. A parameter sort `X$Elt` is already one token (`$` is not splitting
-    /// punctuation), so it needs no special handling. (A kind `[…]` sort is a follow-up.)
+    /// Parse nested structured sorts and kind sorts, returning canonical no-space spelling.
     fn sort_name(&mut self) -> PResult<String> {
         if self.at("[") {
-            // A **kind** sort `[S]` — the top (error) sort of S's connected component (`var B : [Bool]`,
-            // `op undefined : -> [Y$Elt]`). The multi-sort form `[A, B]` names the kind of the component
-            // that contains A and B (`kindNameDecember2022`; the sorts must share one component). `build_sig`
-            // resolves the canonical `[A,B]` spelling to `error_sort(kind_of(·))`. Each inner is a full sort
-            // name (so `[List{Nat}]` nests; the `,` inside `{ … }` is consumed by the inner parse).
+            // `[S]` denotes S's kind sort; `[A,B]` denotes their shared kind. Each inner item is a complete
+            // sort name, so structured sorts can nest.
             self.advance(); // [
             let mut inners = vec![self.sort_name()?];
             while self.at(",") {
@@ -1025,19 +995,14 @@ impl<'a> Parser<'a> {
             return Ok(format!("[{}]", inners.join(",")));
         }
         let mut name = self.name()?;
-        // A `.` inside a sort name is illegal (Maude: `A.B is not a valid sort name`). The lexer glues a
-        // non-terminator dot into the maudeId, so a dotted sort like `A.B` arrives as one token here; a
-        // legitimate structured/kind sort never has a `.` in its base identifier (it uses `{}`/`[]`). This
-        // rejects the whole declaration (bail-on-first-error), matching Maude's "module unusable" recovery
-        //.
+        // Dots are illegal in base sort names. Structured and kind syntax use braces or brackets, so a
+        // dotted token is rejected with the whole declaration.
         if name.contains('.') {
             return Err(format!(
                 "`{name}` is not a valid sort name (`.` not allowed)"
             ));
         }
-        // A *chain* of `{ … }` groups, not just one: a nested instantiation's renaming names the inner
-        // structured sort `NeList{STRICT-WEAK-ORDER}{X}` (Axis-A5), and `List{List{X}}` nests via the
-        // recursive arg parse. Reassembled into Maude's canonical no-space spelling.
+        // Parse a chain of parameter groups recursively and reassemble it without spaces.
         while self.at("{") {
             self.advance(); // {
             let mut args = Vec::new();
@@ -1055,7 +1020,7 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
-    /// A view definition `view V [{X :: T, …}] from <expr> to <expr> is <maps> endv` (B-ii / Axis-A2). An
+    /// A view definition `view V [{X :: T, …}] from <expr> to <expr> is <maps> endv`. An
     /// optional parameter list after the name makes it a *parameterized* view (`view V{X :: T} … to M{X}`),
     /// only used by a nested instantiation. `from`/`to` are module expressions. Maps: `sort A to B .`,
     /// `op f to g .`, `op f : A -> B to g .`, and `op f to term t .`.
@@ -1348,10 +1313,9 @@ impl<'a> Parser<'a> {
                 self.eat_dot()?;
                 m.vars.push(VarDecl { names, sort });
             }
-            // Object-module surface (`omod`, Pillar 2.5-E). `class`/`subclass`/`msg` are **desugared here**
-            // into ordinary sorts/subsorts/ops (Maude's `ooProcess.cc`), so the rest of the pipeline needs
-            // no object-module awareness — only the `is_object` flag (for the pattern-completion transform)
-            // and the auto-imported `CONFIGURATION` (for `Cid`/`Attribute`/`AttributeSet`/`<_:_|_>`/`__`).
+            // Object modules desugar class/subclass/message declarations into ordinary signature entries.
+            // The retained `is_object` flag enables object-pattern completion, and CONFIGURATION is
+            // imported implicitly.
             "class" | "classes" => {
                 if !m.is_object {
                     return Err(format!(
@@ -1367,8 +1331,8 @@ impl<'a> Parser<'a> {
                 let class_start = self.pos;
                 let cname = self.sort_name()?;
                 let ctoks = self.toks[class_start..self.pos].to_vec();
-                // A class name becomes a sort *and* a same-named constant operator; an underscore would
-                // make that operator a mixfix form with a hole (Maude rejects it — `ooProcess.cc`).
+                // A class name also becomes a same-named nullary operator, so underscores would be
+                // interpreted as mixfix holes and are forbidden.
                 if cname.contains('_') {
                     return Err(format!("underscore not allowed in class name `{cname}`"));
                 }
@@ -1427,8 +1391,7 @@ impl<'a> Parser<'a> {
                 }
                 let multi = kw == "msgs";
                 self.advance();
-                // `msg m : S1 S2 -> Msg .` desugars to `op m : S1 S2 -> Msg [ctor msg]` (Maude's `endMsg`
-                // sets `MESSAGE | CTOR`); the range is whatever the user writes (`Msg` by convention).
+                // A message declaration becomes a constructor/message operator with the written range.
                 let names = self.op_names_before_signature()?;
                 let mut domain = Vec::new();
                 while !self.at("->") && !self.at("~>") {
@@ -1468,8 +1431,7 @@ impl<'a> Parser<'a> {
                 let conditional = kw == "ceq";
                 let line = self.peek().map(|token| token.line);
                 self.advance();
-                // Optional leading `[name] :` label (Maude's labelled-equation syntax). Only a real
-                // `[name] :` is peeled; a `[_]`-headed lhs (`eq [x] = y .`) leaves its `[` for the body.
+                // Peel only a genuine `[name] :` label; a bracket-headed term remains in the body.
                 let leading = self.peel_leading_label()?;
                 // Collect the whole statement body (depth-aware over `()[]{}`) and split it, rather than
                 // streaming to the first `=`/`[`: a `[_]`-list term (`eq reverse([]) = [] .`) has top-level
@@ -1478,8 +1440,7 @@ impl<'a> Parser<'a> {
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
-                // A `[print …]` referencing a non-variable token is rejected by Maude, which drops the
-                // statement while keeping the module. Retain the cause for Session-owned rendering.
+                // Invalid `[print …]` variable references drop the statement and retain a diagnostic.
                 if let Some(reason) = print_attr_error(&sa.print, m, self.i) {
                     m.diagnostics.push(Diagnostic::warning(
                         m.name.clone(),
@@ -1560,9 +1521,7 @@ impl<'a> Parser<'a> {
                 }
                 let conditional = kw == "crl";
                 self.advance();
-                // Optional leading label `[name] :` (Maude's labelled-rule syntax) — only a genuine
-                // `[name] :`; a `[_]`-headed lhs (`rl [N] => [N + 1] .`) leaves its leading `[` for the
-                // body.
+                // Peel only a genuine `[name] :` rule label; a bracket-headed term remains in the body.
                 let label = self.peel_leading_label()?;
                 // Collect the whole body depth-aware over `()[]{}` (like `eq`) so a `[_]`-headed lhs/rhs
                 // (`[N + 1]`) is not truncated at its `[`, then peel a trailing `[attrs]` (real attributes
@@ -1580,8 +1539,8 @@ impl<'a> Parser<'a> {
                     ));
                     return Ok(());
                 }
-                // The arrow `=>` lexes as one token (a run of non-punctuation chars); an unspaced `t=>p`
-                // lexes as a single token and so will not split here — rejected exactly as Maude rejects it.
+                // The arrow `=>` lexes as one token. An unspaced `t=>p` is a different identifier token,
+                // so it cannot serve as the rule delimiter.
                 let arrow =
                     top_level_find(&body, self.i, "=>", false).ok_or("rule is missing `=>`")?;
                 let mut rest = body.split_off(arrow + 1);
@@ -1618,7 +1577,7 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 self.advance();
-                // `strat[s] n1 … : <domain sorts> @ Sort .`; Maude omits the colon when the
+                // `strat[s] n1 … : <domain sorts> @ Sort .`; the colon is omitted when the
                 // strategy has no call parameters (`strats n1 n2 @ Sort .`).
                 let mut names = Vec::new();
                 while !self.at(":") && !self.at("@") {
@@ -1685,7 +1644,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    // ---- strategy expressions (Pillar 2.4) ----
+    // ---- strategy expressions ----
 
     /// Parse a strategy expression (precedence low→high: `? :` < `|` < `;` < postfix `* + !` < atom).
     /// Term-carrying parts (test/matchrew patterns + conditions, application substitutions, call arguments)
@@ -1776,7 +1735,7 @@ impl<'a> Parser<'a> {
                     StratExpr::One(e)
                 }
             }
-            // Derived branch forms — kept in surface spelling (echo fidelity); resolution desugars.
+            // Derived branch forms retain their surface spelling for command echoes; resolution desugars them.
             "try" | "not" | "test" => {
                 self.advance();
                 self.eat("(")?;
@@ -1979,7 +1938,7 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    // ---- module expressions (B5) ----
+    // ---- module expressions ----
 
     /// A (non-parameterized) module expression: a summation of renamings of atoms. `*` (renaming) binds
     /// tighter than `+` (summation); both are left-associative. Parses up to the terminator `.`.
@@ -2004,10 +1963,10 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    /// `(NAME | '(' module_expr ')') ('{' arg (',' arg)* '}')*`. Each `{…}` after the base is a parameterized
-    /// instantiation `M{A, …}`; a *chain* `M{A}{B}` (Axis-A5 kind 1) re-instantiates the free parameters a
-    /// theory-view argument leaves behind. A **parenthesized** base is itself instantiable —
-    /// `(M * (renaming)){V}` instantiates a renamed parameterized module (finding C3a; stock `linear.maude`).
+    /// `(NAME | '(' module_expr ')') ('{' arg (',' arg)* '}')*`. Each `{…}` after the base is a
+    /// parameterized instantiation `M{A, …}`. A chain `M{A}{B}` re-instantiates free parameters left by a
+    /// theory-view argument. A parenthesized base is also instantiable, so `(M * (renaming)){V}` applies an
+    /// argument to a renamed parameterized module.
     fn module_atom(&mut self) -> PResult<ModuleExpr> {
         let mut e = if self.at("(") {
             self.advance();
@@ -2023,7 +1982,7 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    /// The argument list of an instantiation `{A1, A2, …}` (Axis-A2/A5). Each argument is a full module
+    /// The argument list of an instantiation `{A1, A2, …}`. Each argument is a full module
     /// expression: a view name (`Nat`), a nested instantiation (`BoxV{ToColor}`, `List{Nat}`), or a bare
     /// enclosing-parameter name (`X`). `flatten` classifies each contextually.
     fn instantiation_args(&mut self) -> PResult<Vec<ModuleExpr>> {
@@ -2084,9 +2043,8 @@ impl<'a> Parser<'a> {
                     });
                 }
                 "attr" => {
-                    // `attr a [. C] to b`: the attribute op is `a`:_` (range `Attribute`); the optional
-                    // `. C` class qualifier (Maude's disambiguator) is parsed and ignored (a single
-                    // attribute name is unambiguous in these specs).
+                    // Parse and ignore an optional `. C` attribute-class qualifier; one attribute name is
+                    // unambiguous here.
                     let from = self.name()?;
                     if self.at_dot() {
                         self.eat_dot()?;
@@ -2169,10 +2127,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// An optional leading `[name] :` statement label (Maude's labelled-statement syntax, valid on
-    /// `eq`/`ceq`/`mb`/`cmb`/`rl`/`crl`). It fires **only** when the bracket group is `[` <one token> `]`
-    /// immediately followed by `:` — otherwise the leading `[` heads a `[_]`-term LHS
-    /// (`rl [N] => [N + 1] .`, `eq [x] = y .`) and is left for the body.
+    /// Peel an optional `[name] :` statement label. A bracket group qualifies only when it contains one
+    /// token and is immediately followed by `:`; otherwise it remains part of a bracket-headed term.
     fn peel_leading_label(&mut self) -> PResult<Option<String>> {
         if !self.at("[") {
             return Ok(None);
@@ -2240,7 +2196,7 @@ impl<'a> Parser<'a> {
                 "label" => {
                     self.advance(); // 'label'
                     if !self.at("]") {
-                        sa.label = self.peek_text().map(str::to_string); // retained for META up-translation
+                        sa.label = self.peek_text().map(str::to_string); // retained for reflective rendering
                         self.advance();
                     }
                 }
@@ -2253,7 +2209,7 @@ impl<'a> Parser<'a> {
                 "print" => {
                     self.advance(); // 'print'
                     // Capture the print list (strings/variables) until the next attribute keyword or `]`,
-                    // for validation (C4f); a string is always a print item, never a keyword.
+                    // for validation; a string is always a print item, never a keyword.
                     while let Some(t) = self.peek() {
                         if self.at("]") {
                             break;
@@ -2287,8 +2243,7 @@ impl<'a> Parser<'a> {
         Ok(sa)
     }
 
-    /// An optional command bound `[n]` (e.g. `rewrite [2] …`, `continue [3] .`). Returns the number, or
-    /// `None` when absent. (The `[n, m]` search bound is a Pillar A-iv extension.)
+    /// Parse an optional command bound `[n]`, used by rewrite and continue forms.
     fn opt_bound(&mut self) -> PResult<Option<u64>> {
         if self.at("[") {
             self.advance();
@@ -2376,9 +2331,8 @@ impl<'a> Parser<'a> {
                     self.advance();
                     a.memo = true;
                 }
-                // Object-system role attributes (Pillar 2.5). `obj`≡`object`, `msg`≡`message`,
-                // `config`≡`configuration` (Maude's lexer aliases). Recorded onto the symbol; they
-                // drive the `erewrite` object-message scheduler but are inert for plain rewrite/search.
+                // Object-system role aliases are recorded on the symbol. They drive `erewrite` and remain
+                // metadata for ordinary rewrite and search.
                 "config" | "configuration" => {
                     self.advance();
                     a.config = true;
@@ -2417,8 +2371,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     a.id = Some(self.id_term());
                 }
-                // One-sided identity `left id:` / `right id:` (Maude's `assoc left id: e`): the identity
-                // collapses only on the declared side.
+                // One-sided identities collapse only on the declared side.
                 "left" | "right" => {
                     a.id_side = if kw == "left" {
                         IdSide::Left
@@ -2499,9 +2452,8 @@ impl<'a> Parser<'a> {
                     a.pconst = true;
                 }
                 "rpo" => {
-                    // Recursive-path-ordering weight (`[rpo 1]`) — a termination hint; accepted and
-                    // ignored (Maude reads it for its termination checker, not for reduction). Consume an
-                    // optional numeric argument.
+                    // Recursive-path-ordering weight (`[rpo 1]`): accepted as a termination hint but not
+                    // used during reduction. Consume its optional numeric argument.
                     self.advance();
                     if !self.at("]") && self.peek_text().is_some_and(|t| t.parse::<i64>().is_ok()) {
                         self.advance();
@@ -2514,11 +2466,9 @@ impl<'a> Parser<'a> {
         Ok(a)
     }
 
-    /// The identity term bubble of an `id:` / `left id:` / `right id:` attribute — a single term, collected
-    /// up to the next attribute keyword (or `]`). NOT `collect_until(["]"])`, which would swallow following
-    /// attributes (`prec`, `format`, …) into the identity bubble — leaving the op with no `prec`, so e.g.
-    /// SET/MAP's `_,_ [assoc comm id: empty prec 121]` defaulted to prec 41 and mis-parsed a
-    /// constructor-application argument (`a |-> a, a |-> a`).
+    /// Collect the identity term bubble of an `id:` / `left id:` / `right id:` attribute up to the next
+    /// attribute keyword or `]`. Stopping at attribute keywords keeps following `prec`, `format`, and
+    /// other attributes out of the identity term.
     fn id_term(&mut self) -> Vec<Token> {
         self.collect_until(&[
             "assoc",
@@ -2711,7 +2661,7 @@ endfm
         assert_eq!(sp.term_hooks.len(), 2);
     }
 
-    /// B5: import declarations parse into `PreModule.imports` with the right mode + module expression.
+    /// Import declarations preserve their mode and module expression.
     #[test]
     fn parses_imports() {
         let src = "\
@@ -2769,7 +2719,7 @@ endfm
         }
     }
 
-    /// B-i: a theory (`fth`) parses into a `PreModule` flagged `is_theory` (kind Functional), with
+    /// A theory (`fth`) parses into a `PreModule` flagged `is_theory` (kind Functional), with
     /// `[nonexec]` captured on its axiom and an ordinary equation left executable.
     #[test]
     fn parses_functional_theory_with_nonexec() {
@@ -2803,7 +2753,7 @@ endfth
         }
     }
 
-    /// B-i: `th` is a *system* theory (rules allowed); a functional theory (`fth`) rejects rules exactly
+    /// `th` is a *system* theory (rules allowed); a functional theory (`fth`) rejects rules exactly
     /// as `fmod` does. Closing keywords `endth`/`endfth` are matched.
     #[test]
     fn system_theory_allows_rules_functional_rejects() {
@@ -2823,7 +2773,7 @@ endfth
         );
     }
 
-    /// B-iii: a parameterized module parses its formal parameters and structured sort names (`Ctr{X}`,
+    /// A parameterized module parses its formal parameters and structured sort names (`Ctr{X}`,
     /// `X$Elt`, the structured subsort) — the name stays the bare base.
     #[test]
     fn parses_parameterized_module() {
@@ -2852,7 +2802,7 @@ endfm
         assert_eq!(put.range, "NzCtr{X}");
     }
 
-    /// B-iii: multiple parameters and a multi-argument structured sort `Map{X,Y}` (canonical no-space form).
+    /// Multiple parameters and a multi-argument structured sort `Map{X,Y}` (canonical no-space form).
     #[test]
     fn parses_multi_param_and_structured_sort() {
         let src = "fmod MAP{X :: TRIV, Y :: TRIV} is sort Map{X,Y} . op e : -> Map{X,Y} . endfm\n";
@@ -2863,7 +2813,7 @@ endfm
         assert_eq!(m.ops[0].range, "Map{X,Y}");
     }
 
-    /// B-ii: a view parses into a `ViewDecl` — from-theory, to-module, a sort map, and op→op / op→term maps.
+    /// A view parses into a `ViewDecl` — from-theory, to-module, a sort map, and op→op / op→term maps.
     #[test]
     fn parses_view() {
         let src = "\
@@ -2914,7 +2864,7 @@ endv
         ));
     }
 
-    /// B-ii: an empty view (`view V from T to M is endv`) parses with no maps.
+    /// An empty view (`view V from T to M is endv`) parses with no maps.
     #[test]
     fn parses_empty_view() {
         let s = parse("view Id from TRIV to TRIV is endv\n");
@@ -2922,7 +2872,7 @@ endv
         assert!(s.views[0].sort_maps.is_empty() && s.views[0].op_maps.is_empty());
     }
 
-    /// Axis-A2: a parameterized view name (`view V{X :: T} …`) parses into `ViewDecl.params`, and its `to`
+    /// A parameterized view name (`view V{X :: T} …`) parses into `ViewDecl.params`, and its `to`
     /// target may be a (non-`Named`) instantiation `LIST{X}`.
     #[test]
     fn parses_parameterized_view() {
@@ -2944,8 +2894,8 @@ endv
         }
     }
 
-    /// B-iv: a parameterized instantiation `LIST{Nat}` parses into `ModuleExpr::Instantiation`; a
-    /// multi-argument `MAP{Nat, String}` carries one argument expression per parameter. Axis-A5: a nested
+    /// A parameterized instantiation `LIST{Nat}` parses into `ModuleExpr::Instantiation`; a
+    /// multi-argument `MAP{Nat, String}` carries one argument expression per parameter. A nested
     /// instantiation `BOX{BoxV{ToColor}}` parses its argument as an inner `Instantiation`.
     #[test]
     fn parses_instantiation() {
@@ -2976,7 +2926,7 @@ endv
             },
             other => panic!("expected Instantiation, got {other:?}"),
         }
-        // Axis-A5 kind 1: a *chain* `BOX{ToT2}{C2}` parses as an instantiation whose base is itself an
+        // A chain `BOX{ToT2}{C2}` parses as an instantiation whose base is itself an
         // instantiation (the inner `{ToT2}` applied, then the outer `{C2}`).
         let m4 = &parse("fmod M is protecting BOX{ToT2}{C2} . endfm\n").modules[0];
         match &m4.imports[0].expr {

@@ -7,8 +7,8 @@
 //! done by text — an operator comma and an argument separator are the same token (`delete(E, (E, S))`,
 //! `if E in S' then E, A else A fi`) — so it is done *grammar-aware*: build the source module's parser
 //! ([`OpRenamer`]), parse each term bubble, and replace only the literal fragment tokens at the
-//! parse-identified operator positions. The renaming's optional `[ … ]` overrides the target op's
-//! attributes (the prelude's `op _,_ to _;_ [prec 43]`).
+//! parse-identified operator positions. Optional attributes on a renaming override the target operator's
+//! precedence, gathering, and strategy metadata.
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
@@ -96,7 +96,6 @@ pub fn apply_renaming(
         .map(|s| (s.from.clone(), s.to.clone()))
         .collect();
 
-    // Declarations.
     rename_each(&mut d.sorts, &sort_map);
     for chain in &mut d.subsorts {
         for group in chain {
@@ -121,9 +120,7 @@ pub fn apply_renaming(
                     .as_ref()
                     .is_none_or(|(d, r)| *d == orig_domain && *r == orig_range)
         }) {
-            // Preserve the OO declaration's separated attribute suffix. `class C | a : S` desugars to
-            // `[a, :, _]`; rebuilding `b:_` with `tokenize` alone collapses that source distinction and
-            // Maude then prints renamed attributes as `b: value` instead of `b : value`.
+            // Preserve a separated OO attribute suffix so renamed attributes retain `b : value` spacing.
             let spaced_attribute_suffix = op.name.len() > 1 && canon.ends_with(":_");
             let suffix = spaced_attribute_suffix.then(|| {
                 let n = op.name.len();
@@ -148,11 +145,8 @@ pub fn apply_renaming(
             subst_tokens(idb, &single_op_map, interner);
             subst_sort_tokens(idb, &sort_map, interner);
         }
-        // `special (op-hook …)` signatures reference OTHER ops by name (build_sig resolves hooks by
-        // name), so a renamed referenced op must be tracked — INT * (op s_ : Nat -> NzNat to $succ)
-        // must repoint every succSymbol op-hook at $succ or the renamed module loses its builtins
-        // (stock machine-int.maude). Sort names inside hook signatures and term-hook constants
-        // rename like everything else.
+        // Hook signatures refer to other operators by name, so renaming a referenced operator must update
+        // the hook. Sorts in hook signatures and constants in term hooks follow the same renaming.
         if let Some(sp) = &mut op.attrs.special {
             for (_purpose, toks) in &mut sp.op_hooks {
                 let Some(colon) = toks.iter().position(|t| interner.resolve(t.sym) == ":") else {
@@ -365,8 +359,8 @@ pub fn apply_renaming(
     Ok(d)
 }
 
-/// Apply an ordinary module renaming to every term-bearing leaf of a strategy expression. Strategy names
-/// themselves require Maude's separate `strat … to …` mapping and are intentionally left unchanged.
+/// Rename every term-bearing leaf of a strategy expression. Strategy names are unchanged because ordinary
+/// operator renamings do not target them.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_strategy_expr(
     expr: &mut StratExpr,
@@ -405,7 +399,6 @@ fn rewrite_strategy_expr(
                 rewrite_term_bubble(variable);
                 rewrite_term_bubble(value);
             }
-            drop(rewrite_term_bubble);
             for child in substrats {
                 rewrite_strategy_expr(
                     child,
@@ -425,7 +418,6 @@ fn rewrite_strategy_expr(
         | StratExpr::Star(child)
         | StratExpr::Plus(child)
         | StratExpr::Normalize(child) => {
-            drop(rewrite_term_bubble);
             rewrite_strategy_expr(
                 child,
                 structural,
@@ -439,7 +431,6 @@ fn rewrite_strategy_expr(
             );
         }
         StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
-            drop(rewrite_term_bubble);
             rewrite_strategy_expr(
                 left,
                 structural,
@@ -468,7 +459,6 @@ fn rewrite_strategy_expr(
             success,
             failure,
         } => {
-            drop(rewrite_term_bubble);
             for child in [test, success, failure] {
                 rewrite_strategy_expr(
                     child,
@@ -485,7 +475,6 @@ fn rewrite_strategy_expr(
         }
         StratExpr::Test { pattern, cond, .. } => {
             rewrite_term_bubble(pattern);
-            drop(rewrite_term_bubble);
             if let Some(cond) = cond {
                 rewrite_cond(cond, sort_map, single_op_map, const_qual, lparen, interner);
             }
@@ -500,7 +489,6 @@ fn rewrite_strategy_expr(
             for (variable, _) in subs.iter_mut() {
                 rewrite_term_bubble(variable);
             }
-            drop(rewrite_term_bubble);
             if let Some(cond) = cond {
                 rewrite_cond(cond, sort_map, single_op_map, const_qual, lparen, interner);
             }
@@ -519,7 +507,6 @@ fn rewrite_strategy_expr(
             }
         }
         StratExpr::Sugar { args, .. } => {
-            drop(rewrite_term_bubble);
             for child in args {
                 rewrite_strategy_expr(
                     child,
@@ -543,8 +530,8 @@ fn rewrite_strategy_expr(
 }
 
 /// Expand each bare constant occurrence `c` (a key of `const_qual`) into the sort-qualified `( c ) .Sort`
-/// — disambiguating an overload shared across two instantiations. A single left-to-right pass: the
-/// emitted constant token is the original (never re-scanned).
+/// to disambiguate overloads shared across instantiations. The left-to-right pass emits each matched input
+/// token once without rescanning it.
 fn qualify_constants(
     b: &[Token],
     const_qual: &HashMap<String, Vec<Token>>,
@@ -596,8 +583,8 @@ fn rewrite_term(
     *b = qualify_constants(b, const_qual, lparen, interner);
 }
 
-/// Rewrite a condition bubble (textual sort + single-token op; constant qualification). A mixfix op
-/// rename inside a condition fragment is not reached — the prelude has none.
+/// Rewrite a condition bubble with textual sort and single-token operator renames, then qualify constants.
+/// Mixfix operator occurrences in condition fragments remain unchanged.
 fn rewrite_cond(
     b: &mut Vec<Token>,
     sort_map: &HashMap<String, String>,
@@ -621,7 +608,7 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
         kind: ModuleKind::System,
         is_theory: false,
         is_strategy: false,
-        // A scaffold for building the renaming source grammar (no statements are executed here), so
+        // This temporary module exists only to build the source grammar; no statements execute here, so
         // object-pattern completion is irrelevant.
         is_object: false,
         params: Vec::new(),
@@ -642,8 +629,8 @@ fn is_single_token(name: &str, interner: &mut Interner) -> bool {
     frags.len() == 1 && matches!(frags[0], Frag::Tok(_))
 }
 
-/// Overlay the renaming's attribute overrides onto the target op's attributes (the prelude uses
-/// `[prec 43]`; `gather`/`strat` are carried for completeness).
+/// Replace the target operator's precedence, gathering, and strategy attributes when the renaming supplies
+/// corresponding overrides.
 fn apply_attr_override(attrs: &mut Attrs, ovr: &Attrs) {
     if ovr.prec.is_some() {
         attrs.prec = ovr.prec;
@@ -686,9 +673,8 @@ fn subst_tokens(bubble: &mut [Token], map: &HashMap<String, String>, interner: &
             && !name.is_empty()
             && let Some(to) = map.get(sort)
         {
-            // A glued colon variable `name:sort` (e.g. a statement variable inlined by the flattener's
-            // `inline_own_vars`): rename its sort component (`A:Elt ↦ A:Item`), as the instantiation
-            // path does. The whole-token branch above can't see the sort buried after the `:`.
+            // A glued colon variable stores its sort inside the same token. Rename that component
+            // (`A:Elt ↦ A:Item`) because the whole-token branch cannot see the suffix separately.
             t.sym = interner.intern(&format!("{name}:{to}"));
         }
     }

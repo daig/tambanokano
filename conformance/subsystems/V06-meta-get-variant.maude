@@ -1,4 +1,4 @@
-*** V06-meta-get-variant — lifted from the reference suite (Meta/metaGetVariant.maude)
+*** V06-meta-get-variant
 *** PRELUDE
 set show timing off .
 

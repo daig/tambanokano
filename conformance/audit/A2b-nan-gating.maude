@@ -1,11 +1,9 @@
 *** PRELUDE
-*** A2b-nan-gating — NaN can never appear in a Maude value; Infinity ops stay unreduced
-*** Infinity is built with float("Infinity") (reduces to Infinity on BOTH sides) so the diff isolates the
-*** NaN-manufacturing bug rather than tnk's separate Infinity-literal parse gap.
+*** NaN-producing operations stay unreduced; `float("Infinity")` isolates arithmetic behavior from parsing.
 red in CONVERSION : float("Infinity") - float("Infinity") .
 red in CONVERSION : float("Infinity") * 0.0 .
 red in CONVERSION : float("Infinity") / float("Infinity") .
 red in CONVERSION : float("Infinity") rem 2.0 .
-*** regression guard: these are already unreduced on both sides
+*** these are already unreduced on the session
 red in CONVERSION : sqrt(-1.0) .
 red in CONVERSION : 1.0 / 0.0 .

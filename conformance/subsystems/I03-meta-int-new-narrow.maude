@@ -1,5 +1,4 @@
-*** I03-meta-int-new-narrow — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntNewNarrow.maude; oracle verified 2026-07-23.
+*** I03-meta-int-new-narrow
 *** PRELUDE
 set show timing off .
 set show advisories off .

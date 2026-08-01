@@ -1,8 +1,5 @@
-*** Phase 2.4 — fair `srewrite` (and `dsrewrite`) ORDER + per-solution cumulative rewrite COUNT, byte-
-*** identical to Maude 3.5.1. These pin the process-queue scheduler: the unequal-depth interleavings the
-*** old eager depth-first enumerator got wrong, where the fair FIFO round-robin and the DFS LIFO stack give
-*** different solution orders AND different per-solution counts. The `result`/`rewrites:` pair per solution
-*** is the oracle (see strategy_fair_counts_through_repl).
+*** Fair `srewrite` and depth-first `dsrewrite` solution order and cumulative rewrite counts. Unequal-depth
+*** branches distinguish FIFO round-robin scheduling from the LIFO depth-first stack.
 mod FAIR is
   sort S .
   ops a b c d e g : -> S [ctor] .
@@ -28,5 +25,5 @@ dsrewrite a using (r1 | r2) * .
 srewrite a using r2 | r1 .
 *** a branch nested after a union — interleaved sub-tasks (the c-branch's e emerges with the b-branch's g).
 srewrite a using (r1 | r2) ; (p ? pp : q) .
-*** normalize nested after a union, depth-first (the eager enumerator collapsed this count).
+*** normalize nested after a union, depth-first.
 dsrewrite a using (r1 | r2) ! .

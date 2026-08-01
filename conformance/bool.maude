@@ -1,8 +1,6 @@
-*** B3.3 built-in seam conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/bool.maude < /dev/null
-*** EqualitySymbol _~_ and BranchSymbol myif, bound monomorphically via special id-hook — poly is
-*** deferred to B4/B5. myif is LAZY: the dead branch is never reduced. Mirrors the engine.rs B3.3
-*** tests. A Truth sort avoids the prelude's built-in Bool.
+*** Built-in seam conformance against stock Maude.
+*** EqualitySymbol _~_ and BranchSymbol myif are bound monomorphically via id-hooks. `myif` is lazy:
+*** its dead branch is not reduced. Polymorphic hook expansion has separate BOOL fixtures.
 fmod BOOLB is
   sorts Truth Zero NzNat Nat .
   subsorts Zero NzNat < Nat .

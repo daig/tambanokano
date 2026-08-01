@@ -1,4 +1,4 @@
-*** T06-meta-check — all metaCheck cases lifted from the reference suite (Misc/smtTest.maude)
+*** T06-meta-check — all metaCheck cases
 *** PRELUDE
 set show timing off .
 load smt

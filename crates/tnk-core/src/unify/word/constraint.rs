@@ -1,10 +1,8 @@
 //! Packed constraints on variables in word-equation problems.
 //!
-//! Line-faithful port of Maude's `Utility/variableConstraint.{hh,cc}`.
 
-/// A variable may take the empty word, have a finite word-length upper bound, or carry a
-/// theory index (which implies an upper bound of one). The representation deliberately mirrors
-/// Maude's packed 32-bit value: `(index << 2) | theory | take_empty`.
+/// A variable may take the empty word, have a finite length bound, or carry a theory index, which
+/// implies an upper bound of one. Packed layout: `(index << 2) | theory | take_empty`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct VariableConstraint(u32);
 
@@ -17,7 +15,7 @@ impl VariableConstraint {
         self.0 |= Self::TAKE_EMPTY;
     }
 
-    /// Zero means unbounded, as in Maude.
+    /// Zero means unbounded.
     pub(super) fn set_upper_bound(&mut self, upper_bound: usize) {
         debug_assert!(upper_bound <= (u32::MAX >> Self::INDEX_SHIFT) as usize);
         self.0 = (self.0 & Self::TAKE_EMPTY) | ((upper_bound as u32) << Self::INDEX_SHIFT);

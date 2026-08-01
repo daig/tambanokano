@@ -5,7 +5,8 @@ use super::transition::{Transition, TransitionSet};
 #[cfg(test)]
 use std::fmt::Write;
 
-/// Gastin–Oddoux very weak alternating automaton, after reachability renumbering.
+/// Gastin–Oddoux very weak alternating automaton used as the first LTL-to-Büchi stage, after
+/// reachability renumbering.
 pub(crate) struct VeryWeakAlternatingAutomaton<'a> {
     context: &'a BddContext,
     formula: &'a LogicFormula,
@@ -30,6 +31,7 @@ impl<'a> VeryWeakAlternatingAutomaton<'a> {
         automaton
     }
 
+    #[cfg(test)]
     pub(crate) fn state_count(&self) -> usize {
         self.states.len()
     }
@@ -248,7 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atom_and_negated_atom_match_reference_dumps() {
+    fn atom_and_negated_atom_use_opposite_transition_literals() {
         let context = BddContext::new(1);
         let mut atom = LogicFormula::default();
         let p = atom.make_proposition(0);
@@ -267,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn next_until_release_and_boolean_folding_match_reference_shape() {
+    fn next_until_release_and_boolean_folding_build_expected_shape() {
         let context = BddContext::new(2);
         let mut formula = LogicFormula::default();
         let p = formula.make_proposition(0);

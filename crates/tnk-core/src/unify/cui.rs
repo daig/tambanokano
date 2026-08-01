@@ -1,18 +1,12 @@
-//! CUI-theory unification — commutative and/or identity and/or idempotent operators that are
-//! **not** associative (Maude's `CUI_Theory`). Idempotence is unsupported for unification, so this
-//! covers C / CU / CUl / CUr / U / Ul / Ur.
+//! CUI-theory unification for commutative and/or identity-bearing non-associative operators.
+//! Idempotence is unsupported, so this covers C / CU / CUl / CUr / U / Ul / Ur.
 //!
-//! Ports, line-faithful including alternative enumeration order:
-//!   * `CUI_DagNode::computeSolvedForm2` / `computeSolvedFormCommutativeCase` /
-//!     `makePurifiedVersion` / `indirectOccursCheck` (`src/CUI_Theory/CUI_DagNode.cc`),
-//!   * `CUI_UnificationSubproblem` — the pure-commutative subproblem, forwards then reverse per
-//!     problem (`src/CUI_Theory/CUI_UnificationSubproblem.cc`),
-//!   * `CUI_UnificationSubproblem2` — the with-identity subproblem, seven ordered alternatives per
-//!     problem (`src/CUI_Theory/CUI_UnificationSubproblem2.cc`).
+//! Observable alternative order is deterministic: the pure-commutative subproblem tries the forward
+//! and reverse orientations for each equation, while identity-bearing equations use seven ordered
+//! collapse alternatives. Purification and the indirect occurs check run before those alternatives.
 //!
-//! A CUI node's two arguments are kept in `dag_compare` order for the commutative cases (tnk's
-//! `make_cui` canonicalizes exactly as Maude's normal form), so the four-comparison C decision
-//! procedure reads them as `l0 <= l1`, `r0 <= r1`.
+//! Commutative CUI nodes keep their two arguments in `dag_compare` order, so the four-comparison
+//! decision procedure receives `l0 <= l1` and `r0 <= r1`.
 
 use super::{
     Marker, PendingStack, SavedSubst, UnifyContext, UnifyEnv, compute_solved_form,
@@ -23,12 +17,9 @@ use crate::engine::Engine;
 use crate::symbol::SymbolId;
 use std::cmp::Ordering;
 
-/// The two arguments of a CUI-unification node. Read generically through `children()` so it works
-/// for BOTH node representations a CUI-unification-theory symbol can have: a genuine `Cui` node
-/// (two-sided `id:` / `comm` / `idem` ops, identity kept in the kernel) and a **`Free`** node
-/// (one-sided `left id:`/`right id:` ops, whose identity the frontend withholds from the kernel,
-/// so tnk builds them as binary free applications). Both are binary with
-/// positionally-meaningful (or, for comm, `dag_compare`-ordered) arguments.
+/// Return the two arguments of either binary representation used by the CUI solver. `Cui` nodes
+/// represent two-sided identity or commutativity and store commutative arguments in canonical order;
+/// `Free` nodes represent one-sided identity and keep positional order.
 fn cui_args(e: &Engine, id: DagId) -> (DagId, DagId) {
     let mut kids = e.node(id).children();
     let a0 = kids.next().expect("CUI-unification node is binary");
@@ -48,8 +39,7 @@ fn rebuild_binary(env: &mut UnifyEnv, symbol: SymbolId, a0: DagId, a1: DagId) ->
     rt.rebuild(sig, symbol, vec![a0, a1])
 }
 
-/// Build the identity DAG of a CUI-with-id operator (`getIdentityDag`): the two-sided identity,
-/// or whichever one-sided identity is declared.
+/// Build the declared identity DAG of a CUI operator.
 fn identity_dag(env: &mut UnifyEnv, symbol: SymbolId) -> DagId {
     let identity = env
         .e
@@ -60,16 +50,16 @@ fn identity_dag(env: &mut UnifyEnv, symbol: SymbolId) -> DagId {
     env.e.make_identity(identity)
 }
 
-/// `DagNode::compare` on two nodes, via the runtime's canonical total order.
+/// Compare two nodes by the runtime's canonical total order.
 fn compare(e: &Engine, a: DagId, b: DagId) -> Ordering {
     e.dag_compare(a, b)
 }
 
 // ======================================================================================
-// CUI_DagNode::computeSolvedForm2
+// CUI solved-form dispatch
 // ======================================================================================
 
-/// `CUI_DagNode::computeSolvedForm2` — `lhs` is a non-ground CUI node.
+/// Solve an equation whose `lhs` is a non-ground CUI node.
 pub(crate) fn cui_solved_form2(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -95,8 +85,8 @@ pub(crate) fn cui_solved_form2(
         let r = last_variable_in_chain(env.e, ctx, rhs);
         let r_index = var_index(env.e, r).unwrap() as usize;
         if let Some(value) = ctx.value(r_index) {
-            // Bound: recurse with computeSolvedForm2 (matches the reference — not the ground-aware
-            // computeSolvedForm).
+            // Re-enter the non-ground dispatcher with the representative's binding. The binding may
+            // have a different top theory, which must participate in clash resolution.
             return cui_solved_form2_generic(env, lhs, value, ctx, pending);
         }
         if has_id {
@@ -110,9 +100,7 @@ pub(crate) fn cui_solved_form2(
     pending.resolve_theory_clash(env.e, lhs, rhs)
 }
 
-/// Re-entry when the bound value's top may differ from CUI: dispatch through the generic
-/// `computeSolvedForm2` again (the reference calls the virtual `computeSolvedForm2`, which for a
-/// non-CUI value lands in that value's theory arm).
+/// Re-enter the generic non-ground dispatcher while retaining the CUI node as the left side.
 fn cui_solved_form2_generic(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -120,13 +108,12 @@ fn cui_solved_form2_generic(
     ctx: &mut UnifyContext,
     pending: &mut PendingStack,
 ) -> bool {
-    // `lhs` is our CUI node (non-ground); solve lhs =? value through the standard dispatcher.
+    // Solve the CUI node against the representative's binding through normal theory dispatch.
     super::compute_solved_form2(env, lhs, value, ctx, pending)
 }
 
-/// `CUI_DagNode::computeSolvedFormCommutativeCase` — pure C, same top symbol. Decide in ≤4
-/// comparisons whether any of the six argument equalities forces a single branch; otherwise push
-/// the two-alternative problem onto the pending stack.
+/// For pure C terms with the same top symbol, use at most four canonical-order comparisons to
+/// detect forced argument equalities. Push the two orientations when neither is forced.
 fn commutative_case(
     env: &mut UnifyEnv,
     lhs: DagId,
@@ -179,8 +166,8 @@ fn commutative_case(
     compute_solved_form(env, l0, r0, ctx, pending) && compute_solved_form(env, l1, r1, ctx, pending)
 }
 
-/// `CUI_DagNode::makePurifiedVersion` — abstract each non-variable argument to a fresh variable
-/// (solving it against the abstraction), then rebuild in commutative normal order.
+/// Abstract each non-variable argument to a fresh variable, solve it against the abstraction, and
+/// rebuild in commutative normal order.
 fn make_purified_version(
     env: &mut UnifyEnv,
     this: DagId,
@@ -215,15 +202,14 @@ fn make_purified_version(
     if !need_rebuild {
         return this;
     }
-    // Rebuild via the theory dispatcher: a comm Cui op re-sorts, a one-sided-id Free op keeps
-    // positional order — both handled by `rebuild_binary`.
+    // Rebuilding canonicalizes a commutative `Cui` node and preserves a one-sided-identity `Free`
+    // node's positional order.
     let _ = comm;
     rebuild_binary(env, s, l0, l1)
 }
 
-/// `CUI_DagNode::indirectOccursCheck` — can `rep_var` be reached by chasing `var |-> var` and
-/// `var |-> our-symbol` bindings from `this`'s arguments? `rep_var` is a representative (unbound
-/// or bound-to-non-variable).
+/// Determine whether `rep_var` is reachable by chasing variable-to-variable and
+/// variable-to-this-symbol bindings from `this`'s arguments.
 fn indirect_occurs_check(env: &UnifyEnv, this: DagId, rep_var: DagId, ctx: &UnifyContext) -> bool {
     let s = env.e.node(this).symbol();
     let (a0, a1) = cui_args(env.e, this);
@@ -242,8 +228,8 @@ fn indirect_occurs_arg(
         if env.e.deep_equal(r, rep_var) {
             return true;
         }
-        // Same-symbol binding (`d->symbol() == s`) — s is our binary CUI-unification op, so any
-        // node with that symbol is a binary node whether its rep is Cui or (one-sided-id) Free.
+        // A same-symbol binding is binary in both the `Cui` and one-sided-identity `Free`
+        // representations.
         if let Some(d) = ctx.value(var_index(env.e, r).unwrap() as usize)
             && env.e.node(d).symbol() == s
         {
@@ -258,7 +244,7 @@ fn indirect_occurs_arg(
 }
 
 // ======================================================================================
-// CUI_UnificationSubproblem — pure C
+// Pure-commutative subproblem
 // ======================================================================================
 
 struct CProblem {
@@ -337,7 +323,7 @@ impl CSubproblem {
                         && compute_solved_form(env, l1, r1, ctx, pending))
                     {
                         failed = true;
-                        break; // goto backtrack (from this same index)
+                        break; // retry this index while backtracking
                     }
                     i += 1;
                 }
@@ -362,7 +348,7 @@ impl CSubproblem {
                             self.problems[idx].reverse_tried = true;
                             i += 1;
                             restart = true;
-                            break; // goto forward
+                            break; // resume forward search
                         }
                     }
                     i -= 1;
@@ -382,11 +368,10 @@ impl CSubproblem {
 }
 
 // ======================================================================================
-// CUI_UnificationSubproblem2 — with identity
+// CUI subproblem with identity
 // ======================================================================================
 
-/// The seven ordered alternatives (`CUI_UnificationSubproblem2::Alternatives`). Numeric order IS
-/// the enumeration order.
+/// The seven alternatives for an identity-bearing equation. Numeric order is enumeration order.
 mod alt {
     pub(super) const FORWARDS: u8 = 0;
     pub(super) const REVERSE: u8 = 1;
@@ -439,8 +424,7 @@ impl CuiIdSubproblem {
         roots
     }
 
-    /// `CUI_UnificationSubproblem2::addUnification` — classify the legal alternatives (recursing on
-    /// the degenerate collapse cases).
+    /// Classify the legal alternatives, solving degenerate collapse cases recursively.
     pub(crate) fn add_unification(
         &mut self,
         env: &mut UnifyEnv,
@@ -536,7 +520,7 @@ impl CuiIdSubproblem {
         });
     }
 
-    /// `leftCollapse`: `left_arg` is a variable bound to the identity (left id only).
+    /// Whether `left_arg` is a variable bound to the identity when only a left identity is declared.
     fn left_collapse(
         &self,
         env: &UnifyEnv,
@@ -550,7 +534,7 @@ impl CuiIdSubproblem {
         left_id && self.bound_to_identity(env, left_arg, id, ctx)
     }
 
-    /// `rightCollapse`: `right_arg` is a variable bound to the identity (right id only).
+    /// Whether `right_arg` is a variable bound to the identity when only a right identity is declared.
     fn right_collapse(
         &self,
         env: &UnifyEnv,
@@ -574,7 +558,7 @@ impl CuiIdSubproblem {
         false
     }
 
-    /// `equivalent`: two terms equal after chasing each's variable representative + binding.
+    /// Compare terms after resolving each variable representative and its binding.
     fn equivalent(&self, env: &UnifyEnv, first: DagId, second: DagId, ctx: &UnifyContext) -> bool {
         let f = self.resolve(env, first, ctx);
         let s = self.resolve(env, second, ctx);
@@ -591,7 +575,7 @@ impl CuiIdSubproblem {
         }
     }
 
-    /// `equivalentToGroundDag`: `dag` equals `ground` directly, or is a variable bound to it.
+    /// Whether `dag` equals `ground` directly or is a variable bound to it.
     fn equivalent_to_ground(
         &self,
         env: &UnifyEnv,
@@ -636,7 +620,7 @@ impl CuiIdSubproblem {
                     if !self.find_alternative(env, idx, true, ctx, pending) {
                         i -= 1;
                         failed = true;
-                        break; // goto backtrack
+                        break; // backtrack from this problem
                     }
                     i += 1;
                 }
@@ -651,7 +635,7 @@ impl CuiIdSubproblem {
                     if self.find_alternative(env, idx, false, ctx, pending) {
                         i += 1;
                         restart = true;
-                        break; // goto forward
+                        break; // resume forward search
                     }
                     i -= 1;
                 }
@@ -664,7 +648,7 @@ impl CuiIdSubproblem {
         }
     }
 
-    /// `Problem::findAlternative` — advance to the next legal alternative that solves.
+    /// Advance to the next legal alternative whose constraints solve successfully.
     fn find_alternative(
         &mut self,
         env: &mut UnifyEnv,
@@ -698,7 +682,7 @@ impl CuiIdSubproblem {
         false
     }
 
-    /// `Problem::tryAlternative` — attempt the current alternative.
+    /// Attempt the currently selected alternative.
     fn try_alternative(
         &mut self,
         env: &mut UnifyEnv,
@@ -747,8 +731,8 @@ impl CuiIdSubproblem {
                 let r2_index = var_index(env.e, r2).unwrap() as usize;
                 match ctx.value(r2_index) {
                     None => {
-                        // Avoid an occur-check-failing binding local to our theory (collapse would
-                        // have been tried on another branch, so we just fail here).
+                        // Reject a local occurs-check cycle; identity-collapse alternatives are
+                        // enumerated on separate branches.
                         if indirect_occurs_check(env, lhs, r2, ctx) {
                             return false;
                         }

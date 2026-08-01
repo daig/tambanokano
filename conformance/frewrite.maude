@@ -1,7 +1,4 @@
-*** Pillar A-ii: `frewrite` (position-fair rewriting) + frozen arguments.
-*** Byte-for-byte vs the reference (modulo `====`/`Bye.`):
-***   ~/Downloads/Maude-3/maude -no-banner conformance/frewrite.maude < /dev/null
-***   ./target/debug/tnk-repl conformance/frewrite.maude < /dev/null
+*** Position-fair rewriting and frozen arguments.
 ***
 *** ESSENTIAL position-fairness (the reason frewrite exists): each pass gives every non-frozen position
 *** one rule application before moving on, so a bound spreads across positions rather than draining one:

@@ -20,6 +20,9 @@ use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
 use std::collections::{HashMap, HashSet};
 
+type RenameTarget = (Option<usize>, Vec<String>);
+type RenameTargets = HashMap<String, Vec<RenameTarget>>;
+
 /// A renamer for one import's op renamings: the source module's signature + grammar (built once from the
 /// *pre-rename* declarations) plus the from-name → target-fragment map.
 pub struct OpRenamer {
@@ -28,7 +31,7 @@ pub struct OpRenamer {
     /// from-op canonical name (`_,_`, `empty`, `f`) → the candidate renames of that name: each an optional
     /// disambiguating **arity** (`Some(2)` for `op f : A B -> C to g`; `None` renames every overload) with
     /// the target op's literal fragment texts, in order (`_;_` → `[";"]`, `none` → `["none"]`).
-    targets: HashMap<String, Vec<(Option<usize>, Vec<String>)>>,
+    targets: RenameTargets,
 }
 
 impl OpRenamer {
@@ -44,7 +47,7 @@ impl OpRenamer {
         if renames.is_empty() {
             return Ok(None);
         }
-        let mut targets: HashMap<String, Vec<(Option<usize>, Vec<String>)>> = HashMap::new();
+        let mut targets = RenameTargets::new();
         for (from, arity, to) in renames {
             targets
                 .entry(from.clone())
@@ -60,10 +63,9 @@ impl OpRenamer {
         }))
     }
 
-    /// Rewrite one term bubble in place-ish (returns a fresh token vector). Replaces every renamed
-    /// operator's literal fragment tokens with its target's. A bubble that does not parse as a term (a
-    /// non-term fragment) is returned unchanged — operator identity is undefined there, so nothing is
-    /// renamed (the prelude's renamed imports have no such fragments mentioning the renamed ops).
+    /// Rewrite one term bubble into a fresh token vector, replacing each renamed operator's literal
+    /// fragments. A bubble that does not parse as a term is returned unchanged because operator identity
+    /// is undefined there.
     pub fn rewrite(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
         if bubble.is_empty() {
             return bubble.to_vec();
@@ -90,10 +92,9 @@ impl OpRenamer {
 
     /// Walk `t`, recording `(token-position, replacement-text)` for each literal fragment of a renamed
     /// operator. At a `MakeTerm(sym)` node whose symbol is renamed, the literal fragments are the
-    /// terminal positions of the production's rhs — found by tiling `[start, end)` with the child spans
-    /// (Maude's `extractFirstSubparse` order): a terminal consumes one token, a nonterminal jumps to the
-    /// next child's end. A compact `MakeIter(sym)` token is rewritten as a unit (`g^N` → `h^N`), preserving
-    /// its arbitrary-size scalar count.
+    /// terminal positions of the production's rhs, found by tiling `[start, end)` with child spans. A
+    /// terminal consumes one token and a nonterminal jumps to the next child's end. A compact
+    /// `MakeIter(sym)` token is rewritten as a unit (`g^N` → `h^N`), preserving its scalar count.
     fn collect(
         &self,
         t: &PTree,

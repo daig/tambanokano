@@ -1,8 +1,6 @@
-*** Pillar A-v: the rewrite-condition fragment `crl ... if t => p` — a nested `=>*` reachability search
-*** from t's instance, matching p against each reachable state (the one remaining condition kind).
-*** Byte-for-byte vs the reference (rate normalized):
-***   ~/Downloads/Maude-3/maude -no-banner conformance/rewrite-cond.maude < /dev/null
-***   ./target/debug/tnk-repl conformance/rewrite-cond.maude < /dev/null
+*** Rewrite-condition fragments perform nested `=>*` reachability search
+*** from the instantiated source, matching the pattern against each reachable state.
+*** Rate normalized.
 ***
 *** REACH (specific target): `if X => c` holds iff X reaches c via =>* (0 or more steps).
 ***   f(a)     -> done   (a =>* c via a->b->c; 2 search rewrites + the rule = 3)

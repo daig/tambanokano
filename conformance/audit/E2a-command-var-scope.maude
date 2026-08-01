@@ -1,8 +1,7 @@
 *** E2a-command-var-scope — variable aliases are module-local: a command in module M parses with M's
-*** OWN var declarations, which take priority over any imported module's same-named variable —
-*** Pre-fix, prelude BOOL-OPS's Bool-sorted A B C, collected first by the
-*** flatten, shadowed the module's own N-sorted A B C in the command grammar: reducing A typed it at
-*** Bool, and reducing c applied to A and B failed to parse entirely.
+*** OWN variable declarations, which take priority over any imported module's same-named variable.
+*** Prelude BOOL-OPS also declares Bool-sorted A B C, so this fixture verifies that command grammar
+*** resolution selects the module's N-sorted A B C instead.
 *** PRELUDE
 set show timing off .
 fmod VARSCOPE is

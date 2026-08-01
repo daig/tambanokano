@@ -1,5 +1,4 @@
-*** Phase-0 throughput fixture: the same naive-Peano-Fibonacci theory the benchmark builds.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/fib.maude < /dev/null
+*** Naive Peano-Fibonacci throughput fixture shared with the benchmark.
 fmod FIB is
   sort Nat .
   op 0 : -> Nat [ctor] .

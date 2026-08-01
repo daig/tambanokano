@@ -1,24 +1,23 @@
-//! The strategy language interpreter (Pillar 2.4) — executes a parsed [`StratExpr`] against a subject term,
-//! enumerating the solutions of `srewrite` (fair) / `dsrewrite` (depth-first).
+//! Strategy-language execution over parsed [`StratExpr`] values.
 //!
-//! The surface [`StratExpr`] (with raw term bubbles) is first **resolved** against the module's grammar +
-//! rule table into an [`RStrat`] (patterns parsed to [`Term`]s, rule labels resolved to their sides +
-//! condition), then **executed** by a faithful port of Maude's strategic-search **process + task model**
-//! ([`Search`]): a `VecDeque` of [`Process`]es, each a `(term, pending-strategy-stack, task)`. One step
-//! *decomposes* the top strategy frame into successor processes (a decompose does **no** rewrite — it only
-//! schedules); a rule application runs as a resumable [`AppState`] yielding **one** rewrite per step; a
-//! process with an empty pending stack is a **solution** routed to its [`task`](Process::task). The fair
-//! (`srewrite`) mode appends successors (FIFO, round-robin); `dsrewrite` prepends (LIFO, depth-first). The
-//! **task tree** handles sub-searches that feed their solutions back to a continuation — `?:`/`try`/`not`/
-//! `test`/`or-else` (branch), `one`, `!` (normalize): each spawns a child task whose sub-processes run **in
-//! the same queue** (interleaved with the parent), with a per-task slave count detecting exhaustion (for the
-//! branch's failure arm / a normal form). This reproduces Maude's exact solution **order** and per-solution
-//! cumulative **rewrite count** (validated against Maude 3.5.1's C++ `StrategyLanguage/`).
+//! Resolution parses term bubbles with their compiled grammar, binds rule labels, and leaves named calls as
+//! lazy `RStrat::Call` frames. At execution, a call matches compatible definitions in declaration order,
+//! specializes each matching body with argument bindings, and schedules its bodies one at a time.
 //!
-//! `matchrew`/`amatchrew` and **conditional-rule rewrite-condition substrategies** run their sub-searches
-//! *eagerly within a step* (faithful values + order + reachability; their per-solution count can collapse
-//! when interleaved with parallel unequal-depth work — Maude's `SubtermTask`/`rewriteTask` parallel-odometer
-//! is the documented residual). `xmatchrew` and conditional `csd` error clearly at resolve.
+//! Each `Process` carries a term, pending strategy stack, and task id. Decomposing a frame only schedules
+//! successors; an `AppState` instead fires at most one rule match per process step. A process whose pending
+//! stack is empty emits a solution to its task. `srewrite` appends successors for FIFO round-robin search;
+//! `dsrewrite` prepends them, preserving local successor order for depth-first search.
+//!
+//! Branching, `one`, and normalization run sub-searches as child tasks in the same queue. A task's `slaves`
+//! count includes its live processes and child tasks; reaching zero triggers exhaustion behavior such as a
+//! branch failure arm or normal-form emission. Shared scheduling determines both solution order and the
+//! cumulative rewrite count recorded when each solution is emitted.
+//!
+//! `matchrew` and `amatchrew` run each selected by-variable strategy to exhaustion before rebuilding the
+//! Cartesian product of their results. These eager sub-searches share the cumulative rewrite counter, so
+//! unequal branch depths affect later emitted counts. Resolution rejects `xmatchrew` and calls that have only
+//! conditional `csd` definitions.
 
 use crate::build_term::{VarIndex, build_term};
 use crate::cfparser::compile::CompiledGrammar;
@@ -35,13 +34,13 @@ use tnk_core::sort::KindId;
 use tnk_core::term::{ConditionFragment, Term};
 use tnk_core::variant::term_from_dag_slots;
 
-/// One solution of a strategy run: the (reduced) result term + the cumulative rewrite count at its emit.
+/// A reduced strategy result and the cumulative rewrite count when it was emitted.
 pub struct StratSolution {
     pub term: DagId,
     pub rewrites: u64,
 }
 
-/// A resolved rule (its compiled-trace sides + condition) for strategy application.
+/// A rule selected for strategy application, including its condition and variable-slot names.
 #[derive(Clone)]
 struct RRule {
     lhs: Term,
@@ -91,8 +90,8 @@ enum RStrat {
         name: String,
         args: Vec<Term>,
     },
-    /// Runtime-only resumable definition enumerator. Each body runs as a child call task while the
-    /// enumerator survives in the parent task, reproducing Maude's fair call-process interleaving.
+    /// Enumerates specialized named-call bodies one at a time. Each body runs as a child task while the
+    /// generator remains in the parent task, allowing fair interleaving.
     CallGenerator {
         bodies: Rc<Vec<Rc<RStrat>>>,
         next: usize,
@@ -193,9 +192,8 @@ struct OneMatch {
     result: DagId,
 }
 
-/// A task — a sub-computation whose solutions feed a continuation. `slaves` counts the live processes + live
-/// child tasks belonging to it; when it reaches zero the task is **exhausted** (its failure / normal-form
-/// action fires). Maude's `StrategicTask` slave-list.
+/// A sub-search whose solutions feed a continuation. `slaves` counts live processes and child tasks;
+/// reaching zero exhausts the task and runs its completion action.
 struct TaskState {
     parent: usize,
     slaves: i32,
@@ -206,11 +204,11 @@ struct TaskState {
 enum TaskKind {
     /// The top-level task — its solutions are the command's results.
     Root,
-    /// One named-strategy definition trial. Every body solution resumes the call's outer continuation in
-    /// the parent task; exhaustion has no fallback action.
+    /// A named-call body task. Each solution resumes the call's outer continuation in the parent task;
+    /// exhaustion has no fallback action.
     Call { rest: Pending },
-    /// `E ? success : failure` on `dag` (continuation `rest`): each `E`-solution → `success`; if `E` has none
-    /// (exhausted with `!had_success`) → `failure` on `dag`.
+    /// `E ? success : failure` on `dag`: the first `E` solution schedules `success` and commits; exhaustion
+    /// without a solution schedules `failure` on the original `dag`.
     Branch {
         dag: DagId,
         success: Rc<RStrat>,
@@ -220,8 +218,8 @@ enum TaskKind {
     },
     /// `one(E)` (continuation `rest`): forward the **first** `E`-solution, then discard the rest.
     One { rest: Pending, taken: bool },
-    /// `E !` on `dag` (continuation `rest`): each `E`-solution re-arms `E!`; if `E` has none, `dag` is a
-    /// normal form → emit it.
+    /// `E !` on `dag`: each `E` solution starts another normalization round; a round with no solution emits
+    /// `dag` as a normal form.
     Normalize {
         dag: DagId,
         normalize: Rc<RStrat>,
@@ -230,7 +228,7 @@ enum TaskKind {
     },
 }
 
-/// Run `srewrite`/`dsrewrite [in M :] term using strat` in Maude's order with per-solution cumulative counts.
+/// Run a fair or depth-first strategic rewrite and return per-solution cumulative rewrite counts.
 pub fn srewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -254,8 +252,7 @@ pub fn srewrite_command(
     srewrite_dag(lm, i, subj, strat, depth_first)
 }
 
-/// Run a strategy over an already-built ground subject. META-INTERPRETER uses this entry point after
-/// down-translating its reflected `Term`, avoiding a print-and-reparse round trip.
+/// Run a strategy over an already-built ground subject, bypassing subject parsing and construction.
 pub fn srewrite_dag(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -284,12 +281,11 @@ pub fn srewrite_dag(
     Ok((out, total))
 }
 
-/// Render a strategy expression back to source text (the echo). Best-effort.
+/// Format a strategy expression for command echoing.
 pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
-    /// Maude's echo precedence (tightest first): atoms/calls/keyword forms (0), postfix
-    /// iteration `* + !` (1), `;` (2), `|` (3), `? :` (4). A child prints parenthesized when
-    /// its precedence exceeds what the position admits. A right child at the same precedence is
-    /// also grouped for the left-associative `;` and `|` parsers, preserving the original AST.
+    /// Surface-syntax precedence, tightest first: atoms and keyword forms, postfix iteration, sequence,
+    /// union, then branch. Parenthesize children that exceed their allowed precedence and right children
+    /// of left-associative sequence or union nodes.
     fn prec(e: &StratExpr) -> u8 {
         match e {
             StratExpr::Star(_) | StratExpr::Plus(_) | StratExpr::Normalize(_) => 1,
@@ -315,8 +311,7 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             format!("({}){op}", print_strategy(a, i))
         }
     }
-    // Punctuation-aware token spacing, matching Maude's pattern echo (`f(X:S, Y:S)`, not
-    // `f ( X:S , Y:S )`): no space after an opener or before a closer/comma.
+    // Punctuation-aware token spacing: no space after an opener or before a closer/comma.
     fn join(toks: &[Token], i: &Interner) -> String {
         let mut out = String::new();
         for t in toks {
@@ -324,8 +319,7 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             let no_space = out.is_empty()
                 || out.ends_with(['(', '[', '{'])
                 || matches!(s, ")" | "]" | "}" | ",")
-                // application: `f(` glues when the preceding token is word-like (`f(X:S, Y:S)`),
-                // while an operator keeps its space (`a + (b + c)`) — Maude's echo spacing.
+                // Applications glue `f(`, while operator contexts retain spaces such as `a + (b + c)`.
                 || (s == "(" && out.chars().last().is_some_and(|c| c.is_alphanumeric()));
             if !no_space {
                 out.push(' ');
@@ -415,8 +409,8 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             let by = subs
                 .iter()
                 .map(|(v, st)| {
-                    // A by-clause substrategy binds tighter than the `,` separating clauses:
-                    // `;`/`|`/`? :` need parens (oracle: `by X:S using (r1 | r2), …`).
+                    // A by-clause strategy binds tighter than its comma; sequence, union, and branch
+                    // children therefore need parentheses.
                     let s = print_strategy(st, i);
                     let s = if prec(st) >= 2 { format!("({s})") } else { s };
                     format!("{} using {}", join(v, i), s)
@@ -458,9 +452,8 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
     }
 }
 
-/// Apply Maude's recoverable `top` rule to the surface tree before echoing/execution: the modifier
-/// survives only around a direct rule application (`all` or a rule label). Named strategy calls are
-/// deliberately tested before expansion, so `top(call)` is discarded even if the call body applies a rule.
+/// Remove `top` unless it directly wraps `all` or a rule label. A named call does not inherit `top` when
+/// its body later applies a rule.
 pub fn discard_inapplicable_top(e: &mut StratExpr, lm: &LoadedModule) {
     match e {
         StratExpr::Top(inner) => {
@@ -514,14 +507,14 @@ pub fn discard_inapplicable_top(e: &mut StratExpr, lm: &LoadedModule) {
     }
 }
 
-/// Resolve a surface [`StratExpr`] into an [`RStrat`] (shared via [`Rc`]). Named calls remain lazy and
-/// recursive definitions are opened by the runtime call generator. `xmatchrew`/conditional `csd` error clearly.
+/// Resolve supported surface forms into shared [`RStrat`] nodes. Named calls stay lazy; resolution rejects
+/// `xmatchrew` and calls supported only by conditional definitions.
 fn resolve(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> Result<Rc<RStrat>, String> {
     resolve_in(e, lm, &lm.grammar, i, &VarIndex::new())
 }
 
-/// Resolve in a particular source grammar with `seed` variables already bound by an enclosing strategy
-/// definition. The grammar determines syntax; all semantic actions already point into `lm.built`.
+/// Resolve term bubbles with `grammar`, treating the variables in `seed` as already bound. Resolved terms
+/// and selected rules belong to `lm.built`.
 fn resolve_in(
     e: &StratExpr,
     lm: &LoadedModule,
@@ -566,9 +559,8 @@ fn resolve_in(
         }
         StratExpr::Top(inner) => {
             let resolved = resolve_in(inner, lm, grammar, i, seed)?;
-            // Maude attaches `top` only to a direct rule application. A named strategy call is a
-            // distinct surface node: the modifier is ignored before the call body is expanded, even
-            // when that body happens to resolve to an application strategy.
+            // `top` applies only to a direct rule application, not to a named call whose body later
+            // resolves to one.
             let direct_application = match &**inner {
                 StratExpr::All => true,
                 StratExpr::Apply { label, .. } => !rules_labelled(lm, label).is_empty(),
@@ -604,7 +596,7 @@ fn resolve_in(
         StratExpr::Star(child) => RStrat::Star(resolve_in(child, lm, grammar, i, seed)?),
         StratExpr::Plus(child) => RStrat::Plus(resolve_in(child, lm, grammar, i, seed)?),
         StratExpr::Normalize(child) => RStrat::Normalize(resolve_in(child, lm, grammar, i, seed)?),
-        // Surface sugar desugars here (the parser preserves the spelling for the echo).
+        // Lower surface sugar to branch combinators; printing retains the original form.
         StratExpr::Sugar { kind, args } => {
             let branch =
                 |test: &StratExpr, success: StratExpr, failure: StratExpr| StratExpr::Branch {
@@ -710,7 +702,7 @@ fn resolve_in(
     Ok(Rc::new(r))
 }
 
-/// Parse an optional `such that` condition for a test/matchrew, rejecting a rewrite (`=>`) fragment.
+/// Resolve an optional test or matchrew condition, rejecting rewrite (`=>`) fragments.
 #[allow(clippy::too_many_arguments)]
 fn resolve_test_cond(
     cond: Option<&[Token]>,
@@ -741,8 +733,8 @@ fn resolve_test_cond(
     Ok(fragments)
 }
 
-/// Resolve an application's initial substitution. Values may reference variables bound by an enclosing
-/// strategy definition, but may not introduce new variables.
+/// Resolve a rule application's initial substitution. Values may use variables from the enclosing strategy
+/// definition but cannot introduce variables.
 fn resolve_subst(
     subst: &[(Vec<Token>, Vec<Token>)],
     lm: &LoadedModule,
@@ -766,8 +758,8 @@ fn resolve_subst(
     Ok(out)
 }
 
-/// Resolve a named call without expanding it. Every definition remains a separately matchable candidate,
-/// so recursion is naturally lazy and declaration-only strategies correctly yield no solutions.
+/// Resolve a named call's arguments while deferring definition matching until execution. A declared strategy
+/// without an executable matching definition resolves successfully and yields no solutions.
 fn resolve_call(
     name: &str,
     args: &[Vec<Token>],
@@ -861,6 +853,7 @@ fn contains_xmatchrew(strategy: &StratExpr) -> bool {
     }
 }
 
+/// Compile kind-based call profiles and executable unconditional definitions in declaration order.
 fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram {
     let mut program = StrategyProgram::default();
     let mut seen_declarations = HashSet::new();
@@ -915,8 +908,8 @@ fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram 
             continue;
         }
         let Some(grammar) = definition_grammar(lm, def.home.as_deref()) else {
-            // A plain donor whose grammar cannot be remapped is not executable; never silently parse its
-            // source bubbles in a different grammar.
+            // A definition is executable only with its associated grammar; never parse its token bubbles
+            // with another grammar.
             continue;
         };
         let mut vars = VarIndex::new();
@@ -1022,9 +1015,7 @@ fn rrule(t: &crate::sig::syntax::RlTrace) -> RRule {
     }
 }
 
-// ---- the process + task executor ----
-
-/// Run a (sub-)search to exhaustion, returning every solution `(term, cumulative-count-at-emit)` in order.
+/// Execute a search to exhaustion and return solutions in emission order with their cumulative counts.
 fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(DagId, u64)> {
     let mut s = Search {
         q: VecDeque::new(),
@@ -1050,20 +1041,20 @@ fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(Da
     s.out
 }
 
-/// The strategic search state — the process ring (as a `VecDeque`) + the task tree.
+/// Runnable processes and the task tree that routes sub-search results and detects exhaustion.
 struct Search {
     q: VecDeque<Process>,
     tasks: Vec<TaskState>,
-    /// Cycle-pruning seen-set: `(term, pending-key, task)`. Per-task (Maude's `alreadySeen`), which also
-    /// de-duplicates re-reached solution states.
+    /// Prunes repeated `(term, pending-key, task)` states, including repeated solution states. Task identity
+    /// keeps independent sub-searches separate.
     seen: Vec<(DagId, Vec<usize>, usize)>,
     fifo: bool,
     out: Vec<(DagId, u64)>,
 }
 
 impl Search {
-    /// Schedule successors: FIFO (append) for `srewrite`, LIFO (prepend, keeping order) for `dsrewrite`. Each
-    /// scheduled process is a new live slave of its task.
+    /// Add successors as live slaves of their tasks. FIFO mode appends them for round-robin execution;
+    /// depth-first mode prepends them while preserving their local order.
     fn schedule(&mut self, succ: Vec<Process>) {
         for s in &succ {
             self.tasks[s.task].slaves += 1;
@@ -1079,7 +1070,7 @@ impl Search {
         }
     }
 
-    /// Register a new child task of `parent` (itself a slave of `parent`), returning its id.
+    /// Register a child task, which counts as one live slave of `parent`.
     fn new_task(&mut self, parent: usize, kind: TaskKind) -> usize {
         self.tasks[parent].slaves += 1;
         self.tasks.push(TaskState {
@@ -1091,8 +1082,7 @@ impl Search {
         self.tasks.len() - 1
     }
 
-    /// Account for one slave of `task` leaving; on reaching zero, the task is exhausted (its failure /
-    /// normal-form action fires, then it leaves its parent's slave list — cascading).
+    /// Remove one live slave. Losing the last slave exhausts the task and may cascade into its parent.
     fn dec_slave(&mut self, task: usize) {
         self.tasks[task].slaves -= 1;
         if self.tasks[task].slaves == 0 && self.tasks[task].alive {
@@ -1100,7 +1090,7 @@ impl Search {
         }
     }
 
-    /// A task's sub-search exhausted: run its on-exhaust action, then detach it from its parent.
+    /// Run a task's exhaustion action, then detach the task from its parent.
     fn exhaust(&mut self, task: usize) {
         let parent = self.tasks[task].parent;
         let succ = match &mut self.tasks[task].kind {
@@ -1148,7 +1138,7 @@ impl Search {
         }
     }
 
-    /// Route a solution reached under `task` (a process with empty pending) to the task's continuation.
+    /// Route a completed process through its task's continuation.
     fn emit(&mut self, task: usize, dag: DagId, count: u64) {
         let parent = self.tasks[task].parent;
         let succ = match &mut self.tasks[task].kind {
@@ -1213,13 +1203,13 @@ impl Search {
             TaskKind::One { .. } | TaskKind::Branch { .. }
         );
         self.schedule(succ);
-        // `one` and conditional branching commit to the first successful sub-search result.
+        // `one` and conditional branching discard their remaining sub-search after the first solution.
         if commit {
             self.kill(task);
         }
     }
 
-    /// Kill a task (and detach from its parent) — its still-queued processes are dropped when popped.
+    /// Mark a task dead and detach it; any queued processes are discarded when dequeued.
     fn kill(&mut self, task: usize) {
         if !self.tasks[task].alive {
             return;
@@ -1235,11 +1225,11 @@ impl Search {
     fn run_one(&mut self, cx: &mut Cx, mut p: Process) {
         let t = p.task;
         if !self.tasks[t].alive {
-            // A process of a killed task (e.g. `one` past its first solution) — drop it.
+            // A committed `one` or branch can leave already-queued processes behind.
             self.dec_slave(t);
             return;
         }
-        // A resumable rule application: fire one match, spawn its result + survive, else die.
+        // A resumable application fires one match and reschedules itself for the remaining matches.
         if let Some(mut app) = p.app.take() {
             if let Some(m) = app.matches.pop_front() {
                 let whole = replace_at(cx.eng, p.dag, &m.path, m.result);
@@ -1263,7 +1253,7 @@ impl Search {
             self.dec_slave(t);
             return;
         }
-        // A decomposition process: prune on a (term, pending) revisit within this task.
+        // Repeated decomposition states within one task cannot produce new continuations.
         let key = pending_key(&p.pending);
         if self
             .seen
@@ -1284,8 +1274,8 @@ impl Search {
         self.dec_slave(t);
     }
 
-    /// Decompose the top strategy frame into successors (the core combinators) or spawn a child task (the
-    /// sub-search combinators: branch / one / normalize). `t` is the running process's task.
+    /// Turn the next frame into successor processes. Branch, `one`, and normalization instead create child
+    /// tasks so their sub-search completion can control the outer continuation.
     fn decompose(
         &mut self,
         cx: &mut Cx,
@@ -1507,9 +1497,8 @@ impl Search {
     }
 }
 
-/// Match one named call against every compatible definition in donation order and specialize each body
-/// with its match substitution. Calls remain lazy in the resolved tree; recursive bodies are opened only
-/// when their call frame is decomposed.
+/// Return specialized bodies for definitions whose name, argument kinds, subject kind, and patterns match.
+/// Definitions and matcher solutions retain their enumeration order.
 fn call_bodies(cx: &mut Cx, dag: DagId, name: &str, args: &[Term]) -> Vec<Rc<RStrat>> {
     let subject_kind = cx.eng.sorts().kind_of(cx.eng.node(dag).sort());
     let arg_kinds: Vec<KindId> = args
@@ -1558,6 +1547,7 @@ fn call_bodies(cx: &mut Cx, dag: DagId, name: &str, args: &[Term]) -> Vec<Rc<RSt
     bodies
 }
 
+/// Substitute bound definition variables throughout a resolved body, leaving unbound slots unchanged.
 fn specialize_strategy(strategy: &Rc<RStrat>, bindings: &[Option<Term>]) -> Rc<RStrat> {
     let resolved = match &**strategy {
         RStrat::Idle => RStrat::Idle,
@@ -1720,7 +1710,7 @@ fn specialize_term(term: &Term, bindings: &[Option<Term>]) -> Term {
     }
 }
 
-/// Flatten a left-nested `_;_` spine into its element strategies (Maude's n-ary concatenation).
+/// Flatten a left-nested `_;_` spine into its element strategies.
 fn flatten_seq(s: &Rc<RStrat>, out: &mut Vec<Rc<RStrat>>) {
     if let RStrat::Seq(a, b) = &**s {
         flatten_seq(a, out);
@@ -1730,7 +1720,7 @@ fn flatten_seq(s: &Rc<RStrat>, out: &mut Vec<Rc<RStrat>>) {
     }
 }
 
-/// Flatten a `_|_` spine into its alternatives (Maude's n-ary union — the decompose timing must match).
+/// Flatten a `_|_` spine into alternatives while retaining decomposition order.
 fn flatten_union(s: &Rc<RStrat>, out: &mut Vec<Rc<RStrat>>) {
     if let RStrat::Union(a, b) = &**s {
         flatten_union(a, out);
@@ -1740,8 +1730,8 @@ fn flatten_union(s: &Rc<RStrat>, out: &mut Vec<Rc<RStrat>>) {
     }
 }
 
-/// All matches of `rules` against `dag` (positions pre-order × rules × match solutions), honouring `top` and
-/// the application substitution — the resumable application's work-list (one rewrite fired per step).
+/// Collect rule matches in position, rule, and matcher order. `top` restricts matching to the root, and the
+/// application substitution is enforced while matching. The executor fires one collected match per step.
 fn precompute_matches(
     cx: &mut Cx,
     dag: DagId,
@@ -1779,8 +1769,8 @@ fn precompute_matches(
     out
 }
 
-/// Build the caller-supplied bindings for a rule application. The matcher enforces these bindings
-/// while enumerating, avoiding a second filter pass and retaining its theory-extension residue.
+/// Build initial rule-variable bindings from the application substitution. Supplying them to the matcher
+/// preserves any theory-extension residue associated with each solution.
 fn initial_bindings(
     cx: &mut Cx,
     r: &RRule,
@@ -1795,7 +1785,7 @@ fn initial_bindings(
     Some(initial)
 }
 
-/// Apply rules whose conditions / rewrite-condition substrategies must be solved (the eager path).
+/// Apply rules eagerly when conditions or rewrite-condition substrategies require nested searches.
 fn apply_eager(
     cx: &mut Cx,
     dag: DagId,
@@ -1852,7 +1842,7 @@ fn apply_eager(
     out
 }
 
-/// Solve a rule's / test's condition fragments `frags[i..]`, returning every completed binding vector.
+/// Solve `frags[i..]` in order and return every completed binding vector.
 fn solve_frags(
     cx: &mut Cx,
     frags: &[ConditionFragment],
@@ -1919,8 +1909,8 @@ fn solve_frags(
     }
 }
 
-/// `matchrew`/`amatchrew`: match the pattern, run each by-variable's substrategy, rebuild for every
-/// combination (first by-variable varies fastest).
+/// For each selected `matchrew` or `amatchrew` match satisfying `cond`, run every by-variable strategy to
+/// exhaustion and rebuild the Cartesian product of their results. The first by-variable varies fastest.
 #[allow(clippy::too_many_arguments)]
 fn matchrew_solutions(
     cx: &mut Cx,
@@ -2244,7 +2234,7 @@ mod tests {
                 .map(|definition| pattern_name(definition))
                 .collect::<Vec<_>>(),
             ["a", "b"],
-            "definition donation order is retained"
+            "definition declaration order is retained"
         );
 
         let pair = program

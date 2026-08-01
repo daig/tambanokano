@@ -1,4 +1,4 @@
-*** B5: renaming `* (sort A to B, op f to g)` — names substituted across decls + statement bubbles.
+*** Renaming `* (sort A to B, op f to g)` substitutes names across declarations and statement bubbles.
 fmod ORIG is
   sort Elt .
   op e : -> Elt [ctor] .

@@ -1,4 +1,4 @@
-*** U05-au-unification — lifted from the reference suite (Misc/AU_Unification.maude)
+*** U05-au-unification
 *** PRELUDE
 ***
 ***	Tests for associative-identity unification.
@@ -20,7 +20,7 @@ unify X =? Y X /\ Z Y =? A B .
 *** one side goes to empty
 unify X =? Y X /\  Z C =? C  /\ Z Y =? A B .
 
-*** both sides go to one variable
+*** each side goes to one variable
 unify X =? Y X /\ A C =? C  /\ Z Y =? A B .
 
 *** both side to to empty

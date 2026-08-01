@@ -1,6 +1,5 @@
-//! Surface AST: the `PreModule` (signature + raw statement bubbles) the surface parser produces before
-//! the per-module mixfix term parse runs (B4.4). Term-carrying parts (op identity, equation lhs/rhs,
-//! conditions, command terms) are kept as un-parsed token **bubbles**.
+//! Surface AST produced before per-module mixfix parsing. Term-carrying identities, statements,
+//! conditions, and commands remain raw token bubbles.
 
 use crate::lex::Token;
 
@@ -38,8 +37,7 @@ impl Diagnostic {
     }
 }
 
-/// A parsed functional-module skeleton. `Clone` so the module system (B5) can combine the declarations
-/// of an import closure into one flattened `PreModule`.
+/// Parsed module skeleton. `Clone` supports import-closure flattening and module transformations.
 #[derive(Debug, Clone)]
 pub struct PreModule {
     pub name: String,
@@ -50,16 +48,11 @@ pub struct PreModule {
     /// Functional (`fmod`/`fth`) or system (`mod`/`th`). A system module/theory may declare rules
     /// (`rl`/`crl`); a functional one may not. This is the *rule-gating* axis only.
     pub kind: ModuleKind,
-    /// Whether this is a **theory** (`fth`/`th`) rather than a module (`fmod`/`mod`). Orthogonal to
-    /// [`kind`](Self::kind) (Maude's `ModuleType` is a bitfield: functional/system ⊥ theory). A theory is
-    /// a *specification* — the source of a view and the bound of a parameter (`X :: T`); its statements
-    /// are not executed (theory axioms are `[nonexec]` proof obligations). Built with its signature like a
-    /// module, but [`nonexec`](Statement) statements are not added to the engine.
+    /// Whether this is a theory rather than a module. Orthogonal to functional/system kind. Theory
+    /// statements are specifications and proof obligations rather than executable statements.
     pub is_theory: bool,
-    /// Formal parameters `{X :: T, …}` (Pillar B-iii). A parameter `X :: T` makes a *parameter copy* of
-    /// theory `T`: each of `T`'s sorts `s` is imported renamed to `X$s` (a parameter sort), so the body can
-    /// refer to `X$Elt` and to parameterized sorts `List{X}`. Empty for an ordinary module. The module's
-    /// stored [`name`](Self::name) is the bare base (`LIST`, not `LIST{X}`).
+    /// Formal parameters `{X :: T, …}`. Each parameter imports a renamed copy of its theory under the
+    /// `X$` prefix; empty for an ordinary module. The stored module name remains the bare base.
     pub params: Vec<Parameter>,
     /// Imported modules (`protecting`/`extending`/`including <module-expr> .`), in declaration order.
     pub imports: Vec<Import>,
@@ -73,22 +66,18 @@ pub struct PreModule {
     /// strategy declarations/definitions ([`strat_decls`](Self::strat_decls)/[`strat_defs`](Self::strat_defs)).
     /// Orthogonal to [`kind`](Self::kind) (a strategy module is a system module). Plain `mod`/`fmod` = `false`.
     pub is_strategy: bool,
-    /// `true` for an **object-oriented module** (`omod`/`oth`, Pillar 2.5-E). An object module is a system
-    /// module (rules allowed) that additionally permits `class`/`subclass`/`msg` declarations, which the
-    /// parser **desugars** into ordinary sorts/subsorts/ops (so [`ops`](Self::ops) etc. carry the lowered
-    /// form and the rest of the pipeline is unchanged). It auto-imports `CONFIGURATION`. The flag is
-    /// carried through flattening so `load_statements` runs the **object-pattern completion** transform
-    /// (`ooTransform.cc`) — splicing a fresh `AttributeSet` variable into each object pattern and turning a
-    /// class *constant* into a fresh class-sorted variable (subclass polymorphism) — only for object modules.
+    /// `true` for an object-oriented module or theory (`omod`/`oth`). Its class, subclass, and message
+    /// declarations are desugared to ordinary signature entries, and `CONFIGURATION` is imported
+    /// implicitly. During statement loading, object patterns are completed with an AttributeSet variable
+    /// and class constants are generalized to class-sorted variables.
     pub is_object: bool,
-    /// `strat`/`strats` declarations (Pillar 2.4) — empty for a non-strategy module.
+    /// Strategy declarations and definitions; empty for a non-strategy module.
     pub strat_decls: Vec<StratDecl>,
-    /// `sd`/`csd` strategy definitions (Pillar 2.4) — empty for a non-strategy module.
+    /// `sd`/`csd` definitions; empty for a non-strategy module.
     pub strat_defs: Vec<StratDef>,
 }
 
-/// One formal parameter `X :: T` of a parameterized module/view: the parameter name and the theory it is
-/// bound by. (Pillar B-iii.)
+/// A formal module/view parameter `X :: T`: parameter name and its bounding theory.
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: String,
@@ -104,9 +93,8 @@ pub enum ModuleKind {
     System,
 }
 
-/// An import declaration: a mode and the module expression it imports. The mode does **not** affect
-/// flattening (which declarations are imported) — it is a semantic-check annotation (no-junk /
-/// no-confusion), stored for later. So B5 flattens all three modes identically.
+/// An import declaration. Flattening imports the same declarations for all three modes; the mode is
+/// retained for reflection, while no-junk and no-confusion obligations are not enforced.
 #[derive(Debug, Clone)]
 pub struct Import {
     pub mode: ImportMode,
@@ -120,26 +108,26 @@ pub enum ImportMode {
     Including,
 }
 
-/// A module expression: a named module, a summation `A + B` (the union), a renaming `M * (sort A to B, op f
-/// to g)`, or a parameterized **instantiation** `M{V1, …}` (Pillar B-iv) supplying a view per parameter.
+/// A module expression: named module, sum, renaming, or parameterized instantiation with one module/view
+/// argument per formal parameter.
 #[derive(Debug, Clone)]
 pub enum ModuleExpr {
     Named(String),
     Sum(Box<ModuleExpr>, Box<ModuleExpr>),
     Rename(Box<ModuleExpr>, Vec<RenameItem>),
-    /// `M{arg, …}` — instantiate the parameterized module `M` with one argument per parameter. Each
-    /// argument is itself a module expression (Pillar B Axis-A2/A5): a view name (`Nat`), a nested
-    /// instantiation of a parameterized view (`BoxV{ToColor}`, `List{Nat}`), or a bare enclosing-parameter
-    /// name (`X`) which `flatten` classifies contextually (a view vs. an enclosing parameter).
+    /// Instantiate a parameterized module with view names, nested view/module instantiations, or enclosing
+    /// parameter names classified contextually during flattening.
     Instantiation(Box<ModuleExpr>, Vec<ModuleExpr>),
 }
 
-/// One mapping inside a renaming `* (…)`. Op renaming is by canonical mixfix name (`_,_ to _;_`);
-/// the optional `[ … ]` carries attribute *overrides* for the target op (the prelude uses `[prec 43]`
-/// on `op _,_ to _;_`). An **arity-disambiguated** op rename `op f : A B -> C to g` carries
-/// [`dom_range`](RenameItem::Op::dom_range) — the source domain/range that selects *one* overload of a
-/// name shared by several (only that overload is renamed). A `label l to m` renames a statement label.
+/// One mapping inside a renaming `* (…)`. Operator renaming uses canonical mixfix names (`_,_ to _;_`).
+/// Optional `[ … ]` attributes override the target declaration, for example `[prec 43]`. An
+/// arity-disambiguated rename `op f : A B -> C to g` stores the selecting domain and range in
+/// [`dom_range`](RenameItem::Op::dom_range), so only that overload is renamed. A `label l to m` item
+/// renames a statement label.
+// Renames are short-lived parser ASTs; retaining attributes inline avoids one allocation per op mapping.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RenameItem {
     Sort {
         from: String,
@@ -160,19 +148,16 @@ pub enum RenameItem {
     },
 }
 
-/// A view definition `view V from T to M is <maps> endv` (Pillar B-ii). A view maps a source theory `T`
-/// to a target module (or theory) `M`, supplying the concrete sorts/ops that satisfy `T` — the argument of
-/// a parameterized-module instantiation `M{V}` (B-iv). `from`/`to` are module expressions; a **parameterized
-/// view** `view V{X :: T} from T' to M{X} …` (Axis-A2) carries [`params`](Self::params) and a non-`Named`
-/// `to` target, and is exercised by a nested instantiation `M{V{Arg}}` (Axis-A5).
+/// A view maps a source theory into a target module or theory, providing sort and operator mappings for
+/// module instantiation. Parameterized views retain formal parameters and may target a structured module
+/// expression; instantiating the view substitutes arguments through its target and maps.
 #[derive(Debug, Clone)]
 pub struct ViewDecl {
     pub name: String,
     /// Line of the `view` keyword when the declaration came from source text.
     pub source_line: Option<u32>,
-    /// Formal parameters `{X :: T, …}` of a *parameterized* view (Axis-A2). Empty for an ordinary view.
-    /// A parameterized view is only used by instantiating it (`V{Arg}`) inside a nested module
-    /// instantiation; that instantiation substitutes the args into `to`/`sort_maps`/`op_maps`.
+    /// Formal parameters of a parameterized view. Instantiation substitutes their arguments into the
+    /// target expression and all sort/operator maps.
     pub params: Vec<Parameter>,
     pub from: ModuleExpr,
     pub to: ModuleExpr,
@@ -212,8 +197,8 @@ pub struct OpDecl {
     pub domain: Vec<String>,
     pub range: String,
     /// Whether the declaration used the **partial** arrow `~>` (`op _/_ : Float Float ~> Float`).
-    /// Maude lifts every domain and range sort of a partial declaration to its kind (error sort), so
-    /// kind-level arguments are accepted and an unreduced application remains at the result kind.
+    /// Signature construction lifts every domain and range sort to its kind, allowing kind-level
+    /// arguments and assigning an unreduced application to the result kind.
     pub partial: bool,
     pub attrs: Attrs,
 }
@@ -239,25 +224,22 @@ pub struct Attrs {
     /// `strat (…)` — the raw 1-based positions (ending in `0`).
     pub strat: Option<Vec<u32>>,
     /// `frozen` / `frozen (1 2)` — `None` = not frozen; `Some([])` = all arguments frozen (`[frozen]`);
-    /// `Some([1,3])` = those 1-based argument positions frozen. A frozen argument is never rewritten by
-    /// `rewrite`/`frewrite`/`search` (Pillar A).
+    /// `Some([1,3])` = those 1-based argument positions frozen. Rewriting does not descend into them.
     pub frozen: Option<Vec<u32>>,
     pub special: Option<SpecialSpec>,
     pub ditto: bool,
     /// `memo` — retained for an explicit unsupported-feature warning; it has no kernel semantics.
     pub memo: bool,
-    /// `poly (<positions>)` — the polymorphic argument/range positions (Maude's `Polymorph`),
-    /// numbered with arguments `1..n` and the range as `0`. A position listed here is `Universal`:
-    /// `build_sig` expands the op into one concrete declaration per kind, substituting that kind's
-    /// error (top) sort at each listed position. `None` = an ordinary, monomorphic op.
+    /// Polymorphic argument/range positions: arguments use `1..n`, range uses `0`. Each listed position
+    /// expands to the error sort of every kind; `None` is monomorphic.
     pub poly: Option<Vec<u32>>,
     /// `format (<word> …)` — one format directive word per **gap** of the operator's mixfix form (gaps =
     /// tokens + 1: before each token/hole, plus a trailing one). Each word is a directive string (`d`
     /// default, `s` space, `t` tab, `n` newline, `i` indent, `+`/`-` indent level — e.g. `n++i`, `ni`).
-    /// The pretty-printer uses it for `_<-_`/`{_,_,_}`/`rl_=>_[_].` layout; `None` = Maude's default spacing.
+    /// The pretty-printer consumes these directives; `None` selects default spacing.
     pub format: Option<Vec<String>>,
-    /// `config` / `configuration` — the configuration-multiset constructor (`__`), Pillar 2.5. Recorded
-    /// onto the kernel symbol; the `erewrite` object-message scheduler keys its soup partition on it.
+    /// `config` / `configuration` — marks the configuration-multiset constructor used by `erewrite`
+    /// object/message partitioning.
     pub config: bool,
     /// `obj` / `object` — the object constructor (`<_:_|_>`).
     pub object: bool,
@@ -269,17 +251,14 @@ pub struct Attrs {
     /// module `P{X :: T}` such a constant is referred to as `X$c` (the parameter prefix, like a parameter
     /// sort `X$s`); instantiating `P{V}` maps `X$c` through `V`'s op map for `c`.
     pub pconst: bool,
-    /// Which side(s) the `id:` collapses: `left id:` / `right id:` collapse only that side (Maude's
-    /// one-sided identity), a plain `id:` is two-sided. Meaningful only when
-    /// [`id`](Self::id) is `Some`.
+    /// Sides on which an identity collapses. Meaningful only when [`id`](Self::id) is present.
     pub id_side: IdSide,
 }
 
-/// The side(s) on which an operator's `id:` identity element collapses at construction/matching. Maude's
-/// `assoc [left|right] id:` — a one-sided identity only absorbs an identity argument on its declared side.
+/// Identity-collapse sides for associative operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IdSide {
-    /// A plain `id:` — collapses on either side (Maude's two-sided identity).
+    /// Collapse on either side.
     #[default]
     Both,
     /// `left id:` — only a leading identity argument collapses.
@@ -298,8 +277,8 @@ pub enum GatherElem {
     Any,
 }
 
-/// A `special (id-hook … op-hook … term-hook …)` directive: hook names + their argument bubbles, resolved
-/// to a `tnk-core::SpecialOp` by `build_sig` (B4.2).
+/// A `special (id-hook … op-hook … term-hook …)` directive, resolved to a typed kernel hook while the
+/// signature is built.
 #[derive(Debug, Default, Clone)]
 pub struct SpecialSpec {
     /// `(class_name, data_tokens)` — e.g. `("ACU_NumberOpSymbol", ["+"])`, `("BranchSymbol", [])`.
@@ -310,8 +289,8 @@ pub struct SpecialSpec {
     pub term_hooks: Vec<(String, Vec<Token>)>,
 }
 
-/// A statement — `eq`/`ceq`/`owise`, `mb`/`cmb`, `rl`/`crl`. Term parts are raw bubbles (parsed in B4.4).
-/// `nonexec` ([`nonexec`] statement attribute) marks an axiom that is *not* applied during
+/// A statement: equation, membership axiom, or rule. Term parts remain raw bubbles until module loading.
+/// The `[nonexec]` statement attribute marks an axiom that is *not* applied during
 /// reduction/rewriting — a proof obligation (theory axioms are all `[nonexec]`, but a module statement may
 /// be too). Such statements parse and carry through flattening, but are skipped when loading the engine.
 #[derive(Debug, Clone)]
@@ -332,8 +311,7 @@ pub enum Statement {
         nonexec: bool,
         label: Option<String>,
     },
-    /// `rl [\[label\] :] lhs => rhs .` (or `crl … if cond .`). A rule condition may carry a rewrite
-    /// fragment `t => p` (Pillar A-v) in addition to the `ceq`-style fragments.
+    /// A rule condition can contain a rewrite fragment `t => p` in addition to equation-style fragments.
     Rule {
         label: Option<String>,
         lhs: Vec<Token>,
@@ -346,9 +324,8 @@ pub enum Statement {
     },
 }
 
-/// A **strategy declaration** `strat name : <domain> @ Sort .` (Pillar 2.4) — names a strategy with its
-/// argument sorts (`domain`, empty for a 0-ary strategy) and the **subject sort** it applies to (`@ Sort`).
-/// `strats a b : … @ … .` expands to one [`StratDecl`] per name.
+/// A strategy declaration names a strategy, its argument sorts, and the subject sort after `@`.
+/// `strats` expands to one declaration per name.
 #[derive(Debug, Clone)]
 pub struct StratDecl {
     pub name: String,
@@ -389,7 +366,7 @@ pub enum TestKind {
     AMatch,
 }
 
-/// A **strategy expression** (the combinator tree, Table 10.1). Term-carrying parts (a rule label's initial
+/// A **strategy expression** combinator tree. Term-carrying parts (a rule label's initial
 /// substitution / its rewrite-condition substrategies, a test/matchrew pattern + condition, a call's
 /// arguments) are raw token bubbles, parsed against the module grammar at execution time. The derived forms
 /// `try`/`not`/`test`/`or-else` keep their surface spelling ([`StratExpr::Sugar`]) for the command echo
@@ -462,13 +439,11 @@ pub enum StratExpr {
     Call { name: String, args: Vec<Vec<Token>> },
 }
 
-/// A top-level command (functional fragment): `reduce`/`red`, object-level SMT `check`/`smt-search`,
-/// `match`/`xmatch`, the rewriting commands `rewrite`/`rew` + `continue` (Pillar A), and the strategy
-/// commands `srewrite`/`dsrewrite` (Pillar 2.4).
+/// A top-level command covering reduction, matching, rewriting/search, strategies, SMT, variants,
+/// narrowing, reflection, inspection, and session controls.
 #[derive(Debug)]
 pub enum Command {
-    /// `reduce [in M :] term .`. The optional `module` is Maude's `in <MODULE> :` qualifier — reduce in
-    /// that module instead of the current one (a one-shot override; the current module is unchanged).
+    /// Reduce in an optional one-command module override without changing the current module.
     Reduce {
         module: Option<String>,
         term: Vec<Token>,
@@ -490,25 +465,23 @@ pub enum Command {
         bound: Option<u64>,
         term: Vec<Token>,
     },
-    /// `frewrite [bound [, gas]] term .` — position-fair rewriting (Pillar A-ii). `gas` (default 1) is the
-    /// number of rule applications per position per pass.
+    /// Position-fair rewriting. `gas` defaults to one rule application per position per pass.
     Frewrite {
         module: Option<String>,
         bound: Option<u64>,
         gas: Option<u64>,
         term: Vec<Token>,
     },
-    /// `erewrite [bound [, gas]] term .` — object-message-fair rewriting of a configuration (Pillar 2.5).
-    /// `bound` caps **deliveries** (config-level rule rewrites); `gas` (default 1) is the per-position gas
-    /// for the non-config fallback.
+    /// Object-message-fair rewriting of a configuration. `bound` caps config-level deliveries; `gas`
+    /// controls the non-config position-fair fallback.
     ERewrite {
         module: Option<String>,
         bound: Option<u64>,
         gas: Option<u64>,
         term: Vec<Token>,
     },
-    /// `search [n,m] subject =>arrow pattern [such that cond] .` (Pillar A-iv): reachability search.
-    /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
+    /// `search [n,m] subject =>arrow pattern [such that cond] .`: reachability search.
+    /// `max_solutions` is `[n]`; `max_depth` is the second bound in `[n,m]`.
     Search {
         module: Option<String>,
         max_solutions: Option<u64>,
@@ -518,11 +491,8 @@ pub enum Command {
         pattern: Vec<Token>,
         such_that: Option<Vec<Token>>,
     },
-    /// `smt-search [n,m] [in M :] subject =>arrow pattern [such that cond] .`: object-level SMT search
-    /// syntax. It preserves the same surface contract as `search` while remaining a distinct command
-    /// variant for later SMT-specific execution; `=>1`/`=>+`/`=>*`/`=>!` are accepted here and runtime
-    /// decides which arrows are supported.
-    /// `max_solutions` = `[n]`, `max_depth` = the `[n,m]` second bound.
+    /// Object-level `smt-search`, with the same surface bounds and arrows as `search`.
+    /// Runtime validates which arrows the configured SMT engine supports.
     SmtSearch {
         module: Option<String>,
         max_solutions: Option<u64>,
@@ -532,10 +502,8 @@ pub enum Command {
         pattern: Vec<Token>,
         such_that: Option<Vec<Token>>,
     },
-    /// `[irredundant] unify [[bound]] [in M :] T1 =? T2 [/\ …] .` (Pillar S1): order-sorted
-    /// unification. `bound` = `[n]` (max unifiers before continuation); `irredundant` selects the
-    /// minimal-complete-set filter. `body` is the raw `=?`/`/\`-separated bubble, split by the
-    /// command builder.
+    /// Order-sorted unification. `bound` limits returned unifiers; `irredundant` requests the
+    /// minimal-complete-set filter; `body` retains the raw `=?`/`/\`-separated term bubble.
     Unify {
         module: Option<String>,
         bound: Option<u64>,
@@ -589,8 +557,7 @@ pub enum Command {
     },
     /// `continue [bound] .` — resume the last `rewrite`/`frewrite`/`search` for more steps/solutions.
     Continue { bound: Option<u64> },
-    /// `srewrite [in M :] T using E .` (fair) / `dsrewrite …` (depth-first) — strategy-controlled rewriting
-    /// (Pillar 2.4). Enumerates the solutions of applying strategy `E` to `T`.
+    /// Fair (`srewrite`) or depth-first (`dsrewrite`) strategy-controlled rewriting.
     Srewrite {
         module: Option<String>,
         depth_first: bool,
@@ -625,9 +592,8 @@ pub enum TopItem {
     Command(Command),
 }
 
-/// The result of surface-parsing a source file: the modules, the view definitions, and the top-level
-/// commands, each tagged with the index (into `modules`) of the module it runs against — the most recently
-/// entered one, as in Maude.
+/// The result of surface-parsing a source file: modules, view definitions, and top-level commands. Each
+/// command is tagged with the index of the most recently entered module in `modules`.
 #[derive(Debug, Default)]
 pub struct Source {
     pub modules: Vec<PreModule>,

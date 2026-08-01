@@ -1,7 +1,7 @@
-*** Axis-A5 chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (leaving the parameter
+*** Chained instantiation `M{ToTheory}{Arg}` — a theory-view first level (leaving the parameter
 *** bound to a richer theory) composed with a by-parameter or module-view second level, plus the chained
 *** import's renaming collapsing the multi-level structured sort. This is the SORTABLE-LIST family's shape:
-*** `LIST{STRICT-WEAK-ORDER}{X}` renamed to `List{X}`. Self-contained; oracle is this file through Maude 3.
+*** `LIST{STRICT-WEAK-ORDER}{X}` renamed to `List{X}`.
 
 fth ELT is sort Elt . endfth
 fth ORD is

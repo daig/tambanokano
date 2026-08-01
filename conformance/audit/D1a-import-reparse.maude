@@ -1,5 +1,5 @@
 *** PRELUDE
-*** D1a-import-reparse — imported statements re-parsed in importer grammar: oracle builds, tnk hard-errors
+*** D1a-import-reparse — imported statements re-parsed in importer grammar: expected parity builds
 fmod D1ABASE is
   sort S .
   ops a b : -> S .

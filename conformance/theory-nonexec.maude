@@ -1,4 +1,4 @@
-*** B-i: theories (fth). A theory is a SPECIFICATION (a view source / parameter bound). Its
+*** A theory is a specification used as a view source or parameter bound. Its
 *** `[nonexec]` axioms are proof obligations, NEVER applied during reduction; ordinary
 *** equations in a theory DO fire. Self-contained (no imports), ground reduce subjects.
 fth ELT-ORD is

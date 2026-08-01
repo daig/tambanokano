@@ -1,5 +1,4 @@
-*** I15-meta-int-variant-match — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntVariantMatch.maude; oracle verified 2026-07-23.
+*** I15-meta-int-variant-match
 *** PRELUDE
 set show timing off .
 

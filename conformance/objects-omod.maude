@@ -1,4 +1,4 @@
-*** Pillar 2.5-E: omod/class/subclass/msg -- the object-oriented surface language. Each omod desugars to
+*** Object-oriented `omod`/`class`/`subclass`/`msg` surface syntax. Each omod desugars to
 *** CONFIGURATION-based Core-Maude (class C to sort C + subsort C less-than Cid + constant op C : -> C
 *** [ctor]; attribute a : S to op a :_ : S -> Attribute [ctor gather (and)]; subclass to subsort; msg to
 *** op ... [ctor msg]) and auto-imports the built-in CONFIGURATION. The load-bearing case is object-pattern
@@ -7,8 +7,7 @@
 *** rule's Account (the class constant is rewritten to a fresh class-sorted variable). BANK/PINGPONG behave
 *** identically to the hand-written CONFIGURATION encodings in objects.maude.
 ***
-*** Oracle -- byte-for-byte, modulo the `====`/`Bye.` framing:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/objects-omod.maude < /dev/null
+*** Oracle output is compared byte-for-byte after removing Maude's banner and exit framing.
 
 set show advisories off .
 

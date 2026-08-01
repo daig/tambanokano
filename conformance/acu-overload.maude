@@ -1,8 +1,7 @@
-*** F-B regression (post-B2 audit) — an ASYMMETRIC overloaded declaration on a COMMUTATIVE operator
+*** An ASYMMETRIC overloaded declaration on a COMMUTATIVE operator
 *** must give an argument-order-INDEPENDENT least sort (Maude's `commutativeSortCompletion`, which
 *** adds the swapped declaration `[b,a] -> r` for each `[a,b] -> r`). This is exactly the shape of the
-*** prelude's `op _+_ : NzNat Nat -> NzNat [assoc comm]`. Mirrors the engine.rs B2.1 regression tests.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-overload.maude < /dev/null
+*** prelude's `op _+_ : NzNat Nat -> NzNat [assoc comm]`.
 
 fmod ACU-OVERLOAD is
   sorts Zero NzNat Nat .

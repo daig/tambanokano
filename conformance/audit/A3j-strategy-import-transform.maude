@@ -1,4 +1,4 @@
-*** A3j-strategy-import-transform — sum, ordinary renaming, instantiation, and redefinition transform strategies (TNK-005)
+*** Sum, renaming, instantiation, and redefinition transform strategies.
 smod A3J-SUM-LEFT is
   sort S .
   ops a b c : -> S .

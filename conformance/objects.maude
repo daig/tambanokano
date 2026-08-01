@@ -1,13 +1,12 @@
-*** Pillar 2.5-A: object-message configurations under plain rewrite/search -- no erewrite, no IO.
+*** Object-message configurations under ordinary rewrite/search, without external IO.
 *** Proves the build-layer plumbing for the OO operator attributes: `config`/`obj`/`portal` are
 *** recorded onto the kernel symbol, and the `ObjectConstructorSymbol` id-hook on `<_:_|_>` resolves --
 *** the object constructor is an ordinary free symbol; its third argument is the ACU `AttributeSet`.
-*** CONFIGURATION is the real prelude module -- prelude.maude:3213, verbatim; the bank/ping-pong systems
-*** are hand-written Core-Maude -- the omod/class desugaring is Phase 2.5-E. `set show advisories off`
-*** suppresses the reference's "redefining module CONFIGURATION" advisory so the output is comparable.
+*** CONFIGURATION is the real prelude module; the bank/ping-pong systems are hand-written Core-Maude
+*** and exercise omod/class desugaring. `set show advisories off` suppresses the
+*** "redefining module CONFIGURATION" advisory so the output is comparable.
 ***
-*** Oracle -- byte-for-byte, modulo the `====`/`Bye.` framing:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/objects.maude < /dev/null
+*** Oracle output is compared byte-for-byte after removing Maude's banner and exit framing.
 
 set show advisories off .
 
@@ -75,7 +74,7 @@ search in BANK : < a : Account | bal : 0 > credit(a, 5) credit(a, 7) =>* < a : A
 rewrite [4] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > .
 search [1] in PINGPONG : ping(p1, p2) < p1 : Player | turns : 0 > < p2 : Player | turns : 0 > =>+ pong(p2, p1) C:Configuration .
 
-*** Pillar 2.5-B: erewrite (object-message-fair). The `msg`-flagged credit/ping/pong engage the
+*** Object-message-fair erewrite uses the `msg`-flagged credit/ping/pong rules through the
 *** ConfigSymbol scheduler. One pass delivers every queued message object-by-object (oid order); the
 *** [n] bound counts delivering passes -- bank delivers both credits in one pass, ping-pong one per pass.
 erewrite in BANK : < a : Account | bal : 0 > < b : Account | bal : 100 > credit(a, 50) credit(b, 25) .

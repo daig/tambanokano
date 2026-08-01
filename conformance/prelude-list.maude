@@ -1,11 +1,8 @@
-*** M2 milestone — the real prelude's LIST{X :: TRIV} instantiated as LIST{Nat}, over its BOOL+NAT
-*** substrate (BOOL stack 33-82, NAT 110-243, TRIV + the Nat view + LIST 1017-1071, verbatim from
-*** ~/Downloads/Maude-3/prelude.maude). Exercises AU identity-collapse matching: every list recursion
-*** (occurs/size/reverse via $size/$reverse) peels `E L` off the front and must match the final single
-*** element `c` as `c nil` (`__` has id: nil), then `nil` via the base equation. Also the poly == / if
-*** (occurs), the Nat length (size), and parameterized instantiation (LIST{Nat}).
-***
-*** Oracle: stock Maude, `fmod T is protecting LIST{Nat} . endfm` then `red in T : <term> .`.
+*** Stock prelude LIST{X :: TRIV}, instantiated as LIST{Nat}, over its BOOL+NAT substrate.
+*** AU identity-collapse matching (occurs/size/reverse via $size/$reverse) peels `E L` off the front
+*** and must match the final single element `c` as `c nil` (`__` has id: nil), then `nil` via the base
+*** equation. Also the poly == / if (occurs), the Nat length (size), and parameterized instantiation
+*** target module: LIST{Nat}.
 
 fmod TRUTH-VALUE is
   sort Bool .

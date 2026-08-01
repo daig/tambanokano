@@ -1,7 +1,5 @@
-//! Pure-integer associative/associative-with-identity word unification.
-//!
-//! This module is the DAG-independent port of Maude's `Utility/variableConstraint.*`,
-//! `wordSystem.*`, `wordLevel*.cc/hh`, and `pigPug*.cc/hh`.
+//! Pure-integer associative and associative-with-identity word unification. The solver separates
+//! packed variable constraints, system-level search, equation levels, and PigPug prefix moves.
 
 mod constraint;
 mod pigpug;
@@ -27,7 +25,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_left_linear_sequence_is_move_order_faithful() {
+    fn strict_left_linear_sequence_follows_move_order() {
         // A B =? X Y. The three elementary unifiers are emitted in
         // RHS_PEEL, LHS_PEEL, EQUATE order.
         let mut system = WordSystem::new(4, 1, false);

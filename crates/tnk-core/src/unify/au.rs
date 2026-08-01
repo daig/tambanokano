@@ -1,6 +1,5 @@
-//! Associative / associative-with-identity unification — Maude's
-//! `AU_UnificationSubproblem2`. The DAG-facing bridge abstracts ordered AU arguments into a pure
-//! [`WordSystem`], then materializes each word solution without changing its enumeration order.
+//! Associative and associative-with-identity unification. The DAG bridge abstracts ordered AU
+//! arguments into a [`WordSystem`] and materializes each solution without changing enumeration order.
 
 use super::word::{INCOMPLETE, SUCCESS, Word, WordSystem};
 use super::{
@@ -421,8 +420,7 @@ fn identity_top_symbol(e: &Engine, symbol: SymbolId) -> Option<SymbolId> {
     })
 }
 
-/// `BinarySymbol::hasUnequal{Left,Right}IdentityCollapse`: whether collapsing the identity on the
-/// selected side can change the other argument's sort.
+/// Whether collapsing the identity on the selected side can change the other argument's sort.
 fn unequal_identity_collapse(e: &Engine, symbol: SymbolId, identity_on_left: bool) -> bool {
     super::unequal_identity_collapse(e, symbol, identity_on_left).is_some()
 }

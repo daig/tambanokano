@@ -1,6 +1,4 @@
-*** Phase-0 conformance fixture: the same Peano theory the tnk-core kernel builds in Rust.
-*** Run with the reference C++ Maude and compare canonical forms (and rewrite counts):
-***   ~/Downloads/Maude-3/maude -no-banner conformance/peano.maude < /dev/null
+*** Peano natural-number theory: canonical forms and rewrite counts.
 fmod PEANO is
   sort Nat .
   op 0 : -> Nat [ctor] .

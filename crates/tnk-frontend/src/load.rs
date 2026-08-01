@@ -1,12 +1,8 @@
-//! Loading: drive a whole `.maude` source end-to-end. Surface-parse it, then for each module build the
-//! signature ([`build_module`]), the mixfix grammar ([`build_grammar`]), and add its parsed statements;
-//! commands are run against the module they follow (Maude's current module). The B4.4c entry point and
-//! the basis for the B5 REPL.
-//!
-//! Scope: unconditional and conditional `eq`/`mb` (`ceq`/`cmb`/condition fragments/`owise`, B4.5c) and
-//! the `reduce` (B4.4c) and `match`/`xmatch` (B4.5d, via [`match_command`]) commands. The `match`
-//! command drives the kernel's public multi-solution stream (`Engine::match_solutions`). Still open in
-//! B4.5: `__` juxtaposition (B4.5e, blocks `au`) and the whole-prelude differential test.
+//! End-to-end loading of module text. The surface parser records declarations and raw term bubbles;
+//! each module then builds its signature, per-module mixfix grammar, identities, statements, rules,
+//! memberships, and strategies. Command helpers parse against a selected loaded module and open the
+//! corresponding reduce, rewrite, search, match, strategy, SMT, variant, or narrowing operation.
+//! Session state and presentation remain in `tnk-session`.
 
 use crate::build_term::{VarIndex, build_dag, build_logic_dag, build_term};
 use crate::cfparser::compile::CompiledGrammar;
@@ -45,7 +41,7 @@ pub struct LoadedModule {
     /// Imported strategy-definition home grammars, with semantic actions remapped to `built`. A strategy
     /// definition carrying a distinct `home` is executable only when this map contains that home.
     pub strategy_grammars: HashMap<String, CompiledGrammar>,
-    /// Maude's module-wide `validForSMT_Rewriting` result.
+    /// Cached module-wide SMT-rewrite eligibility.
     pub smt_rewrite_valid: bool,
 }
 
@@ -59,8 +55,7 @@ pub enum StatementTraceRef {
 }
 
 impl LoadedModule {
-    /// Recompute Maude's module-wide SMT-rewrite eligibility after callers install statements
-    /// directly into the built engine (the reflected-module path does this post-build).
+    /// Recompute SMT-rewrite eligibility after callers install statements directly into the engine.
     pub fn refresh_smt_rewrite_valid(&mut self, pm: &PreModule) {
         self.smt_rewrite_valid =
             self.built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
@@ -81,10 +76,10 @@ pub struct Loaded {
     pub commands: Vec<(usize, Command)>,
 }
 
-/// Build one `PreModule` into a runnable [`LoadedModule`]: signature ([`build_module`]) + mixfix grammar
-/// ([`build_grammar`]) + its statements ([`load_statements`]). The module system (`tnk-modules`) calls
-/// this on a *flattened* `PreModule` (the import closure merged into one), so imports need no kernel
-/// change — flattening is a pure `PreModule → PreModule` transform upstream of here.
+/// Build one `PreModule` into a runnable [`LoadedModule`]: signature ([`build_module`]), mixfix grammar
+/// ([`build_grammar`]), and statements (`load_statements`). The module system (`tnk-modules`) supplies a
+/// flattened `PreModule` whose import closure has already been merged, so kernel loading remains
+/// import-independent.
 pub fn build_loaded_module(
     pm: &PreModule,
     interner: &mut Interner,
@@ -104,12 +99,10 @@ pub fn build_loaded_module(
     })
 }
 
-/// Build a flattened `PreModule` into a [`LoadedModule`] with the **D1a import-reparse point-fix**: each
-/// statement whose flattened-grammar parse is ambiguous is re-parsed against its home module's own grammar
-/// (see [`load_statements_homed`]). `homes` (parallel to `pm.statements`, from
-/// `tnk_modules::flatten::flatten_with_homes`) tags each statement's origin module; `home_mod` resolves a
-/// home name to an already-built [`LoadedModule`] (the loader's / REPL's module cache). Signature-identical
-/// to [`build_loaded_module`] up to those two extra inputs; the module system routes flattened modules here.
+/// Build a flattened `PreModule` with per-import statement reparsing. A statement whose flattened grammar
+/// is ambiguous is reparsed against its home module's grammar; see [`load_statements_homed`]. `homes`,
+/// parallel to `pm.statements`, identifies each statement's home, and `home_mod` resolves an already-built
+/// home module from the loader or REPL cache. The module system routes flattened modules through this entry.
 pub fn build_loaded_module_homed<'m>(
     pm: &PreModule,
     homes: &[Option<String>],
@@ -119,9 +112,9 @@ pub fn build_loaded_module_homed<'m>(
     build_loaded_module_homed_traced(pm, homes, home_mod, interner).map(|(loaded, _)| loaded)
 }
 
-/// The homed build plus a source-aligned map to the dense executable trace vectors. Reflection needs
-/// this map because Maude drops an individually rejected statement while keeping the surrounding module;
-/// indexing the dense vectors by source position would then shift every following axiom.
+/// The homed build plus a source-aligned map to dense executable trace vectors. Rejected and non-executable
+/// statements occupy `None` slots so later axioms retain their source positions even though trace vectors
+/// contain only registered statements.
 pub fn build_loaded_module_homed_traced<'m>(
     pm: &PreModule,
     homes: &[Option<String>],
@@ -192,19 +185,15 @@ fn install_identities(
     Ok(())
 }
 
-/// Produce a copy of `home`'s compiled grammar whose semantic **actions** resolve symbols and sorts in
-/// `flat`'s tables instead of `home`'s — so a bubble parsed against the home module's (unambiguous) grammar
-/// builds a kernel term over the *flattened* module's symbols (the D1a point-fix seam). The grammar's
-/// structure (nonterminals/terminals/precedence) is `home`'s, so it disambiguates exactly as the home
-/// module does; only the resolved [`SymbolId`]/[`SortId`] each action carries is re-pointed.
+/// Clone `home`'s compiled grammar and remap its semantic **actions** to symbols and sorts in `flat`.
+/// Parsing still uses the home grammar's nonterminals, terminals, and precedence, while term construction
+/// targets the flattened module.
 ///
-/// Matching is by intrinsic identity: an operator by `(name, domain kinds, range kind)` — the same key
-/// `build_module` uses, and invariant across a symbol's subsort-overloaded declarations — with kinds
-/// translated home→flat through any shared declared sort name; a sort by name (an error/kind sort by its
-/// kind). Because a plain import copies every home sort/operator into the flattened module under the same
-/// name and profile, every action resolves. Returns `None` if any action references a home symbol/sort with
-/// no flattened counterpart (e.g. a renamed donation reached here) — the caller then keeps the flattened
-/// grammar, i.e. the pre-fix behavior; never a *wrong* symbol.
+/// Operators match by `(name, domain kinds, range kind)`, the same intrinsic key used by `build_module`.
+/// Kinds map from home to flat through a shared declared sort name; declared sorts map by name, while
+/// error sorts map by kind. A plain import supplies every matching sort and operator profile. Returns
+/// `None` if an action cannot resolve to a flattened symbol or sort, such as after a renamed donation;
+/// callers then retain the flattened grammar rather than attaching an incorrect action.
 pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<CompiledGrammar> {
     let hsorts = home.built.engine.sorts();
     let fsorts = flat.engine.sorts();
@@ -327,9 +316,9 @@ fn statement_line(statement: &Statement) -> Option<u32> {
     .map(|token| token.line)
 }
 
-/// Parse + build + add each of the module's statement bubbles to the engine, all against the flattened
-/// module's own grammar `g`. The import-free / meta / REPL-legacy entry (no home information); the module
-/// system's [`build_loaded_module_homed`] adds the D1a per-statement home grammars on top.
+/// Parse, build, and add each statement bubble using the flattened module's grammar `g`. This direct
+/// entry has no statement-home information; [`build_loaded_module_homed`] adds per-statement home
+/// grammars.
 fn load_statements(
     pm: &PreModule,
     m: &mut BuiltModule,
@@ -354,9 +343,8 @@ pub fn load_statements_homed<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     i: &Interner,
 ) -> Result<(Vec<Option<StatementTraceRef>>, Vec<Diagnostic>), String> {
-    // Object-pattern completion context (Pillar 2.5-E): resolved once for an `omod`'s flattened module
-    // (the CONFIGURATION object constructor / AttributeSet symbol / class sorts). `None` for a non-object
-    // module, or one with no object constructor in scope — completion then never runs.
+    // Resolve object-pattern completion context once for a flattened object module: its CONFIGURATION
+    // object constructor, AttributeSet operator, and class sorts. No context means no completion.
     let oo = pm.is_object.then(|| m.engine.oo_info()).flatten();
     // Cache home-module grammars remapped onto this flattened module's symbols. Imported statements use
     // these first; `None` means the home is unavailable or cannot be remapped, so the flat grammar is used.
@@ -442,9 +430,9 @@ pub fn load_statements_homed<'m>(
     Ok((trace_refs, diagnostics))
 }
 
-/// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover the
-/// original variable slots for source-form rendering. Maude prints `[narrowing]` rules from normalized
-/// `Term`s in `show path`, so AC/ACU arguments there follow canonical order rather than parser order.
+/// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover its
+/// pre-normalization variable slots for source-form rendering. `[narrowing]` rules in `show path` use
+/// normalized `Term`s, so AC and ACU arguments follow canonical rather than parser order.
 fn normalize_trace_term(m: &mut BuiltModule, i: &Interner, vars: &VarIndex, term: &Term) -> Term {
     let bindings: Vec<_> = (0..vars.count())
         .map(|slot| {
@@ -454,7 +442,7 @@ fn normalize_trace_term(m: &mut BuiltModule, i: &Interner, vars: &VarIndex, term
                 .get(base)
                 .expect("statement variable name was interned by the lexer")
                 .index();
-            m.engine.make_var(vars.sort(slot), name, slot as u32)
+            m.engine.make_var(vars.sort(slot), name, slot)
         })
         .collect();
     let dag = m.engine.instantiate_bindings(term, &bindings);
@@ -626,11 +614,10 @@ fn restore_echo_variable_positions(m: &BuiltModule, source: &Term, normalized: T
 }
 
 /// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
-/// the D1a home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
+/// the home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
 /// unambiguous home grammar, so the flattened-grammar kind-homogeneity trick is neither needed nor valid —
 /// its `Nt::Comp(kind, …)` start would name a *flattened* kind absent from the home grammar). Registers
 /// nothing before the last fallible parse, so a returned `Err` leaves `m` unchanged (safe to retry).
-
 fn load_one_stmt(
     stmt: &Statement,
     m: &mut BuiltModule,
@@ -731,7 +718,7 @@ fn load_one_stmt(
                 "equation id is the dense eq_traces index"
             );
             m.eq_traces.push(trace);
-            return Ok(true);
+            Ok(true)
         }
         Statement::Mb {
             lhs,
@@ -804,7 +791,7 @@ fn load_one_stmt(
                 "membership id is the dense mb_traces index"
             );
             m.mb_traces.push(trace);
-            return Ok(true);
+            Ok(true)
         }
         Statement::Rule {
             label,
@@ -814,8 +801,8 @@ fn load_one_stmt(
             nonexec,
             narrowing,
         } => {
-            // Same build order as an equation (lhs → condition → rhs, sharing one variable index;
-            // matches Maude's `equation.cc` numbering); registered in the kernel's separate rule table.
+            // Rules use the same lhs → condition → rhs build order and shared variable index as
+            // equations, then register in the kernel's separate rule table.
             let mut vars = VarIndex::new();
             let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
@@ -866,7 +853,7 @@ fn load_one_stmt(
             } else {
                 Vec::new()
             };
-            // Maude rejects conditions on `[narrowing]` rules.
+            // A `[narrowing]` rule cannot carry a condition.
             if *narrowing && !condition.is_empty() {
                 return Err("a narrowing rule cannot have a condition".to_string());
             }
@@ -928,7 +915,7 @@ fn load_one_stmt(
                 "rule id is the dense rl_traces index"
             );
             m.rl_traces.push(trace);
-            return Ok(true);
+            Ok(true)
         }
     }
 }
@@ -1092,13 +1079,10 @@ pub enum StmtTrace {
     Rl(RlTrace),
 }
 
-/// Parse a statement's raw bubbles into its [`StmtTrace`] against an already-built module's grammar and
-/// signature, **without** registering it in the engine and **without** object-pattern completion. This is
-/// how META up-translation reflects a module's own `[nonexec]` axioms: [`load_statements`] skips them (a
-/// proof obligation is applied by neither reduction nor completion, so it carries no engine trace), yet
-/// `upEqs`/`upMbs`/`upRls`/`upModule` must still emit them. Mirrors the per-statement parse in
-/// [`load_statements`] (lhs → condition → rhs, sharing one variable index); the returned trace carries the
-/// statement's `nonexec`/`owise`/`label` for the up-translated `AttrSet`.
+/// Parse a statement's raw bubbles into a [`StmtTrace`] against an already-built module's grammar and
+/// signature without registering it or completing object patterns. This exposes `[nonexec]` statements
+/// to reflective rendering even though engine loading skips them. The left side, condition, and right
+/// side share one variable index; the trace retains `nonexec`, `owise`, and `label`.
 pub fn parse_statement_trace(
     stmt: &Statement,
     m: &BuiltModule,
@@ -1201,7 +1185,7 @@ enum Connective {
     Eq,
     /// `term : sort` (sort test).
     Sort,
-    /// `lhs => pattern` (rewrite condition — rules only, Pillar A-v).
+    /// `lhs => pattern` (rewrite condition, legal only in rules).
     Rewrite,
 }
 
@@ -1220,9 +1204,7 @@ pub(crate) fn parse_condition(
     let mut frags = Vec::new();
     for ftoks in split_on_text(bubble, "/\\", i) {
         let Some((left, conn, right)) = split_connective(ftoks, i) else {
-            // A bare boolean fragment `b` abbreviates `b = true` (Maude's abbreviated condition). The
-            // `true` anchor (SystemTrue) is present whenever BOOL is in scope — which it must be for a
-            // boolean-valued condition to typecheck.
+            // A bare boolean fragment `b` abbreviates `b = true`. BOOL supplies the required true anchor.
             let lhs = parse_build(ftoks, g, m, i, vars)?;
             let true_sym = m
                 .true_sym
@@ -1256,8 +1238,8 @@ pub(crate) fn parse_condition(
                 rhs: parse_build(right, g, m, i, vars)?,
             },
             Connective::Rewrite => {
-                // `lhs => pattern`: build the source (its variables already bound), then the target
-                // pattern — whose variables not yet bound are fresh (the `=>*` search binds them).
+                // `lhs => pattern`: build the left term using existing bindings, then build the target
+                // pattern, whose previously unbound variables become fresh binders for the search.
                 let lhs = parse_build(left, g, m, i, vars)?;
                 let pattern = parse_build(right, g, m, i, vars)?;
                 let mut pat_vars = Vec::new();
@@ -1303,9 +1285,8 @@ fn split_on_text<'a>(toks: &'a [Token], sep: &str, i: &Interner) -> Vec<&'a [Tok
     parts
 }
 
-/// Find a fragment's connective token (`:=` / `=` / `:` / `=>`) at paren-depth 0 and split around it.
-/// `None` if the fragment has no connective — a **bare boolean** condition `b`, which the caller
-/// desugars to `b = true` (Maude's abbreviated condition, e.g. `ceq X < Z = true if X < Y /\ Y < Z`).
+/// Split a top-level condition connective (`:=`, `=`, `:`, or `=>`). A fragment with no connective is
+/// a bare boolean condition and is desugared to `b = true`.
 fn split_connective<'a>(
     toks: &'a [Token],
     i: &Interner,
@@ -1344,9 +1325,8 @@ fn stmt_is_nonexec(s: &Statement) -> bool {
     }
 }
 
-/// Reject a rewrite (`=>`) fragment in a non-rule condition — `=>` conditions are legal only in rules
-/// (`crl`), never in an `ceq`/`cmb` (Pillar A-v). The clean user-facing guard ahead of the kernel's
-/// defensive `compile_condition` assert.
+/// Reject a rewrite (`=>`) fragment in a non-rule condition. Rewrite conditions are valid only in `crl`;
+/// this guard returns a stable error before the kernel's defensive assertion.
 fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Result<(), String> {
     if condition
         .iter()
@@ -1359,12 +1339,9 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
     Ok(())
 }
 
-/// Collect a term's distinct variable indices, in first-seen order.
-/// Whether every variable a statement *instantiates* is bound by the time it is needed: rhs and each
-/// condition fragment's evaluated side may use only lhs variables plus the fresh binders of *earlier*
-/// `:=`/`=>` fragments (Maude's "used before it is bound" check). A violating statement is degraded to
-/// non-executable — parsed but never registered — instead of panicking at `instantiate` (A1c);
-/// the caller retains the rejection cause as an owned dropped-statement diagnostic.
+/// Check that every variable is bound before use. A right side and each evaluated condition side may
+/// use left-side variables plus fresh binders from earlier `:=` or `=>` fragments. Violations make the
+/// statement non-executable and retain a dropped-statement diagnostic.
 fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option<&Term>) -> bool {
     let mut bound = Vec::new();
     term_var_indices(lhs, &mut bound);
@@ -1432,12 +1409,8 @@ fn parse_forest(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<P
     Ok(parsed.tree)
 }
 
-/// Parse a **command** term bubble, warn-and-pick on ambiguity: Maude warns and takes
-/// its first parse — our extraction is the same `extractFirstSubparse` walk (first split in
-/// chart/completion order, pass2.cc), so the picked tree is used; the warning text is deferred
-/// diagnostics (phase E). Statement bubbles keep the strict [`parse_forest`]: their ambiguity today
-/// is dominated by the import-reparse artifact (D1a), where a noisy error is the safer behavior
-/// until the home-grammar fix lands.
+/// Parse a command term and choose the first chart/completion parse on ambiguity. Statement bubbles use
+/// strict [`parse_forest`] and reject ambiguity.
 fn parse_forest_pick(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
     Ok(parse_forest_any(tokens, g, i)?.tree)
 }
@@ -1492,10 +1465,9 @@ fn parse_forest_any_with_effort(
     })
 }
 
-/// Maude accepts an omitted third argument in object syntax (`< O : C | >`) as the empty
-/// `AttributeSet`. The mixfix grammar still sees `<_:_|_>` as an ordinary three-hole operator, so
-/// materialize its identity token before parsing. The borrowed common path keeps non-object terms free
-/// of token copies.
+/// Object syntax permits an omitted third argument (`< O : C | >`), denoting the empty `AttributeSet`.
+/// The mixfix grammar treats `<_:_|_>` as an ordinary three-hole operator, so this function materializes
+/// the identity token before parsing. The common non-object path remains borrowed and allocates no token copy.
 fn fill_empty_object_attributes<'a>(
     tokens: &'a [Token],
     m: &BuiltModule,
@@ -1590,11 +1562,10 @@ fn term_kind(t: &Term, m: &BuiltModule) -> Option<KindId> {
     t.top_symbol().map(|s| m.engine.symbol_kind(s))
 }
 
-/// Parse + build the rhs of an equation/rule **kind-homogeneously** with its lhs: an equation's two sides
-/// share one kind, so a bare overloaded constant (`none` — declared at a dozen sorts across META-MODULE)
-/// is disambiguated by the lhs's kind, exactly as Maude parses `eq … = none .`. The rhs is parsed at the
-/// lhs kind's term nonterminal; if that yields no parse (a malformed/cross-kind rhs), we fall back to the
-/// unconstrained universal start so the original error surfaces.
+/// Parse and build an equation or rule right side in the left side's kind. This disambiguates a bare
+/// overloaded constant such as `none`. If the kind-specific nonterminal yields no parse for a malformed
+/// or cross-kind right side, retry from the universal start symbol so the underlying parse or build error
+/// is reported.
 fn parse_build_rhs(
     rhs: &[Token],
     lhs: &Term,
@@ -1654,11 +1625,9 @@ fn resolve_sort(tokens: &[Token], m: &BuiltModule, i: &Interner) -> Result<SortI
         .ok_or_else(|| format!("unknown sort `{name}`"))
 }
 
-/// The Maude-faithful command echo for `reduce in M : <term> .`: the parsed term, theory-normalized and
-/// pretty-printed exactly as the reference binary prints it. Float, rational, and negative special
-/// constants collapse to canonical surface forms (`1.0e+2`, `2/4`, `-3`), redundant parentheses drop, and
-/// AC arguments appear in kernel canonical order. Reuses the command's parsed tree, builds the
-/// pre-reduction DAG, and renders it.
+/// Canonical command echo for `reduce in M : <term> .`: theory-normalized and pretty-printed from
+/// the parsed command term. Special constants use canonical surface forms, redundant parentheses
+/// drop, and AC arguments follow kernel order.
 pub fn command_echo(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1693,14 +1662,10 @@ pub fn reduce_command(
     i: &Interner,
     term: &ParsedCommandTerm<'_>,
 ) -> Result<(DagId, u64), String> {
-    // Reset BEFORE building so this command's count starts clean. Construction itself does no rewrites
-    // (C1: membership axioms now apply lazily at the reduce normal-form point, not at construction); the
-    // `reduce` below is where every equation and membership application is counted (Maude's accounting).
+    // Construction is uncounted; equations and memberships contribute during reduction. Build within a
+    // deduplication window so repeated source subterms share one normalized DAG node. Close the window
+    // before reduction, including on construction failure.
     lm.built.engine.reset_rewrites();
-    // C7: build the subject inside a structural-dedup window so a repeated subterm (`< g(a), g(a) >`)
-    // becomes one shared node — `reduce` then normalizes it once, matching Maude's hash-consed subject
-    // DAG. The window must close before `reduce` (it spans only construction); end it even on a build
-    // error, then propagate, so a failed parse never leaks an open window into the next command.
     lm.built.engine.begin_dedup();
     let dag = build_subject_dag(lm, term.tree(), term.tokens(), i);
     lm.built.engine.end_dedup();
@@ -1725,9 +1690,9 @@ pub fn build_command_dag(
     dag
 }
 
-/// Parse a command-shaped term into the first one or two concrete parses needed by META-LEVEL's
-/// `metaParse`. Each tuple contains the source-order [`Term`] used for up-translation, its variable names,
-/// and the canonical symbolic DAG used to compute the least sort.
+/// Parse a command-shaped term into the first one or two concrete parses required by `metaParse`. Each
+/// tuple contains the source-order [`Term`] used for reflective encoding, its variable names, and the
+/// canonical symbolic DAG used to compute the least sort.
 pub fn build_logic_command_parses(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1792,14 +1757,9 @@ pub fn build_logic_command_dag(
     dag
 }
 
-/// Build a command's subject DAG from its parse tree, handling BOTH ground terms (the [`build_dag`] fast
-/// path — compact literals/numerals) and **open** terms with variables. Maude reduces open terms (a
-/// variable is inert under reduction — `red X:A .`, `red g(X, a) .`, `red N + 1 .`);
-/// tnk's kernel DAG has no variable node, so each distinct variable is realized as a fresh nullary
-/// constant of its declared sort, named for the variable's print form — a declared var prints bare (`N`),
-/// an on-the-fly var with its sort (`X:A`), because that is the variable's source token. The [`VarIndex`]
-/// dedups by name, so a repeated variable shares one constant (`g(X, X)` stays linked). The atom is
-/// irreducible (no equation names it), so reduction is a no-op on it, exactly like Maude's inert variable.
+/// Build a command subject, using the fast ground-DAG path when possible. For an open term, realize each
+/// distinct variable as an inert nullary constant of its declared sort and source print name. Repeated
+/// occurrences share one constant.
 fn build_subject_dag(
     lm: &mut LoadedModule,
     tree: &PTree,
@@ -1825,10 +1785,8 @@ fn build_subject_dag(
                 .built
                 .engine
                 .add_op(vars.name(idx).to_string(), vec![], vars.sort(idx));
-            // Class the atom as a variable: `.=.`'s stability/groundness analysis must see Maude's
-            // VariableSymbol (never stable, never ground), and comm/AC canonical ordering must
-            // compare same-sort variables by name-token code (the variable's source token is
-            // guaranteed interned — it was lexed), not by symbol creation order.
+            // Mark the atom as a variable for stability and groundness analysis. Same-sort canonical
+            // order uses the interned source-name rank rather than symbol creation order.
             let rank = i.get(vars.name(idx)).map(|s| s.index()).unwrap_or(u32::MAX);
             lm.built
                 .engine
@@ -1846,9 +1804,8 @@ fn tree_has_var(tree: &PTree, g: &CompiledGrammar) -> bool {
         || tree.nt_children.iter().any(|c| tree_has_var(c, g))
 }
 
-/// The token index where a failed command/term parse got stuck — the furthest token a valid partial
-/// parse consumed (Maude's `badTokenIndex`). `metaParse` reports this as `noParse(n)` (B4);
-/// parsed at the universal `Term` start, matching [`build_command_dag`].
+/// Furthest token consumed by a valid partial command parse. `metaParse` reports this index through
+/// `noParse(n)`.
 pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -> usize {
     let mut effort = ParseEffort::default();
     match earley::parse(&lm.grammar, term, Nt::Term, i, &mut effort) {
@@ -1857,8 +1814,8 @@ pub fn command_parse_furthest(lm: &LoadedModule, i: &Interner, term: &[Token]) -
     }
 }
 
-/// Begin a `rewrite` (rule-fair) session over `term` (Pillar A). The caller drives the returned
-/// [`Rewriting`] with [`Rewriting::run`] and stores it for `continue`.
+/// Begin a rule-fair `rewrite` session over `term`. The caller drives the returned [`Rewriting`] and
+/// stores it for `continue`.
 pub fn rewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1868,8 +1825,8 @@ pub fn rewrite_command(
     Ok(lm.built.engine.rewrite(dag))
 }
 
-/// Begin a `frewrite` (position-fair) session over `term` (Pillar A-ii); `gas` rule applications per
-/// position per pass.
+/// Begin a position-fair `frewrite` session over `term`, with `gas` rule applications per position
+/// per pass.
 pub fn frewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1880,8 +1837,8 @@ pub fn frewrite_command(
     Ok(lm.built.engine.frewrite(dag, gas))
 }
 
-/// Begin an `erewrite` (object-message-fair) session over `term` (Pillar 2.5-B); `gas` is the
-/// per-position gas for the non-config fallback (default 1).
+/// Begin an object-message-fair `erewrite` session over `term`; `gas` controls the non-configuration
+/// position-fair fallback.
 pub fn erewrite_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -1892,10 +1849,9 @@ pub fn erewrite_command(
     Ok(lm.built.engine.erewrite(dag, gas))
 }
 
-/// Begin a `search` (Pillar A-iv): build the subject DAG + the goal pattern (a [`Term`], its variable
-/// names tracked for rendering) + the optional `such that` condition over the goal's variables, then
-/// open the [`Search`] for `arrow` up to `max_depth`. Returns the session and the goal's [`VarIndex`]
-/// (for the `Var:Sort --> value` solution lines).
+/// Begin a `search`: build the subject DAG, goal pattern, goal-variable table, and optional `such that`
+/// condition, then open a [`Search`] for `arrow` up to `max_depth`. Returns the session and variables
+/// needed to render bindings.
 #[allow(clippy::too_many_arguments)]
 pub fn search_command(
     lm: &mut LoadedModule,
@@ -1977,7 +1933,7 @@ pub fn smt_search_command(
     let mut subject_variables = VarIndex::new();
     let mut goal_variables = VarIndex::new();
     let goal = build_term(
-        &pattern_tree,
+        pattern_tree,
         &lm.grammar,
         &lm.built,
         pattern.tokens(),
@@ -2196,8 +2152,8 @@ pub fn narrow_command(
     lm.built.engine.end_dedup();
     let mut subject_dag = subject_dag?;
     let mut goal_dag = goal_dag?;
-    // Maude indexes command variables by walking each canonical DAG, not by source-token order.
-    // This is visible in substitutions whenever an AC(U) operator reorders the input.
+    // Command variable slots follow canonical DAG traversal rather than token order. AC and ACU
+    // canonicalization can therefore reorder substitution keys.
     let mut variable_order = tnk_core::variant::variables_in_dag(&lm.built.engine, subject_dag);
     for slot in tnk_core::variant::variables_in_dag(&lm.built.engine, goal_dag) {
         if !variable_order.contains(&slot) {
@@ -2226,10 +2182,7 @@ pub fn narrow_command(
         .unwrap_or(subject_dag);
     goal_dag = tnk_core::unify::instantiate(&mut lm.built.engine, &remapping, goal_dag)
         .unwrap_or(goal_dag);
-    specs = variable_order
-        .iter()
-        .map(|&old| specs[old].clone())
-        .collect();
+    specs = variable_order.iter().map(|&old| specs[old]).collect();
     variables.reorder(&variable_order);
     let echo_variables: Vec<_> = (0..variables.count())
         .map(|slot| {
@@ -2512,10 +2465,7 @@ fn canonicalize_narrow_command_dag(
         .map(|(old, spec)| Some(engine.make_var(spec.sort, spec.name, new_slot[old])))
         .collect();
     let dag = tnk_core::unify::instantiate(engine, &remapping, dag).unwrap_or(dag);
-    let specs = variable_order
-        .iter()
-        .map(|&old| specs[old].clone())
-        .collect();
+    let specs = variable_order.iter().map(|&old| specs[old]).collect();
     variables.reorder(&variable_order);
     Ok((dag, specs))
 }
@@ -2532,17 +2482,12 @@ struct RawSolution {
     portion: Option<MatchedPortion>,
 }
 
-/// Parse + build + enumerate the solutions of a `match`/`xmatch` command. Returns one rendered block
-/// per solution (each the `Var --> value` lines, prefixed for `xmatch` by `Matched portion = …`), in
-/// the kernel matcher's enumeration order; [`format_matchers`] wraps them into Maude's `Matcher N`
-/// display. The blocks are the unit the conformance harness compares against the reference binary —
-/// **as a set**, since exact ACU/AU solution *order* (Maude's Diophantine order) is a deferred B1
-/// follow-up; every solution and its bindings are reproduced, only the order may differ.
+/// Parse, build, and enumerate a `match`/`xmatch` command. Returns one rendered block per solution in
+/// the kernel matcher's enumeration order; [`format_matchers`] adds the `Matcher N` framing. `xmatch`
+/// blocks may begin with `Matched portion = …`; both forms then list `Var --> value` bindings.
 ///
-/// The pattern is built as a kernel [`Term`] (tracking variable names for display); the subject is
-/// built as a ground DAG and reduced to normal form, matching Maude's behaviour (and a no-op on the
-/// already-normal conformance subjects). `xmatch` enables extension matching (a sub-part of the
-/// subject, leaving a residue); plain `match` requires the whole subject to be consumed.
+/// The pattern is a kernel [`Term`]; the subject is built as a ground DAG and normalized. `xmatch`
+/// permits a sub-part match with residue, while `match` requires the whole subject.
 pub fn match_command(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -2555,7 +2500,7 @@ pub fn match_command(
     let nr = vars.count();
 
     let subj_tree = parse_forest_pick(subject, &lm.grammar, i)?;
-    // C7: dedup the subject's repeated subterms into shared nodes before reducing (see `reduce_command`).
+    // Preserve source-level DAG sharing before reduction.
     lm.built.engine.begin_dedup();
     let subj = build_dag(
         &subj_tree,
@@ -2596,9 +2541,8 @@ pub fn match_command(
         .collect())
 }
 
-/// Render one solution's body: the `Matched portion = …` line (for `xmatch`) followed by the
-/// substitution — either `Var --> value` lines (variable order = first occurrence in the pattern,
-/// Maude's index order) or `empty substitution` when the pattern is ground.
+/// Render the optional matched-portion line and substitution. Bindings follow first occurrence in the
+/// pattern; a ground pattern prints `empty substitution`.
 fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarIndex) -> String {
     let mut lines: Vec<String> = Vec::new();
     match sol.portion {
@@ -2625,9 +2569,8 @@ fn render_solution(m: &BuiltModule, i: &Interner, sol: &RawSolution, vars: &VarI
     lines.join("\n")
 }
 
-/// Wrap rendered solution blocks into Maude's `match`/`xmatch` display: `No match.` when empty, else
-/// each block under a `Matcher N` header, blocks separated by a blank line. (The B5 REPL renderer; the
-/// header/`Decision time` framing around it is the command layer's.)
+/// Wrap rendered `match`/`xmatch` solution blocks: `No match.` when empty, otherwise `Matcher N`
+/// sections separated by blank lines.
 pub fn format_matchers(blocks: &[String]) -> String {
     if blocks.is_empty() {
         return "No match.".to_string();
@@ -2640,10 +2583,8 @@ pub fn format_matchers(blocks: &[String]) -> String {
         .join("\n\n")
 }
 
-/// A [`NameCodes`](tnk_core::unify::NameCodes) source over the session interner: fresh-variable
-/// names (`#1`, `#2`, …) are interned into the same code space as user variable names, so the
-/// kernel's variable ordering (`dag_compare` on name codes) matches Maude's token-code order. `pub`
-/// so the REPL can build one for its own `find_next` loop after `unify_command` returns.
+/// A [`NameCodes`](tnk_core::unify::NameCodes) source backed by the session interner. Fresh and user
+/// variable names share one code space, which supplies canonical variable ordering.
 pub struct InternerNames<'a>(pub &'a mut Interner);
 impl tnk_core::unify::NameCodes for InternerNames<'_> {
     fn code(&mut self, name: &str) -> u32 {
@@ -2651,10 +2592,8 @@ impl tnk_core::unify::NameCodes for InternerNames<'_> {
     }
 }
 
-/// Relative token-name ranks established by Maude 3.5.1's standing prelude before a user module is
-/// parsed. VariableTerm comparison uses these global token codes, so a self-contained module still
-/// normalizes conventional one-letter variables in this order (direct oracle: an AC sum of A..Z).
-/// Names outside the standing set retain this session's interner order after the reserved prefix.
+/// Reserved relative ranks for conventional standing variable names. Other names retain session
+/// interner order after the reserved range.
 pub fn maude_variable_name_rank(name: &str, fallback: u32) -> u32 {
     const STANDING: &[&str] = &[
         "E", "A", "B", "C", "I", "J", "N", "M", "K", "Z", "Q", "R", "X", "Y", "L", "S", "P", "D",
@@ -2665,8 +2604,8 @@ pub fn maude_variable_name_rank(name: &str, fallback: u32) -> u32 {
         .position(|&candidate| candidate == name)
         .map_or(0x100u32.saturating_add(fallback), |rank| rank as u32)
 }
-/// Maude resolves `X:Sort` to the existing declared variable `X` when both name and sort agree, and
-/// consequently drops the on-the-fly sort suffix in command echoes and substitution keys.
+/// Resolve `X:Sort` to the declared variable `X` when both name and sort match, omitting the on-the-fly
+/// sort suffix from command echoes and substitution keys.
 pub fn command_variable_display_name(
     grammar: &CompiledGrammar,
     i: &Interner,
@@ -2691,15 +2630,21 @@ pub fn command_variable_display_name(
 }
 
 /// The built pieces of a `unify` command: the pretty-printed echo body (`T1 =? T2 /\ …`, without
-/// the `unify in M :` frame or trailing ` .`), the original variables' print names (slot order),
-/// and the resumable [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
+/// the `unify in M :` frame or trailing ` .`), input variable print names in slot order, and the resumable
+/// [`UnifyProblem`](tnk_core::unify::problem::UnifyProblem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifyReadiness {
+    Ready,
+    UnsafeVariableName,
+    UnsupportedTheory,
+}
+
 pub struct UnifyCommand {
     pub echo: String,
     pub var_names: Vec<String>,
-    /// `false` if any unificand variable has a name that could collide with a fresh `#n`/`%n`/`@n`
-    /// variable (Maude's `variableNameConflict`) — the caller then emits only the (stripped)
-    /// "unsafe variable name" warning, like a screening failure.
-    pub names_ok: bool,
+    /// Whether enumeration can start. Unsafe fresh-family names and unsupported theories are
+    /// distinguished from a supported problem that has no unifier.
+    pub readiness: UnifyReadiness,
     pub problem: tnk_core::unify::problem::UnifyProblem,
     pub(crate) source_var_names: Vec<String>,
     pub(crate) equations: Vec<(DagId, DagId)>,
@@ -2717,9 +2662,8 @@ fn build_unify_echo_term(
     build_term(tree, &lm.grammar, &lm.built, tokens, i, vars)
 }
 
-/// Build a `unify` command: parse each pair with temporary source-order slots, theory-normalize every
-/// side, then use Maude's post-normalization variable order for the resumable order-sorted problem and
-/// displayed substitution keys.
+/// Build a `unify` command: parse each pair with temporary source-order slots, normalize every side
+/// by its theory, then use the resulting variable order for the resumable problem and displayed keys.
 pub fn unify_command(
     lm: &mut LoadedModule,
     i: &mut Interner,
@@ -2741,8 +2685,7 @@ pub fn unify_command(
         let lhs_tree = parse_forest_pick(side[0], &lm.grammar, i)?;
         // Establish source-order variable slots before the DAG constructor canonicalizes commutative args.
         let lhs_echo = build_unify_echo_term(&lhs_tree, lm, side[0], i, &mut vars)?;
-        // `Token::split` interns the base when Maude turns an on-the-fly `X:Sort` token into a
-        // VariableTerm. Do that before the DAG builder records the variable's name id.
+        // Intern each on-the-fly `X:Sort` base before the DAG builder records its name id.
         for idx in 0..vars.count() {
             let name = vars.name(idx);
             let base = name.split_once(':').map_or(name, |(base, _)| base);
@@ -2820,6 +2763,13 @@ pub fn unify_command(
         names: &mut names,
     };
     let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
+    let readiness = if !names_ok {
+        UnifyReadiness::UnsafeVariableName
+    } else if !problem.problem_okay() {
+        UnifyReadiness::UnsupportedTheory
+    } else {
+        UnifyReadiness::Ready
+    };
     let var_names = problem
         .original_variable_order()
         .iter()
@@ -2828,7 +2778,7 @@ pub fn unify_command(
     Ok(UnifyCommand {
         echo,
         var_names,
-        names_ok,
+        readiness,
         problem,
         source_var_names,
         equations: source_equations,
@@ -2837,8 +2787,7 @@ pub fn unify_command(
     })
 }
 
-/// Render one unifier's substitution (`name --> value` lines, or `empty substitution`), matching
-/// `UserLevelRewritingContext::printSubstitution`.
+/// Render one unifier's substitution as `name --> value` lines, or `empty substitution`.
 pub fn render_unifier(
     m: &BuiltModule,
     i: &Interner,
@@ -2935,9 +2884,8 @@ pub fn executable_variant_equations(m: &mut BuiltModule, i: &mut Interner) -> Ve
         .collect()
 }
 
-/// Build the target, irreducibility blockers, and executable `[variant]` equation set for `get
-/// variants`. The target's source slots are reordered only after theory canonicalization, matching
-/// Maude's `VariantSearch` constructor.
+/// Build a variant target, irreducibility blockers, and executable `[variant]` equations. Target slots
+/// are reordered only after theory canonicalization.
 pub fn variant_command(
     lm: &mut LoadedModule,
     i: &mut Interner,
@@ -3071,7 +3019,7 @@ pub fn variant_unify_command(
 
     let UnifyCommand {
         mut echo,
-        names_ok,
+        readiness,
         problem,
         source_var_names,
         equations,
@@ -3079,6 +3027,7 @@ pub fn variant_unify_command(
         mut vars,
         ..
     } = unify_command(lm, i, body)?;
+    let names_ok = readiness != UnifyReadiness::UnsafeVariableName;
     drop(problem);
     let pair_count = equations.len();
     if pair_count == 0 {
@@ -3408,12 +3357,9 @@ pub fn variant_match_command(
 mod tests {
     use super::*;
 
-    /// One expected command result, transcribed from the reference binary:
-    /// `~/Downloads/Maude-3/maude -no-banner conformance/<file>.maude < /dev/null`.
+    /// One expected command result for the fixture-result harness.
     enum Expect {
-        /// A `reduce`: `(result-sort, an expected-term in surface syntax, rewrite-count)`. The expected
-        /// term is reduced through the same pipeline and compared by `deep_equal`, so its surface form
-        /// just has to denote the same value (e.g. `- 3` for the binary's `-3`, `s s 0` for `s_^2(0)`).
+        /// A reduce expectation: result sort, equivalent surface term, and rewrite count.
         Reduce {
             sort: &'static str,
             term: &'static str,
@@ -3421,9 +3367,7 @@ mod tests {
         },
         /// A `match`/`xmatch`: the expected solution blocks (each the `Var --> value` lines, or for
         /// `xmatch` the `Matched portion = …` line + substitution), rendered by [`render_solution`].
-        /// Compared **as a set** (both sides sorted): the binary's exact ACU/AU solution *order* is
-        /// Maude's Diophantine order, a deferred B1 follow-up — we reproduce every solution and its
-        /// bindings, only the order may differ (CUI's two pairings happen to match order too).
+        /// Compared as a set because solution enumeration order is not part of this harness contract.
         Match(&'static [&'static str]),
     }
 
@@ -3449,10 +3393,9 @@ mod tests {
         },
     }
 
-    /// Load `src` and assert each command matches the reference binary: a `reduce`'s result sort, rewrite
-    /// count, and value (via reducing the expected term through the same pipeline); a `match`/`xmatch`'s
-    /// solution set (rendered blocks, sorted — see [`Expect::Match`]).
-    fn conform(src: &str, expected: &[Expect]) {
+    /// Load `src` and check each reduce result's sort, count, and value or each match result's complete
+    /// rendered solution set.
+    fn check_results(src: &str, expected: &[Expect]) {
         let mut loaded = load_source(src).expect("load source");
         let cmds: Vec<(usize, Cmd)> = loaded
             .commands
@@ -3470,7 +3413,7 @@ mod tests {
                         subject: subject.clone(),
                         xmatch: *xmatch,
                     },
-                    _ => panic!("this conformance harness covers only reduce/match"),
+                    _ => panic!("the fixture-result harness covers only reduce and match commands"),
                 };
                 (*m, cmd)
             })
@@ -3545,7 +3488,7 @@ mod tests {
         }
     }
 
-    macro_rules! conformance_file {
+    macro_rules! fixture_file {
         ($name:expr) => {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -3556,9 +3499,9 @@ mod tests {
     }
 
     #[test]
-    fn iter_conforms() {
-        conform(
-            conformance_file!("iter.maude"),
+    fn iter_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("iter.maude"),
             &[
                 e("Zero", "0", 0),
                 e("NzNat", "s 0", 0),
@@ -3641,7 +3584,7 @@ mod tests {
             assert_eq!(
                 command_echo(lm, &loaded.interner, &parsed, false).expect("iter command echo"),
                 echo,
-                "oracle print for `{input}`"
+                "expected print for `{input}`"
             );
             let (result, rewrites) =
                 reduce_command(lm, &loaded.interner, &parsed).expect("reduce overloaded iter");
@@ -3660,7 +3603,7 @@ mod tests {
     #[test]
     fn u03_million_iter_identities_load_and_commands_five_six_match() {
         let mut loaded =
-            load_source(conformance_file!("subsystems/U03-unification3.maude")).expect("load U03");
+            load_source(fixture_file!("subsystems/U03-unification3.maude")).expect("load U03");
         let targets: Vec<_> = loaded
             .commands
             .iter()
@@ -3688,7 +3631,7 @@ mod tests {
                 unify_command(&mut loaded.modules[module], &mut loaded.interner, &body)
                     .expect("build U03 unify");
             assert_eq!(command.echo, "X:Small =? f(g(Y:Big), Z:Small)");
-            assert!(command.names_ok && command.problem.problem_okay());
+            assert_eq!(command.readiness, UnifyReadiness::Ready);
 
             let mut solutions = Vec::new();
             {
@@ -3717,8 +3660,8 @@ mod tests {
     }
 
     #[test]
-    fn iter_comm_normalization_uses_standing_maude_name_order() {
-        let mut loaded = load_source(conformance_file!("subsystems/U-ch13-07-iter-comm.maude"))
+    fn iter_comm_normalization_uses_standing_variable_name_order() {
+        let mut loaded = load_source(fixture_file!("subsystems/U-ch13-07-iter-comm.maude"))
             .expect("load iter-comm fixture");
         let commands: Vec<_> = loaded
             .commands
@@ -3744,9 +3687,9 @@ mod tests {
     }
 
     #[test]
-    fn bool_conforms() {
-        conform(
-            conformance_file!("bool.maude"),
+    fn bool_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("bool.maude"),
             &[
                 e("Truth", "tt", 1),
                 e("Truth", "ff", 1),
@@ -3759,9 +3702,9 @@ mod tests {
     }
 
     #[test]
-    fn nat_conforms() {
-        conform(
-            conformance_file!("nat.maude"),
+    fn nat_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("nat.maude"),
             &[
                 e("NzNat", "5", 1),
                 e("NzNat", "4", 1),
@@ -3781,9 +3724,9 @@ mod tests {
     }
 
     #[test]
-    fn int_conforms() {
-        conform(
-            conformance_file!("int.maude"),
+    fn int_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("int.maude"),
             &[
                 e("NzInt", "- 3", 0),
                 e("NzNat", "3", 1),
@@ -3802,12 +3745,10 @@ mod tests {
         );
     }
 
-    // ---- B4.5a: broaden the differential harness to the currently-loadable conformance modules ----
-
     #[test]
-    fn peano_conforms() {
-        conform(
-            conformance_file!("peano.maude"),
+    fn peano_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("peano.maude"),
             &[
                 e("Nat", "s s s s 0", 3),
                 e("Nat", "s s s s s s s s s s s s 0", 21),
@@ -3816,9 +3757,9 @@ mod tests {
     }
 
     #[test]
-    fn strat_conforms() {
-        conform(
-            conformance_file!("strat.maude"),
+    fn strategy_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("strat.maude"),
             &[
                 e("Nat", "s s z", 1),
                 e("Nat", "z", 1),
@@ -3841,14 +3782,11 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C8 — AC matching with "alien" (non-ground non-variable) subterms. `eq s M + N = s
-    /// (M + N)` over a commutative `+` matches the alien `s M` recursively; Maude's greedy matcher binds
-    /// it to the canonically-smallest element, fixing the rewrite count deterministically. Was a panic
-    /// (acu.rs:64). Counts (2/3/3/4/4 and 8/13) are byte-identical to the reference binary.
+    /// AC matching recurses into compound alien subterms and uses deterministic greedy binding order.
     #[test]
-    fn correctness_ac_alien_conforms() {
-        conform(
-            conformance_file!("correctness-ac-alien.maude"),
+    fn ac_alien_matching_produces_expected_results() {
+        check_results(
+            fixture_file!("correctness-ac-alien.maude"),
             &[
                 e("Nat", "s s s z", 2),
                 e("Nat", "s s s s s z", 3),
@@ -3861,14 +3799,12 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C8 — AU (associative, not commutative) alien subterms + non-linear variables. An
-    /// alien `s M` under `__` matches one element recursively; a repeated var `X X` re-matches the same
-    /// run. Was a panic (au.rs). Counts byte-identical to the reference; the leftmost-alien / maximal-
-    /// collector order is Maude's greedy order (so reduce counts are deterministic).
+    /// AU matching recurses into alien subterms and rechecks nonlinear variables against the same run,
+    /// using leftmost maximal-collector order.
     #[test]
-    fn correctness_au_alien_conforms() {
-        conform(
-            conformance_file!("correctness-au-alien.maude"),
+    fn au_alien_matching_produces_expected_results() {
+        check_results(
+            fixture_file!("correctness-au-alien.maude"),
             &[
                 e("E", "a b c", 2),     // (s s a) b c — peel two successors off the head
                 e("E", "a b c", 1),     // a (s b) c   — interior successor untouched
@@ -3880,13 +3816,11 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C8 — a theory-rooted subterm under a FREE operator (the cross-theory `Sequence`
-    /// arm): `eq f(a X) = X` (AU arg) and `eq g(a ; X) = X` (AC arg). The free skeleton binds; the alien
-    /// subterm is matched recursively. Was a panic (theory.rs:65). Byte-identical to the reference.
+    /// Free skeletons recursively match theory-rooted children, including AU and AC arguments.
     #[test]
-    fn correctness_free_alien_conforms() {
-        conform(
-            conformance_file!("correctness-free-alien.maude"),
+    fn free_alien_matching_produces_expected_results() {
+        check_results(
+            fixture_file!("correctness-free-alien.maude"),
             &[
                 e("E", "b c", 1),      // f(a b c) — AU alien under free f
                 e("E", "f(b c)", 0),   // f(b c)   — no match (head is not a)
@@ -3897,16 +3831,14 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C8 — uniform cross-theory composition: a theory-rooted subterm under an `iter` (S)
-    /// or `comm` (CUI) operator now matches modulo its theory (`s (a + X)`, `(a + X) ; Y`), via the same
-    /// `enumerate_alien_solutions` seam as ACU/AU aliens and free-with-theory-children. Were panics.
+    /// Theory-rooted children compose uniformly beneath iterator and CUI operators.
     #[test]
-    fn correctness_cross_theory_conforms() {
-        conform(
-            conformance_file!("correctness-cross-theory.maude"),
+    fn cross_theory_matching_produces_expected_results() {
+        check_results(
+            fixture_file!("correctness-cross-theory.maude"),
             &[
                 e("Foo", "s (a + b)", 1), // membership lhs `s (a + X)` matches modulo AC under iter
-                e("E", "b", 1),           // eq reduces s(a+a) before the membership (C1 lazy)
+                e("E", "b", 1),           // equation reduces s(a+a) before membership
                 e("E", "s (b + b)", 0),   // no leading a
                 e("E", "b ; b", 1),       // AC term as a CUI argument
                 e("E", "(b + b) ; a", 0), // no leading a in either pairing
@@ -3914,15 +3846,12 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C5 — membership axioms whose lhs is a theory term, matched modulo the theory. Since
-    /// memberships compile to the same `LhsAutomaton` as equations, the C8 cross-theory matching covers
-    /// their lhs: AC (non-linear `X + X`, alien `s M + N`), AU (`a L`, alien `(s M) L`), and iter/S
-    /// (`s s s X`) membership lhs all match the reference. (Collapse-matching under an identity — Maude
-    /// applying `mb a L` to collapsed sub-elements — is the separate deferred count-only gap.)
+    /// Membership axioms use the same theory-aware lhs automata as equations. These cases cover AC,
+    /// AU, and iterator matching; identity-collapse membership has a separate rewrite-count divergence.
     #[test]
-    fn correctness_membership_theory_conforms() {
-        conform(
-            conformance_file!("correctness-membership-theory.maude"),
+    fn theory_memberships_produce_expected_results() {
+        check_results(
+            fixture_file!("correctness-membership-theory.maude"),
             &[
                 // AC-MB
                 e("Sym", "a + a", 1),
@@ -3942,17 +3871,16 @@ mod tests {
         );
     }
 
-    /// TNK-011: top-collapsing ACU/two-sided-AU/CUI memberships are offered outside their syntactic
-    /// root. Covers recursive survivors, conditional matching, direct+collapse ordering, identity
-    /// re-entry, a false-positive control, and the downstream sorted-equation value impact.
+    /// Collapsing ACU, two-sided AU, and CUI memberships are offered outside their syntactic root.
+    /// Covers recursive survivors, conditions, ordering, identity re-entry, and downstream sort effects.
     #[test]
-    fn tnk_011_collapsing_memberships_conform() {
-        let source = conformance_file!("audit/B3c-membership-collapse.maude")
+    fn collapsing_memberships_produce_expected_results() {
+        let source = fixture_file!("audit/B3c-membership-collapse.maude")
             .lines()
             .filter(|line| !line.starts_with("set trace"))
             .collect::<Vec<_>>()
             .join("\n");
-        conform(
+        check_results(
             &source,
             &[
                 e("Special", "a", 1),             // ACU identity collapse
@@ -3977,15 +3905,12 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C1 seam 3 — strat × membership. A custom `strat` leaves args unreduced, but Maude
-    /// (and now we) still refine their TRUE SORT at the top step: the overloaded `wrap`'s result sort
-    /// reflects the refined `mk(e):Sml` (→ WrS, not Wr), and `pick`'s discarded branch still has its
-    /// membership counted (4 rewrites). Distinct subterms only — a repeated reducible-membership subterm
-    /// was, at C1 time, the separate subject-DAG-sharing divergence (C7, since resolved).
+    /// Strategy-controlled arguments still receive true-sort and membership refinement at the top step.
+    /// Discarded branches retain their rewrite accounting.
     #[test]
-    fn correctness_strat_mb_conforms() {
-        conform(
-            conformance_file!("correctness-strat-mb.maude"),
+    fn strategy_memberships_produce_expected_results() {
+        check_results(
+            fixture_file!("correctness-strat-mb.maude"),
             &[
                 e("WrS", "wrap(mk(e))", 1), // skipped arg refined → overloaded range WrS
                 e("Sml", "mkA", 4), // both branches refined before selection; discarded one counts
@@ -3994,9 +3919,9 @@ mod tests {
     }
 
     #[test]
-    fn acu_overload_conforms() {
-        conform(
-            conformance_file!("acu-overload.maude"),
+    fn acu_overloads_produce_expected_results() {
+        check_results(
+            fixture_file!("acu-overload.maude"),
             &[
                 e("NzNat", "z + nz", 0),
                 e("NzNat", "z + nz", 0),
@@ -4011,9 +3936,9 @@ mod tests {
     }
 
     #[test]
-    fn acu_reduce_conforms() {
-        conform(
-            conformance_file!("acu-reduce.maude"),
+    fn acu_reduction_produces_expected_results() {
+        check_results(
+            fixture_file!("acu-reduce.maude"),
             &[
                 e("N", "s 0 + s 0 + s 0", 1),
                 e("E", "a + b", 1),
@@ -4024,9 +3949,9 @@ mod tests {
     }
 
     #[test]
-    fn membership_conforms() {
-        conform(
-            conformance_file!("membership.maude"),
+    fn membership_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("membership.maude"),
             &[
                 e("SymPair", "< z, z >", 1),
                 e("Pair", "< z, s z >", 0),
@@ -4040,15 +3965,12 @@ mod tests {
         );
     }
 
-    /// Phase 1.5 / C1 — eager→lazy sort & membership computation. A membership on a *reducible* operator
-    /// (one that also has equations) is applied only at the reduce normal-form point, so a redex an
-    /// equation reduces away is never constrained: the counts are 1 / 2 / 1 (not the eager 2 / 3 / hang).
-    /// The third command is a `cmb` with a divergent condition that Maude — and now we — never evaluate,
-    /// because the equation reduces `g(a)` to `big` first (a *termination* fix, not just a count fix).
+    /// Memberships on reducible operators apply only at normal form. An equation can therefore remove a
+    /// redex before its membership or divergent membership condition is considered.
     #[test]
-    fn correctness_mb_reducible_conforms() {
-        conform(
-            conformance_file!("correctness-mb-reducible.maude"),
+    fn reducible_memberships_produce_expected_results() {
+        check_results(
+            fixture_file!("correctness-mb-reducible.maude"),
             &[
                 e("Big", "big", 1), // MB-REDUCIBLE: eq g(a)=big fires; mb g(X):Small never reached
                 e("S", "g(b)", 2),  // MB-REWRITE-CHAIN: g(a)→g(b) [1] then g(b)'s mb [2]
@@ -4057,14 +3979,12 @@ mod tests {
         );
     }
 
-    /// C7 structure sharing: a repeated reducible subterm reduces once, matching Maude's hash-consed
-    /// subject/rhs DAG. Counts are byte-identical to the reference binary (pre-C7 ours over-counted the
-    /// duplicate); result + least sort were always faithful. Covers a subject duplicate, a deep shared
-    /// chain, an rhs duplicate, a triple, a membership on a shared constant, and the AU/CUI/ACU theories.
+    /// Repeated reducible subterms normalize once through subject/RHS DAG sharing, including under AU,
+    /// CUI, and ACU theories.
     #[test]
-    fn correctness_sharing_conforms() {
-        conform(
-            conformance_file!("correctness-sharing.maude"),
+    fn shared_subterms_produce_expected_results() {
+        check_results(
+            fixture_file!("correctness-sharing.maude"),
             &[
                 e("P", "< b, b >", 1), // FREE subject dup: two g(a) -> one node, reduced once
                 e("P", "< c, c >", 2), // deep shared chain g(g(a))->g(b)->c, once
@@ -4074,20 +3994,17 @@ mod tests {
                 e("L", "b b", 1),      // AU: two equal elements share, reduced once
                 e("L", "b b b", 1),    // AU: three equal elements
                 e("E", "b & b", 1),    // CUI: two equal elements share
-                e("E", "b + b", 1),    // ACU: already merges to multiplicity 2 (unchanged by C7)
+                e("E", "b + b", 1),    // ACU: already merges to multiplicity 2
             ],
         );
     }
 
     #[test]
-    fn overload_conforms() {
-        // Command 8 is a kind-level (error-sort) result. C4: the kernel now names a kind after its MAXIMAL
-        // sort (Maude's `printKind`), so this single-top component prints `[Nat]` byte-identically to the
-        // reference (was `[Zero]` — the first-declared member). (overload.maude is the non-preregular module;
-        // Maude also warns on preregularity, which we don't surface yet — B2.1's deferred diagnostics sink —
-        // but the reduced results/sorts match.)
-        conform(
-            conformance_file!("overload.maude"),
+    fn overloaded_commands_produce_expected_results() {
+        // Command 8 has a kind-level result named after the maximal sort. Non-preregularity warnings are
+        // not surfaced; values and sorts remain checked.
+        check_results(
+            fixture_file!("overload.maude"),
             &[
                 e("Zero", "0", 0),
                 e("NzNat", "s 0", 0),
@@ -4103,12 +4020,9 @@ mod tests {
         );
     }
 
-    // ---- B4.5b: built-in literals (string / qid / float) ----
-
-    /// Like [`conform`], but checks the result's *printed* form (Maude-faithful, uncolored) against the
-    /// binary's text — for modules whose results are literals best compared textually (no ACU residues,
-    /// so no order/spacing caveats).
-    fn conform_render(src: &str, expected: &[Expect]) {
+    /// Check each result's printed form for fixtures whose literal values are most directly compared as
+    /// text and do not introduce ACU ordering or spacing choices.
+    fn check_rendered_results(src: &str, expected: &[Expect]) {
         let mut loaded = load_source(src).expect("load source");
         let cmds: Vec<(usize, Vec<Token>)> = loaded
             .commands
@@ -4146,9 +4060,9 @@ mod tests {
     }
 
     #[test]
-    fn float_conforms() {
-        conform_render(
-            conformance_file!("float.maude"),
+    fn float_commands_render_expected_results() {
+        check_rendered_results(
+            fixture_file!("float.maude"),
             &[
                 e("Flt", "4.0", 1),
                 e("Flt", "3.5", 1),
@@ -4163,13 +4077,12 @@ mod tests {
         );
     }
 
-    /// C9: floats print via Maude's `doubleToString` — the normalized scientific form (`1.0e+4`,
-    /// `2.5e-1`), the 17-significant-digit rounding of 0.1, and a long non-scientific mantissa. `float.maude`
-    /// only used format-coincident values, so this fixture is what pins the printer against the binary.
+    /// Pin normalized scientific notation, 17-significant-digit rounding, and a long fixed-point
+    /// mantissa.
     #[test]
-    fn float_print_conforms() {
-        conform_render(
-            conformance_file!("correctness-float-print.maude"),
+    fn float_formatter_renders_expected_forms() {
+        check_rendered_results(
+            fixture_file!("correctness-float-print.maude"),
             &[
                 e("Flt", "3.3333333333333331e-1", 1),
                 e("Flt", "1.0e+4", 1),
@@ -4187,13 +4100,13 @@ mod tests {
         );
     }
 
-    /// C10: a `-` glued to digits (`-7`) lexes as one `SMALL_NEG` token and parses via the `-_` minus op
-    /// (`MAKE_INTEGER`), exactly as a spaced `- 7` — so `-7 quo 2`, `3 + -7`, `5 - -7` all parse and reduce.
-    /// (The lexer-level `5 -7` rejection — matching the binary — is pinned in `lex::tests`.)
+    /// A `-` glued to digits (`-7`) is one `SMALL_NEG` token and uses the `-_` minus operator's
+    /// `MAKE_INTEGER` production, so `-7 quo 2`, `3 + -7`, and `5 - -7` parse and reduce. With no
+    /// separating operator token, `5 -7` remains invalid.
     #[test]
-    fn glued_minus_conforms() {
-        conform_render(
-            conformance_file!("correctness-glued-minus.maude"),
+    fn glued_minus_parses_and_reduces() {
+        check_rendered_results(
+            fixture_file!("correctness-glued-minus.maude"),
             &[
                 e("NzInt", "-3", 0),
                 e("NzInt", "-7", 0),
@@ -4207,16 +4120,13 @@ mod tests {
         );
     }
 
-    /// C3: order-dependent equation + membership application matches the reference binary. The
-    /// first-*declared* matching equation fires (declaration order, not specificity — `f(a)` → `b` when
-    /// `eq f(a)=b` is first, `c` when `eq f(X)=c` is first); a non-confluent `eq a=b . eq a=c` → `b`;
-    /// comparable membership targets apply smallest-sort-first (1 rewrite, no double count); a conditional
-    /// fallback takes the first whose condition holds. (The incomparable-membership tiebreak and
-    /// repeated-subterm sharing are separate documented residuals — C7.)
+    /// Equation and membership application follows declaration order. The first matching equation
+    /// fires regardless of specificity; comparable membership targets apply smallest-sort-first
+    /// without double-counting, and a conditional fallback takes the first condition that succeeds.
     #[test]
-    fn eq_mb_order_conforms() {
-        conform_render(
-            conformance_file!("correctness-eq-mb-order.maude"),
+    fn equation_and_membership_order_is_observable() {
+        check_rendered_results(
+            fixture_file!("correctness-eq-mb-order.maude"),
             &[
                 e("S", "b", 1),
                 e("S", "c", 1),
@@ -4230,9 +4140,9 @@ mod tests {
     }
 
     #[test]
-    fn string_conforms() {
-        conform_render(
-            conformance_file!("string.maude"),
+    fn string_commands_render_expected_results() {
+        check_rendered_results(
+            fixture_file!("string.maude"),
             &[
                 e("Str", "\"abcd\"", 1),
                 e("NzNat", "5", 1),
@@ -4248,13 +4158,12 @@ mod tests {
         );
     }
 
-    /// C11: a rational special constant prints compactly as `num/den` (Maude's `handleDivision`), so this
-    /// now checks the printed text (was value-only `conform` while we printed the generic `3 / 4`). A
-    /// `0/N` is *not* a rational — `0` is the `Zero` constant, not a numeral — so it stays spaced (`0 / 5`).
+    /// A rational special constant prints compactly as `num/den`. A zero numerator is the ordinary
+    /// `Zero` constant rather than a positive numeral, so `0 / 5` retains mixfix spacing.
     #[test]
-    fn rat_conforms() {
-        conform_render(
-            conformance_file!("rat.maude"),
+    fn rational_commands_render_expected_results() {
+        check_rendered_results(
+            fixture_file!("rat.maude"),
             &[
                 e("NzNat", "2", 1),
                 e("NzRat", "3/4", 1),
@@ -4267,12 +4176,10 @@ mod tests {
         );
     }
 
-    // ---- B4.5c: conditional statements (ceq / cmb / owise-with-condition / := / sort-test) ----
-
     #[test]
-    fn conditional_conforms() {
-        conform(
-            conformance_file!("conditional.maude"),
+    fn conditional_equations_produce_expected_results() {
+        check_results(
+            fixture_file!("conditional.maude"),
             &[
                 e("Nat", "s s z", 3),
                 e("Nat", "s s z", 5),
@@ -4284,9 +4191,9 @@ mod tests {
     }
 
     #[test]
-    fn owise_conforms() {
-        conform(
-            conformance_file!("owise.maude"),
+    fn owise_equations_produce_expected_results() {
+        check_results(
+            fixture_file!("owise.maude"),
             &[
                 e("Truth", "tt", 1),
                 e("Truth", "ff", 1),
@@ -4299,9 +4206,9 @@ mod tests {
     }
 
     #[test]
-    fn match_cond_conforms() {
-        conform(
-            conformance_file!("match-cond.maude"),
+    fn match_conditions_produce_expected_results() {
+        check_results(
+            fixture_file!("match-cond.maude"),
             &[
                 e("Nat", "s z", 1),
                 e("Nat", "z", 1),
@@ -4313,9 +4220,9 @@ mod tests {
     }
 
     #[test]
-    fn cmb_conforms() {
-        conform(
-            conformance_file!("cmb.maude"),
+    fn conditional_memberships_produce_expected_results() {
+        check_results(
+            fixture_file!("cmb.maude"),
             &[
                 e("GoodPair", "< z, s z >", 2),
                 e("Pair", "< s z, z >", 1),
@@ -4325,14 +4232,12 @@ mod tests {
         );
     }
 
-    /// B4.5d: the `match`/`xmatch` command end-to-end through the public kernel solution stream. ACU
-    /// matching with and without identity, and an extension `xmatch` reporting the matched portion — the
-    /// strongest from-text exercise of the B1 matcher. Solution sets vs the reference binary (order is
-    /// Maude's deferred Diophantine order; see [`Expect::Match`]).
+    /// End-to-end `match`/`xmatch` through the public kernel solution stream, including ACU identity
+    /// and extension matches. Compare solution sets because enumeration order is not an API contract.
     #[test]
-    fn acu_match_conforms() {
-        conform(
-            conformance_file!("acu-match.maude"),
+    fn acu_matching_produces_expected_solutions() {
+        check_results(
+            fixture_file!("acu-match.maude"),
             &[
                 // match X + Y <=? a + b + c  — six splits into two non-empty parts.
                 mat(&[
@@ -4356,8 +4261,7 @@ mod tests {
         );
     }
 
-    /// The Maude `match` display layout: `No match.` when empty, else `Matcher N` headers with a blank
-    /// line between blocks (the B5 REPL renderer over [`match_command`]'s blocks).
+    /// Empty results use `No match.`; numbered blocks are separated by blank lines.
     #[test]
     fn format_matchers_layout() {
         assert_eq!(format_matchers(&[]), "No match.");
@@ -4370,12 +4274,11 @@ mod tests {
         );
     }
 
-    /// B4.5d: CUI `match` (the two commutative pairings) alongside the CUI reduce locks (matching modulo
-    /// commutativity, and the idem/identity collapses at construction).
+    /// CUI matching enumerates both commutative pairings and preserves identity/idempotence collapse.
     #[test]
-    fn cui_conforms() {
-        conform(
-            conformance_file!("cui.maude"),
+    fn cui_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("cui.maude"),
             &[
                 // match f(X, Y) <=? f(a, b)  — the two pairings.
                 mat(&["X --> a\nY --> b", "X --> b\nY --> a"]),
@@ -4388,8 +4291,8 @@ mod tests {
 
     /// General ground identities normalize identically in ACU, AU, CUI, and one-sided AU theories.
     #[test]
-    fn compound_identities_conform_across_theories() {
-        conform(
+    fn compound_identities_normalize_across_theories() {
+        check_results(
             "fmod ID-THEORIES is
                sort S .
                ops a b : -> S [ctor] .
@@ -4419,15 +4322,12 @@ mod tests {
         );
     }
 
-    /// B4.5e: `__` juxtaposition (`op __ : E E -> E [assoc]`, the empty-syntax production `E ::= E E`).
-    /// The `[assoc]` right-associating gather `(e E)` disambiguates the otherwise-ambiguous adjacent
-    /// nonterminals; the kernel then flattens the parse modulo associativity. AU `match` (ordered
-    /// prefix/suffix splits incl. the identity `nil`) + the two AU reduce locks (extension on both ends;
-    /// the lone variable absorbing the ordered tail).
+    /// Juxtaposition syntax uses right-associating gather to disambiguate adjacent nonterminals. AU
+    /// matching then enumerates ordered prefix/suffix splits, including identity splits.
     #[test]
-    fn au_conforms() {
-        conform(
-            conformance_file!("au.maude"),
+    fn au_commands_produce_expected_results() {
+        check_results(
+            fixture_file!("au.maude"),
             &[
                 // match X Y <=? a b c  — four ordered splits, including nil via the identity.
                 mat(&[
@@ -4494,44 +4394,36 @@ endm
         assert!(module.rl_traces[0].narrowing);
     }
 
-    /// The whole-conformance-suite differential gate (B4.5e, the last B4 deliverable). EVERY conformance
-    /// module loads, EVERY command runs, and every reduced result **round-trips** (`parse∘print_raw =
-    /// id`). The per-module `*_conforms` tests pin exact sorts / counts / values against the reference
-    /// binary; this sweep is the breadth guarantee — parser and pretty-printer stay mutually consistent
-    /// across the *entire* suite — and the explicit list is the coverage guard: a new `conformance/*.maude`
-    /// must be added here, so nothing silently drops out of coverage.
+    /// Load, run, and raw-print every listed frontend fixture. Keeping the fixture list explicit prevents
+    /// newly added cases from silently falling outside this breadth check.
     #[test]
-    fn whole_conformance_suite() {
+    fn all_frontend_fixtures_load_run_and_round_trip() {
         use crate::pretty::print_raw;
         // (name, source, round_trip). `fib` is the throughput fixture — its result is a 17711-deep
         // successor chain, so we run+count it but skip the (correct, but O(n)-token) round-trip reparse;
         // `peano` round-trips the same Peano-Fibonacci theory at a small numeral.
         let modules: &[(&str, &str, bool)] = &[
-            ("acu-match", conformance_file!("acu-match.maude"), true),
-            (
-                "acu-overload",
-                conformance_file!("acu-overload.maude"),
-                true,
-            ),
-            ("acu-reduce", conformance_file!("acu-reduce.maude"), true),
-            ("au", conformance_file!("au.maude"), true),
-            ("bool", conformance_file!("bool.maude"), true),
-            ("cmb", conformance_file!("cmb.maude"), true),
-            ("conditional", conformance_file!("conditional.maude"), true),
-            ("cui", conformance_file!("cui.maude"), true),
-            ("fib", conformance_file!("fib.maude"), false),
-            ("float", conformance_file!("float.maude"), true),
-            ("int", conformance_file!("int.maude"), true),
-            ("iter", conformance_file!("iter.maude"), true),
-            ("match-cond", conformance_file!("match-cond.maude"), true),
-            ("membership", conformance_file!("membership.maude"), true),
-            ("nat", conformance_file!("nat.maude"), true),
-            ("overload", conformance_file!("overload.maude"), true),
-            ("owise", conformance_file!("owise.maude"), true),
-            ("peano", conformance_file!("peano.maude"), true),
-            ("rat", conformance_file!("rat.maude"), true),
-            ("strat", conformance_file!("strat.maude"), true),
-            ("string", conformance_file!("string.maude"), true),
+            ("acu-match", fixture_file!("acu-match.maude"), true),
+            ("acu-overload", fixture_file!("acu-overload.maude"), true),
+            ("acu-reduce", fixture_file!("acu-reduce.maude"), true),
+            ("au", fixture_file!("au.maude"), true),
+            ("bool", fixture_file!("bool.maude"), true),
+            ("cmb", fixture_file!("cmb.maude"), true),
+            ("conditional", fixture_file!("conditional.maude"), true),
+            ("cui", fixture_file!("cui.maude"), true),
+            ("fib", fixture_file!("fib.maude"), false),
+            ("float", fixture_file!("float.maude"), true),
+            ("int", fixture_file!("int.maude"), true),
+            ("iter", fixture_file!("iter.maude"), true),
+            ("match-cond", fixture_file!("match-cond.maude"), true),
+            ("membership", fixture_file!("membership.maude"), true),
+            ("nat", fixture_file!("nat.maude"), true),
+            ("overload", fixture_file!("overload.maude"), true),
+            ("owise", fixture_file!("owise.maude"), true),
+            ("peano", fixture_file!("peano.maude"), true),
+            ("rat", fixture_file!("rat.maude"), true),
+            ("strat", fixture_file!("strat.maude"), true),
+            ("string", fixture_file!("string.maude"), true),
         ];
         for &(name, src, round_trip) in modules {
             let mut loaded = load_source(src).unwrap_or_else(|e| panic!("{name}: load: {e}"));
@@ -4684,8 +4576,7 @@ endm
         );
     }
 
-    /// Opt-in TNK-016 scaling benchmark. Both inputs deliberately exceed the interactive safety budget so
-    /// parser algorithm changes can still be compared without weakening that availability boundary.
+    /// Opt-in parser scaling benchmark above the interactive effort limit.
     #[test]
     #[ignore = "opt-in large-grammar parser benchmark"]
     fn large_grammar_valid_and_invalid_parse_benchmark() {
@@ -4743,5 +4634,40 @@ endm
         let tokens = tokenize(&text, &mut loaded.interner);
         parse_command_term(&loaded.modules[0], &loaded.interner, &tokens)
             .expect("retained 2,000-atom command must remain below the parser budget");
+    }
+    #[test]
+    fn unify_readiness_distinguishes_screening_failures() {
+        fn readiness(source: &str) -> UnifyReadiness {
+            let mut loaded = load_source(source).expect("load unification screening module");
+            let (module, command) = loaded.commands.pop().expect("one unify command");
+            let Command::Unify { body, .. } = command else {
+                panic!("expected a unify command");
+            };
+            unify_command(&mut loaded.modules[module], &mut loaded.interner, &body)
+                .expect("build unify command")
+                .readiness
+        }
+
+        assert_eq!(
+            readiness(
+                "fmod UNSAFE-NAME is
+                   sort S .
+                   op a : -> S [ctor] .
+                 endfm
+                 unify #1:S =? a .",
+            ),
+            UnifyReadiness::UnsafeVariableName
+        );
+        assert_eq!(
+            readiness(
+                "fmod UNSUPPORTED-THEORY is
+                   sort S .
+                   op a : -> S [ctor] .
+                   op f : S S -> S [comm idem] .
+                 endfm
+                 unify f(X:S, a) =? f(a, a) .",
+            ),
+            UnifyReadiness::UnsupportedTheory
+        );
     }
 }

@@ -1,8 +1,7 @@
-*** Phase 1.5 / C10 — glued prefix-minus lexing. A `-` glued to digits like `-7` is one SMALL_NEG
+*** Glued prefix-minus lexing. A `-` glued to digits like `-7` is one SMALL_NEG
 *** token in Maude token.cc, parsed via the `-_` MinusSymbol MAKE_INTEGER action, exactly as a
 *** spaced `- 7`. A spaced `-` stays the `_-_`/`-_` operator token, so subtraction is unaffected,
-*** and `5 -7` fails to parse just as the reference binary rejects it. Differential vs the binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/correctness-glued-minus.maude < /dev/null
+*** and `5 -7` fails to parse.
 fmod INTB is
   sorts Truth Zero NzNat Nat NzInt Int .
   subsorts Zero NzNat < Nat .

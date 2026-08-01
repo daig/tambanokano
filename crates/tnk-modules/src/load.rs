@@ -1,9 +1,6 @@
-//! `load_program`: drive a whole `.maude` source through the module system — parse, build the module
-//! database, flatten each module's import closure, and build each into a runnable [`LoadedModule`].
-//!
-//! This is the import-aware counterpart of the frontend's `load_source` (which rejects imports). It is
-//! the entry the B5 REPL consumes next round: load a file, hold the [`Program`] (modules + the command
-//! list + a name→index map), and run commands against the current module.
+//! Import-aware program loading parses source text, builds module and view databases, flattens each
+//! import closure, and compiles every module into a runnable [`LoadedModule`]. The returned [`Program`]
+//! retains modules, commands, source declarations, views, and name indexes for batch or session use.
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Interner, tokenize};
@@ -15,12 +12,10 @@ use crate::db::ModuleDb;
 use crate::flatten::flatten_with_homes;
 use crate::view::{ViewDb, validate_view};
 
-/// Flatten `name`'s import closure and build it into a runnable [`LoadedModule`], applying the **D1a
-/// import-reparse point-fix**: a statement the flattened grammar parses ambiguously is re-parsed against
-/// its home module's own grammar. `home_mod` resolves an imported statement's home name to its
-/// already-built module (the caller's module cache — `load_program`'s in-progress map, or the REPL's
-/// `modules`); a home not found there simply keeps the flattened-grammar behavior. This is the single
-/// entry both `load_program` and the REPL use to build an import-aware module.
+/// Flatten an import closure and compile it. Imported statement bubbles that are ambiguous in the
+/// flattened grammar are retried against their home module's grammar. `home_mod` resolves those already
+/// built homes; if absent, the flattened-grammar result is retained. Batch loading and incremental
+/// sessions share this entry point.
 pub fn flatten_and_build<'m>(
     name: &str,
     db: &ModuleDb,
@@ -32,9 +27,9 @@ pub fn flatten_and_build<'m>(
     build_loaded_module_homed(&flat, &homes, home_mod, interner)
 }
 
-/// A loaded program: the shared interner, every module **flattened** (one [`LoadedModule`] per top-level
-/// `fmod`, in file order), a name→index map (for the REPL's `select`), the validated views (B-ii), and the
-/// commands tagged with the index of the module they run against (the most recently entered one).
+/// A loaded program: the shared interner, one flattened [`LoadedModule`] per parsed module or theory
+/// declaration in source order, a name-to-index map, validated views, and commands tagged with the module
+/// index they run against.
 pub struct Program {
     pub interner: Interner,
     pub modules: Vec<LoadedModule>,
@@ -45,7 +40,7 @@ pub struct Program {
 
 /// Collect every module/view name a module expression references — the bases and arguments of imports,
 /// summations `A + B`, renamings `M * (…)`, and instantiations `M{V, …}`. This is the dependency-tracking
-/// support for redefinition invalidation (A4c): it deliberately **over-approximates** — an instantiation
+/// support for redefinition invalidation: it deliberately **over-approximates** — an instantiation
 /// argument that is really an enclosing parameter is captured too (harmless: it won't match a defined
 /// name), and a view name used as an instantiation argument is captured (so redefining a view re-flattens
 /// its users). Over-approximation can only cause an extra (semantically invisible) rebuild, never a missed
@@ -71,7 +66,7 @@ fn collect_expr_names(e: &ModuleExpr, out: &mut HashSet<String>) {
 
 /// The direct module/view dependencies of a module: every name mentioned in its imports plus its parameter
 /// theories. The module's own name and its formal-parameter names are excluded (a parameter is bound
-/// locally, not a dependency). Used to invalidate cached dependents when a module/view is redefined (A4c).
+/// locally, not a dependency). Used to invalidate cached dependents when a module/view is redefined.
 pub fn module_dep_names(pm: &PreModule) -> HashSet<String> {
     let mut out = HashSet::new();
     for p in &pm.params {
@@ -89,7 +84,7 @@ pub fn module_dep_names(pm: &PreModule) -> HashSet<String> {
 
 /// The direct module/view dependencies of a view: its `from` source theory, its `to` target module
 /// expression, and any parameter theories. Its own name and formal-parameter names are excluded. Used to
-/// invalidate cached dependents when a view is redefined (A4c).
+/// invalidate cached dependents when a view is redefined.
 pub fn view_dep_names(v: &ViewDecl) -> HashSet<String> {
     let mut out = HashSet::new();
     for p in &v.params {
@@ -119,19 +114,17 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     let names: Vec<String> = pre.iter().map(|m| m.name.clone()).collect();
     let mut db = ModuleDb::from_modules(pre);
 
-    // Views first (B-ii): validate each against the module DB, then store — so a parameterized
-    // instantiation `M{V}` reached while flattening a module can resolve its view (B-iv). A bad view aborts
-    // the load with the reference binary's diagnostic.
+    // Validate and store views first so module instantiations can resolve them during flattening.
+    // Invalid views abort loading before any module is built.
     let mut views = ViewDb::new();
     for v in pre_views {
         validate_view(&v, &db, &views, &mut interner)?;
         views.insert(v);
     }
 
-    // Then flatten + build each module (instantiations resolve against `views`). Before each flatten,
-    // inject any built-in prelude module the module imports (e.g. an `omod`'s auto-imported
-    // `CONFIGURATION`) that the user has not defined — in file order, so an imported module's own
-    // built-in needs are satisfied by the time a later importer is flattened.
+    // Flatten modules in source order. Before each flatten, inject any imported built-in module
+    // (for example, an `omod`'s automatic `CONFIGURATION` import) that is not already defined.
+    // This makes an imported module's built-in dependencies available before later importers are built.
     let mut modules: Vec<LoadedModule> = Vec::with_capacity(names.len());
     let mut module_index: HashMap<String, usize> = HashMap::new();
     for (idx, name) in names.iter().enumerate() {
@@ -140,9 +133,8 @@ pub fn load_program(src: &str) -> Result<Program, String> {
             .map(|pm| pm.imports.clone())
             .unwrap_or_default();
         crate::prelude::ensure_builtins(&imports, &mut db, &mut interner);
-        // Resolve an imported statement's home to its already-built module (built earlier in file order —
-        // imports precede importers in a well-formed file). Scoped to a block so the immutable borrows of
-        // `modules`/`module_index` end before this module is pushed.
+        // Imported statement homes resolve to modules built earlier in source order; well-formed imports
+        // precede their importers.
         let lm = {
             let built = &modules;
             let built_ix = &module_index;
@@ -168,10 +160,7 @@ mod tests {
     use tnk_frontend::load::{parse_command_term, reduce_command};
     use tnk_frontend::pretty::print_raw;
 
-    /// One expected `reduce` result, transcribed from the reference binary:
-    /// `~/Downloads/Maude-3/maude -no-banner conformance/import-<name>.maude < /dev/null`.
-    /// `(result-sort, an expected-term in surface syntax, rewrite-count)`; the expected term is reduced
-    /// through the same flattened module and compared by `deep_equal`.
+    /// Expected reduction result: result sort, surface term, and rewrite count.
     struct Expect {
         sort: &'static str,
         term: &'static str,
@@ -185,17 +174,16 @@ mod tests {
         }
     }
 
-    /// Load a multi-module `.maude` program through the module system and assert each `reduce` command's
-    /// result sort, rewrite count, and value match the reference binary — and that the printed result
-    /// round-trips (`parse∘print_raw = id`) against the flattened module's grammar.
-    fn conform(src: &str, expected: &[Expect]) {
+    /// Load a multi-module program, check each reduce result's sort/count/value, and require the
+    /// printed result to round-trip through the flattened grammar.
+    fn assert_program_results(src: &str, expected: &[Expect]) {
         let mut prog = load_program(src).expect("load program");
         let cmds: Vec<(usize, Vec<Token>)> = prog
             .commands
             .iter()
             .map(|(m, c)| match c {
                 Command::Reduce { term, .. } => (*m, term.clone()),
-                _ => panic!("import conformance uses only `reduce`"),
+                _ => panic!("program-result fixtures contain only `reduce` commands"),
             })
             .collect();
         assert_eq!(cmds.len(), expected.len(), "command count");
@@ -215,7 +203,7 @@ mod tests {
             }
             assert_eq!(rw, exp.rewrites, "command {idx} rewrite count");
 
-            // Value: reduce the expected surface term through the same module and compare.
+            // Reduce the expected surface term in the same module before structural comparison.
             let exp_toks = tokenize(exp.term, &mut prog.interner);
             let expected_parsed = parse_command_term(&prog.modules[*m], &prog.interner, &exp_toks)
                 .unwrap_or_else(|err| panic!("command {idx} expected `{}`: {err}", exp.term));
@@ -230,7 +218,7 @@ mod tests {
                 );
             }
 
-            // Round-trip: the printed result re-parses to the same term.
+            // Printed results must parse and reduce to the same term in the flattened grammar.
             let printed = print_raw(&prog.modules[*m].built, &prog.interner, got);
             let toks = tokenize(&printed, &mut prog.interner);
             let reparsed_term = parse_command_term(&prog.modules[*m], &prog.interner, &toks)
@@ -246,7 +234,7 @@ mod tests {
         }
     }
 
-    macro_rules! conformance_file {
+    macro_rules! module_fixture {
         ($name:expr) => {
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -258,9 +246,9 @@ mod tests {
 
     /// `protecting` a base module; commands use both the imported and the new signatures.
     #[test]
-    fn import_protecting_conforms() {
-        conform(
-            conformance_file!("import-protecting.maude"),
+    fn import_protecting_uses_imported_and_local_signatures() {
+        assert_program_results(
+            module_fixture!("import-protecting.maude"),
             &[
                 e("N", "s(s(s(s(0))))", 4),          // double(2) = 4
                 e("N", "s(s(s(s(s(s(s(0)))))))", 7), // 1 + double(3) = 7
@@ -268,11 +256,11 @@ mod tests {
         );
     }
 
-    /// protecting / extending / including all flatten identically — the same `d(2) = 4` in three modules.
+    /// `protecting`, `extending`, and `including` flatten identically: `d(2) = 4` in all three modules.
     #[test]
-    fn import_modes_conforms() {
-        conform(
-            conformance_file!("import-modes.maude"),
+    fn import_modes_flatten_identically() {
+        assert_program_results(
+            module_fixture!("import-modes.maude"),
             &[
                 e("N", "s(s(s(s(0))))", 4),
                 e("N", "s(s(s(s(0))))", 4),
@@ -282,20 +270,20 @@ mod tests {
     }
 
     /// Diamond import: `TOP` imports `LEFT` and `RIGHT`, both protecting `BASE` — `BASE` included once,
-    /// so `combine(1) = 2·1 + 3·1 = 5` with the binary's exact rewrite count.
+    /// so `combine(1) = 2·1 + 3·1 = 5` in 12 rewrites.
     #[test]
-    fn import_diamond_conforms() {
-        conform(
-            conformance_file!("import-diamond.maude"),
+    fn import_diamond_merges_base_once() {
+        assert_program_results(
+            module_fixture!("import-diamond.maude"),
             &[e("N", "s(s(s(s(s(0)))))", 12)],
         );
     }
 
     /// Module summation `A + B`: the importer sees both signatures.
     #[test]
-    fn import_summation_conforms() {
-        conform(
-            conformance_file!("import-summation.maude"),
+    fn import_summation_exposes_both_signatures() {
+        assert_program_results(
+            module_fixture!("import-summation.maude"),
             &[e("SA", "a2", 1), e("SB", "b2", 1)],
         );
     }
@@ -303,20 +291,18 @@ mod tests {
     /// Renaming `* (sort Elt to Item, op wrap to box)` — the renamed sort is the result sort and the
     /// renamed op fires inside the equation (`wrap(X)=X` became `box(X)=X`): `top(e) = box(e) = e`.
     #[test]
-    fn import_renaming_conforms() {
-        conform(
-            conformance_file!("import-renaming.maude"),
+    fn import_renaming_rewrites_declarations_and_equations() {
+        assert_program_results(
+            module_fixture!("import-renaming.maude"),
             &[e("Item", "e", 2), e("Item", "e", 1)],
         );
     }
 
-    /// A compound identity is a ground term in the copied signature, not a source symbol id. It survives a
-    /// plain import, a whole-module sort/operator rename, and parameter instantiation through a view whose
-    /// prefix source operator becomes mixfix in the target. Results and counts are the live Maude 3.5.1
-    /// outputs for the same source.
+    /// A compound identity is a ground term in the copied signature, not a source symbol id. It survives
+    /// plain import, whole-module renaming, and instantiation when the mapped operator changes syntax.
     #[test]
-    fn compound_identity_transfer_conforms() {
-        conform(
+    fn compound_identity_survives_transforms() {
+        assert_program_results(
             "fmod ID-BASE is\n\
                sort S .\n\
                ops a b : -> S [ctor] .\n\
@@ -368,12 +354,11 @@ mod tests {
         );
     }
 
-    /// A whole-module rename must rewrite a structured sort inside an existing identity qualifier
-    /// without wrapping the already-qualified constant again. This is the shape used by the stock
-    /// `linear.maude` `Vector{Int0}`/`Matrix{Int0}` renames.
+    /// A whole-module rename rewrites structured sorts inside identity qualifiers without wrapping an
+    /// already-qualified constant again.
     #[test]
-    fn structured_sort_identity_rename_conforms() {
-        conform(
+    fn structured_sort_identity_rename_stays_qualified() {
+        assert_program_results(
             "fmod STRUCT-ID is\n\
                sorts Int0 Vector{Int0} .\n\
                op empty : -> Vector{Int0} [ctor] .\n\
@@ -389,44 +374,43 @@ mod tests {
         );
     }
 
-    /// B-i: a theory (`fth`) builds its signature like a module, but a `[nonexec]` axiom is a proof
-    /// obligation that is never applied (`e < e` stays, 0 rewrites) while an ordinary theory equation does
-    /// fire (`id(e) = e`, 1 rewrite). Differentially verified against the reference binary.
+    /// A theory builds its signature like a module, but a `[nonexec]` axiom remains a proof obligation
+    /// and never fires; an ordinary theory equation remains executable.
     #[test]
-    fn theory_nonexec_conforms() {
-        conform(
-            conformance_file!("theory-nonexec.maude"),
+    fn theory_nonexec_axiom_does_not_fire() {
+        assert_program_results(
+            module_fixture!("theory-nonexec.maude"),
             &[e("Bool", "e < e", 0), e("Elt", "e", 1)],
         );
     }
 
-    /// B-i: a theory flattens its `protecting`/`including` imports exactly as a module does — `TINY`'s
+    /// A theory flattens its `protecting`/`including` imports exactly as a module does — `TINY`'s
     /// equation `neg(t) = f` fires inside the theory `ORD` that protects it.
     #[test]
-    fn theory_import_conforms() {
-        conform(
-            conformance_file!("theory-import.maude"),
+    fn theory_import_equation_fires() {
+        assert_program_results(
+            module_fixture!("theory-import.maude"),
             &[e("B", "f", 1), e("B", "t", 2)],
         );
     }
 
-    /// B-ii: a file carrying a *valid* view loads end-to-end — the view is validated and stored, and the
-    /// target module's reduces are unaffected (`p(s(z)) = z`). The view itself is exercised in B-iv.
+    /// A file carrying a *valid* view loads end-to-end — the view is validated and stored, and the
+    /// target module's reduces are unaffected (`p(s(z)) = z`).
     #[test]
-    fn view_good_conforms() {
-        conform(
-            conformance_file!("view-good.maude"),
+    fn valid_view_loads() {
+        assert_program_results(
+            module_fixture!("view-good.maude"),
             &[e("N", "z", 1), e("N", "s(z)", 1)],
         );
     }
 
-    /// B-iii: a parameterized module `fmod CTR{X :: TRIV}` builds and reduces ground terms. The parameter
+    /// A parameterized module `fmod CTR{X :: TRIV}` builds and reduces ground terms. The parameter
     /// copy turns the theory sort `Elt` into the parameter sort `X$Elt`; structured sorts `Ctr{X}` /
-    /// `NzCtr{X}` (and the subsort between them) drive the least-sort results. Byte-identical to the binary.
+    /// `NzCtr{X}` and their subsort relation determine the least-sort results.
     #[test]
-    fn param_module_conforms() {
-        conform(
-            conformance_file!("param-module.maude"),
+    fn parameterized_module_builds() {
+        assert_program_results(
+            module_fixture!("param-module.maude"),
             &[
                 e("Ctr{X}", "zero", 1),
                 e("NzCtr{X}", "inc(inc(zero))", 3),
@@ -435,14 +419,12 @@ mod tests {
         );
     }
 
-    /// B-iv: parameterized-module instantiation `M{V}`. The single-parameter `BOX{ToColor}` substitutes
-    /// the parameter sort (`X$Elt ↦ Hue`) and names structured sorts (`Box{X} ↦ Box{ToColor}`), importing
-    /// the view's target; the multi-parameter `PR{VA, VB}` binds each parameter independently. All four
-    /// results/sorts/counts are byte-identical to the reference binary.
+    /// Parameterized-module instantiation substitutes parameter sorts, names structured sorts, imports
+    /// view targets, and binds each parameter of a multi-parameter module independently.
     #[test]
-    fn instantiation_conforms() {
-        conform(
-            conformance_file!("instantiation.maude"),
+    fn instantiation_substitutes_parameters() {
+        assert_program_results(
+            module_fixture!("instantiation.maude"),
             &[
                 e("Hue", "red", 1),
                 e("Box{ToColor}", "wrap(green)", 1),
@@ -452,16 +434,13 @@ mod tests {
         );
     }
 
-    /// Axis-A2/A5: a *parameterized view* `BoxV{X :: TRIV}` instantiated by a module-view `ToColor`, used
-    /// as the argument of a **nested instantiation** `BOX{BoxV{ToColor}}`. The outer element sort is
-    /// `Box{ToColor}`, so `wrap`/`peek` are ad-hoc overloaded across the `Hue` / `Box{ToColor}` /
-    /// `Box{BoxV{ToColor}}` kinds and the equation `peek(wrap(E:X$Elt)) = E:X$Elt` is instantiated at two
-    /// different element sorts (the colon variable's sort is rewritten per copy). Byte-identical to the
-    /// reference binary across all five reduces.
+    /// A parameterized view instantiated by a module-view can itself serve as the argument of a nested
+    /// instantiation. Colon-variable sorts are rewritten for each instantiated equation copy, keeping
+    /// overloads over the resulting kinds distinct.
     #[test]
-    fn instantiation_nested_conforms() {
-        conform(
-            conformance_file!("instantiation-nested.maude"),
+    fn nested_instantiation_keeps_kinds_distinct() {
+        assert_program_results(
+            module_fixture!("instantiation-nested.maude"),
             &[
                 e("Box{ToColor}", "wrap(red)", 0),
                 e("Box{BoxV{ToColor}}", "wrap(wrap(red))", 0),
@@ -472,14 +451,14 @@ mod tests {
         );
     }
 
-    /// Axis-A5 kind 2: a **by-parameter** instantiation. `PAIR{X :: TRIV}` protects `LIST{X}` —
+    /// A **by-parameter** instantiation: `PAIR{X :: TRIV}` protects `LIST{X}` —
     /// instantiating `LIST` by the *enclosing parameter* `X`, not a view — and `USEP` grounds it with
     /// `PAIR{ToN}`, re-instantiating the bound `X ↦ ToN` (the import `LIST{X}` becomes `LIST{ToN}`).
-    /// Reductions fire through both modules' instantiated equations. Byte-identical to the reference.
+    /// Reductions fire through both modules' instantiated equations.
     #[test]
-    fn instantiation_byparam_conforms() {
-        conform(
-            conformance_file!("instantiation-byparam.maude"),
+    fn by_parameter_instantiation_rebinds_imports() {
+        assert_program_results(
+            module_fixture!("instantiation-byparam.maude"),
             &[
                 e("List{ToN}", "cons(0, cons(s(0), nil))", 1),
                 e(
@@ -492,15 +471,15 @@ mod tests {
         );
     }
 
-    /// Axis-A5: nested ground instantiation `LIST{List{ToN}}` (the `LIST{List{Nat}}` shape) — the
+    /// Nested ground instantiation `LIST{List{ToN}}` (the `LIST{List{Nat}}` shape) — the
     /// parameterized view `List` instantiated by `ToN` derives a view to `LIST{ToN}`, so the outer element
     /// sort is `List{ToN}` and `cons`/`nil`/`app` are ad-hoc overloaded across the `Nat` / `List{ToN}` /
     /// `List{List{ToN}}` kinds. Reductions fire (`app` over lists of lists) and the disambiguated constant
-    /// `(nil).List{ToN}` round-trips. Byte-identical to the reference.
+    /// `(nil).List{ToN}` round-trips through the flattened grammar.
     #[test]
-    fn instantiation_nested_list_conforms() {
-        conform(
-            conformance_file!("instantiation-nested-list.maude"),
+    fn nested_list_instantiation_reduces() {
+        assert_program_results(
+            module_fixture!("instantiation-nested-list.maude"),
             &[
                 e("List{List{ToN}}", "cons(cons(0, nil), nil)", 0),
                 e("List{List{ToN}}", "cons(cons(0, nil), cons(nil, nil))", 2),
@@ -509,14 +488,14 @@ mod tests {
         );
     }
 
-    /// Axis-A5 kind 1: a **theory-view** argument. `ToT2`'s target `T2` is a theory, so `BOX{ToT2}` keeps a
+    /// A **theory-view** argument: `ToT2`'s target `T2` is a theory, so `BOX{ToT2}` keeps a
     /// free parameter retyped to `T2`; the chain `BOX{ToT2}{C2}` grounds it with the module-view `C2`. The
     /// composition maps `X$Elt ↦ Hue` and names the structured sort `Box{X} ↦ Box{ToT2}{C2}` (the whole
-    /// chain). Byte-identical to the reference across the element- and box-typed results.
+    /// chain), and reductions preserve both element- and box-typed results.
     #[test]
-    fn instantiation_theory_view_conforms() {
-        conform(
-            conformance_file!("instantiation-theory-view.maude"),
+    fn theory_view_chain_grounds_parameter() {
+        assert_program_results(
+            module_fixture!("instantiation-theory-view.maude"),
             &[
                 e("Box{ToT2}{C2}", "wrap(red)", 0),
                 e("Hue", "red", 1),
@@ -527,34 +506,33 @@ mod tests {
 
     /// Bracketed comments `***( … )` / `---( … )` — balanced parens across newlines, with a backquoted paren
     /// not counting and code-looking text inside ignored — plus inline ones and plain line comments with a
-    /// stray `(`. The module builds past all of them and reduces. Byte-identical to the reference.
+    /// stray `(`. The module ignores every comment form and reduces normally.
     #[test]
-    fn bracketed_comment_conforms() {
-        conform(
-            conformance_file!("correctness-bracketed-comment.maude"),
+    fn bracketed_comments_are_ignored() {
+        assert_program_results(
+            module_fixture!("correctness-bracketed-comment.maude"),
             &[e("S", "a", 1), e("S", "a", 2)],
         );
     }
 
     /// A **user-typed** colon variable over a structured sort (`L:List{Nat}`, written inline in an equation):
     /// the lexer keeps the braces in one token, so it resolves to a variable of sort `List{Nat}` and the
-    /// equation fires. Byte-identical to the reference.
+    /// equation fires.
     #[test]
-    fn structured_colon_var_conforms() {
-        conform(
-            conformance_file!("correctness-colon-var-structured.maude"),
+    fn structured_colon_variable_parses() {
+        assert_program_results(
+            module_fixture!("correctness-colon-var-structured.maude"),
             &[e("List{Nat}", "c(0, nil)", 1), e("List{Nat}", "hd(nil)", 0)],
         );
     }
 
     /// A membership over a **structured** sort in a parameterized module (`mb cons(H, T) : NeList{E}`):
     /// both the inline-typed lhs and the structured target sort instantiate (`E ↦ ToN`), so `cons(0, nil)`
-    /// has least sort `NeList{ToN}`. Byte-identical to the reference (the structured membership sort and the
-    /// multi-token sort resolution are exercised end-to-end).
+    /// has least sort `NeList{ToN}`, exercising structured membership and multi-token sort resolution.
     #[test]
-    fn instantiation_membership_conforms() {
-        conform(
-            conformance_file!("instantiation-membership.maude"),
+    fn instantiated_membership_rewrites_sort() {
+        assert_program_results(
+            module_fixture!("instantiation-membership.maude"),
             &[
                 e("NeList{ToN}", "cons(0, nil)", 1),
                 e("NeList{ToN}", "cons(0, cons(s(0), nil))", 2),
@@ -565,11 +543,11 @@ mod tests {
 
     /// A parameterized `SET{X}` with an associative-commutative union (`id: empty`) instantiated by `ToN`:
     /// a theory operator and AC matching inside a parameterized module, with duplicate singletons collapsing
-    /// via the idempotence equation. Byte-identical to the reference.
+    /// via the idempotence equation.
     #[test]
-    fn instantiation_set_ac_conforms() {
-        conform(
-            conformance_file!("instantiation-set-ac.maude"),
+    fn instantiated_set_supports_ac_matching() {
+        assert_program_results(
+            module_fixture!("instantiation-set-ac.maude"),
             &[
                 e("NeSet{ToN}", "sing(0), sing(s(0))", 1),
                 e("NeSet{ToN}", "sing(0)", 2),
@@ -578,11 +556,11 @@ mod tests {
     }
 
     /// A two-parameter `MAP{K, V}` instantiated by two distinct views (`ToN`, `ToS`): each parameter binds
-    /// independently and the structured sorts use both arguments (`Map{ToN,ToS}`). Byte-identical.
+    /// independently and the structured sorts use both arguments (`Map{ToN,ToS}`).
     #[test]
-    fn instantiation_map_multiparam_conforms() {
-        conform(
-            conformance_file!("instantiation-map.maude"),
+    fn multiparameter_instantiation_binds_independently() {
+        assert_program_results(
+            module_fixture!("instantiation-map.maude"),
             &[
                 e("Nat", "0", 1),
                 e("Map{ToN,ToS}", "put(0 |-> a, put(s(0) |-> b, mt))", 0),
@@ -590,53 +568,52 @@ mod tests {
         );
     }
 
-    /// Axis-A3: a parameterized module `protecting`s the same module its instantiating view targets — the
+    /// A parameterized module `protecting`s the same module its instantiating view targets — the
     /// shared module is merged exactly once (the flatten visited-set), so a membership it carries is not
-    /// double-counted (3 rewrites, not inflated). Byte-identical to the binary; no new engine code (the
-    /// pre-existing dedup already handles it — this pins it as a regression guard).
+    /// double-counted: each command completes in three rewrites.
     #[test]
-    fn param_shared_import_conforms() {
-        conform(
-            conformance_file!("param-shared-import.maude"),
+    fn shared_import_is_merged_once() {
+        assert_program_results(
+            module_fixture!("param-shared-import.maude"),
             &[e("NzN", "s(s(z))", 3), e("NzN", "s(s(s(z)))", 3)],
         );
     }
 
-    /// Axis-A1: view operator maps. `ToFL` maps `op zero to term f0` (op→term) and `op wrap to box`
+    /// View operator maps: `ToFL` maps `op zero to term f0` (op→term) and `op wrap to box`
     /// (op→op); at instantiation both are substituted into `ARR`'s statements, so `d0(mk) = zero = f0` and
-    /// `d1(mk) = wrap(zero) = box(f0)`. Byte-identical to the binary.
+    /// `d1(mk) = wrap(zero) = box(f0)`.
     #[test]
-    fn param_view_opmap_conforms() {
-        conform(
-            conformance_file!("param-view-opmap.maude"),
+    fn view_operator_maps_rewrite_statements() {
+        assert_program_results(
+            module_fixture!("param-view-opmap.maude"),
             &[e("F", "f0", 1), e("F", "box(f0)", 1)],
         );
     }
 
-    /// Axis-A4: a parameter theory `ORD` that `protecting`s a module `B` (sort `Bool`) and `including`s
+    /// A parameter theory `ORD` that `protecting`s a module `B` (sort `Bool`) and `including`s
     /// `TRIV` (sort `Elt`). The parameter copy qualifies only the theory-declared `Elt` (→ `X$Elt`) and
     /// keeps the module-declared `Bool`, so `USE-ORD`'s `-> Bool` resolves; instantiation `USE-ORD{ToNN}`
-    /// maps `Elt ↦ N`, `cmp ↦ le`, so `check(w(n0),w(n0)) = tt`. Byte-identical to the binary.
+    /// maps `Elt ↦ N`, `cmp ↦ le`, so `check(w(n0),w(n0)) = tt`.
     #[test]
-    fn param_theory_module_sorts_conforms() {
-        conform(
-            conformance_file!("param-theory-module-sorts.maude"),
+    fn parameter_theory_qualifies_only_own_sorts() {
+        assert_program_results(
+            module_fixture!("param-theory-module-sorts.maude"),
             &[e("Bool", "tt", 2)],
         );
     }
 
     #[test]
-    fn signature_disambiguated_view_maps_conform() {
-        conform(
-            conformance_file!("audit/A4g-view-specific-map.maude"),
+    fn signature_disambiguated_view_maps_select_overload() {
+        assert_program_results(
+            module_fixture!("audit/A4g-view-specific-map.maude"),
             &[e("X", "x1", 2), e("Y", "y1", 2)],
         );
     }
 
     #[test]
-    fn transformed_module_imports_in_parameter_theories_conform() {
-        conform(
-            conformance_file!("audit/A4h-theory-transformed-imports.maude"),
+    fn transformed_imports_in_parameter_theories_flatten() {
+        assert_program_results(
+            module_fixture!("audit/A4h-theory-transformed-imports.maude"),
             &[
                 e("Truth", "yes", 2),
                 e("BoxI{A4H-ToN-I}", "boxi(zi)", 2),
@@ -645,13 +622,11 @@ mod tests {
         );
     }
 
-    /// Cross-kind ad-hoc operator overloading (the kernel prerequisite nested instantiation surfaced):
-    /// `f : A -> B` and `f : B -> C` are the *same* name+arity in *different* connected components, so they
-    /// are distinct symbols (the argument kind selects the declaration), and `f(f(a))` types as `C`.
-    /// Byte-identical to the reference binary.
+    /// Cross-kind ad-hoc overloads with the same name and arity are distinct symbols. Argument kind
+    /// selects the declaration, so `f : A -> B`, `f : B -> C` gives `f(f(a)) : C`.
     #[test]
-    fn cross_kind_overload_conforms() {
-        conform(
+    fn cross_kind_overload_selects_argument_kind() {
+        assert_program_results(
             "fmod CK is\n\
                sorts A B C .\n\
                op a : -> A [ctor] .\n\
@@ -667,8 +642,7 @@ mod tests {
         );
     }
 
-    /// B-ii: a view whose sort map targets a non-existent sort fails to load, with the reference binary's
-    /// `failed to find sort … in … to represent …` diagnostic.
+    /// A view sort map targeting a nonexistent sort fails to load with a precise source/target diagnostic.
     #[test]
     fn bad_view_rejected_by_load() {
         let src = "fth TRIV is sort Elt . endfth\n\

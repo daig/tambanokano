@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A5g-strategy-import-reflection — source/flat and transformed strategy payloads agree across meta APIs (TNK-005)
+*** Source, flat, and transformed strategy payloads agree across meta APIs.
 mod A5G-COMMON is
   sort S .
   ops a b c d : -> S .

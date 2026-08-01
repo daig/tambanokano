@@ -1,4 +1,4 @@
-*** U09-meta-unify — lifted from the reference suite (Meta/metaUnify.maude)
+*** U09-meta-unify
 *** PRELUDE
 set show timing off .
 set show advisories off .

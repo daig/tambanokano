@@ -1,9 +1,8 @@
-*** B3.5 INT built-in number ops conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/int.maude < /dev/null
+*** INT built-in number operations.
 *** A negative is `-(s^n(0))` via MinusSymbol (`-_`, a ctor): `-(s^n(0))` is canonical (0 rewrites),
-*** `-(-x)` reduces to `x` and `-0` to `0` (1 each). The same ACU/NumberOp symbols as NAT, lifted to
-*** signed via the `minusSymbol` op-hook; `quo`/`rem` truncate toward zero. Mirrors the engine.rs B3.5
-*** test. A `Truth` sort avoids the prelude's built-in `Bool`.
+*** `-(-x)` reduces to `x` and `-0` to `0` (1 each).
+*** Signed via the `minusSymbol` op-hook; `quo`/`rem` truncate toward zero.
+*** A `Truth` sort avoids the prelude's built-in `Bool`.
 fmod INTB is
   sorts Truth Zero NzNat Nat NzInt Int .
   subsorts Zero NzNat < Nat .

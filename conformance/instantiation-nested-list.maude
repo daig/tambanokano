@@ -1,4 +1,4 @@
-*** Axis-A5: nested ground instantiation LIST{List{ToN}} (the LIST{List{Nat}} shape).
+*** Nested ground instantiation LIST{List{ToN}} (the LIST{List{Nat}} shape).
 *** The parameterized view List instantiated by ToN gives a derived view whose target
 *** is LIST{ToN}; LIST{List{ToN}} then has element sort List{ToN}, so cons/nil/app are
 *** ad-hoc overloaded across the Nat / List{ToN} / List{List{ToN}} kinds. An overloaded

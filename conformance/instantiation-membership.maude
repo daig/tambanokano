@@ -1,6 +1,6 @@
 *** A membership over a structured/parameterized sort in a parameterized module: mb cons(H,T) : NeList{E}.
 *** The membership's lhs uses inline-typed variables and its target sort NeList{E} is structured; both
-*** instantiate (E to ToN) so cons(0, nil) has least sort NeList{ToN}. Byte-identical to the reference.
+*** instantiate (E to ToN) so cons(0, nil) has least sort NeList{ToN}.
 fth TRIV is sort Elt . endfth
 fmod NN is sort Nat . op 0 : -> Nat [ctor] . op s : Nat -> Nat [ctor] . endfm
 view ToN from TRIV to NN is sort Elt to Nat . endv

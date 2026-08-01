@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn product_and_raw_product_preserve_reference_order() {
+    fn product_and_raw_product_preserve_canonical_order() {
         let context = BddContext::new(2);
         let mut left = TransitionSet::default();
         left.insert(

@@ -3,6 +3,7 @@ name = "tnk-core"
 description = "tambanokano kernel: terms, GC'd DAG arena, order-sorted types, theories, reduction"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -14,20 +15,15 @@ smt-z3 = ["dep:z3"]
 
 
 [dependencies]
-# D4: arbitrary-precision integers/rationals (pure Rust). Wrapped behind `crate::num` so the kernel
-# never names the backend; `Float` stays IEEE f64. License: LGPL-3.0-only (revisit before distribution).
+# Arbitrary-precision integers and rationals behind `crate::num`; malachite is LGPL-3.0-only.
 malachite = "0.9"
-# Heap-backed stack growth at the nested-condition seam: unbounded rewrite-condition
-# recursion (`crl b => c if b => c .`) must diverge like Maude (interruptible, heap-growing),
-# not abort on call-stack overflow. Used only in `condition_holds`.
+# Heap-backed stack growth at the nested-condition seam: an unbounded rewrite condition remains
+# interruptible and heap-growing instead of aborting on call-stack overflow.
 stacker = "0.1"
-# Order-sorted-unification sort computation (SortBdds + AllSat). Pure Rust —
-# the default build stays pure-Rust without any native BDD library. Replaces
-# Maude's BuDDy.
-
+# Order-sorted-unification sort computation (SortBdds + AllSat). The default build remains pure Rust
+# and requires no native BDD library.
 biodivine-lib-bdd = "0.5.27"
-# D7: optional native SMT backend. All SMT metadata and command plumbing remain in the default
-# pure-Rust build; only DAG-to-z3 translation and solving are gated.
+# Optional native SMT backend; default builds remain pure Rust.
 z3 = { version = "0.20.2", optional = true, default-features = false }
 
 [dev-dependencies]

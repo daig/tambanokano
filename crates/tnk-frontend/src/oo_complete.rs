@@ -1,6 +1,6 @@
-//! Object-pattern completion (Pillar 2.5-E) — a faithful port of Maude's `ooProcess`/`ooTransform.cc`
-//! statement transformer, run by [`load_statements`](crate::load) on the parsed [`Term`]s of an
-//! **object module** (`omod`) before they are compiled into engine equations/rules.
+//! Object-pattern completion for parsed object-module terms. The
+//! transformer runs in [`load_statements`](crate::load) on parsed [`Term`]s from an **object module**
+//! (`omod`) before compilation into engine equations and rules.
 //!
 //! For each object pattern `< O : C | atts >` in a statement, completion makes the statement match objects
 //! that carry *more* than the mentioned attributes, and rules written for a class apply to its subclasses:
@@ -18,11 +18,10 @@
 //!    pattern is added to the pattern as a fresh kind-variable attribute `a(A:[K])` (so the LHS matches
 //!    objects that already carry it).
 //!
-//! Completion is **gated structurally**: it fires only on object patterns whose class argument is a class
-//! constant / class-sorted variable, so CONFIGURATION's own `getClass` equation (`< O : C:Cid | A >`, with
-//! `Cid` not a class sort) and any non-object statement pass through untouched. It runs only for `omod`s
-//! (the [`is_object`](tnk_frontend_ast) flag), matching Maude, but the structural gate makes it a no-op
-//! elsewhere regardless.
+//! Completion is gated structurally: it fires only on object patterns whose class argument is a class
+//! constant or class-sorted variable. CONFIGURATION's `getClass` equation (`< O : C:Cid | A >`, where
+//! `Cid` is not a class sort) and other non-object statements pass through unchanged. The pass is enabled
+//! only for object modules; its structural gate also makes it a no-op for ineligible statements.
 
 use std::collections::HashMap;
 
@@ -34,7 +33,7 @@ use tnk_core::term::{ConditionFragment, Term, Var};
 use crate::build_term::VarIndex;
 use crate::sig::syntax::BuiltModule;
 
-/// Where an object occurrence sits, which decides how completion rewrites it (Maude's `GatherMode`).
+/// Position of an object occurrence, determining how completion rewrites it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// The statement's left-hand side (and its own object patterns) — the *defining* occurrence.
@@ -59,9 +58,9 @@ struct ObjInfo {
     /// The class sort (a strict subsort of `Cid`): the sort of `V` if the class is a constant, or the
     /// declared sort of the class variable.
     class_sort: SortId,
-    /// The class argument's variable index if it is already a variable of class sort; `None` if it is a
-    /// class *constant* (which completion replaces with a fresh `V:class_sort` on all occurrences). A
-    /// class variable must not be used elsewhere in the statement (`checkVariables`).
+    /// The class argument's variable index when it is already a class-sorted variable; `None` when it is
+    /// a class constant that completion replaces with a fresh `V:class_sort` in every occurrence. A
+    /// class variable used elsewhere in the statement disables completion.
     class_var: Option<u32>,
     pattern: Occ,
     subjects: Vec<Occ>,
@@ -74,7 +73,7 @@ struct ObjPlan {
     /// The attribute-set variable term appended to every occurrence (the existing pattern one, or a fresh
     /// `Atts`).
     atts_var: Term,
-    /// The pattern's attribute terms (original + added kind-variable attributes), for RHS missing-copies.
+    /// Existing and added pattern attributes, used to restore attributes missing from a subject occurrence.
     pattern_attrs: Vec<(SymbolId, Term)>,
     /// Kind-variable attributes to add to the LHS pattern (attributes some RHS has but the pattern lacks).
     added_attrs: Vec<(SymbolId, Term)>,
@@ -108,9 +107,9 @@ pub fn complete_statement(
     if !check_variables(&objs, lhs, rhs.as_deref(), cond) {
         return false;
     }
-    // `ObjectSystemRewritingContext::objectMessage` is emitted only when completion changes the
-    // statement. An already class-polymorphic object carrying the shared attribute-set variable, with
-    // identical attribute keys in every occurrence, is already complete.
+    // Report a change only when completion adds or replaces something. A class-polymorphic object that
+    // already carries the shared attribute-set variable, with identical attribute keys in every
+    // occurrence, is already complete.
     let needs_completion = objs.iter().any(|obj| {
         obj.class_var.is_none()
             || obj.pattern.set_var.is_none()
@@ -144,8 +143,8 @@ pub fn complete_statement(
                 Term::var(vars.index_of(&name, info.attr_set_sort), info.attr_set_sort)
             }
         };
-        // Attributes that appear in some RHS/condition occurrence but not in the pattern: add them to the
-        // pattern as fresh kind-variable attributes (Maude uses the attribute's domain kind).
+        // Attributes present in a subject occurrence but absent from the pattern become fresh
+        // kind-variable attributes in the pattern, using each attribute operator's domain kind.
         let pattern_syms: Vec<SymbolId> = obj.pattern.attrs.iter().map(|(s, _)| *s).collect();
         let mut added_attrs: Vec<(SymbolId, Term)> = Vec::new();
         for subj in &obj.subjects {
@@ -195,17 +194,15 @@ fn gather(
         if *symbol == info.object_ctor && args.len() == 3 {
             record_object(args, mode, info, m, objs, ignore);
         }
-        // Fall through to the general case (an object's arguments — or a soup's other elements — may hold
-        // further objects), matching Maude's `gatherObjects`.
+        // Continue recursively because object arguments and other soup elements may contain objects.
         for a in args {
             gather(a, mode, info, m, objs, ignore);
         }
     }
 }
 
-/// Record one object occurrence `< oid : class | atts >` (`args` = `[oid, class, atts]`), updating
-/// `objs`/`ignore` as Maude's `gatherObjects` does for a fresh vs. repeated object name and a pattern vs.
-/// subject position.
+/// Record one `< oid : class | atts >` occurrence, updating gathered state for new or repeated object
+/// identities in pattern and subject positions.
 fn record_object(
     args: &[Term],
     mode: Mode,
@@ -253,7 +250,7 @@ fn record_object(
     }
 }
 
-/// Gather from a condition fragment, mapping each sub-term to its Maude `GatherMode`.
+/// Gather a condition fragment, assigning pattern or subject mode to each of its terms.
 fn gather_condition(
     frag: &ConditionFragment,
     info: &OoInfo,
@@ -283,8 +280,8 @@ fn gather_condition(
 }
 
 /// Classify a class argument. Returns `(class_sort, class_var_index)` for a class-sorted variable
-/// (`Some(index)`) or a class constant — an arity-0 ctor ranging on a class sort — (`None` index), else
-/// `None` (which disables completion). Mirrors `recordClassArgument`.
+/// (`Some(index)`) or an arity-zero constructor whose range is a class sort (`None` index). Any other
+/// term returns `None` and disables completion.
 fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortId, Option<u32>)> {
     match class {
         Term::Var(v) => info
@@ -299,10 +296,9 @@ fn classify_class(class: &Term, info: &OoInfo, m: &BuiltModule) -> Option<(SortI
     }
 }
 
-/// Decompose an attribute-set term into its individual attribute terms (keyed by head operator) plus at
-/// most one attribute-set variable. `None` (disabling completion) on a duplicate attribute, a second
-/// set variable, a variable of a non-AttributeSet sort, or an unrecognized subterm — mirroring
-/// `analyzeAttributeSetArgument`.
+/// Decompose an attribute-set term into its individual attribute terms, keyed by head operator, and at
+/// most one attribute-set variable. A duplicate attribute, second set variable, variable of another
+/// sort, or unrecognized subterm returns `None` and disables completion.
 fn decompose_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule) -> Option<Occ> {
     let mut occ = Occ {
         attrs: Vec::new(),
@@ -341,8 +337,7 @@ fn walk_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule, occ: &mut Occ) -> 
     }
 }
 
-/// Whether `sym` is an attribute operator — its result sort is a **strict** subsort of the AttributeSet
-/// sort (i.e. `Attribute`). Structural stand-in for Maude's `attributeSymbols` membership.
+/// Whether `sym` is an attribute operator: its result is a strict subsort of `AttributeSet`.
 fn is_attribute_op(sym: SymbolId, info: &OoInfo, m: &BuiltModule) -> bool {
     m.engine
         .symbol_declarations(sym)
@@ -352,9 +347,8 @@ fn is_attribute_op(sym: SymbolId, info: &OoInfo, m: &BuiltModule) -> bool {
         })
 }
 
-/// Maude's `checkVariables`: a set variable in the pattern must appear (identically) in every subject
-/// occurrence and nowhere else; if the pattern has no set variable, no subject may have one. Returns
-/// `false` to disable completion.
+/// Require a pattern set variable to occur identically in every subject occurrence and nowhere else.
+/// Without a pattern set variable, no subject may contain one. Failure disables completion.
 fn check_variables(
     objs: &[ObjInfo],
     lhs: &Term,
@@ -374,8 +368,7 @@ fn check_variables(
     }
     for obj in objs {
         let occurrences = 1 + obj.subjects.len();
-        // A class *variable* may be used only as the class of this object's occurrences (once per
-        // occurrence) — reusing it elsewhere disables completion (Maude's `classVariableName` check).
+        // A class variable may appear only once as the class of each occurrence.
         if let Some(cv) = obj.class_var
             && counts.get(&cv).copied().unwrap_or(0) > occurrences
         {
@@ -472,7 +465,7 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
     let mut elems: Vec<Term> = Vec::new();
     match mode {
         Mode::Pattern => {
-            // Original attributes, then the added kind-variable attributes (subject-only ones).
+            // Existing pattern attributes, followed by attributes introduced for subject-only keys.
             elems.extend(own.attrs.iter().map(|(_, t)| t.clone()));
             elems.extend(plan.added_attrs.iter().map(|(_, t)| t.clone()));
         }
@@ -494,9 +487,8 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
     };
 }
 
-/// The kind (top/error sort) of an attribute operator's argument, for a fresh kind-variable attribute
-/// `a(A:[K])` (Maude's `at.first->domainComponent(0)->sort(Sort::KIND)`). Attribute operators are unary
-/// (`a :_ : S -> Attribute`); on the degenerate 0-ary case, fall back to the AttributeSet kind.
+/// Return the kind sort of an attribute operator's argument. Attribute operators are unary; a nullary
+/// edge case falls back to the `AttributeSet` kind.
 fn attribute_kind_sort(m: &BuiltModule, info: &OoInfo, attr_sym: SymbolId) -> SortId {
     let sorts = m.engine.sorts();
     let dom = m
@@ -529,8 +521,7 @@ fn condition_terms(frag: &ConditionFragment) -> Vec<&Term> {
     }
 }
 
-/// Choose a variable name not already used in `vars`: the bare `base`, else `base2`, `base3`, … (Maude's
-/// `chooseFreshVariableName`, whose numbering starts at 2).
+/// Choose an unused variable name: `base`, then `base2`, `base3`, and so on.
 fn choose_fresh(base: &str, vars: &VarIndex) -> String {
     let used = |name: &str| (0..vars.count()).any(|i| vars.name(i) == name);
     if !used(base) {

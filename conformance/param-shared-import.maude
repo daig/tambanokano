@@ -1,7 +1,7 @@
-*** B-iv / Axis-A3: a parameterized module BOX{X :: TRIV} protects NUM, and is instantiated by a
+*** A parameterized module BOX{X :: TRIV} protects NUM and is instantiated by a
 *** view whose target IS NUM. The shared module must be merged EXACTLY ONCE (the flatten visited-set),
 *** not once via the import and again via the view target. A membership (mb s(W) : NzN, which counts as
-*** a rewrite) makes a double-merge observable: it would inflate the count. Byte-identical to the binary.
+*** a rewrite) makes a double-merge observable: it would inflate the count.
 fth TRIV is sort Elt . endfth
 
 fmod NUM is

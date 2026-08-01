@@ -1,4 +1,4 @@
-*** V02-variant-matching — lifted from the reference suite (Misc/variantMatching.maude)
+*** V02-variant-matching
 *** PRELUDE
 set show timing off .
 

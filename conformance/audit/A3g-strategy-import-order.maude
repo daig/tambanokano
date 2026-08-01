@@ -1,4 +1,4 @@
-*** A3g-strategy-import-order — definition order/counts, diamond dedup, and independent conflicts (TNK-005)
+*** Strategy definitions preserve order/counts, deduplicate diamonds, and retain independent conflicts.
 mod A3G-COMMON is
   sort S .
   ops a b c d e : -> S .

@@ -244,8 +244,8 @@ pub(crate) fn check_rewrite_system(
         return None;
     };
 
-    // The model checker searches for a behavior satisfying the negated property. Reduction through the
-    // shipped LTL equations both charges the exact rewrites and puts the formula in negative normal form.
+    // The checker searches for a behavior satisfying the negated property. Reducing the negation
+    // both charges its equational rewrites and converts the formula to negative normal form.
     let initial_root = runtime.root(*initial);
     let negated = runtime.make_free(signature, hooks.temporal.not_symbol, vec![*property]);
     let negated = runtime.reduce(signature, negated, descent);

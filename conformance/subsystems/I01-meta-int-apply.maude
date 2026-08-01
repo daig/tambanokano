@@ -1,5 +1,4 @@
-*** I01-meta-int-apply — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntApply.maude; oracle verified 2026-07-23.
+*** I01-meta-int-apply
 *** PRELUDE
 set show timing off .
 set show advisories off .

@@ -1,10 +1,7 @@
-//! `build_grammar`: construct a module's mixfix CF [`Grammar`] from its [`BuiltModule`] — a port of
-//! `MixfixModule::makeComponentProductions` + `makeSymbolProductions` (`makeGrammar.cc`).
+//! `build_grammar` constructs a module's mixfix [`Grammar`] from its [`BuiltModule`].
 //!
-//! Emission order follows Maude: **component productions** (per kind: sort names, the `TERM` injection,
-//! parentheses, flattened assoc lists) and the declared-variable productions first, then **symbol
-//! productions** (per operator: constants, prefix/assoc-prefix forms, mixfix forms, the successor
-//! numeral). Order is observable (it decides the first parse on ambiguity), so it is preserved.
+//! Component productions and declared variables are emitted before per-operator productions. This
+//! order decides the first parse on ambiguous input.
 //!
 //! Iter-symbol productions cover both genuine prefix names (`g^n(t)`) and canonical mixfix names
 //! (`s_^n(t)`), alongside built-in literal, sort-disambiguation, colon-variable, and structured-sort
@@ -42,7 +39,7 @@ fn dot_sort_terminals(name: &str, interner: &mut Interner) -> Vec<GSym> {
 }
 
 /// Build the per-module mixfix grammar. Interns the punctuation/sort-name tokens it needs (idempotent —
-/// they share the module's interner, so a grammar terminal's [`Sym`] equals the lexed input token's).
+/// they share the module's interner, so a grammar terminal's [`crate::lex::Sym`] equals the lexed input token's).
 pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
     let mut g = Grammar::default();
     let sorts = m.engine.sorts();
@@ -96,11 +93,9 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
             Action::PassThru,
         );
 
-        // Sort disambiguation: `<FooTerm> ::= ( <FooTerm> ) .Sort` for each sort of this kind (Maude's
-        // `(t).Sort` syntax — the inverse of the printer's `(t).Sort` disambiguation of an ad-hoc-overloaded
-        // term). The `.Sort` qualifier selects this kind, so an overloaded constant like `nil` (one per
-        // kind) round-trips. The qualifier lexes with the leading dot fused to the base token
-        // (`.List{ToN}` → `.List { ToN }`); the inner term passes through unchanged.
+        // Sort qualifier: `<FooTerm> ::= ( <FooTerm> ) .Sort`. The qualifier selects the result kind,
+        // allowing overloaded constants to round-trip. Structured qualifiers lex as multiple fragments;
+        // the inner term passes through unchanged.
         for &member in &sorts.kind(k).members {
             let mut rhs = vec![GSym::T(lp), GSym::N(term_nt), GSym::T(rp)];
             rhs.extend(dot_sort_terminals(sorts.name(member), interner));
@@ -141,9 +136,7 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
         );
     }
 
-    // On-the-fly variable productions: `<FooTerm> ::= name:Foo` for every sort (Maude's colon-variable
-    // syntax) — a `name:sort` token of that sort, the whole token becoming the variable name. Iterated in
-    // SortId order for a reproducible grammar.
+    // Add `name:sort` variable productions for each sort in stable `SortId` order.
     let mut sort_names: Vec<(&String, SortId)> = m.sorts.iter().map(|(n, &s)| (n, s)).collect();
     sort_names.sort_by_key(|&(_, s)| s);
     for (sort_name, sort_id) in sort_names {
@@ -183,9 +176,8 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
     g
 }
 
-/// The canonical glued name of a mixfix operator — its fragments concatenated, holes written `_`
-/// (`[Tok(s), Hole]` → `s_`). Matches Maude's `Token::name` for the symbol; used to key the `iter`-token
-/// terminal against the base name of an `f^count` input token.
+/// Canonical glued mixfix name: concatenate fragments and write holes as `_`. Used to match the base
+/// name of an `f^count` token.
 fn glued_name(frags: &[Frag], interner: &Interner) -> String {
     let mut s = String::new();
     for f in frags {
@@ -197,8 +189,8 @@ fn glued_name(frags: &[Frag], interner: &Interner) -> String {
     s
 }
 
-/// Productions for one operator (`makeSymbolProductions` body). All tokens it needs are either
-/// pre-interned operator-name fragments or the punctuation passed in `(lp, rp, comma)`.
+/// Productions for one operator. All required tokens are either pre-interned operator-name fragments or
+/// the punctuation passed in `(lp, rp, comma)`.
 fn symbol_productions(
     g: &mut Grammar,
     m: &BuiltModule,
@@ -212,7 +204,7 @@ fn symbol_productions(
     let range_nt = Nt::Comp(sorts.kind_of(syn.range), NtType::Term);
     let arg_nt = |k: usize| GSym::N(Nt::Comp(sorts.kind_of(syn.domain[k]), NtType::Term));
     // `SMT_NumberSymbol` is a pseudo-constructor, not a literal named `<Integers>`/`<Reals>`.
-    // Its productions are lexical number classes exactly as in `makeGrammar.cc`.
+    // Its productions use lexical number classes rather than literal labels.
     if m.engine.symbol(sym).is_smt_number() {
         debug_assert_eq!(nr_args, 0);
         let kind = m
@@ -297,9 +289,8 @@ fn symbol_productions(
                 Action::MakeNatural(sym),
             );
         }
-        // A minus symbol additionally accepts a negative numeral: `<rangeTerm> ::= SMALL_NEG` (Maude's
-        // `MAKE_INTEGER`). `-7` is one `SMALL_NEG` token; `- 7` and `5 - 7` keep `-` as the `-_`/`_-_`
-        // operator token, so prefix negation and binary subtraction are unaffected.
+        // Unary minus accepts one glued negative-integer token. Spaced minus remains an operator, so
+        // prefix negation and binary subtraction are unaffected.
         if m.minus_sym == Some(sym) {
             push(
                 g,
@@ -310,26 +301,23 @@ fn symbol_productions(
                 Action::MakeInteger(sym),
             );
         }
-        // A division symbol additionally accepts a glued rational literal: `<rangeTerm> ::= RATIONAL`
-        // (Maude's `MAKE_RATIONAL` → `DivisionSymbol::makeRatTerm`). A negative numerator needs the
-        // `MinusSymbol`; RAT always imports it (INT), but guard so the production is well-formed.
-        if m.division_sym == Some(sym) {
-            if let Some(minus) = m.minus_sym {
-                push(
-                    g,
-                    range_nt,
-                    vec![GSym::T(Terminal::Rational)],
-                    0,
-                    vec![],
-                    Action::MakeRational {
-                        division: sym,
-                        minus,
-                    },
-                );
-            }
+        // Division accepts one glued rational token. A negative numerator also requires unary minus.
+        if m.division_sym == Some(sym)
+            && let Some(minus) = m.minus_sym
+        {
+            push(
+                g,
+                range_nt,
+                vec![GSym::T(Terminal::Rational)],
+                0,
+                vec![],
+                Action::MakeRational {
+                    division: sym,
+                    minus,
+                },
+            );
         }
-        // An `iter` symbol additionally accepts the `f^count(t)` iter-token form: `<rangeTerm> ::=
-        // ITER_SYMBOL ( <argTerm> )` (Maude's `MAKE_ITER`). The `iter` axiom forces arity 1.
+        // Iteration symbols accept `f^count(<arg>)`; the axiom requires arity one.
         if syn.iter && nr_args == 1 {
             let name_str = glued_name(&syn.frags, interner);
             let name = interner.intern(&name_str);
@@ -347,7 +335,7 @@ fn symbol_productions(
                 Action::MakeIter(sym),
             );
         }
-        // (Deferred B4.5: the `s_(t)` prefix form.)
+        // The parenthesized prefix spelling of a hole-bearing name (for example `s_(t)`) is not generated.
         return;
     }
 
@@ -501,7 +489,7 @@ endfm
         let (m, _i, g) = build(NATB);
         let plus = m.ops[&("_+_".to_string(), 2)];
         let ps = prods_for(&g, plus);
-        // Exactly the mixfix form (assoc-prefix and `_+_(a,b)` are deferred): prec 41, gather [40,41].
+        // Select the mixfix production and verify precedence 41 with gather [40, 41].
         let mix = ps
             .iter()
             .find(|p| p.prec == 41)

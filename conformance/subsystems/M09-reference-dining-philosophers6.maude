@@ -1,4 +1,4 @@
-*** M09-reference-dining-philosophers6 — exact reference source, including setup reduce/search
+*** M09-reference-dining-philosophers6 — dining philosophers setup reduce/search
 *** PRELUDE
 set show timing off .
 set show advisories off .

@@ -1,10 +1,10 @@
-*** B3-mb-extension — AC (conditional) memberships are not applied through extension
+*** B3-mb-extension — AC (conditional) memberships applied through extension
 *** Over AC _|_, a membership whose LHS is a proper sub-multiset of the subject must fire through extension.
-*** MB-EXT: mb a | a : Special. red a | a is 1 rewrite on both engines by a direct match. red a | a | a stays
-*** 1 rewrite on the oracle because it fires through extension, but is 0 on tnk.
-*** CMB-EXT: cmb a | a : Special if a = a. The subject a | a | h(h(a)) reduces h(h(a)) to a in 2 rewrites on
-*** both engines; the oracle then applies the cmb through extension for a third rewrite, so 3, tnk skips it, so 2.
-*** Result term a | a | a and its printed sort agree on both; the COUNT is the pin.
+*** MB-EXT: mb a | a : Special. red a | a is 1 rewrite by a direct match. red a | a | a
+*** expected parity: 1 rewrite through extension.
+*** CMB-EXT: cmb a | a : Special if a = a. The subject a | a | h(h(a)) reduces h(h(a)) to a in 2 rewrites;
+*** expected parity then applies the cmb through extension for a third rewrite (total 3).
+*** Result term a | a | a and its printed sort agree; the COUNT is the pin.
 fmod MB-EXT is
   sorts E Special .
   subsort Special < E .

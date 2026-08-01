@@ -1,5 +1,4 @@
-*** I02-meta-int-match — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntMatch.maude; oracle verified 2026-07-23.
+*** I02-meta-int-match
 *** PRELUDE
 set show timing off .
 set show advisories off .

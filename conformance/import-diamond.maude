@@ -1,4 +1,4 @@
-*** B5: a diamond import — TOP imports LEFT and RIGHT, both protecting BASE; BASE included exactly once.
+*** A diamond import: TOP imports LEFT and RIGHT, both protecting BASE; BASE is included exactly once.
 fmod BASE is
   sort N .
   op 0 : -> N [ctor] .

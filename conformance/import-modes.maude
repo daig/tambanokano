@@ -1,4 +1,4 @@
-*** B5: protecting / extending / including all flatten identically (mode is a semantic annotation only).
+*** Protecting, extending, and including flatten identically; mode is a semantic annotation only.
 fmod NAT0 is
   sort N .
   op 0 : -> N [ctor] .

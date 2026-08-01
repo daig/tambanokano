@@ -1,30 +1,19 @@
-//! A port of Maude's `AutoWrapBuffer` (`IO_Stuff/autoWrapBuffer.{hh,cc}`) — the line-wrapper Maude
-//! installs on stdout. Long output is broken across lines at a column limit, with wrapped continuation
-//! lines indented by [`LEFT_MARGIN`] spaces; breaks land only at "legal positions" (a space, or just
-//! after a `,([{`) and never inside a `"string"` or an `ESC … m` color sequence. Maude applies it to the
-//! whole output stream, so our REPL applies it once at the [`eval`](crate::Repl::eval) boundary — making
-//! our printed output byte-for-byte identical to `maude file.maude` even for a very long result (C13;
-//! e.g. `fib(22)`'s 17711-successor numeral wraps to ~190 lines exactly as the reference does).
+//! Fixed-width output wrapping with four-space continuation indentation. Breaks occur only at legal ASCII
+//! positions and never inside string literals or ANSI color sequences.
 //!
-//! Ported faithfully, including the per-byte width accounting (so a multibyte UTF-8 char counts as
-//! several columns, as in Maude) and the "token too long to ever fit" hard-dump. Breaks are only ever
-//! inserted at ASCII boundaries (before a buffered run that began after a space/`,([{`), so the wrapped
-//! byte stream stays valid UTF-8.
+//! Width is measured per byte, so a multibyte UTF-8 character occupies multiple columns. Oversized tokens
+//! are emitted intact. Breaks occur only at ASCII boundaries, preserving valid UTF-8 output.
 
-/// Maude's `DEFAULT_COLUMNS` — the wrap width when stdout is not a terminal (the case differential
-/// testing exercises: `maude file.maude` piped). A wrapped line is kept to `LINE_WIDTH - RIGHT_MARGIN`
-/// (79) columns.
+/// Noninteractive wrap width; content may occupy 79 columns before the right margin.
 const LINE_WIDTH: i32 = 80;
-/// Indent of a wrapped continuation line (`AutoWrapBuffer::LEFT_MARGIN`).
+/// Continuation-line indentation.
 const LEFT_MARGIN: i32 = 4;
-/// Columns kept clear at the right (`AutoWrapBuffer::RIGHT_MARGIN`): a line may fill to column
-/// `LINE_WIDTH - RIGHT_MARGIN`.
+/// Columns reserved at the right edge.
 const RIGHT_MARGIN: i32 = 1;
 /// `pending_width` sentinel: not currently buffering (no legal break position is pending).
 const UNDEFINED: i32 = -1;
 
-/// Wrap `input` exactly as Maude's stdout `AutoWrapBuffer` would. Pure: no terminal-width detection (it
-/// uses Maude's non-TTY default of 80, which is what the reference binary uses when its output is piped).
+/// Wrap using the fixed noninteractive width without terminal detection.
 pub fn auto_wrap(input: &str) -> String {
     let mut w = Wrapper::default();
     for &b in input.as_bytes() {
@@ -33,9 +22,9 @@ pub fn auto_wrap(input: &str) -> String {
     w.finish()
 }
 
-/// The streambuf state machine. `pending` holds bytes seen since the last legal break position; once a
-/// further legal position is reached, [`decide_on_break`](Self::decide_on_break) either dumps them in
-/// place or, if dumping would overrun the right margin, inserts a newline + indent *before* them.
+/// Wrapping state machine. `pending` holds bytes seen since the last legal break position; at the next
+/// legal position, [`decide_on_break`](Self::decide_on_break) either emits them in place or inserts a
+/// newline and indentation before them when they would overrun the right margin.
 struct Wrapper {
     out: Vec<u8>,
     /// Column the cursor would be at if `pending` were printed.
@@ -65,14 +54,13 @@ impl Default for Wrapper {
 }
 
 impl Wrapper {
-    /// `AutoWrapBuffer::dumpBuffer` — emit the pending bytes, keeping buffering off until restarted.
+    /// Emit the pending bytes, keeping buffering off until it is restarted.
     fn dump_buffer(&mut self) {
         self.out.extend_from_slice(&self.pending);
         self.pending.clear();
     }
 
-    /// `AutoWrapBuffer::handleEscapeSequenceChar` — a `\t`/ESC byte: buffered (if buffering) but not
-    /// counted toward the width.
+    /// Handle a `\t` or ESC byte: buffer it when buffering is active, but do not count it toward width.
     fn handle_escape_char(&mut self, ch: u8) {
         if self.pending_width == UNDEFINED {
             self.out.push(ch);
@@ -81,9 +69,7 @@ impl Wrapper {
         }
     }
 
-    /// `AutoWrapBuffer::handleChar` — a printable byte: buffered and counted, or emitted directly when not
-    /// buffering. A pending run that grows past what could *ever* fit on a fresh wrapped line is dumped
-    /// and buffering disabled (a hard-wrapped token Maude does not try to avoid).
+    /// Buffer printable bytes until a legal break. Oversized indivisible tokens are emitted intact.
     fn handle_char(&mut self, ch: u8) {
         if self.pending_width == UNDEFINED {
             self.out.push(ch);
@@ -97,8 +83,8 @@ impl Wrapper {
         }
     }
 
-    /// `AutoWrapBuffer::decideOnBreak` — at a fresh legal break position, decide whether the pending run
-    /// should start a new (indented) line because dumping it in place would overrun the right margin.
+    /// At a legal break position, move the pending run to a new indented line if emitting it in place
+    /// would overrun the right margin.
     fn decide_on_break(&mut self) {
         if self.pending_width == UNDEFINED {
             return;
@@ -128,13 +114,13 @@ impl Wrapper {
         self.pending_width = UNDEFINED;
     }
 
-    /// `AutoWrapBuffer::legalPositionToBreak` — mark that a `\n` could be inserted here; start buffering.
+    /// Mark a legal newline position and start buffering.
     fn legal_position_to_break(&mut self) {
         self.pending_width = 0;
         self.cursor = self.cursor.rem_euclid(LINE_WIDTH);
     }
 
-    /// `AutoWrapBuffer::overflow` — process one output byte.
+    /// Process one output byte.
     fn byte(&mut self, ch: u8) {
         if self.in_escape {
             self.handle_escape_char(ch);
@@ -146,8 +132,7 @@ impl Wrapper {
         if !is_print(ch) {
             self.in_string = false;
         }
-        // `normal` replays Maude's `goto normal` (handle the byte as content); the special cases that
-        // break out of the switch leave it false.
+        // `normal` means the byte is ordinary content; structural branches leave it false.
         let mut normal = false;
         match ch {
             b'"' => {
@@ -199,22 +184,19 @@ impl Wrapper {
         self.seen_backslash = self.in_string && !self.seen_backslash && ch == b'\\';
     }
 
-    /// Flush at end-of-stream: Maude's result line ends with a `\n` whose `decideOnBreak` flushes (and
-    /// possibly wraps) the final pending run; the REPL trims that trailing newline, so we reproduce the
-    /// same break decision here without emitting the newline itself.
+    /// Flush the final pending run without appending a newline.
     fn finish(mut self) -> String {
         self.decide_on_break();
         String::from_utf8(self.out).expect("wrap inserts breaks only at ASCII boundaries")
     }
 }
 
-/// `isprint` for a byte (C locale): printable ASCII `0x20..=0x7e`. High/control bytes are non-printing,
-/// which (matching Maude) drops us out of `"string"` mode.
+/// Printable ASCII byte predicate. High and control bytes end string mode.
 fn is_print(ch: u8) -> bool {
     (0x20..=0x7e).contains(&ch)
 }
 
-/// `AutoWrapBuffer::nextTabPosition` — round up to the next 8-column tab stop.
+/// Round up to the next eight-column tab stop.
 fn next_tab(pos: i32) -> i32 {
     (pos + 8) & !7
 }
@@ -231,8 +213,7 @@ mod tests {
         assert_eq!(auto_wrap("Bye."), "Bye.");
     }
 
-    /// Every wrapped line stays within `LINE_WIDTH - RIGHT_MARGIN` (79) columns, and continuation lines
-    /// carry the 4-space indent — the structural invariant of Maude's wrapper.
+    /// Wrapped lines fit the 79-column content width and continuations carry four spaces.
     #[test]
     fn wraps_at_seventy_nine_columns_with_indent() {
         let long = format!("result Nat: {}", "s ".repeat(200));

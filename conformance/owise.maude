@@ -1,6 +1,5 @@
-*** B2.3b owise (otherwise) conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/owise.maude < /dev/null
-*** An owise equation applies only when no non-owise equation matches. Mirrors the engine.rs tests.
+*** Owise (otherwise) conformance
+*** An owise equation applies only when no non-owise equation matches.rs tests.
 
 fmod OWISE-EQ is
   sorts Nat Truth .

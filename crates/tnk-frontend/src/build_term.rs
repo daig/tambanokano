@@ -1,12 +1,9 @@
 //! `build_term`: walk a parse [`PTree`] into a kernel [`Term`], and the end-to-end glue that takes a
 //! command/term token bubble through lex-built grammar → Earley parse → forest → term → reduce.
 //!
-//! A port of the functional subset of Maude's `MixfixParser::makeTerm` (`mixfixParser.cc`): each
-//! production carries an [`Action`] resolved at grammar-build time, and the tree-walk dispatches on it —
-//! `MakeTerm` builds `symbol(args…)` from the nonterminal children (flattening a single assoc-list child,
-//! Maude's `makeAssocList`); `MakeVariable` resolves a token to a statement-local variable index;
-//! `MakeNatural` and `MakeIter` build one compact bignum-backed [`Term::Iter`]; `PassThru` forwards its
-//! one child. Instantiation preserves that compact S-theory representation in the runtime DAG.
+//! Each grammar production carries a pre-resolved [`Action`]. The tree walk builds operator
+//! applications, flattens associative-list children, assigns statement-local variable indices, keeps
+//! iteration counts compact, and forwards pass-through nodes.
 
 use crate::cfparser::compile::CompiledGrammar;
 use crate::cfparser::forest::PTree;
@@ -20,8 +17,8 @@ use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
 
-/// Assigns each distinct variable *name* a statement-local index (Maude's `Term`s index variables, not
-/// name them). Shared across a statement's lhs/rhs/condition so the same name maps to the same index.
+/// Assign each distinct variable name a statement-local index. One index is shared across a
+/// statement's left side, right side, and condition.
 #[derive(Debug, Default, Clone)]
 pub struct VarIndex {
     entries: Vec<(String, SortId)>,
@@ -155,8 +152,7 @@ pub fn build_term(
     }
 }
 
-/// The argument terms for a `MakeTerm`: the nonterminal children, except that a single associative-list
-/// child is flattened to the operator's full argument sequence (Maude's `makeAssocList`).
+/// Build a `MakeTerm` argument list, flattening a lone associative-list child into its elements.
 fn make_args(
     tree: &PTree,
     _sym: SymbolId,
@@ -176,8 +172,7 @@ fn make_args(
     }
 }
 
-/// Flatten a left-recursive assoc-list subtree into its element terms, left-to-right (Maude's
-/// `makeAssocList`: collect right children walking left, then the leftmost, then reverse).
+/// Flatten a left-recursive associative-list subtree into element terms from left to right.
 fn flatten_assoc(
     node: &PTree,
     g: &CompiledGrammar,
@@ -186,11 +181,8 @@ fn flatten_assoc(
     i: &Interner,
     vars: &mut VarIndex,
 ) -> Result<Vec<Term>, String> {
-    // Collect the element subtrees walking the left-recursive list (right child, then descend
-    // left), then reverse to left-to-right BEFORE building — so variables are indexed into `vars`
-    // in source (left-to-right) order, matching Maude's post-normalize `indexVariables`. (Building
-    // during the right-to-left walk would index them reversed: invisible to reduce/match but wrong
-    // for the observable `unify` slot/print order.)
+    // Collect right children while walking the left spine, then reverse before building. This preserves
+    // source-order variable indexing and therefore observable unification slot and print order.
     let mut subtrees: Vec<&PTree> = Vec::new();
     let mut cur = node;
     loop {
@@ -286,6 +278,7 @@ pub fn build_dag(
 
 /// Build a symbolic command DAG directly, keeping variables as genuine logic-variable leaves.
 /// Unlike [`build_term`], compact `f^N(arg)` iteration remains one bignum-backed DAG node.
+#[allow(clippy::too_many_arguments)]
 pub fn build_logic_dag(
     tree: &PTree,
     g: &CompiledGrammar,
@@ -431,8 +424,7 @@ fn build_dag_inner(
                 let token = &tokens[tree.start];
                 let name = token.text(i);
                 let index = vars.index_of(name, sort);
-                // Maude's MAKE_VARIABLE calls `Token::split` and stores the base-name code in the
-                // VariableTerm; the full `X:Sort` token code is not the variable id.
+                // Store the base-name token code; the full `X:Sort` token is not the variable identity.
                 let base = name.split_once(':').map_or(name, |(base, _)| base);
                 let name = i.get(base).unwrap_or(token.sym).index();
                 Ok(engine.make_var(sort, name, index))
@@ -446,6 +438,7 @@ fn build_dag_inner(
 /// The argument DAGs for a `MakeTerm`: the nonterminal children, flattening a single assoc-list child to
 /// the operator's full argument sequence (the `build_term` `make_args` analogue, on the DAG side). A
 /// manual loop (not `map`) so the `&mut Engine` reborrows per child.
+#[allow(clippy::too_many_arguments)]
 fn dag_args(
     tree: &PTree,
     g: &CompiledGrammar,
@@ -487,6 +480,7 @@ fn dag_args(
     Ok(args)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flatten_dag_assoc(
     node: &PTree,
     g: &CompiledGrammar,
@@ -528,13 +522,11 @@ fn flatten_dag_assoc(
     Ok(args)
 }
 
-/// Strip a string literal's surrounding quotes and undo its escapes (the lexer keeps the quotes),
-/// yielding the raw **byte** value. Maude strings are byte sequences, so this iterates the token text's
-/// bytes — a source literal `"héllo"` is UTF-8 in the file, so its 6 source bytes become 6 value bytes.
-/// Ported from `Token::stringToRope`: backslash-newline is a source continuation (both bytes disappear);
-/// the named control escapes `\a`(7) `\b`(8) `\f`(12) `\n \r \t` `\v`(11), `\"`, `\\`, a 1–3 digit
-/// octal escape (value truncated to a byte, C semantics), and any other `\c` → the bare byte `c`
-/// (e.g. `\q` → `q`, verified against the oracle).
+/// Strip a string literal's surrounding quotes and decode its escapes into a raw **byte** value. The
+/// lexer retains the quotes, and this function iterates the token text's bytes: `"héllo"` occupies six
+/// UTF-8 bytes and therefore yields six value bytes. Backslash-newline is a continuation and removes
+/// both bytes. Named control escapes are `\a`(7), `\b`(8), `\f`(12), `\n`, `\r`, `\t`, `\v`(11),
+/// `\"`, and `\\`; a 1–3 digit octal escape is truncated to one byte, and any other `\c` yields `c`.
 pub fn unquote_string(tok: &str) -> Vec<u8> {
     let inner = tok
         .strip_prefix('"')
@@ -562,7 +554,7 @@ pub fn unquote_string(tok: &str) -> Vec<u8> {
             b't' => out.push(b'\t'),
             b'v' => out.push(0x0b),
             b'0'..=b'7' => {
-                // 1–3 octal digits; the value wraps to a byte (C `char` truncation: `\400` → 0).
+                // Read 1–3 octal digits and truncate the accumulated value to one byte (`\400` → 0).
                 let mut val: u32 = 0;
                 let mut n = 0;
                 while n < 3 && matches!(bytes.get(i), Some(b'0'..=b'7')) {
@@ -606,8 +598,8 @@ fmod NATB is
 endfm
 ";
 
-    /// A self-contained harness over NATB: parse a term, build it, reduce it, and report `(result-sort
-    /// name, rewrite count, deep-equal to a reference numeral)`.
+    /// Parse, build, and reduce a NATB term, reporting its result sort, rewrite count, and equality with
+    /// an expected numeral.
     struct Natb {
         m: BuiltModule,
         i: Interner,
@@ -642,7 +634,7 @@ endfm
             (r, self.m.engine.rewrites())
         }
 
-        /// A reference numeral `s^n(0)` built directly via the kernel.
+        /// An expected numeral `s^n(0)` built directly through the engine.
         fn numeral(&mut self, n: u64) -> tnk_core::dag::DagId {
             let z = self.m.engine.make_const(self.m.nat_zero.unwrap());
             self.m.engine.make_iter(self.m.nat_succ.unwrap(), n, z)
@@ -663,10 +655,10 @@ endfm
         s
     }
 
-    /// The B4.4b milestone for terms: parse `.maude` text → reduce → matches a kernel-built reference,
-    /// with the binary's result sort and rewrite count.
+    /// Parse module text and check arithmetic results against engine-built expected numerals, including
+    /// the result sort and rewrite count.
     #[test]
-    fn reduces_arithmetic_to_reference_numerals() {
+    fn reduces_arithmetic_to_expected_numerals() {
         let mut e = natb();
 
         let (r, rw) = e.reduce("2 + 3");

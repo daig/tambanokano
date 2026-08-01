@@ -1,7 +1,6 @@
 *** Full-trace fixture: membership-axiom steps. The trace shows the membership header, the mb body, the
 *** substitution, then a sort narrowing line "oldSort: term becomes newSort" -- not a term rewrite. Two
 *** memberships lower g(g(a)) from sort A: g(a) becomes B inner, g(g(a)) becomes C outer.
-***   ~/Downloads/Maude-3/maude -no-banner conformance/trace-membership.maude < /dev/null
 fmod MB-CHAIN is
   sorts A B C .
   subsorts C < B < A .

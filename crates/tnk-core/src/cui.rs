@@ -61,11 +61,10 @@ impl CuiLhs {
     /// - a CUI node of this operator: the whole-node pairings (both orders when `comm`), preceded —
     ///   when extension is allowed and the op has `id:` — by the **collapse-extension** pairings
     ///   (one pattern operand takes the identity, the other matches ONE argument, the remaining
-    ///   argument is the residue: `eq a * X = c` on `a * b` gives `b * c`, oracle-verified;
-    ///   identity-first ordering).
-    /// - any other subject, for an op with `id:`/`idem`: the **collapse** arms (Maude's
-    ///   id0/id1/idemCollapseMatch) — one operand vs the identity dag and the other vs the whole
-    ///   subject (id), or both operands vs the subject (idem).
+    ///   argument is the residue: `eq a * X = c` on `a * b` gives `b * c`, with identity-first
+    ///   ordering).
+    /// - any other subject, for an op with `id:`/`idem`: one operand matches the identity and the
+    ///   other the whole subject (`id:`), or both operands match the whole subject (`idem`).
     pub(crate) fn match_(
         &self,
         rt: &Runtime,
@@ -192,6 +191,9 @@ fn collect_vars(t: &Term, out: &mut Vec<u32>) {
     }
 }
 
+type CuiBindings = Vec<(u32, DagId)>;
+type CuiSolution = (CuiBindings, Option<DagId>);
+
 /// A resumable enumerator over the (at most two, deduped) commutative pairings of a [`CuiLhs`]. The
 /// pairings are enumerated lazily on the first [`next`](CuiSubproblem::next) — each argument is matched
 /// through the full matcher seam, so a theory-rooted argument needs `&mut Runtime` — then replayed.
@@ -204,7 +206,7 @@ pub(crate) struct CuiSubproblem {
     /// The pairing options, in match-preference order (identity/collapse first).
     pairings: Vec<Pairing>,
     /// Deduped pairing solutions (bindings + the pairing's residue); `None` until the first `next`.
-    solutions: Option<Vec<(Vec<(u32, DagId)>, Option<DagId>)>>,
+    solutions: Option<Vec<CuiSolution>>,
     cursor: usize,
     bound: Vec<u32>,
     /// The most recent solution's unmatched argument (collapse-extension), spliced by `build_result`.
@@ -229,7 +231,7 @@ impl CuiSubproblem {
                 Target::Dag(d) => d,
                 Target::Identity => id_dag.expect("Identity target only built when id: present"),
             };
-            let mut sols: Vec<(Vec<(u32, DagId)>, Option<DagId>)> = Vec::new();
+            let mut sols: Vec<CuiSolution> = Vec::new();
             for p in &self.pairings {
                 let (a, b) = (resolve(p.t1), resolve(p.t2));
                 let aliens = [(self.p1.clone(), a), (self.p2.clone(), b)];
@@ -281,7 +283,7 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
 
-    /// `match f(X, Y) <=? f(a, b)` over `[comm]` — the two commutative pairings (== reference binary).
+    /// `match f(X, Y) <=? f(a, b)` over `[comm]` yields both commutative pairings.
     #[test]
     fn cui_match_two_pairings() {
         let mut e = Engine::new();

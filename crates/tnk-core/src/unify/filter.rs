@@ -1,16 +1,11 @@
-//! The irredundant-unification filter — Maude's `UnifierFilter` (`src/Higher/unifierFilter.cc`):
-//! keep a minimal set of unifiers that are most general on the original ("interesting") variables,
-//! discarding any unifier that is an instance of a retained one.
+//! The irredundant-unification filter keeps a minimal set of unifiers that are most general on the
+//! input variables, discarding any unifier that is an instance of a retained one.
 //!
-//! Maude tests subsumption by *matching* the retained unifier's bindings against the candidate's. We
-//! express the same relation as unification, because tnk's unifier is complete for every implemented
-//! theory — including the one-sided-identity collapse (`left id:` / `right id:`) that the kernel
-//! matcher deliberately omits. Concretely, a retained unifier `r` subsumes a
-//! candidate `u` iff `u` is an instance of `r` on the interesting variables, i.e. the system
-//! `{ r[i] =? freeze(u[i]) }` is satisfiable, where `freeze` replaces `u`'s fresh variables with
-//! fresh distinct ground constants (so the only remaining variables are `r`'s — one-sided
-//! unification / matching). This reuses [`UnifyProblem`] verbatim; no kernel matcher change and no
-//! change to theory classification.
+//! A retained unifier `r` subsumes candidate `u` iff `u` is an instance of `r` on those variables.
+//! When matching cannot represent the equation theory, satisfiability of
+//! `{ r[i] =? freeze(u[i]) }` decides subsumption instead. `freeze` replaces `u`'s fresh variables
+//! with distinct ground constants, leaving only the variables from `r`; [`UnifyProblem`] then covers
+//! every implemented unification theory.
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
@@ -23,11 +18,9 @@ use crate::term::Term;
 use super::problem::{UnifyProblem, VarSpec};
 use super::{NameCodes, UnifyEnv, is_ground};
 
-/// Apply the irredundant filter to `unifiers` (each the interesting-variable bindings in slot order,
-/// as produced by [`UnifyProblem::find_next`]) and return the most-general subset, in enumeration
-/// order. Mirrors `UnifierFilter::insertUnifier`: a new unifier subsumed by a survivor is dropped;
-/// otherwise it evicts every survivor it subsumes and is appended (so survivors stay in the order the
-/// enumerator produced them, which the display renumbers).
+/// Return the most-general subset of `unifiers`, whose entries contain input-variable bindings in
+/// slot order. A candidate subsumed by a survivor is dropped; otherwise it evicts every survivor it
+/// subsumes and is appended. Survivor order therefore follows enumeration order.
 pub fn irredundant(e: &mut Engine, unifiers: Vec<Vec<DagId>>) -> Vec<Vec<DagId>> {
     let mut survivors: Vec<Vec<DagId>> = Vec::new();
     'candidate: for u in unifiers {
@@ -64,13 +57,11 @@ impl NameCodes for ScratchNames {
     }
 }
 
-/// Whether `retained` subsumes `candidate` on the interesting variables — i.e. `candidate` is an
-/// instance of `retained` modulo the theory. Both slices are the bindings in slot order and of equal
-/// length (one entry per original variable).
+/// Whether `candidate` is an instance of `retained` modulo the equation theory. Both slices contain
+/// one binding per input variable in slot order.
 pub(crate) fn subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
-    // Matching is the reference relation and is dramatically cheaper than a throwaway unification
-    // problem. The only implemented matcher gap is a genuinely one-sided identity; keep the frozen
-    // unification fallback solely for vectors containing one.
+    // Matching is cheaper when it supports every theory in the vectors. One-sided identity is the
+    // sole matcher gap, so only those vectors need the frozen-unification fallback.
     if !retained
         .iter()
         .chain(candidate)

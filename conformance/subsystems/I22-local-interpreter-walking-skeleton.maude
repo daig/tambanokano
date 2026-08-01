@@ -1,10 +1,9 @@
-*** I22-local-interpreter-walking-skeleton — Phase I-S0 reference probe.
-*** Oracle verified against Maude 3.5.1 on 2026-07-23.
+*** Local-interpreter request lifecycle.
 *** PRELUDE
 set show timing off .
 set show advisories off .
 
-*** Phase I-S0 walking skeleton: local create/insert/select-reduce/reply/delete.
+*** Create, insert, select, reduce, reply, and delete.
 
 load metaInterpreter
 set include BOOL off .

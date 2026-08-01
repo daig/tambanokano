@@ -1,23 +1,14 @@
-//! The theory-plugin seam: a compiled [`LhsAutomaton`] whose two-phase
-//! match produces a resumable, multi-solution [`Subproblem`].
+//! The theory-matching seam: a compiled [`LhsAutomaton`] whose deterministic first phase returns a
+//! resumable, multi-solution [`Subproblem`].
 //!
-//! Phase 1 implements only the **free theory** — a deterministic, single-solution structural match —
-//! but the *shape* is what the later theories need and is the reason this seam exists now:
-//! - **AC/ACU matching is genuinely multi-solution** (one pattern can match a subject many ways), so
-//!   the rewrite driver must consume a *stream* of solutions, not a single yes/no.
-//! - **Conditional equations** accept a solution only if the condition holds, and otherwise must
-//!   **backtrack into the next solution** of the same left-hand side.
+//! The closed automaton set covers free patterns, free skeletons with theory-rooted aliens, ACU, AU,
+//! CUI, and iterated successors. Multi-solution theory matches and heterogeneous alien compositions
+//! share the same `next()` stream, so a failed condition can backtrack into the next match without
+//! special-casing the reduction driver. The all-free path remains a direct structural match.
 //!
-//! Driving [`crate::engine::Engine::reduce`]'s rewrite step around `while sp.next(..) { .. }` now
-//! means adding those features later is a new [`Subproblem`] arm plus a condition check in the
-//! existing loop — not a rewrite of the reduce core. Free matching stays the recursive
-//! [`Engine::match_pattern`]; the compiled discrimination net is a later performance step behind this
-//! same seam and does not change the driver.
-//!
-//! Since the A4 signature/runtime split, [`LhsAutomaton::match_`]/[`Subproblem::next`] take the
-//! immutable `Signature` and the mutable `Runtime` separately: a conditional equation can `reduce`
-//! its condition (needs `&mut` runtime) and an AC subproblem can allocate residue nodes while the
-//! equation table stays borrowed — without changing the driver loop.
+//! [`LhsAutomaton::match_`] and [`Subproblem::next`] take the immutable `Signature` and mutable `Runtime`
+//! separately. Conditions can reduce and theory matchers can allocate residue nodes while the statement
+//! table remains borrowed.
 
 use crate::acu::{AcuLhs, AcuSubproblem};
 use crate::au::{AuLhs, AuSubproblem};
@@ -129,19 +120,15 @@ impl RewriteMatchContext {
     }
 }
 
-/// A left-hand side compiled for matching in its theory. Closed set; this slice has
-/// the free and **ACU** arms. Future arms (`Au`, `Cui`, `S`, …) carry their compiled per-theory
-/// automata and are pure additions behind this type.
+/// A left-hand side compiled for matching in its theory. The enum is closed so dispatch stays static;
+/// each variant owns the compiled representation its matching algorithm needs.
 #[derive(Clone)]
 pub(crate) enum LhsAutomaton {
-    /// Free theory, **all-free** pattern: matched by direct structural recursion
-    /// ([`Engine::match_pattern`]), a single deterministic solution. The hot path (this is what `fib`
-    /// and the prelude use); compiling it to a discrimination net is a later performance step.
+    /// Free theory with an all-free pattern: direct structural matching with one deterministic solution.
+    /// This is the hot path used by ordinary equations and prelude definitions.
     Free(Term),
-    /// Free-theory top with a **theory-rooted (alien) subterm** (`f(a + b)`, AC `+` under free `f`):
-    /// matched via [`Runtime::match_skeleton`] (free skeleton + variables) composing the aliens'
-    /// subproblems into a [`Subproblem::Sequence`] (C8). Separate from [`Free`](LhsAutomaton::Free) so
-    /// the all-free path stays a plain single-solution match.
+    /// Free root containing theory-rooted child patterns. The free skeleton matches deterministically,
+    /// then a [`Subproblem::Sequence`] composes the child matchers.
     FreeWithAliens(Term),
     /// ACU theory (`assoc comm [id:]`): multiset matching, genuinely multi-solution.
     Acu(AcuLhs),
@@ -175,11 +162,8 @@ impl LhsAutomaton {
             Some(Theory::Au) => LhsAutomaton::Au(AuLhs::compile(lhs, sig)),
             Some(Theory::Cui) => LhsAutomaton::Cui(CuiLhs::compile(lhs, sig)),
             Some(Theory::S) => LhsAutomaton::S(SLhs::compile(lhs, sig)),
-            // Free-theory (or bare-variable) top. An all-free pattern is the deterministic
-            // single-solution match (`match_pattern`); a theory-rooted subterm under it (`f(a + b)`, AC
-            // `+` under free `f`) takes the C8 cross-theory path (`match_skeleton` + a
-            // [`Subproblem::Sequence`] composing the alien sub-automata), kept a separate variant so the
-            // free hot path pays nothing for it.
+            // Keep theory-rooted children on the composed path so the common all-free case remains a
+            // single deterministic match.
             _ if lhs.is_free_matchable(sig) => LhsAutomaton::Free(lhs),
             _ => LhsAutomaton::FreeWithAliens(lhs),
         }
@@ -190,15 +174,11 @@ impl LhsAutomaton {
     /// all. For the free theory the match is fully determined here, so the returned subproblem yields
     /// exactly the one solution already bound in `subst`.
     ///
-    /// `ext_allowed` enables *extension* (matching a sub-multiset of an AC subject and leaving a
-    /// residue) — the free theory ignores it; ACU uses it for top-level rewriting and `xmatch`
-    /// (audit F-3).
+    /// `ext_allowed` enables matching a sub-multiset or subsequence while retaining the unmatched residue.
+    /// The free theory ignores it; ACU/AU use it for top-level rewriting and `xmatch`.
     ///
-    /// `command` is set only for the `match`/`xmatch` **commands** (not reduce/rewrite/search): it
-    /// enables the extension refinements that Maude's interactive matcher shows but the rewrite engine
-    /// takes the first solution of — the AU `bigEnough` floor + `SequencePartition` order, and the
-    /// subject-driven *bare-variable* extension (`matchVariableWithExtension`). Keeping it off the
-    /// rewrite path guarantees reduce/rewrite behaviour is unchanged.
+    /// `command` distinguishes interactive matching from rewrite/search. It enables command-only AU
+    /// partition ordering, minimum matched spans, and subject-driven bare-variable extension.
     pub(crate) fn match_(
         &self,
         rt: &Runtime,
@@ -210,11 +190,9 @@ impl LhsAutomaton {
     ) -> Option<Subproblem> {
         match self {
             LhsAutomaton::Free(pat) => {
-                // A **bare variable** with extension, as an `xmatch` command over a theory node, matches a
-                // sub-part of the subject (Maude dispatches on the *subject*'s theory —
-                // `DagNode::matchVariableWithExtension`). Only the S and AU cases occur in the audit; any
-                // other subject (free constant, ACU, CUI, …) falls through to the whole-subject match,
-                // which prints no `Matched portion` line.
+                // A bare variable in an extension command can match a sub-part selected by the
+                // subject theory. S and AU expose matched portions; other theories fall back to a
+                // whole-subject match with no `Matched portion` record.
                 if command
                     && ext_allowed
                     && let Term::Var(v) = pat
@@ -252,9 +230,7 @@ impl LhsAutomaton {
                     .then_some(Subproblem::FreeOnce { pending: true })
             }
             LhsAutomaton::FreeWithAliens(pat) => {
-                // Match the free skeleton (binding the free variables), collecting the theory-rooted
-                // alien subterms, then compose their subproblems into a Sequence (C8). The skeleton is
-                // deterministic; the aliens are the multi-solution part.
+                // Bind the free skeleton and compose the theory-rooted child matchers.
                 let mut aliens = Vec::new();
                 rt.match_skeleton(sig, pat, subject, subst, &mut aliens)
                     .then(|| Subproblem::Sequence(SequenceSubproblem::new(aliens)))
@@ -275,13 +251,12 @@ impl LhsAutomaton {
 }
 
 /// A residual matching subproblem: a resumable enumerator of the remaining solutions of an
-/// [`LhsAutomaton`] against a subject. [`Subproblem::next`] binds the next solution into the shared
-/// `Subst` and returns `true`, or returns `false` once the solutions are exhausted.
-///
-/// This is the stream the reduce driver consumes: ACU matching populates it with the several
-/// solutions of an associative-commutative match, and conditional equations (B2) will `next()` again
-/// when a solution fails its condition. Closed set; solution *combinators*
-/// (sequence / disjunction over sub-matches) are the heterogeneous case that may later use boxing.
+/// [`LhsAutomaton`] against a subject. [`Subproblem::next`] binds one solution into the shared `Subst`
+/// and returns `true`, then returns `false` when exhausted. Associative and commutative matchers can
+/// contribute several solutions; condition failure resumes the same stream. Sequence and disjunction
+/// variants compose heterogeneous sub-matches without dynamic dispatch.
+// Matching is a hot path; keeping the resumable state inline avoids one allocation per match.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Subproblem {
     /// The free theory has at most one solution (a deterministic structural match), already bound in
     /// `subst` by [`LhsAutomaton::match_`]; `pending` yields it exactly once.
@@ -294,16 +269,14 @@ pub(crate) enum Subproblem {
     Cui(CuiSubproblem),
     /// S theory: the (lazy) successor-extension solutions (see [`SSubproblem`]).
     S(SSubproblem),
-    /// Cross-theory composition (C8): the theory-rooted alien subterms of a free-rooted pattern, matched
-    /// recursively and composed (Maude's `SubproblemSequence`). See [`SequenceSubproblem`].
+    /// Recursively composed theory-rooted children of a free-rooted pattern.
     Sequence(SequenceSubproblem),
 }
 
 impl Subproblem {
-    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. Takes
-    /// `&mut Runtime` because a multi-solution arm (ACU/AU) builds fresh binding/residue nodes between
-    /// solutions (audit F-3 widening); the free arm ignores `rt`/`sig`/`subst` (its single solution
-    /// was bound during `match_`).
+    /// Advance to the next solution, binding it into `subst`; `false` when exhausted. Multi-solution
+    /// ACU/AU arms need `&mut Runtime` to build binding and residue nodes between solutions. The free arm
+    /// ignores `rt`/`sig`/`subst` because its single solution was bound during `match_`.
     pub(crate) fn next(&mut self, rt: &mut Runtime, sig: &Signature, subst: &mut Subst) -> bool {
         match self {
             // Yield the already-bound solution exactly once.
@@ -325,17 +298,15 @@ impl Subproblem {
         }
     }
 
-    /// Extension-match status of the *current* solution, for the `xmatch` command's display. `None`
-    /// means the match carried no extension info (a free-theory subject, or a non-extension match) — so
-    /// no `Matched portion` line is printed; `Some(true)` is `(whole)`; `Some(false)` a genuine
-    /// sub-portion (the caller builds it from the instantiated pattern). Mirrors Maude's
-    /// `ExtensionInfo != 0` / `matchedWhole()` test in `Mixfix/match.cc`.
+    /// Extension-match status of the current solution for `xmatch` display. `None` suppresses the
+    /// `Matched portion` line, `Some(true)` means the whole subject, and `Some(false)` means a genuine
+    /// sub-portion that the caller rebuilds from the instantiated pattern.
     pub(crate) fn matched_status(&self) -> Option<bool> {
         match self {
             Subproblem::FreeOnce { .. } | Subproblem::Sequence(_) => None,
             Subproblem::Acu(sp) => sp.matched_status(),
             Subproblem::Au(sp) => sp.matched_status(),
-            // CUI extension display is unexercised by the audit; report no portion line.
+            // CUI extension display has no matched-portion form.
             Subproblem::Cui(_) => None,
             Subproblem::S(sp) => sp.matched_status(),
         }
@@ -350,8 +321,7 @@ impl Subproblem {
 
     /// Build the rewrite result by splicing the instantiated `rhs` into the matched position: a whole
     /// match (the free theory, or an extension match with no residue) is just `rhs`; an extension
-    /// match re-assembles the residue around it in the theory's normal form — an ACU multiset, or an
-    /// AU ordered prefix/suffix (Maude's `partialConstruct`). Needs `&mut Runtime` to build the node.
+    /// match reassembles residue in theory-normal form: an ACU multiset or AU prefix/suffix.
     pub(crate) fn build_result(&self, rt: &mut Runtime, sig: &Signature, rhs: DagId) -> DagId {
         match self {
             Subproblem::FreeOnce { .. } => rhs,
@@ -365,12 +335,8 @@ impl Subproblem {
     }
 }
 
-/// The C8 cross-theory composition: a free-rooted pattern's **theory-rooted alien subterms** (collected
-/// by [`Runtime::match_skeleton`] as `(pattern, subject)` pairs) matched recursively and composed —
-/// Maude's `SubproblemSequence`. Each alien is matched by its own [`LhsAutomaton`] against its subject
-/// subterm, sharing the substitution (so a variable shared across aliens / the free skeleton stays
-/// consistent). The combinations are enumerated by nested backtracking on the first `next` (needs
-/// `&mut Runtime` to drive the sub-automata) and replayed one per `next`, mirroring the ACU/AU paths.
+/// Recursively compose the theory-rooted child patterns collected from a free skeleton. All child
+/// automata share one substitution, and their combinations are replayed through nested backtracking.
 pub(crate) struct SequenceSubproblem {
     aliens: Vec<(Term, DagId)>,
     /// The alien sub-patterns' variable indices, captured into each recorded solution.

@@ -1,6 +1,4 @@
-*** ACU reduce conformance (Stage B1) — exact rewrite counts vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-reduce.maude < /dev/null
-*** Each module mirrors a `crates/tnk-core/src/engine.rs` `ac_reduce_*` test.
+*** ACU reduction and exact rewrite counts
 
 fmod ACU-GROUND is                  *** ground element consumed with extension
   sort N . op 0 : -> N . op s_ : N -> N . op _+_ : N N -> N [assoc comm] . var X : N .

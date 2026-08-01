@@ -182,7 +182,7 @@ impl GenBuchiAutomaton<'_> {
             if state_info[state].component != component {
                 continue;
             }
-            for (&(target, fairness_index), _) in self.transitions(state) {
+            for &(target, fairness_index) in self.transitions(state).keys() {
                 let target_component = state_info[target].component;
                 if target_component == component {
                     has_internal_transition = true;
@@ -276,9 +276,9 @@ impl GenBuchiAutomaton<'_> {
         transformed
     }
 
-    /// Find the reference solver's shortest accepting lasso, returning transition predicates for its
-    /// lead-in and cycle. This is a line-for-line structural port of `Temporal/satSolve.cc`: collapse,
-    /// SCC fairness analysis, three ordered BFS passes, then the lead-in roll optimization.
+    /// Find the shortest accepting lasso, returning transition predicates for its lead-in and cycle.
+    /// The solver performs maximal collapse, SCC fairness analysis, three ordered BFS passes, and the
+    /// lead-in roll optimization.
     pub(crate) fn sat_solve(&mut self) -> Option<(Vec<Bdd>, Vec<Bdd>)> {
         self.maximally_collapse_states();
         let analysis = self.scc_analysis();

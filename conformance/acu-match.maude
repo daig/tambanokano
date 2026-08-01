@@ -1,6 +1,4 @@
-*** ACU matching conformance (Stage B1) — solution SETS vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/acu-match.maude < /dev/null
-*** Mirrors the solution-set tests in `crates/tnk-core/src/acu.rs`.
+*** ACU matching solution sets
 
 fmod ACU-MATCH is
   sort E .

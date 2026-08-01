@@ -1,5 +1,4 @@
-*** M01-toggle — smallest model-checker vertical slice: true, lead-in/cycle, and nil lead-in
-*** Fresh probe; oracle-verified against Maude 3.5.1.
+*** Minimal model-checker cases: true, lead-in/cycle, and nil lead-in.
 *** PRELUDE
 set show timing off .
 load model-checker

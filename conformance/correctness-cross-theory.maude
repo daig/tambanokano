@@ -1,10 +1,10 @@
-*** Phase 1.5 / C8 — uniform cross-theory composition: a theory-rooted subterm under an `iter` (S) or a
-*** `comm` (CUI) operator.  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-cross-theory.maude < /dev/null
+*** Uniform cross-theory composition: a theory-rooted subterm under an `iter` (S) or a
+*** `comm` (CUI) operator.
 ***
-*** Completes C8 so every theory matcher composes sub-patterns through the same seam: the S and CUI
+*** Every theory matcher composes sub-patterns through the same seam: the S and CUI
 *** sub-patterns (like ACU/AU aliens and free-with-theory-children) are matched recursively via
 *** `enumerate_alien_solutions`, so an AC term under `s_` (`s (a + X)`) or under `_;_` (`(a + X) ; Y`)
-*** matches modulo its theory. These were loud panics (s.rs:67 / cui.rs).
+*** matches modulo its theory.
 
 fmod S-OVER-AC is
   sorts E Foo .

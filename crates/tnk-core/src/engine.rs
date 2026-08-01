@@ -33,11 +33,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Conservative static register pressure for constructing `term` into a substitution slot.
 ///
-/// Maude's `computeIndexRemapping` colors temporary RHS construction indices by overlapping
-/// lifetimes. The kernel does not retain its frontend builder graph, so this computes the analogous
-/// tree pressure: non-variable children are built largest-first, their results stay live until the
-/// parent is built, and the parent can reuse one child's slot. Ignoring LHS-term reuse can only
-/// overestimate the module minimum.
+/// Temporary RHS pressure is estimated from tree lifetimes: non-variable children are built
+/// largest-first, stay live until their parent is built, and allow the parent to reuse one child slot.
+/// Ignoring reusable LHS terms makes this a conservative upper bound.
 fn term_construction_slots(term: &Term) -> usize {
     let children: Vec<&Term> = match term {
         Term::Var(_) => return 0,
@@ -229,25 +227,18 @@ struct CompiledEquation {
     lhs: LhsAutomaton,
     rhs: Term,
     nr_vars: u32,
-    /// Condition fragments (empty for an unconditional `eq`); all must hold for the equation to apply,
-    /// and a failed condition backtracks into the next matcher solution (B2.3).
+    /// Every condition fragment must hold; failure resumes the next matcher solution.
     condition: Vec<CompiledFragment>,
-    /// `[owise]`: this equation is tried only if no non-owise equation of the symbol applies (B2.3b).
+    /// Fallback equation, considered only after ordinary equations for the symbol fail.
     owise: bool,
-    /// `true` iff [`rhs`](Self::rhs) contains a repeated compound subterm (C7): when set, the rhs is
-    /// instantiated inside a dedup window so the duplicate becomes one shared node (Maude's `RhsBuilder`
-    /// CSE), which `reduce` then normalizes once. `false` (the common case — e.g. `fib`'s `s(N + M)`,
-    /// which shares nothing) takes the plain instantiate path with zero dedup overhead.
+    /// Whether rhs construction needs structural deduplication for a repeated compound subterm.
     rhs_shares: bool,
-    /// Non-ground compound rhs subterms that also occur below the equation lhs root. Maude's
-    /// `TermBag`/`RhsBuilder` reuses those already-reduced matched DAGs instead of constructing fresh
-    /// copies; the reuse is byte-visible in rewrite counts.
+    /// Non-ground compound RHS subterms that also occur below the LHS root. Reusing their already
+    /// reduced matched DAGs preserves structure-sensitive rewrite counts.
     lhs_reuse: Vec<Term>,
 }
 
-/// A membership axiom `mb lhs : sort` compiled for the engine: its lhs as a theory [`LhsAutomaton`]
-/// plus the target sort and variable count. The public [`Membership`] is compiled into this by
-/// [`Signature::add_membership`]. (Conditional `cmb` gains a condition in B2.3.)
+/// Compiled membership matcher, target sort, variable layout, and optional condition.
 struct SortConstraint {
     /// Dense per-module id (assigned by [`Signature::push_membership`]); the frontend keeps this
     /// membership's source `Term` + variable names at `mb_traces[id]` for the trace renderer.
@@ -255,8 +246,7 @@ struct SortConstraint {
     lhs: LhsAutomaton,
     sort: SortId,
     nr_vars: u32,
-    /// Condition fragments (empty for an unconditional `mb`); checked under the membership match's
-    /// substitution before the sort is lowered (B2.3c `cmb`).
+    /// Evaluated under the membership substitution before the sort is lowered.
     condition: Vec<CompiledFragment>,
 }
 
@@ -276,16 +266,12 @@ fn membership_order(
         .then_with(|| left.cmp(&right))
 }
 
-/// A rule `rl lhs => rhs` compiled for the engine: structurally a [`CompiledEquation`] minus `[owise]`
-/// (rules have no owise phase). Unlike equations, rules live in their own [`Signature::rules`] table and
-/// are applied **only** by `rewrite`/`frewrite`/`search` (Pillar A) — never by [`reduce`](Engine::reduce),
-/// which consults only `equations`. The frontend keeps this rule's source `Term`s + variable names +
-/// label at `rl_traces[id]` for the trace renderer and `show path` (`===[ rl ... ]===>`).
-/// The `erewrite` object-message role of a rule (Maude's `ConfigSymbol::compileRules` partition). A
-/// config-rooted rule whose lhs is exactly one object + one message with the **same name** (`checkArgs`)
-/// is delivered on the fast path, keyed by its message symbol; every other config rule (multi-object,
-/// no-message, unstable-name) takes the generic `leftOver` path. Non-config rules are irrelevant to the
-/// scheduler.
+/// A rule `rl lhs => rhs` compiled for the engine: structurally a [`CompiledEquation`] without `[owise]`.
+/// Rules live in their own [`Signature::rules`] table and are applied only by rewriting and search,
+/// never by [`reduce`](Engine::reduce). The frontend retains source terms, variable names, and labels
+/// for tracing and `show path`.
+/// The `erewrite` role of a rule. A configuration rule with exactly one object and one message sharing
+/// the same name uses the message-keyed fast path; all other configuration rules use `LeftOver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OoRuleKind {
     NotConfig,
@@ -311,10 +297,10 @@ struct CompiledRule {
     nr_vars: u32,
     /// The `erewrite` scheduler role, classified from the (uncompiled) lhs at registration.
     oo: OoRuleKind,
-    /// Condition fragments (empty for an unconditional `rl`); a `crl` may additionally carry a **rewrite**
-    /// fragment `t => p` (Pillar A-v) — the one fragment kind equations/memberships may not have.
+    /// Condition fragments (empty for an unconditional `rl`); a `crl` may additionally carry a rewrite
+    /// fragment `t => p`, which is not legal in equations or memberships.
     condition: Vec<CompiledFragment>,
-    /// As [`CompiledEquation::rhs_shares`] — C7 dedup window for an rhs with a repeated compound subterm.
+    /// Whether rhs construction needs structural deduplication.
     rhs_shares: bool,
 }
 
@@ -365,8 +351,8 @@ pub(crate) enum CompiledFragment {
         subject: Term,
         fresh_vars: Vec<u32>,
     },
-    /// `lhs => pattern` — a rewrite condition (rule-only, Pillar A-v): a nested `=>*` reachability search
-    /// from `lhs`'s instance, matching `pattern` against each reachable state.
+    /// `lhs => pattern` — a rewrite condition, legal only in rules: search `lhs`'s reachable states and
+    /// match `pattern` against each one.
     Rewrite {
         lhs: Term,
         pattern: LhsAutomaton,
@@ -382,18 +368,15 @@ pub(crate) enum CondOwner {
     Rule,
 }
 
-/// Whether [`Runtime::drive_match`]'s `accept` callback wants to stop at the first rewrite (equational
-/// reduction and `rewrite`/`frewrite`, which take the first applicable statement) or keep enumerating
-/// every solution (search successor collection, Pillar A-iv).
+/// Whether [`Runtime::drive_match`]'s `accept` callback stops at the first rewrite (equational reduction
+/// and direct rewriting) or enumerates every solution (search successor collection).
 enum Flow {
     Stop,
-    /// Keep enumerating every solution — used by the search successor-collector (Pillar A-iv); `rewrite`
-    /// and equational reduction only ever return [`Flow::Stop`].
-    #[allow(dead_code)]
+    /// Keep enumerating every solution. Equational reduction and direct rewriting use [`Flow::Stop`].
     Continue,
 }
 
-/// Identifies the statement [`Runtime::drive_match`] is driving, for trace events and the F-2 condition
+/// Identifies the statement [`Runtime::drive_match`] is driving, for trace events and condition
 /// root set. `kind` selects the trace metadata (equation vs rule) and the [`RewriteKind`]; `frames`/`redex`
 /// are threaded into [`condition_holds`](Runtime::condition_holds) for GC rooting of a conditional
 /// statement's re-entrant condition reduction (moot for unconditional statements / GC-off REPL).
@@ -404,9 +387,8 @@ struct StmtCtx<'a> {
     redex: DagId,
 }
 
-/// One position in the redex stack of [`Runtime::rewrite_step`]'s top-down traversal: the node, its
-/// parent's index in the stack (`usize::MAX` for the root), and which flattened argument of the parent
-/// it is — enough to rebuild the path to the root after a rewrite (Maude's `RedexPosition`).
+/// One position in the top-down rewrite stack: node, parent index, and flattened parent argument.
+/// These fields reconstruct the root path after a rewrite.
 struct RedexPos {
     node: DagId,
     parent: usize,
@@ -421,24 +403,17 @@ enum EvalAction {
 
 /// One pending node-normalization on the iterative [`Engine::reduce`] work-stack.
 ///
-/// A frame mirrors one activation of the old recursive `reduce`/`reduce_args` pair. `cursor` executes
-/// the operator's normalized argument/top instruction stream; reduced children replace their positions
-/// in `args`, while a successful Top instruction reuses the frame slot for the replacement term.
+/// A frame represents one recursive `reduce`/`reduce_args` activation without using the call stack.
+/// Its cursor executes the operator's normalized argument/top instruction stream. Reduced children
+/// replace their positions in `args`, while a successful Top instruction reuses the frame slot.
 ///
-/// **A2 safe-point-GC contract** (the reason this is an explicit heap stack). The frames hold most
-/// in-flight `DagId`s of an in-progress reduction — but *not all*: at the [`Engine::reduce`] loop
-/// head a just-completed child sits only in the `child_result` local until it is delivered into its
-/// parent's `args` on the next iteration. So the complete root set at the loop head is
-/// `walk(stack) ∪ child_result`. GC must therefore be confined to the loop head:
-/// `try_rewrite_top`/`instantiate`/`make_free` build fresh nodes whose ids live only in native-stack
-/// locals (`instantiate`'s `arg_ids`, the `Subst` bindings, the `rebuilt` node mid-rewrite) and are
-/// *not* discoverable by a stack walk, so they must not be safe points.
+/// **Safe-point GC contract.** Frames contain most in-flight DAG handles, but a completed child remains
+/// in `child_result` until the next loop iteration. Collection is therefore restricted to the loop head,
+/// where `walk(stack) ∪ child_result` is complete. Matcher and constructor locals are not discoverable
+/// from the frame stack and must not cross a collection point unrooted.
 struct ReduceFrame {
-    /// The node this frame was **first** pushed for — preserved when a top rewrite replaces the frame
-    /// (and overwrites `original` with each successive redex). When the frame reaches a normal form,
-    /// that form is recorded as `start`'s [`nf`](crate::dag::DagNode::nf) so a *shared* reference to
-    /// `start` forwards to the result instead of re-reducing it (C7). For the initial frame `start ==
-    /// original`; they diverge only once the node rewrites.
+    /// The node first assigned to this frame. It remains stable across top rewrites so normal-form
+    /// forwarding can update every shared reference to the original redex.
     start: DagId,
     /// The node this frame started from; returned unchanged when no child changed (preserves the
     /// shared DAG id rather than rebuilding an identical node).
@@ -454,8 +429,7 @@ struct ReduceFrame {
     /// Instructions completed so far; [`Signature::strat_action`] synthesizes the standard and
     /// permutative strategies or indexes the symbol's normalized sequence.
     cursor: usize,
-    /// Whether this application has reached its first `0`/top instruction. Maude computes the true
-    /// sorts of every argument exactly there, including arguments the strategy never reduces.
+    /// Whether the first top instruction has been reached, where every argument's true sort is computed.
     seen_top: bool,
 }
 
@@ -500,15 +474,14 @@ pub(crate) struct Signature {
     /// ACU/two-sided-AU/CUI memberships that can collapse at the top, offered to every subject in the
     /// target sort's kind. The compiled matcher rejects impossible conservative candidates.
     collapsing_memberships: HashMap<KindId, Vec<u32>>,
-    /// Rules (`rl`/`crl`), indexed by lhs top symbol. Applied **only** by `rewrite`/`frewrite`/`search`
-    /// (Pillar A) — never by [`reduce`](Engine::reduce), so equational normal forms never apply a rule.
-    /// Adding a rule does not bump `eq_epoch` (rules don't change any equational normal form).
+    /// Rules (`rl`/`crl`), indexed by lhs top symbol. Applied only by rewriting and search, never by
+    /// [`reduce`](Engine::reduce), so adding one does not change equational normal forms or `eq_epoch`.
     rules: HashMap<SymbolId, Vec<CompiledRule>>,
     /// Source-form rules used only by `smt-search`, indexed by lhs top symbol. This deliberately
     /// includes `[nonexec]` rules, which are proof obligations for ordinary rewriting but executable
     /// symbolic transitions modulo SMT.
     smt_rules: HashMap<SymbolId, Vec<CompiledSmtRule>>,
-    /// Whether every retained SMT rule satisfies Maude's static lhs restrictions.
+    /// Whether every retained SMT rule satisfies the static SMT-rewriting LHS restrictions.
     smt_rules_valid: bool,
     /// Source-form `[narrowing]` rules in flattened module order. This includes nonexec rules that are
     /// deliberately absent from `rules`; symbolic unification needs their lhs/rhs and variable layout.
@@ -521,7 +494,7 @@ pub(crate) struct Signature {
     /// the frontend can key its trace metadata by it; per-module (each `Engine` starts at 0).
     next_eq_id: u32,
     /// Next dense membership-axiom id (the count of memberships added). Assigned to each
-    /// [`SortConstraint`]; the trace counterpart of `next_eq_id`.
+    /// [`SortConstraint`] so the frontend can key trace metadata by it.
     next_mb_id: u32,
     /// Next dense rule id (the count of rules added). Assigned to each [`CompiledRule`]; the frontend
     /// keys its `rl_traces` metadata by it.
@@ -532,14 +505,13 @@ pub(crate) struct Signature {
     qid_class: QidClass,
     /// SMT sort/operator bindings assembled from `SMT_Symbol`/`SMT_NumberSymbol` hooks.
     smt_info: SmtInfo,
-    /// Per-sort variable symbols for genuine `Var` leaves (Maude's `Module::instantiateVariable`
-    /// cache), created lazily by [`Engine::variable_symbol`] in demand order — the creation order is
-    /// observable through `dag_compare`'s SymbolId ordering, exactly like Maude's symbol indices.
+    /// Per-sort variable symbols created lazily in demand order. Creation order participates in
+    /// `dag_compare` through symbol identity.
     var_symbols: HashMap<SortId, SymbolId>,
     /// The `zeroTerm` attached to each `iter` successor (`SuccSymbol`).
     succ_zeros: HashMap<SymbolId, SymbolId>,
-    /// Module-wide lower bound for substitution arrays. Real statement variables occupy the prefix;
-    /// the remainder approximates Maude's colored construction/protected-variable footprint.
+    /// Module-wide lower bound for substitution arrays: statement variables plus temporary
+    /// construction and protected-variable slots.
     minimum_substitution_size: usize,
     /// Equation-derived symbolic collapse shapes used to approximate protected LHS abstraction
     /// variables. Retained so imported/replayed statement metadata remains module-global.
@@ -547,8 +519,7 @@ pub(crate) struct Signature {
     substitution_layout_estimates: Vec<SubstitutionLayoutEstimate>,
 }
 
-/// The classification sorts for quoted-identifier constants (Maude's `QuotedIdentifierSymbol` codes
-/// `sortQid`/`kindQid`/`constantQid`/`variableQid`) — see [`Signature::qid_class`].
+/// Sorts used to classify quoted-identifier constants; see [`Signature::qid_class`].
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct QidClass {
     base: Option<SortId>,
@@ -567,7 +538,7 @@ enum QidAux {
     Kind,
 }
 
-/// Port of Maude's `Token::skipSortName`. Returns the byte index of the canonical terminator and
+/// Scan canonical quoted-identifier sort-name syntax. Returns the byte index of the terminator and
 /// whether the name contains a structured-sort parameter list.
 fn skip_qid_sort_name(text: &[u8], start: usize) -> Option<(usize, bool)> {
     let mut parameterized = false;
@@ -613,9 +584,7 @@ fn skip_qid_sort_name(text: &[u8], start: usize) -> Option<(usize, bool)> {
     }
 }
 
-/// Convert the Rust frontend's compact Qid text to Maude's canonical token-name spelling for
-/// auxiliary-property classification. The frontend may retain punctuation without its syntactic
-/// backticks; `Token::computeAuxProperty` sees those backticks.
+/// Add canonical backtick escapes to compact quoted-identifier text before auxiliary classification.
 fn canonical_qid_token_name(text: &str) -> std::borrow::Cow<'_, str> {
     let punct = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',');
     let mut previous_backtick = false;
@@ -640,14 +609,13 @@ fn canonical_qid_token_name(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Port of Maude's `Token::computeAuxProperty`, applied to a quoted identifier's unquoted text.
+/// Classify a quoted identifier's unquoted text using canonical token-name rules.
 fn qid_aux_property(text: &str) -> Option<QidAux> {
     let text = canonical_qid_token_name(text);
     let bytes = text.as_bytes();
 
     if bytes.starts_with(b"`[") {
-        // Maude starts `skipSortName` on the `[` byte, then accepts one or more names separated by
-        // canonical backtick-comma tokens and closed by a canonical backtick-right-bracket.
+        // Parse one or more sort names separated by backtick-comma and closed by backtick-right-bracket.
         let mut start = 1;
         loop {
             let (end, _) = skip_qid_sort_name(bytes, start)?;
@@ -696,15 +664,13 @@ fn qid_aux_property(text: &str) -> Option<QidAux> {
     None
 }
 
-/// One recorded reduction event (opt-in via [`Engine::set_trace`]) — the structured stream the REPL
-/// renders as Maude's full `trace`. Each event carries its **condition-nesting `depth`** (0 at the top
-/// level, +1 inside every condition-fragment reduction): the REPL's `set trace condition off` renders
-/// only depth-0 events, mirroring Maude's `CONDITION_EVAL` sub-context trace flag. Node ids held here
-/// (redex/result/bindings/subject/whole) are rooted by [`safe_point_gc`](Runtime::safe_point_gc).
+/// One recorded reduction event, enabled through [`Engine::set_trace`]. Each event carries its
+/// condition-nesting `depth`: zero at the command's top level and one higher inside each condition
+/// fragment. Disabling condition tracing renders only depth-zero events. Node IDs retained by an event
+/// (redex, result, bindings, subject, and whole term) participate in the reduction's GC root set.
 ///
-/// The `id`s name a module's compiled equations / membership axioms (dense, per-module, assigned by
-/// [`Signature::push_equation`]/[`push_membership`](Signature::push_membership)); the frontend keeps the
-/// source `Term`s + variable names keyed by them and renders the bodies.
+/// The `id` values identify equations and membership axioms within one compiled module. The frontend
+/// retains the corresponding source terms and variable names for rendering.
 #[derive(Debug, Clone)]
 pub enum TraceEvent {
     /// A term rewrite: an equation (`eq_id = Some`) or a built-in (`special`) reduction (`eq_id =
@@ -742,15 +708,14 @@ pub enum TraceEvent {
         depth: u32,
         bindings: Vec<Option<DagId>>,
     },
-    /// End a trial: `success` iff the whole condition held. `kind`/`depth` mirror the matching
-    /// [`TrialStart`](TraceEvent::TrialStart) so the renderer gates (and so pairs) them identically.
+    /// End a trial: `success` iff the whole condition held. `kind` and `depth` repeat the associated
+    /// [`TrialStart`](TraceEvent::TrialStart) values so rendering and pairing use identical keys.
     TrialEnd {
         kind: StmtKind,
         depth: u32,
         success: bool,
     },
-    /// Begin solving condition fragment `index` of `stmt_id`'s condition (`first_attempt = false` on a
-    /// backtracking re-solve → Maude's `re-solving`).
+    /// Begin condition fragment `index`; `first_attempt = false` marks a backtracking re-solve.
     FragmentStart {
         kind: StmtKind,
         stmt_id: u32,
@@ -831,7 +796,7 @@ pub enum RewriteKind {
     Equation,
     /// A built-in (`special`) operator's reduction.
     BuiltIn,
-    /// A user rule (`rl`/`crl`), applied by `rewrite`/`frewrite`/`search` (Pillar A).
+    /// A user rule (`rl`/`crl`), applied by rewriting or search.
     Rule,
 }
 
@@ -844,7 +809,7 @@ pub enum StmtKind {
     /// A (conditional) membership axiom.
     Membership,
     /// A (conditional) rule (`rl`/`crl`) — selects the frontend `rl_traces` metadata and the `rls`
-    /// trace flag (Pillar A).
+    /// trace flag.
     Rule,
 }
 
@@ -900,31 +865,28 @@ pub(crate) enum ERewritePassStep {
 #[derive(Default)]
 pub(crate) struct Runtime {
     dags: Arena<DagNode>,
-    /// Name-token ranks of the pseudo-variable constants realized for non-ground command subjects
-    /// ([`SymbolClass::Variable`]): same-sort variables order by name code in Maude
-    /// (variableDagNode.cc), and [`dag_compare`](Self::dag_compare) mirrors that here. Empty unless a
-    /// non-ground subject was built, so the ground hot path pays one `is_empty` check.
+    /// Name-token ranks of pseudo-variable constants realized for non-ground command subjects.
+    /// Same-sort variables order by name code. Empty unless a non-ground subject was built, so the
+    /// ground hot path pays one `is_empty` check.
     var_ranks: HashMap<SymbolId, u32>,
-    /// Relative first-ascent ranks for quoted identifiers synthesized by META-level output. Maude
-    /// interns each complete payload (for example `X:Foo`) lazily; using the source variable's bare
-    /// token code gives the wrong order when fresh and rule variables share a reflected substitution.
+    /// Relative first-ascent ranks for quoted identifiers synthesized by META-level output. Each
+    /// complete payload (for example `X:Foo`) is interned lazily; the source variable's bare token
+    /// code gives the wrong order when fresh and rule variables share a reflected substitution.
     qid_ranks: HashMap<String, u32>,
-    /// Relative creation ranks of Maude's per-sort `VariableSymbol`s. Original command variables
-    /// are parsed before their final theory-normalized slots are known, so the unification driver
-    /// records the parser-equivalent first-demand order explicitly. Unranked mid-solve symbols keep
-    /// the ordinary `SymbolId` fallback.
+    /// Relative creation ranks of per-sort variable symbols. Original command variables are parsed
+    /// before their final theory-normalized slots are known, so the unification driver records the
+    /// parser-equivalent first-demand order explicitly. Unranked mid-solve symbols use `SymbolId`.
     sort_var_ranks: HashMap<SymbolId, u32>,
-    /// Kind/error metadata for per-sort variable symbols. Within one kind, Maude's real-sort
-    /// VariableSymbols precede the synthesized kind-error VariableSymbol even when a previous
-    /// command forced the error symbol first during unsorted solving.
+    /// Kind/error metadata for per-sort variable symbols. Within one kind, real-sort variables
+    /// precede the synthesized kind-error variable even if an earlier command created the error
+    /// symbol first.
     sort_var_meta: HashMap<SymbolId, (KindId, bool)>,
-    /// Per-identity cached normalized DAG (Maude's `BinarySymbol::getIdentityDag`). Values are
-    /// engine-lifetime GC roots and are stamped reduced when handed to a collapse binding.
+    /// Per-identity cached normalized DAG. Values are engine-lifetime GC roots and are stamped
+    /// reduced when handed to a collapse binding.
     identity_dags: HashMap<IdentityId, DagId>,
     /// Guards identity materialization against recursively identity-bearing terms.
     identity_building: HashSet<IdentityId>,
-    /// Aggregate command count. Breakdown categories below are subcounts of this value; equational
-    /// rewrites are the remainder, matching Maude's accounting for transferred meta-level work.
+    /// Aggregate command count. The categories below are subcounts; equational rewrites are the remainder.
     pub(crate) rewrite_count: u64,
     membership_count: u64,
     rule_rewrite_count: u64,
@@ -934,9 +896,9 @@ pub(crate) struct Runtime {
     model_check_stats: Vec<ModelCheckStats>,
     /// Completed satisfiability statistics waiting for the command layer to consume them.
     sat_solve_stats: Vec<SatSolveStats>,
-    /// Next value for the `counter` built-in (Maude's `CounterSymbol`): each `rewrite`/`frewrite` step
-    /// that fires a `counter` redex yields this and increments it. Reset to 0 at the start of each
-    /// top-level rewriting command (not on `continue`). Inert under equational `reduce`.
+    /// Next value for the `counter` built-in. Each rule-style counter redex yields this value and
+    /// increments it. Reset to 0 at the start of each top-level command except `continue`; inert under
+    /// equational `reduce`.
     pub(crate) counter_value: u64,
     /// When `Some`, [`reduce`](Engine::reduce) records a structured [`TraceEvent`] stream here (opt-in
     /// via [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate node ids, so it
@@ -959,38 +921,27 @@ pub(crate) struct Runtime {
     gc_interval: Option<u64>,
     /// DAG nodes allocated since the last collection (drives `gc_interval`).
     allocs_since_gc: u64,
-    /// Engine-global GC roots that protect the **outer** reduction's working set across a re-entrant
-    /// condition reduction (F-2). A condition fragment is evaluated by calling [`reduce`](Self::reduce)
-    /// again; that nested reduce's [`safe_point_gc`](Self::safe_point_gc) can only see *its own* frame
-    /// stack, so [`condition_holds`](Self::condition_holds) pushes the outer frames' roots + match
-    /// bindings + redex here for the duration of the solve (Maude marks from all active rewriting
-    /// contexts). `safe_point_gc` marks everything here in addition to the current stack. Used only when
-    /// `gc_interval` is `Some` (otherwise GC never fires, so the vec stays empty — no overhead off-path).
+    /// Engine-global roots protecting an outer reduction across re-entrant condition reduction.
+    /// Nested collection sees its own frames, so condition solving temporarily adds the outer frames,
+    /// match bindings, and redex here. This remains empty when in-reduction GC is disabled.
     protected: Vec<DagId>,
-    /// Construction-time structural-dedup memo (C7 Half 1), `None` (the default) except inside a
-    /// [`begin_dedup`](Self::begin_dedup)…[`end_dedup`](Self::end_dedup) window. While `Some`, every
-    /// [`alloc_node`](Self::alloc_node) returns an existing structurally-identical node instead of a
-    /// duplicate, so a repeated subterm in the subject (or a sharing rhs) becomes **one** shared node —
-    /// which `nf`-forwarding then reduces once. Construction-scoped (never spans a GC safe point), so the
-    /// memo never holds a stale id; the default `None` path is a single `is_some()` branch on the
-    /// allocation funnel, leaving the reduce hot path untouched. Bottom-up construction keeps the
-    /// [`NodeTerm`] key shallow (children are deduped first, so identical subtrees already share ids).
+    /// Construction-scoped structural deduplication. While present, allocation reuses an equal
+    /// [`NodeTerm`]. Windows never span a GC safe point, so the memo cannot retain stale handles.
     dedup: Option<HashMap<NodeTerm, DagId>>,
-    /// Captured `stdout` / `stderr` writes from `erewrite` EXTERNAL-mode stream managers (Pillar 2.5-C),
-    /// surfaced by the REPL. Reset per `erewrite` command via [`reset_external`](Engine::reset_external).
+    /// Captured `stdout` / `stderr` writes from `erewrite` stream managers, surfaced by the REPL and
+    /// reset per `erewrite` command via [`reset_external`](Engine::reset_external).
     external_out: String,
     external_err: String,
-    /// Buffered, rooted reply messages from external managers (Maude's `incomingMessages` mailbox).
-    /// They are delivered into the soup on the next `erewrite` pass (`getExternalMessages`) and remain
-    /// live across a suspended parent pass and arbitrary child-engine work.
+    /// Buffered, rooted replies from external managers. The next `erewrite` pass delivers them into
+    /// the soup; they remain live across suspended parent work.
     incoming: Vec<RootedDag>,
     /// Capability registry for host-owned external targets. The rooted target DAGs persist across
     /// commands until the host explicitly unregisters the corresponding opaque token.
     external_targets: HashMap<u64, RootedDag>,
     next_external_target: u64,
-    /// Pending `stdin` input for `getLine` (Pillar 2.5-C): the raw not-yet-read bytes. A `getLine` reads up
-    /// to and **including** the next `\n` (or the rest with no trailing `\n`); empty buffer = EOF → `""`.
-    /// Threaded by the REPL across commands (NOT reset per command, unlike the output buffers).
+    /// Pending scripted `stdin` bytes for `getLine`. A call consumes through the next `\n` (inclusive),
+    /// or the remainder when no newline exists; an empty buffer is EOF. The REPL preserves unread input
+    /// across commands.
     pub(crate) external_in: String,
 }
 
@@ -1029,12 +980,8 @@ impl Default for Signature {
     }
 }
 
-/// Whether `t` has a repeated **compound** subterm — some `Op` term appearing (by structural value) at
-/// two or more positions. Decides an equation's `rhs_shares` flag (C7 Half 1): only such an rhs needs the
-/// dedup window, so the common non-sharing rhs (e.g. `fib`'s `s(N + M)`) keeps the plain instantiate path.
-/// Bare `Var`s are skipped — a repeated variable already shares through the substitution (`instantiate`
-/// returns the one binding), so it is not a construction duplicate. Over-approximating is safe: a false
-/// positive only enables the (idempotent) dedup window; there are no false negatives.
+/// Detect a repeated compound rhs subterm. Variables are excluded because repeated occurrences already
+/// share their substitution binding. A false positive only enables an idempotent deduplication window.
 fn term_has_repeated_subterm(t: &Term) -> bool {
     let mut seen: HashSet<&Term> = HashSet::new();
     let mut stack = vec![t];
@@ -1058,9 +1005,8 @@ fn term_has_repeated_subterm(t: &Term) -> bool {
     false
 }
 
-/// Textually equal, non-ground compound terms available for Maude's equation left-to-right sharing.
-/// The lhs root itself is not inserted by `findAvailableTerms(..., atTop = true)`; variables already
-/// share through the substitution and need no entry.
+/// Textually equal, non-ground compound terms available for left-to-right equation sharing. The LHS
+/// root is excluded; variables already share through substitution.
 fn lhs_rhs_shared_subterms(lhs: &Term, rhs: &Term) -> Vec<Term> {
     fn has_variable(term: &Term) -> bool {
         match term {
@@ -1153,9 +1099,9 @@ impl Signature {
         self.recompute_minimum_substitution_size();
     }
 
-    /// Approximate `insertAbstractionVariables`: recursively retain each immediate non-variable alien
-    /// beneath a non-free theory node. Whether it needs protection is decided against the module's
-    /// equation-derived collapse patterns in [`recompute_minimum_substitution_size`](Self::recompute_minimum_substitution_size).
+    /// Recursively retain each immediate non-variable alien beneath a non-free theory node.
+    /// [`recompute_minimum_substitution_size`](Self::recompute_minimum_substitution_size) decides
+    /// whether each candidate needs protection from equation-derived collapse shapes.
     fn collect_abstraction_candidates(&self, term: &Term, out: &mut Vec<LayoutAlien>) {
         match term {
             Term::Op { symbol, args } => {
@@ -1320,10 +1266,8 @@ impl Signature {
         })
     }
 
-    /// Register an **ACU** operator (`assoc comm`, optionally with a two-sided `id:`). The operator
-    /// must be binary (Maude requires associative operators to be binary); its arguments are stored
-    /// flattened as a multiset and matched modulo AC(+U). `identity` is the constant symbol declared
-    /// as `id: <const>`, or `None`.
+    /// Register a binary ACU operator, optionally with a two-sided identity. Applications are stored as
+    /// flattened multisets and matched modulo associativity, commutativity, and identity.
     pub(crate) fn add_op_ac(
         &mut self,
         name: impl Into<String>,
@@ -1435,9 +1379,8 @@ impl Signature {
         id
     }
 
-    /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Its nodes
-    /// store the iteration count compactly as `s^count(arg)` and match modulo the successor extension.
-    /// Must be unary; not commutative, so no declaration completion.
+    /// Register a unary `iter` successor. Nodes store a compact iteration count and match modulo
+    /// successor extension.
     pub(crate) fn add_op_iter(
         &mut self,
         name: impl Into<String>,
@@ -1466,8 +1409,8 @@ impl Signature {
             class: SymbolClass::default(),
         })
     }
-    /// Whether any (conditional or not) equation is indexed at `s` — the `equationFree()` half of
-    /// the decompose-equality stability test.
+    /// Whether any unconditional or conditional equation is indexed at `s`, used by the
+    /// decompose-equality stability test.
     pub(crate) fn has_equations(&self, s: SymbolId) -> bool {
         self.equations.get(&s).is_some_and(|v| !v.is_empty())
     }
@@ -1476,10 +1419,8 @@ impl Signature {
         self.symbols.get(id)
     }
 
-    /// Resolve an operator by canonical name + arity to its symbol id (the META-LEVEL descent seam's
-    /// reverse lookup, for building result terms like `true`/`false` or down-translating `downTerm`'s
-    /// argument into the current module). Our kernel folds overloads into one symbol per `(name, arity)`,
-    /// so this is unambiguous; `None` if no such operator is declared in this module.
+    /// Resolve an operator by canonical name and arity for metalevel construction. Overloads sharing
+    /// that pair are folded into one symbol; absent declarations return `None`.
     pub(crate) fn resolve_symbol(&self, name: &str, arity: usize) -> Option<SymbolId> {
         self.symbols
             .iter()
@@ -1493,10 +1434,10 @@ impl Signature {
     }
 
     /// Attach an additional declaration to an existing operator (ad-hoc / subsort overloading). All
-    /// declarations of an operator must agree on arity; least-sort resolution walks them in the order
-    /// added, so the *original* `add_op*` declaration stays first (the tie-break favours it). Must be
-    /// called before any node of `sym` is built (sorts are cached at construction). The parser (B4) is
-    /// the eventual real source; this is the hand-built-module entry point.
+    /// declarations must agree on arity. Least-sort resolution walks them in insertion order, so the
+    /// first `add_op*` declaration wins an incomparable tie. Call this before building any node of
+    /// `sym`, because construction caches sorts. The frontend uses this while building signatures;
+    /// programmatic clients may call it directly.
     pub(crate) fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
         self.add_op_decl_with_ctor(sym, domain, range, false);
     }
@@ -1531,22 +1472,16 @@ impl Signature {
         self.symbols.get_mut(sym).inconsistent_constructor_axioms = true;
     }
 
-    /// Maude's `BinarySymbol::commutativeSortCompletion` (`Interface/binarySymbol.cc`): a commutative
-    /// operator's declaration set is completed so that every **asymmetric** declaration `[a, b] -> r`
-    /// also carries its swapped form `[b, a] -> r` (same range, same `ctor`), unless one is already
-    /// present.
+    /// Complete a commutative operator's declaration set: every asymmetric declaration
+    /// `[a, b] -> r` also receives `[b, a] -> r` with the same range and constructor flag, unless
+    /// that declaration already exists.
     ///
-    /// Maude builds a *positional* sort diagram from the declarations and folds it left-to-right over
-    /// an ACU multiset / CUI pair (`ACU_DagNode::argVecComputeBaseSort` → `computeMultSortIndex`);
-    /// [`compute_sort`](Self::compute_sort) likewise checks `arg_sorts[i] <= decl.domain[i]`
-    /// **positionally**. Commutativity requires either argument order to yield the same least sort,
-    /// but the canonical element order (by [`dag_compare`](Runtime::dag_compare)) can present the
-    /// lower-sorted element first — so without the swapped declaration an asymmetric overload such as
-    /// NAT's `_+_ : NzNat Nat -> NzNat` would compute an argument-order-dependent (wrong) least sort
-    /// (e.g. `z + nz : Nat` instead of `NzNat`). Completing the set restores order-independence
-    /// without changing the fold. Idempotent (a swap's swap is the original, already present), so it is
-    /// safe to run after each declaration is registered. AU (associative, non-commutative) and free
-    /// operators are left untouched — their argument order is significant.
+    /// [`compute_sort`](Self::compute_sort) checks declarations positionally while ACU and CUI nodes
+    /// canonicalize their arguments. Completing both positions makes least-sort selection independent
+    /// of canonical argument order. Without the swapped declaration, an overload such as
+    /// `_+_ : NzNat Nat -> NzNat` could type `z + nz` as `Nat` instead of `NzNat`. Completion is
+    /// idempotent and runs after each declaration is registered. AU and free operators are unchanged
+    /// because their argument order is significant.
     fn commutative_sort_completion(&mut self, sym: SymbolId) {
         let s = self.symbols.get(sym);
         if !matches!(s.theory(), Theory::Acu | Theory::Cui) || !s.axioms.comm {
@@ -1577,20 +1512,19 @@ impl Signature {
         self.symbols.get_mut(sym).decls.extend(to_add);
     }
 
-    /// Mark every declaration of `sym` as a constructor (`[ctor]`, B2.4). Metadata only — it does not
-    /// change reduction; recorded for the later constructor analysis.
+    /// Mark every declaration of `sym` as a constructor (`[ctor]`). This does not change reduction;
+    /// constructor-sensitive symbolic analyses consume the metadata.
     pub(crate) fn set_ctor(&mut self, sym: SymbolId) {
         for decl in &mut self.symbols.get_mut(sym).decls {
             decl.ctor = true;
         }
     }
 
-    /// Install and normalize an operator evaluation strategy (`strat (…)`, B2.4).
+    /// Install and normalize an operator evaluation strategy.
     ///
-    /// Source positions are 1-based and `0` means "try at the root." As in Maude's
-    /// `Strategy::setStrategy`, duplicate argument positions and adjacent zeroes are discarded and a
-    /// missing final zero is appended. An empty list denotes the standard strategy. Associative
-    /// symbols use Maude's three meaningful permutative classes: eager, lazy, or semi-eager.
+    /// Source positions are one-based and zero means top. Duplicate positions and adjacent zeroes are
+    /// discarded, a missing final zero is appended, and an empty list selects the standard strategy.
+    /// Associative symbols classify as eager, lazy, or semi-eager.
     pub(crate) fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
         let symbol = self.symbols.get(sym);
         let arity = symbol.arity();
@@ -1603,10 +1537,8 @@ impl Signature {
         let strategy = if raw.is_empty() {
             None
         } else if matches!(symbol.theory(), Theory::Acu | Theory::Au) {
-            // Maude's BinarySymbol::setPermuteStrategy: flattened associative applications cannot
-            // distinguish their two declared argument positions. Any argument before the first top
-            // makes the strategy eager; an argument first seen after a top makes it semi-eager; no
-            // argument at all is lazy.
+            // Flattened associative applications cannot distinguish the two declared positions.
+            // Arguments before the first top imply eager; after top imply semi-eager; none imply lazy.
             let mut seen_top = false;
             let mut classified = None;
             for &step in raw {
@@ -1655,12 +1587,11 @@ impl Signature {
         self.symbols.get_mut(sym).strategy = strategy;
     }
 
-    /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`, Pillar A). `raw` is the 1-based
-    /// positions from the source — empty for a bare `[frozen]` (all arguments); stored 0-based.
+    /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`). `raw` contains the 1-based source
+    /// positions — empty for bare `[frozen]` (all arguments) — and is stored 0-based.
     ///
-    /// Returns `false` without changing the symbol when any position is outside the operator's arity,
-    /// or when a constant is given a bare `frozen` attribute. This is Maude's atomic
-    /// warning-and-ignore recovery semantics; source diagnostics belong to the frontend.
+    /// Invalid positions and bare `frozen` on a constant leave the symbol unchanged and return false;
+    /// the frontend owns diagnostics.
     #[must_use]
     pub(crate) fn set_frozen(&mut self, sym: SymbolId, raw: &[u32]) -> bool {
         let arity = self.symbols.get(sym).arity();
@@ -1675,23 +1606,19 @@ impl Signature {
         true
     }
 
-    /// Set the object-system role flags (`config`/`obj`/`msg`/`portal`) on `sym` (Pillar 2.5). Inert
-    /// for the existing rewriting modes; consumed by the `erewrite` object-message scheduler (Phase B).
+    /// Set the object-system role flags (`config`/`obj`/`msg`/`portal`) on `sym`. Ordinary rewrite modes
+    /// treat them as metadata; the `erewrite` object-message scheduler consumes them.
     pub(crate) fn set_oo_flags(&mut self, sym: SymbolId, oo: OoFlags) {
         self.symbols.get_mut(sym).oo = oo;
     }
 
-    /// Set a built-in reduction rule (`special (id-hook …)`, B3) on `sym`. The op-hook/term-hook
-    /// references are passed already resolved to [`SymbolId`]s (the future parser does the resolution;
-    /// hand-built modules supply them directly). A [`SpecialOp::Branch`] has an intrinsic dynamic
-    /// strategy: reduce its condition, attempt selection, and only if selection fails reduce every
-    /// branch before the final user-equation attempt (cf. Maude's `BranchSymbol::eqRewrite`).
+    /// Set a built-in reduction rule (`special (id-hook …)`) on `sym`. Hook references arrive already
+    /// resolved to [`SymbolId`]s. Attaching [`SpecialOp::Branch`] also installs its intrinsic lazy
+    /// evaluation strategy and synthetic branch-sort declarations.
     pub(crate) fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         if let SpecialOp::Branch { .. } = op {
-            // Re-attaching a Branch (the same op reached via two import paths — e.g. `if_then_else_fi`
-            // from a parameter theory's `protecting BOOL` and a regular `BOOL` import) is a no-op: the
-            // seam already installed its intrinsic strategy. The "no user strat" check therefore
-            // guards only the *first* attach — a genuine user strategy still trips it.
+            // Branch attachment is idempotent because flattened imports can revisit the same symbol.
+            // A user strategy is still invalid on the first attachment.
             if matches!(
                 self.symbols.get(sym).special,
                 Some(SpecialOp::Branch { .. })
@@ -1704,9 +1631,8 @@ impl Signature {
                  carry a user strat",
                 self.symbols.get(sym).name()
             );
-            // BranchSymbol's result sort follows the common sort of its branch arguments. Maude
-            // encodes this by adding one synthetic declaration per proper sort in the branch kind:
-            // condition sort × branch sort^n -> branch sort.
+            // A branch operator's result sort follows its branch arguments. Add one synthetic
+            // condition-sort × branch-sortⁿ → branch-sort declaration per proper branch sort.
             let (arity, condition_sort, branch_sorts) = {
                 let symbol = self.symbols.get(sym);
                 let base = &symbol.decls()[0];
@@ -1781,22 +1707,56 @@ impl Signature {
         }
     }
 
-    /// Least sort of `symbol(args…)` whose arguments have sorts `arg_sorts`, under multi-declaration
-    /// overloading — Maude's `findMinSortIndex` (sortTable.cc:369). The least sort is the minimum of
-    /// the *applicable* declarations' range sorts (a declaration is applicable iff every `arg_sorts[i]
-    /// <= decl.domain[i]`), breaking incomparable (non-preregular) ties toward the **earliest**
-    /// declaration. Reproduced directly by intersecting range **down-sets** in declaration order
-    /// (correctness-first; the flattened sort-diagram decision table is a later perf step). No
-    /// applicable declaration → the error sort of the range's kind.
+    /// Least sort of `symbol(args…)` under multi-declaration overloading. A declaration applies iff
+    /// every `arg_sorts[i] <= decl.domain[i]`. A later range replaces the current choice only when it
+    /// is below every earlier applicable range, so incomparable ties select the earliest declaration.
+    /// If no declaration applies, the result is the error sort of the range kind.
     pub(crate) fn compute_sort(&self, symbol: SymbolId, arg_sorts: &[SortId]) -> SortId {
-        self.compute_sort_uniq(symbol, arg_sorts).0
+        let decls = self.symbols.get(symbol).decls();
+        assert_eq!(
+            arg_sorts.len(),
+            decls[0].domain.len(),
+            "arity mismatch building `{}`",
+            self.symbols.get(symbol).name()
+        );
+        let applicable = |decl: &OpDeclaration| {
+            arg_sorts
+                .iter()
+                .zip(&decl.domain)
+                .all(|(&arg, &domain)| self.sorts.leq(arg, domain))
+        };
+        if let [only] = decls {
+            return if applicable(only) {
+                only.range
+            } else {
+                self.sorts.error_sort(self.sorts.kind_of(only.range))
+            };
+        }
+        debug_assert!(
+            decls
+                .iter()
+                .all(|decl| self.sorts.kind_of(decl.range) == self.sorts.kind_of(decls[0].range)),
+            "operator declaration group invariant violated for `{}`: range kinds differ; cross-kind \
+             range overloads must use distinct symbols",
+            self.symbols.get(symbol).name()
+        );
+        let mut least = None;
+        for (index, decl) in decls.iter().enumerate() {
+            if applicable(decl)
+                && decls[..index]
+                    .iter()
+                    .filter(|prior| applicable(prior))
+                    .all(|prior| self.sorts.leq(decl.range, prior.range))
+            {
+                least = Some(decl.range);
+            }
+        }
+        least.unwrap_or_else(|| self.sorts.error_sort(self.sorts.kind_of(decls[0].range)))
     }
 
-    /// The sort of a built-in **NA** constant — *value-dependent* (Maude's per-symbol NA sort
-    /// functions), not just the least declared range. Strings and floats select their most-specific
-    /// declaration for a one-character/finite value and their most-general declaration otherwise.
-    /// Quoted identifiers use Maude's token auxiliary-property grammar; an unclassified token has the
-    /// base `Qid` sort (the most-general declaration).
+    /// Value-dependent least sort of a built-in nonalgebraic constant. One-character strings and
+    /// finite floats select the narrow declaration; quoted identifiers use token classification and
+    /// otherwise fall back to the base `Qid` sort.
     pub(crate) fn compute_na_sort(&self, symbol: SymbolId, value: &NaValue) -> SortId {
         let decls = self.symbols.get(symbol).decls();
         let (mut min, mut max) = (decls[0].range, decls[0].range);
@@ -1809,9 +1769,8 @@ impl Signature {
             }
         }
         if let NaValue::Qid(q) = value {
-            // META-TERM extends `<Qids>` with Sort/Kind/Constant/Variable declarations. Maude's
-            // `QuotedIdentifierSymbol::determineSort` returns the base `Qid` for token text with no
-            // auxiliary property, rather than arbitrarily choosing one of those incomparable subsorts.
+            // Unclassified quoted identifiers use the base `Qid` rather than an arbitrary
+            // incomparable classification subsort.
             return self.classify_qid(q).or(self.qid_class.base).unwrap_or(max);
         }
         let special = match value {
@@ -1823,8 +1782,7 @@ impl Signature {
         if special { min } else { max }
     }
 
-    /// Classify quoted-identifier text exactly as Maude's `Token::computeAuxProperty`; return `None`
-    /// for ordinary operator-name Qids and for a classification code absent from this module.
+    /// Classify quoted-identifier text; return `None` for ordinary names or absent class sorts.
     fn classify_qid(&self, text: &str) -> Option<SortId> {
         let qc = &self.qid_class;
         match qid_aux_property(text)? {
@@ -1849,86 +1807,8 @@ impl Signature {
         }
     }
 
-    /// [`compute_sort`](Self::compute_sort) plus the **preregularity** bit: `true` iff the least sort
-    /// is unique (the running down-set intersection equals the chosen range's down-set — Maude's
-    /// `unique` flag). Maude *warns* when this is false; we compute it but defer the user-facing
-    /// warning (no diagnostics sink yet) — the tie-break itself is exercised by conformance.
-    pub(crate) fn compute_sort_uniq(
-        &self,
-        symbol: SymbolId,
-        arg_sorts: &[SortId],
-    ) -> (SortId, bool) {
-        let decls = self.symbols.get(symbol).decls();
-        assert_eq!(
-            arg_sorts.len(),
-            decls[0].domain.len(),
-            "arity mismatch building `{}`",
-            self.symbols.get(symbol).name()
-        );
-        // Fast path: a single declaration (no overloading — every free/theory op in practice). Its
-        // range is the unique least sort when applicable, else the kind's error sort. Avoids the
-        // per-node down-set clone the general path does, keeping the reduce hot path allocation-free.
-        if let [only] = decls {
-            let applicable = arg_sorts
-                .iter()
-                .zip(&only.domain)
-                .all(|(&a, &dom)| self.sorts.leq(a, dom));
-            return if applicable {
-                (only.range, true)
-            } else {
-                (self.sorts.error_sort(self.sorts.kind_of(only.range)), true)
-            };
-        }
-        debug_assert!(
-            decls
-                .iter()
-                .all(|d| self.sorts.kind_of(d.range) == self.sorts.kind_of(decls[0].range)),
-            "operator declaration group invariant violated for `{}`: range kinds differ; cross-kind \
-             range overloads must use distinct symbols",
-            self.symbols.get(symbol).name()
-        );
-        // Walk declarations in order, intersecting applicable range down-sets. `running` is the
-        // down-set of the GLB so far; `min_range` is the earliest range that is <= everything so far.
-        let mut min_range: Option<SortId> = None;
-        let mut running: Option<std::collections::BTreeSet<SortId>> = None;
-        for d in decls {
-            if !arg_sorts
-                .iter()
-                .zip(&d.domain)
-                .all(|(&a, &dom)| self.sorts.leq(a, dom))
-            {
-                continue; // declaration not applicable to these argument sorts
-            }
-            let down = self.sorts.down_set(d.range);
-            match &mut running {
-                None => {
-                    running = Some(down.clone());
-                    min_range = Some(d.range);
-                }
-                Some(r) => {
-                    r.retain(|x| down.contains(x)); // intersect with this range's down-set
-                    if *r == *down {
-                        min_range = Some(d.range); // d.range <= everything so far ⇒ new minimum
-                    }
-                }
-            }
-        }
-        match min_range {
-            // unique iff the GLB's down-set (`running`) equals the chosen min's down-set ⇒ min is the GLB.
-            Some(r) => (r, running.as_ref() == Some(self.sorts.down_set(r))),
-            None => (
-                self.sorts.error_sort(self.sorts.kind_of(decls[0].range)),
-                true,
-            ),
-        }
-    }
-
-    /// Least sort of a theory (ACU/AU/CUI) node, folding the **binary** [`compute_sort`](Self::compute_sort)
-    /// left-to-right over the canonical element sorts (Maude's `traverse(traverse(0, i1), i2)`). For the
-    /// single binary declaration `[D, D] -> R` every B1 / conformance operator carries, this returns `R`
-    /// iff all elements `<= D` (else the kind's error sort) — identical to the old per-theory
-    /// `compute_*_sort` — and extends to subsort-overloaded AC later with no reshape. `elem_sorts` is
-    /// non-empty (a canonical theory node holds ≥ 2 elements).
+    /// Fold a binary theory operator left-to-right over canonical element sorts. This handles
+    /// subsort overloads without representation-specific sort logic.
     pub(crate) fn compute_sort_fold(&self, symbol: SymbolId, elem_sorts: &[SortId]) -> SortId {
         let mut acc = elem_sorts[0];
         for &e in &elem_sorts[1..] {
@@ -1944,17 +1824,9 @@ impl Signature {
             .is_some_and(|id| self.sorts.leq(self.identity_sort(id), sort))
     }
 
-    /// The per-sort **bound** for associative operator `op` (Maude's `AssociativeSymbol::sortBound` via
-    /// `associativeSortBoundsAnalysis`): the maximum number of `op`-arguments a term of sort `s` can
-    /// have — `1` for an *element* sort (two arguments joined escape it, e.g. SET's `X$Elt`),
-    /// [`UNBOUNDED`](crate::diophantine::UNBOUNDED) for a *collector* sort (any number stays `<= s`,
-    /// e.g. `Set`). Returned as a map over the operator's kind's member sorts; a sort not present is
-    /// treated `UNBOUNDED` by callers. This distinguishes the Diophantine *stripper* rows (maxSize 1)
-    /// from *collector* rows (unbounded), fixing both efficiency and the enumeration order.
-    ///
-    /// Ports the fixpoint over the sort diagram. Sort constraints (memberships) on `op` — which force
-    /// their target sorts unbounded — are **not** modelled: no conformance AC operator with a variable
-    /// top-variable carries one (B3's membership pattern is ground).
+    /// Maximum number of associative operands a term of each sort can contain. Element sorts have
+    /// bound one; collector sorts are unbounded. These bounds distinguish stripper and collector rows
+    /// in ACU distribution. Variable-headed membership constraints are outside this analysis.
     pub(crate) fn acu_sort_bounds(&self, op: SymbolId) -> std::collections::HashMap<SortId, i32> {
         use crate::diophantine::UNBOUNDED;
         let range = self.symbols.get(op).decls()[0].range;
@@ -1963,7 +1835,7 @@ impl Signature {
         let error = self.sorts.error_sort(kind);
         let mut bounds: std::collections::HashMap<SortId, i32> =
             members.iter().map(|&s| (s, UNBOUNDED)).collect();
-        // Sorts `>= s` within the component (Maude's `insertGreaterOrEqualSorts`).
+        // Sorts greater than or equal to `s` within the component.
         let ge = |s: SortId| -> Vec<SortId> {
             members
                 .iter()
@@ -2000,10 +1872,8 @@ impl Signature {
         bounds
     }
 
-    /// Whether `sort` has Maude's `LIMIT_SORT` (or stronger `PURE_SORT`) property for an associative
-    /// operator: combining any two arguments whose sorts are `<= sort` still has sort `<= sort`.
-    /// `ACU_NonLinearLhsAutomaton` requires this closure before it may collect several subject
-    /// elements into one repeated-variable binding.
+    /// Whether every pair of operand sorts below `sort` combines below `sort`, permitting a repeated
+    /// variable to collect multiple associative operands safely.
     pub(crate) fn acu_nonlinear_sort_safe(&self, op: SymbolId, sort: SortId) -> bool {
         let kind = self.sorts.kind_of(sort);
         self.sorts
@@ -2026,13 +1896,8 @@ impl Signature {
             })
     }
 
-    /// Least sort of an **S** node `s^count(arg)` (Maude's `S_Symbol::computeBaseSort` /
-    /// `SortPath::computeSortIndex`). The successor's unary sort function, iterated over the argument
-    /// sort, is eventually periodic (it maps a finite kind into itself), so the sort follows a **lead**
-    /// prefix then a **cycle**: `count` in the lead indexes the prefix directly, beyond it indexes into
-    /// the cycle. For NAT (`s_ : Nat -> NzNat`) the path is `Zero ↦ NzNat ↦ NzNat …`, so `s^n(0)` is
-    /// `NzNat` for every `n >= 1`. Correctness-first: the path is recomputed per call (Maude precomputes
-    /// a `sortPathTable` per argument sort — a perf follow-up).
+    /// Least sort of `s^count(arg)`. Iterating a unary sort function over a finite kind eventually
+    /// follows a lead and cycle; counts beyond the lead index modulo the cycle.
     pub(crate) fn compute_s_sort(&self, symbol: SymbolId, arg_sort: SortId, count: &Nat) -> SortId {
         let (seq, lead) = self.s_sort_path(symbol, arg_sort);
         let path_len = seq.len();
@@ -2042,7 +1907,7 @@ impl Signature {
         {
             return seq[c - 1];
         }
-        // Past the lead: index into the cycle (Maude's `computeSortIndex` tail arithmetic).
+        // Past the lead, index modulo the cycle.
         let cycle = path_len - lead;
         let steps = count
             .checked_sub(&Nat::from_u64((lead + 1) as u64))
@@ -2071,9 +1936,8 @@ impl Signature {
         self.push_equation(eq.lhs, eq.rhs, eq.nr_vars, Vec::new(), false)
     }
 
-    /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3): the condition is a list of
-    /// [`ConditionFragment`]s (equality / sort-test), all of which must hold; a failure backtracks into
-    /// the next matcher solution. `eq` stays the unconditional entry point (empty condition).
+    /// Register a conditional equation. All equality and sort-test fragments must hold; failure
+    /// backtracks to the next matcher solution.
     pub(crate) fn add_conditional_equation(
         &mut self,
         lhs: Term,
@@ -2084,8 +1948,8 @@ impl Signature {
         self.push_equation(lhs, rhs, nr_vars, condition, false)
     }
 
-    /// Register an `[owise]` equation (optionally conditional): tried only if no non-owise equation of
-    /// the symbol applies (Maude's `applyReplaceNoOwise` two-phase matching, B2.3b).
+    /// Register an optional conditional `[owise]` equation, tried only after every ordinary equation
+    /// for the symbol fails.
     pub(crate) fn add_owise_equation(
         &mut self,
         lhs: Term,
@@ -2096,7 +1960,7 @@ impl Signature {
         self.push_equation(lhs, rhs, nr_vars, condition, true)
     }
 
-    /// Register an executable equation carrying Maude's `[variant]` attribute.
+    /// Register an executable equation carrying the `[variant]` attribute.
     pub(crate) fn add_variant_equation(
         &mut self,
         lhs: Term,
@@ -2128,11 +1992,8 @@ impl Signature {
         self.next_eq_id += 1;
         let rhs_shares = term_has_repeated_subterm(&rhs);
         let lhs_reuse = lhs_rhs_shared_subterms(&lhs, &rhs);
-        // Collapse indexing (Maude's Module::indexEquation): an equation whose lhs can COLLAPSE —
-        // its top operator's identity/idem axioms can erase it, leaving a term rooted elsewhere —
-        // must also be offered to the symbols it can collapse to, so `eq a + X = c` (id: e) is tried
-        // on a bare subject `a`, and `eq (S ; S) = S` on the identity constant `e` (B1a/B1b).
-        // Computed before `lhs` moves into the automaton.
+        // Index collapsing equations under every possible surviving top symbol. Identity and
+        // idempotence can erase the declared root, so a bare collapse target must still try the equation.
         let extra_targets = self.collapse_targets(&lhs, top);
         let compiled = CompiledEquation {
             id,
@@ -2148,22 +2009,15 @@ impl Signature {
             self.equations.entry(t).or_default().push(compiled.clone());
         }
         self.equations.entry(top).or_default().push(compiled);
-        // A term canonical under the old equation set may now be reducible: invalidate every
-        // node's cached "reduced" stamp by advancing the epoch.
+        // Adding an equation can invalidate every cached normal form; advance the epoch.
         self.eq_epoch += 1;
         id
     }
 
-    /// The extra symbols an equation must be indexed under because its lhs can collapse to a term
-    /// rooted there (Maude computes `Term::collapseSymbols` and offers such equations beyond the top
-    /// symbol; each symbol's `mightMatchPattern` filter makes the effective set exactly {top} ∪
-    /// collapse targets). For a top operator with `id:`: every argument that is a bare variable can
-    /// absorb the identity, so with **all** arguments variables the pattern collapses to the identity
-    /// constant itself (all-identity assignment; a multiplicity-1 variable additionally makes it
-    /// collapse to *anything* — approximated here by every symbol, like Maude's offer-to-all), and
-    /// with exactly **one** non-variable argument it collapses to that argument's top symbol. CUI
-    /// `idem` patterns `f(P, P')` collapse to the shape both operands can match. ≥2 non-variable
-    /// arguments cannot collapse below two elements — no extra targets.
+    /// Additional symbol indices for an equation whose LHS can collapse below its root. Identity-only
+    /// variable patterns include the identity; a multiplicity-one variable can leave any top symbol;
+    /// one non-variable argument can leave that argument's top. Idempotent CUI patterns can collapse
+    /// only to a shape matched by both operands.
     fn collapse_targets(&self, lhs: &Term, top: SymbolId) -> Vec<SymbolId> {
         let sym = self.symbols.get(top);
         let has_id = sym.identity.is_some();
@@ -2187,9 +2041,8 @@ impl Signature {
             let nonvars: Vec<&Term> = args.iter().filter(|a| !matches!(a, Term::Var(_))).collect();
             match nonvars.len() {
                 0 => {
-                    // All variables. A variable occurring exactly once can be the lone survivor of
-                    // any shape → offer everywhere (Maude's offer-to-all); with every variable
-                    // repeated (e.g. `S ; S`) only the all-identity collapse remains.
+                    // A variable occurring once may be the lone survivor of any shape. If every
+                    // variable repeats, only the all-identity collapse remains.
                     let mut single_occurrence = false;
                     for a in args {
                         if let Term::Var(v) = a
@@ -2247,9 +2100,9 @@ impl Signature {
 
     /// Compile a condition (public [`ConditionFragment`]s) for evaluation: equality / sort-test fragments
     /// are stored as-is; a matching (`:=`) or rewrite (`=>`) fragment's pattern is compiled to an
-    /// [`LhsAutomaton`] through the same A3 seam (and F-A guard) as an equation lhs. `owner` gates the
-    /// **rewrite** (`=>`) fragment, which is legal only in a rule condition — the frontend rejects it in
-    /// an `ceq`/`cmb` (this is the defensive kernel backstop, A-v).
+    /// [`LhsAutomaton`] through the same matcher seam and rule-only guard as an equation lhs. `owner` gates
+    /// the **rewrite** (`=>`) fragment, which is legal only in a rule condition — the frontend rejects it in
+    /// an `ceq`/`cmb`; this is the defensive kernel backstop.
     fn compile_condition(
         &self,
         condition: Vec<ConditionFragment>,
@@ -2290,9 +2143,8 @@ impl Signature {
             .collect()
     }
 
-    /// Register an unconditional rule `rl lhs => rhs` (Pillar A). Compiles the lhs to a theory
-    /// [`LhsAutomaton`] through the same A3 seam as an equation, and stores it in the [`rules`](Self::rules)
-    /// table — never consulted by [`reduce`](Engine::reduce), so equational reduction can never apply it.
+    /// Register an unconditional rule `rl lhs => rhs`. Compiles the lhs through the theory matcher seam
+    /// and stores it in the rule table, which equational [`reduce`](Engine::reduce) never consults.
     pub(crate) fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
         self.push_rule(lhs, rhs, nr_vars, Vec::new(), None)
     }
@@ -2307,9 +2159,8 @@ impl Signature {
         self.push_rule(lhs, rhs, nr_vars, Vec::new(), label)
     }
 
-    /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v): the condition is the
-    /// same [`ConditionFragment`] list as `ceq`, and a rule condition may *additionally* contain a
-    /// **rewrite** fragment `t => p` (A-v). All fragments must hold; a failure backtracks into the next
+    /// Register a conditional rule `crl lhs => rhs if condition`. It accepts the same condition fragments
+    /// as `ceq`, plus rule-only rewrite fragments `t => p`. Fragment failure backtracks into the next
     /// matcher solution.
     pub(crate) fn add_conditional_rule(
         &mut self,
@@ -2332,10 +2183,8 @@ impl Signature {
         self.push_rule(lhs, rhs, nr_vars, condition, label)
     }
 
-    /// Compile and register a rule, returning its dense per-module **id** (the index the frontend keys
-    /// its `rl_traces` metadata by). Mirrors [`push_equation`](Self::push_equation) minus the `owise`
-    /// phase and — crucially — **without** bumping `eq_epoch`: a rule cannot change any equational normal
-    /// form, so invalidating the reduced-cache would be a pure regression.
+    /// Compile and register a rule with a dense module-local id. Rules do not advance `eq_epoch`
+    /// because they cannot alter equational normal forms.
     fn push_rule(
         &mut self,
         lhs: Term,
@@ -2402,10 +2251,8 @@ impl Signature {
             });
     }
 
-    /// Classify a rule's lhs for the `erewrite` scheduler (Maude's `ConfigSymbol::checkArgs`). An
-    /// object-message rule is a `config`-rooted lhs of exactly two arguments — one **object** constructor
-    /// and one **message** constructor, both stable (an application, not a top variable) and sharing the
-    /// same first argument (the object/target *name*). Everything else config-rooted is `LeftOver`.
+    /// Classify a configuration rule for `erewrite`. The object-message fast path requires exactly
+    /// one stable object and one stable message sharing their first, name-bearing argument.
     fn classify_oo_rule(&self, lhs: &Term) -> OoRuleKind {
         let Term::Op { symbol, args } = lhs else {
             return OoRuleKind::NotConfig;
@@ -2456,18 +2303,14 @@ impl Signature {
         }
     }
 
-    /// Register an (unconditional) membership axiom `mb lhs : sort`, compiling its lhs to a theory
-    /// [`LhsAutomaton`] and indexing it by the lhs top symbol. A node's least sort is constrained at
-    /// construction, so — like overload declarations — **memberships must be declared before any node
-    /// of their lhs's symbol is built** (a node built earlier keeps its un-constrained sort). Does not
-    /// bump `eq_epoch`: memberships refine sorts, not the `reduced` cache.
+    /// Register an unconditional membership axiom `mb lhs : sort`, compile its lhs, and add it to the
+    /// direct-symbol or collapse-kind index. Memberships refine sorts lazily at a node's reduction
+    /// normal-form point and do not change the equation epoch.
     pub(crate) fn add_membership(&mut self, mb: Membership) -> u32 {
         self.push_membership(mb.lhs, mb.sort, mb.nr_vars, Vec::new())
     }
 
-    /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
-    /// only when the condition (the same [`ConditionFragment`]s as `ceq`) holds under the membership
-    /// match's substitution. `mb` stays the unconditional entry point (empty condition).
+    /// Register a conditional membership, lowering the sort only when its condition holds.
     pub(crate) fn add_conditional_membership(
         &mut self,
         lhs: Term,
@@ -2492,9 +2335,8 @@ impl Signature {
         let top = lhs
             .top_symbol()
             .expect("membership lhs must be an application");
-        // Maude offers a top-collapsing sort constraint broadly, then lets each symbol/matcher reject
-        // impossible candidates. A kind-wide index is the same semantic envelope without cloning the
-        // compiled constraint or duplicating recursive collapse-symbol analysis.
+        // Index top-collapsing memberships across the result kind; individual matchers reject
+        // impossible candidates without cloning the compiled constraint.
         let collapse_kind = {
             let symbol = self.symbols.get(top);
             match symbol.theory() {
@@ -2545,18 +2387,11 @@ impl Signature {
 impl Runtime {
     // ---- DAG construction ----
 
-    /// Allocate a node with its **base** (structural) sort, accounting it against the safe-point-GC
-    /// interval. The universal allocator for every `make_*` builder: a freshly built node carries only
-    /// its base sort — membership axioms (`mb`/`cmb`) are **not** applied here. Maude likewise gives a
-    /// fresh `DagNode` no sort at construction (`SORT_UNKNOWN`) and refines it lazily at the reduce
-    /// normal-form point (`DagNode::reduce` → `fastComputeTrueSort`); we keep the eager *base* sort (so
-    /// `sort_of` stays a total read) but defer the membership refinement identically — see the C1
-    /// normal-form step in [`reduce`](Self::reduce). (The alloc counter only matters when `gc_interval`
-    /// is set, so the default path is a no-op increment. Reset by `safe_point_gc`, so it can't overflow.)
+    /// Allocate a node with its structural base sort and account for safe-point GC. Membership
+    /// refinement occurs only when reduction reaches a normal form.
     fn alloc_node(&mut self, sort: SortId, term: NodeTerm) -> DagId {
-        // C7 Half 1: inside a dedup window, collapse a structurally-identical node to the existing one.
-        // A hit allocates nothing (so it must NOT bump the GC alloc counter — hence the `alloc_raw`
-        // split). The `is_some()` guard is the only cost on the default reduce path.
+        // Reuse an equal node while a construction deduplication window is open. A hit allocates
+        // nothing and therefore does not advance the GC allocation counter.
         if self.dedup.is_some() {
             if let Some(&existing) = self.dedup.as_ref().unwrap().get(&term) {
                 return existing;
@@ -2584,11 +2419,8 @@ impl Runtime {
         })
     }
 
-    /// Open a construction-time structural-dedup window (C7 Half 1): until [`end_dedup`](Self::end_dedup),
-    /// every node built via [`alloc_node`](Self::alloc_node) is deduplicated, so a repeated subterm
-    /// becomes one shared node. Must wrap a pure-construction span with **no GC safe point** inside (the
-    /// memo holds raw ids), and must be balanced by `end_dedup`. Re-opening inside an open window is
-    /// supported by save/restore at the call site (the rhs path); the bare pair simply resets to `None`.
+    /// Open a construction-only structural-deduplication window. It must not span a GC safe point and
+    /// must be balanced by [`end_dedup`](Self::end_dedup).
     fn begin_dedup(&mut self) {
         self.dedup = Some(HashMap::new());
     }
@@ -2598,19 +2430,9 @@ impl Runtime {
         self.dedup = None;
     }
 
-    /// Lower `id`'s cached least sort by the membership axioms of its top symbol (Maude's
-    /// `constrainToSmallerSort`): whole-match the node against each membership (see
-    /// [`constrain_node_whole`](Self::constrain_node_whole)).
-    /// **Each application counts as one rewrite** (Maude counts membership applications in
-    /// its `rewrites` total). Non-confluent membership sets (incomparable applicable targets) remain a
-    /// follow-up. Theory matching includes `iter`; identity/idem-collapse memberships still need
-    /// collapse-target indexing so they are offered to subjects rooted outside the lhs operator.
-    ///
-    /// **Lazy timing (C1):** this is called only at a node's reduce **normal-form point** (after its
-    /// equations are exhausted), never at construction — mirroring Maude's `fastComputeTrueSort`. So a
-    /// term an equation reduces away is never constrained (no over-count; a `cmb` whose condition loops
-    /// never fires on a doomed redex). `whole` is the reconstructed root term for the `set trace whole`
-    /// `Whole:` line (the caller threads `id` up its reduce frame stack); `None` when not whole-tracing.
+    /// Lower a node's cached least sort through applicable direct and top-collapsing memberships.
+    /// Candidates merge by target-sort order and match whole; every successful lowering counts once.
+    /// Memberships run only at a node's reduction normal form. `whole` carries trace reconstruction.
     fn constrain_to_smaller_sort(
         &mut self,
         sig: &Signature,
@@ -2618,25 +2440,13 @@ impl Runtime {
         whole: Option<DagId>,
         frames: &[ReduceFrame],
     ) {
-        // B3: AC memberships fire **through extension** — on sub-multisets of an AC subject.
-        // Maude's mechanism is simply bottom-up reduction of the UNFLATTENED right-associated
-        // parse: each intermediate node reaches its own reduce normal-form point and is
-        // whole-constrained there. Since make_acu now splices nested same-symbol arguments
-        // LAZILY (an unreduced nested node stays nested until its parent's rebuild), tnk's
-        // subjects keep the parse shape through reduction and the same mechanism fires
-        // naturally — including Maude's written-order-dependent counts on heterogeneous
-        // multisets (the earlier synthetic canonical-prefix replay is gone).
+        // Lazy associative flattening lets each intermediate parse node reach its own normal-form
+        // membership point, preserving source-order accounting.
         self.constrain_node_whole(sig, id, whole, frames);
     }
 
-    /// Constrain a **single** node by the memberships of its top symbol, whole-matched (Maude's
-    /// `constrainToSmallerSort2` at one node): repeatedly find the first membership — ordered
-    /// smallest-target-sort first by [`add_membership`](Signature::add_membership) — whose target is
-    /// strictly below the node's current sort and whose lhs matches (whole, no extension), lower the
-    /// node's sort to it, and retry from the top, to a fixpoint. **Each lowering counts as one rewrite**
-    /// (Maude counts membership applications); smallest-first means a node drops straight to its smallest
-    /// applicable sort in one application. [`constrain_to_smaller_sort`] wraps this with the AC prefix
-    /// fold so the extension case is covered too.
+    /// Repeatedly apply the first whole-matching membership whose target is strictly below the current
+    /// sort, then restart from the smallest target until a fixpoint. Each lowering counts once.
     fn constrain_node_whole(
         &mut self,
         sig: &Signature,
@@ -2695,7 +2505,7 @@ impl Runtime {
                     continue;
                 }
                 if let Some(bindings) = self.membership_applies(sig, sc, id, frames) {
-                    // Record BEFORE mutating the sort: the event captures the *old* (current) sort.
+                    // Record before mutation so the event captures the current sort as `old_sort`.
                     if self.tracing() {
                         let depth = self.condition_depth;
                         self.record(TraceEvent::Membership {
@@ -2709,7 +2519,7 @@ impl Runtime {
                         });
                     }
                     self.dags.get_mut(id).sort = sc.sort;
-                    self.rewrite_count += 1; // a membership application counts as a rewrite (Maude)
+                    self.rewrite_count += 1; // membership application
                     self.membership_count += 1;
                     lowered = true;
                     break; // restart the merged order with the new, smaller sort
@@ -2721,12 +2531,9 @@ impl Runtime {
         }
     }
 
-    /// Whether the membership applies to node `id`: its compiled lhs matches *and* (for a `cmb`) its
-    /// condition holds under that match. Reads through the A3 matcher seam, so a free lhs uses the
-    /// recursive matcher and a theory lhs its own automaton. A condition that fails for one match
-    /// solution backtracks into the next (B2.3c); the condition's own reductions count toward the
-    /// rewrite total whether or not it ends up holding. Identity/idem-collapse memberships still need
-    /// extra-symbol indexing; once offered, their theory matchers already handle the collapse.
+    /// Whether a compiled membership lhs matches `id` and, for a `cmb`, its condition holds. Free and
+    /// theory patterns dispatch through the same automaton seam; a condition failure backtracks into the
+    /// next match solution, and all condition reductions contribute to the rewrite total.
     /// On success returns the membership match's substitution snapshot (for the trace), or an empty
     /// `Vec` when not tracing (no allocation); `None` on no-match. A conditional membership (`cmb`) emits
     /// a *trial* per matcher solution, backtracking on condition failure.
@@ -2792,8 +2599,7 @@ impl Runtime {
         symbol: SymbolId,
         args: Vec<DagId>,
     ) -> DagId {
-        // Keep the old `compute_free_sort` theory guard verbatim — its message must still name
-        // `make_acu` (see `make_free_on_ac_operator_panics`); the arity check now lives in `compute_sort`.
+        // Preserve the public guard message while keeping arity validation in `compute_sort`.
         assert_eq!(
             sig.symbol(symbol).theory(),
             Theory::Free,
@@ -2806,11 +2612,8 @@ impl Runtime {
 
     /// Rebuild a node after substitution while preserving its exact theory representation.
     ///
-    /// Maude's `DagNode::instantiate(..., false)` deliberately skips top normalization: an AC/AU
-    /// binding inserted below the same symbol remains a shared nested child until ordinary reduction
-    /// visits it. Narrowing's final goal instantiation relies on that sharing for observable rewrite
-    /// counts. The source node is canonical, so this can only create a transient noncanonical
-    /// application; callers must pass it directly to reduction.
+    /// Substitution skips top normalization, so a same-symbol AC/AU binding can remain a shared nested
+    /// child until reduction. This transient representation preserves narrowing rewrite counts.
     pub(crate) fn make_preserving_representation(
         &mut self,
         sig: &Signature,
@@ -2841,10 +2644,8 @@ impl Runtime {
         self.alloc_node(sort, term)
     }
 
-    /// Least sort of a free node `symbol(args…)`. The common case — a single declaration, no
-    /// overloading — is computed **inline** with no allocation (the equivalent of the old
-    /// `compute_free_sort`), keeping the reduce hot path fast; only an overloaded free operator falls
-    /// back to the general [`Signature::compute_sort`], which needs the argument sorts as a slice.
+    /// Least sort of a free node `symbol(args…)`. A single declaration is handled inline without
+    /// allocating; overloaded operators use [`Signature::compute_sort`] with a collected sort slice.
     fn free_sort(&self, sig: &Signature, symbol: SymbolId, args: &[DagId]) -> SortId {
         let decls = sig.symbol(symbol).decls();
         if let [only] = decls {
@@ -2869,14 +2670,8 @@ impl Runtime {
         sig.compute_sort(symbol, &arg_sorts)
     }
 
-    /// Recompute `id`'s **base** (structural) sort from its current children's sorts — Maude's
-    /// `computeBaseSort`, the pure membership-free part of `fastComputeTrueSort`. Mirrors the per-theory
-    /// sort each `make_*` builder computes, but reads the *existing* (already-canonical) node instead of
-    /// rebuilding it. The C1 reduce normal-form step calls this before constraining: a child refined in
-    /// place at its own normal-form point does **not** propagate to a parent that was not rebuilt (the
-    /// reduce loop keeps `original` when `args == orig`), so the parent must recompute its base sort from
-    /// the now-refined children here. A pure function of the children's sorts ⇒ idempotent. An `Na`
-    /// constant has no children, so its base sort never changes (kept as-is).
+    /// Recompute an existing node's structural base sort from its current children without applying
+    /// memberships. This propagates child sort refinements even when the parent node itself was reused.
     fn compute_base_sort(&self, sig: &Signature, id: DagId) -> SortId {
         match &self.node(id).term {
             NodeTerm::Free { symbol, args } => self.free_sort(sig, *symbol, args),
@@ -2906,11 +2701,9 @@ impl Runtime {
 
     /// Make a fresh reducible occurrence of `id` for an argument evaluated after a strategy `0`.
     ///
-    /// Maude's `copyReducible` copies the unreduced root and recursively copies only the argument
-    /// positions that are eager for that root's own strategy. A fresh copy matters even for a leaf:
-    /// two subject positions may share one hash-consed redex, but `copyAndReduce` after a top attempt
-    /// reduces each physical occurrence independently. `copies` preserves sharing *within* one copied
-    /// occurrence; it is deliberately new for each strategy argument.
+    /// Copies the unreduced root and only its eager argument positions. The fresh occurrence prevents
+    /// two physical subject positions sharing one hash-consed redex from normalizing only once.
+    /// `copies` preserves sharing within one occurrence and is reset for each strategy argument.
     fn copy_reducible(&mut self, sig: &Signature, id: DagId) -> DagId {
         self.copy_eager_upto_reduced(sig, id, &mut HashMap::new())
     }
@@ -2981,22 +2774,10 @@ impl Runtime {
         copy
     }
 
-    /// Refine `id`'s sort — and recursively its subterms' — to their **true sorts** without applying any
-    /// equations: Maude's `DagNode::computeTrueSort`. The C1 seam-3 counterpart to the reduce normal-form
-    /// step, for **strat-skipped** args: a custom evaluation strategy (`strat`) never reduces them, so
-    /// they never reach a reduce normal-form point — yet Maude's `complexStrategy` calls `computeTrueSort`
-    /// on *all* args at the strat `0` step (`FreeTheory/freeSymbol.cc:503`), refining even the skipped
-    /// ones. We mirror that: recurse into the children, recompute this node's base sort from the
-    /// now-refined children, then constrain by its memberships (each application counts, as Maude counts
-    /// membership applications).
-    ///
-    /// `seen` dedupes shared subterms reached within one strat node (e.g. an instantiated `f(X, X)` whose
-    /// two slots are the same node), so such a node is refined — and its membership counted — exactly
-    /// once, matching Maude (whose `slowComputeTrueSort` no-ops once a node's sort is known). An
-    /// already-reduced node carries its true sort, so it is skipped too. (A node shared as a *skipped arg
-    /// across two separate strat frames* in one reduction would be refined once per frame — a narrow edge
-    /// needing `strat` + `mb` + a repeated strat-skipped compound. C7's construction dedup can now produce
-    /// such sharing, but no observed case hits it.)
+    /// Compute true sorts recursively without applying equations. Evaluation strategies may skip
+    /// arguments during reduction, so this path still refines their children, recomputes each base sort,
+    /// and applies memberships. `seen` prevents duplicate work for shared subterms within one strategy
+    /// frame; already-reduced nodes already carry their true sort.
     fn compute_true_sort(
         &mut self,
         sig: &Signature,
@@ -3014,7 +2795,7 @@ impl Runtime {
         let base = self.compute_base_sort(sig, id);
         self.dags.get_mut(id).sort = base;
         // No reduce frame here (this is off the main stack), so no `Whole:` reconstruction — `None`. `frames`
-        // is the enclosing reduce's stack: an F-2 root set for a `cmb` condition that re-enters `reduce`.
+        // is the enclosing reduce's stack: a root set for a `cmb` condition that re-enters `reduce`.
         self.constrain_to_smaller_sort(sig, id, None, frames);
     }
 
@@ -3116,14 +2897,9 @@ impl Runtime {
             .is_some_and(|id_sym| self.is_constant(dag, id_sym))
     }
 
-    /// Build a canonical **ACU** node for `symbol` from `raw_args` (`(element, multiplicity)` pairs).
-    /// Canonicalizes to the AC(+U) normal form (Maude's `normalizeAtTop` → `insertAlien` →
-    /// `sortAndUniquize`): (1) flatten arguments that are themselves `symbol`-rooted ACU nodes (scaling
-    /// their multiplicities), (2) drop identity elements when the operator has `id:`, (3) merge equal
-    /// elements (summing multiplicities) and sort by [`dag_compare`](Self::dag_compare), (4) collapse —
-    /// an empty multiset is the identity element, a single element of multiplicity 1 is that element
-    /// itself, otherwise an [`NodeTerm::Acu`] node. So the result is in normal form and equal ACU terms
-    /// are structurally identical through the [`children`](crate::dag::DagNode::children) visitor.
+    /// Build a canonical **ACU** node from `(element, multiplicity)` pairs. Flatten same-symbol nodes,
+    /// discard identities, merge equal elements, sort structurally, then collapse an empty multiset to
+    /// the identity or a singleton to its element. Every surviving node is therefore in ACU normal form.
     pub(crate) fn make_acu(
         &mut self,
         sig: &Signature,
@@ -3133,8 +2909,8 @@ impl Runtime {
         self.make_acu_normalized(sig, symbol, raw_args, false)
     }
 
-    /// Maude normalizes a fresh non-eager ACU application before its first top attempt, so nested
-    /// same-symbol nodes and equal unreduced entries must be combined before semi-eager arguments run.
+    /// Canonicalize a fresh non-eager ACU application before its first top attempt, including nested
+    /// same-symbol nodes and equal unreduced entries.
     fn make_acu_at_top(
         &mut self,
         sig: &Signature,
@@ -3164,9 +2940,8 @@ impl Runtime {
         let identity = sig.symbol(symbol).identity();
         let epoch = sig.eq_epoch();
 
-        // Normal construction defers an unreduced nested application so bottom-up reduction retains
-        // its rewrite count. A strategy Top is Maude's explicit normalizeAtTop boundary and recursively
-        // flattens those nodes immediately.
+        // Ordinary construction defers unreduced nested applications to retain bottom-up rewrite
+        // accounting. An explicit strategy Top boundary flattens them immediately.
         let mut pending = raw_args;
         let mut flat: Vec<(DagId, u32)> = Vec::with_capacity(pending.len());
         while let Some((arg, mult)) = pending.pop() {
@@ -3191,8 +2966,8 @@ impl Runtime {
             }
         }
 
-        // Ordinary construction merges distinct equal entries only after reduction; the explicit
-        // top-normalization path merges them immediately, as ACU_DagNode::normalizeAtTop does.
+        // Ordinary construction merges equal entries only after reduction; explicit top
+        // normalization merges them immediately.
         flat.sort_by(|&(x, _), &(y, _)| self.dag_compare(x, y));
         let mut args: Vec<(DagId, u32)> = Vec::with_capacity(flat.len());
         for (element, mult) in flat {
@@ -3231,11 +3006,9 @@ impl Runtime {
         }
     }
 
-    /// Rebuild an ACU node after changing only variable indices while retaining the existing
-    /// argument order, multiplicities, and duplicate entries. Maude indexes retained symbolic DAGs
-    /// in place, so this path must not sort, merge structurally equal elements, or collapse: copied
-    /// ground subterms can deliberately occupy distinct argument entries and carry independent
-    /// reduction-count state.
+    /// Rebuild an ACU node after changing only variable indices, preserving argument order,
+    /// multiplicities, and duplicate entries. Symbolic DAG indexing must not sort, merge, or collapse:
+    /// copied ground subterms may occupy distinct entries with independent reduction state.
     pub(crate) fn make_acu_preserving_order(
         &mut self,
         sig: &Signature,
@@ -3250,17 +3023,14 @@ impl Runtime {
         self.alloc_node(sort, NodeTerm::Acu { symbol, args })
     }
 
-    /// Eagerly put `dag` into **theory normal form** for the symbolic engine (unification/variants):
-    /// flatten nested same-symbol ACU/AU nodes and merge equal ACU elements **unconditionally**,
-    /// unlike [`make_acu`](Self::make_acu)'s lazy, rewrite-count-preserving splice (which only
-    /// flattens/merges already-*reduced* nodes). Maude's `Term::normalize(true)` does this before
-    /// unification; without it a parse-nested `X + X + Y` (from a `prec`/`gather` binary parse) would
-    /// reach the ACU solver as `{(X+X): 1, Y: 1}` instead of `{X: 2, Y: 1}`. Bottom-up; leaves and
-    /// free/S/CUI nodes are rebuilt from normalized children.
-    /// Preserve Maude's in-place "already reduced" flag across an alpha/theory-normalizing rebuild.
-    /// A forwarding redex (`nf = Some`) is deliberately excluded: only a node that is its own normal
-    /// form may bless an equivalent rebuilt node, and a theory collapse to a different top symbol is
-    /// left to the reducer.
+    /// Put `dag` into eager **theory normal form** for symbolic operations: recursively flatten nested
+    /// same-symbol ACU/AU nodes and merge equal ACU elements unconditionally. This differs from
+    /// [`make_acu`](Self::make_acu), whose lazy splice preserves concrete rewrite accounting. Without
+    /// this pass, a binary parse of `X + X + Y` would reach ACU solving as `{(X+X): 1, Y: 1}` rather
+    /// than `{X: 2, Y: 1}`.
+    ///
+    /// A normal-form source may transfer its reduced stamp to an equivalent rebuilt node. Forwarding
+    /// redexes and theory collapses may not.
     fn inherit_reduced_status(&mut self, sig: &Signature, source: DagId, rebuilt: DagId) {
         if source == rebuilt {
             return;
@@ -3279,7 +3049,7 @@ impl Runtime {
     }
 
     pub(crate) fn normalize_for_unify(&mut self, sig: &Signature, dag: DagId) -> DagId {
-        let normalized = match self.dags.get(dag).term.clone() {
+        match self.dags.get(dag).term.clone() {
             NodeTerm::Var { .. } | NodeTerm::Na { .. } => dag,
             NodeTerm::Free { symbol, args } => {
                 let nargs: Vec<DagId> = args
@@ -3335,8 +3105,7 @@ impl Runtime {
                 }
                 self.make_au(sig, symbol, flat) // flat already spliced; make_au drops identities/collapses
             }
-        };
-        normalized
+        }
     }
 
     /// The eager ACU canonicalizer used by [`normalize_for_unify`]: sort + **unconditionally** merge
@@ -3471,11 +3240,9 @@ impl Runtime {
         }
     }
 
-    /// Build a canonical **CUI** node for `symbol` from its two arguments. Applies the collapse axioms
-    /// at construction (Maude keeps CUI terms in normal form): an identity argument (`id:`) drops the
-    /// node to the other argument; idempotence (`idem`) drops `f(a, a)` to `a`; otherwise the two
-    /// arguments are placed in canonical (sorted) order for commutativity. So `f(b, a)` and `f(a, b)`
-    /// are the same node, and `f(a, a)`/`f(a, e)` collapse away for free (0 rewrites).
+    /// Build a canonical **CUI** node from two arguments. An identity argument yields the other
+    /// argument; idempotence collapses `f(a, a)` to `a`; commutative arguments are sorted. These
+    /// collapses are structural and do not increment the rewrite count.
     pub(crate) fn make_cui(
         &mut self,
         sig: &Signature,
@@ -3486,7 +3253,7 @@ impl Runtime {
         self.make_cui_ordered(sig, symbol, x, y, false)
     }
 
-    /// The `Term::normalize(true)` path compares variable arguments by name id before slots exist.
+    /// Pre-index normalization compares variable arguments by name because substitution slots do not exist yet.
     fn make_cui_for_unify(
         &mut self,
         sig: &Signature,
@@ -3540,10 +3307,8 @@ impl Runtime {
         )
     }
 
-    /// Build a canonical **S** (`iter`) node `s^count(arg)` (Maude's `S_DagNode::normalizeAtTop`):
-    /// `count == 0` collapses to `arg` (`s^0(x) = x`); a nested same-symbol successor flattens
-    /// (`s^j(s^k(x)) = s^(j+k)(x)` — one level suffices, the inner node is already normalized); otherwise
-    /// an [`NodeTerm::S`] with the periodic least sort ([`compute_s_sort`](Signature::compute_s_sort)).
+    /// Build a canonical **S** (`iter`) node `s^count(arg)`: zero collapses to `arg`, nested
+    /// same-symbol successors combine counts, and surviving nodes use the periodic least sort.
     pub(crate) fn make_s(
         &mut self,
         sig: &Signature,
@@ -3572,11 +3337,11 @@ impl Runtime {
         self.alloc_node(sort, NodeTerm::S { symbol, count, arg })
     }
 
-    /// Build an atomic **NA** constant node carrying `value` (a string/qid/float). The sort is
-    /// `symbol`'s range (`symbol` is an arity-0 NA-constant symbol — Maude's `StringSymbol` etc.).
+    /// Build an atomic **NA** constant node carrying a string, quoted identifier, or float. The sort
+    /// is derived from the arity-zero symbol and value.
     pub(crate) fn make_na(&mut self, sig: &Signature, symbol: SymbolId, value: NaValue) -> DagId {
-        // "don't allow IEEE-754 -0.0" (floatDagNode.cc): -0.0 normalizes to +0.0, so bit-level
-        // structural equality (deep_equal, dag_compare, `.=.`) coincides with value equality.
+        // Normalize -0.0 to +0.0 so bit-level structural equality and ordering coincide with value
+        // equality.
         let value = match value {
             NaValue::Float(bits) if f64::from_bits(bits) == 0.0 => NaValue::Float(0.0f64.to_bits()),
             v => v,
@@ -3585,9 +3350,8 @@ impl Runtime {
         self.alloc_node(sort, NodeTerm::Na { symbol, value })
     }
 
-    /// Build a **variable** leaf (Maude's `VariableDagNode`): `symbol` is the per-sort variable
-    /// symbol ([`Engine::variable_symbol`]), whose range is the node's sort; `name` is the interned
-    /// base-name token code; `index` the owning problem's substitution slot.
+    /// Build a variable leaf. `symbol` identifies its sort, `name` is the interned base-name token,
+    /// and `index` is the owning problem's substitution slot.
     pub(crate) fn make_var(
         &mut self,
         sig: &Signature,
@@ -3645,16 +3409,8 @@ impl Runtime {
         )
     }
 
-    /// A **total order** on DAG nodes, consistent with structural (modulo-AC) equality — i.e.
-    /// `dag_compare(a, b) == Equal` iff [`deep_equal`](Self::deep_equal)`(a, b)`. Mirrors C++
-    /// `DagNode::compare`: order by top symbol first, then lexicographically by arguments (ACU nodes
-    /// compare their canonical `(element, multiplicity)` sequences). This is the key the ACU
-    /// canonicalizer sorts and uniquizes by. Recurses on *element* depth (like `match_pattern`,
-    /// author-/data-shallow for the canonical subterms it compares); an iterative form is a follow-up
-    /// if deep ACU elements ever appear.
-    /// A node's top-symbol arity — Maude's `Symbol::arity`, the high bits of its `orderInt` order key.
-    /// A theory symbol is binary (ACU / AU / CUI) or unary (S, the `iter` successor); an NA constant is
-    /// nullary; a free symbol carries its declared argument count. The primary key of [`dag_compare`].
+    /// A node's top-symbol arity: two for ACU/AU/CUI, one for S, zero for NA constants and variables,
+    /// otherwise the free symbol's declared arity. This is the primary [`dag_compare`] key.
     fn node_arity(n: &DagNode) -> usize {
         match &n.term {
             NodeTerm::Free { args, .. } => args.len(),
@@ -3669,12 +3425,13 @@ impl Runtime {
         self.qid_ranks.entry(text.to_string()).or_insert(next);
     }
 
+    /// Compare DAGs in the runtime's total structural order. Equality agrees with
+    /// [`deep_equal`](Self::deep_equal), and nested canonical elements are compared recursively.
     pub(crate) fn dag_compare(&self, a: DagId, b: DagId) -> Ordering {
         self.dag_compare_inner(a, b, false)
     }
 
-    /// The comparison used while emulating `Term::normalize(true)`, before Maude's
-    /// `indexVariables` pass assigns substitution slots.
+    /// Pre-index theory-normalization comparison, using variable names before slots are assigned.
     fn dag_compare_for_unify(&self, a: DagId, b: DagId) -> Ordering {
         self.dag_compare_inner(a, b, true)
     }
@@ -3684,19 +3441,14 @@ impl Runtime {
             return Ordering::Equal; // same node id — identical, prune
         }
         let (na, nb) = (self.dags.get(a), self.dags.get(b));
-        // Maude builds each symbol's order key as `orderInt = symbolCount++ | (arity << 24)`
-        // (`Interface/symbol.cc`), so the canonical symbol order is **arity-first** (the high bits),
-        // then global creation index. A mixed-arity ACU soup therefore groups by arity before
-        // creation order. Mirror that by comparing arity, then `SymbolId` below.
+        // Canonical symbol order is arity first, then global creation index. Mixed-arity ACU terms
+        // therefore group by arity before creation order.
         match Self::node_arity(na).cmp(&Self::node_arity(nb)) {
             Ordering::Equal => {}
             ord => return ord,
         }
-        // Same-sort command-subject variables order by their name-token code (Maude shares one
-        // `VariableSymbol` per sort and `compareArguments` is `id() - id()` on name codes), not by
-        // tnk's per-command symbol creation order. Cross-sort variables keep the symbol-order
-        // fallback (Maude compares distinct `VariableSymbol`s by creation order there, which the
-        // `SymbolId` order approximates).
+        // Same-sort command-subject variables order by name-token rank rather than per-command symbol
+        // creation order. Cross-sort variables retain the `SymbolId` fallback.
         if na.symbol() != nb.symbol()
             && !self.var_ranks.is_empty()
             && na.sort == nb.sort
@@ -3707,19 +3459,17 @@ impl Runtime {
         {
             return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
         }
-        // Genuine variables of different sorts have different per-sort VariableSymbols in Maude.
-        // Their lazy creation order is recorded by `sort_var_ranks`; use it before the SymbolId
-        // fallback so statement/command traversal order remains stable across cached searches.
+        // Variables of different sorts have different per-sort symbols. Prefer their recorded lazy
+        // creation rank to the SymbolId fallback so cached searches retain traversal order.
         if na.symbol() != nb.symbol()
             && matches!(na.term, NodeTerm::Var { .. })
             && matches!(nb.term, NodeTerm::Var { .. })
-        {
-            if let (Some(&ra), Some(&rb)) = (
+            && let (Some(&ra), Some(&rb)) = (
                 self.sort_var_ranks.get(&na.symbol()),
                 self.sort_var_ranks.get(&nb.symbol()),
-            ) {
-                return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
-            }
+            )
+        {
+            return ra.cmp(&rb).then_with(|| na.symbol().cmp(&nb.symbol()));
         }
         match na.symbol().cmp(&nb.symbol()) {
             Ordering::Equal => {}
@@ -3736,10 +3486,8 @@ impl Runtime {
                 }
                 Ordering::Equal // same symbol ⇒ same arity ⇒ all pairs compared
             }
-            // ACU compares the argument COUNT first, then each pair's multiplicity BEFORE its
-            // element (ACU_DagNode::compareArguments) — observable wherever same-symbol AC nodes of
-            // different sizes sit in an enclosing canonical order (e.g. `_and_` conjunctions inside
-            // an `_xor_` soup: the oracle orders the 2-conjunct terms before the 4-conjunct one).
+            // ACU nodes compare argument count first, then each pair's multiplicity before its element.
+            // This keeps same-symbol nodes of different sizes in a stable enclosing canonical order.
             (NodeTerm::Acu { args: xa, .. }, NodeTerm::Acu { args: ya, .. }) => {
                 match xa.len().cmp(&ya.len()) {
                     Ordering::Equal => {}
@@ -3757,8 +3505,8 @@ impl Runtime {
                 }
                 Ordering::Equal
             }
-            // AU: length first, then elementwise (AU_DagNode::compareArguments). CUI always has
-            // exactly two arguments, so the shared length compare is a no-op there.
+            // AU compares length and then elements. CUI always has two arguments, so its length
+            // comparison is a no-op.
             (NodeTerm::Au { args: xa, .. }, NodeTerm::Au { args: ya, .. })
             | (NodeTerm::Cui { args: xa, .. }, NodeTerm::Cui { args: ya, .. }) => {
                 match xa.len().cmp(&ya.len()) {
@@ -3773,9 +3521,8 @@ impl Runtime {
                 }
                 Ordering::Equal
             }
-            // S successor: the scalar `count` is part of identity (not a child), so compare it first,
-            // then the argument (Maude's `S_DagNode::compareArguments`). This keeps the order consistent
-            // with the `deep_equal` S-arm, so `s^2(0)` and `s^3(0)` order correctly inside an ACU subject.
+            // S compares its scalar count before its argument, matching structural equality and
+            // ordering iterates such as `s^2(0)` and `s^3(0)` correctly inside ACU subjects.
             (
                 NodeTerm::S {
                     count: xc, arg: xa, ..
@@ -3787,9 +3534,8 @@ impl Runtime {
                 Ordering::Equal => self.dag_compare_inner(*xa, *ya, variables_by_name),
                 ord => ord,
             },
-            // An NA constant orders by its scalar value (consistent with the `deep_equal` Na arm). A string
-            // value compares as Maude's `Rope` does — signed bytes (`StringDagNode::compareArguments`), not
-            // the derived unsigned byte order — so a high byte orders before an ASCII one.
+            // NA constants compare scalar values. Strings use signed-byte order, so a high byte sorts
+            // before an ASCII byte.
             (
                 NodeTerm::Na {
                     value: NaValue::Str(xs),
@@ -3817,9 +3563,8 @@ impl Runtime {
                 _ => xs.cmp(ys),
             },
             (NodeTerm::Na { value: xv, .. }, NodeTerm::Na { value: yv, .. }) => xv.cmp(yv),
-            // `VariableTerm`/`VariableDagNode::compareArguments` uses the interned name id. During
-            // ordinary DAG solving, slot order remains the established canonical approximation;
-            // only pre-index term normalization selects the reference's name-id ordering.
+            // Variables compare by interned name during pre-index normalization and by established
+            // slot order during ordinary DAG solving.
             (
                 NodeTerm::Var {
                     name: xn,
@@ -3919,10 +3664,8 @@ impl Runtime {
         self.mark_identity_roots();
         for frame in frames {
             self.mark_reachable(frame.original);
-            // `start` is the node this frame will memoize at completion (C7 forwarding). Once the frame
-            // has rewritten, `start` is the *abandoned* original redex — no longer in the live structure,
-            // referenced only here — so it must be rooted, or GC reclaims it and the completion's
-            // `nf` write is a use-after-free. When `start == original` this is a redundant (deduped) mark.
+            // `start` is the frame's forwarding target. After a rewrite it may be reachable only from
+            // this frame, so root it until completion stores its normal form.
             self.mark_reachable(frame.start);
             for &r in &frame.args {
                 self.mark_reachable(r);
@@ -3944,7 +3687,7 @@ impl Runtime {
                 self.mark_reachable(id);
             }
         }
-        // F-2: the outer reduction(s)' working set, protected across any re-entrant condition reduce we
+        // The outer reduction's working set is protected across any re-entrant condition reduction we
         // are nested inside (`condition_holds` pushed it). Without this a nested condition-GC would sweep
         // the outer frames' siblings / match bindings / redex. (Cloned to release the borrow before
         // `mark_reachable` takes `&mut self`; empty — a no-op — unless we are inside a condition.)
@@ -3974,9 +3717,8 @@ impl Runtime {
         while let Some(id) = stack.pop() {
             kids.clear();
             kids.extend(self.dags.get(id).children());
-            // A reduced node's forwarding normal form (C7 `nf`) is not a structural child — `g(a)`'s
-            // child is `a`, not its result `b` — so the `children()` visitor misses it; mark it here so
-            // a node that is still reachable keeps the result it forwards to alive (freed together).
+            // A forwarding normal form is not a structural child; mark it explicitly so it lives with
+            // the node that references it.
             if let Some(nf) = self.dags.get(id).nf {
                 kids.push(nf);
             }
@@ -4044,8 +3786,7 @@ impl Runtime {
         descent: &mut dyn DescentOps,
     ) -> DagId {
         if self.node(root).reduced_epoch == sig.eq_epoch() {
-            // Already normal: forward to its recorded nf (C7) — `root`'s own content may be a redex that
-            // rewrote out of place, so the nf, not `root`, is its canonical form (`None` ⇒ self).
+            // Return the recorded out-of-place normal form; `None` means the node itself is canonical.
             return self.node(root).nf.unwrap_or(root);
         }
 
@@ -4059,7 +3800,7 @@ impl Runtime {
             // the only `pop` (below) is immediately followed by a `return` when it empties, so the
             // loop never re-enters with an empty stack — the `expect`s below are therefore unreachable.
 
-            // Safe-point GC (A2): the loop head is the *only* point during a reduction where every
+            // Safe-point GC: the loop head is the *only* point during a reduction where every
             // in-flight node is discoverable (the frame stack + `child_result`); collect here when
             // allocation pressure crosses the configured interval so a large reduction stays bounded.
             if let Some(interval) = self.gc_interval
@@ -4090,10 +3831,9 @@ impl Runtime {
                     .expect("a normalized evaluation strategy always ends in Top")
             };
 
-            // Reduce one selected argument. After a Top instruction Maude first makes a reducible
-            // per-occurrence copy; without it, two physical slots sharing one hash-consed redex would
-            // incorrectly normalize once. Before the first Top, already-reduced shared subterms retain
-            // the ordinary forwarding fast path.
+            // After a Top instruction, reduce a fresh per-occurrence copy. Otherwise two physical
+            // slots sharing one hash-consed redex would normalize only once. Before the first Top,
+            // already-reduced shared subterms retain normal-form forwarding.
             if let EvalAction::Argument(position) = action {
                 let (mut child, after_top) = {
                     let frame = stack.last().expect("empty reduce stack");
@@ -4105,9 +3845,8 @@ impl Runtime {
                         Theory::Acu
                     )
                 {
-                    // An ACU node stores one argument per distinct element plus a multiplicity. The
-                    // generic frame expands that representation for rebuilding, but Maude's
-                    // copyAndReduceSubterms copies/reduces each distinct entry only once.
+                    // ACU stores one entry per distinct element plus a multiplicity. The generic frame
+                    // expands this for rebuilding, but each distinct entry is copied and reduced once.
                     let repeated_result = {
                         let frame = stack.last().unwrap();
                         let original = frame.orig[position];
@@ -4137,10 +3876,9 @@ impl Runtime {
                 unreachable!("Argument handled above");
             };
 
-            // Maude's complexStrategy computes every argument's true sort exactly at the first `0`,
-            // including lazy arguments that this strategy never reduces. Standard strategy arguments
-            // have already reached their own normal-form points, so retain the membership-free and
-            // standard-strategy hot paths.
+            // At the first `0`, compute true sorts for every argument, including lazy arguments this
+            // strategy never reduces. Standard strategies already reach those normal-form points and
+            // retain the membership-free hot path.
             let (first_top, custom_strategy) = {
                 let frame = stack.last_mut().expect("empty reduce stack");
                 let first = !frame.seen_top;
@@ -4214,13 +3952,11 @@ impl Runtime {
             };
 
             // Intermediate Top instructions exclude `[owise]`; the final Top includes it. A successful
-            // attempt abandons the old strategy and starts the replacement term's strategy from step 0.
+            // attempt abandons this strategy and starts the replacement term's strategy from step 0.
             if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent, final_step) {
                 self.rewrite_count += 1;
-                // Maude's `while (!isReduced())` exit: a rewrite whose result is ALREADY reduced (a
-                // bare-variable rhs bound to the cached identity dag — the collapse one-shot)
-                // terminates this position immediately; the rewrite above still counted. Fresh RHS
-                // nodes never carry the stamp, so `eq a = a` keeps looping.
+                // A rewrite result already stamped reduced terminates this position after counting the
+                // rewrite. Fresh RHS nodes lack the stamp, so a self-rewrite such as `eq a = a` loops.
                 if self.node(next).reduced_epoch == sig.eq_epoch() {
                     let done = self.node(next).nf.unwrap_or(next);
                     if self.record_whole && self.tracing() {
@@ -4241,10 +3977,8 @@ impl Runtime {
                     child_result = Some(done);
                     continue;
                 }
-                // Faithful `set trace whole`: reconstruct the whole root term before/after this top
-                // rewrite (the redex `rebuilt` / result `next` threaded up through the ancestor frames)
-                // and patch the just-recorded `Rewrite` event. Gated — off by default; only allocates
-                // when whole-tracing is on.
+                // Whole tracing reconstructs the root before and after this top rewrite by threading
+                // the redex and result through ancestor frames. This allocation is gated off by default.
                 if self.record_whole && self.tracing() {
                     let before = self.reconstruct_whole(sig, &stack, rebuilt);
                     let after = self.reconstruct_whole(sig, &stack, next);
@@ -4311,9 +4045,8 @@ impl Runtime {
         }
     }
 
-    /// Build a fresh [`ReduceFrame`] positioned at the start of `id`'s children. `start` defaults to
-    /// `id`; the Phase-2 rewrite-replace copies the prior frame's `start` over so it survives a chain
-    /// of rewrites (C7 forwarding).
+    /// Build a [`ReduceFrame`] at the start of `id`'s children. `start` initially names `id` and remains
+    /// stable across top-rewrite replacements so normalization can update the original node's cache.
     fn new_reduce_frame(&self, id: DagId) -> ReduceFrame {
         let node = self.node(id);
         let orig: Vec<DagId> = node.children().collect();
@@ -4328,11 +4061,9 @@ impl Runtime {
         }
     }
 
-    /// Reconstruct the whole root term with `leaf` threaded up through the ancestor reduce frames — the
-    /// in-progress whole term Maude's `root()` would show for `set trace whole`. Every ancestor exists
-    /// because it is waiting on an Argument instruction; Top instructions never push a child frame.
-    /// Already-reduced siblings sit in `args`; not-yet-visited ones keep their originals. Allocates
-    /// O(depth) nodes, so it is only called when whole-tracing is on.
+    /// Reconstruct the in-progress root by threading `leaf` through ancestor reduce frames. Each
+    /// ancestor is waiting on an Argument instruction; reduced siblings are in `args`, and unvisited
+    /// siblings retain their originals. Allocates O(depth), so only whole tracing calls this path.
     fn reconstruct_whole(&mut self, sig: &Signature, stack: &[ReduceFrame], leaf: DagId) -> DagId {
         let mut node = leaf;
         for frame in stack[..stack.len() - 1].iter().rev() {
@@ -4372,19 +4103,6 @@ impl Runtime {
         }
     }
 
-    /// Apply the first matching equation at the top of `id`, returning the instantiated rhs (or
-    /// `None` if no equation applies).
-    ///
-    /// Driven as a **solution stream** through the A3 matcher seam: each equation's compiled
-    /// [`LhsAutomaton`] yields a [`Subproblem`](crate::theory::Subproblem) whose `next` enumerates
-    /// solutions into `subst`. Phase 1 equations are unconditional, so the *first* solution of the
-    /// first matching equation wins; the `while sp.next(..)` loop is where a conditional equation will
-    /// evaluate its condition and, on failure, fall through to the next solution — and where an AC
-    /// subproblem will surface its several solutions. (Free matching yields exactly one.)
-    ///
-    /// The A4 borrow split is what lets this avoid cloning the rhs: `eqs` (and thus `&eq.rhs`) is a
-    /// shared borrow of `sig`, disjoint from the `&mut self` runtime, so the matched rhs is
-    /// instantiated straight out of the still-borrowed equation table.
     /// Whether the [`TraceEvent`] stream is being recorded (opt-in via [`Engine::set_trace`]).
     fn tracing(&self) -> bool {
         self.trace.is_some()
@@ -4397,8 +4115,7 @@ impl Runtime {
         }
     }
 
-    /// Snapshot all bindings of `subst` (each `Some`/`None`) for a trace event — the statement's
-    /// variables `0..nr_vars`, in index order (Maude prints them so, `(unbound)` for `None`).
+    /// Snapshot all substitution bindings in variable-index order for a trace event.
     fn snapshot_subst(subst: &Subst) -> Vec<Option<DagId>> {
         (0..subst.len()).map(|i| subst.get(i)).collect()
     }
@@ -4412,9 +4129,8 @@ impl Runtime {
         final_step: bool,
     ) -> Option<DagId> {
         let symbol = self.node(id).symbol();
-        // Built-in operators (`special`) are the symbol's primary reduction rule (Maude's `eqRewrite`);
-        // they are tried before user equations and fall through (`None`) on no-match. The `&SpecialOp`
-        // borrowed from `sig` coexists with `&mut self` (the A4 split).
+        // Built-ins are the symbol's primary reduction rule: try them before user equations and fall
+        // through on no match. The split signature/runtime borrows avoid cloning the hook.
         if let Some(op) = sig.symbol(symbol).special() {
             if let Some(r) = self.try_special(sig, id, op, descent) {
                 if self.tracing() {
@@ -4432,8 +4148,8 @@ impl Runtime {
                 }
                 return Some(r);
             }
-            // BranchSymbol's first Top is selection-only. Maude reduces every remaining branch before
-            // trying user equations when the condition matches no hooked test.
+            // A branch operator's first Top is selection-only. If no test matches, reduce every
+            // remaining branch before trying user equations.
             if !final_step && matches!(op, SpecialOp::Branch { .. }) {
                 return None;
             }
@@ -4447,9 +4163,8 @@ impl Runtime {
             Theory::Acu | Theory::Au | Theory::S | Theory::Cui
         );
         let eqs = sig.equations.get(&symbol)?;
-        // Intermediate `0` instructions try only ordinary equations; the final `0` adds the `[owise]`
-        // fallback after every ordinary equation fails (Maude's `applyReplaceNoOwise` / `applyReplace`).
-        // BranchSymbol's selection-only intermediate Top returned above without trying either class.
+        // Intermediate `0` instructions try ordinary equations only; the final `0` adds `[owise]`
+        // fallbacks. A branch operator's selection-only Top returned above before either class.
         if let Some(result) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
             return Some(result);
         }
@@ -4458,13 +4173,10 @@ impl Runtime {
             .flatten()
     }
 
-    /// Try the equations of one phase (`owise == false` → the normal equations; `owise == true` → the
-    /// `[owise]` fallbacks) against `id`, returning the first applicable rewrite. Drives each equation
-    /// as a **solution stream** through the A3 matcher seam: the compiled [`LhsAutomaton`] yields a
-    /// [`Subproblem`](crate::theory::Subproblem) whose `next` enumerates solutions into `subst`; a
-    /// conditional equation accepts a solution only if its condition holds, else backtracks into the
-    /// next solution (Maude's `solveCondition` retry). The A4 borrow split lets the matched `&eq.rhs`
-    /// (a shared borrow of `sig`) instantiate in place without a defensive clone.
+    /// Try one equation class (`owise == false` for ordinary equations, `true` for fallbacks) against
+    /// `id`, returning the first applicable rewrite. Each compiled matcher yields a solution stream;
+    /// conditional failure backtracks to the next solution. The shared signature borrow keeps the rhs
+    /// available for direct instantiation without cloning it.
     fn try_equations(
         &mut self,
         sig: &Signature,
@@ -4507,21 +4219,9 @@ impl Runtime {
         None
     }
 
-    /// Drive one statement — an equation or a rule — against `subject` as a **solution stream**, the
-    /// de-duplicated core of [`try_equations`](Self::try_equations) and the rule appliers
-    /// ([`apply_first_rule_at`](Self::apply_first_rule_at)/[`all_successors_at`](Self::all_successors_at)).
-    ///
-    /// The compiled [`LhsAutomaton`] yields a [`Subproblem`](crate::theory::Subproblem) whose `next`
-    /// enumerates solutions into `subst`; each solution is a *trial* — if `condition` holds (a failure
-    /// backtracks into the next solution, Maude's `solveCondition` retry), the rhs is built (inside the
-    /// C7 dedup window when `rhs_shares`) and spliced into the matched position by `build_result` (a
-    /// whole match = just the rhs; an extension match re-assembles the theory residue — Maude's
-    /// `partialConstruct`), then handed to `accept`. `accept` returns [`Flow::Stop`] to halt with that
-    /// result (first-applicable: equational reduce / `rewrite` / `frewrite`) or [`Flow::Continue`] to
-    /// enumerate every solution (search successor collection). Returns the first `Stop`'s result, else
-    /// `None`. The caller owns `subst` (reset here to `nr_vars`) so its capacity is reused across a
-    /// symbol's statements. The A4 borrow split lets the matched `&rhs` (a shared borrow of `sig`)
-    /// instantiate in place without a defensive clone.
+    /// Drive one equation or rule as a matcher solution stream. Each candidate must satisfy the
+    /// condition before rhs construction and theory-specific residue reconstruction. The callback
+    /// selects first-applicable behavior or complete successor enumeration.
     #[allow(clippy::too_many_arguments)]
     fn drive_match(
         &mut self,
@@ -4580,12 +4280,8 @@ impl Runtime {
                     continue;
                 }
             }
-            // C7: an rhs with a TEXTUALLY repeated compound subterm (e.g. `< g(X), g(X) >`) is built
-            // with per-subterm CSE so the duplicate becomes one shared node — reduced once, like
-            // Maude's `RhsBuilder`. Textual, not value-keyed: distinct rhs subterms that instantiate
-            // to equal values (RAT's `I * M` vs `J * N` on `1/6 + 1/6`) stay separate nodes and count
-            // separately, exactly like Maude. The flag keeps the non-sharing common case (`fib`) on
-            // the plain path.
+            // Reuse structurally repeated RHS subterms. Distinct expressions that instantiate to equal
+            // values remain distinct so physical-occurrence rewrite accounting stays intact.
             let reuse = self.find_reduced_instances(sig, subject, lhs_reuse, subst);
             let built = match (rhs_shares, reuse.is_empty()) {
                 (true, true) => self.instantiate_cse(sig, rhs, subst),
@@ -4786,12 +4482,9 @@ impl Runtime {
         out
     }
 
-    /// Apply the first applicable rule at `node` (Pillar A): round-robin over the node's symbol's rules
-    /// from `cursors`, returning `(rule_id, result)` — the rewritten node — or `None` if no rule applies.
-    /// Round-robin fairness (Maude's `RuleTable::applyRules`/`nextRule`): the cursor advances **past** the
-    /// rule that fired, so repeatedly rewriting a symbol cycles through its rules. Each application bumps
-    /// the global `rewrite_count` (it counts toward Maude's `rewrites:` total). Reuses the shared
-    /// [`drive_match`](Self::drive_match) seam, so a `crl`'s condition is checked identically to a `ceq`'s.
+    /// Apply the first rule at `node`, round-robin from the per-symbol cursor. The cursor advances past
+    /// the rule that fires, and the rewrite contributes to the global count. Conditional rules use the
+    /// same matching and condition evaluator as equations.
     fn apply_first_rule_at(
         &mut self,
         sig: &Signature,
@@ -4801,10 +4494,8 @@ impl Runtime {
         self.apply_first_rule_filtered(sig, node, cursors, None)
     }
 
-    /// As [`apply_first_rule_at`](Self::apply_first_rule_at), but considering only rules of the given
-    /// `erewrite` class when `filter` is `Some` (the fast object-message path vs the generic `leftOver`
-    /// path — Maude's `ruleMap[msg]` vs `leftOver.rules`). `None` considers every rule (ordinary
-    /// `rewrite`/`frewrite`/`search`).
+    /// As [`apply_first_rule_at`](Self::apply_first_rule_at), optionally restricted to one `erewrite`
+    /// class: object-message rules or generic leftovers. `None` considers every rule.
     fn apply_first_rule_filtered(
         &mut self,
         sig: &Signature,
@@ -4872,11 +4563,9 @@ impl Runtime {
         None
     }
 
-    /// Find the top-down-first rewritable position of `root` and apply one rule there, returning the new
-    /// root (path rebuilt) or `None` if no rule applies anywhere (a normal form, for `rewrite`). Faithful
-    /// to Maude's `ruleRewrite` redex-stack traversal (`Core/run.cc:24`): breadth-first from the root,
-    /// trying each position in stack order; the first position whose symbol has an applicable rule
-    /// rewrites, then the path back to the root is rebuilt (Maude's `copyWithReplacement`).
+    /// Find the first rewritable position in top-down breadth-first order and apply one rule there.
+    /// Returns the rebuilt root, or `None` when no rule applies anywhere. Positions and rules retain
+    /// their stack/declaration order.
     fn rewrite_step(
         &mut self,
         sig: &Signature,
@@ -4932,9 +4621,8 @@ impl Runtime {
         }
     }
 
-    /// Rebuild the path from a rewritten position up to the root: starting at stack position `leaf_idx`
-    /// with `new_node` in place, reconstruct each ancestor with the one argument leading to the redex
-    /// replaced (Maude's chained `copyWithReplacement`). Ancestors' other children stay shared.
+    /// Rebuild from a rewritten position to the root, replacing the path argument at each ancestor
+    /// while preserving all other children by sharing.
     fn rebuild_path(
         &mut self,
         sig: &Signature,
@@ -4957,10 +4645,9 @@ impl Runtime {
         node
     }
 
-    /// Eagerly materialize one state's raw rule results while deferring the equational work spent
-    /// finding them. `StateGraph` replays each prefix only when its corresponding result is consumed,
-    /// and replays the tail only when the caller asks to prove the stream exhausted. This matches
-    /// Maude's lazy `findNextRewrite` accounting without retaining matcher borrows across graph calls.
+    /// Materialize one state's raw rule results while deferring the equational work spent finding
+    /// them. `StateGraph` replays each prefix when its result is consumed and the tail only when the
+    /// caller proves exhaustion, without retaining matcher borrows across graph calls.
     pub(crate) fn state_successors_deferred(
         &mut self,
         sig: &Signature,
@@ -5121,10 +4808,8 @@ impl Runtime {
         memo[&id]
     }
 
-    /// Enumerate the solutions of matching the compiled `goal` against `state` whose `such_that` condition
-    /// holds (Pillar A-iv `search` ... `such that`): one binding vector (the goal's variables `0..nr_vars`)
-    /// per solution, in matcher order. `search` runs with tracing off, so the condition check records
-    /// nothing (its dummy `stmt_id` is never rendered).
+    /// Enumerate goal matches whose `such_that` condition holds. Each result contains bindings for goal
+    /// variables `0..nr_vars` and the rewrite count after condition evaluation.
     fn eval_goal(
         &mut self,
         sig: &Signature,
@@ -5141,10 +4826,8 @@ impl Runtime {
         };
         while sp.next(self, sig, &mut subst) {
             if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state) {
-                // Snapshot the rewrite count *after* the `such that` condition's equational reductions
-                // (the `rem`/`=/=` etc.): Maude bills those to the solution the condition admits, so the
-                // per-solution `rewrites:` count includes the condition evaluation.
-                // An empty condition is 0-cost, so this equals the discovery count.
+                // Snapshot after the `such that` condition's equational reductions so the accepted
+                // solution includes their rewrite count. An empty condition has no cost.
                 let bindings = (0..nr_vars)
                     .map(|k| subst.get(k).expect("goal variable bound"))
                     .collect();
@@ -5154,19 +4837,11 @@ impl Runtime {
         solutions
     }
 
-    /// Whether every fragment of `condition` holds under the matched substitution `subst` — the B2.3
-    /// condition check the rewrite driver runs before accepting a solution (empty condition ⇒ `true`).
+    /// Evaluate every condition fragment under a matched substitution.
     ///
-    /// Each fragment is evaluated by **re-entrant reduction** of its instantiated term(s). **F-2 (the
-    /// engine-global active-frame root set):** that nested `reduce`'s [`safe_point_gc`](Self::safe_point_gc)
-    /// only sees its *own* frame stack, so before solving we push the **outer** reduction's working set —
-    /// each ancestor frame's `original` (transitively its unreduced children) and strategy-reduced `args`,
-    /// the match `subst` bindings, and the `redex` — onto [`protected`](Self::protected), which
-    /// `safe_point_gc` also marks (Maude marks from all active rewriting contexts). Nested conditions stack
-    /// further roots; each pops its own on return. In-reduction GC therefore stays *enabled* during a
-    /// condition (bounded memory — the condition's own garbage is reclaimed) without sweeping outer state.
-    /// Gated on `gc_interval`: with GC off the vec is never read, so we skip the push entirely (the default
-    /// REPL path is unchanged). `frames` is the outer reduce's stack; `redex` the node being rewritten/tested.
+    /// Fragment evaluation may re-enter reduction. Before doing so, protect the outer frames,
+    /// substitution bindings, and redex because a nested GC sees only its own reduction stack. Nested
+    /// conditions stack and then remove their own protected roots.
     #[allow(clippy::too_many_arguments)]
     fn condition_holds(
         &mut self,
@@ -5181,11 +4856,9 @@ impl Runtime {
         if condition.is_empty() {
             return true;
         }
-        // Every rewrite-condition recursion cycle passes through here (rule application →
-        // condition → nested search → rule application → …). Grow the stack on demand so an
-        // unboundedly recursive condition (`crl b => c if b => c .`) diverges the way Maude
-        // does — heap-growing, interruptible in principle — instead of aborting the process on
-        // call-stack overflow (manual-verify item, not oracle-diffable).
+        // Every rewrite-condition recursion cycle passes through here. Grow the stack on demand so an
+        // unbounded recursive condition remains heap-growing and externally interruptible rather than
+        // aborting the process on native call-stack overflow.
         stacker::maybe_grow(128 * 1024, 8 * 1024 * 1024, || {
             self.condition_holds_inner(sig, condition, subst, kind, stmt_id, frames, redex)
         })
@@ -5206,7 +4879,7 @@ impl Runtime {
             let base = self.protected.len();
             for f in frames {
                 self.protected.push(f.original);
-                self.protected.push(f.start); // C7: the outer frames' memoization targets (see safe_point_gc)
+                self.protected.push(f.start); // normal-form forwarding target
                 self.protected.extend_from_slice(&f.args);
             }
             for i in 0..subst.len() {
@@ -5224,8 +4897,7 @@ impl Runtime {
         holds
     }
 
-    /// Record the end of solving condition fragment `index` (Maude's `traceEndFragment`): the fragment
-    /// text again, plus — on success — the substitution after it (`Var --> binding` lines).
+    /// Record a condition fragment's end, including the resulting substitution on success.
     fn end_fragment(
         &mut self,
         kind: StmtKind,
@@ -5252,12 +4924,9 @@ impl Runtime {
         }
     }
 
-    /// Trace the re-visit of a *deterministic* (equality/sort-test) fragment as the solver backtracks
-    /// back through it: a succeeded deterministic fragment whose later fragments failed is re-solved by
-    /// Maude's iterative `solveCondition` (and fails, having no second solution). Our recursive solver
-    /// unwinds through it instead, so we reproduce just the trace events here — a `re-solving` +
-    /// `failure for condition fragment` pair. **Trace-only**: it never affects the search, the rewrite
-    /// count, or the bindings (a deterministic re-solve does no reduction). No-op when not tracing.
+    /// Emit the trace-only revisit of a deterministic equality or sort-test fragment while
+    /// backtracking. Recursive solving unwinds rather than evaluating that no-second-solution attempt,
+    /// so this records the corresponding start and failure without changing search, counts, or bindings.
     fn trace_deterministic_backtrack(
         &mut self,
         kind: StmtKind,
@@ -5282,13 +4951,11 @@ impl Runtime {
         });
     }
 
-    /// Satisfy `condition[i..]` under `subst`, backtracking (Maude's `solveCondition`): an **equality**
-    /// fragment reduces both sides and compares modulo the axioms; a **sort-test** reduces the term and
-    /// checks its least sort; a **matching** (`:=`) fragment reduces the subject and enumerates the
-    /// pattern's solutions, recursing into the remaining fragments for each and retrying the next on
-    /// failure. The re-entrant reductions are what make a condition's rewrites count toward the total.
-    /// A matching fragment's `fresh_vars` are unbound before each attempt so backtracking re-binds
-    /// cleanly; on overall success the accepted bindings remain in `subst` for the rhs.
+    /// Satisfy `condition[i..]` under `subst` with backtracking. Equality fragments reduce and compare
+    /// both sides; sort tests reduce and inspect the least sort; matching fragments reduce the subject
+    /// and enumerate pattern solutions. Re-entrant reductions contribute to the command total.
+    /// Matching fragments clear their fresh variables before each attempt; accepted bindings remain
+    /// available to RHS construction.
     #[allow(clippy::too_many_arguments)]
     fn solve_condition(
         &mut self,
@@ -5303,9 +4970,8 @@ impl Runtime {
             return true; // every fragment satisfied
         };
         let depth = self.condition_depth;
-        // Begin solving this fragment (Maude's `traceBeginFragment`, first attempt). A matching
-        // fragment may re-solve on backtrack below, emitting its own `FragmentStart { first_attempt:
-        // false }`.
+        // Record the first attempt. A matching fragment may emit another start event when backtracking
+        // asks it for another solution.
         if self.tracing() {
             self.record(TraceEvent::FragmentStart {
                 kind,
@@ -5319,7 +4985,7 @@ impl Runtime {
         // `depth + 1` (gated by `set trace condition`).
         match frag {
             CompiledFragment::Equality { lhs, rhs } => {
-                // F-2: reduce each side, pinning the reduced `l` across `r`'s reduction — under
+                // Reduce each side while pinning the reduced `l` across `r`'s reduction. Under
                 // in-reduction GC, `l` is live only in this native local while `r` reduces, so a nested
                 // safe point would otherwise sweep it. `r` is instantiated *after* `l`'s reduce, so nothing
                 // unrooted is live during `l`'s reduction either.
@@ -5338,8 +5004,7 @@ impl Runtime {
                 if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
                     return true;
                 }
-                // A later fragment failed: backtrack unwinds through this (succeeded) deterministic
-                // fragment. Trace it as Maude does; the search/result/count are unaffected.
+                // A later fragment failed; trace deterministic backtracking without changing search or counts.
                 self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
                 false
             }
@@ -5368,7 +5033,7 @@ impl Runtime {
                 self.condition_depth += 1;
                 let subj = self.reduce(sig, subj, &mut NullDescent);
                 self.condition_depth -= 1;
-                // F-2: `subj` — and the fresh-var bindings, which are its subterms — must survive the
+                // `subj` — and the fresh-variable bindings, which are its subterms — must survive the
                 // pattern match and the recursive solve of the later fragments, both of which reduce under
                 // in-reduction GC; pin it for the rest of this fragment.
                 let _root_subj = self.root(subj);
@@ -5422,8 +5087,7 @@ impl Runtime {
                 pattern,
                 fresh_vars,
             } => {
-                // Instantiate + reduce the search origin, then explore its `=>*` reachable states for a
-                // matching `pattern` that lets the rest of the condition succeed (Pillar A-v).
+                // Reduce the instantiated origin, then search its `=>*` states for a matching pattern.
                 let start = self.instantiate(sig, lhs, subst);
                 self.condition_depth += 1;
                 let start = self.reduce(sig, start, &mut NullDescent);
@@ -5435,12 +5099,9 @@ impl Runtime {
         }
     }
 
-    /// Solve a rewrite condition `lhs => pattern` (Pillar A-v): breadth-first over the `=>*` reachable
-    /// states from `start` (hash-consed by `deep_equal`; the start itself is tried first, as `=>*`
-    /// includes zero steps), match `pattern` against each — binding `fresh_vars` — and recurse into the
-    /// rest of the condition, backtracking to the next reachable state on failure. Every rule step counts
-    /// as a rewrite (Maude accounting). Non-termination on an infinite reachable space is inherited from
-    /// Maude.
+    /// Solve a rewrite condition with breadth-first `=>*` reachability, including the zero-step state.
+    /// Pattern and remaining-condition failure backtrack to the next reachable state. Every rule step
+    /// contributes to the rewrite count; infinite reachable spaces may not terminate.
     ///
     /// Every retained DAG follows the same ownership contract as `StateGraph`: `states` owns one
     /// [`RootGuard`] per discovered canonical state, and each raw successor keeps its guard until it has
@@ -5527,11 +5188,9 @@ impl Runtime {
 // Engine: the thin public facade over Signature + Runtime
 // ======================================================================================
 
-/// The CONFIGURATION symbols/sorts an object module's **object-pattern completion** keys on (Pillar
-/// 2.5-E). Resolved structurally from the `object`-flagged constructor `<_:_|_>` in scope — Maude's
-/// `ObjectConstructorSymbol`/`findClassIdSort`/`findAtttributeSort` — so a user configuration with
-/// different sort names still works. Returned by [`Engine::oo_info`]; `None` when no object constructor
-/// is in scope (the module is not object-oriented).
+/// The symbols and sorts used by object-pattern completion. They are resolved structurally from the
+/// object constructor `<_:_|_>`, so modules may use arbitrary sort names. [`Engine::oo_info`] returns
+/// `None` when no object constructor is in scope.
 #[derive(Debug, Clone)]
 pub struct OoInfo {
     /// The object constructor `<_:_|_> : Oid Cid AttributeSet -> Object` (the `object` attribute).
@@ -5563,9 +5222,8 @@ impl Engine {
         self.sig.symbol(sym).is_commutative()
     }
 
-    /// The object-oriented completion context (Pillar 2.5-E) — the CONFIGURATION symbols/sorts the
-    /// `omod` object-pattern completion transform reads. `None` when no `object`-flagged constructor is
-    /// in scope, or it does not have the `Oid Cid AttributeSet` shape, or no AttributeSet `_,_` is found.
+    /// Resolve the object-pattern completion context from the current signature. Returns `None` when
+    /// the object constructor or its `Oid Cid AttributeSet` structure is unavailable.
     pub fn oo_info(&self) -> Option<OoInfo> {
         // The object constructor: the first symbol carrying the `object` OO flag.
         let (object_ctor, osym) = self.sig.symbols.iter().find(|(_, s)| s.oo.object)?;
@@ -5613,22 +5271,22 @@ impl Engine {
     pub(crate) fn signature(&self) -> &Signature {
         &self.sig
     }
-    /// Shared access to the mutable runtime half (DAG arena/GC/statistics). Test-only counterpart of
-    /// [`signature`](Self::signature).
+    /// Shared access to the mutable runtime half (DAG arena, GC, and statistics), available only in
+    /// tests. [`signature`](Self::signature) exposes the immutable half.
     #[cfg(test)]
     pub(crate) fn runtime(&self) -> &Runtime {
         &self.rt
     }
     /// Both halves borrowed disjointly, to drive the matcher seam's `next` — which needs a `&mut
-    /// Runtime` and a `&Signature` at once (the A4 split). Used by
+    /// Runtime` and a `&Signature` at once. Used by
     /// [`match_solutions`](Self::match_solutions) and its [`Solutions`] stream, and by the theory tests.
     pub(crate) fn parts_mut(&mut self) -> (&Signature, &mut Runtime) {
         (&self.sig, &mut self.rt)
     }
     /// Run one operation against the public, minimal META descent view of this engine.
     ///
-    /// Kept crate-visible for engine-neutral external-message transport: no runtime or signature
-    /// reference can escape the callback.
+    /// Kept crate-visible for engine-neutral external-message transport; neither the runtime nor
+    /// signature can remain borrowed after the callback returns.
     pub(crate) fn with_meta_ctx<R>(&mut self, f: impl FnOnce(&mut MetaCtx) -> R) -> R {
         let mut ctx = MetaCtx {
             rt: &mut self.rt,
@@ -5663,10 +5321,9 @@ impl Engine {
 
     /// Number of distinct kinds whose values use unsigned decimal integer syntax.
     ///
-    /// Maude's pretty-printer treats both algebraic `SuccSymbol` naturals and SMT integer constants as
-    /// competing numeral families. A numeral in an unknown-range context needs a sort qualifier only
-    /// when more than one such kind is present (or when a user constant has the same spelling, tracked by
-    /// the frontend).
+    /// Algebraic successor naturals and SMT integer constants are competing numeral families. An
+    /// unknown-range numeral needs a qualifier when more than one such kind exists; the frontend also
+    /// accounts for colliding user constants.
     pub fn integer_literal_kind_count(&self) -> usize {
         let mut kinds = HashSet::new();
         for &symbol in self.sig.succ_zeros.keys() {
@@ -5688,8 +5345,8 @@ impl Engine {
             _ => None,
         }
     }
-    /// Static part of Maude's `validForSMT_Rewriting` gate. The frontend adds the one distinction
-    /// unavailable in the kernel: collapse axioms on ordinary operators versus polymorph instances.
+    /// Kernel-side validity gate for SMT rewriting. The frontend separately distinguishes collapse
+    /// axioms on ordinary operators from polymorphic instances.
     pub fn valid_for_smt_rewriting(&self) -> bool {
         self.sig.smt_info.conjunction().is_some()
             && !self.sig.smt_rules.is_empty()
@@ -5748,10 +5405,9 @@ impl Engine {
     }
 
     /// Attach an additional declaration to an existing operator (ad-hoc / subsort overloading); the
-    /// least sort of an application is then resolved across all of them. Declarations must agree on
-    /// arity and are tried in the order added (the original `add_op*` declaration stays first — the
-    /// tie-break favours it). Add all declarations before building any node of `sym` (sorts cache at
-    /// construction).
+    /// least sort of an application is resolved across all declarations. They must agree on arity and
+    /// are tried in insertion order, so the first `add_op*` declaration wins an incomparable tie. Add
+    /// every declaration before building a node of `sym`, because construction caches sorts.
     pub fn add_op_decl(&mut self, sym: SymbolId, domain: Vec<SortId>, range: SortId) {
         self.sig.add_op_decl(sym, domain, range);
     }
@@ -5773,7 +5429,7 @@ impl Engine {
         self.sig.mark_inconsistent_constructor_axioms(sym);
     }
 
-    /// Mark an operator as a constructor (`[ctor]`, B2.4) — metadata that does not affect reduction.
+    /// Mark an operator as a constructor (`[ctor]`); reduction-inert metadata used by symbolic analyses.
     pub fn set_ctor(&mut self, sym: SymbolId) {
         self.sig.set_ctor(sym);
     }
@@ -5783,16 +5439,14 @@ impl Engine {
         self.sig.symbol(sym).is_constructor()
     }
 
-    /// Install an operator evaluation strategy (B2.4): positive entries are 1-based argument
-    /// positions and `0` is a top-rewrite attempt. The complete instruction stream is normalized by
-    /// [`Signature::set_strategy`]; an empty slice selects the standard eager strategy.
+    /// Install an operator evaluation strategy: positive entries are 1-based argument positions and
+    /// `0` is a top-rewrite attempt. An empty slice selects the standard eager strategy.
     pub fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
         self.sig.set_strategy(sym, raw);
     }
 
-    /// Mark `sym`'s frozen arguments (`frozen` / `frozen (raw…)`, Pillar A): `raw` is the 1-based frozen
-    /// argument positions — pass an empty slice for a bare `[frozen]` (all arguments). A frozen argument
-    /// is never rewritten by `rewrite`/`frewrite`/`search`; equational `reduce` is unaffected.
+    /// Mark 1-based frozen argument positions on `sym`; an empty slice freezes every argument.
+    /// Rule rewriting and search skip frozen arguments, while equational reduction still visits them.
     ///
     /// Returns `false` and leaves the symbol unchanged when the attribute references an invalid
     /// position. This makes declaration input recoverable without weakening the signature invariant.
@@ -5805,9 +5459,8 @@ impl Engine {
         self.sig.symbol(sym).is_frozen_arg(arg)
     }
 
-    /// Record the object-system role of `sym` (`config`/`obj`/`msg`/`portal` attributes, Pillar 2.5).
-    /// Inert for `reduce`/`rewrite`/`frewrite`/`search` (the `config` `__` stays an ordinary ACU soup);
-    /// the flags drive the `erewrite` object-message scheduler's soup partition (Phase 2.5-B).
+    /// Record the object-system role of `sym` (`config`/`obj`/`msg`/`portal`). Ordinary rewrite modes
+    /// treat the configuration as an ACU soup; the flags drive `erewrite`'s object/message partition.
     pub fn set_oo_flags(
         &mut self,
         sym: SymbolId,
@@ -5827,14 +5480,8 @@ impl Engine {
         );
     }
 
-    /// Attach a built-in reduction rule (`special (id-hook …)`, B3) to `sym` — tried before user
-    /// equations. Hook references are passed already resolved to [`SymbolId`]s (the future parser does
-    /// the name resolution; hand-built modules supply them directly, as with [`add_equation`]).
-    /// [`SpecialOp::Branch`](crate::symbol::SpecialOp) installs its intrinsic dynamic strategy and
-    /// sort-refining synthetic declarations.
-    /// Classify `sym` for the decompose-equality stability analysis (see [`SymbolClass`]): the
-    /// frontend marks builtin marker-class symbols at module build, and command evaluation marks the
-    /// pseudo-variable constants it realizes for a non-ground subject.
+    /// Classify `sym` for decompose-equality stability analysis. Module construction marks built-in
+    /// marker classes, and command evaluation marks pseudo-variable constants for non-ground subjects.
     pub fn set_symbol_class(&mut self, sym: SymbolId, class: SymbolClass) {
         if let SymbolClass::Variable { rank } = class {
             self.rt.var_ranks.insert(sym, rank);
@@ -5922,28 +5569,13 @@ impl Engine {
         zero
     }
 
-    /// Constant-only compatibility API used by hand-built kernel tests.
-    pub fn set_one_sided_identity(
-        &mut self,
-        sym: SymbolId,
-        side: IdentitySide,
-        id_const: SymbolId,
-    ) {
-        let identity = self.sig.constant_identity(id_const);
-        self.sig.symbols.get_mut(sym).one_sided_id = Some((side, identity));
-    }
-
-    /// The per-sort variable symbol backing genuine `Var` leaves — Maude's
-    /// `Module::instantiateVariable(sort)`. Created **lazily, in demand order** (command parse →
-    /// mid-solve fresh kinds → unifier extraction) and cached for the module's lifetime: the
-    /// creation order is observable through `dag_compare`'s SymbolId ordering between distinct
-    /// variable symbols, exactly like Maude's symbol indices. Named after its sort (like Maude);
-    /// never entered in any frontend name table, so it cannot collide with user operators.
-    /// Record the first-demand order of per-sort variable symbols recovered by command
-    /// normalization. Existing ranks are permanent, as in Maude's module-level symbol cache;
-    /// newly encountered sorts append in the supplied order. The slice is then restored to that
-    /// module-lifetime order: its input traversal came from an already-canonical command DAG whose
-    /// child order can itself reflect symbols materialized by earlier commands.
+    /// Lazily create and cache one internal variable symbol per sort. Demand order is observable in
+    /// structural ordering, so command parsing, fresh-kind generation, and extraction share a permanent
+    /// module-level rank. Symbols use their sort names but never enter frontend name tables.
+    ///
+    /// Command normalization records first demand for each sort, appends new ranks, and restores the
+    /// supplied slice to module-lifetime order. An already-canonical command DAG therefore cannot
+    /// change the permanent ranks used by later commands.
     fn rank_term_variable_sorts(&mut self, terms: &[&Term]) {
         fn collect(term: &Term, sorts: &mut Vec<SortId>) {
             match term {
@@ -5979,8 +5611,10 @@ impl Engine {
             .map_or(0, |r| r + 1);
         for &sort in sorts.iter() {
             let sym = self.variable_symbol(sort);
-            if !self.rt.sort_var_ranks.contains_key(&sym) {
-                self.rt.sort_var_ranks.insert(sym, next);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.rt.sort_var_ranks.entry(sym)
+            {
+                entry.insert(next);
                 next += 1;
             }
         }
@@ -6004,18 +5638,16 @@ impl Engine {
         sym
     }
 
-    /// Build a **variable** leaf (Maude's `VariableDagNode`) of the given sort: `name` is the
-    /// interned base-name token code (frontend-resolved for printing), `index` the owning
-    /// unification problem's substitution slot. Creates the per-sort variable symbol on first use.
+    /// Build a variable leaf of `sort`. `name` is its interned base-name token and `index` is the owning
+    /// symbolic problem's substitution slot. The per-sort symbol is created on first use.
     pub fn make_var(&mut self, sort: SortId, name: u32, index: u32) -> DagId {
         let sym = self.variable_symbol(sort);
         self.rt.make_var(&self.sig, sym, name, index)
     }
 
-    /// Instantiate a static statement term with symbolic variables, then apply Maude's eager
-    /// `Term::normalize(true)` ordering. Reflection uses this because executable matching does not need
-    /// the source [`Term`] to retain its canonical AC/ACU argument order, while `upModule` exposes that
-    /// order and the enclosing meta-level statement sets are themselves order-sensitive.
+    /// Instantiate and eagerly theory-normalize a static statement pattern for reflection. Executable
+    /// matching does not require the source [`Term`] to retain canonical AC/ACU order, but `upModule`
+    /// exposes that order and enclosing metalevel statement sets are order-sensitive.
     pub fn normalize_pattern_for_reflection(
         &mut self,
         term: &Term,
@@ -6067,19 +5699,17 @@ impl Engine {
         self.rt.inherit_reduced_status(&self.sig, source, rebuilt);
     }
 
-    /// Rebuild a symbolic DAG with each original variable slot replaced by `new_slots[old_slot]`.
-    /// Unification calls this after theory normalization: Maude normalizes each static `Term` before
-    /// `indexVariables`, so commutative canonical order—not parser encounter order—defines the visible
-    /// substitution slots. The iterative postorder walk preserves sharing and compact `S` counts.
+    /// Rebuild a symbolic DAG with each original slot replaced by `new_slots[old_slot]`. This runs
+    /// after theory normalization, so commutative canonical order—not parser encounter order—defines
+    /// visible substitution slots. The iterative postorder walk preserves sharing and compact S counts.
     pub(crate) fn remap_variable_slots(&mut self, root: DagId, new_slots: &[u32]) -> DagId {
         self.remap_variable_slots_inner(root, new_slots, false)
     }
 
     /// Remap variable slots without normalizing any enclosing theory node.
     ///
-    /// This is the slot-indexing counterpart of Maude's `instantiate(..., false)`: final narrowing
-    /// goals may contain shared, transiently noncanonical AC/AU children, and rebuilding them through
-    /// the canonical builders would destroy the sharing before reduction.
+    /// Final narrowing goals may contain shared, transiently noncanonical AC/AU children. Canonical
+    /// builders would destroy that sharing before reduction.
     pub(crate) fn remap_variable_slots_preserving_representation(
         &mut self,
         root: DagId,
@@ -6238,6 +5868,8 @@ impl Engine {
         self.make_const(sym)
     }
 
+    /// Attach a built-in reduction rule to `sym`, before user equations. Hook references must already
+    /// be resolved. Branch hooks install their intrinsic strategy and synthetic sort declarations.
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
         self.sig.set_special(sym, op);
     }
@@ -6267,10 +5899,8 @@ impl Engine {
         self.sig.add_op_au(name, domain, range, identity)
     }
 
-    /// Register a **CUI** operator (any non-assoc subset of `comm` / `id:` / `idem` — Maude's
-    /// CUI_Theory). Must be binary; a `comm` op stores its two arguments in canonical order (non-comm
-    /// ops stay positional), and `idem`/`id:` collapse `f(a,a)` / `f(a,e)` to a single element at
-    /// construction.
+    /// Register a binary **CUI** operator with any non-associative subset of `comm`, `id:`, and `idem`.
+    /// Commutative arguments are canonicalized; identities and equal idempotent arguments collapse.
     pub fn add_op_cui(
         &mut self,
         name: impl Into<String>,
@@ -6284,8 +5914,7 @@ impl Engine {
             .add_op_cui(name, domain, range, comm, idem, identity)
     }
 
-    /// Register an **S** (`iter`) operator: a unary stacked successor `s_` (Maude's `[iter]`). Must be
-    /// unary; its nodes (built via [`make_iter`](Self::make_iter)) store `s^count(arg)` compactly.
+    /// Register a unary **S** (`iter`) operator whose nodes store `s^count(arg)` compactly.
     pub fn add_op_iter(
         &mut self,
         name: impl Into<String>,
@@ -6335,11 +5964,8 @@ impl Engine {
     }
 
     /// Resolve a META application by connected-component profile when no sort-level declaration applies.
-    /// Reflected rule sides may contain special operations whose declared result is an error sort until
-    /// reduction (for example `upModule : [Qid] [Bool] -> [Module]` beneath
-    /// `insertModule : Oid Oid Module -> Msg`). Maude still constructs that kind-correct term and lets
-    /// inner reduction refine its sort. Selecting by name/arity alone is unsafe because names such as
-    /// `__` are overloaded across unrelated kinds.
+    /// Reflected rule sides may contain special operations whose result remains an error sort until
+    /// inner reduction refines it. Name-and-arity selection alone is unsafe across unrelated kinds.
     pub fn resolve_operator_for_kinds(
         &self,
         name: &str,
@@ -6406,9 +6032,8 @@ impl Engine {
         })
     }
 
-    /// Resolve a META constant in the connected component named by its annotation. Maude treats the
-    /// suffix as a kind/component discriminator, not an upper sort bound: `'a.Elem` may denote
-    /// `a : XOR` when `Elem` and `XOR` belong to the same component.
+    /// Resolve a META constant in the connected component named by its annotation. The suffix selects
+    /// a component rather than imposing an upper sort bound.
     pub fn resolve_constant_at_sort(&self, name: &str, sort: SortId) -> Option<SymbolId> {
         let kind = self.sig.sorts.kind_of(sort);
         self.sig.symbols_iter().find_map(|(id, symbol)| {
@@ -6490,7 +6115,7 @@ impl Engine {
     }
 
     /// Build a canonical **ACU** node for an `assoc comm [id:]` operator from `(element, multiplicity)`
-    /// pairs (see [`Runtime::make_acu`]). The result is in AC(+U) normal form — flattened, identity
+    /// pairs (see `Runtime::make_acu`). The result is in AC(+U) normal form — flattened, identity
     /// dropped, equal elements merged, canonically ordered — and may collapse to a single element or
     /// the identity. `symbol` must be ACU (declared via [`add_op_ac`](Self::add_op_ac)).
     pub fn make_acu(&mut self, symbol: SymbolId, args: Vec<(DagId, u32)>) -> DagId {
@@ -6515,20 +6140,20 @@ impl Engine {
     }
 
     /// Build a canonical **AU** node for an `assoc [id:]` operator from an ordered element list (see
-    /// [`Runtime::make_au`]): `make_au(concat, vec![a, b, c])` builds the canonical `a b c`. Flattened
+    /// `Runtime::make_au`): `make_au(concat, vec![a, b, c])` builds the canonical `a b c`. Flattened
     /// and identity-dropped, order preserved; may collapse to a single element or the identity.
     pub fn make_au(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
         self.rt.make_au(&self.sig, symbol, elements)
     }
 
     /// Build a canonical **CUI** node for a `comm [idem] [id:]` operator from its two arguments (see
-    /// [`Runtime::make_cui`]): commutatively ordered, with `f(a,a)`/`f(a,e)` collapsed.
+    /// `Runtime::make_cui`): commutatively ordered, with `f(a,a)`/`f(a,e)` collapsed.
     pub fn make_cui(&mut self, symbol: SymbolId, x: DagId, y: DagId) -> DagId {
         self.rt.make_cui(&self.sig, symbol, x, y)
     }
 
     /// Build a canonical **S** (`iter`) node `s^count(arg)` for an `iter` operator (see
-    /// [`Runtime::make_s`]): `count == 0` collapses to `arg`, nested same-symbol successors flatten.
+    /// `Runtime::make_s`): `count == 0` collapses to `arg`, nested same-symbol successors flatten.
     /// `symbol` must be an `iter` operator (declared via [`add_op_iter`](Self::add_op_iter)).
     pub fn make_iter(&mut self, symbol: SymbolId, count: u64, arg: DagId) -> DagId {
         self.rt.make_s(&self.sig, symbol, Nat::from_u64(count), arg)
@@ -6550,18 +6175,17 @@ impl Engine {
         Some(self.rt.make_s(&self.sig, symbol, n.magnitude(), arg))
     }
 
-    /// Build a string-literal NA node (the `<Strings>` `StringSymbol`, B3.6); `symbol` is an arity-0
-    /// string-constant operator. The value is a raw byte sequence (Maude strings are bytes, not UTF-8).
+    /// Build a raw-byte string literal as an atomic node.
     pub fn make_string(&mut self, symbol: SymbolId, value: &[u8]) -> DagId {
         self.rt
             .make_na(&self.sig, symbol, NaValue::Str(value.into()))
     }
-    /// Build a quoted-identifier NA node (the `<Qids>` `QuotedIdentifierSymbol`, B3.6).
+    /// Build a quoted identifier as an atomic node.
     pub fn make_qid(&mut self, symbol: SymbolId, value: &str) -> DagId {
         self.rt
             .make_na(&self.sig, symbol, NaValue::Qid(value.into()))
     }
-    /// Build a float NA node (the `<Floats>` `FloatSymbol`, B3.7).
+    /// Build a float as an atomic node.
     pub fn make_float(&mut self, symbol: SymbolId, value: f64) -> DagId {
         self.rt
             .make_na(&self.sig, symbol, NaValue::Float(value.to_bits()))
@@ -6630,18 +6254,15 @@ impl Engine {
 
     // ---- equations + reduction ----
 
-    /// Register an unconditional equation, indexed by its left-hand side's top symbol. The lhs is
-    /// compiled to a theory `LhsAutomaton` (the A3 matcher seam) here, once. A term canonical under
-    /// the old equation set may now be reducible, so this advances the equation epoch, invalidating
-    /// every node's cached "reduced" stamp.
+    /// Register an unconditional equation and invalidate canonical-form caches by advancing the equation
+    /// epoch.
     pub fn add_equation(&mut self, eq: Equation) -> u32 {
         self.rank_term_variable_sorts(&[&eq.lhs, &eq.rhs]);
         self.sig.add_equation(eq)
     }
 
-    /// Register a conditional equation `ceq lhs = rhs if condition` (B2.3). The condition is a list of
-    /// [`ConditionFragment`](crate::term::ConditionFragment)s (equality / sort-test); all must hold for
-    /// the equation to fire, and a failed condition backtracks into the next matcher solution.
+    /// Register a conditional equation. All fragments must hold; failure resumes the next matcher
+    /// solution.
     pub fn add_conditional_equation(
         &mut self,
         lhs: Term,
@@ -6654,8 +6275,7 @@ impl Engine {
             .add_conditional_equation(lhs, rhs, nr_vars, condition)
     }
 
-    /// Register an `[owise]` equation (optionally conditional): applied only when no non-owise equation
-    /// of the symbol matches (B2.3b). Pass an empty `condition` for a plain `eq ... [owise]`.
+    /// Register an optional conditional fallback equation, considered only after ordinary equations fail.
     pub fn add_owise_equation(
         &mut self,
         lhs: Term,
@@ -6667,7 +6287,7 @@ impl Engine {
         self.sig.add_owise_equation(lhs, rhs, nr_vars, condition)
     }
 
-    /// Register an executable equation carrying Maude's `[variant]` attribute.
+    /// Register an executable equation carrying the `[variant]` attribute.
     pub fn add_variant_equation(
         &mut self,
         lhs: Term,
@@ -6702,9 +6322,8 @@ impl Engine {
         subproblem.next(&mut self.rt, &self.sig, &mut subst)
     }
 
-    /// Whether several retained-pattern DAGs match candidate DAGs under one shared substitution.
-    /// Variant folding uses this instead of unification: in particular, AU matching is complete even
-    /// though Maude's AU unifier intentionally is not.
+    /// Whether retained patterns match candidate DAGs under one shared substitution. Variant folding
+    /// uses matching rather than unification so AU matching remains complete.
     pub(crate) fn shared_match_exists(
         &mut self,
         patterns: Vec<Term>,
@@ -6743,17 +6362,14 @@ impl Engine {
         exists(0, &pairs, &mut self.rt, &self.sig, &mut subst)
     }
 
-    /// Register an (unconditional) membership axiom `mb lhs : sort` (the lhs compiled to the A3
-    /// matcher seam). Memberships lower a node's least sort at construction, so declare them before
-    /// building any node of the lhs's symbol (cf. the overload add-declarations-first contract).
+    /// Register an unconditional membership axiom. Its compiled matcher is indexed for direct and
+    /// top-collapsing candidates; sort refinement occurs lazily at reduction normal form.
     pub fn add_membership(&mut self, mb: Membership) -> u32 {
         self.rank_term_variable_sorts(&[&mb.lhs]);
         self.sig.add_membership(mb)
     }
 
-    /// Register a conditional membership `cmb lhs : sort if condition` (B2.3c): the sort is lowered
-    /// only when the condition holds under the membership match. Pass an empty `condition` for a plain
-    /// `mb` (or use [`add_membership`](Self::add_membership)).
+    /// Register a conditional membership. An empty condition is equivalent to a plain membership.
     pub fn add_conditional_membership(
         &mut self,
         lhs: Term,
@@ -6766,9 +6382,8 @@ impl Engine {
             .add_conditional_membership(lhs, sort, nr_vars, condition)
     }
 
-    /// Register an unconditional rule `rl lhs => rhs` (Pillar A), returning its dense per-module id (the
-    /// index the frontend keys its `rl_traces` metadata by). Rules are applied only by `rewrite`/
-    /// `frewrite`/`search`, never by [`reduce`](Self::reduce).
+    /// Register an unconditional rule, returning its dense per-module id. Rules are applied only by
+    /// rewriting and search, never by [`reduce`](Self::reduce).
     pub fn add_rule(&mut self, lhs: Term, rhs: Term, nr_vars: u32) -> u32 {
         self.rank_term_variable_sorts(&[&lhs, &rhs]);
         self.sig.add_rule(lhs, rhs, nr_vars)
@@ -6786,9 +6401,8 @@ impl Engine {
         self.sig.add_labelled_rule(lhs, rhs, nr_vars, label)
     }
 
-    /// Register a conditional rule `crl lhs => rhs if condition` (Pillar A-iii/A-v). The condition is the
-    /// same [`ConditionFragment`](crate::term::ConditionFragment) list as `ceq`, and a rule condition may
-    /// additionally contain a **rewrite** fragment `t => p` (A-v).
+    /// Register a conditional rule. It accepts the equation condition fragments plus rewrite fragments
+    /// of the form `term => pattern`.
     pub fn add_conditional_rule(
         &mut self,
         lhs: Term,
@@ -6800,7 +6414,7 @@ impl Engine {
         self.sig.add_conditional_rule(lhs, rhs, nr_vars, condition)
     }
 
-    /// Conditional counterpart of [`add_labelled_rule`](Self::add_labelled_rule).
+    /// Register a labelled conditional rule.
     pub fn add_labelled_conditional_rule(
         &mut self,
         lhs: Term,
@@ -6869,9 +6483,8 @@ impl Engine {
         &self.sig.narrowing_rules
     }
 
-    /// Reorder executable rules by dense rule id without changing those ids or their trace metadata.
-    /// Reflection uses this after an `upModule` RuleSet has erased source declaration order: Maude
-    /// recompiles the AC-canonical RuleSet order, which is observable through conditional-rule counts.
+    /// Reorder executable rules by dense id without changing ids or trace metadata. Reflection calls
+    /// this after an AC-canonical RuleSet has erased source declaration order.
     pub fn reorder_rules(&mut self, ordered_ids: &[u32]) {
         let mut ranks = vec![usize::MAX; self.sig.next_rule_id as usize];
         for (rank, &id) in ordered_ids.iter().enumerate() {
@@ -6884,7 +6497,7 @@ impl Engine {
         }
     }
 
-    /// Begin a `rewrite` session over `initial` (Pillar A): rule-fair, reduce-to-canonical then apply the
+    /// Begin a rule-fair rewrite session: reduce to canonical form, then apply the
     /// first rule at the top-down-first redex. Returns a resumable [`Rewriting`] — drive it with
     /// [`Rewriting::run`] (bound or unbounded) and resume with `continue`. The session keeps its current
     /// term GC-rooted, so it can be stored between REPL commands.
@@ -6904,10 +6517,8 @@ impl Engine {
         self.rt.rewrite_step(&self.sig, current, cursors)
     }
 
-    /// Apply the first applicable rule at `node` (round-robin via `cursors`), returning the rewritten
-    /// node or `None`. Used by the position-fair `frewrite` traversal (Pillar A-ii) and `search` (A-iv),
-    /// which drive the per-position rule application themselves rather than through the top-down
-    /// [`rewrite_step`](Self::rewrite_step).
+    /// Apply the first rule at `node` using the per-symbol round-robin cursor. Position-fair rewriting
+    /// and search use this entry directly instead of the top-down [`rewrite_step`](Self::rewrite_step).
     pub(crate) fn rewrite_at(
         &mut self,
         node: DagId,
@@ -6918,9 +6529,8 @@ impl Engine {
             .map(|(_, r)| r)
     }
 
-    /// Apply the first applicable rule of the given `erewrite` class (object-message vs `leftOver`) at
-    /// `node`; the scheduler restricts the fast path to object-message rules and the generic path to
-    /// `leftOver` rules, mirroring Maude's `ruleMap`/`leftOver` split.
+    /// Apply the first applicable rule in one `erewrite` class—object-message or generic leftover—at
+    /// `node`.
     fn rewrite_at_filtered(
         &mut self,
         node: DagId,
@@ -6932,8 +6542,8 @@ impl Engine {
             .map(|(_, r)| r)
     }
 
-    /// Whether the config operator `sym` has any `leftOver` (non-object-message) rule — the gate for the
-    /// generic `leftOverRewrite` path (a delivering system like bank/ping-pong has none).
+    /// Whether the config operator `sym` has a generic `LeftOver` rule, enabling the scheduler's
+    /// non-object-message rewrite path.
     fn has_leftover_rules(&self, sym: SymbolId) -> bool {
         self.sig
             .rules
@@ -6947,7 +6557,7 @@ impl Engine {
         self.rt.rebuild(&self.sig, symbol, children)
     }
 
-    /// Begin a `search` from `initial` (Pillar A-iv): build the reachable-state graph on the fly,
+    /// Begin a search from `initial`, building the reachable-state graph lazily and
     /// matching each state against `goal` (compiled here, with its `nr_vars` variables) filtered by
     /// `such_that`, for the reachability relation `arrow` up to `max_depth`. Returns a lazy
     /// [`Search`] — pull solutions with [`Search::next_solution`].
@@ -7027,9 +6637,8 @@ impl Engine {
         )
     }
 
-    /// Begin an SMT search whose fresh rule variables are numbered strictly above the supplied
-    /// arbitrary-precision decimal base. This is the META-LEVEL entry point; object commands retain
-    /// Maude's default base of zero through [`Self::smt_search`].
+    /// Begin an SMT search whose fresh rule variables start strictly above an arbitrary-precision
+    /// decimal base. Object-level commands use zero through [`Self::smt_search`].
     #[allow(clippy::too_many_arguments)]
     pub fn smt_search_with_fresh_base(
         &mut self,
@@ -7162,9 +6771,8 @@ impl Engine {
         self.rt.add_rewrites(rewrites);
     }
 
-    /// Count one rule application (the search successor `succ` was just produced) and reduce it to the
-    /// canonical state form. Bumping here, interleaved with the reduce, keeps each discovered state's
-    /// rewrite-count snapshot faithful to Maude's incremental accounting.
+    /// Count one rule application and reduce its successor to canonical state form. Interleaving the
+    /// increment with reduction preserves each discovered state's rewrite-count snapshot.
     pub(crate) fn reduce_successor(&mut self, succ: DagId) -> DagId {
         self.rt
             .reduce_graph_successor(&self.sig, succ, &mut NullDescent)
@@ -7185,25 +6793,18 @@ impl Engine {
             .eval_goal(&self.sig, goal, nr_vars, such_that, state)
     }
 
-    /// Begin a `frewrite` session over `initial` (Pillar A-ii): position-fair, `gas` rule applications
-    /// per position per traversal pass. Returns a resumable [`Rewriting`] (drive with [`Rewriting::run`]).
+    /// Begin a position-fair `frewrite` session over `initial`, allowing `gas` rule applications per
+    /// position per traversal pass. Returns a resumable [`Rewriting`] driven by [`Rewriting::run`].
     pub fn frewrite(&mut self, initial: DagId, gas: u64) -> Rewriting {
         let root = self.root(initial);
         Rewriting::new_position_fair(root, initial, gas)
     }
 
-    /// One position-fair traversal pass of `node` (Pillar A-ii): post-order (leaves first, left to
-    /// right — a *clean*, well-defined order), giving
-    /// each **non-frozen** position up to `gas` rule applications with an equational reduce between each.
-    /// `remaining` bounds the rewrites across the whole run (`None` = unbounded); `progress` records
-    /// whether any rule fired (the pass loop repeats while it does). Faithful to Maude's `fairTraversal`
-    /// substance — gas-bounded position fairness, reduce-between, frozen-skipping — without porting its
-    /// exact redex-stack discipline (the conceded clean-order divergence affects only the intermediate
-    /// term of a bounded `frewrite [n]`).
+    /// Run one position-fair traversal pass in post-order, left to right. Each non-frozen position gets
+    /// up to `gas` rule applications, with equational reduction between applications. `remaining` bounds
+    /// rewrites across the run; `progress` records whether another pass is needed.
     ///
-    /// Recurses on subject depth; `frewrite` is used over (shallow) configuration/object terms, and the
-    /// equational reductions it calls are themselves iterative — a deep-term explicit stack is a
-    /// follow-up if a pathologically deep rule structure ever appears.
+    /// The deterministic traversal order may affect the intermediate result of a bounded `frewrite`.
     pub(crate) fn frewrite_pass(
         &mut self,
         node: DagId,
@@ -7234,14 +6835,13 @@ impl Engine {
         } else {
             node
         };
-        // 2. A rewritten child can enable an equation here (Maude's `ascend` reduce of a stale parent);
-        //    reduce the rebuilt node to canonical form before trying rules at it. (`frozen` blocks rules,
-        //    not equations, so reducing a frozen child's value is correct.)
+        // 2. A rewritten child may enable an equation here. Reduce the rebuilt parent before trying
+        //    rules; frozen positions block rules, not equational reduction.
         if changed {
             node = self.reduce(node);
         }
-        // 3. Apply up to `gas` rules at this node, reducing between each (Maude's `doRewriting` gas loop).
-        //    A `counter` redex fires here too (like a rule), advancing the counter.
+        // 3. Apply up to `gas` rules at this node, reducing between applications. Counter redexes use
+        //    the same budget and advance the counter.
         let mut g = gas;
         while g > 0 && *remaining != Some(0) {
             let fired = match self.rt.try_counter(&self.sig, node) {
@@ -7263,47 +6863,18 @@ impl Engine {
         node
     }
 
-    /// `erewrite` entry (Pillar 2.5-B): object-message-fair rewriting of a configuration. Default `gas`
-    /// is 1 (`erewrite.cc:56`). Returns a resumable [`Rewriting`] session, like [`frewrite`](Self::frewrite).
+    /// Begin object-message-fair rewriting of a configuration. `gas` controls deliveries per pass.
     pub fn erewrite(&mut self, initial: DagId, gas: u64) -> crate::rewrite::Rewriting {
         let root = self.root(initial);
         crate::rewrite::Rewriting::new_object_message_fair(root, initial, gas)
     }
 
-    /// Whether `id` is a `config`-tagged ACU node (the object-message configuration soup) — the trigger
-    /// for the [`erewrite_pass`](Self::erewrite_pass) scheduler. Mirrors Maude dispatching the
-    /// object-message machinery on `ConfigSymbol` (an ACU op carrying the `config` attribute).
+    /// Whether `id` is a `config`-tagged ACU node, which selects the object-message scheduler.
     pub(crate) fn is_config_node(&self, id: DagId) -> bool {
         let node = self.node(id);
         let symbol = self.symbol(node.symbol());
 
         matches!(node.term, NodeTerm::Acu { .. }) && symbol.oo.config
-    }
-
-    /// Complete one object-message pass without offering host-owned external targets. This preserves the
-    /// ordinary kernel/test entry point; the resumable host path drives [`ERewritePass`] directly.
-    pub(crate) fn erewrite_pass(
-        &mut self,
-        config: DagId,
-        progress: &mut bool,
-        cursors: &mut HashMap<SymbolId, u32>,
-    ) -> DagId {
-        let mut pass = self.begin_erewrite_pass(config);
-        let mut descent = NullDescent;
-        loop {
-            match self.advance_erewrite_pass(&mut pass, cursors, false, &mut descent) {
-                ERewritePassStep::Complete {
-                    term,
-                    progress: made_progress,
-                } => {
-                    *progress |= made_progress;
-                    return term;
-                }
-                ERewritePassStep::External { .. } => {
-                    unreachable!("external targets are disabled for erewrite_pass")
-                }
-            }
-        }
     }
 
     /// Partition a configuration and root all state needed to resume its delivery pass.
@@ -7494,9 +7065,8 @@ impl Engine {
         }
     }
 
-    /// Evaluate a manager request's payload while preserving its target and requester. Message arguments
-    /// are otherwise frozen while resident in a configuration; Maude evaluates these values at the
-    /// external-manager boundary (notably `upModule`/`upView`) before dispatch.
+    /// Evaluate a manager request's payload while preserving its target and requester. Configuration
+    /// arguments are otherwise frozen; the external-manager boundary evaluates these values before dispatch.
     fn reduce_external_message_payload(
         &mut self,
         message: DagId,
@@ -7545,10 +7115,8 @@ impl Engine {
         pass.awaiting_external = false;
     }
 
-    /// Pull the object named `name` out of a delivery result `r` (Maude's `retrieveObject`): the result is
-    /// a config soup (or a single element); return that object (the one whose name = arg0 matches) and the
-    /// remaining elements (newly-produced messages/objects) to fold back into the soup. If the rule
-    /// consumed the object (none with `name` survives), the object is `None` and everything is "others".
+    /// Extract the object named `name` from a delivery result. Return that object and every other
+    /// configuration element; if the rule consumed the object, return `None` and all elements as others.
     fn retrieve_object(&self, r: DagId, name: DagId) -> (Option<DagId>, Vec<DagId>) {
         let elems: Vec<(DagId, u32)> = match &self.node(r).term {
             NodeTerm::Acu { args, .. } if self.symbol(self.node(r).symbol()).oo.config => {
@@ -7588,8 +7156,7 @@ impl Engine {
         self.rt.reset_rewrites();
     }
 
-    /// Count one successful symbolic variant-narrowing step. Maude includes this counter in the
-    /// command's aggregate `rewrites:` value even though no ordinary equation was matched directly.
+    /// Count one symbolic variant-narrowing step in the command's aggregate rewrite total.
     pub(crate) fn count_variant_narrowing_step(&mut self) {
         self.rt.add_rewrites(1);
         self.rt.variant_narrowing_count += 1;
@@ -7610,9 +7177,8 @@ impl Engine {
         )
     }
 
-    /// Snapshot and restore command-visible rewrite accounting around work performed by an
-    /// intentionally isolated Maude subcontext. Narrowing `vfold` keeps its variant subsumption
-    /// searches for reuse but never transfers their counts into the parent narrowing context.
+    /// Snapshot command-visible rewrite accounting around an isolated subcontext. Narrowing `vfold`
+    /// retains its subsumption searches for reuse without transferring their counts to the parent.
     pub(crate) fn rewrite_checkpoint(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.rt.rewrite_count,
@@ -7631,14 +7197,13 @@ impl Engine {
         self.rt.narrowing_count = checkpoint.4;
     }
 
-    /// Reset the `counter` built-in (Maude's `CounterSymbol`) to 0 — call at the start of each top-level
-    /// `rewrite`/`frewrite` command so successive commands restart the count (`continue` does not reset).
+    /// Reset the `counter` built-in to zero at the start of a top-level `rewrite` or `frewrite`.
+    /// `continue` deliberately preserves it.
     pub fn reset_counter(&mut self) {
         self.rt.reset_counter();
     }
 
-    /// Reset the `erewrite` EXTERNAL-mode state (captured stream output + the reply mailbox) — call at the
-    /// start of each `erewrite` command (Pillar 2.5-C).
+    /// Clear captured external stream output and the reply mailbox before a new `erewrite` command.
     pub fn reset_external(&mut self) {
         self.rt.external_out.clear();
         self.rt.external_err.clear();
@@ -7716,8 +7281,7 @@ impl Engine {
         true
     }
 
-    /// Take the captured `stdout` writes from the last `erewrite` run (the REPL surfaces them before the
-    /// `rewrites:`/`result` lines, as Maude interleaves the side-channel writes).
+    /// Take captured `stdout` writes from the last `erewrite` run before rendering its result lines.
     pub fn take_external_out(&mut self) -> String {
         std::mem::take(&mut self.rt.external_out)
     }
@@ -7726,7 +7290,7 @@ impl Engine {
         std::mem::take(&mut self.rt.external_err)
     }
 
-    /// Set the pending `stdin` input for `getLine` (the scripted input stream; Pillar 2.5-C).
+    /// Set the pending scripted `stdin` input consumed by `getLine`.
     pub fn set_external_input(&mut self, input: String) {
         self.rt.external_in = input;
     }
@@ -7735,11 +7299,9 @@ impl Engine {
         std::mem::take(&mut self.rt.external_in)
     }
 
-    /// Handle a message addressed to a standard-stream **manager** constant (`stdout`/`stderr`/`stdin`),
-    /// Maude's `StreamManagerSymbol::handleMessage`. `name` is the message's target (arg0); `msg` the
-    /// message. A synchronous `write(self, me, str)` to `stdout`/`stderr` emits `str` and buffers a
-    /// `wrote(me, self)` reply; returns `true` if the message was a recognized manager request (consumed).
-    /// `getLine` (stdin) is reactor-async and not yet handled here (returns `false`, leaving it in the soup).
+    /// Handle a standard-stream manager request. Output writes emit text and queue `wrote(me, self)`;
+    /// `getLine` consumes scripted input and queues `gotLine(me, self, line)`. Returns whether a request
+    /// was recognized and consumed.
     fn handle_stream_message(&mut self, name: DagId, msg: DagId) -> bool {
         let Some(SpecialOp::StreamManager {
             stream,
@@ -7777,9 +7339,8 @@ impl Engine {
             }
             return true;
         }
-        // `getLine(self, me, prompt)` (stdin) → write `prompt` to stdout, read a line (incl. its `\n`; empty
-        // at EOF), reply `gotLine(me, self, line)`. Synchronous over the scripted input buffer — the true
-        // reactor (a forked reader for interactive stdin) is the `mio` phase; for piped input this is exact.
+        // `getLine(self, me, prompt)` (stdin) → write `prompt` to stdout, consume one line from the
+        // scripted input buffer, and reply `gotLine(me, self, line)`.
         if Some(msg_sym) == get_line_msg && stream == StdStream::Stdin {
             if args.len() != 3 {
                 return false;
@@ -7811,9 +7372,8 @@ impl Engine {
         self.rt.condition_depth = 0;
     }
 
-    /// Enable/disable whole-root-term reconstruction at each rewrite (Maude's `set trace whole`). Only
-    /// acts while tracing; off by default (the reconstruction allocates per rewrite). Set it alongside
-    /// [`set_trace`](Self::set_trace) when rendering with the `whole` flag on.
+    /// Enable whole-root reconstruction for each trace rewrite. This allocates per rewrite, is disabled
+    /// by default, and only acts while tracing.
     pub fn set_record_whole(&mut self, on: bool) {
         self.rt.record_whole = on;
     }
@@ -7842,12 +7402,9 @@ impl Engine {
         std::mem::take(&mut self.rt.sat_solve_stats)
     }
 
-    /// Open a construction-time structural-dedup window (C7): until [`end_dedup`](Self::end_dedup), DAG
-    /// nodes built through the `make_*`/`rebuild`/`instantiate` funnel that are structurally identical
-    /// collapse to a single shared node — so a subject like `< g(a), g(a) >` becomes one `g(a)` node,
-    /// which `reduce` then normalizes once (matching Maude's hash-consed subject DAG). The frontend wraps
-    /// the **subject build** (`build_dag`) in this; it must enclose a pure-construction span with no
-    /// reduction or GC inside, and be balanced by `end_dedup`. Idempotent for a fresh window.
+    /// Open a construction-only structural-deduplication window. Equal nodes built through the standard
+    /// construction funnel share one DAG identity. The window must not contain reduction or collection
+    /// and must be closed with [`end_dedup`](Self::end_dedup).
     pub fn begin_dedup(&mut self) {
         self.rt.begin_dedup();
     }
@@ -7857,17 +7414,9 @@ impl Engine {
         self.rt.end_dedup();
     }
 
-    /// Reduce `root` to canonical form by innermost, eager equational simplification. A node already
-    /// stamped canonical at the current epoch is returned unchanged (forwarded to its normal form), so a
-    /// *shared, already-reduced* subterm is never re-normalized. A shared subterm that is still
-    /// *reducible* is normalized **once total** when the references share a DAG node (C7 forwarding +
-    /// construction dedup); distinct (un-shared) occurrences are each normalized, as before.
-    ///
-    /// Iterative (explicit `ReduceFrame` work-stack) rather than recursive: the recursion depth of
-    /// the old `reduce`/`reduce_args` grew with *subject* depth — unbounded user data — and aborted
-    /// the process on deep terms. This is a faithful simulation: children are reduced
-    /// left-to-right before the top is rewritten, and each rewrite result is itself re-reduced, so
-    /// the sequence of redexes — and thus the rewrite count — is identical to the recursive version.
+    /// Reduce `root` to canonical form by innermost equational simplification. Canonical nodes and shared
+    /// forwarding targets are reused. An explicit frame stack avoids subject-depth recursion while
+    /// preserving left-to-right child order, top rewriting, and rewrite counts.
     #[must_use]
     pub fn reduce(&mut self, root: DagId) -> DagId {
         self.rt.reduce(&self.sig, root, &mut NullDescent)
@@ -7890,7 +7439,7 @@ impl Engine {
         self.rt.match_pattern(&self.sig, pat, subject, subst)
     }
 
-    /// Structural equality of two DAG nodes (Phase 0 has no hash-consing, so this is a deep walk).
+    /// Structural equality of two DAG nodes.
     #[must_use]
     pub fn deep_equal(&self, a: DagId, b: DagId) -> bool {
         self.rt.deep_equal(a, b)
@@ -7913,8 +7462,8 @@ impl Engine {
         self.instantiate(term, &subst)
     }
     /// Instantiate a rule RHS under explicit bindings and splice it through a detached match residue.
-    /// This is the post-condition counterpart of [`Solutions::rewrite_result`]: callers may release the
-    /// solution stream, extend its bindings while solving conditions, then construct the same result.
+    /// Callers can release the solution stream, extend its bindings while solving conditions, and then
+    /// reconstruct the result from the captured context.
     pub fn instantiate_rewrite_result(
         &mut self,
         rhs: &Term,
@@ -7926,15 +7475,9 @@ impl Engine {
         context.build_result(runtime, signature, built)
     }
 
-    /// Begin enumerating *every* match of `pattern` (with `nr_vars` distinct variables, indexed
-    /// `0..nr_vars`) against `subject` — the public face of the A3 matcher seam's multi-solution
-    /// [`Subproblem`] stream, which [`match_pattern`](Self::match_pattern) (a single yes/no) cannot
-    /// reach. Drives the `match`/`xmatch` commands and, later, the REPL.
-    ///
-    /// `extension` allows the pattern to match a *sub-part* of the subject and leave a residue (the
-    /// `xmatch` command, and how AC/AU equations rewrite at the top); `false` requires the whole
-    /// subject to be consumed (the plain `match` command). Returns a resumable [`Solutions`] — call
-    /// [`Solutions::advance`] to step, then read [`Solutions::binding`] / [`Solutions::matched_portion`].
+    /// Begin enumerating every match of `pattern` against `subject`. `extension` permits a subterm match
+    /// with a residual context; otherwise the whole subject must match. The returned [`Solutions`]
+    /// exposes bindings, matched portions, and reconstruction contexts for `match` and `xmatch`.
     pub fn match_solutions(
         &mut self,
         pattern: Term,
@@ -8008,12 +7551,12 @@ impl Engine {
     }
 }
 
-/// A resumable stream of the matches of `pattern <=? subject`, wrapping the A3 matcher seam's
-/// [`Subproblem`] so callers outside the kernel can enumerate solutions without touching the
+/// A resumable stream of the matches of `pattern <=? subject`, wrapping the matcher seam's
+/// `Subproblem` so callers outside the kernel can enumerate solutions without touching the
 /// crate-private matcher types. Created by [`Engine::match_solutions`].
 ///
 /// Holds `&mut Engine` because advancing a multi-solution (ACU/AU) match allocates fresh
-/// binding/residue nodes between solutions (the F-3/F-4 widening) — the same reason the reduce driver
+/// binding/residue nodes between solutions while widening variable sorts — the same reason the reduce driver
 /// drives `Subproblem::next` with `&mut Runtime`.
 pub struct Solutions<'e> {
     engine: &'e mut Engine,
@@ -8083,11 +7626,9 @@ impl Solutions<'_> {
         subproblem.build_result(runtime, sig, built)
     }
 
-    /// The matched portion rendered for the `xmatch` **command** display — mirroring Maude's
-    /// `Mixfix/match.cc`: `None` when the match carried no extension info (a free-theory subject, or a
-    /// non-extension match), so no `Matched portion` line is printed; `Some(Whole)` when the whole
-    /// subject was matched (`(whole)`); otherwise `Some(Portion(dag))` with the built sub-part. Valid
-    /// only after a successful [`advance`](Self::advance).
+    /// Matched-portion data for `xmatch` command display. `None` means no extension information and
+    /// suppresses the display line; `Some(Whole)` prints `(whole)`; `Some(Portion(dag))` carries the
+    /// matched sub-part. Valid only after a successful [`advance`](Self::advance).
     pub fn matched_portion_display(&mut self) -> Option<MatchedPortion> {
         match self.subproblem.as_ref()?.matched_status()? {
             true => Some(MatchedPortion::Whole),
@@ -8101,7 +7642,7 @@ impl Solutions<'_> {
 /// The matched portion of an `xmatch` command solution (see [`Solutions::matched_portion_display`]):
 /// either the whole subject (`(whole)`) or a genuine sub-portion carrying its built DAG.
 pub enum MatchedPortion {
-    /// The extension match covered the whole subject — Maude prints `(whole)`.
+    /// The extension match covered the whole subject and renders as `(whole)`.
     Whole,
     /// A proper sub-portion of the subject; the caller renders this DAG.
     Portion(DagId),
@@ -8180,7 +7721,7 @@ mod tests {
         assert_eq!(e.variable_symbol(nat), vs_nat, "same sort → cached symbol");
         assert_ne!(vs_nat, vs_nz);
 
-        // Identity: name code, not slot index (Maude VariableDagNode::equal is symbol + id).
+        // Identity uses the variable's name code, not its substitution slot.
         let x0 = e.make_var(nat, 7, 0);
         let x1 = e.make_var(nat, 7, 1);
         let y = e.make_var(nat, 8, 2);
@@ -8208,8 +7749,8 @@ mod tests {
         );
     }
 
-    /// `UnificationProblem` mirrors Maude's `Term::normalize(true)` before `indexVariables`: the
-    /// temporary source slots must not determine the canonical order of same-sort variables.
+    /// Pre-index unification normalization prevents temporary source slots from determining the
+    /// canonical order of same-sort variables.
     #[test]
     fn unify_normalization_orders_variables_by_name_before_reindex() {
         let mut e = Engine::new();
@@ -8234,10 +7775,9 @@ mod tests {
         );
     }
 
-    /// The public [`Engine::match_solutions`] facade drives the ACU matcher seam end-to-end:
-    /// `X + Y <=? a + b + c` enumerates the binary's six solutions (compared as a set — exact
-    /// Diophantine *order* is a deferred B1 follow-up), and `xmatch a + b <=? a + b + c` yields the one
-    /// extension match whose matched portion is `a + b`.
+    /// The public matcher facade enumerates all six ACU bindings for `X + Y <=? a + b + c`; the test
+    /// compares them as a set because enumeration order is not part of this API's contract. Extension
+    /// matching also reports the matched `a + b` portion.
     #[test]
     fn match_solutions_enumerates_acu() {
         let mut e = Engine::new();
@@ -8298,7 +7838,7 @@ mod tests {
 
     /// Three constants threaded by rules `a => b => c => d`. `rewrite` drives them to the normal form
     /// `d` in 3 rule applications, while `reduce` (which consults only the equation table) leaves `a`
-    /// untouched — the structural "equations don't rewrite" guarantee (Pillar A-i).
+    /// untouched — the structural guarantee that equations do not perform rule rewriting.
     fn chain_engine() -> (Engine, SymbolId, SymbolId, SymbolId, SymbolId) {
         let mut e = Engine::new();
         let s = e.add_sort("S");
@@ -8401,9 +7941,7 @@ mod tests {
         assert_eq!(e.sort_of(sum), nat);
     }
 
-    /// B2.1 least sort under multi-declaration overloading (== reference binary,
-    /// `conformance/overload.maude` OVERLOAD-SORT): `_+_` is overloaded `Nat Nat -> Nat` *and*
-    /// `NzNat NzNat -> NzNat`; the least sort of an application is resolved across both declarations.
+    /// Resolve least sorts across every declaration of an overloaded operator.
     #[test]
     fn overloaded_operator_least_sort() {
         let mut e = Engine::new();
@@ -8439,9 +7977,7 @@ mod tests {
         assert_eq!(e.sort_of(zero_plus_zero), nat, "0 + 0 : Nat");
     }
 
-    /// B2.1 (== reference binary, OVERLOAD-RED): overloading + equations — the result's least sort and
-    /// the rewrite count co-vary. `s 0 + s 0` → `s s 0 : NzNat` (2 rewrites); `0 + 0` → `0 : Zero`
-    /// (1 rewrite, the result re-sorts *down* from Nat to Zero).
+    /// Overloading and equations make the result's least sort and rewrite count co-vary.
     #[test]
     fn overloaded_operator_reduce_and_resort() {
         let mut e = Engine::new();
@@ -8490,9 +8026,7 @@ mod tests {
         assert_eq!(e.sort_of(r2), zero, "result 0 : Zero (re-sorted down)");
     }
 
-    /// B2.1 (== reference binary, OVERLOAD-ERR): no applicable declaration → the kind's error sort
-    /// (and the ill-sorted term does not rewrite). Only `_+_ : NzNat NzNat -> NzNat` is declared, so
-    /// `0 + 0` (Zero arguments) has no applicable declaration.
+    /// With no applicable declaration, an overloaded application has the kind's error sort and does not rewrite.
     #[test]
     fn overloaded_operator_no_applicable_decl_is_error_sort() {
         let mut e = Engine::new();
@@ -8553,9 +8087,8 @@ mod tests {
         assert_ne!(config_join, attr_join);
     }
 
-    /// B2.1 (== reference binary, OVERLOAD-PREREG): a non-preregular operator (`f : A -> A` and
-    /// `f : A -> B` with A, B incomparable) — Maude warns and assigns the least sort by the **earliest
-    /// declaration**. We reproduce the tie-break (the warning itself is deferred): `f(c) : A`.
+    /// A non-preregular operator with incomparable result sorts resolves to its earliest declaration.
+    /// Diagnostic emission is outside this kernel API.
     #[test]
     fn non_preregular_overload_breaks_toward_earliest_declaration() {
         let mut e = Engine::new();
@@ -8578,12 +8111,8 @@ mod tests {
         );
     }
 
-    /// B2.1 / audit-F-B regression (== reference binary, `conformance/acu-overload.maude` ACU-OVERLOAD):
-    /// an **asymmetric** overloaded declaration on a **commutative** operator must give an
-    /// argument-order-independent least sort. `_+_ : NzNat Nat -> NzNat [assoc comm]` overloaded
-    /// `Nat Nat -> Nat`: `z + nz : NzNat` whichever element the canonical multiset order puts first
-    /// (Maude's `commutativeSortCompletion` adds the swapped `Nat NzNat -> NzNat` declaration). The
-    /// pre-fix positional fold gave `Nat` whenever the Zero element sorted first.
+    /// An asymmetric commutative overload must have an argument-order-independent least sort. Sort
+    /// completion adds the swapped declaration so canonical argument order cannot select a broader range.
     #[test]
     fn acu_asymmetric_overload_least_sort_is_commutative() {
         let mut e = Engine::new();
@@ -8623,9 +8152,7 @@ mod tests {
         );
     }
 
-    /// B1/B2.1 / audit-F-B regression (== reference binary, CUI-OVERLOAD): the same order-independence
-    /// for a **commutative non-associative** operator. `make_cui` orders its pair canonically (Zero
-    /// before NzNat), so `g(z, nz) : NzNat` needs the swapped `Nat NzNat -> NzNat` declaration too.
+    /// The same overload-order independence applies to commutative non-associative operators.
     #[test]
     fn cui_asymmetric_overload_least_sort_is_commutative() {
         let mut e = Engine::new();
@@ -8654,11 +8181,8 @@ mod tests {
         assert_eq!(gg(&mut e, z, z), "Nat", "g(z, z) : Nat");
     }
 
-    /// B2.2 membership axioms (== reference binary, `conformance/membership.maude` MB-PAIR): a
-    /// non-linear `mb < N, N > : SymPair` lowers a pair's least sort, and **each membership application
-    /// counts as a rewrite** (Maude's accounting). The lowered sort then drives which equations fire:
-    /// `eq f(P) = z` with `P : SymPair` reduces `f(< z, z >)` but not `f(< z, s z >)`. Memberships are
-    /// applied at construction, so each case resets the counter *before* building its query term.
+    /// A non-linear membership lowers a pair's least sort and counts as a rewrite. The refined sort then
+    /// determines which equations apply.
     #[test]
     fn membership_lowers_sort_and_counts_as_rewrite() {
         let mut e = Engine::new();
@@ -8682,7 +8206,7 @@ mod tests {
             nr_vars: 1,
         });
 
-        // < z, z > : SymPair — one membership application. C1: construction gives the *base* sort
+        // < z, z > : SymPair — one membership application. Construction gives the *base* sort
         // (Pair); the membership refines it to SymPair lazily, at the reduce normal-form point.
         e.reset_rewrites();
         let (z0, z1) = (e.make_const(z), e.make_const(z));
@@ -8735,12 +8259,8 @@ mod tests {
         );
     }
 
-    /// B3 (== reference binary, conformance/audit/B3-mb-extension.maude): an AC membership fires
-    /// **through extension** — on a sub-multiset of the subject, not only the whole node. `mb (a | a) :
-    /// Special` fires once on `a | a` (whole match) *and* once on `a | a | a` (Maude reduces it as the
-    /// right-associated `a | (a | a)`, so the prefix `a | a` reaches a normal-form point and is
-    /// constrained). The count moves; the result term and its printed sort do not (`a | a | a` stays E
-    /// because refining the transient prefix to Special is discarded when the whole re-flattens).
+    /// An AC membership fires through extension on a sub-multiset, not only on the whole node. Refining a
+    /// transient prefix affects the rewrite count but can disappear when the parent is flattened again.
     #[test]
     fn ac_membership_fires_through_extension() {
         let mut e = Engine::new();
@@ -8784,10 +8304,8 @@ mod tests {
         );
     }
 
-    /// B3, conditional variant (CMB-EXT): `cmb (a | a) : Special if a = a` fires through extension too,
-    /// and the condition's (zero-cost, `a` already reduced) evaluation is accounted. `a | a | h(h(a))`
-    /// reduces `h(h(a))` to `a` in 2 rewrites (`eq h(a) = a` twice), then the cmb fires once on the
-    /// resulting `a | a | a` prefix — 3 total, matching the oracle (tnk was 2 before the extension seam).
+    /// Conditional AC memberships also fire through extension; condition reductions remain included in
+    /// the rewrite count.
     #[test]
     fn ac_conditional_membership_fires_through_extension() {
         let mut e = Engine::new();
@@ -8835,11 +8353,8 @@ mod tests {
         assert!(e.deep_equal(r, three), "result is a | a | a");
     }
 
-    /// B3 GC safety: the extension fold builds transient prefix nodes and evaluates `cmb` conditions
-    /// (which re-enter `reduce` and can hit a safe-point GC) off the main reduce stack. With GC forced
-    /// on every allocation, the subject and its element children must stay rooted through the whole fold
-    /// (the `id` push into the F-2 `protected` set) — else the final whole-node constrain reads freed
-    /// nodes. Same scenario as the conditional-extension test, but under `set_gc_interval(Some(1))`.
+    /// Extension folding builds transient prefix nodes and evaluates membership conditions off the main
+    /// reduction stack. Forced collection verifies that the subject and its children stay rooted.
     #[test]
     fn ac_conditional_membership_extension_survives_gc() {
         let mut e = Engine::new();
@@ -8896,9 +8411,7 @@ mod tests {
         assert!(e.deep_equal(r, five), "result is a | a | a | a | a");
     }
 
-    /// B2.2 (== reference binary, MB-CHAIN): two memberships lower a sort two levels. The constrain
-    /// pass is **smallest-target-sort first**, so `g(g(a))` drops straight to C (one application on the
-    /// outer node), giving 2 applications total (inner `g(a) : B`, outer `g(g(a)) : C`) — not 3.
+    /// Chained memberships lower sorts in smallest-target-first order.
     #[test]
     fn membership_chain_lowers_two_levels() {
         let mut e = Engine::new();
@@ -8927,7 +8440,7 @@ mod tests {
         let _ = e.reduce(a0);
         assert_eq!(e.rewrites(), 0);
 
-        // C1: construction gives the base sort (A); the memberships refine it lazily at reduce.
+        // Construction gives the base sort (A); the memberships refine it lazily at reduce.
         e.reset_rewrites();
         let a1 = e.make_const(a);
         let ga = e.make_free(g, vec![a1]);
@@ -9099,9 +8612,8 @@ mod tests {
         assert!(e.deep_equal(result, two));
     }
 
-    /// `ceq max(M,N)=M if M<=N=ff`. The condition `M<=N` itself reduces (re-entrant), its rewrites
-    /// count, and a failed first condition backtracks to the second equation — re-reducing the
-    /// condition (Maude caches nothing): `max(2,1)` is 5 rewrites, not 3.
+    /// In `ceq max(M,N)=M if M<=N=ff`, condition reduction contributes to the count. Failure of the
+    /// first equation retries the condition for the second, so `max(2,1)` takes five rewrites.
     #[test]
     fn conditional_equation_with_equality_condition() {
         let mut e = Engine::new();
@@ -9187,7 +8699,7 @@ mod tests {
         assert_eq!(decode(&e, r3, z, s), 0, "max(0,0) = 0");
     }
 
-    /// B2.3a conditional equation with a sort-test condition (== reference binary, CEQ-SORT):
+    /// A conditional equation with a sort-test condition fires only for a compatible least sort.
     /// `ceq nz?(N) = s z if N : NzNat` fires only when the argument's least sort is `<= NzNat`.
     #[test]
     fn conditional_equation_with_sort_test_condition() {
@@ -9230,10 +8742,8 @@ mod tests {
         assert_eq!(e.node(r2).symbol(), nzq, "nz?(z) is its own normal form");
     }
 
-    /// B2.3a/F-2: a conditional equation whose condition reduces re-entrantly stays correct with
-    /// safe-point GC enabled. The nested reduce keeps GC enabled while `condition_holds` protects the
-    /// outer frame/bindings/redex and the equality arm pins its left result across right-side reduction.
-    /// Result and rewrite count must be identical to the GC-off run.
+    /// Re-entrant condition reduction remains correct under safe-point collection: the outer frame,
+    /// bindings, redex, and equality result stay rooted.
     #[test]
     fn conditional_reduce_is_stable_under_safe_point_gc() {
         fn run(interval: Option<u64>) -> (SymbolId, u64) {
@@ -9279,12 +8789,11 @@ mod tests {
         );
         assert_eq!(
             on, off,
-            "conditional reduce identical with safe-point GC on — F-2 mitigation holds"
+            "conditional reduce is identical with safe-point GC enabled"
         );
     }
 
-    /// B2.3b `owise` equations (== reference binary, `conformance/owise.maude` OWISE-EQ): an `[owise]`
-    /// equation fires only when no non-owise equation of the symbol matches.
+    /// An `[owise]` equation fires only when no ordinary equation for the symbol applies.
     #[test]
     fn owise_equation_applies_when_no_normal_equation_matches() {
         let mut e = Engine::new();
@@ -9329,9 +8838,8 @@ mod tests {
         assert_eq!(e.node(r1).symbol(), ff, "iszero(s z) = ff via owise");
     }
 
-    /// B2.3b (== reference binary, OWISE-COND): `owise` applies even when a non-owise *conditional*
-    /// equation matched structurally but its condition failed. `ceq clamp(N)=z if N<=s z=tt` /
-    /// `eq clamp(N)=s z [owise]`: clamp(0)=0 (2 rw), clamp(1)=0 (3 rw), clamp(2)=s z via owise (3 rw).
+    /// `[owise]` still applies when an ordinary conditional equation matches structurally but its
+    /// condition fails.
     #[test]
     fn owise_applies_when_conditional_equation_condition_fails() {
         let mut e = Engine::new();
@@ -9388,10 +8896,8 @@ mod tests {
         }
     }
 
-    /// B2.3c conditional membership (== reference binary, `conformance/cmb.maude`):
-    /// `cmb < M, N > : GoodPair if M <= N = tt` lowers a pair's sort only when its condition holds —
-    /// and the condition's reductions count (`<z,sz>` is 2 rewrites: condition 1 + membership 1; the
-    /// failing `<sz,z>` is 1, the condition reduce alone).
+    /// A conditional membership lowers a pair's sort only when its condition holds; condition reductions
+    /// contribute to the rewrite count.
     #[test]
     fn conditional_membership_lowers_sort_when_condition_holds() {
         let mut e = Engine::new();
@@ -9435,9 +8941,7 @@ mod tests {
             }],
         );
 
-        // Build < a, b >, reduce it, and read back its least sort + rewrite count. C1: the cmb now fires
-        // at the reduce normal-form point (not construction), so we reduce before reading — the count
-        // (condition reductions + the cmb application) is the same, just relocated from build to reduce.
+        // Build and reduce `< a, b >` before reading its least sort and rewrite count.
         let build = |e: &mut Engine, a: u32, b: u32| -> (SortId, u64) {
             e.reset_rewrites();
             let na = numeral(e, z, s, a);
@@ -9468,10 +8972,8 @@ mod tests {
         );
     }
 
-    /// B2.3d matching condition `:=` (== reference binary, `conformance/match-cond.maude` MATCH-COND):
-    /// `ceq pred(N) = M if s M := N` binds the fresh `M` by matching the pattern `s M` against `N`. The
-    /// `:=` match itself is not a rewrite (only the rhs application is); a non-matching subject (`z`)
-    /// fails the condition.
+    /// A `:=` condition binds fresh variables by matching its pattern against the reduced subject; the
+    /// match itself is not counted as a rewrite.
     #[test]
     fn matching_condition_binds_fresh_variable() {
         let mut e = Engine::new();
@@ -9514,9 +9016,7 @@ mod tests {
         assert_eq!(e.node(r0).symbol(), pred, "pred(z) is its own normal form");
     }
 
-    /// B2.3d (== reference binary, MATCH-COND2): the matching subject itself reduces before the pattern
-    /// is matched. `ceq f(N) = M if s M := g(N)` with `eq g(N) = s s N`: f(0)=1 and f(1)=2, each 2
-    /// rewrites (g reduces once, then f→M).
+    /// A `:=` condition reduces its subject before matching.
     #[test]
     fn matching_condition_reduces_subject_first() {
         let mut e = Engine::new();
@@ -9552,8 +9052,7 @@ mod tests {
         }
     }
 
-    /// B2.4 `[ctor]` (== reference binary): a constructor declaration is recorded but does **not**
-    /// affect functional reduction — `s 0 + s s 0` is `s s s 0` in 3 rewrites either way.
+    /// A `[ctor]` declaration is recorded but does not affect functional reduction.
     #[test]
     fn ctor_is_recorded_and_inert_for_reduction() {
         let mut e = Engine::new();
@@ -9593,10 +9092,9 @@ mod tests {
         assert_eq!(decode(&e, r, z, s), 3, "s 0 + s s 0 = s s s 0");
     }
 
-    /// B2.4 evaluation strategy (== reference binary, `conformance/strat.maude`): `if_then_else_fi` with
-    /// `strat (1 0)` reduces the condition then the top, leaving the unused branch unreduced. The chosen
-    /// branch *is* reduced (it becomes the result), so `if tt then big else z` costs the `big` reduction
-    /// while `if tt then z else big` does not.
+    /// With `strat (1 0)`, `if_then_else_fi` reduces the condition and then the selected top while
+    /// leaving the unused branch unreduced. The chosen branch is reduced because it becomes the
+    /// result.
     #[test]
     fn evaluation_strategy_is_lazy() {
         let mut e = Engine::new();
@@ -9682,7 +9180,7 @@ mod tests {
         let _ = e.make_free(f, Vec::new());
     }
 
-    /// B1.1: an `assoc comm` operator classifies as the ACU theory and carries its axioms +
+    /// An `assoc comm` operator classifies as the ACU theory and carries its axioms +
     /// identity; a plain operator stays Free. (The free hot path must be untouched by AC ops.)
     #[test]
     fn ac_operator_is_classified_acu() {
@@ -9722,7 +9220,7 @@ mod tests {
         (e, s, a, b, c, plus)
     }
 
-    /// B1.2: ACU construction is canonical modulo commutativity and associativity — `a+b == b+a`,
+    /// ACU construction is canonical modulo commutativity and associativity — `a+b == b+a`,
     /// and `(a+b)+c == a+(b+c) == a+b+c` (flattened to a 3-element multiset).
     #[test]
     fn acu_canonical_modulo_ac() {
@@ -9759,9 +9257,8 @@ mod tests {
             let (x, y, z) = (e.make_const(a), e.make_const(b), e.make_const(c));
             e.make_ac(plus, vec![x, y, z])
         };
-        // Nested same-symbol arguments splice LAZILY (Maude's on-demand normalization): the
-        // unreduced nested forms stay nested at construction, and canonical equality holds at
-        // the reduce normal-form point (a 0-rewrite normalization here — no equations).
+        // Nested same-symbol arguments splice lazily: unreduced nodes remain nested at construction,
+        // then become canonically equal at the zero-rewrite normal-form point.
         let abc_left = e.reduce(abc_left);
         let abc_right = e.reduce(abc_right);
         let abc_flat = e.reduce(abc_flat);
@@ -9774,7 +9271,7 @@ mod tests {
         );
     }
 
-    /// B1.2: identity (`id:`) elements vanish and the multiset collapses — `a+e == a`, `e+e == e`,
+    /// Identity (`id:`) elements vanish and the multiset collapses — `a+e == a`, `e+e == e`,
     /// `a+e+b == a+b`.
     #[test]
     fn acu_identity_collapses() {
@@ -9809,7 +9306,7 @@ mod tests {
         );
     }
 
-    /// B1.2: equal elements merge into a multiplicity (`a+a` keeps two children via one `(a,2)` pair),
+    /// Equal elements merge into a multiplicity (`a+a` keeps two children via one `(a,2)` pair),
     /// and a lone element never gets wrapped (`make_ac` of one element is that element).
     #[test]
     fn acu_merges_multiplicity_and_never_wraps_singleton() {
@@ -9830,7 +9327,7 @@ mod tests {
         assert_eq!(wrapped, lone, "make_ac of a single element collapses to it");
     }
 
-    /// B1.2: GC traces an ACU DAG through the visitor (reachable kept, rest reclaimed) and `deep_equal`
+    /// GC traces an ACU DAG through the visitor (reachable kept, rest reclaimed) and `deep_equal`
     /// is modulo-AC across *distinct* element ids.
     #[test]
     fn acu_gc_and_modulo_equality() {
@@ -9865,9 +9362,8 @@ mod tests {
         e.make_free(s, vec![z])
     }
 
-    /// B1.5 reduce lock (== reference binary): `op _+_ [assoc comm]`, `eq X + 0 = X`;
-    /// `red s 0 + 0 + s 0 + s 0` → `s 0 + s 0 + s 0` in **1** rewrite (X absorbs the rest; the ground
-    /// `0` is consumed and spliced away as residue).
+    /// Under `[assoc comm]`, `eq X + 0 = X` rewrites `s 0 + 0 + s 0 + s 0` once to
+    /// `s 0 + s 0 + s 0`: `X` absorbs the remainder and the matched ground `0` is removed.
     #[test]
     fn ac_reduce_ground_consumed_with_extension() {
         let mut e = Engine::new();
@@ -9898,7 +9394,7 @@ mod tests {
         );
     }
 
-    /// B1.5 reduce lock: ground AC pattern needing a residue splice — `eq a + a = a` on `a + a + b`
+    /// AC reduce lock: ground AC pattern needing a residue splice — `eq a + a = a` on `a + a + b`
     /// → `a + b` in **1** rewrite (the matched `{a,a}` is replaced by `a`, residue `b` spliced).
     #[test]
     fn ac_reduce_ground_pattern_residue_splice() {
@@ -9917,9 +9413,8 @@ mod tests {
         assert_eq!(kids, vec![a, b], "result is a + b");
     }
 
-    /// B1.5 reduce lock (the subtle one — non-linear AC variable + identity): `op _;_ [assoc comm
-    /// id: empty]`, `eq N ; N = N`; `red 0 ; s0 ; 0 ; s0` → `0 ; s0` in **2** rewrites. Reproducing
-    /// the count needs minimal-first solution order + skipping the empty (no-op) binding.
+    /// Non-linear AC matching with identity: `eq N ; N = N` reduces `0 ; s0 ; 0 ; s0` to `0 ; s0`
+    /// in two rewrites. This requires minimal-first solutions and skipping the empty no-op binding.
     #[test]
     fn ac_reduce_set_idempotency_two_rewrites() {
         let mut e = Engine::new();
@@ -9934,7 +9429,7 @@ mod tests {
             rhs: Term::var(0, nat),
             nr_vars: 1,
         });
-        // Build inside the construction-dedup window, as every real command subject is (C7):
+        // Build inside the construction-dedup window, as every real command subject is:
         // the repeated `0`/`s 0` subterms become ONE shared node each, so the ACU multiset merges
         // by node identity exactly as the frontend-built subject would.
         e.begin_dedup();
@@ -9943,18 +9438,13 @@ mod tests {
         let subject = e.make_ac(set, vec![z0, s0a, z1, s0b]); // 0 ; s0 ; 0 ; s0
         e.end_dedup();
         let r = e.reduce(subject);
-        assert_eq!(
-            e.rewrites(),
-            2,
-            "two duplicate-removals (== reference binary)"
-        );
+        assert_eq!(e.rewrites(), 2, "two duplicate-removal rewrites");
         assert_eq!(e.node(r).children().count(), 2, "result is 0 ; s0");
     }
 
-    /// Direct, already-flattened AC node: the specialized non-linear automaton binds the maximal
-    /// quotient first, so `eq X + X = X` reduces flat `a+a+a+a` to `a` in **2** rewrites. Parsed
-    /// source still reports 3 because its three binary construction nodes reduce bottom-up; that
-    /// observable command contract is locked by `conformance/acu-reduce.maude`.
+    /// For a direct flattened AC node, the specialized non-linear matcher binds the maximal quotient:
+    /// `eq X + X = X` reduces `a+a+a+a` to `a` in two rewrites. A binary source construction takes
+    /// three because its nested nodes reduce bottom-up.
     #[test]
     fn ac_reduce_flat_nonlinear_idempotency_two_rewrites() {
         let (mut e, s, a, _b, _c, plus) = ac_ctx();
@@ -9982,10 +9472,8 @@ mod tests {
         assert_eq!(e.node(r).symbol(), a, "result collapses to the constant a");
     }
 
-    /// B1.5 reduce lock (lone-variable collector strategy, == reference binary): `eq a + X = b` on
-    /// `a + c + c` → `b` in 1 rewrite. X absorbs `c + c` (a whole match), NOT a minimal binding that
-    /// would leave `b + c` — the system is non-confluent under extension and Maude takes the collector
-    /// match. (Regression for the latent bug where a lone linear variable bound minimally.)
+    /// For `eq a + X = b` on `a + c + c`, the collector binding assigns all of `c + c` to `X`, so
+    /// the result is `b` in one rewrite rather than `b + c` from a minimal binding.
     #[test]
     fn ac_reduce_lone_variable_absorbs() {
         let (mut e, s, a, b, c, plus) = ac_ctx();
@@ -10005,10 +9493,7 @@ mod tests {
         );
     }
 
-    /// C8: a theory-rooted (AC) subterm under a *free* operator is matched via the cross-theory
-    /// `Sequence` arm — the free skeleton (`f(_)`) binds, the AC alien `a + b` is matched recursively.
-    /// `eq f(a + b) = cc` fires on `f(b + a)` (the `+` canonicalizes). Was a loud guard ("theory-rooted
-    /// … not yet supported"); == the reference binary (`cc`, 1 rewrite).
+    /// A free skeleton can recursively match a structured AC child modulo its theory.
     #[test]
     fn free_pattern_over_theory_subterm_matches() {
         let (mut e, s, a, b, _c, plus) = ac_ctx();
@@ -10031,9 +9516,7 @@ mod tests {
         assert_eq!(e.node(r).symbol(), c, "result is cc");
     }
 
-    /// The guard's boundary: a *variable* over a theory subject is fine (it binds the whole AC node),
-    /// so `eq f(X) = g(X)` compiles and fires on `f(a + b)`. Only a *structured* theory sub-pattern is
-    /// rejected — not a variable that happens to bind a theory term.
+    /// A variable beneath a free symbol can bind an entire theory term.
     #[test]
     fn free_pattern_with_variable_over_theory_subject_is_allowed() {
         let (mut e, s, a, b, _c, plus) = ac_ctx();
@@ -10052,10 +9535,8 @@ mod tests {
         assert_eq!(e.node(r).symbol(), g, "result is g(a + b)");
     }
 
-    /// C8: a theory-rooted subterm under a *theory* operator (an ACU `+` term as an argument of the ACU
-    /// `;`) is matched as an **alien** — compiled to its own automaton and matched recursively — so
-    /// `eq (a + b) ; c = d` fires on `(a + b) ; c` (and, modulo commutativity, on `(b + a) ; c`). Was a
-    /// loud guard ("theory-rooted ground subterm … not yet supported"); == the reference binary (`d`, 1).
+    /// A theory-rooted child under another theory operator is compiled as an alien automaton and matched
+    /// recursively modulo its own theory.
     #[test]
     fn theory_subterm_under_theory_operator_matches() {
         let mut e = Engine::new();
@@ -10103,9 +9584,8 @@ mod tests {
         (e, s, a, b, c, d, cat)
     }
 
-    /// B1 AU reduce lock (extension on both ends, == reference binary): `op __ [assoc]`, `eq b c = a`;
-    /// `red d b c d` → `d a d` in 1 rewrite (the contiguous `b c` is matched, prefix `d` and suffix
-    /// `d` are spliced back around the rhs — order preserved).
+    /// Under `[assoc]`, `eq b c = a` rewrites `d b c d` once to `d a d`; extension matching
+    /// preserves and restores both the prefix and suffix.
     #[test]
     fn au_reduce_ground_pattern_extension_both_ends() {
         let (mut e, _s, a, b, c, d, cat) = au_ctx();
@@ -10127,8 +9607,8 @@ mod tests {
         assert_eq!(kids, vec![d, a, d], "result is the ordered sequence d a d");
     }
 
-    /// B1 AU reduce lock (lone-variable collector, == reference binary): `eq a X = b` on `a c c` → `b`
-    /// in 1 rewrite (X absorbs the ordered tail `c c`; not `b c` from a minimal binding).
+    /// For `eq a X = b` on `a c c`, the collector binding assigns the ordered tail `c c` to `X`, so
+    /// the result is `b` in one rewrite.
     #[test]
     fn au_reduce_lone_variable_absorbs() {
         let (mut e, s, a, b, c, _d, cat) = au_ctx();
@@ -10144,8 +9624,8 @@ mod tests {
         assert_eq!(e.node(r).symbol(), b, "result is b (X absorbed c c)");
     }
 
-    /// B1 CUI canonicalization (== reference binary): `comm` orders the pair (`f(b,a) == f(a,b)`);
-    /// `idem` collapses `g(a,a)` to `a`; `id:` collapses `h(a,e)` to `a` — all at construction.
+    /// CUI construction orders commutative pairs, collapses equal idempotent arguments, and removes
+    /// identities immediately.
     #[test]
     fn cui_canonical_comm_idem_identity() {
         let mut e = Engine::new();
@@ -10181,8 +9661,7 @@ mod tests {
         assert_eq!(e.node(hae).symbol(), a, "h(a, e) collapses to a (id:)");
     }
 
-    /// B1 CUI reduce lock (== reference binary): `eq f(a, b) = c` matches `f(b, a)` modulo
-    /// commutativity → `c` in 1 rewrite.
+    /// `eq f(a, b) = c` matches `f(b, a)` modulo commutativity and rewrites it once to `c`.
     #[test]
     fn cui_reduce_modulo_commutativity() {
         let mut e = Engine::new();
@@ -10250,9 +9729,8 @@ mod tests {
         }
     }
 
-    /// B3.2 S-theory construction + sort (== reference binary, `conformance/iter.maude` ITER): `s^n(0)`
-    /// stores the count compactly, `s^0(x)` collapses to `x`, nested successors flatten, and the sort
-    /// follows the successor's declaration (`s^n(0) : NzNat` for n >= 1, `0 : Zero`).
+    /// Compact iteration stores the exponent, collapses `s^0(x)` to `x`, flattens nested successors,
+    /// and derives the result sort from the successor declaration.
     #[test]
     fn iter_node_construction_and_sort() {
         let (mut e, zero, nznat, _nat, z, s) = iter_ctx();
@@ -10276,7 +9754,7 @@ mod tests {
         );
     }
 
-    /// B3.2 THE soundness gate (the audit's #1 B3 trap): the S `count` is scalar payload, not a child,
+    /// S-theory soundness gate: the S `count` is scalar payload, not a child,
     /// so `deep_equal`/`dag_compare` must compare it — else `s^2(0)` and `s^3(0)` (both child `[0]`)
     /// would compare equal.
     #[test]
@@ -10305,8 +9783,8 @@ mod tests {
         assert_eq!(e.runtime().dag_compare(s2a, s2b), Ordering::Equal);
     }
 
-    /// B3.2 S-theory reduce, ground equation (== reference binary, ITER): `eq s s 0 = 0` rewrites
-    /// `s^5(0)` modulo the successor extension — `s^5 -> s^3 -> s^1`, 2 rewrites, result `s 0 : NzNat`.
+    /// With `eq s s 0 = 0`, successor extension rewrites `s^5(0)` through exponents 3 and 1 in two
+    /// rewrites, yielding `s 0 : NzNat`.
     #[test]
     fn iter_reduce_ground_equation() {
         let (mut e, _zero, nznat, _nat, z, s) = iter_ctx();
@@ -10323,9 +9801,8 @@ mod tests {
         assert!(e.deep_equal(r, s1), "result is s 0");
     }
 
-    /// B3.2 S-theory reduce, variable equation (== reference binary, ITER-VAR): `eq s s s X = s X`
-    /// rewrites `s^5(0) -> s 0` (2 rewrites) and `s^3(0) -> s 0` (1) — the variable absorbs the
-    /// successor surplus (the extension's first/whole solution).
+    /// For `eq s s s X = s X`, the variable absorbs the successor surplus: `s^5(0)` reaches `s 0`
+    /// in two rewrites and `s^3(0)` reaches it in one.
     #[test]
     fn iter_reduce_variable_equation() {
         let (mut e, _zero, _nznat, nat, z, s) = iter_ctx();
@@ -10349,10 +9826,9 @@ mod tests {
         assert!(e.deep_equal(r2, s1b));
     }
 
-    /// B3.3 built-in seam (== reference binary, `conformance/prelude-bool.maude`): `EqualitySymbol`
-    /// (`_~_`) reduces to `tt`/`ff` by structural equality (1 rewrite). A decided `BranchSymbol`
-    /// (`myif`) selects one branch without touching the dead branch; an undecidable condition instead
-    /// normalizes every branch before trying user equations. Attached via `set_special`.
+    /// Built-in equality returns `tt` or `ff` from structural equality in one rewrite. A decided
+    /// branch selects one arm without reducing the unused arm; an undecidable condition normalizes
+    /// every arm before user equations are considered.
     #[test]
     fn builtin_equality_and_branch_over_bool() {
         use crate::symbol::SpecialOp;
@@ -10480,10 +9956,9 @@ mod tests {
         assert_eq!(e.node(children[1]).symbol(), z);
     }
 
-    /// B3.4 NAT built-in number ops (== reference binary, `conformance/nat.maude`): `_+_`/`_*_`/`gcd`
-    /// (ACU_NumberOp, fold the multiset with multiplicity) and `_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_`
-    /// (NumberOp). Each is 1 rewrite; the result sort follows the value (`s^n(0) : NzNat`); a
-    /// non-numeric operand survives as ACU residue (`x + 2 + 3 = x + 5`).
+    /// NAT addition, multiplication, and GCD fold ACU multisets with multiplicity. Quotient,
+    /// remainder, exponentiation, and comparisons are binary. Each built-in takes one rewrite, result
+    /// sorts follow the value, and a non-numeric argument remains as ACU residue.
     #[test]
     fn builtin_nat_arithmetic_and_comparisons() {
         use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp};
@@ -10508,7 +9983,7 @@ mod tests {
             true_: tt,
             false_: ff,
         };
-        // ACU ops: NzNat Nat -> NzNat overloaded Nat Nat -> Nat (the prelude shape; F-B-completed).
+        // ACU operators use `NzNat Nat -> NzNat` plus the broader `Nat Nat -> Nat` overload.
         let acu_op = |e: &mut Engine, name: &'static str, op: NumOp| -> SymbolId {
             let o = e.add_op_ac(name, vec![nznat, nat], nznat, None);
             e.add_op_decl(o, vec![nat, nat], nat);
@@ -10593,11 +10068,7 @@ mod tests {
         let q = e.make_ac(plus, vec![xn, n2, n3]);
         let r = e.reduce(q);
         assert_eq!(e.rewrites(), 1, "x + 2 + 3 = x + 5 in 1 rewrite");
-        assert_eq!(
-            e.sort_of(r),
-            nznat,
-            "x + 5 : NzNat (asymmetric overload, F-B)"
-        );
+        assert_eq!(e.sort_of(r), nznat, "x + 5 retains the NzNat result sort");
         assert_eq!(e.node(r).symbol(), plus, "result is still a + node");
         let kids: Vec<DagId> = e.node(r).children().collect();
         assert_eq!(kids.len(), 2, "x + 5 has two operands");
@@ -10613,10 +10084,9 @@ mod tests {
         assert!(has_x && has_5, "x + 5 = {{x, s^5(0)}}");
     }
 
-    /// B3.5 INT signed arithmetic (== reference binary, `conformance/int.maude`): negatives are
-    /// `-(s^n(0))` via `MinusSymbol` (a negative numeral is canonical — 0 rewrites; `-(-x)` and `-0`
-    /// reduce in 1). The same ACU/Number ops as NAT, lifted to signed via the `minus` hook; `quo`/`rem`
-    /// truncate toward zero. The result sort follows the value (`NzInt`/`NzNat`/`Zero`).
+    /// Signed INT arithmetic represents a negative numeral as `-(s^n(0))`. Canonical negatives take
+    /// no rewrite, while double negation and negative zero reduce once. Quotient and remainder
+    /// truncate toward zero; the result sort follows the signed value.
     #[test]
     fn builtin_int_signed_arithmetic() {
         use crate::symbol::{BoolHooks, NatHooks, NumOp, SpecialOp};
@@ -10786,9 +10256,8 @@ mod tests {
         assert_eq!(cmp(&mut e, 3, -2), ff, "3 < -2 = ff");
     }
 
-    /// B3.6 NA theory + STRING + QID (== reference binary, `conformance/string.maude`): strings/qids
-    /// are atomic `NodeTerm::Na` constants. `StringOpSymbol` does concat / length / substr /
-    /// comparisons; quoted-ids match only themselves via the Na equality arm (through `EqualitySymbol`).
+    /// Strings and quoted identifiers are atomic `NodeTerm::Na` constants. String hooks provide
+    /// concatenation, length, substring, and comparisons; quoted identifiers match only themselves.
     #[test]
     fn builtin_string_and_qid() {
         use crate::dag::NaValue;
@@ -10953,9 +10422,8 @@ mod tests {
         assert_eq!(qcmp(&mut e, "foo", "bar"), ff, "'foo == 'bar is false");
     }
 
-    /// B3.7 FLOAT built-in ops (== reference binary, `conformance/float.maude`): `f64` arithmetic /
-    /// negation / abs / sqrt / comparisons via FloatOpSymbol over atomic `NodeTerm::Na` float values
-    /// (all free ops). Each built-in is 1 rewrite (`abs(neg(3.0))` is 2).
+    /// FLOAT hooks provide arithmetic, negation, absolute value, square root, and comparisons over
+    /// atomic `NodeTerm::Na` float values. Each hook takes one rewrite; nested hooks compose.
     #[test]
     fn builtin_float_ops() {
         use crate::dag::NaValue;
@@ -11071,10 +10539,8 @@ mod tests {
         assert_eq!(cf(&mut e, 2.5, 1.5), ff, "2.5 < 1.5 = ff");
     }
 
-    /// B3.8 RAT — the DivisionSymbol kernel op (== reference binary, `conformance/rat.maude`): `_/_`
-    /// canonicalises `I / N` to lowest terms (divide by gcd; denominator 1 → the integer). RAT's
-    /// arithmetic is equation-defined (a post-parser milestone), so this is the only RAT kernel op;
-    /// `0/N` and an already-canonical fraction do not rewrite.
+    /// Rational division canonicalizes `I / N` to lowest terms and returns an integer for denominator
+    /// one. Zero numerators and already-canonical fractions remain for equations to handle.
     #[test]
     fn builtin_division_canonicalizes_rationals() {
         use crate::symbol::{NatHooks, SpecialOp};
@@ -11186,7 +10652,7 @@ mod tests {
             e.deep_equal(result, four),
             "2 + 2 should reduce to s s s s 0"
         );
-        assert_eq!(e.rewrites(), 3, "rewrite count matches reference Maude");
+        assert_eq!(e.rewrites(), 3, "three rewrites");
     }
 
     #[test]
@@ -11241,7 +10707,7 @@ mod tests {
             e.deep_equal(result, twelve),
             "3 * 4 should reduce to s^12 0"
         );
-        assert_eq!(e.rewrites(), 21, "rewrite count matches reference Maude");
+        assert_eq!(e.rewrites(), 21, "twenty-one rewrites");
     }
 
     #[test]
@@ -11278,8 +10744,8 @@ mod tests {
     #[test]
     fn ill_sorted_argument_blocks_rewrite_and_lands_in_error_sort() {
         // f : Nat -> Nat applied to a Bool (a different kind): the node lands in Nat's error sort,
-        // and `eq f(N:Nat) = z` must NOT fire (a Bool can't match a Nat variable). (Review R2 M4
-        // / "error-sort propagation is monotone and safe".)
+        // and `eq f(N:Nat) = z` must NOT fire (a Bool can't match a Nat variable). This guards
+        // monotone, safe error-sort propagation.
         let mut e = Engine::new();
         let nat = e.add_sort("Nat");
         let boolean = e.add_sort("Bool"); // separate kind
@@ -11335,10 +10801,9 @@ mod tests {
         }
     }
 
-    /// Depth 200_000 is ~4x the old recursive reducer's debug stack cliff (~50k); the recursive
-    /// `reduce`/`reduce_args` aborted the *process* here. The iterative work-stack
-    /// must reduce it. `s^N + s^N` drives the deepest recursion the old code had (the addition loop
-    /// rebuilds `s(plus(..))` and re-descends ~N frames).
+    /// Depth 200_000 exercises normalization well beyond ordinary call-stack limits. The iterative
+    /// work stack must reduce it without overflowing. `s^N + s^N` drives the deepest path because the
+    /// addition loop rebuilds `s(plus(..))` and descends through approximately `N` frames.
     #[test]
     fn iterative_reduce_handles_deep_addition_without_overflow() {
         let mut e = Engine::new();
@@ -11372,9 +10837,8 @@ mod tests {
         assert_eq!(decode(&e, r, zero, s), 2 * N, "s^N + s^N = s^2N");
     }
 
-    /// A deep chain with no applicable equation: the old `reduce` still descended the whole spine
-    /// (`reduce_args` → `reduce(child)`) and overflowed. The result must be the *input* id — change
-    /// detection preserves shared structure rather than rebuilding an identical chain.
+    /// An equation-free chain 200,000 nodes deep is already normal. Iterative traversal must return
+    /// the original shared DAG id without overflowing or rebuilding it.
     #[test]
     fn iterative_reduce_walks_deep_spine_without_overflow() {
         let mut e = Engine::new();
@@ -11390,11 +10854,9 @@ mod tests {
         );
     }
 
-    /// Conformance lock against the reference C++ Maude binary (`conformance/fib.maude`): the
-    /// iterative reducer must reproduce the *exact* redex sequence — `fib(22) = 17711` in `186579`
-    /// rewrites.
+    /// The iterative reducer follows a stable redex sequence: `fib(22) = 17711` in 186579 rewrites.
     #[test]
-    fn fib_22_matches_reference_rewrite_count() {
+    fn fib_22_has_stable_rewrite_count() {
         let mut e = Engine::new();
         let nat = e.add_sort("Nat");
         e.close_sorts();
@@ -11439,19 +10901,11 @@ mod tests {
         let q = e.make_free(fib, vec![n]);
         let r = e.reduce(q);
         assert_eq!(decode(&e, r, zero, s), 17711, "fib(22) = 17711");
-        assert_eq!(
-            e.rewrites(),
-            186579,
-            "exact rewrite count matches reference Maude"
-        );
+        assert_eq!(e.rewrites(), 186579, "stable rewrite count for fib(22)");
     }
 
-    /// C7 forwarding, re-baselined: a *shared, still-reducible* redex is reduced — and counted — **once
-    /// total**, not once per occurrence. This test pinned the pre-C7 behaviour (2 rewrites: a rewritten
-    /// node was never stamped canonical, so a second reference re-reduced it); its own note said to
-    /// re-baseline here once forwarding lands. With the `nf` forward the rewritten node IS stamped and
-    /// carries its normal form, so the second reference delivers it without re-reducing — Maude's
-    /// shared-DAG count. (A rewrite to a subterm: `s 0 + 0 = s 0` forwards `C` to its own argument `s 0`.)
+    /// A shared reducible redex is normalized once; normal-form forwarding lets every later reference
+    /// reuse the cached result.
     #[test]
     fn shared_reducible_redex_is_reduced_once() {
         let mut e = Engine::new();
@@ -11477,14 +10931,10 @@ mod tests {
 
         // f(s 0, s 0): the shared C fired `N + 0 = N` once; the second reference forwarded to the result.
         assert_eq!(e.node(r).symbol(), f);
-        assert_eq!(
-            e.rewrites(),
-            1,
-            "shared reducible redex reduced once total (C7 forwarding)"
-        );
+        assert_eq!(e.rewrites(), 1, "shared reducible redex reduced once total");
     }
 
-    /// A [`RootGuard`] pins its node across `gc`; dropping it releases the root (D2 amendment).
+    /// A [`RootGuard`] pins its node across `gc`; dropping it releases the root.
     #[test]
     fn root_guard_keeps_node_alive_then_releases_on_drop() {
         let mut e = Engine::new();
@@ -11530,10 +10980,9 @@ mod tests {
         assert_eq!(e.node(g.get()).symbol(), b, "the guard now protects nb");
     }
 
-    /// Done-when: safe-point GC during *one* reduction keeps memory bounded. The same `fib`
-    /// reduction is run with GC off (capacity grows to the full allocation high-water) and with a
-    /// short GC interval (capacity stays near the live working set); the result is unchanged. Roots
-    /// in flight (the work-stack + child_result) are kept, so the answer is still correct.
+    /// Safe-point GC keeps arena capacity near the live working set during one reduction while
+    /// preserving the result. The disabled run records the full allocation high-water; the enabled
+    /// run verifies that the work stack and pending child result keep every in-flight root alive.
     #[test]
     fn safe_point_gc_bounds_memory_within_one_reduction() {
         fn run(interval: Option<u64>) -> (u32, u64, usize) {
@@ -11596,7 +11045,7 @@ mod tests {
         );
     }
 
-    /// Locks the `set_gc_interval` rooting contract (review finding): with safe-point GC enabled, a
+    /// Locks the `set_gc_interval` rooting contract: with safe-point GC enabled, a
     /// result held across a later reduction survives *iff* it is pinned by a [`RootGuard`]. Here the
     /// rooted result of `2 + 2` is still `s^4 0` after a second, allocation-heavy reduction triggers
     /// collection. (Without the guard the second reduction would reclaim it — a debug stale-handle
@@ -11646,15 +11095,12 @@ mod tests {
         );
     }
 
-    /// F-2 (engine-global condition-reduce root set): with in-reduction GC on, a re-entrant condition
-    /// reduction must NOT sweep the OUTER reduction's live state. Reducing `pair(a, cond(b))` (`a`, `b`
-    /// distinct numerals): reducing `cond(b)` fires a conditional equation whose condition reduces
-    /// `b + b` on both sides (allocating enough to trigger several collections), during which `pair`'s
-    /// already-reduced first argument `a` is live ONLY in the outer reduce frame. Before the fix the
-    /// hazard was avoided by disabling GC for the whole condition (unbounded memory); now GC stays on and
-    /// `condition_holds` protects the outer frame + bindings + redex, so `a` survives and the result is
-    /// `pair(a, b)` intact. (Without the protected root set a nested collection would reclaim `a`, leaving
-    /// a dangling/reused id — `decode` would then panic or read the wrong value.)
+    /// With in-reduction GC enabled, a re-entrant condition reduction must preserve the outer reduction's
+    /// live state. Reducing `pair(a, cond(b))` fires a conditional equation whose condition reduces `b + b`
+    /// on both sides and triggers several collections. The already-reduced `a` exists only in the outer
+    /// frame, so `condition_holds` must protect that frame, its bindings, and its redex until the nested
+    /// reduction finishes. The result remains `pair(a, b)`; omitting any of those roots can reclaim `a`
+    /// and leave a dangling or reused id.
     #[test]
     fn safe_point_gc_during_condition_preserves_outer_frame() {
         let mut e = Engine::new();
@@ -11717,7 +11163,7 @@ mod tests {
         );
     }
 
-    /// F-2, matching (`:=`) condition variant: locks the `solve_condition` *matching* arm's rooting of the
+    /// Matching (`:=`) condition variant: locks the `solve_condition` matching arm's rooting of the
     /// reduced subject — and thus the fresh-var bindings, which are its subterms — across the recursive
     /// solve, under in-reduction GC (a distinct path from the equality arm above). `pickm(X) = Y if
     /// Y := X + X` returns `X + X`; reducing `pickm(b)` reduces `b + b` (allocating → GC fires), and
@@ -11781,9 +11227,8 @@ mod tests {
         );
     }
 
-    /// TNK-017 pending-result boundary: `start` has two successors and the rewrite-condition target is
-    /// the second. Reducing the first successor under per-allocation GC must not collect the still-pending
-    /// second successor while the deferred successor batch is consumed.
+    /// Pending rewrite-condition successors remain rooted while an earlier successor is reduced under
+    /// per-allocation collection.
     #[test]
     fn rewrite_condition_pending_successors_survive_safe_point_gc() {
         fn run(interval: Option<u64>) -> (bool, bool, u64) {
@@ -11839,9 +11284,8 @@ mod tests {
         );
     }
 
-    /// TNK-017 discovered-state/binding boundary: the target is two rule steps deep, then an unrelated
-    /// equality fragment allocates and reduces before the rhs consumes the fresh binding. Every retained
-    /// BFS state—and therefore the reached state's bound child—must remain rooted across that reduction.
+    /// Discovered search states and fresh bindings remain rooted while a later equality condition allocates
+    /// and reduces before the RHS consumes the binding.
     #[test]
     fn rewrite_condition_discovered_states_and_bindings_survive_safe_point_gc() {
         fn run(interval: Option<u64>) -> (bool, bool, u64) {
@@ -11914,11 +11358,9 @@ mod tests {
         );
     }
 
-    /// C7 normal-form forwarding (Half 2), in isolation — no construction dedup needed: a *manually*
-    /// shared reducible subterm (the **same** `DagId` referenced twice) is reduced **once**. `< g(a),
-    /// g(a) >` with `eq g(a) = b`: out of place, the rewritten `g(a)` node is abandoned, so the second
-    /// reference would re-reduce it (2 rewrites); the `nf` forward lets the second reference deliver the
-    /// already-computed `b` (1 rewrite, matching Maude's shared-DAG count). Result is `< b, b >` either way.
+    /// Normal-form forwarding needs no construction deduplication. A manually shared `g(a)` referenced
+    /// twice under `<_,_>` is reduced once; its forwarding record supplies the cached `b` to the second
+    /// argument, yielding `< b, b >`.
     #[test]
     fn forwarding_reduces_a_shared_redex_once() {
         let mut e = Engine::new();

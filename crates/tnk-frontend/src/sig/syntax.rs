@@ -1,5 +1,5 @@
-//! The frontend's syntax + resolution tables, produced by [`build_module`](super::build_sig::build_module)
-//! and consumed by the grammar builder (B4.3) and pretty-printer (B4.6).
+//! Frontend syntax and resolution tables produced by [`build_module`](super::build_sig::build_module)
+//! and consumed by the grammar builder and pretty-printer.
 
 use crate::lex::{Frag, Token};
 use crate::surface::ast::{GatherElem, IdSide, Statement};
@@ -10,8 +10,7 @@ use tnk_core::symbol::SymbolId;
 use tnk_core::term::{ConditionFragment, Term};
 
 /// One operator's surface syntax — the per-symbol record the kernel does not store. Holds the mixfix
-/// fragments, the resolved domain/range, and the user-given prec/gather (the OBJ3 defaults are filled in
-/// by the grammar builder, B4.3).
+/// fragments, resolved domain/range, and user `prec`/`gather`; the grammar builder supplies defaults.
 #[derive(Debug, Clone)]
 pub struct SymbolSyntax {
     pub frags: Vec<Frag>,
@@ -22,19 +21,15 @@ pub struct SymbolSyntax {
     /// A constructor of `Attribute` with the reserved canonical `name:_` shape. Retained
     /// independently of the kernel's merged constructor flag for META Qid encoding.
     pub object_attribute: bool,
-    /// Whether the source spelling separated the attribute label from `:_` (`bal :_` rather than
-    /// `state:_`). Maude preserves that distinction when pretty-printing object attributes.
+    /// Whether source spelling separated the attribute label from `:_`; retained for printing.
     pub spaced_label_colon: bool,
     /// Whether the operator carries the `assoc` axiom (ACU/AU). Recorded from the attributes (the kernel
     /// keeps the theory `pub(crate)`); the grammar builder uses it to choose the flattened assoc-list
     /// prefix form `f(<assocList>)` over the positional `f(a, …)` form, and the right-associating gather.
     pub assoc: bool,
-    /// Whether the operator carries the `iter` axiom (the S theory — a stacked successor `s_`). The
-    /// grammar builder uses it to emit the `f^count(t)` iter-token input form (Maude's `iterSymbols`).
+    /// Whether the operator carries `iter`; the grammar uses it to accept `f^count(t)`.
     pub iter: bool,
-    /// The `format (…)` directive words (one per mixfix gap), if declared — the pretty-printer's per-gap
-    /// spacing/indent layout (`_<-_` substitutions, `rl_=>_[_].`, the `__` declaration/trace lists). `None`
-    /// = Maude's default spacing.
+    /// Per-gap `format (…)` directives for spacing and indentation. `None` selects default spacing.
     pub format: Option<Vec<String>>,
 }
 
@@ -72,19 +67,19 @@ pub struct EqTrace {
     /// Statement-local variable names, indexed as the kernel's substitution is (first occurrence order).
     pub var_names: Vec<String>,
     pub owise: bool,
-    /// Whether the equation carries Maude's `[variant]` attribute.
+    /// Whether the equation carries `[variant]`.
     pub variant: bool,
     /// The `[label …]` name, if any — retained for META `upEqs`/`upModule` (renders `[label('l)]`), not
     /// used by execution.
     pub label: Option<String>,
-    /// A `[nonexec]` axiom (a proof obligation). Engine-registered traces are always `false` (build skips
-    /// nonexec); META up-translation sets it for a module's own `[nonexec]` equations, which it parses on
-    /// demand (they carry no engine trace) — [`parse_statement_trace`](crate::load::parse_statement_trace).
+    /// A `[nonexec]` axiom (a proof obligation). Engine-registered traces are always `false` because loading
+    /// skips these axioms. Reflective encoding parses a module's own `[nonexec]` equations on demand through
+    /// [`parse_statement_trace`](crate::load::parse_statement_trace).
     pub nonexec: bool,
 }
 
 /// Source-form trace metadata for one membership axiom, keyed by the kernel's dense membership id
-/// (`BuiltModule::mb_traces[id]`) — the counterpart of [`EqTrace`] for `[c]mb {lhs} : {sort}[ if …] .`.
+/// (`BuiltModule::mb_traces[id]`). Its fields correspond to membership syntax and reuse [`EqTrace`] conventions.
 #[derive(Debug, Clone)]
 pub struct MbTrace {
     pub lhs: Term,
@@ -98,8 +93,8 @@ pub struct MbTrace {
 }
 
 /// Source-form trace metadata for one rule, keyed by the kernel's dense rule id
-/// (`BuiltModule::rl_traces[id]`) — the counterpart of [`EqTrace`] for `[c]rl [{label}] : {lhs} => {rhs}
-/// [ if …] .` Used by the full trace renderer (`*********** rule`) and `show path` (`===[ rl … ]===>`).
+/// (`BuiltModule::rl_traces[id]`). The full trace renderer uses it for `*********** rule`, and
+/// `show path` uses it for `===[ rl … ]===>`.
 #[derive(Debug, Clone)]
 pub struct RlTrace {
     pub lhs: Term,
@@ -123,8 +118,8 @@ pub struct IdentitySpec {
     pub tokens: Vec<Token>,
 }
 
-/// A built module: the `Engine` (sorts + ops + attributes, but **not** statements — those need the grammar,
-/// B4.4) plus the frontend's resolution tables and the still-raw statements/commands.
+/// A built module: kernel engine plus frontend resolution tables and raw statements. Statement term
+/// bubbles are parsed only after the per-module grammar has been built.
 pub struct BuiltModule {
     pub engine: Engine,
     pub name: String,
@@ -139,7 +134,7 @@ pub struct BuiltModule {
     /// Declared variables `(name, sort)` (from `var`/`vars`). Used by the grammar builder (variable
     /// productions) and `build_term` (resolving a variable token to its sort + statement-local index).
     pub vars: Vec<(String, SortId)>,
-    /// The raw statement bubbles (parsed + added to the engine in B4.4).
+    /// Raw statement bubbles, parsed and installed by `load_statements`.
     pub statements: Vec<Statement>,
     /// Per-equation trace metadata, indexed by the kernel's dense equation id (populated by
     /// `load_statements`; empty until statements are loaded). See [`EqTrace`].
@@ -158,26 +153,20 @@ pub struct BuiltModule {
     pub string_sym: Option<SymbolId>,
     pub float_sym: Option<SymbolId>,
     pub qid_sym: Option<SymbolId>,
-    /// The `MinusSymbol` operator (`-_`), if any — the pretty-printer renders `-(s^n(0))` compactly as
-    /// `-n` (Maude-faithful), as Maude's `handleMinus` does.
+    /// Unary minus, when present; used to render negative numerals compactly.
     pub minus_sym: Option<SymbolId>,
-    /// The `DivisionSymbol` operator (`_/_`), if any — the pretty-printer renders a rational special
-    /// constant compactly as `num/den` (no spaces), as Maude's `handleDivision` does.
+    /// The `_/_` division operator, if present; rational values render compactly as `num/den`.
     pub division_sym: Option<SymbolId>,
-    /// The boolean truth anchors (`true`/`false`, tagged `SystemTrue`/`SystemFalse` — Maude's
-    /// `trueSymbol`/`falseSymbol`). Used to desugar a bare boolean condition `if p` into `p = true`
-    /// and by sort-test predicates; `None` until a module declares them (the prelude's `TRUTH-VALUE`).
+    /// Boolean truth anchors tagged `SystemTrue` and `SystemFalse`. They desugar a bare Boolean
+    /// condition into equality with true and support sort-test predicates. Absent until declared.
     pub true_sym: Option<SymbolId>,
     pub false_sym: Option<SymbolId>,
-    /// Per-symbol ad-hoc overloading flags for print disambiguation (Maude's `SymbolInfo::iflags`
-    /// `*_OVERLOADED` bits, `entry.cc`). A symbol overloaded across connected components prints
-    /// `(t).Sort` so the output round-trips. [`OVL_ADHOC`] = another symbol shares its name;
-    /// [`OVL_DOMAIN`] = another shares its name *and* domain kinds (forces disambiguation when the range
-    /// is unknown); [`OVL_RANGE`] = another shares its name *and* range kind. Absent = unique (no
-    /// disambiguation).
+    /// Per-symbol overload flags for print disambiguation. Cross-kind overloads print `(term).Sort`
+    /// when context cannot determine a range. [`OVL_ADHOC`] means another symbol shares the name;
+    /// [`OVL_DOMAIN`] also shares domain kinds; [`OVL_RANGE`] also shares the range kind.
     pub overload: HashMap<SymbolId, u8>,
-    /// Distinct kinds whose built-in values use positive decimal syntax (`SuccSymbol` naturals plus SMT
-    /// integers). Maude qualifies a numeral in an unknown-range context only when this exceeds one.
+    /// Number of kinds whose built-in values use positive decimal syntax. An unknown-range numeral
+    /// requires sort qualification when more than one such kind exists.
     pub(crate) integer_literal_kind_count: usize,
     /// Canonical positive decimal spellings also declared as nullary user operators. These collide with
     /// built-in natural pseudo-literals even when there is only one numeral kind.
@@ -185,8 +174,8 @@ pub struct BuiltModule {
     /// Strategy declarations after module flattening. The interpreter coalesces these by
     /// `(name, domain kinds, subject kind)` while retaining donation origins for conflict handling.
     pub strat_decls: Vec<crate::surface::ast::StratDecl>,
-    /// Strategy definitions (`sd`/`csd`) of a strategy module (Pillar 2.4) — the call→body table the
-    /// strategy interpreter resolves a `Call` against. Empty for a non-strategy module.
+    /// Strategy definitions (`sd`/`csd`) indexed by the strategy interpreter. Empty outside strategy
+    /// modules.
     pub strat_defs: Vec<crate::surface::ast::StratDef>,
     /// Identity attribute bubbles retained until the module grammar exists, then parsed and installed
     /// as signature-owned ground terms before statements are compiled.

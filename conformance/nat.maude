@@ -1,9 +1,8 @@
-*** B3.4 NAT built-in number ops conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/nat.maude < /dev/null
+*** NAT built-in number operations conformance
 *** Numerals are `s^n(0)` (the iter/S theory); `_+_`/`_*_`/`gcd` are ACU_NumberOpSymbol (fold the
 *** multiset operands), `_quo_`/`_rem_`/`_^_`/`_<_`/`_<=_` are NumberOpSymbol. Each built-in reduction
 *** is exactly 1 rewrite; the result sort follows the value (`s^n(0) : NzNat`). A non-numeric operand
-*** survives as residue (`x + 2 + 3 = x + 5`). Mirrors the engine.rs B3.4 test. A `Truth` sort avoids
+*** survives as residue (`x + 2 + 3 = x + 5`). A `Truth` sort avoids
 *** the prelude's built-in `Bool`.
 fmod NATB is
   sorts Truth Zero NzNat Nat .

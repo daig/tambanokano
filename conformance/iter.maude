@@ -1,8 +1,7 @@
-*** B3.2 S-theory (`iter`) conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/iter.maude < /dev/null
+*** S-theory (`iter`) conformance
 *** A unary `s_ [iter]` stores `s^count(0)` compactly (the binary prints it `s_^n(0)`). Sorts follow the
 *** successor's declaration (`s^n(0) : NzNat` for n >= 1); a ground or variable iter equation rewrites
-*** modulo the successor extension. Mirrors the engine.rs B3.2 tests.
+*** modulo the successor extension.
 
 fmod ITER is
   sorts Zero NzNat Nat .

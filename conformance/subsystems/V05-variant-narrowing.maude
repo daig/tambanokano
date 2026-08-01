@@ -1,4 +1,4 @@
-*** V05-variant-narrowing — lifted from the reference suite (Misc/variantNarrowing.maude)
+*** V05-variant-narrowing
 *** PRELUDE
 set show timing off .
 

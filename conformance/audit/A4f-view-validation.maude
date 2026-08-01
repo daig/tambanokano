@@ -1,5 +1,5 @@
 *** A4f-view-validation — invalid view sort/order and operator profiles make their instances unusable.
-*** With diagnostics removed, both Maude and tnk produce no command result. Each command would return a
+*** With diagnostics removed, invalid views produce no command result. Each command would return a
 *** value if the corresponding invalid view were incorrectly stored.
 fth A4F-SUBTH is
   sorts Small Big .

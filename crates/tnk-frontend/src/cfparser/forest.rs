@@ -1,13 +1,10 @@
-//! Parse-forest extraction (Maude's `pass2`, DRP path omitted): walk the Earley [`Chart`] to build the
-//! first parse tree for the start nonterminal, and flag ambiguity (a second valid parse anywhere).
+//! Parse-forest extraction: walk an Earley [`Chart`] to build the first parse tree for the start
+//! nonterminal and flag a second valid parse as ambiguity.
 //!
-//! Reconstruction is right-to-left over each production's rhs (Maude's `extractFirstSubparse`,
-//! pass2.cc:168): for a finished item spanning `[origin, end)`, walk its rhs from the right, peeling one
-//! token per terminal and, at each nonterminal hole, finding a finished sub-item that ends at the current
-//! position, whose precedence the hole's gather bound admits, and whose start `s` the prefix `rhs[0..k]`
-//! actually reached (the `chart.contains(s, <prefix item>)` check — Maude's `existsCall`). The first such
-//! split (in chart/completion order) is taken; a second flags ambiguity (Maude reports two and takes the
-//! first).
+//! Reconstruction walks each production right-to-left. It consumes one token per terminal and, for
+//! each nonterminal hole, selects a completed item ending at the current position whose precedence
+//! satisfies the gather bound and whose start is reachable by the production prefix. The first split
+//! in chart/completion order becomes the tree; another valid split marks it ambiguous.
 
 use super::compile::CompiledGrammar;
 use super::earley::{Chart, Item};

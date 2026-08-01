@@ -1,6 +1,5 @@
-*** B2.3c conditional membership (cmb) conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/cmb.maude < /dev/null
-*** A pair is a GoodPair when its first component <= its second. Mirrors the engine.rs tests.
+*** Conditional membership (`cmb`) conformance
+*** A pair is a GoodPair when its first component <= its second.rs tests.
 
 fmod CMB is
   sorts Nat Pair GoodPair Truth .

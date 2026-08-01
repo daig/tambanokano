@@ -1,5 +1,4 @@
-*** I14-meta-int-variant — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntVariant.maude; oracle verified 2026-07-23.
+*** I14-meta-int-variant
 *** PRELUDE
 set show timing off .
 set show advisories off .

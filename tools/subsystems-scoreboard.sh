@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # tools/subsystems-scoreboard.sh — run conformance/subsystems/*.maude through diffmaude.
 #
-# Runs ordinary fixtures through tools/diffmaude.sh. T11 uses the dedicated native
-# value/sort contract checker because its authoritative oracle is the external Maude-2.7
-# prototype, not the Maude-3.5 binary used by the global differential harness.
+# Runs ordinary fixtures through tools/diffmaude.sh. T11 instead uses its dedicated native
+# value/sort checker: the pinned TNK regression contract is independent of historical
+# differential baselines.
 # Prints one PASS/FAIL line per fixture and a final
 #   SUBSYSTEMS <n>/<m> PASS
 # Exit 0 iff n = m. ID prefixes: U* unification, V* variants, N* narrowing,
@@ -11,7 +11,7 @@
 #
 # Options:
 #   -d           also print the diff for each failing fixture
-#   -p PREFIX    run only fixture IDs beginning with PREFIX (for example, `-p U` for S1)
+#   -p PREFIX    run only fixture IDs beginning with PREFIX (for example, `-p U`)
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

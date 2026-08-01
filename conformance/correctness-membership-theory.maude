@@ -1,10 +1,9 @@
-*** Phase 1.5 / C5 — membership axioms (`mb`/`cmb`) whose LEFT-HAND SIDE is a theory term, matched
-*** modulo the theory's axioms.  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-membership-theory.maude < /dev/null
+*** Membership axioms (`mb`/`cmb`) whose LEFT-HAND SIDE is a theory term, matched
+*** modulo the theory's axioms.
 ***
-*** Memberships compile to the same `LhsAutomaton` as equations and match via the same seam, so the C8
+*** Memberships compile to the same `LhsAutomaton` as equations and match through the same seam, so the
 *** cross-theory alien matching covers their lhs too: an AC/AU/iter membership lhs — including non-linear
-*** variables and alien subterms — matches modulo the theory. ACU/two-sided-AU/CUI collapse indexing is
-*** covered by audit/B3c-membership-collapse.maude; this fixture remains the rooted theory-matcher and
+*** variables and alien subterms — matches modulo the theory. This fixture is the rooted theory-matcher and
 *** cross-theory composition baseline.
 
 fmod AC-MB is

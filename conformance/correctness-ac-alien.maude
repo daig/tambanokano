@@ -1,11 +1,10 @@
-*** Phase 1.5 / C8 — AC matching with "alien" (non-ground, non-variable) subterms, conformance vs the
-*** reference binary:  ~/Downloads/Maude-3/maude -no-banner conformance/correctness-ac-alien.maude < /dev/null
+*** AC matching with "alien" (non-ground, non-variable) subterms.
 ***
 *** A pattern lhs with a non-ground non-variable subterm directly under an AC operator — e.g. `s M` under
-*** `+` in textbook commutative Peano addition. Maude matches each alien recursively against a subject
-*** element; for `reduce` its greedy matcher binds the alien to the canonically-FIRST (smallest) matching
-*** element (ACU_GreedyMatcher: findFirstPotentialMatch + the sorted-arg scan), which fixes the rewrite
-*** count deterministically. Was a loud panic (acu.rs:64); mirrors the engine.rs C8 tests.
+*** `+` in textbook commutative Peano addition. Each alien matches recursively against a subject
+*** element; for `reduce` the greedy matcher binds the alien to the canonically-FIRST (smallest) matching
+*** element (ACU_GreedyMatcher: findFirstPotentialMatch + the sorted-arg scan), determining the rewrite
+*** count deterministically.
 
 fmod PEANO-AC is
   sort Nat .

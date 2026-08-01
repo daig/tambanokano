@@ -1,6 +1,5 @@
-*** B-ii: a view maps a theory TRIV to a module NUM. On its own, before instantiation
-*** [B-iv], a view is validated and stored; the target module reduces as usual. This pins
-*** that a file carrying a valid view loads end-to-end and the reduce is unaffected.
+*** A view maps theory TRIV to module NUM. Before instantiation, the view is validated and stored while
+*** the target module reduces normally. This pins end-to-end loading of a file carrying a valid view.
 fth TRIV is
   sort Elt .
 endfth

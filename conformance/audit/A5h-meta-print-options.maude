@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A5h-meta-print-options - META print flags independently control textual and Qid-list rendering (TNK-015)
+*** META print flags independently control textual and Qid-list rendering.
 set show timing off .
 fmod A5H-PRINT is
   sort S .

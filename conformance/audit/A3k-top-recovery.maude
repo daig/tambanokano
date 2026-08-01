@@ -1,5 +1,5 @@
 *** PRELUDE
-*** A3k-top-recovery — TNK-006: discard top on non-applications before echo/expansion; retain direct rule semantics.
+*** Discard `top` on non-applications before echo and expansion; retain direct rule semantics.
 set show timing off .
 smod A3K-TOP is
   sort S .

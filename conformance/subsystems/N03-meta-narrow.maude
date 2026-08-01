@@ -1,4 +1,4 @@
-*** N03-meta-narrow — lifted from the reference suite (Meta/metaNarrow.maude)
+*** N03-meta-narrow
 *** PRELUDE
 set show timing off .
 set show advisories off .

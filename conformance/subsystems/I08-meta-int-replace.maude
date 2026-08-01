@@ -1,5 +1,4 @@
-*** I08-meta-int-replace — Maude 3.5.1 local meta-interpreter reference-suite lift.
-*** Source: tests/Meta/metaIntReplace.maude; oracle verified 2026-07-23.
+*** I08-meta-int-replace
 *** PRELUDE
 set show timing off .
 set show advisories off .

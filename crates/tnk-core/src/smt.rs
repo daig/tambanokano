@@ -10,7 +10,7 @@ use crate::sort::{KindId, SortId};
 use crate::symbol::SymbolId;
 use std::collections::HashMap;
 
-/// The three built-in SMT sorts understood by Maude's `SMT_Info`.
+/// The three built-in SMT sorts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SmtType {
     Boolean,
@@ -18,8 +18,8 @@ pub enum SmtType {
     Real,
 }
 
-/// Maude's 25 `SMT_Symbol::OPERATORS` values. Unary and binary `-` are distinct after the
-/// arity-sensitive hook-resolution step.
+/// The 25 supported SMT operators. Unary and binary `-` are distinct after arity-sensitive hook
+/// resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SmtOp {
     True,
@@ -80,8 +80,8 @@ impl SmtNumber {
         Some(Self(ExactRational::parse(text)?))
     }
 
-    /// Canonical Maude token spelling for the declared SMT sort. Reals always retain a denominator,
-    /// including `/1`; integers never do.
+    /// Canonical token spelling for the declared SMT sort. Reals retain a denominator, including `/1`;
+    /// integers never do.
     pub fn to_maude(&self, kind: SmtType) -> String {
         let text = self.0.to_decimal_ratio();
         match kind {
@@ -108,8 +108,7 @@ impl SmtNumber {
     }
 }
 
-/// Per-signature bindings corresponding to Maude's `SMT_Info`: sort classifications and the operators
-/// used to build accumulated constraints.
+/// Per-signature SMT metadata: sort classifications and operators used to build accumulated constraints.
 #[derive(Debug, Default, Clone)]
 pub struct SmtInfo {
     sort_types: HashMap<SortId, SmtType>,

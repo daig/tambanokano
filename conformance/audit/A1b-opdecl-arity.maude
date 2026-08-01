@@ -1,7 +1,7 @@
 *** A1b-opdecl-arity — declaration arity recovery: invalid mixfix arity and nonbinary assoc
 *** Cases 1 and 2 preserve Maude's warning-and-recovery behavior for a mismatch between an operator
-*** name's holes and its declared arity. Warnings are normalized by the differential harness; the
-*** retained commands prove that the invalid syntax cannot terminate the session.
+*** name's holes and its declared arity. Warnings are normalized by the harness; the
+*** following commands prove that the invalid syntax cannot terminate the session.
 fmod OPARITY is
   sort A .
   ops a b : -> A [ctor] .
@@ -11,7 +11,7 @@ red in OPARITY : a + b .
 red in OPARITY : a .
 
 *** Case 2: 3-hole name declared unary. Maude disables the mixfix syntax while retaining the prefix
-*** declaration; tnk follows the same semantic recovery.
+*** declaration; semantic recovery keeps the prefix form.
 fmod OPUNARY is
   sort A .
   op a : -> A [ctor] .
@@ -19,7 +19,7 @@ fmod OPUNARY is
 endfm
 red in OPUNARY : a .
 
-*** Case 3 (TNK-003): assoc is meaningful only for a binary declaration. Maude clears the compiled
+*** Case 3: assoc is meaningful only for a binary declaration. Maude clears the compiled
 *** attribute and retains a free ternary operator; the nested command proves it is not AU-flattened.
 fmod BAD-ASSOC is
   sort S .

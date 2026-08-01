@@ -1,5 +1,4 @@
 *** M03-deadlock-multi-rule — synthesized deadlock loops and duplicate-rule arc storage
-*** Fresh probes; oracle-verified against Maude 3.5.1.
 *** PRELUDE
 set show timing off .
 load model-checker

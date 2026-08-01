@@ -1,11 +1,10 @@
 //! Order-sorted type system: the sort poset, **kinds** (connected components, each with a
 //! synthesized error/top sort), and the subsort partial order [`Sorts::leq`].
 //!
-//! Ports the A3 design, minimized for Phase 0: build the poset, compute connected components and
-//! the reflexive-transitive subsort closure. The full per-symbol sort *decision diagram* (which
-//! gives least sorts under ad-hoc overloading and preregularity) lands with the complete theory
-//! set in Phase 1; Phase 0 symbols carry a single declaration, so a node's sort is its operator's
-//! range sort (see `engine`).
+//! Builds the poset, connected components and synthesized error sorts, reflexive-transitive subsort
+//! closure, and stable per-kind indices. Application least-sort resolution across overloaded operator
+//! declarations lives in the crate-private `Signature`; symbolic unification builds its sort functions
+//! from the same data in `sort_bdds`.
 
 use crate::id::Id;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +15,7 @@ pub type KindId = Id<Kind>;
 #[derive(Debug, Clone)]
 pub struct Sort {
     pub name: String,
-    /// `true` for the synthesized error/top sort of a kind (Maude's `[Kind]`).
+    /// `true` for the synthesized error/top sort of a kind.
     pub is_error: bool,
 }
 
@@ -26,13 +25,9 @@ pub struct Kind {
     pub members: Vec<SortId>,
     /// The synthesized error/top sort: a supersort of every member.
     pub error: SortId,
-    /// The component's sorts in **Maude's per-component index order** (`sorts[i]` of
-    /// `ConnectedComponent`): `index_order[0]` is the error sort, then the maximal sorts in the
-    /// registration DFS's append order, then the rest by Kahn's algorithm over declaration-ordered
-    /// subsort lists (`Sort::registerConnectedSorts` / `Sort::processSubsorts`). A linear extension
-    /// with supersorts first: `s <= t` implies `index(s) >= index(t)`. This order is **load-bearing
-    /// for unification**: the BDD sort encoding uses these indices, so the AllSat walk — and hence
-    /// the observable unifier enumeration order — depends on it.
+    /// Component index order: error sort first, then maximal user sorts in DFS discovery order, then
+    /// the remaining sorts by a declaration-ordered topological traversal. Supersorts precede
+    /// subsorts. This order determines BDD sort encoding and observable unifier enumeration.
     pub index_order: Vec<SortId>,
 }
 
@@ -42,16 +37,14 @@ pub struct Kind {
 pub struct Sorts {
     sorts: Vec<Sort>,
     kinds: Vec<Kind>,
-    /// Declared immediate supersorts: `up[sub]` lists each `sup` with `sub < sup`, in declaration
-    /// order (Maude's `Sort::supersorts`).
+    /// Declared immediate supersorts: `up[sub]` lists each `sup` with `sub < sup`, in declaration order.
     up: Vec<Vec<SortId>>,
     /// Declared immediate subsorts: `down[sup]` lists each `sub` with `sub < sup`, in declaration
-    /// order (Maude's `Sort::subsorts`). Drives the per-component index order (see [`Kind`]).
+    /// order. Drives each component's index order.
     down: Vec<Vec<SortId>>,
     /// Computed: `geq[s]` = every `x` with `s <= x` (includes `s` and `s`'s kind error sort).
     geq: Vec<BTreeSet<SortId>>,
-    /// Computed: `leqs[r]` = every `y` with `y <= r` — the **down-set** of `r` (Maude's
-    /// `Sort::getLeqSorts`). The inverse of `geq`; the key B2's least-sort resolution intersects.
+    /// Computed down-set for each sort, used by least-sort resolution.
     leqs: Vec<BTreeSet<SortId>>,
     kind_of: Vec<KindId>,
     /// Computed: each sort's index within its kind's [`Kind::index_order`] (error sorts get 0).
@@ -120,8 +113,7 @@ impl Sorts {
         self.geq[a.index()].contains(&b)
     }
 
-    /// The **down-set** of `s`: every sort `y` with `y <= s` (Maude's `Sort::getLeqSorts`). B2's
-    /// least-sort resolution intersects these to find the GLB-with-earliest-declaration-tie-break.
+    /// Return every `y` with `y <= s`. Least-sort resolution intersects these down-sets.
     /// Requires [`close`](Self::close).
     pub(crate) fn down_set(&self, s: SortId) -> &BTreeSet<SortId> {
         debug_assert!(self.closed, "down_set before close()");
@@ -145,21 +137,19 @@ impl Sorts {
         self.kind_of(a) == self.kind_of(b)
     }
 
-    /// A sort's index within its kind's [`Kind::index_order`] (Maude's `Sort::index()`).
-    /// Error sorts are index 0. Requires [`close`](Self::close).
+    /// A sort's index within its kind's [`Kind::index_order`]. Error sorts are index 0.
+    /// Requires [`close`](Self::close).
     pub fn component_index(&self, s: SortId) -> u32 {
         debug_assert!(self.closed, "component_index before close()");
         self.component_index[s.index()]
     }
 
-    /// Maude's per-component sort index order (`ConnectedComponent::ConnectedComponent`):
-    /// the error sort takes index 0; then a DFS from the component's first-declared sort
-    /// (`registerConnectedSorts`: explore declared subsorts first, then supersorts, appending each
-    /// **maximal** sort when visited); then Kahn's algorithm over the growing appended sequence
-    /// (`processSubsorts`: walking `index_order[i]`'s declared subsorts in declaration order,
-    /// a sort is appended when its last unresolved supersort is processed). The result is a linear
-    /// extension with supersorts first. The error sort's synthesized edges to the maximal sorts are
-    /// never walked (Maude's loop starts at index 1 and the error edges are inserted after the DFS).
+    /// Build a deterministic supersort-first linear extension for one kind. Index 0 is the error
+    /// sort. Registration starts at the first-declared member, visits declared subsorts before
+    /// supersorts, appends maximal sorts as they are reached, and records each non-maximal sort's
+    /// unresolved supersort count. Scanning the growing order then appends each declared subsort
+    /// when its final supersort has been processed. Only user-declared edges participate; the
+    /// synthesized error sort remains outside the traversal.
     fn kind_index_order(
         up: &[Vec<SortId>],
         down: &[Vec<SortId>],
@@ -260,11 +250,9 @@ impl Sorts {
         let mut kind_of: Vec<KindId> = vec![Id::from_raw(0); n0];
         for members in groups.into_values() {
             let kid: KindId = Id::from_raw(self.kinds.len() as u32);
-            // Name the kind after its MAXIMAL sorts (Maude's `printKind`: the component's top sorts), a
-            // maximal sort having no user supersort (empty `up`). List them in Maude's component
-            // sort-index order (`index_order`, a DFS topological numbering) rather than declaration order —
-            // they differ for a multi-top component, and a kind-level term prints its kind as this name
-            // (e.g. `metaUnify`'s undefined result `[UnificationPair?,MatchOrUnificationPair,MatchPair?]`).
+            // Name the kind after its maximal sorts (those with no user supersort), listed in
+            // component index order. This keeps kind-level output deterministic and aligns displayed
+            // names with the sort indices used by unifier enumeration.
             let err: SortId = Id::from_raw(self.sorts.len() as u32);
             self.sorts.push(Sort {
                 name: String::new(),
@@ -306,8 +294,8 @@ impl Sorts {
             geq[s] = seen;
         }
 
-        // 4b. Reject subsort cycles: two distinct user sorts that are mutually `<=` (Maude errors
-        // on these).
+        // 4b. Reject mutually reachable distinct user sorts so the subsort relation remains a
+        // partial order.
         for s in 0..n0 {
             let sid = Id::<Sort>::from_raw(s as u32);
             for &t in &geq[s] {
@@ -418,8 +406,8 @@ mod tests {
         assert!(!s.leq(top, a));
     }
 
-    /// Maude's per-component index order: error sort 0, then maximal sorts in DFS append order,
-    /// then Kahn's algorithm over declaration-ordered subsort lists (supersorts first).
+    /// Component indices put the error sort first, then DFS-discovered maximal sorts, then the
+    /// declaration-ordered topological remainder.
     #[test]
     fn component_index_order_diamond() {
         // Diamond declared bottom-up: A < B, A < C, B < D, C < D.
@@ -461,9 +449,8 @@ mod tests {
         }
     }
 
-    /// Maximal sorts are appended in the DFS's visit order, which follows the *declaration order*
-    /// of subsort edges — reversing the declarations reverses the maximal sorts' indices, and the
-    /// kind's printed name (`printKind`) lists them in that same component sort-index order.
+    /// Maximal sorts follow the DFS visit order induced by declared subsort edges. Reversing those
+    /// declarations reverses both their component indices and their order in the kind's printed name.
     #[test]
     fn component_index_order_follows_declaration_order() {
         let build = |flip: bool| {

@@ -1,4 +1,4 @@
-*** T01-check-boolean — Boolean SMT checks lifted from the reference suite (Misc/smtTest.maude)
+*** T01-check-boolean — Boolean SMT checks
 set show timing off .
 load smt
 

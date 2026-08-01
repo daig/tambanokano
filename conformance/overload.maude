@@ -1,6 +1,5 @@
-*** B2.1 least-sort-under-overloading conformance vs the reference binary:
-***   ~/Downloads/Maude-3/maude -no-banner conformance/overload.maude < /dev/null
-*** The printed `result <Sort>:` line is the least sort. Mirrors the engine.rs B2.1 tests.
+*** Least-sort-under-overloading conformance
+*** The printed `result <Sort>:` line is the least sort.
 
 fmod OVERLOAD-SORT is
   sorts Zero NzNat Nat .
