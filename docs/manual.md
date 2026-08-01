@@ -10,6 +10,8 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 
 ## 0. How to read this reference
 
+Use [The TNK Book](book.md) for a guided, nonnormative introduction: mental models, progressive syntax, practical workflows, debugging guidance, extended examples, and exercises. Use this Reference for exact syntax and semantics, feature states and profiles, error and Session-state contracts, completeness and resource boundaries, and API contracts; [Appendix L](#appendix-l--normative-clause-index) provides stable clause lookup. If the Book and this Reference differ, this Reference is authoritative.
+
 ### 0.1 Normative hierarchy
 
 **TNK-DOC-001 — Authority.** Contract clauses define intended TNK behavior. If this Reference is ambiguous, the behavior is unspecified until a clause resolves it. Rustdoc and the compiler define the exact Rust type and ownership surface of the installed release; this Reference defines its semantic behavior. `TNK-RECOVERY-001` separately records tentative current-release behavior at named invalid-input seams, including known deviations from the intended contracts.

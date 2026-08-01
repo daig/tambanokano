@@ -2,7 +2,7 @@
 
 tambanokano (TNK) is a Rust runtime for rewriting logic and membership equational logic. It provides a textual source and command surface for its documented feature set, plus reusable kernel, frontend, module, and session APIs.
 
-TNK supports order-sorted signatures, equations and rules, algebraic theories, rewriting and reachability search, strategies, unification, variants, narrowing, SMT integration, LTL model checking, module composition, reflection, and object-oriented modules. The exact stability and completeness boundary of every surface is defined in the [TNK Language and System Reference](docs/manual.md).
+Start with [The TNK Book](docs/book.md) for a guided, nonnormative path through modeling, search, verification, and Rust hosting. Use the [TNK Language and System Reference](docs/manual.md) for exact syntax and semantics, API and state-transition contracts, feature status, and completeness/resource boundaries.
 
 ## Quick start
 
@@ -143,6 +143,7 @@ The complete list is [§24, Unsupported and intentionally absent behavior](docs/
 
 ## Documentation
 
+- [The TNK Book](docs/book.md) — guided, nonnormative instruction through mental models, progressive workflows, extended examples, and exercises
 - [Language and System Reference](docs/manual.md) — normative syntax, semantics, APIs, feature states, diagnostics, resource limits, and command catalogue
 - [CHANGELOG](CHANGELOG.md) — release notes
 - [NOTICE](NOTICE) — licensing boundaries and redistributed companion libraries
