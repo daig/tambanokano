@@ -10,7 +10,7 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 
 ## 0. How to read this reference
 
-Use [The TNK Book](book.md) for a guided, nonnormative introduction: mental models, progressive syntax, practical workflows, debugging guidance, extended examples, and exercises. Use this Reference for exact syntax and semantics, feature states and profiles, error and Session-state contracts, completeness and resource boundaries, and API contracts; [Appendix L](#appendix-l--normative-clause-index) provides stable clause lookup. If the Book and this Reference differ, this Reference is authoritative.
+Use [TNK Quick Reference](cheatsheet.md) for a compact recall aid: core syntax, command selection, common controls, and high-impact gotchas. Use [The TNK Book](book.md) for a guided, nonnormative introduction: mental models, progressive syntax, practical workflows, debugging guidance, extended examples, and exercises. Use this Reference for exact syntax and semantics, feature states and profiles, error and Session-state contracts, completeness and resource boundaries, and API contracts; [Appendix L](#appendix-l--normative-clause-index) provides stable clause lookup. If the Book, Quick Reference, and this Reference differ, this Reference is authoritative.
 
 ### 0.1 Normative hierarchy
 
@@ -142,7 +142,7 @@ TNK assigns one matching/canonicalization theory to an operator from its attribu
 
 **TNK-TERM-002 — Associativity.** An associative application is flattened without changing left-to-right argument order. For an associative-commutative application, arguments form a deterministic canonical multiset. The internal sort order of equal-kind elements is Implementation-defined; clients that need mathematical AC equality compare multisets or canonical terms.
 
-**TNK-TERM-003 — Identities.** `id: e` is two-sided and participates in AU, ACU, and CUI construction and matching. On an associative operator, `left id: e` and `right id: e` collapse only the corresponding AU end. On a commutative operator a one-sided declaration becomes two-sided. A non-associative, non-commutative operator with only a one-sided identity remains a free binary constructor for ordinary construction/matching; no general CUI collapse is promised. Identity terms must be ground and sort-compatible.
+**TNK-TERM-003 — Identities.** `id: e` is two-sided and participates in AU, ACU, and CUI construction and matching. On an associative operator, `left id: e` and `right id: e` collapse only the corresponding AU end. On a commutative operator a one-sided declaration becomes two-sided. A non-associative, non-commutative operator with only a one-sided identity remains a free binary constructor for ordinary construction/matching; no general CUI collapse is promised. Identity terms must be ground and sort-compatible. At a supported identity-matching boundary, a pattern rooted at the operator can match a subject whose canonical form is not rooted there, with omitted operands bound to the identity.
 
 **TNK-TERM-004 — Idempotence.** `[idem]` identifies `f(x,x)` with `x` at canonicalization and matching boundaries supported by the CUI matcher. Non-ground unification under an idempotent operator is Unsupported; ground terms still canonicalize.
 
@@ -210,6 +210,8 @@ A condition is a conjunction of fragments evaluated left-to-right:
 
 **TNK-COND-001 — Backtracking.** If a later fragment fails, evaluation resumes the nearest earlier multi-solution matching or rewrite fragment. It then propagates outward to the statement matcher. Bindings introduced on a failed branch MUST be rolled back.
 
+The first complete condition branch is accepted. Enumeration among otherwise tied matcher solutions or rewrite states is Implementation-defined under `TNK-CMD-002`. A statement that uses a branch-introduced binding in its right side is portable only when the accepted branch is unique or every accepted branch produces the same canonical right side.
+
 **TNK-COND-002 — Variable discipline.** An equation or membership right side/target condition may use only variables bound by its left side or by earlier condition fragments. A rule may similarly introduce variables through earlier condition fragments; an executable statement with an unbound right-side variable is rejected. Rewrite fragments are legal only in rule conditions.
 
 **TNK-COND-003 — Divergence.** Rewrite conditions can explore an unbounded state space and recursive conditions can diverge. TNK avoids process-stack overflow at the recursive condition seam, but it does not impose a semantic timeout and exposes no cooperative cancellation token.
@@ -219,6 +221,8 @@ A condition is a conjunction of fragments evaluated left-to-right:
 **TNK-RULE-001 — Transition.** One rule transition selects a non-frozen position, matches one executable rule left side modulo the symbol theories, satisfies its condition, replaces the redex with the instantiated right side, and equationally reduces the resulting term where required by the driving command.
 
 Rule transitions are distinct from equation normalization. `reduce` never applies rules. `rewrite`, `frewrite`, `erewrite`, ordinary `search`, strategies, LTL model checking, and some condition fragments do.
+
+**TNK-RULE-002 — Model-theoretic obligations.** TNK does not prove termination or confluence of $E$, or coherence of $R$ with $E$ modulo $A$. Rule-fair rewriting and ordinary search canonicalize states before matching rules. A model that expects the transition relation to be well-defined modulo $E$ MUST make rule behavior coherent across $E$-equivalent representatives; otherwise a rule matching only a noncanonical representative can be absent from the explored graph.
 
 ### 3.6 Semantic relations and environments
 
@@ -950,7 +954,7 @@ The reusable source pipeline and its principal entry points are:
 | first-packed-parse choices on named command bubbles | Experimental | all; disambiguate portable source | `TNK-PARSE-002` |
 | equations, memberships, executable conditions | Stable | all | `TNK-REDUCE-*`, `TNK-MB-*`, `TNK-COND-*` |
 | free/AU/ACU/CUI canonicalization and matching | Stable | listed theory boundary | `TNK-TERM-*`, `TNK-MATCH-*` |
-| rule-fair/position-fair rewriting and BFS search | Stable | all | `TNK-REWRITE-001/002`, `TNK-SEARCH-*` |
+| rule semantics, rule-fair/position-fair rewriting, BFS search | Stable | model obligations in `TNK-RULE-002` | `TNK-RULE-*`, `TNK-REWRITE-001/002`, `TNK-SEARCH-*` |
 | saved-operation continuation without an intervening command | Stable | supported owners only | `TNK-CONT-001` |
 | failed-command continuation invalidation details | Experimental | Session renderer | `TNK-CONT-001` |
 | current invalid-input recovery and diagnostic gaps | Experimental | incorrect input only; do not rely on it | `TNK-RECOVERY-001`, Appendix H.4 |
@@ -1702,7 +1706,7 @@ The identifier is the stable reference; section numbers are navigational. The in
 | equations/reduction | `TNK-REDUCE-001`, `TNK-REDUCE-002`, `TNK-REDUCE-003` | §3.1 |
 | memberships | `TNK-MB-001`, `TNK-MB-002` | §3.2 |
 | conditions | `TNK-COND-001`, `TNK-COND-002`, `TNK-COND-003` | §3.4 |
-| rules and semantic notation | `TNK-RULE-001`, `TNK-SEM-001` | §§3.5–3.6 |
+| rules and semantic notation | `TNK-RULE-001`, `TNK-RULE-002`, `TNK-SEM-001` | §§3.5–3.6 |
 | lexer | `TNK-LEX-001`, `TNK-LEX-002`, `TNK-LEX-003` | §4 |
 | term parser | `TNK-PARSE-001`, `TNK-PARSE-002`, `TNK-PARSE-003` | §4.2 |
 | module/declaration/view surface | `TNK-MOD-001`, `TNK-DECL-001`, `TNK-STMT-001`, `TNK-VIEW-001` | §§5–6 |

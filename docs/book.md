@@ -9,7 +9,7 @@
 
 > **The authority boundary**
 >
-> This book teaches TNK; it does not define TNK. The normative companion is [The TNK Language and System Reference](manual.md); its exhaustive [normative clause index](manual.md#appendix-l--normative-clause-index) is the durable entry point for contract lookup. When an explanation here and a contract clause there appear to disagree, the Reference is authoritative. Stable identifiers such as `TNK-SEARCH-002` name Reference clauses, not rules created by this book.
+> This book teaches TNK; it does not define TNK. Use [TNK Quick Reference](cheatsheet.md) to recall syntax, commands, controls, and high-impact gotchas; use this Book to learn the underlying models and workflows. The normative companion is [The TNK Language and System Reference](manual.md); its exhaustive [normative clause index](manual.md#appendix-l--normative-clause-index) is the durable entry point for contract lookup. When an explanation here or in the Quick Reference and a contract clause there appear to disagree, the Reference is authoritative. Stable identifiers such as `TNK-SEARCH-002` name Reference clauses, not rules created by this book.
 
 TNK is an independent rewriting-logic system implemented by the tambanokano Rust workspace. Its source language inherits a substantial intellectual lineage from Maude, but neither Maude behavior nor Maude documentation defines TNK. You do not need to know Maude to read this book.
 
@@ -1096,6 +1096,12 @@ ceq eval(var(X), E) = N
 
 If an environment contains several bindings for the same name, the AC matcher can produce several condition solutions. A later fragment may reject the first and cause TNK to resume the nearest earlier multi-solution fragment.
 
+### Treat a binding condition as a relation
+
+A successful statement stops at the first complete condition branch. In the environment example, duplicate bindings for `X` may supply several values for `N`. If no later fragment distinguishes them and the right side uses `N`, the equation's result follows the matcher's tie order, which is implementation-defined.
+
+For a function-like lookup, enforce a uniqueness invariant or require duplicate bindings to carry the same canonical value. If every choice matters, expose the relation through matching, rules, or search instead of collapsing it to one value with an equation.
+
 ### Backtracking restores bindings
 
 Consider:
@@ -1141,6 +1147,7 @@ An executable statement with an unbound right-side variable is invalid. Under th
 - Assuming a Boolean abbreviation works in a prelude-free module.
 - Putting a rewrite fragment in an equation or membership condition.
 - Treating one failed matcher branch as failure of the entire conditional statement.
+- Using a multi-solution binding as a function result without a uniqueness invariant.
 - Assuming nested rewrite search is automatically finite.
 
 ### Exercises
@@ -1217,6 +1224,24 @@ One-sided identities need special care. On associative operators, `left id:` and
 
 Associativity combined with idempotence is not a supported theory family in this edition. Do not infer support for `[assoc idem]` or `[assoc comm idem]` from the separate AU/ACU and CUI implementations. If the intended value is a mathematical set, use a supported representation with explicit duplicate-elimination equations, or keep the operation in the non-associative CUI family and accept its binary shape.
 
+### An identity can remove the pattern root
+
+Identity matching is not syntactic tree matching. Consider:
+
+```maude
+fmod COLLAPSE-PATTERN is
+  sort List .
+  ops nil a b : -> List [ctor] .
+  op __ : List List -> List [ctor assoc id: nil] .
+  var X : List .
+  eq a X = b .
+endfm
+```
+
+`reduce in COLLAPSE-PATTERN : a .` returns `b`. The equation pattern is rooted at concatenation, but it matches the bare constant `a` by binding `X` to `nil`, because `a nil` and `a` are the same AU value.
+
+This applies at supported identity-matching boundaries: an apparent operator layer may collapse away. If an operand must be nonempty, express that invariant with a suitable sort or condition rather than assuming the pattern root proves it.
+
 ### Iteration represents huge unary chains compactly
 
 For a unary `[iter]` operator:
@@ -1281,6 +1306,7 @@ Keeping these layers separate makes both the model and its tests clearer.
 - Assuming idempotent matching implies supported idempotent unification.
 - Using `xmatch` as arbitrary recursive subterm search.
 - Forgetting that an identity adds empty bindings to the matcher solution domain.
+- Assuming a pattern rooted at an identity-bearing operator requires that operator to remain in the subject's canonical syntax.
 - Reading an iteration token as a built-in arithmetic power.
 
 ### Exercises
@@ -1418,7 +1444,7 @@ Equations answer “What value is this?” Rules answer “What can happen next?
 **Feature status:** Stable ordinary rules and conditions  
 **Profile:** default; no prelude required  
 **Prerequisites:** Parts I–II  
-**Reference map:** `TNK-RULE-001`, `TNK-REDUCE-*`, `TNK-COND-*`, `TNK-SEM-001`
+**Reference map:** `TNK-RULE-*`, `TNK-REDUCE-*`, `TNK-COND-*`, `TNK-SEM-001`
 
 We will model two workers, `alice` and `bob`, that share one key. A worker can be `idle`, `waiting`, or `inside` a critical section. The key is a token in an AC configuration.
 
@@ -1485,6 +1511,23 @@ Only the rule application adds one unit of rule depth. Equation, membership, mat
 
 Equation normal form and rule normal form answer different questions. Equation normal form means the deterministic computation layer has no further equation or hook step at the positions selected by its strategy. Rule normal form means no admissible ordinary rule transition remains. A state can be equation-normal and still have many rule successors; every search node has exactly that shape.
 
+### Keep rules coherent with equation canonicalization
+
+Rule-fair rewriting and search normalize states before matching rules. That creates a modeling obligation:
+
+```maude
+mod COHERENCE-DEMO is
+  sort S .
+  ops a b c : -> S [ctor] .
+  eq a = b .
+  rl [r] : a => c .
+endm
+```
+
+Here `rewrite [1] in COHERENCE-DEMO : a .` returns `b`, and `search [1] in COHERENCE-DEMO : a =>+ c .` finds no solution. Normalization replaces `a` by `b` before rule `r` can match.
+
+TNK does not prove equation termination or confluence, or rule coherence with equations. Make rules agree on equation-equivalent representatives—usually by writing left sides against canonical forms—so normalization does not erase intended transitions.
+
 ### Rule labels are part of the modeling interface
 
 Labels make transitions inspectable and controllable:
@@ -1530,6 +1573,7 @@ This lets one module carry logical material beyond its ordinary transition relat
 - Counting equation cleanup as additional rule depth.
 - Marking a rule `[nonexec]` and expecting ordinary search to see it.
 - Freezing an argument to change equational evaluation order.
+- Writing a rule only for a noncanonical representative and expecting normalization to preserve that transition.
 
 ### Exercises
 
@@ -4757,7 +4801,7 @@ An observed finite prefix is not a proof unless the exercise explicitly asks onl
 
 ## Appendix C — Navigating the Reference
 
-Use stable `TNK-*` identifiers rather than memorizing section numbers.
+Use [TNK Quick Reference](cheatsheet.md) for fast syntax and command recall. For exact semantics, use stable `TNK-*` identifiers rather than memorizing Reference section numbers.
 
 ### Question-to-clause map
 
@@ -4766,7 +4810,7 @@ Use stable `TNK-*` identifiers rather than memorizing section numbers.
 | What makes two terms structurally equal? | `TNK-TERM-*` |
 | Which sort does a term have? | `TNK-SORT-*`, `TNK-MB-*` |
 | Why did a term parse this way? | `TNK-LEX-*`, `TNK-PARSE-*` |
-| What does one equation/rule step mean? | `TNK-REDUCE-*`, `TNK-RULE-001` |
+| What does one equation/rule step mean? | `TNK-REDUCE-*`, `TNK-RULE-*` |
 | How do conditions backtrack? | `TNK-COND-*` |
 | Which rewrite driver should I use? | `TNK-REWRITE-*`, `TNK-CONT-001` |
 | Is search complete and in what order? | `TNK-SEARCH-*`, `TNK-CMD-*` |
@@ -4956,6 +5000,7 @@ Classify the cause before changing either implementation or expected output. Acc
 ### Further reading
 
 - [The TNK Language and System Reference](manual.md): normative TNK behavior.
+- [TNK Quick Reference](cheatsheet.md): nonnormative syntax, command, control, and gotcha recall.
 - Workspace Rustdoc: exact installed Rust types and ownership signatures.
 - Maude manual and book: historical language, theory, and modeling background; nonnormative for TNK.
 

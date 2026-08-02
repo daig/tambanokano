@@ -16,7 +16,7 @@ Initial supported release of tambanokano.
 - Module and view databases with imports, sums, structural renaming, parameter instantiation, dependent rebuilds, import hygiene checks, and transactional definition failure.
 - Object-module desugaring, external stream objects, interpreter-manager objects, metalevel command descent, module/term reflection, and child interpreter state.
 - Reusable `tnk-core`, `tnk-frontend`, `tnk-modules`, and `tnk-session` APIs plus the interactive `tnk-repl` executable.
-- A normative language and system reference covering syntax, observable semantics, API preconditions, diagnostics, resource limits, feature stability, and unsupported boundaries.
+- A documentation suite comprising the normative language and system Reference, a guided TNK Book, and a compact Quick Reference for syntax, commands, controls, and modeling gotchas.
 
 ### Correctness and hardening
 

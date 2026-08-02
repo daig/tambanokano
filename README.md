@@ -11,6 +11,8 @@
 <p align="center">
   <a href="docs/book.md">Book</a>
   ·
+  <a href="docs/cheatsheet.md">Quick Reference</a>
+  ·
   <a href="docs/manual.md">Reference</a>
   ·
   <a href="CHANGELOG.md">Changelog</a>
@@ -22,7 +24,7 @@
 
 tambanokano (TNK) is a Rust runtime for rewriting logic and membership equational logic. It provides a textual source and command surface for its documented feature set, plus reusable kernel, frontend, module, and session APIs.
 
-Start with [The TNK Book](docs/book.md) for a guided, nonnormative path through modeling, search, verification, and Rust hosting. Use the [TNK Language and System Reference](docs/manual.md) for exact syntax and semantics, API and state-transition contracts, feature status, and completeness/resource boundaries.
+Start with [The TNK Book](docs/book.md) for a guided, nonnormative path through modeling, search, verification, and Rust hosting. Keep [TNK Quick Reference](docs/cheatsheet.md) nearby for syntax, command selection, controls, and high-impact gotchas. Use the [TNK Language and System Reference](docs/manual.md) for exact syntax and semantics, API and state-transition contracts, feature status, and completeness/resource boundaries.
 
 ## Quick start
 
@@ -164,6 +166,7 @@ The complete list is [§24, Unsupported and intentionally absent behavior](docs/
 ## Documentation
 
 - [The TNK Book](docs/book.md) — guided, nonnormative instruction through mental models, progressive workflows, extended examples, and exercises
+- [TNK Quick Reference](docs/cheatsheet.md) — compact syntax, command, control, capability, and modeling-gotcha recall
 - [Language and System Reference](docs/manual.md) — normative syntax, semantics, APIs, feature states, diagnostics, resource limits, and command catalogue
 - [CHANGELOG](CHANGELOG.md) — release notes
 - [NOTICE](NOTICE) — licensing boundaries and redistributed companion libraries
