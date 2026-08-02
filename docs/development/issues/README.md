@@ -25,6 +25,7 @@ The user-facing contract remains in [`docs/manual.md`](../../manual.md). Issue r
 | ID | Issue | Type | User-facing boundary |
 |---|---|---|---|
 | TNK-DEV-002 | [Phase I-C concurrent runtime](TNK-DEV-002-ic-concurrent-runtime.md) | Feature | Reference §17, §24, Appendix K.1 |
+| TNK-DEV-017 | [Typed Rust reducers and future control extensions](TNK-DEV-017-typed-rust-reducers.md) ([focused Stage 1 design](../strict-rust-reducers-design.md)) | Runtime/API feature | Reference §3.2, §16.1, and Appendix G |
 
 ## Pending decisions
 
