@@ -3496,6 +3496,7 @@ Choose the highest layer that provides the result type your application needs.
 | tokenize, parse, build an import-free module, print terms | `tnk-frontend` |
 | maintain imports, views, flattening, dependency rebuilds | `tnk-modules` |
 | construct signatures and run typed algorithms directly | `tnk-core` |
+| add a pure strict Rust equational function to source modules | `tnk-core::host` catalog plus a catalog-aware `tnk-session`/loader |
 
 Starting below `Session` increases control and responsibility. Do not bypass module flattening or rooting rules merely to avoid parsing text output.
 
@@ -3577,6 +3578,69 @@ session.set_stdin("first line\nsecond line\n");
 ```
 
 This replaces the scripted input consumed by later `erewrite` `getLine` requests. It does not replace the host's source-submission channel.
+
+### Strict Rust reducers
+
+Use a strict reducer when deterministic host computation belongs in equational normalization but is impractical to express as TNK equations—for example, byte-oriented text normalization, content hashing, or a checked native codec. This is an Optional runtime capability and a trusted in-process boundary, not a plugin or sandbox.
+
+Registration happens before module construction:
+
+```rust
+use tnk_core::host::{HostFunctionCatalog, codecs};
+use tnk_session::Session;
+
+fn lowercase_ascii(input: &[u8]) -> Vec<u8> {
+    input.to_ascii_lowercase()
+}
+
+let catalog = HostFunctionCatalog::builder()
+    .register_typed1(
+        "text.lowercase-ascii",
+        codecs::string(),
+        codecs::string(),
+        lowercase_ascii,
+    )
+    .expect("valid unique reducer registration")
+    .build();
+
+let mut session = Session::builder()
+    .host_functions(catalog)
+    .build();
+```
+
+The capability key has at least two `.`-separated segments. Every segment starts with lowercase ASCII,
+contains only lowercase ASCII letters, digits, and interior `-`, and never ends in `-`.
+
+The source operator names the same capability and supplies the string constructor required to encode the result:
+
+```maude
+fmod HOST-TEXT is
+  sort String .
+  op <Strings> : -> String
+    [ctor special (id-hook StringSymbol)] .
+  op lowercaseAscii : String -> String
+    [special (id-hook HostFunctionSymbol (text.lowercase-ascii)
+              op-hook stringSymbol (<Strings> : ~> String))] .
+endfm
+```
+
+Now `reduce in HOST-TEXT : lowercaseAscii("TNK-V1") .` produces `"tnk-v1"`. TNK first normalizes the direct argument, borrows the existing string payload as `&[u8]` without cloning it, invokes Rust once at the final top attempt, counts the successful host return once, checks its selected result sort, and then normalizes the returned term. The structured event is `TraceEvent::Rewrite { kind: RewriteKind::HostFunction, host_key: Some(canonical_key), ... }`; rendered host traces show that same key, while every other `TraceEvent::Rewrite` has `host_key: None`. Typed unary/binary adapters call Rust only after every input decodes; a miss declines without invoking the callback. Their owned `Vec<u8>` output becomes a new TNK byte string through the resolved `stringSymbol`.
+
+The typed string helpers cover unary and binary byte-string functions. Implement `StrictReducer` directly when the function must:
+
+- accept symbolic normal forms rather than only decoded native values;
+- require declaration-relative operator or constant hooks through `StrictReducerDescriptor`;
+- inspect `DagRef` structure or groundness;
+- build constants or theory-aware free/ACU/AU/CUI applications through `StrictReduceCtx`;
+- distinguish `StrictOutcome::Decline` from `ReducerFault`.
+
+Callback lifetimes prevent proof-bearing DAG wrappers from escaping. The context exposes neither raw `DagId` nor `&mut Engine`, cannot re-enter reduction, and constructs only same-signature results with declared theory and identity canonicalization. This protects engine provenance and GC/caching invariants; it does not make arbitrary callback code safe. A callback must be deterministic and referentially transparent, with no time, I/O, randomness, mutable result-affecting state, or externally visible side effects. It executes synchronously without cancellation, timeout, or preemption; its author owns termination and CPU/memory bounds. Returning `ReducerFault` restores TNK-owned operation state, counters, and trace append state, attempts no equation fallback, and faults a resumable owner so later calls return the same error. That atomicity does not cover callback-authored external side effects. A panic is not caught or translated to `ReducerFault`, carries no rollback guarantee, and follows the embedding's Rust panic policy.
+
+Use `Session::builder().host_functions(catalog)` for the ordinary source path. `load_source_with_host_functions` and `load_program_with_host_functions` carry the same capability into lower-level frontend/module pipelines. `Engine::with_host_functions` plus `bind_host_function` is the syntax-free path. Catalog-unaware constructors use an empty catalog, so a source `HostFunctionSymbol` attachment then fails module construction rather than becoming inert.
+
+The catalog is immutable and may be cloned into independent Sessions. Child interpreters and reflected module builds inherit the owning Session's catalog. To replace an implementation, build a new Engine or Session; live replacement after execution is deliberately unavailable.
+
+Strict reducers cannot short-circuit an argument, request staged evaluation, perform stateful or nondeterministic work, or own external I/O. Those jobs require evaluator-control, rewrite, descent, or external-object contracts. The reserved `HostControlSymbol` class installs no control protocol, never consults the strict catalog, and remains inert/nonbinding even if its token is a registered strict key. See [Reference §16.1.1](manual.md#1611-strict-rust-reducers) and [Appendix G.3](manual.md#g3-strict-host-function-attachments) for the exact strategy, hook, fault, and result-validation rules.
 
 ### Resume one bounded operation
 

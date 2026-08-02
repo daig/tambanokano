@@ -9,6 +9,7 @@
 
 use crate::dag::DagId;
 use crate::engine::{CompiledFragment, Engine};
+use crate::host::ReducerFault;
 use crate::root::RootGuard;
 use crate::theory::LhsAutomaton;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -54,6 +55,7 @@ struct State {
 }
 
 /// One search solution: the goal-variable bindings and the state + counts to report.
+#[derive(Debug)]
 pub struct Solution {
     pub number: u32,
     pub state: usize,
@@ -89,16 +91,16 @@ pub(crate) struct RawSuccessors {
 /// The rewrite-engine operations needed by [`StateGraph`]. Implementations are statically dispatched:
 /// ordinary search uses [`Engine`], while model checking supplies the active `Runtime`/`Signature` view.
 pub(crate) trait GraphContext {
-    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors;
+    fn graph_state_successors(&mut self, root: DagId) -> Result<RawSuccessors, ReducerFault>;
     fn graph_replay_rewrites(&mut self, rewrites: u64);
-    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId;
+    fn graph_reduce_successor(&mut self, successor: DagId) -> Result<DagId, ReducerFault>;
     fn graph_dag_hash(&self, id: DagId) -> u64;
     fn graph_deep_equal(&self, lhs: DagId, rhs: DagId) -> bool;
     fn graph_root(&self, id: DagId) -> RootGuard;
 }
 
 impl GraphContext for Engine {
-    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors {
+    fn graph_state_successors(&mut self, root: DagId) -> Result<RawSuccessors, ReducerFault> {
         self.state_successors(root)
     }
 
@@ -106,7 +108,7 @@ impl GraphContext for Engine {
         self.replay_graph_rewrites(rewrites);
     }
 
-    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {
+    fn graph_reduce_successor(&mut self, successor: DagId) -> Result<DagId, ReducerFault> {
         self.reduce_successor(successor)
     }
 
@@ -128,6 +130,27 @@ pub(crate) struct GraphSuccessor {
     pub(crate) state: usize,
     /// True only when committing this rewrite result inserted a new canonical state.
     pub(crate) discovered: bool,
+}
+
+struct RawSuccessorCheckpoint {
+    rule_id: u32,
+    term: DagId,
+    enumeration_rewrites: u64,
+    root: RootGuard,
+}
+
+struct StateCheckpoint {
+    fwd: BTreeMap<usize, BTreeSet<u32>>,
+    successor_order: Vec<usize>,
+    raw: Option<Vec<RawSuccessorCheckpoint>>,
+    raw_tail_rewrites: u64,
+    expanded: bool,
+}
+
+struct StateGraphCheckpoint {
+    states_len: usize,
+    states: Vec<StateCheckpoint>,
+    index: HashMap<u64, Vec<usize>>,
 }
 
 /// Shared, lazily expanded reachable-state graph used by ordinary search and LTL model checking.
@@ -164,20 +187,23 @@ impl StateGraph {
         context: &mut C,
         state: usize,
         transition: usize,
-    ) -> Option<GraphSuccessor> {
-        if let Some(&target) = self.states.get(state)?.successor_order.get(transition) {
-            return Some(GraphSuccessor {
+    ) -> Result<Option<GraphSuccessor>, ReducerFault> {
+        let Some(source) = self.states.get(state) else {
+            return Ok(None);
+        };
+        if let Some(&target) = source.successor_order.get(transition) {
+            return Ok(Some(GraphSuccessor {
                 state: target,
                 discovered: false,
-            });
+            }));
         }
         loop {
             if self.states[state].expanded {
-                return None;
+                return Ok(None);
             }
             if self.states[state].raw.is_none() {
                 let term = self.states[state].term;
-                let batch = context.graph_state_successors(term);
+                let batch = context.graph_state_successors(term)?;
                 let source = &mut self.states[state];
                 source.raw = Some(batch.entries.into());
                 source.raw_tail_rewrites = batch.tail_rewrites;
@@ -195,11 +221,13 @@ impl StateGraph {
                 }
             };
             context.graph_replay_rewrites(tail_rewrites);
-            let next = next?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
             context.graph_replay_rewrites(next.enumeration_rewrites);
             let (rule_id, successor) = (next.rule_id, next.term);
 
-            let reduced = context.graph_reduce_successor(successor);
+            let reduced = context.graph_reduce_successor(successor)?;
             let hash = context.graph_dag_hash(reduced);
             let existing = self.lookup(context, hash, reduced);
             let (target, discovered) = match existing {
@@ -235,10 +263,65 @@ impl StateGraph {
             }
             self.states[state].successor_order.push(target);
             debug_assert_eq!(self.states[state].successor_order.len() - 1, transition);
-            return Some(GraphSuccessor {
+            return Ok(Some(GraphSuccessor {
                 state: target,
                 discovered,
+            }));
+        }
+    }
+
+    fn checkpoint<C: GraphContext>(&self, context: &C) -> StateGraphCheckpoint {
+        StateGraphCheckpoint {
+            states_len: self.states.len(),
+            states: self
+                .states
+                .iter()
+                .map(|state| StateCheckpoint {
+                    fwd: state.fwd.clone(),
+                    successor_order: state.successor_order.clone(),
+                    raw: state.raw.as_ref().map(|raw| {
+                        raw.iter()
+                            .map(|successor| RawSuccessorCheckpoint {
+                                rule_id: successor.rule_id,
+                                term: successor.term,
+                                enumeration_rewrites: successor.enumeration_rewrites,
+                                root: context.graph_root(successor.term),
+                            })
+                            .collect()
+                    }),
+                    raw_tail_rewrites: state.raw_tail_rewrites,
+                    expanded: state.expanded,
+                })
+                .collect(),
+            index: self.index.clone(),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: StateGraphCheckpoint) {
+        self.states.truncate(checkpoint.states_len);
+        for (state, saved) in self.states.iter_mut().zip(checkpoint.states) {
+            state.fwd = saved.fwd;
+            state.successor_order = saved.successor_order;
+            state.raw = saved.raw.map(|raw| {
+                raw.into_iter()
+                    .map(|successor| RawSuccessor {
+                        rule_id: successor.rule_id,
+                        term: successor.term,
+                        enumeration_rewrites: successor.enumeration_rewrites,
+                        _root: successor.root,
+                    })
+                    .collect()
             });
+            state.raw_tail_rewrites = saved.raw_tail_rewrites;
+            state.expanded = saved.expanded;
+        }
+        self.index = checkpoint.index;
+    }
+
+    fn discard_pending(&mut self) {
+        for state in &mut self.states {
+            state.raw = None;
+            state.raw_tail_rewrites = 0;
         }
     }
 
@@ -314,6 +397,7 @@ impl StateGraph {
 
 /// The state currently being expanded, one successor at a time (lazy generation — so a bounded
 /// `search [n]` generates only as many successors as it needs, and `continue` resumes mid-expansion).
+#[derive(Clone, Copy)]
 struct Expanding {
     state: usize,
     cursor: usize,
@@ -335,6 +419,8 @@ pub struct Search {
     solution_count: u32,
     /// Whether state 0 has been tested against the goal yet (it is seeded, not discovered by expansion).
     tested_initial: bool,
+    /// The first reducer fault terminally invalidates this resumable search.
+    fault: Option<ReducerFault>,
 }
 
 impl Search {
@@ -362,6 +448,7 @@ impl Search {
             pending: VecDeque::new(),
             solution_count: 0,
             tested_initial: false,
+            fault: None,
         }
     }
 
@@ -369,36 +456,72 @@ impl Search {
         self.graph.len()
     }
 
-    /// Return the next solution, generating only enough of the BFS to find it. `continue` resumes the
-    /// same expansion. One-successor quanta prevent bounded searches from doing unnecessary work and
-    /// preserve rewrite snapshots across counter resets.
+    /// Return the next solution, generating only enough of the BFS to find it. Panics on reducer
+    /// faults; embeddings should use [`try_next_solution`](Self::try_next_solution).
     pub fn next_solution(&mut self, engine: &mut Engine) -> Option<Solution> {
+        self.try_next_solution(engine)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`next_solution`](Self::next_solution).
+    pub fn try_next_solution(
+        &mut self,
+        engine: &mut Engine,
+    ) -> Result<Option<Solution>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let checkpoint = engine.semantic_checkpoint();
+        let graph_checkpoint = self.graph.checkpoint(engine);
+        let solution_count = self.solution_count;
+        let tested_initial = self.tested_initial;
+        match self.try_next_solution_inner(engine) {
+            Ok(solution) => Ok(solution),
+            Err(fault) => {
+                engine.restore_semantic_checkpoint(checkpoint);
+                self.graph.restore(graph_checkpoint);
+                self.solution_count = solution_count;
+                self.tested_initial = tested_initial;
+                self.frontier.clear();
+                self.expanding = None;
+                self.pending.clear();
+                self.graph.discard_pending();
+                self.fault = Some(fault.clone());
+                Err(fault)
+            }
+        }
+    }
+
+    fn try_next_solution_inner(
+        &mut self,
+        engine: &mut Engine,
+    ) -> Result<Option<Solution>, ReducerFault> {
         // State 0 is seeded (not discovered by expansion); test it once — handles `=>*`'s state-0 solution.
         if !self.tested_initial {
             self.tested_initial = true;
-            self.test_discovered(engine, 0);
+            self.test_discovered(engine, 0)?;
         }
         loop {
-            if let Some(sol) = self.pending.pop_front() {
-                return Some(sol);
+            if let Some(solution) = self.pending.pop_front() {
+                return Ok(Some(solution));
             }
-            if !self.step(engine) {
-                return None;
+            if !self.step(engine)? {
+                return Ok(None);
             }
         }
     }
 
     /// Advance the lazy BFS by one quantum: generate the next successor of the state under expansion, or
     /// move on to the next frontier state. Returns `false` when the reachable space is exhausted.
-    fn step(&mut self, engine: &mut Engine) -> bool {
+    fn step(&mut self, engine: &mut Engine) -> Result<bool, ReducerFault> {
         if self.expanding.is_none() {
             // Take the next frontier state to expand. Handle one state per call (returning `true` for
             // progress) so a queued solution is never lost to an exhaustion `false` in the same call.
             let Some(state) = self.frontier.pop_front() else {
-                return false;
+                return Ok(false);
             };
             if !self.may_expand(state) {
-                return true;
+                return Ok(true);
             }
             self.expanding = Some(Expanding { state, cursor: 0 });
         }
@@ -406,22 +529,22 @@ impl Search {
         let expanding = self.expanding.as_mut().expect("expansion initialized");
         let source = expanding.state;
         let transition = expanding.cursor;
-        match self.graph.get_next_state(engine, source, transition) {
+        match self.graph.get_next_state(engine, source, transition)? {
             None => {
                 self.expanding = None;
                 if transition == 0 {
-                    self.test_normal_form(engine, source);
+                    self.test_normal_form(engine, source)?;
                 }
             }
             Some(successor) => {
                 expanding.cursor += 1;
                 if successor.discovered {
                     self.frontier.push_back(successor.state);
-                    self.test_discovered(engine, successor.state);
+                    self.test_discovered(engine, successor.state)?;
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Whether state `s` may generate successors (the depth caps of `=>1` and the `[_, max_depth]` bound).
@@ -434,23 +557,25 @@ impl Search {
     }
 
     /// `=>1`/`=>+`/`=>*`: if state `s` is at a qualifying depth, match the goal and queue solutions.
-    fn test_discovered(&mut self, engine: &mut Engine, s: usize) {
-        let ok = match self.arrow {
-            Arrow::One => self.graph.state_depth(s) == 1,
-            Arrow::Plus => self.graph.state_depth(s) >= 1,
+    fn test_discovered(&mut self, engine: &mut Engine, state: usize) -> Result<(), ReducerFault> {
+        let eligible = match self.arrow {
+            Arrow::One => self.graph.state_depth(state) == 1,
+            Arrow::Plus => self.graph.state_depth(state) >= 1,
             Arrow::Star => true,
             Arrow::Bang => false, // a `=>!` solution is a normal form (see `test_normal_form`)
         };
-        if ok {
-            self.queue_solutions(engine, s);
+        if eligible {
+            self.queue_solutions(engine, state)?;
         }
+        Ok(())
     }
 
     /// `=>!`: state `s` has no successors (a normal form) — match the goal and queue solutions.
-    fn test_normal_form(&mut self, engine: &mut Engine, s: usize) {
+    fn test_normal_form(&mut self, engine: &mut Engine, state: usize) -> Result<(), ReducerFault> {
         if self.arrow == Arrow::Bang {
-            self.queue_solutions(engine, s);
+            self.queue_solutions(engine, state)?;
         }
+        Ok(())
     }
 
     /// Match the goal, filtered by `such_that`, against state `s` and queue one [`Solution`] per
@@ -460,21 +585,22 @@ impl Search {
     /// A `=>!` state is tested only after successor exhaustion, so its counts include work performed
     /// between discovery and normal-form confirmation. The other arrows test qualifying states when
     /// they are discovered.
-    fn queue_solutions(&mut self, engine: &mut Engine, s: usize) {
-        let term = self.graph.state_dag(s).expect("search state exists");
+    fn queue_solutions(&mut self, engine: &mut Engine, state: usize) -> Result<(), ReducerFault> {
+        let term = self.graph.state_dag(state).expect("search state exists");
         let states = self.graph.len();
         for (bindings, rewrites) in
-            engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term)
+            engine.eval_goal(&self.goal, self.goal_nr_vars, &self.such_that, term)?
         {
             self.solution_count += 1;
             self.pending.push_back(Solution {
                 number: self.solution_count,
-                state: s,
+                state,
                 bindings,
                 states,
                 rewrites,
             });
         }
+        Ok(())
     }
 
     /// The path from the initial state (state 0) to state `n`, following BFS-tree `parent` links — the

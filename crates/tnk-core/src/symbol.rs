@@ -114,6 +114,10 @@ pub struct Symbol {
     /// root attempts; associative semi-eager strategies use a dynamic form because a flattened
     /// runtime node can have more arguments than its binary declaration.
     pub(crate) strategy: Option<EvalStrategy>,
+    /// Whether the last raw strategy supplied to the signature was exactly the strict eager argument
+    /// order, with an optional sole final top attempt. Unlike `strategy`, this retains rejected
+    /// duplicate and incremental source steps after normalization.
+    pub(crate) strict_eager_source_strategy: bool,
     /// Frozen arguments (`frozen` / `frozen (…)`): the 0-based argument positions that
     /// `rewrite`/`frewrite`/`search` must **not** rewrite within. `None` = no frozen args; `Some([])` =
     /// all arguments frozen (`[frozen]`); `Some([0,2])` = those positions. Inert for equational `reduce`.
@@ -221,6 +225,8 @@ pub struct SatSolverHooks {
 /// directly.
 #[derive(Debug, Clone)]
 pub enum SpecialOp {
+    /// Host-provided pure strict reducer resolved through the signature's immutable catalog.
+    HostFunction(crate::host::HostBindingId),
     /// `_==_` / `_=/=_`: reduce both arguments, compare them structurally, and return the configured
     /// equality or inequality constant.
     Equality { eq: SymbolId, neq: SymbolId },

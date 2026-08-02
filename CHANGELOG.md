@@ -2,6 +2,21 @@
 
 All notable user-visible changes are documented here. This project follows Semantic Versioning for release identifiers; compatibility guarantees are qualified by the feature states in the normative reference.
 
+## [Unreleased]
+
+### Added
+
+- Added immutable host-function catalogs and strict Rust reducers: source operators can bind typed or scoped in-process callbacks through `HostFunctionSymbol`, with eager argument normalization, build-time strategy/hook validation, equation fallthrough, checked result normalization, structured tracing/accounting, and fault propagation across Session, reflection, child-interpreter, rewrite, search, variant, and narrowing paths.
+- Added catalog-aware Session, frontend, module, reflection, and low-level Engine construction paths. Catalogs survive module sums, views, parameter instantiation, renaming, dependent rebuilds, and nested execution without process-global registration or live callback replacement.
+
+### Correctness and hardening
+
+- Scoped callback DAG wrappers and callback-lifetime `HostSymbol` capabilities prevent raw engine-handle escape, captured or cross-engine callback construction, reentrant reduction, and unsafe collection. Host bindings are sealed before semantic execution; missing capabilities and incompatible eager schedules, overloads, sorts, theories, or supporting hooks reject module construction.
+
+### Documentation
+
+- Documented the public reducer API, source attachment grammar, purity/trust boundary, fault policy, supported typed adapters, feature status, and end-to-end configured Session workflow.
+
 ## [0.1.0] - 2026-07-29
 
 Initial supported release of tambanokano.

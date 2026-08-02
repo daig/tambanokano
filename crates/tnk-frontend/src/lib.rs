@@ -7,6 +7,8 @@
 //! syntax (precedence, gather bounds, and mixfix tokens), while `tnk-core` stores the
 //! executable semantics. Frontend `SymbolSyntax` tables retain the information needed
 //! by the grammar and pretty-printer.
+//! Catalog-aware loaders accept an immutable [`tnk_core::host::HostFunctionCatalog`] before signature
+//! construction; catalog-unaware entry points use an empty catalog.
 //!
 
 pub mod build_term;

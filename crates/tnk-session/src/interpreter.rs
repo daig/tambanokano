@@ -12,10 +12,11 @@ use tnk_core::external::{
     ExternalResponse, ExternalRewriteBreakdown, ExternalTargetToken, MetaEnvelope, MetaNode,
     MetaNodeRef, MetaTransport,
 };
+use tnk_core::host::{HostFunctionCatalog, ReducerFault};
 use tnk_core::symbol::{MetaHooks, MetaOp};
 use tnk_frontend::lex::Interner;
 use tnk_modules::db::ModuleDb;
-use tnk_modules::meta::{MetaDescent, down_term, up_parsed_term, up_sort};
+use tnk_modules::meta::{MetaDescent, try_down_term, up_parsed_term, up_sort};
 use tnk_modules::view::ViewDb;
 
 use super::Session;
@@ -96,6 +97,7 @@ struct CursorEntry {
 /// handler has returned, so no child operation can run while the parent engine is borrowed.
 pub(super) struct ManagerAction {
     pub response: Option<ExternalResponse>,
+    pub fault: Option<ReducerFault>,
     pub register: Option<(u64, MetaEnvelope)>,
     pub unregister: Option<ExternalTargetToken>,
 }
@@ -104,6 +106,7 @@ impl ManagerAction {
     fn rejected() -> Self {
         Self {
             response: None,
+            fault: None,
             register: None,
             unregister: None,
         }
@@ -112,6 +115,7 @@ impl ManagerAction {
     fn reply(response: ExternalResponse) -> Self {
         Self {
             response: Some(response),
+            fault: None,
             register: None,
             unregister: None,
         }
@@ -123,6 +127,7 @@ pub(super) struct LocalInterpreterManager<'a> {
     source_interner: &'a Interner,
     source_db: &'a ModuleDb,
     source_views: &'a ViewDb,
+    host_functions: &'a HostFunctionCatalog,
 }
 
 impl<'a> LocalInterpreterManager<'a> {
@@ -131,12 +136,14 @@ impl<'a> LocalInterpreterManager<'a> {
         source_interner: &'a Interner,
         source_db: &'a ModuleDb,
         source_views: &'a ViewDb,
+        host_functions: &'a HostFunctionCatalog,
     ) -> Self {
         Self {
             registry,
             source_interner,
             source_db,
             source_views,
+            host_functions,
         }
     }
 
@@ -171,7 +178,12 @@ impl<'a> LocalInterpreterManager<'a> {
             // point because its target was concurrently invalidated, leave the message untouched.
             return ManagerAction::rejected();
         };
-        child.handle(request)
+        let mut action = child.handle(request);
+        if let Some(fault) = child.session.reducer_fault.take() {
+            action.response = None;
+            action.fault = Some(fault);
+        }
+        action
     }
 
     pub(super) fn commit_registration(&mut self, id: u64, token: ExternalTargetToken) -> bool {
@@ -211,7 +223,9 @@ impl<'a> LocalInterpreterManager<'a> {
             return ManagerAction::rejected();
         };
         let target = reply.rooted_at(target_node);
-        let mut session = Session::new();
+        let mut session = Session::builder()
+            .host_functions(self.host_functions.clone())
+            .build();
         session.interner = self.source_interner.clone();
         session.db = self.source_db.clone();
         session.views = self.source_views.clone();
@@ -227,6 +241,7 @@ impl<'a> LocalInterpreterManager<'a> {
             },
         );
         ManagerAction {
+            fault: None,
             response: Some(ExternalResponse {
                 reply: Some(reply),
                 rewrites: 0,
@@ -255,6 +270,7 @@ impl<'a> LocalInterpreterManager<'a> {
         let token = child.target_token;
         self.registry.children.remove(&id);
         ManagerAction {
+            fault: None,
             response: Some(ExternalResponse {
                 reply: Some(reply),
                 rewrites: 0,
@@ -309,12 +325,14 @@ impl LocalInterpreter {
             let name = reflected_module_name(ctx, module)?;
 
             let decoded = {
+                let host_functions = session.host_functions.clone();
                 let mut descent = MetaDescent::new(
                     &mut session.interner,
                     &session.db,
                     &session.views,
                     &mut session.meta_state,
-                );
+                )
+                .with_host_functions(host_functions);
                 descent.down_module_with_source(ctx, hooks, module)
             };
 
@@ -394,12 +412,14 @@ impl LocalInterpreter {
             let requester = *args.get(1)?;
             let view = *args.get(2)?;
             let decoded = {
+                let host_functions = session.host_functions.clone();
                 let mut descent = MetaDescent::new(
                     &mut session.interner,
                     &session.db,
                     &session.views,
                     &mut session.meta_state,
-                );
+                )
+                .with_host_functions(host_functions);
                 descent.down_view(ctx, hooks, view)
             }?;
             let name = decoded.name.clone();
@@ -1177,17 +1197,26 @@ fn invoke_descent(
     let symbol = ctx.resolve_op(&format!("%externalCall{}", args.len()), args.len())?;
     let redex = ctx.app(symbol, args);
     let before = ctx.rewrites();
-    let result = {
+    let attempt = {
+        let host_functions = session.host_functions.clone();
         let mut descent = MetaDescent::new(
             &mut session.interner,
             &session.db,
             &session.views,
             &mut session.meta_state,
         )
+        .with_host_functions(host_functions)
         .with_interpreter_manager_accounting();
-        descent.descend(ctx, op, hooks, redex)?
+        descent.descend(ctx, op, hooks, redex)
     };
-    Some((result, ctx.rewrites().saturating_sub(before)))
+    match attempt {
+        Ok(Some(result)) => Some((result, ctx.rewrites().saturating_sub(before))),
+        Ok(None) => None,
+        Err(fault) => {
+            session.reducer_fault = Some(fault);
+            None
+        }
+    }
 }
 
 fn invoke_srewrite_descent(
@@ -1200,18 +1229,27 @@ fn invoke_srewrite_descent(
     let symbol = ctx.resolve_op(&format!("%externalCall{}", args.len()), args.len())?;
     let redex = ctx.app(symbol, args);
     let before = ctx.rewrites();
-    let result = {
+    let attempt = {
         let Session {
+            host_functions,
             interner,
             db,
             views,
             meta_state,
             ..
         } = session;
-        let mut descent = MetaDescent::new(interner, db, views, meta_state);
-        descent.descend(ctx, MetaOp::Srewrite { depth_first }, hooks, redex)?
+        let mut descent = MetaDescent::new(interner, db, views, meta_state)
+            .with_host_functions(host_functions.clone());
+        descent.descend(ctx, MetaOp::Srewrite { depth_first }, hooks, redex)
     };
-    Some((result, ctx.rewrites().saturating_sub(before)))
+    match attempt {
+        Ok(Some(result)) => Some((result, ctx.rewrites().saturating_sub(before))),
+        Ok(None) => None,
+        Err(fault) => {
+            session.reducer_fault = Some(fault);
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1470,6 +1508,8 @@ impl Session {
         subject: DagId,
     ) -> Option<(u64, DagId, DagId)> {
         let Session {
+            host_functions,
+            reducer_fault,
             modules,
             interner,
             db,
@@ -1478,11 +1518,26 @@ impl Session {
             ..
         } = self;
         let loaded = modules.get_mut(module)?;
-        let subject = down_term(ctx, hooks, subject, &mut loaded.built, interner)?;
+        let subject = match try_down_term(ctx, hooks, subject, &mut loaded.built, interner) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => return None,
+            Err(fault) => {
+                *reducer_fault = Some(fault);
+                return None;
+            }
+        };
         loaded.built.engine.reset_rewrites();
-        let result = {
-            let mut descent = MetaDescent::new(interner, db, views, meta_state);
-            loaded.built.engine.reduce_with(subject, &mut descent)
+        let attempt = {
+            let mut descent = MetaDescent::new(interner, db, views, meta_state)
+                .with_host_functions(host_functions.clone());
+            loaded.built.engine.try_reduce_with(subject, &mut descent)
+        };
+        let result = match attempt {
+            Ok(result) => result,
+            Err(fault) => {
+                *reducer_fault = Some(fault);
+                return None;
+            }
         };
         let rewrites = loaded.built.engine.rewrites();
         let up_result = up_parsed_term(ctx, hooks, &loaded.built, interner, result);
@@ -1497,10 +1552,29 @@ impl Session {
         module: &str,
         subject: DagId,
     ) -> Option<(DagId, DagId)> {
-        let loaded = self.modules.get_mut(module)?;
-        let subject = down_term(ctx, hooks, subject, &mut loaded.built, &mut self.interner)?;
-        let result = loaded.built.engine.normalize_for_unify(subject);
-        let up_result = up_parsed_term(ctx, hooks, &loaded.built, &self.interner, result);
+        let Session {
+            modules,
+            reducer_fault,
+            interner,
+            ..
+        } = self;
+        let loaded = modules.get_mut(module)?;
+        let subject = match try_down_term(ctx, hooks, subject, &mut loaded.built, interner) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => return None,
+            Err(fault) => {
+                *reducer_fault = Some(fault);
+                return None;
+            }
+        };
+        let result = match loaded.built.engine.try_normalize_for_unify(subject) {
+            Ok(result) => result,
+            Err(fault) => {
+                *reducer_fault = Some(fault);
+                return None;
+            }
+        };
+        let up_result = up_parsed_term(ctx, hooks, &loaded.built, interner, result);
         let up_type = up_sort(ctx, hooks, &loaded.built, result);
         Some((up_result, up_type))
     }
@@ -1517,6 +1591,8 @@ impl Session {
         gas: u64,
     ) -> Option<(u64, ExternalRewriteBreakdown, DagId, DagId)> {
         let Session {
+            host_functions,
+            reducer_fault,
             interner,
             db,
             modules,
@@ -1526,32 +1602,57 @@ impl Session {
             ..
         } = self;
         let loaded = modules.get_mut(module)?;
-        let subject = down_term(ctx, hooks, subject, &mut loaded.built, interner)?;
+        let subject = match try_down_term(ctx, hooks, subject, &mut loaded.built, interner) {
+            Ok(Some(subject)) => subject,
+            Ok(None) => return None,
+            Err(fault) => {
+                *reducer_fault = Some(fault);
+                return None;
+            }
+        };
         loaded.built.engine.reset_rewrites();
         let result = match mode {
             DirectRewrite::Rule => {
                 let mut rewriting = loaded.built.engine.rewrite(subject);
-                rewriting.run(&mut loaded.built.engine, bound).term
+                match rewriting.try_run(&mut loaded.built.engine, bound) {
+                    Ok(step) => step.term,
+                    Err(fault) => {
+                        *reducer_fault = Some(fault);
+                        return None;
+                    }
+                }
             }
             DirectRewrite::Position => {
                 let mut rewriting = loaded.built.engine.frewrite(subject, gas);
-                rewriting.run(&mut loaded.built.engine, bound).term
+                match rewriting.try_run(&mut loaded.built.engine, bound) {
+                    Ok(step) => step.term,
+                    Err(fault) => {
+                        *reducer_fault = Some(fault);
+                        return None;
+                    }
+                }
             }
             DirectRewrite::Object => {
                 loaded.built.engine.reset_external();
                 *interpreters = InterpreterRegistry::default();
                 let mut rewriting = loaded.built.engine.erewrite(subject, gas);
-                super::drive_external_rewriting(
+                match super::drive_external_rewriting(
                     &mut rewriting,
                     loaded,
+                    host_functions,
                     interner,
                     db,
                     views,
                     meta_state,
                     interpreters,
                     bound,
-                )
-                .term
+                ) {
+                    Ok(step) => step.term,
+                    Err(fault) => {
+                        *reducer_fault = Some(fault);
+                        return None;
+                    }
+                }
             }
         };
         let rewrites = loaded.built.engine.rewrites();

@@ -1,13 +1,13 @@
 # TNK-DEV-017 — Typed Rust reducers and future control extensions
 
-**Status:** Planned  
-**Type:** Runtime and public extension API  
-**Current contract:** [`docs/manual.md` §3.2, §16.1, and Appendix G](../../manual.md#32-equational-reduction)  
+**Status:** Closed — Stage 1 implemented on 2026-08-02; future control extensions remain unselected
+**Type:** Runtime and public extension API
+**Current contract:** [`docs/manual.md` §3.2, §16.1.1, and Appendix G.3](../../manual.md#1611-strict-rust-reducers)
 **Focused Stage 1 design:** [`strict-rust-reducers-design.md`](../strict-rust-reducers-design.md)
 
 ## Purpose
 
-TNK intends to support Rust-defined equational functions. The first supported class will be deliberately strict: TNK normalizes every argument before invoking the Rust reducer, invokes it at one final top-reduction point, and normalizes any returned term through the ordinary reduction loop.
+TNK supports Rust-defined strict equational functions. TNK normalizes every argument before invoking the Rust reducer, invokes it at one final top-reduction point, and normalizes any returned term through the ordinary reduction loop.
 
 This first class must not make host-defined lazy or staged control operators impossible. A later design may distinguish normal arguments from suspended DAGs at the Rust type boundary and allow a trusted control extension to participate in argument-demand decisions. That general facility is not yet specified or selected for implementation. This issue records the compatibility boundary that Stage 1 must preserve while those decisions remain open.
 
@@ -15,9 +15,13 @@ This issue is not a commitment to arbitrary Rust callbacks. Any extension class 
 
 ## Current behavior
 
-Source `special (...)` attachments select a closed set of TNK-owned implementations. The frontend resolves recognized `id-hook`, `op-hook`, and `term-hook` data into a `tnk_core::symbol::SpecialOp`; `Runtime::try_special` exhaustively dispatches that enum before user equations. `Engine::set_special` lets a low-level Rust caller attach one of the same existing enum variants, but cannot attach caller-supplied reduction code.
+Hosts construct an immutable `tnk_core::host::HostFunctionCatalog` before module construction. `Session::builder().host_functions(...)`, catalog-aware frontend/module loaders, and `Engine::with_host_functions` carry that capability set into built signatures. Source operators bind an exact canonical key through `special (id-hook HostFunctionSymbol (KEY) ...)`; descriptor-declared `op-hook` and `term-hook` references are resolved and sort-checked while the signature is built. A key matches `^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$`: every segment begins lowercase, contains only lowercase ASCII letters/digits/interior hyphens, never ends in a hyphen, and at least one dot separates segments.
 
-A successful ordinary special is one equational rewrite. Its replacement starts its own evaluation strategy and is reduced to normal form. A declined special falls through to user equations. Unknown or unsupported hook classes currently attach no `SpecialOp` and are silent, as tracked by [TNK-DEV-014](TNK-DEV-014-unsupported-hooks.md).
+Only fixed-arity free root operators with the standard eager strategy are admitted. Each direct argument is current-epoch normal before one final callback. `StrictOutcome::Decline` falls through to ordinary equations and then `[owise]`; `Reduced(BuiltDag)` is provenance/sort checked, counts one host step, and re-enters ordinary normalization. A successful structured trace is `TraceEvent::Rewrite { kind: RewriteKind::HostFunction, host_key: Some(canonical_key), ... }`, every other `TraceEvent::Rewrite` has `host_key: None`, and rendered host traces include that same key. `ReducerFault` aborts the owning semantic operation. Session renders one error and saves no continuation; lower-level fallible drivers return the fault. A catalog is immutable once built, and signature attachments seal when semantic execution begins; changing an implementation requires a new catalog and a newly built Engine/Session.
+
+The callback receives scoped proof wrappers and a narrow `StrictReduceCtx`, never raw `DagId` values or `&mut Engine`. `StrictCall::hooks()` returns `ScopedHostHooks<'ctx>`; a purpose lookup produces an opaque `HostSymbol<'ctx>` that can be used for same-callback construction but cannot expose or escape as a raw supporting-hook ID. The context may inspect `DagView`/`ChildView`, test groundness, fallibly decode native values, and construct constants, native strings, or theory-aware free/ACU/AU/CUI applications with declared identity canonicalization. It cannot mutate the signature, re-enter reduction, initiate collection, forge reduction metadata, mix Engines, or retain callback-scoped values. Typed string adapters borrow existing byte payloads as `&[u8]` without input cloning/allocation, invoke Rust only after every argument decodes, and encode the owned `Vec<u8>` output through the resolved `stringSymbol`. Catalogs propagate through module composition, dependent rebuilds, META descent, and child interpreters. Existing TNK-owned `SpecialOp` variants keep their bespoke behavior.
+
+Unsupported non-host id-hook classes remain tracked by [TNK-DEV-014](TNK-DEV-014-unsupported-hooks.md). A missing `HostFunctionSymbol` capability is different: it is an explicit module-build error, not an inert ordinary operator. `HostControlSymbol` is a reserved, Unsupported future boundary: it never consults the strict catalog or installs a binding, and its operator remains ordinary/inert even when its data token matches a registered strict key.
 
 Runtime normality is metadata, not a distinct DAG representation. Every runtime term is an engine-relative `DagId`. A node records the equation epoch at which it was proved canonical and may forward to an out-of-place normal form. Unreduced applications and normal forms use the same `NodeTerm` representations. Structural construction has already canonicalized declared axioms such as associativity, commutativity, identity, and iteration even when equational reduction is still pending.
 
@@ -32,7 +36,7 @@ Normality, groundness, and native decodability are independent:
 
 ### Stage 1 — strict eager Rust reducers
 
-The first open Rust extension class will model a pure equational function over canonical argument normal forms.
+The implemented Rust extension class models a pure equational function over canonical argument normal forms.
 
 At minimum its contract is:
 
@@ -44,10 +48,12 @@ At minimum its contract is:
 6. Symbolic normal forms remain legal inputs. Native decoding is an explicit fallible refinement, not an implication of normality or sort.
 7. Rust may decline, allowing ordinary equations to run, or return a same-engine, structurally valid, well-sorted term.
 8. The returned term need not already be normal; TNK normalizes it through the ordinary loop.
-9. A successful return is counted and traced centrally as one outer built-in rewrite. The reducer does not charge that step itself.
-10. The reducer is deterministic and referentially transparent with respect to the canonical redex and immutable attachment/signature state. Ordinary reduction cannot depend on time, I/O, mutable host state, or nondeterministic services.
-11. Rust cannot mutate the active signature, forge DAG metadata, initiate collection at an unsafe point, retain unrooted IDs, mix engines, or re-enter the mutably borrowed engine.
-12. Stateful, externally observable, or nondeterministic operations use a rewrite-, external-object-, or descent-level contract instead of this equational reducer class.
+9. A successful return is counted and traced centrally as one outer host-function rewrite. The reducer does not charge that step itself.
+10. The reducer is deterministic and referentially transparent with respect to the canonical redex and immutable attachment/signature state. Ordinary reduction cannot depend on time, I/O, randomness, mutable result-affecting host state, nondeterministic services, or externally visible side effects.
+11. Rust cannot mutate the active signature, forge DAG metadata, initiate collection at an unsafe point, retain unrooted IDs/capabilities, mix engines, or re-enter the mutably borrowed engine.
+12. Callback panics are not caught or translated to `ReducerFault`; they follow the embedding's Rust unwind/abort policy.
+13. Execution is synchronous and supplies no cancellation, timeout, async yield, preemption, callback-controlled transaction, or resource bound. A returned `ReducerFault` restores TNK-owned operation state, aggregate/breakdown counts, and trace append state, attempts no equation fallback, and leaves a resumable owner returning the same fault; callback-authored external side effects and arbitrary panics have no rollback guarantee. Reducer authors own termination and CPU/memory behavior; interruptible or untrusted execution requires outer process isolation.
+14. Stateful, externally observable, nondeterministic, or I/O operations use a rewrite-, external-object-, or descent-level contract instead of this equational reducer class.
 
 Standard left-to-right eager evaluation is the conservative initial policy. Whether Stage 1 may also admit a permutation that still evaluates every argument before one final top attempt is an explicit decision below; implementations must not accidentally accept early-top or omitted-argument schedules.
 
@@ -107,26 +113,46 @@ TNK's existing `Branch` special is an evaluator-control primitive: it evaluates 
 
 ## Stage 1 type and API boundary
 
-Stage 1 should expose the strongest useful claims without pretending that normal forms are necessarily concrete values.
+Stage 1 exposes proof-bearing callback types rather than pretending that normal forms are necessarily concrete values. The exact shipped signatures are authoritative in `tnk_core::host`; the shape below records the design distinction that selected them:
 
-A representative nonbinding shape is:
+The shipped `tnk_core::host` public symbol set is:
+
+- registration and identity: `HostFunctionCatalog`, `HostFunctionCatalogBuilder`,
+  `HostFunctionKey`, opaque `HostFunctionId`, and `HostFunctionRegistrationError`;
+- descriptors and build-time binding: `StrictReducerDescriptor`,
+  `StrictReducerDescriptorBuilder`, `HookSort`, `OpHookRequirement`, `TermHookRequirement`,
+  `ResolvedHostHooks`, `ResolvedHostHooksBuilder`, opaque `HostBindingId`, and
+  `HostBindingError`;
+- callback protocol: `StrictReducer`, `StrictCall`, `StrictReduceCtx`, `ScopedHostHooks`,
+  `HostSymbol`, `NormalDag`, `RedexDag`, `DagRef`, `DagView`, `ChildView`, `BuiltDag`,
+  `StrictOutcome`, `ReducerFault`, and `BuildError`;
+- typed string support: `codecs`, `codecs::StringCodec`, and `codecs::string`.
+
+`ResolvedHostHooks` is build-time Engine binding data; its raw lookup is crate-private. Callback
+lookups are available only through `ScopedHostHooks` and return callback-scoped `HostSymbol`
+capabilities. The catalog-aware outer entry points are `SessionBuilder::host_functions`,
+`Engine::{with_host_functions,host_functions,validate_host_function_binding,bind_host_function,try_prepare_identities,try_normalize_for_unify,try_symbol_identity_dag}`,
+the public `tnk-frontend` configured entry points
+`load::{load_source_with_host_functions,build_loaded_module_with_host_functions,try_build_loaded_module_with_host_functions,build_loaded_module_with_host_functions_and_inline_statements,try_build_loaded_module_with_host_functions_and_inline_statements,build_loaded_module_homed_with_host_functions,build_loaded_module_homed_traced_with_host_functions,try_build_loaded_module_homed_traced_with_host_functions,LoadedModuleBuildError}`; and
+`tnk-modules::{load::{flatten_and_build_with_host_functions,load_program_with_host_functions},
+view::validate_view_with_host_functions,meta::MetaDescent::with_host_functions}`.
 
 ```rust
-trait StrictReducer {
-    fn reduce(
-        &mut self,
-        ctx: &mut StrictReduceCtx<'_>,
-        args: &[NormalDag<'_>],
-    ) -> StrictReduceResult;
+trait StrictReducer: Send + Sync + 'static {
+    fn reduce<'ctx>(
+        &self,
+        ctx: &mut StrictReduceCtx<'ctx>,
+        call: StrictCall<'ctx>,
+    ) -> Result<StrictOutcome<'ctx>, ReducerFault>;
 }
 
-enum StrictReduceResult {
+enum StrictOutcome<'ctx> {
     Decline,
-    Reduced(BuiltDag<'_>),
+    Reduced(BuiltDag<'ctx>),
 }
 ```
 
-The actual design may use registry IDs, associated descriptors, or generics differently. It must preserve these separations:
+The design preserves these separations:
 
 - `NormalDag` proves evaluation state, not groundness or native value shape;
 - `decode_*` operations perform fallible representation recognition;
@@ -213,7 +239,7 @@ Before selecting a control extension, decide:
 - Stage 1 does not redefine explicit META-LEVEL quotation or engine-neutral `MetaEnvelope` transport.
 - Stage 1 does not remove or generalize existing `SpecialOp` variants solely for architectural uniformity.
 - The future control sketch does not commit TNK to user-defined lazy operators; it preserves an intentional design opening.
-- Observable behavior changes require corresponding Reference updates. This issue remains developer intent rather than current user-facing contract until implementation lands.
+- Observable Stage 1 behavior is normative in the Reference. Any future control extension requires its own selection record and Reference update.
 
 ## Stage 1 selection and completion gate
 
@@ -233,3 +259,16 @@ Stage 1 is complete only when:
 10. the Reference and Rust API map describe the shipped capability and its limits.
 
 A strategy-aware control extension requires its own later selection record and completion gate. Stage 1 completion must not claim that general Rust-defined specials are supported.
+
+## Stage 1 selected decisions and completion evidence
+
+- **Source/registration:** `HostFunctionSymbol (KEY)` with the canonical segment grammar above into a host-owned immutable catalog; duplicate registration and missing capability are errors. Reserved `HostControlSymbol` is inert/nonbinding and never resolves through that catalog.
+- **Accepted strategy/theory:** fixed arity, free root theory, non-polymorphic declaration, and only the normalized standard left-to-right eager schedule; lazy, omitted, repeated-top, early-top, and permuted schedules are rejected.
+- **Type proof:** callback-scoped `NormalDag`, `RedexDag`, `DagRef`, `DagView`/`ChildView`, `ScopedHostHooks`, opaque `HostSymbol`, and `BuiltDag`; fallible zero-copy decoders and theory-aware builders through `StrictReduceCtx`; no raw-ID or Engine escape.
+- **Results/faults/trust:** `Decline` means equation fallthrough only; a returned term is same-engine and selected-range checked; `ReducerFault` propagates through fallible semantic drivers and Session; documented infallible wrappers panic on faults. Trusted callback panics are not caught or mislabeled. Callbacks remain pure deterministic synchronous code with no cancellation/resource boundary.
+- **Cache/lifecycle:** catalogs cannot mutate; signature attachments seal on first semantic execution; new semantics require a newly built Engine, invalidating any old engine-relative DAG/cache state by construction.
+- **GC/accounting/trace:** callback live values remain in the active reduction root set; successful host return contributes exactly one `RewriteKind::HostFunction` event carrying/rendering the canonical host key; decline and faults contribute none, and every other `TraceEvent::Rewrite` carries no host key.
+- **Primary fixtures:** `text.normalize-tag`, `path.join`, `routing.prefer-configured`, and `testing.fail` in `crates/tnk-session/tests/strict_rust_reducers.rs`. Core contracts and compile-fail proofs are in `crates/tnk-core/tests/strict_rust_reducers.rs` and `tnk_core::host` rustdoc.
+- **Acceptance commands:** `cargo test --workspace`, `cargo check --workspace --all-targets`, and `cargo check --workspace --all-targets --all-features`.
+
+The mandatory matrix in the focused design is implemented without ignored or expected-failure cases. Strategy-aware argument demand, stateful/nondeterministic reducers, external I/O, dynamic libraries, sandboxing, and a stable plugin ABI remain outside the shipped feature. Any such evaluator-control work must use a new issue and completion gate; it must not weaken `StrictReducer`.

@@ -2,11 +2,12 @@
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
+use crate::host::ReducerFault;
 use crate::root::RootGuard;
 use crate::sort::SortId;
 use crate::unify::problem::VarSpec;
 use crate::unify::{NameCodes, UnifyEnv, instantiate};
-use crate::variant::{VariantEquation, VariantMode, VariantSearch};
+use crate::variant::{VariantEquation, VariantMode, VariantSearch, VariantSearchError};
 
 use super::analysis::{ConstructorAnalysis, Eligibility, EligibilityRejection, SortOverrides};
 use super::formula::{Branch, Formula};
@@ -29,16 +30,40 @@ pub enum Decision {
     Rejected(EligibilityRejection),
 }
 
+enum DecisionStepError {
+    Rejected(EligibilityRejection),
+    Reducer(ReducerFault),
+}
+
+impl From<ReducerFault> for DecisionStepError {
+    fn from(fault: ReducerFault) -> Self {
+        Self::Reducer(fault)
+    }
+}
+
+fn variant_search_error(error: VariantSearchError) -> DecisionStepError {
+    match error {
+        VariantSearchError::Invalid(_) => {
+            DecisionStepError::Rejected(EligibilityRejection::VariantSearchSetup)
+        }
+        VariantSearchError::Reducer(fault) => DecisionStepError::Reducer(fault),
+    }
+}
+
 /// Decide a query in DNF order, preserving the order of branches and variant unifiers and stopping
 /// at the first witness.
-pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQuery) -> Decision {
+pub fn decide(
+    engine: &mut Engine,
+    names: &mut dyn NameCodes,
+    query: VariantSatQuery,
+) -> Result<Decision, ReducerFault> {
     let analysis = match ConstructorAnalysis::build(engine, &query.overrides, query.has_memberships)
     {
         Ok(analysis) => analysis,
-        Err(rejection) => return Decision::Rejected(rejection),
+        Err(rejection) => return Ok(Decision::Rejected(rejection)),
     };
     if let Eligibility::Rejected(rejection) = &analysis.eligibility {
-        return Decision::Rejected(rejection.clone());
+        return Ok(Decision::Rejected(rejection.clone()));
     }
 
     // The formula's free variables are existentially quantified over constructor inhabitants. If any
@@ -49,7 +74,7 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
         .iter()
         .any(|spec| analysis.sorts.empty.contains(&spec.sort))
     {
-        return Decision::Unsat;
+        return Ok(Decision::Unsat);
     }
 
     // These are the sole object-engine instances of the query's source variables. Every formula
@@ -74,7 +99,7 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
 
         if instantiated.positive.is_empty() {
             if instantiated.negative.is_empty() {
-                return Decision::Sat;
+                return Ok(Decision::Sat);
             }
             match negative_candidate_is_satisfiable(
                 engine,
@@ -84,9 +109,12 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
                 &identity_values,
                 &variant_equations,
             ) {
-                Ok(true) => return Decision::Sat,
+                Ok(true) => return Ok(Decision::Sat),
                 Ok(false) => continue,
-                Err(rejection) => return Decision::Rejected(rejection),
+                Err(DecisionStepError::Rejected(rejection)) => {
+                    return Ok(Decision::Rejected(rejection));
+                }
+                Err(DecisionStepError::Reducer(fault)) => return Err(fault),
             }
         }
 
@@ -98,17 +126,22 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
             &variant_equations,
         ) {
             Ok(search) => search,
-            Err(rejection) => return Decision::Rejected(rejection),
+            Err(DecisionStepError::Rejected(rejection)) => {
+                return Ok(Decision::Rejected(rejection));
+            }
+            Err(DecisionStepError::Reducer(fault)) => return Err(fault),
         };
         let canonical_order = search.original_variable_order().to_vec();
 
         loop {
             let next = {
                 let mut env = UnifyEnv { e: engine, names };
-                search.find_next(&mut env)
+                search.try_find_next(&mut env)?
             };
             if search.is_incomplete() {
-                return Decision::Rejected(EligibilityRejection::VariantSearchIncomplete);
+                return Ok(Decision::Rejected(
+                    EligibilityRejection::VariantSearchIncomplete,
+                ));
             }
             let Some(unifier) = next else {
                 break;
@@ -129,7 +162,7 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
                 &unifier.substitution,
             );
             if instantiated.negative.is_empty() {
-                return Decision::Sat;
+                return Ok(Decision::Sat);
             }
             match negative_candidate_is_satisfiable(
                 engine,
@@ -139,16 +172,19 @@ pub fn decide(engine: &mut Engine, names: &mut dyn NameCodes, query: VariantSatQ
                 &values,
                 &variant_equations,
             ) {
-                Ok(true) => return Decision::Sat,
+                Ok(true) => return Ok(Decision::Sat),
                 Ok(false) => {}
-                Err(rejection) => return Decision::Rejected(rejection),
+                Err(DecisionStepError::Rejected(rejection)) => {
+                    return Ok(Decision::Rejected(rejection));
+                }
+                Err(DecisionStepError::Reducer(fault)) => return Err(fault),
             }
         }
     }
 
     // Keep the query variables pinned through the complete streamed traversal.
     drop(variable_roots);
-    Decision::Unsat
+    Ok(Decision::Unsat)
 }
 
 struct RootedPairs {
@@ -214,7 +250,7 @@ fn positive_unifiers(
     variables: &[VarSpec],
     pairs: &[(DagId, DagId)],
     equations: &[VariantEquation],
-) -> Result<(VariantSearch, Vec<usize>), EligibilityRejection> {
+) -> Result<(VariantSearch, Vec<usize>), DecisionStepError> {
     let mut globals = Vec::new();
     let mut seen = vec![false; variables.len()];
     for &(lhs, rhs) in pairs {
@@ -252,7 +288,7 @@ fn positive_unifiers(
         None,
         "0",
     )
-    .map_err(|_| EligibilityRejection::VariantSearchSetup)?;
+    .map_err(variant_search_error)?;
     search.enable_unification(env.e, pair_count);
     drop(target_root);
     drop(remapped_roots);
@@ -370,8 +406,8 @@ fn negative_candidate_is_satisfiable(
     negative: &[(DagId, DagId)],
     unifier: &[Option<DagId>],
     equations: &[VariantEquation],
-) -> Result<bool, EligibilityRejection> {
-    let Some(normalized) = normalize_disequalities(engine, negative, unifier) else {
+) -> Result<bool, DecisionStepError> {
+    let Some(normalized) = normalize_disequalities(engine, negative, unifier)? else {
         return Ok(false);
     };
     let pair_count = normalized.pairs.len();
@@ -380,16 +416,20 @@ fn negative_candidate_is_satisfiable(
     loop {
         let next = {
             let mut env = UnifyEnv { e: engine, names };
-            search.find_next(&mut env)
+            search.try_find_next(&mut env)?
         };
         if search.is_incomplete() {
-            return Err(EligibilityRejection::VariantSearchIncomplete);
+            return Err(DecisionStepError::Rejected(
+                EligibilityRejection::VariantSearchIncomplete,
+            ));
         }
         let Some(variant) = next else {
             return Ok(false);
         };
         let Some(pairs) = variant_target_pairs(engine, variant.term, pair_count) else {
-            return Err(EligibilityRejection::VariantSearchSetup);
+            return Err(DecisionStepError::Rejected(
+                EligibilityRejection::VariantSearchSetup,
+            ));
         };
         if !pairs.iter().all(|&(lhs, rhs)| {
             ConstructorAnalysis::is_constructor_term(engine, lhs)
@@ -397,7 +437,7 @@ fn negative_candidate_is_satisfiable(
         }) {
             continue;
         }
-        if constructor_variant_is_satisfiable(engine, analysis, &pairs) {
+        if constructor_variant_is_satisfiable(engine, analysis, &pairs)? {
             return Ok(true);
         }
     }
@@ -410,7 +450,7 @@ fn negative_constructor_variants(
     names: &mut dyn NameCodes,
     pairs: &[(DagId, DagId)],
     equations: &[VariantEquation],
-) -> Result<VariantSearch, EligibilityRejection> {
+) -> Result<VariantSearch, DecisionStepError> {
     let mut slots = Vec::new();
     let mut specs_by_slot = Vec::new();
     for &(lhs, rhs) in pairs {
@@ -448,7 +488,7 @@ fn negative_constructor_variants(
         None,
         "0",
     )
-    .map_err(|_| EligibilityRejection::VariantSearchSetup)?;
+    .map_err(variant_search_error)?;
     search.skip_root_position();
     drop(target_root);
     drop(remapped_roots);
@@ -511,9 +551,9 @@ fn constructor_variant_is_satisfiable(
     engine: &mut Engine,
     analysis: &ConstructorAnalysis,
     pairs: &[(DagId, DagId)],
-) -> bool {
+) -> Result<bool, ReducerFault> {
     if pairs.iter().any(|&(lhs, rhs)| engine.deep_equal(lhs, rhs)) {
-        return false;
+        return Ok(false);
     }
 
     let mut finite_variables = Vec::new();
@@ -523,12 +563,12 @@ fn constructor_variant_is_satisfiable(
             || !collect_finite_variables(engine, analysis, rhs, &mut seen, &mut finite_variables)
         {
             // A variable in an empty constructor sort has no assignment.
-            return false;
+            return Ok(false);
         }
     }
     if finite_variables.is_empty() {
         // OS compactness supplies a constructor assignment for the remaining infinite-sort variables.
-        return true;
+        return Ok(true);
     }
 
     let max_slot = finite_variables.iter().copied().max().unwrap_or(0);
@@ -549,38 +589,38 @@ fn normalize_disequalities(
     engine: &mut Engine,
     pairs: &[(DagId, DagId)],
     values: &[Option<DagId>],
-) -> Option<RootedPairs> {
+) -> Result<Option<RootedPairs>, ReducerFault> {
     let mut normalized = Vec::with_capacity(pairs.len());
     let mut roots = Vec::with_capacity(pairs.len() * 2);
     for &(lhs, rhs) in pairs {
-        let lhs = instantiate_reduce_normalize(engine, lhs, values);
+        let lhs = instantiate_reduce_normalize(engine, lhs, values)?;
         roots.push(engine.root(lhs));
-        let rhs = instantiate_reduce_normalize(engine, rhs, values);
+        let rhs = instantiate_reduce_normalize(engine, rhs, values)?;
         roots.push(engine.root(rhs));
         if engine.deep_equal(lhs, rhs) {
-            return None;
+            return Ok(None);
         }
         normalized.push((lhs, rhs));
     }
-    Some(RootedPairs {
+    Ok(Some(RootedPairs {
         pairs: normalized,
         _roots: roots,
-    })
+    }))
 }
 
 fn instantiate_reduce_normalize(
     engine: &mut Engine,
     dag: DagId,
     values: &[Option<DagId>],
-) -> DagId {
+) -> Result<DagId, ReducerFault> {
     let instantiated = instantiate(engine, values, dag).unwrap_or(dag);
     let instantiated_root = engine.root(instantiated);
-    let reduced = engine.reduce(instantiated);
+    let reduced = engine.try_reduce(instantiated)?;
     let reduced_root = engine.root(reduced);
-    let normalized = engine.normalize_for_unify(reduced);
+    let normalized = engine.try_normalize_for_unify(reduced)?;
     drop(instantiated_root);
     drop(reduced_root);
-    normalized
+    Ok(normalized)
 }
 
 fn collect_finite_variables(
@@ -625,21 +665,21 @@ fn finite_assignment_satisfies(
     variables: &[usize],
     depth: usize,
     assignment: &mut [Option<DagId>],
-) -> bool {
+) -> Result<bool, ReducerFault> {
     if depth == variables.len() {
         for &(lhs, rhs) in pairs {
-            let lhs = instantiate_reduce_normalize(engine, lhs, assignment);
+            let lhs = instantiate_reduce_normalize(engine, lhs, assignment)?;
             let lhs_root = engine.root(lhs);
-            let rhs = instantiate_reduce_normalize(engine, rhs, assignment);
+            let rhs = instantiate_reduce_normalize(engine, rhs, assignment)?;
             let rhs_root = engine.root(rhs);
             let equal = engine.deep_equal(lhs, rhs);
             drop(lhs_root);
             drop(rhs_root);
             if equal {
-                return false;
+                return Ok(false);
             }
         }
-        return true;
+        return Ok(true);
     }
 
     let slot = variables[depth];
@@ -649,13 +689,13 @@ fn finite_assignment_satisfies(
         .expect("collected finite variable must have representatives");
     for &representative in representatives {
         assignment[slot] = Some(representative);
-        if finite_assignment_satisfies(engine, analysis, pairs, variables, depth + 1, assignment) {
+        if finite_assignment_satisfies(engine, analysis, pairs, variables, depth + 1, assignment)? {
             assignment[slot] = None;
-            return true;
+            return Ok(true);
         }
     }
     assignment[slot] = None;
-    false
+    Ok(false)
 }
 
 fn variable_sort(engine: &Engine, pairs: &[(DagId, DagId)], slot: usize) -> Option<SortId> {
@@ -768,7 +808,7 @@ mod tests {
         };
         assert_eq!(
             decide(&mut engine, &mut names, unsatisfiable),
-            Decision::Unsat
+            Ok(Decision::Unsat)
         );
 
         let satisfiable = VariantSatQuery {
@@ -782,7 +822,10 @@ mod tests {
             overrides: SortOverrides::default(),
             has_memberships: false,
         };
-        assert_eq!(decide(&mut engine, &mut names, satisfiable), Decision::Sat);
+        assert_eq!(
+            decide(&mut engine, &mut names, satisfiable),
+            Ok(Decision::Sat)
+        );
     }
 
     /// Variantizing the conjunction under one tuple root keeps the two occurrences of `X`
@@ -854,6 +897,6 @@ mod tests {
             has_memberships: false,
         };
 
-        assert_eq!(decide(&mut engine, &mut names, query), Decision::Unsat);
+        assert_eq!(decide(&mut engine, &mut names, query), Ok(Decision::Unsat));
     }
 }

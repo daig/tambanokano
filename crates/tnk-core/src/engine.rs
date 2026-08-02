@@ -15,6 +15,11 @@ use crate::arena::Arena;
 use crate::dag::{DagId, DagNode, NaValue, NodeTerm};
 use crate::descent::{DescentOps, MetaCtx, NullDescent};
 use crate::external::{ExternalRewriteBreakdown, ExternalTargetToken, MetaEnvelope};
+use crate::host::{
+    HookSort, HostBindingError, HostBindingId, HostFunctionCatalog, HostFunctionId,
+    HostFunctionKey, ReducerFault, ResolvedHostBinding, ResolvedHostHooks, StrictOutcome, built_id,
+    invoke_strict,
+};
 use crate::num::Nat;
 use crate::rewrite::Rewriting;
 use crate::root::{RootGuard, Roots};
@@ -28,6 +33,7 @@ use crate::symbol::{
 };
 use crate::term::{ConditionFragment, Equation, Membership, Subst, Term};
 use crate::theory::{LhsAutomaton, RewriteMatchContext, Subproblem};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -517,6 +523,12 @@ pub(crate) struct Signature {
     /// variables. Retained so imported/replayed statement metadata remains module-global.
     collapse_patterns: Vec<CollapsePattern>,
     substitution_layout_estimates: Vec<SubstitutionLayoutEstimate>,
+    /// Immutable reducer implementations shared by every binding in this signature.
+    host_functions: HostFunctionCatalog,
+    /// Signature-local hook and declaration bindings referenced by `SpecialOp::HostFunction`.
+    host_bindings: Vec<ResolvedHostBinding>,
+    /// One-way lifecycle guard: semantic execution prevents later host attachment or replacement.
+    host_bindings_sealed: Cell<bool>,
 }
 
 /// Sorts used to classify quoted-identifier constants; see [`Signature::qid_class`].
@@ -681,6 +693,8 @@ pub enum TraceEvent {
         kind: RewriteKind,
         eq_id: Option<u32>,
         depth: u32,
+        /// Stable configured identity for a strict host rewrite; absent for every other rewrite kind.
+        host_key: Option<HostFunctionKey>,
         redex: DagId,
         result: DagId,
         bindings: Vec<Option<DagId>>,
@@ -796,6 +810,8 @@ pub enum RewriteKind {
     Equation,
     /// A built-in (`special`) operator's reduction.
     BuiltIn,
+    /// A successfully applied strict Rust reducer.
+    HostFunction,
     /// A user rule (`rl`/`crl`), applied by rewriting or search.
     Rule,
 }
@@ -857,6 +873,19 @@ pub(crate) struct ERewritePass {
 pub(crate) enum ERewritePassStep {
     Complete { term: DagId, progress: bool },
     External { target: DagId, message: DagId },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SemanticCheckpoint {
+    rewrite_count: u64,
+    membership_count: u64,
+    rule_rewrite_count: u64,
+    variant_narrowing_count: u64,
+    narrowing_count: u64,
+    counter_value: u64,
+    model_check_stats_len: usize,
+    sat_solve_stats_len: usize,
+    trace_len: Option<usize>,
 }
 
 /// The mutable half of the engine: the garbage-collected DAG arena, the GC root registry, and the
@@ -943,6 +972,9 @@ pub(crate) struct Runtime {
     /// or the remainder when no newline exists; an empty buffer is EOF. The REPL preserves unread input
     /// across commands.
     pub(crate) external_in: String,
+    /// Fault captured across an infallible theory-construction seam (notably lazy identity DAGs).
+    /// The enclosing fallible semantic driver consumes it before reporting success.
+    reducer_fault: Option<ReducerFault>,
 }
 
 #[derive(Default)]
@@ -976,6 +1008,9 @@ impl Default for Signature {
             minimum_substitution_size: 1,
             collapse_patterns: Vec::default(),
             substitution_layout_estimates: Vec::default(),
+            host_functions: HostFunctionCatalog::default(),
+            host_bindings: Vec::default(),
+            host_bindings_sealed: Cell::new(false),
         }
     }
 }
@@ -1259,6 +1294,7 @@ impl Signature {
             identity: None,
             one_sided_id: None,
             strategy: None,
+            strict_eager_source_strategy: true,
             frozen: None,
             special: None,
             oo: OoFlags::default(),
@@ -1294,6 +1330,7 @@ impl Signature {
             identity,
             one_sided_id: None,
             strategy: None,
+            strict_eager_source_strategy: true,
             frozen: None,
             special: None,
             oo: OoFlags::default(),
@@ -1332,6 +1369,7 @@ impl Signature {
             identity,
             one_sided_id: None,
             strategy: None,
+            strict_eager_source_strategy: true,
             frozen: None,
             special: None,
             oo: OoFlags::default(),
@@ -1370,6 +1408,7 @@ impl Signature {
             identity,
             one_sided_id: None,
             strategy: None,
+            strict_eager_source_strategy: true,
             frozen: None,
             special: None,
             oo: OoFlags::default(),
@@ -1403,6 +1442,7 @@ impl Signature {
             identity: None,
             one_sided_id: None,
             strategy: None,
+            strict_eager_source_strategy: true,
             frozen: None,
             special: None,
             oo: OoFlags::default(),
@@ -1417,6 +1457,9 @@ impl Signature {
 
     pub(crate) fn symbol(&self, id: SymbolId) -> &Symbol {
         self.symbols.get(id)
+    }
+    pub(crate) fn host_symbol(&self, id: SymbolId) -> Option<&Symbol> {
+        self.symbols.try_get(id)
     }
 
     /// Resolve an operator by canonical name and arity for metalevel construction. Overloads sharing
@@ -1449,6 +1492,13 @@ impl Signature {
         range: SortId,
         ctor: bool,
     ) {
+        assert!(
+            !matches!(
+                self.symbols.get(sym).special,
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's overload profile is sealed at binding"
+        );
         {
             let s = self.symbols.get_mut(sym);
             assert_eq!(
@@ -1526,6 +1576,13 @@ impl Signature {
     /// discarded, a missing final zero is appended, and an empty list selects the standard strategy.
     /// Associative symbols classify as eager, lazy, or semi-eager.
     pub(crate) fn set_strategy(&mut self, sym: SymbolId, raw: &[u32]) {
+        assert!(
+            !matches!(
+                self.symbols.get(sym).special,
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's strategy is sealed at binding"
+        );
         let symbol = self.symbols.get(sym);
         let arity = symbol.arity();
         assert!(
@@ -1533,6 +1590,20 @@ impl Signature {
             "evaluation strategy {raw:?} for `{}` references an argument outside 0..={arity}",
             symbol.name()
         );
+        let strict_eager_source_strategy = if raw.is_empty() {
+            true
+        } else {
+            let arguments = if raw.last() == Some(&0) {
+                &raw[..raw.len() - 1]
+            } else {
+                raw
+            };
+            arguments.len() == arity
+                && arguments
+                    .iter()
+                    .enumerate()
+                    .all(|(position, &step)| step as usize == position + 1)
+        };
 
         let strategy = if raw.is_empty() {
             None
@@ -1584,7 +1655,9 @@ impl Signature {
                 && steps[arity] == EvalStep::Top;
             (!standard).then_some(EvalStrategy::Sequence(steps))
         };
-        self.symbols.get_mut(sym).strategy = strategy;
+        let symbol = self.symbols.get_mut(sym);
+        symbol.strategy = strategy;
+        symbol.strict_eager_source_strategy = strict_eager_source_strategy;
     }
 
     /// Mark the frozen arguments of `sym` (`frozen` / `frozen (…)`). `raw` contains the 1-based source
@@ -1611,11 +1684,266 @@ impl Signature {
     pub(crate) fn set_oo_flags(&mut self, sym: SymbolId, oo: OoFlags) {
         self.symbols.get_mut(sym).oo = oo;
     }
+    fn validate_host_function(
+        &self,
+        sym: SymbolId,
+        key: &str,
+        hooks: &ResolvedHostHooks,
+    ) -> Result<(HostFunctionId, usize), HostBindingError> {
+        if self.host_bindings_sealed.get() {
+            return Err(HostBindingError::SignatureSealed);
+        }
+        let key = HostFunctionKey::parse(key)
+            .map_err(|error| HostBindingError::InvalidKey(error.to_string()))?;
+        let function = self
+            .host_functions
+            .resolve(&key)
+            .ok_or_else(|| HostBindingError::MissingCapability(key.clone()))?;
+
+        if let Some(special) = self.symbols.get(sym).special() {
+            return match special {
+                SpecialOp::HostFunction(_) => Err(HostBindingError::DuplicateBinding),
+                _ => Err(HostBindingError::InvalidOperator(format!(
+                    "operator `{}` already has a non-host special attachment",
+                    self.symbols.get(sym).name()
+                ))),
+            };
+        }
+
+        let descriptor = self.host_functions.descriptor(function);
+        let symbol = self.symbols.get(sym);
+        if symbol.theory() != Theory::Free {
+            return Err(HostBindingError::InvalidOperator(format!(
+                "strict host operator `{}` must use the free root theory",
+                symbol.name()
+            )));
+        }
+        if !symbol.strict_eager_source_strategy {
+            return Err(HostBindingError::InvalidOperator(format!(
+                "strict host operator `{}` must use the standard eager strategy without repeated \
+                 or incremental steps",
+                symbol.name()
+            )));
+        }
+        if symbol.has_inconsistent_constructor_axioms() {
+            return Err(HostBindingError::IncompatibleDeclarations(format!(
+                "strict host operator `{}` has inconsistent structural declarations",
+                symbol.name()
+            )));
+        }
+        if symbol.arity() != descriptor.arity() {
+            return Err(HostBindingError::InvalidOperator(format!(
+                "strict host operator `{}` has arity {}, but `{key}` requires {}",
+                symbol.name(),
+                symbol.arity(),
+                descriptor.arity()
+            )));
+        }
+
+        let declarations = symbol.decls();
+        let result_kind = self.sorts.kind_of(declarations[0].range);
+        if declarations
+            .iter()
+            .any(|declaration| self.sorts.kind_of(declaration.range) != result_kind)
+        {
+            return Err(HostBindingError::IncompatibleDeclarations(format!(
+                "strict host operator `{}` has declarations in different result kinds",
+                symbol.name()
+            )));
+        }
+        for (index, left) in declarations.iter().enumerate() {
+            for right in &declarations[index + 1..] {
+                let domains_overlap =
+                    left.domain
+                        .iter()
+                        .zip(&right.domain)
+                        .all(|(&left_sort, &right_sort)| {
+                            if !self.sorts.same_kind(left_sort, right_sort) {
+                                return false;
+                            }
+                            self.sorts
+                                .kind(self.sorts.kind_of(left_sort))
+                                .members
+                                .iter()
+                                .copied()
+                                .any(|actual| {
+                                    self.sorts.leq(actual, left_sort)
+                                        && self.sorts.leq(actual, right_sort)
+                                })
+                        });
+                if domains_overlap
+                    && !self.sorts.leq(left.range, right.range)
+                    && !self.sorts.leq(right.range, left.range)
+                {
+                    return Err(HostBindingError::IncompatibleDeclarations(format!(
+                        "strict host operator `{}` has overlapping declarations with incomparable \
+                         result sorts `{}` and `{}`",
+                        symbol.name(),
+                        self.sorts.name(left.range),
+                        self.sorts.name(right.range)
+                    )));
+                }
+            }
+        }
+
+        let required_ops: HashSet<&str> = descriptor
+            .required_op_hooks()
+            .iter()
+            .map(|requirement| requirement.purpose())
+            .collect();
+        let required_terms: HashSet<&str> = descriptor
+            .required_term_hooks()
+            .iter()
+            .map(|requirement| requirement.purpose())
+            .collect();
+        for purpose in hooks.op_purposes() {
+            if !required_ops.contains(purpose) {
+                return Err(HostBindingError::UnexpectedHook(purpose.to_string()));
+            }
+        }
+        for purpose in hooks.term_purposes() {
+            if !required_terms.contains(purpose) {
+                return Err(HostBindingError::UnexpectedHook(purpose.to_string()));
+            }
+        }
+
+        let contract_sort = |declaration: &OpDeclaration, sort: HookSort| match sort {
+            HookSort::Argument(position) => declaration.domain[position],
+            HookSort::Result => declaration.range,
+        };
+        for requirement in descriptor.required_op_hooks() {
+            let hook_id = hooks
+                .get_op(requirement.purpose())
+                .ok_or_else(|| HostBindingError::MissingHook(requirement.purpose().to_string()))?;
+            let hook = self.host_symbol(hook_id).ok_or_else(|| {
+                HostBindingError::InvalidHook(format!(
+                    "op-hook `{}` does not belong to this signature",
+                    requirement.purpose()
+                ))
+            })?;
+            if hook.arity() != requirement.domain().len() {
+                return Err(HostBindingError::InvalidHook(format!(
+                    "op-hook `{}` requires arity {}, found {}",
+                    requirement.purpose(),
+                    requirement.domain().len(),
+                    hook.arity()
+                )));
+            }
+            for declaration in symbol.decls() {
+                let compatible = hook.decls().iter().any(|hook_declaration| {
+                    requirement
+                        .domain()
+                        .iter()
+                        .copied()
+                        .zip(&hook_declaration.domain)
+                        .all(|(expected, &actual)| {
+                            self.sorts
+                                .same_kind(contract_sort(declaration, expected), actual)
+                        })
+                        && requirement.range_constraints().all(|expected| {
+                            self.sorts.same_kind(
+                                contract_sort(declaration, expected),
+                                hook_declaration.range,
+                            )
+                        })
+                });
+                if !compatible {
+                    return Err(HostBindingError::InvalidHook(format!(
+                        "op-hook `{}` has no profile compatible with `{}`",
+                        requirement.purpose(),
+                        symbol.name()
+                    )));
+                }
+            }
+        }
+        for requirement in descriptor.required_term_hooks() {
+            let hook_id = hooks
+                .get_term(requirement.purpose())
+                .ok_or_else(|| HostBindingError::MissingHook(requirement.purpose().to_string()))?;
+            let hook = self.host_symbol(hook_id).ok_or_else(|| {
+                HostBindingError::InvalidHook(format!(
+                    "term-hook `{}` does not belong to this signature",
+                    requirement.purpose()
+                ))
+            })?;
+            if hook.arity() != 0 {
+                return Err(HostBindingError::InvalidHook(format!(
+                    "term-hook `{}` must resolve to a ground constant",
+                    requirement.purpose()
+                )));
+            }
+            for declaration in symbol.decls() {
+                let expected = contract_sort(declaration, requirement.sort());
+                if !hook
+                    .decls()
+                    .iter()
+                    .any(|hook_declaration| self.sorts.same_kind(expected, hook_declaration.range))
+                {
+                    return Err(HostBindingError::InvalidHook(format!(
+                        "term-hook `{}` has no sort compatible with `{}`",
+                        requirement.purpose(),
+                        symbol.name()
+                    )));
+                }
+            }
+        }
+
+        Ok((function, descriptor.arity()))
+    }
+
+    fn bind_host_function(
+        &mut self,
+        sym: SymbolId,
+        key: &str,
+        hooks: ResolvedHostHooks,
+    ) -> Result<HostBindingId, HostBindingError> {
+        let (function, arity) = self.validate_host_function(sym, key, &hooks)?;
+        let binding = HostBindingId::from_index(self.host_bindings.len());
+        self.host_bindings.push(ResolvedHostBinding {
+            function,
+            hooks,
+            arity,
+        });
+        // Host attachment changes normal forms just like a new equation. Invalidate every existing
+        // reduced stamp before exposing the binding.
+        self.eq_epoch += 1;
+        self.symbols.get_mut(sym).special = Some(SpecialOp::HostFunction(binding));
+        Ok(binding)
+    }
+
+    pub(crate) fn host_binding(&self, binding: HostBindingId) -> &ResolvedHostBinding {
+        &self.host_bindings[binding.index()]
+    }
+
+    pub(crate) fn host_function_key(&self, binding: HostBindingId) -> &HostFunctionKey {
+        self.host_functions
+            .key(self.host_bindings[binding.index()].function)
+    }
+
+    pub(crate) fn mark_host_execution(&self) {
+        self.host_bindings_sealed.set(true);
+    }
+    /// Every public symbolic operation is semantic execution, even before a first attachment exists.
+    /// Module construction uses separate crate-private preparation seams.
+    pub(crate) fn mark_symbolic_execution(&self) {
+        self.mark_host_execution();
+    }
+    pub(crate) fn host_reducer(&self, binding: HostBindingId) -> &dyn crate::host::StrictReducer {
+        self.host_functions
+            .reducer(self.host_bindings[binding.index()].function)
+    }
 
     /// Set a built-in reduction rule (`special (id-hook …)`) on `sym`. Hook references arrive already
     /// resolved to [`SymbolId`]s. Attaching [`SpecialOp::Branch`] also installs its intrinsic lazy
     /// evaluation strategy and synthetic branch-sort declarations.
     pub(crate) fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
+        assert!(
+            !matches!(
+                self.symbols.get(sym).special,
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host binding cannot be replaced"
+        );
         if let SpecialOp::Branch { .. } = op {
             // Branch attachment is idempotent because flattened imports can revisit the same symbol.
             // A user strategy is still invalid on the first attachment.
@@ -1985,6 +2313,13 @@ impl Signature {
         let top = lhs
             .top_symbol()
             .expect("equation lhs must be an application");
+        assert!(
+            !matches!(
+                self.symbols.get(top).special,
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "equations cannot be added after a strict host binding is installed"
+        );
         self.note_collapse_pattern(&lhs, &rhs);
         self.note_substitution_layout(&lhs, nr_vars, Some(&rhs), &condition);
         let condition_variables = condition_variable_indices(&condition);
@@ -2378,6 +2713,10 @@ impl Signature {
     pub(crate) fn eq_epoch(&self) -> u32 {
         self.eq_epoch
     }
+
+    fn invalidate_normal_forms(&mut self) {
+        self.eq_epoch += 1;
+    }
 }
 
 // ======================================================================================
@@ -2468,6 +2807,8 @@ impl Runtime {
         if direct.is_empty() && collapsing.is_empty() {
             return;
         }
+        let original_sort = self.node(id).sort;
+        let checkpoint = self.semantic_checkpoint();
 
         loop {
             let current = self.node(id).sort;
@@ -2504,7 +2845,13 @@ impl Runtime {
                 if sc.sort == current || !sig.sorts().leq(sc.sort, current) {
                     continue;
                 }
-                if let Some(bindings) = self.membership_applies(sig, sc, id, frames) {
+                let applies = self.membership_applies(sig, sc, id, frames);
+                if self.reducer_fault.is_some() {
+                    self.dags.get_mut(id).sort = original_sort;
+                    self.restore_semantic_checkpoint(checkpoint);
+                    return;
+                }
+                if let Some(bindings) = applies {
                     // Record before mutation so the event captures the current sort as `old_sort`.
                     if self.tracing() {
                         let depth = self.condition_depth;
@@ -2548,6 +2895,9 @@ impl Runtime {
         subst.reset(sc.nr_vars);
         let mut sp = sc.lhs.match_(self, sig, id, &mut subst, false, false)?;
         while sp.next(self, sig, &mut subst) {
+            if self.reducer_fault.is_some() {
+                return None;
+            }
             if sc.condition.is_empty() {
                 return Some(if self.tracing() {
                     Self::snapshot_subst(&subst)
@@ -2565,7 +2915,7 @@ impl Runtime {
                     bindings,
                 });
             }
-            let holds = self.condition_holds(
+            let holds = match self.condition_holds(
                 sig,
                 &sc.condition,
                 &mut subst,
@@ -2573,7 +2923,13 @@ impl Runtime {
                 sc.id,
                 frames,
                 id,
-            );
+            ) {
+                Ok(holds) => holds,
+                Err(fault) => {
+                    self.reducer_fault = Some(fault);
+                    return None;
+                }
+            };
             if self.tracing() {
                 self.record(TraceEvent::TrialEnd {
                     kind: StmtKind::Membership,
@@ -2875,7 +3231,13 @@ impl Runtime {
         let variant_narrowing_count = self.variant_narrowing_count;
         let narrowing_count = self.narrowing_count;
         let trace_len = self.trace.as_ref().map(Vec::len);
-        let normalized = self.reduce(sig, d, &mut NullDescent);
+        let normalized = match self.reduce(sig, d, &mut NullDescent) {
+            Ok(normalized) => normalized,
+            Err(fault) => {
+                self.reducer_fault = Some(fault);
+                d
+            }
+        };
         self.rewrite_count = rewrite_count;
         self.membership_count = membership_count;
         self.rule_rewrite_count = rule_rewrite_count;
@@ -3019,7 +3381,15 @@ impl Runtime {
             .iter()
             .flat_map(|&(e, m)| std::iter::repeat_n(self.dags.get(e).sort, m as usize))
             .collect();
-        let sort = sig.compute_sort_fold(symbol, &elem_sorts);
+        let sort = if elem_sorts.is_empty() {
+            let identity = sig
+                .symbol(symbol)
+                .identity()
+                .expect("an empty ACU multiset requires an identity element");
+            sig.identity_sort(identity)
+        } else {
+            sig.compute_sort_fold(symbol, &elem_sorts)
+        };
         self.alloc_node(sort, NodeTerm::Acu { symbol, args })
     }
 
@@ -3615,6 +3985,34 @@ impl Runtime {
         RootGuard::new(&self.roots, id)
     }
 
+    /// Keep callback-scoped DAG handles live across a re-entrant reduction's safe-point collection.
+    /// The returned index must be restored when the callback ends; nested callbacks therefore stack.
+    pub(crate) fn begin_strict_callback_scope(
+        &mut self,
+        redex: DagId,
+        arguments: &[DagId],
+    ) -> Option<usize> {
+        self.gc_interval.map(|_| {
+            let base = self.protected.len();
+            self.protected.push(redex);
+            self.protected.extend_from_slice(arguments);
+            base
+        })
+    }
+
+    /// Add a value constructed inside the active strict callback to its scoped GC root set.
+    pub(crate) fn protect_strict_callback_value(&mut self, value: DagId) {
+        if self.gc_interval.is_some() {
+            self.protected.push(value);
+        }
+    }
+
+    /// Release the roots installed by [`Self::begin_strict_callback_scope`].
+    pub(crate) fn end_strict_callback_scope(&mut self, base: usize) {
+        debug_assert!(base <= self.protected.len());
+        self.protected.truncate(base);
+    }
+
     /// Collect every DAG node not reachable from a live [`RootGuard`], an engine-lifetime identity
     /// cache entry, or from `extra_roots` (see [`Engine::gc`]); returns the number reclaimed.
     pub(crate) fn gc(&mut self, extra_roots: impl IntoIterator<Item = DagId>) -> usize {
@@ -3731,6 +4129,35 @@ impl Runtime {
     }
 
     // ---- statistics ----
+    fn semantic_checkpoint(&self) -> SemanticCheckpoint {
+        SemanticCheckpoint {
+            rewrite_count: self.rewrite_count,
+            membership_count: self.membership_count,
+            rule_rewrite_count: self.rule_rewrite_count,
+            variant_narrowing_count: self.variant_narrowing_count,
+            narrowing_count: self.narrowing_count,
+            counter_value: self.counter_value,
+            model_check_stats_len: self.model_check_stats.len(),
+            sat_solve_stats_len: self.sat_solve_stats.len(),
+            trace_len: self.trace.as_ref().map(Vec::len),
+        }
+    }
+
+    fn restore_semantic_checkpoint(&mut self, checkpoint: SemanticCheckpoint) {
+        self.rewrite_count = checkpoint.rewrite_count;
+        self.membership_count = checkpoint.membership_count;
+        self.rule_rewrite_count = checkpoint.rule_rewrite_count;
+        self.variant_narrowing_count = checkpoint.variant_narrowing_count;
+        self.narrowing_count = checkpoint.narrowing_count;
+        self.counter_value = checkpoint.counter_value;
+        self.model_check_stats
+            .truncate(checkpoint.model_check_stats_len);
+        self.sat_solve_stats
+            .truncate(checkpoint.sat_solve_stats_len);
+        if let (Some(trace), Some(len)) = (&mut self.trace, checkpoint.trace_len) {
+            trace.truncate(len);
+        }
+    }
 
     /// Total equational rewrites applied so far.
     pub(crate) fn rewrites(&self) -> u64 {
@@ -3765,6 +4192,32 @@ impl Runtime {
         )
     }
 
+    pub(crate) fn reduce_or_defer_fault(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+        descent: &mut dyn DescentOps,
+    ) -> DagId {
+        match self.reduce(sig, root, descent) {
+            Ok(result) => result,
+            Err(fault) => {
+                self.reducer_fault = Some(fault);
+                root
+            }
+        }
+    }
+
+    pub(crate) fn defer_reducer_fault(&mut self, fault: ReducerFault) {
+        self.reducer_fault = Some(fault);
+    }
+
+    fn check_reducer_fault(&mut self) -> Result<(), ReducerFault> {
+        match self.reducer_fault.take() {
+            Some(fault) => Err(fault),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn record_model_check_stats(&mut self, stats: ModelCheckStats) {
         self.model_check_stats.push(stats);
     }
@@ -3778,16 +4231,17 @@ impl Runtime {
     /// The reduction core; see [`Engine::reduce`] for the contract and the iterative-vs-recursive
     /// rationale. Reads `sig.eq_epoch()`, builds nodes via `self.make_free(sig, ..)`, and rewrites
     /// the top via `self.try_rewrite_top(sig, ..)` — all while holding only a shared borrow of `sig`.
-    #[must_use]
     pub(crate) fn reduce(
         &mut self,
         sig: &Signature,
         root: DagId,
         descent: &mut dyn DescentOps,
-    ) -> DagId {
+    ) -> Result<DagId, ReducerFault> {
+        self.check_reducer_fault()?;
+        sig.mark_host_execution();
         if self.node(root).reduced_epoch == sig.eq_epoch() {
             // Return the recorded out-of-place normal form; `None` means the node itself is canonical.
-            return self.node(root).nf.unwrap_or(root);
+            return Ok(self.node(root).nf.unwrap_or(root));
         }
 
         let mut stack: Vec<ReduceFrame> = Vec::new();
@@ -3796,6 +4250,7 @@ impl Runtime {
         let mut child_result: Option<DagId> = None;
 
         loop {
+            self.check_reducer_fault()?;
             // Invariant: `stack` is non-empty throughout the body. It starts with the root frame and
             // the only `pop` (below) is immediately followed by a `return` when it empties, so the
             // loop never re-enters with an empty stack — the `expect`s below are therefore unreachable.
@@ -3953,7 +4408,7 @@ impl Runtime {
 
             // Intermediate Top instructions exclude `[owise]`; the final Top includes it. A successful
             // attempt abandons this strategy and starts the replacement term's strategy from step 0.
-            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent, final_step) {
+            if let Some(next) = self.try_rewrite_top(sig, rebuilt, &stack, descent, final_step)? {
                 self.rewrite_count += 1;
                 // A rewrite result already stamped reduced terminates this position after counting the
                 // rewrite. Fresh RHS nodes lack the stamp, so a self-rewrite such as `eq a = a` loops.
@@ -3972,7 +4427,7 @@ impl Runtime {
                     }
                     stack.pop();
                     if stack.is_empty() {
-                        return done;
+                        return Ok(done);
                     }
                     child_result = Some(done);
                     continue;
@@ -4023,6 +4478,7 @@ impl Runtime {
                 let whole = (self.record_whole && self.tracing())
                     .then(|| self.reconstruct_whole(sig, &stack, rebuilt));
                 self.constrain_to_smaller_sort(sig, rebuilt, whole, &stack);
+                self.check_reducer_fault()?;
             }
 
             // Stamp the canonical result and forward the frame's original `start` node to it.
@@ -4039,7 +4495,7 @@ impl Runtime {
             }
             stack.pop();
             if stack.is_empty() {
-                return rebuilt;
+                return Ok(rebuilt);
             }
             child_result = Some(rebuilt);
         }
@@ -4120,6 +4576,91 @@ impl Runtime {
         (0..subst.len()).map(|i| subst.get(i)).collect()
     }
 
+    fn try_host_function(
+        &mut self,
+        sig: &Signature,
+        redex: DagId,
+        binding: HostBindingId,
+    ) -> Result<Option<DagId>, ReducerFault> {
+        let symbol = self.node(redex).symbol();
+        let resolved = sig.host_binding(binding);
+        let key = sig.host_function_key(binding);
+        let epoch = sig.eq_epoch();
+        let mut arguments: Vec<DagId> = self.node(redex).children().collect();
+        for (position, argument) in arguments.iter_mut().enumerate() {
+            let node = self.node(*argument);
+            if node.reduced_epoch != epoch {
+                return Err(ReducerFault::new(format!(
+                    "strict callback argument {position} is not normal at the active equation epoch"
+                ))
+                .for_key(key));
+            }
+            let normal = node.nf.unwrap_or(*argument);
+            let target = self.node(normal);
+            if target.reduced_epoch != epoch || target.nf.is_some() {
+                return Err(ReducerFault::new(format!(
+                    "strict callback argument {position} has stale normal-form forwarding"
+                ))
+                .for_key(key));
+            }
+            *argument = normal;
+        }
+        let argument_sorts: Vec<SortId> = arguments
+            .iter()
+            .map(|&argument| self.node(argument).sort)
+            .collect();
+        let result_range = sig.compute_sort(symbol, &argument_sorts);
+        debug_assert_eq!(arguments.len(), resolved.arity);
+        let reducer = sig.host_reducer(binding);
+        let outcome = invoke_strict(
+            self,
+            sig,
+            redex,
+            arguments,
+            argument_sorts,
+            result_range,
+            &resolved.hooks,
+            reducer,
+        )
+        .map(|outcome| match outcome {
+            StrictOutcome::Decline => None,
+            StrictOutcome::Reduced(result) => Some(built_id(result)),
+        });
+        // Identity construction can defer a nested fault through an infallible theory seam. Consume it
+        // even when the callback also failed, and preserve that earlier fault's original host key.
+        self.check_reducer_fault()?;
+        let Some(result) = outcome.map_err(|fault| fault.for_key(key))? else {
+            return Ok(None);
+        };
+        let actual = self.node(result).sort;
+        let actual_kind = sig.sorts.kind_of(actual);
+        let range_kind = sig.sorts.kind_of(result_range);
+        if actual_kind != range_kind {
+            return Err(ReducerFault::new(format!(
+                "returned sort `{}` is in a different kind from selected range `{}`",
+                sig.sorts.name(actual),
+                sig.sorts.name(result_range)
+            ))
+            .for_key(key));
+        }
+        if actual == sig.sorts.error_sort(actual_kind) {
+            return Err(ReducerFault::new(format!(
+                "returned the error sort for kind `{}`",
+                sig.sorts.name(result_range)
+            ))
+            .for_key(key));
+        }
+        if !sig.sorts.leq(actual, result_range) {
+            return Err(ReducerFault::new(format!(
+                "returned sort `{}` is not below selected range `{}`",
+                sig.sorts.name(actual),
+                sig.sorts.name(result_range)
+            ))
+            .for_key(key));
+        }
+        Ok(Some(result))
+    }
+
     fn try_rewrite_top(
         &mut self,
         sig: &Signature,
@@ -4127,31 +4668,47 @@ impl Runtime {
         frames: &[ReduceFrame],
         descent: &mut dyn DescentOps,
         final_step: bool,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         let symbol = self.node(id).symbol();
-        // Built-ins are the symbol's primary reduction rule: try them before user equations and fall
-        // through on no match. The split signature/runtime borrows avoid cloning the hook.
         if let Some(op) = sig.symbol(symbol).special() {
-            if let Some(r) = self.try_special(sig, id, op, descent) {
+            let (result, host_binding) = match op {
+                SpecialOp::HostFunction(binding) => {
+                    debug_assert!(
+                        final_step,
+                        "validated strict host bindings have one final Top instruction"
+                    );
+                    (self.try_host_function(sig, id, *binding)?, Some(*binding))
+                }
+                _ => (self.try_special(sig, id, op, descent)?, None),
+            };
+            self.check_reducer_fault()?;
+            if let Some(result) = result {
                 if self.tracing() {
                     let depth = self.condition_depth;
+                    let host_key =
+                        host_binding.map(|binding| sig.host_function_key(binding).clone());
                     self.record(TraceEvent::Rewrite {
-                        kind: RewriteKind::BuiltIn,
+                        kind: if host_binding.is_some() {
+                            RewriteKind::HostFunction
+                        } else {
+                            RewriteKind::BuiltIn
+                        },
                         eq_id: None,
+                        host_key,
                         depth,
                         redex: id,
-                        result: r,
+                        result,
                         bindings: Vec::new(),
                         whole_before: None,
                         whole_after: None,
                     });
                 }
-                return Some(r);
+                return Ok(Some(result));
             }
             // A branch operator's first Top is selection-only. If no test matches, reduce every
             // remaining branch before trying user equations.
             if !final_step && matches!(op, SpecialOp::Branch { .. }) {
-                return None;
+                return Ok(None);
             }
         }
         // ACU/AU/S/CUI rewriting matches *modulo* the axioms with extension: a pattern may match a
@@ -4162,15 +4719,19 @@ impl Runtime {
             sig.symbol(symbol).theory(),
             Theory::Acu | Theory::Au | Theory::S | Theory::Cui
         );
-        let eqs = sig.equations.get(&symbol)?;
+        let Some(eqs) = sig.equations.get(&symbol) else {
+            return Ok(None);
+        };
         // Intermediate `0` instructions try ordinary equations only; the final `0` adds `[owise]`
         // fallbacks. A branch operator's selection-only Top returned above before either class.
-        if let Some(result) = self.try_equations(sig, id, eqs, ext_allowed, false, frames) {
-            return Some(result);
+        if let Some(result) = self.try_equations(sig, id, eqs, ext_allowed, false, frames)? {
+            return Ok(Some(result));
         }
-        final_step
-            .then(|| self.try_equations(sig, id, eqs, ext_allowed, true, frames))
-            .flatten()
+        if final_step {
+            self.try_equations(sig, id, eqs, ext_allowed, true, frames)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Try one equation class (`owise == false` for ordinary equations, `true` for fallbacks) against
@@ -4185,7 +4746,7 @@ impl Runtime {
         ext_allowed: bool,
         owise: bool,
         frames: &[ReduceFrame],
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         let mut subst = Subst::new();
         for eq in eqs {
             if eq.owise != owise {
@@ -4193,7 +4754,7 @@ impl Runtime {
             }
             // First applicable solution wins (`Flow::Stop`): equational reduction takes the first
             // equation whose lhs matches and whose condition holds.
-            let r = self.drive_match(
+            let result = self.drive_match(
                 sig,
                 id,
                 &eq.lhs,
@@ -4211,12 +4772,12 @@ impl Runtime {
                     redex: id,
                 },
                 &mut |_, _| Flow::Stop,
-            );
-            if r.is_some() {
-                return r;
+            )?;
+            if result.is_some() {
+                return Ok(result);
             }
         }
-        None
+        Ok(None)
     }
 
     /// Drive one equation or rule as a matcher solution stream. Each candidate must satisfy the
@@ -4237,9 +4798,12 @@ impl Runtime {
         subst: &mut Subst,
         ctx: StmtCtx<'_>,
         accept: &mut dyn FnMut(&mut Runtime, DagId) -> Flow,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         subst.reset(nr_vars);
-        let mut sp = lhs.match_(self, sig, subject, subst, ext_allowed, false)?;
+        let Some(mut sp) = lhs.match_(self, sig, subject, subst, ext_allowed, false) else {
+            return Ok(None);
+        };
+        self.check_reducer_fault()?;
         let rewrite_kind = match ctx.kind {
             StmtKind::Equation => RewriteKind::Equation,
             StmtKind::Rule => RewriteKind::Rule,
@@ -4268,7 +4832,7 @@ impl Runtime {
                     ctx.stmt_id,
                     ctx.frames,
                     ctx.redex,
-                );
+                )?;
                 if self.tracing() {
                     self.record(TraceEvent::TrialEnd {
                         kind: ctx.kind,
@@ -4296,6 +4860,7 @@ impl Runtime {
                 self.record(TraceEvent::Rewrite {
                     kind: rewrite_kind,
                     eq_id: Some(ctx.stmt_id),
+                    host_key: None,
                     depth,
                     redex: ctx.redex,
                     result,
@@ -4305,11 +4870,12 @@ impl Runtime {
                 });
             }
             match accept(self, result) {
-                Flow::Stop => return Some(result),
+                Flow::Stop => return Ok(Some(result)),
                 Flow::Continue => {}
             }
         }
-        None
+        self.check_reducer_fault()?;
+        Ok(None)
     }
 
     fn smt_conjoin(
@@ -4490,7 +5056,7 @@ impl Runtime {
         sig: &Signature,
         node: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
-    ) -> Option<(u32, DagId)> {
+    ) -> Result<Option<(u32, DagId)>, ReducerFault> {
         self.apply_first_rule_filtered(sig, node, cursors, None)
     }
 
@@ -4502,12 +5068,14 @@ impl Runtime {
         node: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
         filter: Option<RuleFilter>,
-    ) -> Option<(u32, DagId)> {
+    ) -> Result<Option<(u32, DagId)>, ReducerFault> {
         let symbol = self.node(node).symbol();
-        let rules = sig.rules.get(&symbol)?;
+        let Some(rules) = sig.rules.get(&symbol) else {
+            return Ok(None);
+        };
         let n = rules.len();
         if n == 0 {
-            return None;
+            return Ok(None);
         }
         // Rules of ACU/AU/S symbols match *modulo* the axioms with extension (a sub-multiset / contiguous
         // sub-sequence / successor prefix), exactly as equations do (try_rewrite_top).
@@ -4533,7 +5101,7 @@ impl Runtime {
             // Rule application happens outside `reduce`, so there are no outer reduce frames to root for a
             // conditional rule's re-entrant condition reduction; the caller keeps the whole term rooted
             // (and the REPL runs with GC off), so an empty frame slice is correct here.
-            let r = self.drive_match(
+            let result = self.drive_match(
                 sig,
                 node,
                 &rule.lhs,
@@ -4551,16 +5119,16 @@ impl Runtime {
                     redex: node,
                 },
                 &mut |_, _| Flow::Stop,
-            );
-            if let Some(result) = r {
+            )?;
+            if let Some(result) = result {
                 let rule_id = rule.id;
                 self.rewrite_count += 1;
                 self.rule_rewrite_count += 1;
                 cursors.insert(symbol, ((idx + 1) % n) as u32);
-                return Some((rule_id, result));
+                return Ok(Some((rule_id, result)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Find the first rewritable position in top-down breadth-first order and apply one rule there.
@@ -4571,7 +5139,7 @@ impl Runtime {
         sig: &Signature,
         root: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         let mut stack = vec![RedexPos {
             node: root,
             parent: usize::MAX,
@@ -4585,7 +5153,7 @@ impl Runtime {
                 // childless leaves, until the stack grows or every node has been explored.
                 loop {
                     if next_to_explore == stack.len() {
-                        return None; // every position explored; no rule applies (a normal form)
+                        return Ok(None); // every position explored; no rule applies (a normal form)
                     }
                     let parent_idx = next_to_explore;
                     let d = stack[parent_idx].node;
@@ -4612,10 +5180,10 @@ impl Runtime {
             let node = stack[i].node;
             // A `counter` redex fires like a rule at this (top-down-first) position.
             if let Some(result) = self.try_counter(sig, node) {
-                return Some(self.rebuild_path(sig, &stack, i, result));
+                return Ok(Some(self.rebuild_path(sig, &stack, i, result)));
             }
-            if let Some((_rule_id, result)) = self.apply_first_rule_at(sig, node, cursors) {
-                return Some(self.rebuild_path(sig, &stack, i, result));
+            if let Some((_rule_id, result)) = self.apply_first_rule_at(sig, node, cursors)? {
+                return Ok(Some(self.rebuild_path(sig, &stack, i, result)));
             }
             i += 1;
         }
@@ -4652,8 +5220,22 @@ impl Runtime {
         &mut self,
         sig: &Signature,
         root: DagId,
-    ) -> RawSuccessors {
-        let count_start = self.rewrite_count;
+    ) -> Result<RawSuccessors, ReducerFault> {
+        let checkpoint = self.semantic_checkpoint();
+        let result = self.state_successors_deferred_inner(sig, root, checkpoint.rewrite_count);
+        if result.is_err() {
+            self.restore_semantic_checkpoint(checkpoint);
+        }
+        result
+    }
+
+    fn state_successors_deferred_inner(
+        &mut self,
+        sig: &Signature,
+        root: DagId,
+        count_start: u64,
+    ) -> Result<RawSuccessors, ReducerFault> {
+        self.check_reducer_fault()?;
         let mut last_count = count_start;
         let mut entries = Vec::new();
 
@@ -4684,9 +5266,11 @@ impl Runtime {
         for pos_idx in 0..positions.len() {
             let node = positions[pos_idx].node;
             let mut local: Vec<(u32, DagId, u64, RootGuard)> = Vec::new();
-            self.all_successors_at(sig, node, &mut local);
+            self.all_successors_at(sig, node, &mut local)?;
+            self.check_reducer_fault()?;
             for (rule_id, result, count_after_match, _result_root) in local {
                 let spliced = self.rebuild_path(sig, &positions, pos_idx, result);
+                self.check_reducer_fault()?;
                 entries.push(RawSuccessor {
                     rule_id,
                     term: spliced,
@@ -4697,12 +5281,13 @@ impl Runtime {
             }
         }
 
+        self.check_reducer_fault()?;
         let tail_rewrites = self.rewrite_count - last_count;
         self.rewrite_count = count_start;
-        RawSuccessors {
+        Ok(RawSuccessors {
             entries,
             tail_rewrites,
-        }
+        })
     }
 
     pub(crate) fn reduce_graph_successor(
@@ -4710,7 +5295,7 @@ impl Runtime {
         sig: &Signature,
         successor: DagId,
         descent: &mut dyn DescentOps,
-    ) -> DagId {
+    ) -> Result<DagId, ReducerFault> {
         self.rewrite_count += 1;
         self.rule_rewrite_count += 1;
         self.reduce(sig, successor, descent)
@@ -4725,10 +5310,10 @@ impl Runtime {
         sig: &Signature,
         node: DagId,
         out: &mut Vec<(u32, DagId, u64, RootGuard)>,
-    ) {
+    ) -> Result<(), ReducerFault> {
         let symbol = self.node(node).symbol();
         let Some(rules) = sig.rules.get(&symbol) else {
-            return;
+            return Ok(());
         };
         let ext_allowed = matches!(
             sig.symbol(symbol).theory(),
@@ -4760,8 +5345,9 @@ impl Runtime {
                     out.push((rid, result, rt.rewrite_count, rt.root(result)));
                     Flow::Continue
                 },
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// A structural hash of the DAG at `id`, **consistent with [`deep_equal`](Self::deep_equal)**: equal
@@ -4817,15 +5403,15 @@ impl Runtime {
         nr_vars: u32,
         such_that: &[CompiledFragment],
         state: DagId,
-    ) -> Vec<(Vec<DagId>, u64)> {
+    ) -> Result<Vec<(Vec<DagId>, u64)>, ReducerFault> {
         let mut solutions = Vec::new();
         let mut subst = Subst::new();
         subst.reset(nr_vars);
         let Some(mut sp) = goal.match_(self, sig, state, &mut subst, false, false) else {
-            return solutions;
+            return Ok(solutions);
         };
         while sp.next(self, sig, &mut subst) {
-            if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state) {
+            if self.condition_holds(sig, such_that, &mut subst, StmtKind::Rule, 0, &[], state)? {
                 // Snapshot after the `such that` condition's equational reductions so the accepted
                 // solution includes their rewrite count. An empty condition has no cost.
                 let bindings = (0..nr_vars)
@@ -4834,7 +5420,7 @@ impl Runtime {
                 solutions.push((bindings, self.rewrites()));
             }
         }
-        solutions
+        Ok(solutions)
     }
 
     /// Evaluate every condition fragment under a matched substitution.
@@ -4852,9 +5438,9 @@ impl Runtime {
         stmt_id: u32,
         frames: &[ReduceFrame],
         redex: DagId,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         if condition.is_empty() {
-            return true;
+            return Ok(true);
         }
         // Every rewrite-condition recursion cycle passes through here. Grow the stack on demand so an
         // unbounded recursive condition remains heap-growing and externally interruptible rather than
@@ -4874,7 +5460,7 @@ impl Runtime {
         stmt_id: u32,
         frames: &[ReduceFrame],
         redex: DagId,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         let restore = self.gc_interval.is_some().then(|| {
             let base = self.protected.len();
             for f in frames {
@@ -4895,6 +5481,16 @@ impl Runtime {
             self.protected.truncate(base);
         }
         holds
+    }
+    fn reduce_condition_term(
+        &mut self,
+        sig: &Signature,
+        term: DagId,
+    ) -> Result<DagId, ReducerFault> {
+        self.condition_depth += 1;
+        let result = self.reduce(sig, term, &mut NullDescent);
+        self.condition_depth -= 1;
+        result
     }
 
     /// Record a condition fragment's end, including the resulting substitution on success.
@@ -4965,9 +5561,9 @@ impl Runtime {
         subst: &mut Subst,
         kind: StmtKind,
         stmt_id: u32,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         let Some(frag) = condition.get(i) else {
-            return true; // every fragment satisfied
+            return Ok(true); // every fragment satisfied
         };
         let depth = self.condition_depth;
         // Record the first attempt. A matching fragment may emit another start event when backtracking
@@ -4986,67 +5582,55 @@ impl Runtime {
         match frag {
             CompiledFragment::Equality { lhs, rhs } => {
                 // Reduce each side while pinning the reduced `l` across `r`'s reduction. Under
-                // in-reduction GC, `l` is live only in this native local while `r` reduces, so a nested
-                // safe point would otherwise sweep it. `r` is instantiated *after* `l`'s reduce, so nothing
-                // unrooted is live during `l`'s reduction either.
-                self.condition_depth += 1;
+                // in-reduction GC, `l` is live only in this native local while `r` reduces.
                 let l = self.instantiate(sig, lhs, subst);
-                let l = self.reduce(sig, l, &mut NullDescent);
+                let l = self.reduce_condition_term(sig, l)?;
                 let _root_l = self.root(l);
                 let r = self.instantiate(sig, rhs, subst);
-                let r = self.reduce(sig, r, &mut NullDescent);
-                self.condition_depth -= 1;
+                let r = self.reduce_condition_term(sig, r)?;
                 let holds = self.deep_equal(l, r);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
                 if !holds {
-                    return false;
+                    return Ok(false);
                 }
-                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
-                    return true;
+                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)? {
+                    return Ok(true);
                 }
                 // A later fragment failed; trace deterministic backtracking without changing search or counts.
                 self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
-                false
+                Ok(false)
             }
             CompiledFragment::SortTest { term, sort } => {
-                let t = self.instantiate(sig, term, subst);
-                self.condition_depth += 1;
-                let t = self.reduce(sig, t, &mut NullDescent);
-                self.condition_depth -= 1;
-                let holds = sig.sorts().leq(self.node(t).sort, *sort);
+                let term = self.instantiate(sig, term, subst);
+                let term = self.reduce_condition_term(sig, term)?;
+                let holds = sig.sorts().leq(self.node(term).sort, *sort);
                 self.end_fragment(kind, stmt_id, i, depth, holds, subst);
                 if !holds {
-                    return false;
+                    return Ok(false);
                 }
-                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
-                    return true;
+                if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)? {
+                    return Ok(true);
                 }
                 self.trace_deterministic_backtrack(kind, stmt_id, i, depth);
-                false
+                Ok(false)
             }
             CompiledFragment::Matching {
                 pattern,
                 subject,
                 fresh_vars,
             } => {
-                let subj = self.instantiate(sig, subject, subst);
-                self.condition_depth += 1;
-                let subj = self.reduce(sig, subj, &mut NullDescent);
-                self.condition_depth -= 1;
-                // `subj` — and the fresh-variable bindings, which are its subterms — must survive the
-                // pattern match and the recursive solve of the later fragments, both of which reduce under
-                // in-reduction GC; pin it for the rest of this fragment.
-                let _root_subj = self.root(subj);
-                for &fv in fresh_vars {
-                    subst.unbind(fv); // fresh slate, so a backtracking re-entry rebinds cleanly
+                let subject = self.instantiate(sig, subject, subst);
+                let subject = self.reduce_condition_term(sig, subject)?;
+                // `subject` and its fresh-variable subterms stay rooted through recursive reductions.
+                let _root_subject = self.root(subject);
+                for &fresh in fresh_vars {
+                    subst.unbind(fresh);
                 }
-                let satisfied = match pattern.match_(self, sig, subj, subst, false, false) {
-                    Some(mut sp) => {
-                        let mut ok = false;
+                let satisfied = match pattern.match_(self, sig, subject, subst, false, false) {
+                    Some(mut solutions) => {
+                        let mut satisfied = false;
                         let mut first = true;
                         loop {
-                            // A re-solve (backtrack) begins a fresh attempt (`re-solving condition
-                            // fragment`); the first attempt's begin was emitted above.
                             if !first && self.tracing() {
                                 self.record(TraceEvent::FragmentStart {
                                     kind,
@@ -5057,18 +5641,17 @@ impl Runtime {
                                 });
                             }
                             first = false;
-                            let found = sp.next(self, sig, subst);
+                            let found = solutions.next(self, sig, subst);
                             self.end_fragment(kind, stmt_id, i, depth, found, subst);
                             if !found {
-                                break; // matcher exhausted — this fragment fails
-                            }
-                            if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
-                                ok = true;
                                 break;
                             }
-                            // else: later fragment failed — backtrack into the next matcher solution.
+                            if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)? {
+                                satisfied = true;
+                                break;
+                            }
                         }
-                        ok
+                        satisfied
                     }
                     None => {
                         self.end_fragment(kind, stmt_id, i, depth, false, subst);
@@ -5076,11 +5659,11 @@ impl Runtime {
                     }
                 };
                 if !satisfied {
-                    for &fv in fresh_vars {
-                        subst.unbind(fv);
+                    for &fresh in fresh_vars {
+                        subst.unbind(fresh);
                     }
                 }
-                satisfied
+                Ok(satisfied)
             }
             CompiledFragment::Rewrite {
                 lhs,
@@ -5089,9 +5672,7 @@ impl Runtime {
             } => {
                 // Reduce the instantiated origin, then search its `=>*` states for a matching pattern.
                 let start = self.instantiate(sig, lhs, subst);
-                self.condition_depth += 1;
-                let start = self.reduce(sig, start, &mut NullDescent);
-                self.condition_depth -= 1;
+                let start = self.reduce_condition_term(sig, start)?;
                 self.solve_rewrite_condition(
                     sig, start, pattern, fresh_vars, subst, condition, i, kind, stmt_id, depth,
                 )
@@ -5121,7 +5702,7 @@ impl Runtime {
         kind: StmtKind,
         stmt_id: u32,
         depth: u32,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         let mut states = vec![RootedDag {
             node: start,
             _root: self.root(start),
@@ -5135,8 +5716,8 @@ impl Runtime {
             if let Some(mut sp) = pattern.match_(self, sig, state, subst, false, false) {
                 while sp.next(self, sig, subst) {
                     self.end_fragment(kind, stmt_id, i, depth, true, subst);
-                    if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id) {
-                        return true;
+                    if self.solve_condition(sig, condition, i + 1, subst, kind, stmt_id)? {
+                        return Ok(true);
                     }
                 }
             }
@@ -5144,7 +5725,7 @@ impl Runtime {
             // Generate eagerly exactly as `state_successors` does, including charging all matcher/
             // condition work before reducing the first result. Keep the raw guards, however: reducing
             // one successor may collect, so every other pending result must remain live.
-            let batch = self.state_successors_deferred(sig, state);
+            let batch = self.state_successors_deferred(sig, state)?;
             for successor in &batch.entries {
                 self.rewrite_count += successor.enumeration_rewrites;
             }
@@ -5157,9 +5738,7 @@ impl Runtime {
                 } = successor;
                 self.rewrite_count += 1;
                 self.rule_rewrite_count += 1;
-                self.condition_depth += 1;
-                let reduced = self.reduce(sig, succ, &mut NullDescent);
-                self.condition_depth -= 1;
+                let reduced = self.reduce_condition_term(sig, succ)?;
                 if !states
                     .iter()
                     .any(|rooted| self.deep_equal(rooted.node, reduced))
@@ -5180,7 +5759,7 @@ impl Runtime {
         for &fv in fresh_vars {
             subst.unbind(fv);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -5257,6 +5836,54 @@ impl Engine {
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Create an empty engine whose signature may bind functions from `catalog` before execution.
+    pub fn with_host_functions(catalog: HostFunctionCatalog) -> Self {
+        let mut engine = Self::default();
+        engine.sig.host_functions = catalog;
+        engine
+    }
+
+    /// The immutable capability catalog configured for this engine.
+    ///
+    /// Select a different catalog by constructing a new [`Engine`]; the shared accessor cannot
+    /// replace an existing engine's reducer implementations:
+    ///
+    /// ```compile_fail
+    /// use tnk_core::engine::Engine;
+    /// use tnk_core::host::HostFunctionCatalog;
+    ///
+    /// fn replace_catalog(engine: &mut Engine, replacement: HostFunctionCatalog) {
+    ///     *engine.host_functions() = replacement;
+    /// }
+    /// ```
+    pub fn host_functions(&self) -> &HostFunctionCatalog {
+        &self.sig.host_functions
+    }
+
+    /// Validate a prospective strict reducer attachment without mutating the signature.
+    pub fn validate_host_function_binding(
+        &self,
+        symbol: SymbolId,
+        key: &str,
+        hooks: &ResolvedHostHooks,
+    ) -> Result<(), HostBindingError> {
+        self.sig
+            .validate_host_function(symbol, key, hooks)
+            .map(|_| ())
+    }
+
+    /// Bind a signature operator to one configured strict reducer.
+    ///
+    /// Binding is validation-only and allowed before the first semantic operation. The resolved
+    /// binding becomes immutable signature data and is copied neither per call nor per DAG node.
+    pub fn bind_host_function(
+        &mut self,
+        symbol: SymbolId,
+        key: &str,
+        hooks: ResolvedHostHooks,
+    ) -> Result<HostBindingId, HostBindingError> {
+        self.sig.bind_host_function(symbol, key, hooks)
     }
 
     /// Module-wide lower bound for substitution layouts. Narrowing places state variables at or
@@ -5492,18 +6119,39 @@ impl Engine {
     /// Reserve a two-sided identity slot before the ground term is parsed. This supports mutually
     /// referring operator declarations without degrading identity terms to name lookups.
     pub fn reserve_identity(&mut self, sym: SymbolId, sort: SortId) {
+        assert!(
+            !matches!(
+                self.sig.symbol(sym).special(),
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's theory is sealed at binding"
+        );
         let identity = self.sig.reserve_identity(sort);
         self.sig.symbols.get_mut(sym).identity = Some(identity);
     }
 
     /// Reserve a one-sided identity slot before its ground term is parsed.
     pub fn reserve_one_sided_identity(&mut self, sym: SymbolId, side: IdentitySide, sort: SortId) {
+        assert!(
+            !matches!(
+                self.sig.symbol(sym).special(),
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's theory is sealed at binding"
+        );
         let identity = self.sig.reserve_identity(sort);
         self.sig.symbols.get_mut(sym).one_sided_id = Some((side, identity));
     }
 
     /// Install the parsed ground term into a previously reserved identity slot.
     pub fn set_identity_term(&mut self, sym: SymbolId, term: Term) {
+        assert!(
+            !matches!(
+                self.sig.symbol(sym).special(),
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's identity is sealed at binding"
+        );
         let identity = self
             .sig
             .symbol(sym)
@@ -5519,6 +6167,13 @@ impl Engine {
 
     /// Install the parsed ground term into a previously reserved one-sided identity slot.
     pub fn set_one_sided_identity_term(&mut self, sym: SymbolId, term: Term) {
+        assert!(
+            !matches!(
+                self.sig.symbol(sym).special(),
+                Some(SpecialOp::HostFunction(_))
+            ),
+            "a strict host operator's identity is sealed at binding"
+        );
         let identity = self
             .sig
             .symbol(sym)
@@ -5534,7 +6189,16 @@ impl Engine {
     }
 
     /// Materialize every installed identity as a normalized permanent DAG after module construction.
+    ///
+    /// This compatibility wrapper panics on a strict-reducer fault. Runtime and frontend boundaries
+    /// should use [`Self::try_prepare_identities`].
     pub fn prepare_identities(&mut self) {
+        self.try_prepare_identities()
+            .unwrap_or_else(|fault| panic!("{fault}"));
+    }
+
+    /// Fallible identity materialization for module-build boundaries.
+    pub fn try_prepare_identities(&mut self) -> Result<(), ReducerFault> {
         let identities: HashSet<IdentityId> = self
             .sig
             .symbols_iter()
@@ -5544,10 +6208,14 @@ impl Engine {
                     .chain(sym.one_sided_id.map(|(_, identity)| identity))
             })
             .collect();
-        let (sig, rt) = (&self.sig, &mut self.rt);
-        for identity in identities {
-            rt.identity_dag(sig, identity);
-        }
+        self.try_symbolic_operation(|rt, sig| {
+            for identity in identities {
+                rt.identity_dag(sig, identity);
+                if rt.reducer_fault.is_some() {
+                    break;
+                }
+            }
+        })
     }
     /// Retain a `SuccSymbol`'s `zeroTerm`. A raw term-hook lookup is name/arity-only; select the
     /// same-name zero declaration whose range belongs to the successor's domain kind.
@@ -5645,14 +6313,17 @@ impl Engine {
         self.rt.make_var(&self.sig, sym, name, index)
     }
 
-    /// Instantiate and eagerly theory-normalize a static statement pattern for reflection. Executable
-    /// matching does not require the source [`Term`] to retain canonical AC/ACU order, but `upModule`
-    /// exposes that order and enclosing metalevel statement sets are order-sensitive.
-    pub fn normalize_pattern_for_reflection(
+    /// Fallible form of [`normalize_pattern_for_reflection`](Self::normalize_pattern_for_reflection).
+    /// Returns a strict-reducer fault raised while an identity is materialized by theory
+    /// normalization.
+    pub fn try_normalize_pattern_for_reflection(
         &mut self,
         term: &Term,
         variable_names: &[u32],
-    ) -> DagId {
+    ) -> Result<DagId, ReducerFault> {
+        self.sig.mark_symbolic_execution();
+        self.rt.check_reducer_fault()?;
+        let checkpoint = self.semantic_checkpoint();
         let mut variable_sorts = Vec::<Option<SortId>>::new();
         let mut variable_sort_order = Vec::new();
         let mut work = vec![term];
@@ -5685,13 +6356,96 @@ impl Engine {
             }
         }
         let dag = self.rt.instantiate(&self.sig, term, &subst);
-        self.normalize_for_unify(dag)
+        if let Err(fault) = self.rt.check_reducer_fault() {
+            self.restore_semantic_checkpoint(checkpoint);
+            return Err(fault);
+        }
+        let normalized = self.rt.normalize_for_unify(&self.sig, dag);
+        if let Err(fault) = self.rt.check_reducer_fault() {
+            self.restore_semantic_checkpoint(checkpoint);
+            return Err(fault);
+        }
+        Ok(normalized)
     }
 
-    /// Eagerly theory-normalize `dag` (flatten/merge ACU/AU) for the symbolic engine — the
-    /// `Term::normalize(true)` the `unify` command applies to each unificand before solving.
+    /// Instantiate and eagerly theory-normalize a static statement pattern for reflection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction fails while normalizing an attached identity. Call
+    /// [`try_normalize_pattern_for_reflection`](Self::try_normalize_pattern_for_reflection) at
+    /// fallible semantic boundaries.
+    pub fn normalize_pattern_for_reflection(
+        &mut self,
+        term: &Term,
+        variable_names: &[u32],
+    ) -> DagId {
+        self.try_normalize_pattern_for_reflection(term, variable_names)
+            .unwrap_or_else(|fault| panic!("pattern theory normalization failed: {fault}"))
+    }
+
+    /// Run one symbolic operation as an atomic semantic boundary. Public symbolic work seals host
+    /// attachment before dispatch, including when no attachment exists yet.
+    fn try_symbolic_operation<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Runtime, &Signature) -> T,
+    ) -> Result<T, ReducerFault> {
+        self.sig.mark_symbolic_execution();
+        self.try_build_symbolic_operation(operation)
+    }
+
+    /// Staged module construction may canonicalize statement patterns before committing validated host
+    /// attachments. This is the only unsealed symbolic funnel and remains private to the kernel.
+    fn try_build_symbolic_operation<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Runtime, &Signature) -> T,
+    ) -> Result<T, ReducerFault> {
+        self.rt.check_reducer_fault()?;
+        let checkpoint = self.semantic_checkpoint();
+        let value = operation(&mut self.rt, &self.sig);
+        if let Err(fault) = self.rt.check_reducer_fault() {
+            self.restore_semantic_checkpoint(checkpoint);
+            return Err(fault);
+        }
+        Ok(value)
+    }
+
+    /// Fallible symbolic theory normalization.
+    pub fn try_normalize_for_unify(&mut self, dag: DagId) -> Result<DagId, ReducerFault> {
+        self.try_symbolic_operation(|rt, sig| rt.normalize_for_unify(sig, dag))
+    }
+    /// Internal symbolic normalization for callbacks that cannot return a [`ReducerFault`]. Retain
+    /// the fault for the enclosing fallible driver and leave the input representation in place.
+    pub(crate) fn normalize_for_unify_or_defer_fault(&mut self, dag: DagId) -> DagId {
+        match self.try_normalize_for_unify(dag) {
+            Ok(normalized) => normalized,
+            Err(fault) => {
+                self.defer_reducer_fault(fault);
+                dag
+            }
+        }
+    }
+    /// Module-build counterpart to [`Self::normalize_for_unify_or_defer_fault`]. It intentionally does
+    /// not seal the signature because all equations are still being installed before host attachment.
+    pub(crate) fn normalize_for_unify_for_build_or_defer_fault(&mut self, dag: DagId) -> DagId {
+        match self.try_build_symbolic_operation(|rt, sig| rt.normalize_for_unify(sig, dag)) {
+            Ok(normalized) => normalized,
+            Err(fault) => {
+                self.defer_reducer_fault(fault);
+                dag
+            }
+        }
+    }
+
+    /// Eagerly theory-normalize `dag` (flatten/merge ACU/AU) for the symbolic engine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction fails while normalizing an attached identity. Fallible
+    /// semantic entry points must use [`try_normalize_for_unify`](Self::try_normalize_for_unify).
     pub fn normalize_for_unify(&mut self, dag: DagId) -> DagId {
-        self.rt.normalize_for_unify(&self.sig, dag)
+        self.try_normalize_for_unify(dag)
+            .unwrap_or_else(|fault| panic!("symbolic theory normalization failed: {fault}"))
     }
 
     /// Carry the current-epoch self-normal stamp across a semantics-preserving alpha rebuild.
@@ -5871,6 +6625,10 @@ impl Engine {
     /// Attach a built-in reduction rule to `sym`, before user equations. Hook references must already
     /// be resolved. Branch hooks install their intrinsic strategy and synthetic sort declarations.
     pub fn set_special(&mut self, sym: SymbolId, op: SpecialOp) {
+        assert!(
+            !matches!(&op, SpecialOp::HostFunction(_)),
+            "host functions must be installed through Engine::bind_host_function"
+        );
         self.sig.set_special(sym, op);
     }
 
@@ -6060,17 +6818,33 @@ impl Engine {
             .collect()
     }
 
-    /// Materialize the normalized identity attached to `id`, including one-sided identities.
-    /// Reflection uses the compiled attachment rather than reparsing an ambiguous source token.
-    pub fn symbol_identity_dag(&mut self, id: SymbolId) -> Option<DagId> {
+    /// Fallible materialization of the normalized identity attached to `id`, including one-sided
+    /// identities.
+    pub fn try_symbol_identity_dag(&mut self, id: SymbolId) -> Result<Option<DagId>, ReducerFault> {
+        self.sig.mark_symbolic_execution();
+        self.rt.check_reducer_fault()?;
         let identity = {
             let symbol = self.sig.symbol(id);
             symbol
                 .identity()
                 .or_else(|| symbol.left_identity())
                 .or_else(|| symbol.right_identity())
-        }?;
-        Some(self.rt.identity_dag(&self.sig, identity))
+        };
+        let Some(identity) = identity else {
+            return Ok(None);
+        };
+        self.try_symbolic_operation(|rt, sig| Some(rt.identity_dag(sig, identity)))
+    }
+
+    /// Materialize the normalized identity attached to `id`, including one-sided identities.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction of the identity fails. Fallible semantic entry points must
+    /// use [`try_symbol_identity_dag`](Self::try_symbol_identity_dag).
+    pub fn symbol_identity_dag(&mut self, id: SymbolId) -> Option<DagId> {
+        self.try_symbol_identity_dag(id)
+            .unwrap_or_else(|fault| panic!("identity materialization failed: {fault}"))
     }
 
     /// The kind (connected component) of `sym`'s result — its first declaration's range kind. Used by the
@@ -6088,13 +6862,25 @@ impl Engine {
 
     // ---- DAG construction ----
 
-    /// Build a node for `symbol` from `children`, **dispatching on the operator's theory** (free / ACU /
-    /// AU / CUI / S) — the public form of the internal `rebuild`. Lets a caller (the frontend's command
-    /// builder) construct a node from a symbol + already-built child DAGs without knowing the theory; the
-    /// canonicalization (ACU multiset, AU flatten, S fold) happens inside. For an S (`iter`) symbol the
-    /// children are one successor layer (folded into the count).
+    /// Fallible theory-aware node construction. Returns a strict-reducer fault if construction has to
+    /// normalize an attached identity.
+    pub fn try_make_node(
+        &mut self,
+        symbol: SymbolId,
+        children: Vec<DagId>,
+    ) -> Result<DagId, ReducerFault> {
+        self.try_symbolic_operation(|rt, sig| rt.rebuild(sig, symbol, children))
+    }
+
+    /// Build a theory-aware node from `children`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction fails while materializing an attached identity. Fallible
+    /// semantic entry points must use [`try_make_node`](Self::try_make_node).
     pub fn make_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
-        self.rt.rebuild(&self.sig, symbol, children)
+        self.try_make_node(symbol, children)
+            .unwrap_or_else(|fault| panic!("theory-aware node construction failed: {fault}"))
     }
 
     /// Build a free-theory node `symbol(args...)`, computing and caching its least sort.
@@ -6114,12 +6900,24 @@ impl Engine {
         self.rt.is_identity(&self.sig, identity, dag)
     }
 
-    /// Build a canonical **ACU** node for an `assoc comm [id:]` operator from `(element, multiplicity)`
-    /// pairs (see `Runtime::make_acu`). The result is in AC(+U) normal form — flattened, identity
-    /// dropped, equal elements merged, canonically ordered — and may collapse to a single element or
-    /// the identity. `symbol` must be ACU (declared via [`add_op_ac`](Self::add_op_ac)).
+    /// Fallible canonical ACU construction.
+    pub fn try_make_acu(
+        &mut self,
+        symbol: SymbolId,
+        args: Vec<(DagId, u32)>,
+    ) -> Result<DagId, ReducerFault> {
+        self.try_symbolic_operation(|rt, sig| rt.make_acu(sig, symbol, args))
+    }
+
+    /// Build a canonical ACU node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction fails while materializing an attached identity. Fallible
+    /// semantic entry points must use [`try_make_acu`](Self::try_make_acu).
     pub fn make_acu(&mut self, symbol: SymbolId, args: Vec<(DagId, u32)>) -> DagId {
-        self.rt.make_acu(&self.sig, symbol, args)
+        self.try_make_acu(symbol, args)
+            .unwrap_or_else(|fault| panic!("ACU construction failed: {fault}"))
     }
 
     pub(crate) fn make_acu_preserving_order(
@@ -6129,21 +6927,47 @@ impl Engine {
     ) -> DagId {
         self.rt.make_acu_preserving_order(&self.sig, symbol, args)
     }
-    /// Convenience for [`make_acu`](Self::make_acu) from a flat list of elements (each multiplicity 1):
-    /// `make_ac(plus, vec![a, b, c])` builds the canonical `a + b + c`.
-    pub fn make_ac(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
-        self.rt.make_acu(
-            &self.sig,
+    /// Fallible convenience form of [`try_make_acu`](Self::try_make_acu) for elements with
+    /// multiplicity one.
+    pub fn try_make_ac(
+        &mut self,
+        symbol: SymbolId,
+        elements: Vec<DagId>,
+    ) -> Result<DagId, ReducerFault> {
+        self.try_make_acu(
             symbol,
-            elements.into_iter().map(|e| (e, 1)).collect(),
+            elements.into_iter().map(|element| (element, 1)).collect(),
         )
     }
 
-    /// Build a canonical **AU** node for an `assoc [id:]` operator from an ordered element list (see
-    /// `Runtime::make_au`): `make_au(concat, vec![a, b, c])` builds the canonical `a b c`. Flattened
-    /// and identity-dropped, order preserved; may collapse to a single element or the identity.
+    /// Convenience for [`make_acu`](Self::make_acu) from a flat list of elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`make_acu`](Self::make_acu).
+    pub fn make_ac(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
+        self.try_make_ac(symbol, elements)
+            .unwrap_or_else(|fault| panic!("ACU construction failed: {fault}"))
+    }
+
+    /// Fallible canonical AU construction.
+    pub fn try_make_au(
+        &mut self,
+        symbol: SymbolId,
+        elements: Vec<DagId>,
+    ) -> Result<DagId, ReducerFault> {
+        self.try_symbolic_operation(|rt, sig| rt.make_au(sig, symbol, elements))
+    }
+
+    /// Build a canonical AU node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if strict host reduction fails while materializing an attached identity. Fallible
+    /// semantic entry points must use [`try_make_au`](Self::try_make_au).
     pub fn make_au(&mut self, symbol: SymbolId, elements: Vec<DagId>) -> DagId {
-        self.rt.make_au(&self.sig, symbol, elements)
+        self.try_make_au(symbol, elements)
+            .unwrap_or_else(|fault| panic!("AU construction failed: {fault}"))
     }
 
     /// Build a canonical **CUI** node for a `comm [idem] [id:]` operator from its two arguments (see
@@ -6502,6 +7326,7 @@ impl Engine {
     /// [`Rewriting::run`] (bound or unbounded) and resume with `continue`. The session keeps its current
     /// term GC-rooted, so it can be stored between REPL commands.
     pub fn rewrite(&mut self, initial: DagId) -> Rewriting {
+        self.sig.mark_host_execution();
         let root = self.root(initial);
         Rewriting::new_rule_fair(root, initial)
     }
@@ -6513,7 +7338,7 @@ impl Engine {
         &mut self,
         current: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         self.rt.rewrite_step(&self.sig, current, cursors)
     }
 
@@ -6523,10 +7348,10 @@ impl Engine {
         &mut self,
         node: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         self.rt
             .apply_first_rule_at(&self.sig, node, cursors)
-            .map(|(_, r)| r)
+            .map(|result| result.map(|(_, rewritten)| rewritten))
     }
 
     /// Apply the first applicable rule in one `erewrite` class—object-message or generic leftover—at
@@ -6536,10 +7361,10 @@ impl Engine {
         node: DagId,
         cursors: &mut HashMap<SymbolId, u32>,
         filter: RuleFilter,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         self.rt
             .apply_first_rule_filtered(&self.sig, node, cursors, Some(filter))
-            .map(|(_, r)| r)
+            .map(|result| result.map(|(_, rewritten)| rewritten))
     }
 
     /// Whether the config operator `sym` has a generic `LeftOver` rule, enabling the scheduler's
@@ -6557,10 +7382,8 @@ impl Engine {
         self.rt.rebuild(&self.sig, symbol, children)
     }
 
-    /// Begin a search from `initial`, building the reachable-state graph lazily and
-    /// matching each state against `goal` (compiled here, with its `nr_vars` variables) filtered by
-    /// `such_that`, for the reachability relation `arrow` up to `max_depth`. Returns a lazy
-    /// [`Search`] — pull solutions with [`Search::next_solution`].
+    /// Begin a search from `initial`, panicking if equational normalization invokes a failing reducer.
+    /// Use [`try_search`](Self::try_search) to preserve reducer failures.
     pub fn search(
         &mut self,
         initial: DagId,
@@ -6570,15 +7393,32 @@ impl Engine {
         arrow: Arrow,
         max_depth: Option<u32>,
     ) -> Search {
+        self.try_search(initial, goal, nr_vars, such_that, arrow, max_depth)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`search`](Self::search).
+    pub fn try_search(
+        &mut self,
+        initial: DagId,
+        goal: Term,
+        nr_vars: u32,
+        such_that: Vec<ConditionFragment>,
+        arrow: Arrow,
+        max_depth: Option<u32>,
+    ) -> Result<Search, ReducerFault> {
+        self.sig.mark_host_execution();
         let goal = LhsAutomaton::compile(goal, &self.sig);
         // A `such that` condition may contain a rewrite (`=>`) fragment (a nested search), so it compiles
         // with the rule owner.
         let such_that = self.sig.compile_condition(such_that, CondOwner::Rule);
         // State 0 is the reduced initial term; its reduction's rewrites count toward the search total
         // (they stay in the engine counter, read live for state 0's snapshot).
-        let reduced = self.reduce(initial);
+        let reduced = self.try_reduce(initial)?;
         let root = self.root(reduced);
-        Search::new(root, reduced, goal, nr_vars, such_that, arrow, max_depth)
+        Ok(Search::new(
+            root, reduced, goal, nr_vars, such_that, arrow, max_depth,
+        ))
     }
 
     /// Turn `smt-search`'s `such that` equality fragments into the initial accumulated constraint.
@@ -6624,6 +7464,7 @@ impl Engine {
         max_depth: Option<u32>,
         variable_names: Vec<String>,
     ) -> SmtSearch {
+        self.sig.mark_host_execution();
         self.smt_search_from_fresh_base(
             initial,
             initial_constraint,
@@ -6652,6 +7493,7 @@ impl Engine {
         variable_names: Vec<String>,
         fresh_base_decimal: &str,
     ) -> Option<SmtSearch> {
+        self.sig.mark_host_execution();
         let fresh_base = Nat::from_decimal(fresh_base_decimal)?;
         Some(self.smt_search_from_fresh_base(
             initial,
@@ -6763,7 +7605,7 @@ impl Engine {
 
     /// Every raw rule result one step from `root`, with equation-enumeration work deferred until the
     /// graph consumes the corresponding result.
-    pub(crate) fn state_successors(&mut self, root: DagId) -> RawSuccessors {
+    pub(crate) fn state_successors(&mut self, root: DagId) -> Result<RawSuccessors, ReducerFault> {
         self.rt.state_successors_deferred(&self.sig, root)
     }
 
@@ -6773,7 +7615,7 @@ impl Engine {
 
     /// Count one rule application and reduce its successor to canonical state form. Interleaving the
     /// increment with reduction preserves each discovered state's rewrite-count snapshot.
-    pub(crate) fn reduce_successor(&mut self, succ: DagId) -> DagId {
+    pub(crate) fn reduce_successor(&mut self, succ: DagId) -> Result<DagId, ReducerFault> {
         self.rt
             .reduce_graph_successor(&self.sig, succ, &mut NullDescent)
     }
@@ -6788,7 +7630,7 @@ impl Engine {
         nr_vars: u32,
         such_that: &[CompiledFragment],
         state: DagId,
-    ) -> Vec<(Vec<DagId>, u64)> {
+    ) -> Result<Vec<(Vec<DagId>, u64)>, ReducerFault> {
         self.rt
             .eval_goal(&self.sig, goal, nr_vars, such_that, state)
     }
@@ -6796,6 +7638,7 @@ impl Engine {
     /// Begin a position-fair `frewrite` session over `initial`, allowing `gas` rule applications per
     /// position per traversal pass. Returns a resumable [`Rewriting`] driven by [`Rewriting::run`].
     pub fn frewrite(&mut self, initial: DagId, gas: u64) -> Rewriting {
+        self.sig.mark_host_execution();
         let root = self.root(initial);
         Rewriting::new_position_fair(root, initial, gas)
     }
@@ -6812,9 +7655,9 @@ impl Engine {
         remaining: &mut Option<u64>,
         progress: &mut bool,
         cursors: &mut HashMap<SymbolId, u32>,
-    ) -> DagId {
+    ) -> Result<DagId, ReducerFault> {
         if *remaining == Some(0) {
-            return node; // bound exhausted — leave the rest of the term as it stands
+            return Ok(node); // bound exhausted — leave the rest of the term as it stands
         }
         // 1. Recurse into the non-frozen children first (post-order), rebuilding the node if any changed.
         let symbol = self.node(node).symbol();
@@ -6825,7 +7668,7 @@ impl Engine {
             if *remaining == Some(0) || self.symbol(symbol).is_frozen_arg(pos) {
                 new_children.push(c); // frozen (rules blocked) or budget spent — keep as-is
             } else {
-                let nc = self.frewrite_pass(c, gas, remaining, progress, cursors);
+                let nc = self.frewrite_pass(c, gas, remaining, progress, cursors)?;
                 changed |= nc != c;
                 new_children.push(nc);
             }
@@ -6838,20 +7681,20 @@ impl Engine {
         // 2. A rewritten child may enable an equation here. Reduce the rebuilt parent before trying
         //    rules; frozen positions block rules, not equational reduction.
         if changed {
-            node = self.reduce(node);
+            node = self.try_reduce(node)?;
         }
         // 3. Apply up to `gas` rules at this node, reducing between applications. Counter redexes use
         //    the same budget and advance the counter.
         let mut g = gas;
         while g > 0 && *remaining != Some(0) {
             let fired = match self.rt.try_counter(&self.sig, node) {
-                Some(r) => Some(r),
-                None => self.rewrite_at(node, cursors),
+                Some(result) => Some(result),
+                None => self.rewrite_at(node, cursors)?,
             };
             match fired {
                 Some(r) => {
                     *progress = true;
-                    node = self.reduce(r);
+                    node = self.try_reduce(r)?;
                     g -= 1;
                     if let Some(rem) = remaining {
                         *rem -= 1;
@@ -6860,11 +7703,12 @@ impl Engine {
                 None => break,
             }
         }
-        node
+        Ok(node)
     }
 
     /// Begin object-message-fair rewriting of a configuration. `gas` controls deliveries per pass.
     pub fn erewrite(&mut self, initial: DagId, gas: u64) -> crate::rewrite::Rewriting {
+        self.sig.mark_host_execution();
         let root = self.root(initial);
         crate::rewrite::Rewriting::new_object_message_fair(root, initial, gas)
     }
@@ -6963,7 +7807,7 @@ impl Engine {
         cursors: &mut HashMap<SymbolId, u32>,
         offer_external: bool,
         descent: &mut dyn DescentOps,
-    ) -> ERewritePassStep {
+    ) -> Result<ERewritePassStep, ReducerFault> {
         assert!(
             !pass.awaiting_external,
             "external request must be resolved before resuming"
@@ -6998,11 +7842,9 @@ impl Engine {
                 let message = pass.objects[object_index].messages[message_index];
                 if let Some(object) = pass.objects[object_index].object {
                     let pair = self.make_acu(pass.config_symbol, vec![(object, 1), (message, 1)]);
-                    match self
-                        .rewrite_at_filtered(pair, cursors, RuleFilter::ObjectMessage)
-                        .map(|result| self.reduce_with(result, descent))
-                    {
+                    match self.rewrite_at_filtered(pair, cursors, RuleFilter::ObjectMessage)? {
                         Some(result) => {
+                            let result = self.try_reduce_with(result, descent)?;
                             pass._roots.push(self.root(result));
                             let (object, others) = self.retrieve_object(result, name);
                             pass.objects[object_index].object = object;
@@ -7022,14 +7864,14 @@ impl Engine {
                     continue;
                 }
                 if pass.portal_seen && offer_external && self.is_registered_external_target(name) {
-                    let message = self.reduce_external_message_payload(message, descent);
+                    let message = self.reduce_external_message_payload(message, descent)?;
                     pass.objects[object_index].messages[message_index] = message;
                     pass._roots.push(self.root(message));
                     pass.awaiting_external = true;
-                    return ERewritePassStep::External {
+                    return Ok(ERewritePassStep::External {
                         target: name,
                         message,
-                    };
+                    });
                 }
                 pass.remainder.push((message, 1));
                 pass.objects[object_index].next_message += 1;
@@ -7044,25 +7886,27 @@ impl Engine {
         let remainder = self.make_acu(pass.config_symbol, std::mem::take(&mut pass.remainder));
         pass._roots.push(self.root(remainder));
         if self.has_leftover_rules(pass.config_symbol) {
-            let reduced = self.reduce(remainder);
+            let reduced = self.try_reduce(remainder)?;
             pass._roots.push(self.root(reduced));
-            if let Some(result) = self.rewrite_at_filtered(reduced, cursors, RuleFilter::LeftOver) {
+            if let Some(result) =
+                self.rewrite_at_filtered(reduced, cursors, RuleFilter::LeftOver)?
+            {
                 pass.progress = true;
                 pass._roots.push(self.root(result));
-                return ERewritePassStep::Complete {
+                return Ok(ERewritePassStep::Complete {
                     term: result,
                     progress: true,
-                };
+                });
             }
-            return ERewritePassStep::Complete {
+            return Ok(ERewritePassStep::Complete {
                 term: reduced,
                 progress: pass.progress,
-            };
+            });
         }
-        ERewritePassStep::Complete {
+        Ok(ERewritePassStep::Complete {
             term: remainder,
             progress: pass.progress,
-        }
+        })
     }
 
     /// Evaluate a manager request's payload while preserving its target and requester. Configuration
@@ -7071,18 +7915,18 @@ impl Engine {
         &mut self,
         message: DagId,
         descent: &mut dyn DescentOps,
-    ) -> DagId {
+    ) -> Result<DagId, ReducerFault> {
         let symbol = self.node(message).symbol();
         let mut args: Vec<_> = self.node(message).children().collect();
         let mut payload_roots = Vec::with_capacity(args.len().saturating_sub(2));
         for argument in args.iter_mut().skip(2) {
-            let reduced = self.reduce_with(*argument, descent);
+            let reduced = self.try_reduce_with(*argument, descent)?;
             let meta = match self.symbol(self.node(reduced).symbol()).special() {
                 Some(SpecialOp::Meta { op, hooks }) => Some((*op, hooks.clone())),
                 _ => None,
             };
             *argument = if let Some((op, hooks)) = meta {
-                match self.with_meta_ctx(|ctx| descent.descend(ctx, op, &hooks, reduced)) {
+                match self.with_meta_ctx(|ctx| descent.descend(ctx, op, &hooks, reduced))? {
                     Some(result) => {
                         self.rt.add_rewrites(1);
                         result
@@ -7097,7 +7941,7 @@ impl Engine {
 
         let message = self.make_node(symbol, args);
         drop(payload_roots);
-        message
+        Ok(message)
     }
 
     /// Resolve the message at a suspended pass cursor. Accepted requests are consumed; rejected requests
@@ -7195,6 +8039,15 @@ impl Engine {
         self.rt.rule_rewrite_count = checkpoint.2;
         self.rt.variant_narrowing_count = checkpoint.3;
         self.rt.narrowing_count = checkpoint.4;
+    }
+
+    pub(crate) fn semantic_checkpoint(&self) -> SemanticCheckpoint {
+        self.rt.semantic_checkpoint()
+    }
+
+    pub(crate) fn restore_semantic_checkpoint(&mut self, checkpoint: SemanticCheckpoint) {
+        self.rt.restore_semantic_checkpoint(checkpoint);
+        self.sig.invalidate_normal_forms();
     }
 
     /// Reset the `counter` built-in to zero at the start of a top-level `rewrite` or `frewrite`.
@@ -7417,18 +8270,70 @@ impl Engine {
     /// Reduce `root` to canonical form by innermost equational simplification. Canonical nodes and shared
     /// forwarding targets are reused. An explicit frame stack avoids subject-depth recursion while
     /// preserving left-to-right child order, top rewriting, and rewrite counts.
+    ///
+    /// Panics when a configured reducer reports a contract fault. Embeddings should use
+    /// [`try_reduce`](Self::try_reduce) to handle that fault.
     #[must_use]
     pub fn reduce(&mut self, root: DagId) -> DagId {
-        self.rt.reduce(&self.sig, root, &mut NullDescent)
+        self.try_reduce(root)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`reduce`](Self::reduce).
+    pub fn try_reduce(&mut self, root: DagId) -> Result<DagId, ReducerFault> {
+        self.sig.mark_host_execution();
+        let checkpoint = self.semantic_checkpoint();
+        let result = self.rt.reduce(&self.sig, root, &mut NullDescent);
+        if result.is_err() {
+            self.restore_semantic_checkpoint(checkpoint);
+        }
+        result
     }
 
     /// Like [`reduce`](Self::reduce) but driving META-LEVEL descent through `descent`: a `metaReduce`/…
     /// redex encountered during reduction is handed to the handler (which builds the object module and
-    /// runs the operation). The REPL passes a real handler; everything else uses [`reduce`](Self::reduce)
-    /// (i.e. [`NullDescent`] — descent redexes stay at the kind level).
+    /// runs the operation). Panics on reducer faults; embeddings should use
+    /// [`try_reduce_with`](Self::try_reduce_with).
     #[must_use]
     pub fn reduce_with(&mut self, root: DagId, descent: &mut dyn DescentOps) -> DagId {
-        self.rt.reduce(&self.sig, root, descent)
+        self.try_reduce_with(root, descent)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`reduce_with`](Self::reduce_with).
+    pub fn try_reduce_with(
+        &mut self,
+        root: DagId,
+        descent: &mut dyn DescentOps,
+    ) -> Result<DagId, ReducerFault> {
+        self.sig.mark_host_execution();
+        let checkpoint = self.semantic_checkpoint();
+        let result = self.rt.reduce(&self.sig, root, descent);
+        if result.is_err() {
+            self.restore_semantic_checkpoint(checkpoint);
+        }
+        result
+    }
+
+    /// Internal symbolic-driver reduction. The first reducer fault is retained until the enclosing
+    /// fallible driver boundary retrieves it.
+    pub(crate) fn reduce_or_defer_fault(&mut self, root: DagId) -> DagId {
+        self.sig.mark_host_execution();
+        self.rt
+            .reduce_or_defer_fault(&self.sig, root, &mut NullDescent)
+    }
+
+    /// Retrieve a reducer fault deferred by an internal symbolic driver.
+    pub(crate) fn check_deferred_reducer_fault(&mut self) -> Result<(), ReducerFault> {
+        self.rt.check_reducer_fault()
+    }
+    /// Seal host attachment before a semantic operation implemented outside this module.
+    pub(crate) fn begin_symbolic_execution(&self) {
+        self.sig.mark_symbolic_execution();
+    }
+
+    pub(crate) fn defer_reducer_fault(&mut self, fault: ReducerFault) {
+        self.rt.defer_reducer_fault(fault);
     }
 
     /// Try to match pattern `pat` against `subject`, filling `subst` (which must already be
@@ -7651,7 +8556,14 @@ pub enum MatchedPortion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{
+        HostFunctionCatalog, ReducerFault, ResolvedHostHooks, StrictCall, StrictOutcome,
+        StrictReduceCtx, StrictReducer, StrictReducerDescriptor,
+    };
     use crate::term::{ConditionFragment, Equation, Membership, Term};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     /// `f(a, g(a))` over a single sort `Nat`, with `a` shared (a true DAG). Returns engine + root.
     fn fixture() -> (Engine, DagId, SortId) {
@@ -7773,6 +8685,80 @@ mod tests {
             vec![earlier_name, later_name],
             "pre-index term normalization follows the variable name ids"
         );
+    }
+
+    #[derive(Clone)]
+    struct NormalizeIdentityFault;
+
+    impl StrictReducer for NormalizeIdentityFault {
+        fn reduce<'ctx>(
+            &self,
+            _ctx: &mut StrictReduceCtx<'ctx>,
+            _call: StrictCall<'ctx>,
+        ) -> Result<StrictOutcome<'ctx>, ReducerFault> {
+            Err(ReducerFault::new("raw symbolic identity fault"))
+        }
+    }
+
+    fn faulting_raw_acu() -> (Engine, DagId) {
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "identity.normalize",
+                NormalizeIdentityFault,
+                StrictReducerDescriptor::builder(0).build(),
+            )
+            .expect("register normalization fault reducer")
+            .build();
+        let mut engine = Engine::with_host_functions(catalog);
+        let sort = engine.add_sort("S");
+        engine.close_sorts();
+        let identity = engine.add_op("badIdentity", vec![], sort);
+        engine
+            .bind_host_function(identity, "identity.normalize", ResolvedHostHooks::default())
+            .expect("bind normalization fault reducer");
+        let plus = engine.add_op_ac("plus", vec![sort, sort], sort, Some(identity));
+        let raw = engine.make_acu_preserving_order(plus, Vec::new());
+        engine.set_trace(true);
+        engine.reset_rewrites();
+        (engine, raw)
+    }
+
+    #[test]
+    fn symbolic_normalization_preserves_identity_fault_and_infallible_wrapper_panics() {
+        let (mut fallible, raw) = faulting_raw_acu();
+        let fault = fallible
+            .try_normalize_for_unify(raw)
+            .expect_err("raw empty ACU must materialize its identity");
+        assert_eq!(
+            fault.key().expect("fault key").as_str(),
+            "identity.normalize"
+        );
+        assert_eq!(fault.message(), "raw symbolic identity fault");
+        assert_eq!(fallible.rewrites(), 0);
+        assert_eq!(fallible.rewrite_breakdown(), (0, 0, 0, 0));
+        assert!(fallible.take_trace().is_empty());
+
+        let repeated = fallible
+            .try_normalize_for_unify(raw)
+            .expect_err("failed normalization must remain retry-safe");
+        assert_eq!(
+            repeated.key().expect("repeated fault key").as_str(),
+            "identity.normalize"
+        );
+        assert_eq!(repeated.message(), "raw symbolic identity fault");
+        assert_eq!(fallible.rewrites(), 0);
+        assert_eq!(fallible.rewrite_breakdown(), (0, 0, 0, 0));
+        assert!(fallible.take_trace().is_empty());
+
+        let (mut infallible, raw) = faulting_raw_acu();
+        let panic = catch_unwind(AssertUnwindSafe(|| infallible.normalize_for_unify(raw)))
+            .expect_err("documented infallible normalization must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(message.contains("identity.normalize"), "{message}");
     }
 
     /// The public matcher facade enumerates all six ACU bindings for `X + Y <=? a + b + c`; the test
@@ -11525,5 +12511,147 @@ mod tests {
             cached,
             "compact identity remains canonical on repeat fetch"
         );
+    }
+    #[test]
+    fn binding_host_reducer_invalidates_prebinding_normal_form_stamp() {
+        #[derive(Clone)]
+        struct CountingDecline(Arc<AtomicUsize>);
+
+        impl StrictReducer for CountingDecline {
+            fn reduce<'ctx>(
+                &self,
+                _ctx: &mut StrictReduceCtx<'ctx>,
+                _call: StrictCall<'ctx>,
+            ) -> Result<StrictOutcome<'ctx>, ReducerFault> {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(StrictOutcome::Decline)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "epoch.decline",
+                CountingDecline(Arc::clone(&calls)),
+                StrictReducerDescriptor::builder(0).build(),
+            )
+            .expect("register counting reducer")
+            .build();
+        let mut e = Engine::with_host_functions(catalog);
+        let sort = e.add_sort("S");
+        e.close_sorts();
+        let host = e.add_op("host", vec![], sort);
+        let stale_result = e.add_op("stale", vec![], sort);
+        let redex = e.make_const(host);
+        let stale = e.make_const(stale_result);
+
+        let prebinding_epoch = e.sig.eq_epoch();
+        {
+            let node = e.rt.dags.get_mut(redex);
+            node.reduced_epoch = prebinding_epoch;
+            node.nf = Some(stale);
+        }
+
+        e.bind_host_function(
+            host,
+            "epoch.decline",
+            ResolvedHostHooks::builder()
+                .build()
+                .expect("empty hook table"),
+        )
+        .expect("bind counting reducer");
+        assert_eq!(e.sig.eq_epoch(), prebinding_epoch + 1);
+        assert_ne!(e.node(redex).reduced_epoch, e.sig.eq_epoch());
+
+        let reduced = e.try_reduce(redex).expect("dispatch newly bound reducer");
+        assert_eq!(reduced, redex);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(e.node(redex).reduced_epoch, e.sig.eq_epoch());
+    }
+
+    #[test]
+    fn successor_enumeration_fault_restores_every_counter_and_trace() {
+        #[derive(Clone)]
+        struct CountingFault(Arc<AtomicUsize>);
+
+        impl StrictReducer for CountingFault {
+            fn reduce<'ctx>(
+                &self,
+                _ctx: &mut StrictReduceCtx<'ctx>,
+                _call: StrictCall<'ctx>,
+            ) -> Result<StrictOutcome<'ctx>, ReducerFault> {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(ReducerFault::new("successor enumeration fault"))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "successors.fail",
+                CountingFault(Arc::clone(&calls)),
+                StrictReducerDescriptor::builder(0).build(),
+            )
+            .expect("register successor fault reducer")
+            .build();
+        let mut e = Engine::with_host_functions(catalog);
+        let smaller = e.add_sort("Smaller");
+        let top = e.add_sort("Top");
+        e.add_subsort(smaller, top);
+        e.close_sorts();
+        let state = e.add_op("state", vec![], top);
+        let target = e.add_op("target", vec![], top);
+        let membership_subject = e.add_op("membershipSubject", vec![], top);
+        let helper_start = e.add_op("helperStart", vec![], top);
+        let helper_done = e.add_op("helperDone", vec![], top);
+        let faulting = e.add_op("faulting", vec![], top);
+        e.bind_host_function(
+            faulting,
+            "successors.fail",
+            ResolvedHostHooks::builder()
+                .build()
+                .expect("empty hook table"),
+        )
+        .expect("bind successor fault reducer");
+        e.add_membership(Membership {
+            lhs: Term::constant(membership_subject),
+            sort: smaller,
+            nr_vars: 0,
+        });
+        e.add_rule(Term::constant(helper_start), Term::constant(helper_done), 0);
+        e.add_conditional_rule(
+            Term::constant(state),
+            Term::constant(target),
+            0,
+            vec![
+                ConditionFragment::SortTest {
+                    term: Term::constant(membership_subject),
+                    sort: smaller,
+                },
+                ConditionFragment::Rewrite {
+                    lhs: Term::constant(helper_start),
+                    pattern: Term::constant(helper_done),
+                    fresh_vars: Vec::new(),
+                },
+                ConditionFragment::Equality {
+                    lhs: Term::constant(faulting),
+                    rhs: Term::constant(target),
+                },
+            ],
+        );
+        e.add_rule(Term::constant(state), Term::constant(target), 0);
+        e.set_trace(true);
+
+        let root = e.make_const(state);
+        let fault = match e.state_successors(root) {
+            Err(fault) => fault,
+            Ok(_) => panic!("successor enumeration must stop at the reducer fault"),
+        };
+        assert_eq!(fault.key().expect("fault key").as_str(), "successors.fail");
+        assert_eq!(fault.message(), "successor enumeration fault");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(e.rewrites(), 0);
+        assert_eq!(e.rewrite_breakdown(), (0, 0, 0, 0));
+        assert!(e.take_trace().is_empty());
     }
 }

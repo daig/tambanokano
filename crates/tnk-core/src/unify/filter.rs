@@ -10,6 +10,7 @@
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::fresh::VariableFamily;
+use crate::host::ReducerFault;
 use crate::num::Nat;
 use crate::sort::SortId;
 use crate::symbol::SymbolId;
@@ -40,6 +41,16 @@ pub fn irredundant(e: &mut Engine, unifiers: Vec<Vec<DagId>>) -> Vec<Vec<DagId>>
         survivors = kept;
     }
     survivors
+}
+
+/// Fallible form of [`irredundant`].
+pub fn try_irredundant(
+    e: &mut Engine,
+    unifiers: Vec<Vec<DagId>>,
+) -> Result<Vec<Vec<DagId>>, ReducerFault> {
+    let result = irredundant(e, unifiers);
+    e.check_deferred_reducer_fault()?;
+    Ok(result)
 }
 
 /// A throwaway name-code source for the subsumption sub-problem: satisfiability does not depend on
@@ -99,7 +110,7 @@ pub(crate) fn subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) 
         names: &mut names,
     };
     let mut prob = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
-    prob.find_next(&mut env).is_some()
+    prob.find_next_deferred(&mut env).is_some()
 }
 
 fn contains_one_sided_identity(e: &Engine, root: DagId) -> bool {

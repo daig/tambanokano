@@ -1,9 +1,11 @@
 //! Reusable, host-owned TNK evaluation state.
 //!
 //! [`Session`] owns the persistent interner, module database, built modules, current module, and
-//! resumable command state. [`Session::eval`] evaluates one submission. The `tnk-repl` crate buffers
-//! multiline input through [`Session::input_complete`] and applies terminal wrapping to returned text.
-//! Evaluation is synchronous; an executing reduction or search has no cooperative cancellation token.
+//! resumable command state. [`Session::eval`] evaluates one submission. [`Session::builder`] can
+//! install an immutable [`HostFunctionCatalog`] before module construction so source operators may
+//! invoke strict host-provided Rust reducers. The `tnk-repl` crate buffers multiline input through
+//! [`Session::input_complete`] and applies terminal wrapping to returned text. Evaluation is
+//! synchronous; an executing reduction, search, or reducer callback has no cooperative cancellation token.
 
 mod interpreter;
 mod trace;
@@ -11,6 +13,7 @@ mod trace;
 use interpreter::{InterpreterRegistry, LocalInterpreterManager};
 use std::collections::{HashMap, HashSet};
 use tnk_core::dag::DagId;
+use tnk_core::host::{HostFunctionCatalog, ReducerFault};
 use tnk_core::rewrite::{ExternalRun, RewriteStep, Rewriting};
 use tnk_core::search::Search;
 use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtResult};
@@ -31,9 +34,9 @@ use tnk_frontend::surface::ast::{
 };
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
-use tnk_modules::load::{flatten_and_build, module_dep_names, view_dep_names};
+use tnk_modules::load::{flatten_and_build_with_host_functions, module_dep_names, view_dep_names};
 use tnk_modules::meta::{MetaDescent, MetaState};
-use tnk_modules::view::{ViewDb, validate_view};
+use tnk_modules::view::{ViewDb, validate_view_with_host_functions};
 use trace::{TraceFlags, render_trace};
 
 /// The result of evaluating one input submission: the text to print, and whether to exit the loop.
@@ -46,6 +49,11 @@ pub struct Eval {
 /// The interactive shell's state. One persistent [`Interner`] backs all submissions so module names,
 /// operators, and command terms intern consistently.
 pub struct Session {
+    host_functions: HostFunctionCatalog,
+    /// Optional safe-point GC cadence used only for non-resumable ordinary `reduce` commands.
+    reduce_gc_interval: Option<u64>,
+    /// First nested child-interpreter reducer fault, transferred to the owning semantic driver.
+    reducer_fault: Option<ReducerFault>,
     interner: Interner,
     /// Parsed `PreModule`s (the input to flattening — an importer re-flattens its closure from here).
     db: ModuleDb,
@@ -70,8 +78,8 @@ pub struct Session {
     trace: TraceFlags,
     /// The last resumable session (`rewrite`/`frewrite` or `search`) and the module name it ran in, for
     /// `continue` (and `show path`/`show search graph`). A new execution command normally replaces or
-    /// clears it; a strategy rejected before execution retains the saved continuation. It stays valid
-    /// between commands because in-reduction GC is off, so the session's terms are never collected.
+    /// clears it; a strategy rejected before execution retains the saved continuation. Resumable
+    /// operations always run with in-reduction GC disabled.
     last: Option<(String, Continuation)>,
     /// Pending scripted/piped input for `erewrite`'s `getLine`, moved into the selected engine when an
     /// `erewrite` command starts.
@@ -160,6 +168,35 @@ struct NarrowSession {
     path: bool,
 }
 
+#[derive(Default)]
+pub struct SessionBuilder {
+    host_functions: HostFunctionCatalog,
+    reduce_gc_interval: Option<u64>,
+}
+
+impl SessionBuilder {
+    /// Configure the immutable host-function capability catalog inherited by every module and child
+    /// interpreter built by this Session.
+    pub fn host_functions(mut self, host_functions: HostFunctionCatalog) -> Self {
+        self.host_functions = host_functions;
+        self
+    }
+
+    /// Set the safe-point collection cadence for ordinary, non-resumable `reduce` commands.
+    ///
+    /// The interval is installed on the selected module Engine immediately before reduction and removed
+    /// before rendering the result. It does not enable GC for rewrite/search continuations or nested
+    /// META object Engines. `Some(1)` is useful for stress-testing callback rooting.
+    pub fn reduce_gc_interval(mut self, interval: Option<u64>) -> Self {
+        self.reduce_gc_interval = interval;
+        self
+    }
+
+    pub fn build(self) -> Session {
+        Session::with_configuration(self.host_functions, self.reduce_gc_interval)
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -167,8 +204,23 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Start a Session builder. By default its host-function catalog is empty.
+    pub fn builder() -> SessionBuilder {
+        SessionBuilder::default()
+    }
+
     pub fn new() -> Self {
+        Self::builder().build()
+    }
+
+    fn with_configuration(
+        host_functions: HostFunctionCatalog,
+        reduce_gc_interval: Option<u64>,
+    ) -> Self {
         Self {
+            host_functions,
+            reduce_gc_interval,
+            reducer_fault: None,
             interner: Interner::new(),
             db: ModuleDb::new(),
             modules: HashMap::new(),
@@ -379,12 +431,13 @@ impl Session {
         let built = {
             let mods = &self.modules;
             let home_mod = |module: &str| mods.get(module);
-            flatten_and_build(
+            flatten_and_build_with_host_functions(
                 &name,
                 &candidate_db,
                 &self.views,
                 &home_mod,
                 &mut self.interner,
+                &self.host_functions,
             )
         };
 
@@ -451,7 +504,13 @@ impl Session {
     /// Validate and store a view. Success is silent; validation errors are emitted. A view can later serve
     /// as an instantiation argument and is available to `show view`.
     fn enter_view(&mut self, v: ViewDecl, out: &mut String) {
-        match validate_view(&v, &self.db, &self.views, &mut self.interner) {
+        match validate_view_with_host_functions(
+            &v,
+            &self.db,
+            &self.views,
+            &mut self.interner,
+            &self.host_functions,
+        ) {
             Ok(()) => {
                 let name = v.name.clone();
                 // Record the view's direct dependencies (its from/to modules + parameter theories) and
@@ -496,7 +555,7 @@ impl Session {
         // Rebuild only the ones that are actually built modules (views aren't built; a dependent that
         // failed to build earlier isn't cached). The changed name itself was already (re)built by the
         // caller, so exclude it.
-        let mut rebuilt = false;
+        let mut invalidated = false;
         for name in dependents {
             if name == changed || !self.modules.contains_key(&name) {
                 continue;
@@ -504,19 +563,35 @@ impl Session {
             let built = {
                 let mods = &self.modules;
                 let home_mod = |n: &str| mods.get(n);
-                flatten_and_build(&name, &self.db, &self.views, &home_mod, &mut self.interner)
+                flatten_and_build_with_host_functions(
+                    &name,
+                    &self.db,
+                    &self.views,
+                    &home_mod,
+                    &mut self.interner,
+                    &self.host_functions,
+                )
             };
             match built {
                 Ok(lm) => {
                     self.reported_identity_collapses
                         .retain(|(module, _, _)| module != &name);
                     self.modules.insert(name, lm);
-                    rebuilt = true;
+                    invalidated = true;
                 }
-                Err(e) => out.push_str(&format!("error in module `{name}`: {e}\n")),
+                Err(e) => {
+                    out.push_str(&format!("error in module `{name}`: {e}\n"));
+                    self.modules.remove(&name);
+                    self.reported_identity_collapses
+                        .retain(|(module, _, _)| module != &name);
+                    if self.current.as_deref() == Some(&name) {
+                        self.current = None;
+                    }
+                    invalidated = true;
+                }
             }
         }
-        if rebuilt {
+        if invalidated {
             self.last = None;
         }
     }
@@ -584,6 +659,7 @@ impl Session {
         match c {
             Command::Reduce { term, .. } => {
                 self.last = None; // a non-continue command invalidates the saved rewrite continuation
+                let reduce_gc_interval = self.reduce_gc_interval;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 let Some(parsed) =
                     parse_command_or_report(lm, &self.interner, &term, out)
@@ -597,23 +673,30 @@ impl Session {
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
                 lm.built.engine.set_trace(self.trace.master);
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
+                lm.built.engine.set_gc_interval(reduce_gc_interval);
                 // Build the subject, then reduce driving META-LEVEL descent: a `metaReduce(…)` redex is
                 // handed to `MetaDescent`, which down-translates its meta-module argument into a real
                 // object module (resolving imports from the db) and reduces in it. The descent borrows the
                 // interner mutably, so it is dropped before the (immutable-interner) pretty-print.
-                let reduced = build_command_dag(lm, &self.interner, &parsed).map(|dag| {
+                let reduced = build_command_dag(lm, &self.interner, &parsed).and_then(|dag| {
                     let mut descent = MetaDescent::new(
                         &mut self.interner,
                         &self.db,
                         &self.views,
                         &mut self.meta_state,
-                    );
-                    let result = lm.built.engine.reduce_with(dag, &mut descent);
+                    )
+                    .with_host_functions(self.host_functions.clone());
+                    let result = lm
+                        .built
+                        .engine
+                        .try_reduce_with(dag, &mut descent)
+                        .map_err(|fault| fault.to_string())?;
                     let rewrites = lm.built.engine.rewrites();
                     let model_stats = lm.built.engine.take_model_check_stats();
                     let sat_stats = lm.built.engine.take_sat_solve_stats();
-                    (result, rewrites, model_stats, sat_stats)
+                    Ok((result, rewrites, model_stats, sat_stats))
                 });
+                lm.built.engine.set_gc_interval(None);
                 match reduced {
                     Ok((dag, rw, model_stats, sat_stats)) => {
                         let mut identity_diagnostics = String::new();
@@ -709,6 +792,7 @@ impl Session {
                 }
             }
             Command::Rewrite { bound, term, .. } => {
+                self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `rewrite` restarts the `counter` built-in
                 let Some(parsed) =
@@ -722,24 +806,29 @@ impl Session {
                 lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                 let bound_str = bound.map(|n| format!(" [{n}]")).unwrap_or_default();
                 match rewrite_command(lm, &self.interner, &parsed) {
-                    Ok(mut rw) => {
-                        let body = render_rewriting(
-                            lm,
-                            &self.interner,
-                            self.trace,
-                            self.render_color,
-                            self.show_breakdown,
-                            &mut rw,
-                            bound,
-                        );
-                        out.push_str(&format!("rewrite{bound_str} in {cur} : {echo} .\n{body}"));
-                        // `lm`'s borrow ends above; save the session so `continue` can resume it.
-                        self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
-                    }
+                    Ok(mut rw) => match render_rewriting(
+                        lm,
+                        &self.interner,
+                        self.trace,
+                        self.render_color,
+                        self.show_breakdown,
+                        &mut rw,
+                        bound,
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&format!(
+                                "rewrite{bound_str} in {cur} : {echo} .\n{body}"
+                            ));
+                            // `lm`'s borrow ends above; save the session so `continue` can resume it.
+                            self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    },
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
             Command::Frewrite { bound, gas, term, .. } => {
+                self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.reset_counter(); // a fresh `frewrite` restarts the `counter` built-in
                 let Some(parsed) =
@@ -760,24 +849,29 @@ impl Session {
                     _ => String::new(),
                 };
                 match frewrite_command(lm, &self.interner, &parsed, gas.unwrap_or(1)) {
-                    Ok(mut rw) => {
-                        let body = render_rewriting(
-                            lm,
-                            &self.interner,
-                            self.trace,
-                            self.render_color,
-                            self.show_breakdown,
-                            &mut rw,
-                            bound,
-                        );
-                        out.push_str(&format!("frewrite{bound_str} in {cur} : {echo} .\n{body}"));
-                        self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
-                    }
+                    Ok(mut rw) => match render_rewriting(
+                        lm,
+                        &self.interner,
+                        self.trace,
+                        self.render_color,
+                        self.show_breakdown,
+                        &mut rw,
+                        bound,
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&format!(
+                                "frewrite{bound_str} in {cur} : {echo} .\n{body}"
+                            ));
+                            self.last = Some((cur.clone(), Continuation::Rewrite(rw)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    },
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
             Command::ERewrite { bound, gas, term, .. } => {
                 let Session {
+                    host_functions,
                     interner,
                     db,
                     modules,
@@ -791,6 +885,7 @@ impl Session {
                     show_breakdown,
                     ..
                 } = self;
+                *last = None;
                 let lm = modules.get_mut(&cur).expect("current module is built");
                 let Some(parsed) = parse_command_or_report(lm, interner, &term, out) else {
                     return;
@@ -812,36 +907,40 @@ impl Session {
                     _ => String::new(),
                 };
                 match erewrite_command(lm, interner, &parsed, gas.unwrap_or(1)) {
-                    Ok(mut rw) => {
-                        let step = drive_external_rewriting(
-                            &mut rw,
-                            lm,
-                            interner,
-                            db,
-                            views,
-                            meta_state,
-                            interpreters,
-                            bound,
-                        );
-                        let body = render_rewrite_step(
-                            lm,
-                            interner,
-                            *trace,
-                            *render_color,
-                            *show_breakdown,
-                            step,
-                        );
-                        let ext = lm.built.engine.take_external_out();
-                        out.push_str(&format!(
-                            "erewrite{bound_str} in {cur} : {echo} .\n{ext}{body}"
-                        ));
-                        *last = Some((cur.clone(), Continuation::Rewrite(rw)));
-                    }
+                    Ok(mut rw) => match drive_external_rewriting(
+                        &mut rw,
+                        lm,
+                        host_functions,
+                        interner,
+                        db,
+                        views,
+                        meta_state,
+                        interpreters,
+                        bound,
+                    ) {
+                        Ok(step) => {
+                            let body = render_rewrite_step(
+                                lm,
+                                interner,
+                                *trace,
+                                *render_color,
+                                *show_breakdown,
+                                step,
+                            );
+                            let ext = lm.built.engine.take_external_out();
+                            out.push_str(&format!(
+                                "erewrite{bound_str} in {cur} : {echo} .\n{ext}{body}"
+                            ));
+                            *last = Some((cur.clone(), Continuation::Rewrite(rw)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    },
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
                 *stdin = lm.built.engine.take_external_input();
             }
             Command::Search { max_solutions, max_depth, subject, arrow, pattern, such_that, .. } => {
+                self.last = None;
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false); // ordinary search tracing is unsupported
                 lm.built.engine.set_record_whole(false);
@@ -881,16 +980,23 @@ impl Session {
                 ) {
                     Ok((search, vars)) => {
                         let mut session = SearchSession { search, vars };
-                        let body = render_search(
+                        match render_search(
                             &mut session,
                             lm,
                             &self.interner,
                             self.render_color,
                             max_solutions,
                             self.show_breakdown,
-                        );
-                        out.push_str(&format!("search{bound_str} in {cur} : {header} .\n{body}"));
-                        self.last = Some((cur.clone(), Continuation::Search(Box::new(session))));
+                        ) {
+                            Ok(body) => {
+                                out.push_str(&format!(
+                                    "search{bound_str} in {cur} : {header} .\n{body}"
+                                ));
+                                self.last =
+                                    Some((cur.clone(), Continuation::Search(Box::new(session))));
+                            }
+                            Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                        }
                     }
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
@@ -999,7 +1105,11 @@ impl Session {
                         }
                         out.push_str(&format!("{kw} in {cur} : {echo} using {strat_str} .\n{body}"));
                     }
-                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                    Err(tnk_frontend::strategy::StrategicRewriteError::Reducer(fault)) => {
+                        self.last = None;
+                        out.push_str(&format!("error: {fault}\n"));
+                    }
+                    Err(error) => out.push_str(&format!("error: {error}\n")),
                 }
             }
             Command::Unify { bound, irredundant, body, .. } => {
@@ -1013,40 +1123,63 @@ impl Session {
                 match unify_command(lm, interner, &body) {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                     Ok(mut uc) => {
-                        out.push_str(&format!("{irr}unify {bnd}in {cur} : {} .\n", uc.echo));
-                        if uc.readiness == UnifyReadiness::Ready {
-                            // Collect unifiers (up to the bound) while the engine is borrowed, then
-                            // render — print_pretty needs the interner immutably afterwards.
-                            let mut unifiers: Vec<Vec<DagId>> = Vec::new();
-                            {
-                                let mut names = InternerNames(interner);
-                                let mut env = tnk_core::unify::UnifyEnv {
-                                    e: &mut lm.built.engine,
-                                    names: &mut names,
-                                };
+                        if uc.readiness != UnifyReadiness::Ready {
+                            out.push_str(&format!(
+                                "{irr}unify {bnd}in {cur} : {} .\n",
+                                uc.echo
+                            ));
+                            return;
+                        }
+
+                        // Collect unifiers while the engine is borrowed, then render after releasing
+                        // the mutable interner borrow.
+                        let enumeration = {
+                            let mut names = InternerNames(interner);
+                            let mut env = tnk_core::unify::UnifyEnv {
+                                e: &mut lm.built.engine,
+                                names: &mut names,
+                            };
+                            (|| -> Result<Vec<Vec<DagId>>, ReducerFault> {
+                                let mut unifiers = Vec::new();
                                 while (unifiers.len() as u64) < limit {
-                                    match uc.problem.find_next(&mut env) {
-                                        Some(b) => unifiers.push(b),
+                                    match uc.problem.try_find_next(&mut env)? {
+                                        Some(binding) => unifiers.push(binding),
                                         None => break,
                                     }
                                 }
+                                Ok(unifiers)
+                            })()
+                        };
+                        let mut unifiers = match enumeration {
+                            Ok(unifiers) => unifiers,
+                            Err(fault) => {
+                                out.push_str(&format!("error: {fault}\n"));
+                                return;
                             }
-                            // `irredundant` keeps only the most-general unifiers in enumeration order,
-                            // then display numbering starts at one.
-                            if irredundant {
-                                unifiers =
-                                    tnk_core::unify::filter::irredundant(&mut lm.built.engine, unifiers);
-                            }
-                            if unifiers.is_empty() {
-                                out.push_str("No unifier.\n");
-                            } else {
-                                for (n, u) in unifiers.iter().enumerate() {
-                                    out.push_str(&format!(
-                                        "\nUnifier {}\n{}\n",
-                                        n + 1,
-                                        render_unifier(&lm.built, interner, &uc.var_names, u)
-                                    ));
+                        };
+                        if irredundant {
+                            match tnk_core::unify::filter::try_irredundant(
+                                &mut lm.built.engine,
+                                unifiers,
+                            ) {
+                                Ok(filtered) => unifiers = filtered,
+                                Err(fault) => {
+                                    out.push_str(&format!("error: {fault}\n"));
+                                    return;
                                 }
+                            }
+                        }
+
+                        out.push_str(&format!("{irr}unify {bnd}in {cur} : {} .\n", uc.echo));
+                        if unifiers.is_empty() {
+                            out.push_str("No unifier.\n");
+                        } else {
+                            for (n, unifier) in unifiers.iter().enumerate() {
+                                out.push_str(&format!(
+                                    "\nUnifier {}\n{}\n",
+                                    n + 1,
+                                    render_unifier(&lm.built, interner, &uc.var_names, unifier)
+                                ));
                             }
                         }
                     }
@@ -1062,7 +1195,6 @@ impl Session {
                 match variant_command(lm, interner, &term, blocker_terms, irredundant) {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                     Ok(vc) => {
-                        out.push_str(&format!("get {irr}variants{bnd} in {cur} : {} .\n", vc.echo));
                         if vc.names_ok {
                             let mut session = VariantSession {
                                 search: vc.search,
@@ -1070,9 +1202,30 @@ impl Session {
                                 irredundant,
                                 reported_total: false,
                             };
-                            let body = render_variants(&mut session, lm, interner, self.render_color, bound);
-                            out.push_str(&body);
-                            self.last = Some((cur.clone(), Continuation::Variants(Box::new(session))));
+                            match render_variants(
+                                &mut session,
+                                lm,
+                                interner,
+                                self.render_color,
+                                bound,
+                            ) {
+                                Ok(body) => {
+                                    out.push_str(&format!(
+                                        "get {irr}variants{bnd} in {cur} : {} .\n{body}",
+                                        vc.echo
+                                    ));
+                                    self.last = Some((
+                                        cur.clone(),
+                                        Continuation::Variants(Box::new(session)),
+                                    ));
+                                }
+                                Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                            }
+                        } else {
+                            out.push_str(&format!(
+                                "get {irr}variants{bnd} in {cur} : {} .\n",
+                                vc.echo
+                            ));
                         }
                     }
                 }
@@ -1087,10 +1240,6 @@ impl Session {
                 match variant_unify_command(lm, interner, &body, blocker_terms, filtered) {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                     Ok(vc) => {
-                        out.push_str(&format!(
-                            "{prefix}variant unify{bnd} in {cur} : {} .\n",
-                            vc.echo
-                        ));
                         if vc.names_ok {
                             let mut session = VariantUnifySession {
                                 search: vc.search,
@@ -1106,16 +1255,30 @@ impl Session {
                                 reported_total: false,
                                 next_number: 0,
                             };
-                            let body = render_variant_unifiers(
+                            match render_variant_unifiers(
                                 &mut session,
                                 lm,
                                 interner,
                                 bound,
                                 self.show_breakdown,
-                            );
-                            out.push_str(&body);
-                            self.last =
-                                Some((cur.clone(), Continuation::VariantUnifiers(Box::new(session))));
+                            ) {
+                                Ok(body) => {
+                                    out.push_str(&format!(
+                                        "{prefix}variant unify{bnd} in {cur} : {} .\n{body}",
+                                        vc.echo
+                                    ));
+                                    self.last = Some((
+                                        cur.clone(),
+                                        Continuation::VariantUnifiers(Box::new(session)),
+                                    ));
+                                }
+                                Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                            }
+                        } else {
+                            out.push_str(&format!(
+                                "{prefix}variant unify{bnd} in {cur} : {} .\n",
+                                vc.echo
+                            ));
                         }
                     }
                 }
@@ -1129,10 +1292,6 @@ impl Session {
                 match variant_match_command(lm, interner, &pattern, &subject, blocker_terms) {
                     Err(e) => out.push_str(&format!("error: {e}\n")),
                     Ok(vc) => {
-                        out.push_str(&format!(
-                            "variant match{bnd} in {cur} : {} .\n",
-                            vc.echo
-                        ));
                         if vc.names_ok {
                             let mut session = VariantUnifySession {
                                 search: vc.search,
@@ -1148,17 +1307,29 @@ impl Session {
                                 reported_total: false,
                                 next_number: 0,
                             };
-                            let body = render_variant_unifiers(
+                            match render_variant_unifiers(
                                 &mut session,
                                 lm,
                                 interner,
                                 bound,
                                 self.show_breakdown,
-                            );
-                            out.push_str(&body);
-                            self.last = Some((
-                                cur.clone(),
-                                Continuation::VariantUnifiers(Box::new(session)),
+                            ) {
+                                Ok(body) => {
+                                    out.push_str(&format!(
+                                        "variant match{bnd} in {cur} : {} .\n{body}",
+                                        vc.echo
+                                    ));
+                                    self.last = Some((
+                                        cur.clone(),
+                                        Continuation::VariantUnifiers(Box::new(session)),
+                                    ));
+                                }
+                                Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                            }
+                        } else {
+                            out.push_str(&format!(
+                                "variant match{bnd} in {cur} : {} .\n",
+                                vc.echo
                             ));
                         }
                     }
@@ -1258,11 +1429,6 @@ impl Session {
                                 out,
                             );
                         }
-                        out.push_str(&format!(
-                            "{prefix}{keyword}{stream_options}{bound_str} in {cur} : {} \
-                             {arrow_echo} {} .\n",
-                            command.subject_echo, command.goal_echo
-                        ));
                         let mut session = NarrowSession {
                             search: command.search,
                             variables: command.variables,
@@ -1272,7 +1438,7 @@ impl Session {
                             next_number: 0,
                             path,
                         };
-                        let body = render_narrowing(
+                        match render_narrowing(
                             &mut session,
                             lm,
                             interner,
@@ -1281,9 +1447,18 @@ impl Session {
                             verbose,
                             path,
                             max_solutions,
-                        );
-                        out.push_str(&body);
-                        self.last = Some((cur.clone(), Continuation::Narrow(Box::new(session))));
+                        ) {
+                            Ok(body) => {
+                                out.push_str(&format!(
+                                    "{prefix}{keyword}{stream_options}{bound_str} in {cur} : {} \
+                                     {arrow_echo} {} .\n{body}",
+                                    command.subject_echo, command.goal_echo
+                                ));
+                                self.last =
+                                    Some((cur.clone(), Continuation::Narrow(Box::new(session))));
+                            }
+                            Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                        }
                     }
                 }
             }
@@ -1315,7 +1490,7 @@ impl Session {
                     lm.built.engine.set_record_whole(self.trace.master && self.trace.whole);
                     // `continue` reports only rewrites performed after resuming, so start with a fresh counter.
                     lm.built.engine.reset_rewrites();
-                    let body = render_rewriting(
+                    match render_rewriting(
                         lm,
                         &self.interner,
                         self.trace,
@@ -1323,25 +1498,33 @@ impl Session {
                         self.show_breakdown,
                         &mut rw,
                         bound,
-                    );
-                    out.push_str(&body);
-                    self.last = Some((m, Continuation::Rewrite(rw)));
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&body);
+                            self.last = Some((m, Continuation::Rewrite(rw)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    }
                 }
                 Some((m, Continuation::Search(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     // Search continuation statistics count only work performed after resuming, so reset
                     // before newly generated states snapshot their rewrite count.
                     lm.built.engine.reset_rewrites();
-                    let body = render_search(
+                    match render_search(
                         &mut session,
                         lm,
                         &self.interner,
                         self.render_color,
                         bound,
                         self.show_breakdown,
-                    );
-                    out.push_str(&body);
-                    self.last = Some((m, Continuation::Search(session)));
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&body);
+                            self.last = Some((m, Continuation::Search(session)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    }
                 }
                 Some((m, Continuation::SmtSearch(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
@@ -1359,29 +1542,42 @@ impl Session {
                 Some((m, Continuation::Variants(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.reset_rewrites();
-                    let body =
-                        render_variants(&mut session, lm, &mut self.interner, self.render_color, bound);
-                    out.push_str(&body);
-                    self.last = Some((m, Continuation::Variants(session)));
+                    match render_variants(
+                        &mut session,
+                        lm,
+                        &mut self.interner,
+                        self.render_color,
+                        bound,
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&body);
+                            self.last = Some((m, Continuation::Variants(session)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    }
                 }
                 Some((m, Continuation::VariantUnifiers(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.reset_rewrites();
-                    let body = render_variant_unifiers(
+                    match render_variant_unifiers(
                         &mut session,
                         lm,
                         &mut self.interner,
                         bound,
                         self.show_breakdown,
-                    );
-                    out.push_str(&body);
-                    self.last = Some((m, Continuation::VariantUnifiers(session)));
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&body);
+                            self.last = Some((m, Continuation::VariantUnifiers(session)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    }
                 }
                 Some((m, Continuation::Narrow(mut session))) if m == cur => {
                     let lm = self.modules.get_mut(&cur).expect("current module is built");
                     lm.built.engine.reset_rewrites();
                     let show_state_number = session.path;
-                    let body = render_narrowing(
+                    match render_narrowing(
                         &mut session,
                         lm,
                         &mut self.interner,
@@ -1390,9 +1586,13 @@ impl Session {
                         self.verbose,
                         show_state_number,
                         bound,
-                    );
-                    out.push_str(&body);
-                    self.last = Some((m, Continuation::Narrow(session)));
+                    ) {
+                        Ok(body) => {
+                            out.push_str(&body);
+                            self.last = Some((m, Continuation::Narrow(session)));
+                        }
+                        Err(fault) => out.push_str(&format!("error: {fault}\n")),
+                    }
                 }
                 _ => out.push_str(
                     "No previous rewriting, search, or variant enumeration to continue in this module.\n",
@@ -1951,34 +2151,51 @@ fn render_rewriting(
     show_breakdown: bool,
     rw: &mut Rewriting,
     bound: Option<u64>,
-) -> String {
-    let step = rw.run(&mut lm.built.engine, bound);
-    render_rewrite_step(lm, i, flags, color, show_breakdown, step)
+) -> Result<String, ReducerFault> {
+    let step = rw.try_run(&mut lm.built.engine, bound)?;
+    Ok(render_rewrite_step(
+        lm,
+        i,
+        flags,
+        color,
+        show_breakdown,
+        step,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn drive_external_rewriting(
     rw: &mut Rewriting,
     lm: &mut LoadedModule,
+    host_functions: &HostFunctionCatalog,
     interner: &mut Interner,
     db: &ModuleDb,
     views: &ViewDb,
     meta_state: &mut MetaState,
     interpreters: &mut InterpreterRegistry,
     bound: Option<u64>,
-) -> RewriteStep {
+) -> Result<RewriteStep, ReducerFault> {
     let mut outcome = {
-        let mut descent = MetaDescent::new(interner, db, views, meta_state);
-        rw.run_with_external(&mut lm.built.engine, bound, &mut descent)
+        let mut descent = MetaDescent::new(interner, db, views, meta_state)
+            .with_host_functions(host_functions.clone());
+        rw.try_run_with_external(&mut lm.built.engine, bound, &mut descent)?
     };
     loop {
         match outcome {
-            ExternalRun::Complete(step) => return step,
+            ExternalRun::Complete(step) => return Ok(step),
             ExternalRun::Suspended { token, request } => {
                 let response = {
-                    let mut manager =
-                        LocalInterpreterManager::new(interpreters, interner, db, views);
+                    let mut manager = LocalInterpreterManager::new(
+                        interpreters,
+                        interner,
+                        db,
+                        views,
+                        host_functions,
+                    );
                     let mut action = manager.handle(request);
+                    if let Some(fault) = action.fault.take() {
+                        return Err(fault);
+                    }
                     if let Some(unregister) = action.unregister.take() {
                         lm.built.engine.unregister_external_target(unregister);
                     }
@@ -2000,8 +2217,9 @@ fn drive_external_rewriting(
                     action.response
                 };
                 outcome = {
-                    let mut descent = MetaDescent::new(interner, db, views, meta_state);
-                    rw.resume_external(&mut lm.built.engine, token, response, &mut descent)
+                    let mut descent = MetaDescent::new(interner, db, views, meta_state)
+                        .with_host_functions(host_functions.clone());
+                    rw.try_resume_external(&mut lm.built.engine, token, response, &mut descent)?
                         .expect("the scheduler resumes the token it was just given")
                 };
             }
@@ -2068,14 +2286,14 @@ fn render_search(
     color: bool,
     limit: Option<u64>,
     show_breakdown: bool,
-) -> String {
+) -> Result<String, ReducerFault> {
     let mut out = String::new();
     let mut shown = 0u64;
     loop {
         if limit == Some(shown) {
-            return out; // hit the per-invocation solution bound — continuable, no "No more solutions"
+            return Ok(out); // hit the per-invocation solution bound — continuable, no "No more solutions"
         }
-        match session.search.next_solution(&mut lm.built.engine) {
+        match session.search.try_next_solution(&mut lm.built.engine)? {
             Some(sol) => {
                 shown += 1;
                 let bindings = render_search_bindings(lm, i, &session.vars, &sol.bindings, color);
@@ -2092,7 +2310,7 @@ fn render_search(
                 out.push_str(&format!(
                     "\nNo more solutions.\nstates: {states}  rewrites: {rewrites}{breakdown}\n"
                 ));
-                return out;
+                return Ok(out);
             }
         }
     }
@@ -2178,12 +2396,12 @@ fn render_variants(
     i: &mut Interner,
     color: bool,
     limit: Option<u64>,
-) -> String {
+) -> Result<String, ReducerFault> {
     let mut out = String::new();
     let mut shown = 0u64;
     loop {
         if limit == Some(shown) {
-            return out;
+            return Ok(out);
         }
         let next = {
             let mut names = InternerNames(i);
@@ -2191,7 +2409,7 @@ fn render_variants(
                 e: &mut lm.built.engine,
                 names: &mut names,
             };
-            session.search.find_next(&mut env)
+            session.search.try_find_next(&mut env)?
         };
         if session.irredundant && !session.reported_total {
             let rewrites = lm.built.engine.rewrites();
@@ -2220,16 +2438,16 @@ fn render_variants(
                     let rewrites = lm.built.engine.rewrites();
                     out.push_str(&format!("rewrites: {rewrites}\n"));
                 }
-                return out;
+                return Ok(out);
             }
         }
     }
 }
 
 impl VariantUnifySession {
-    fn advance(&mut self, lm: &mut LoadedModule, i: &mut Interner) {
+    fn advance(&mut self, lm: &mut LoadedModule, i: &mut Interner) -> Result<(), ReducerFault> {
         if self.exhausted {
-            return;
+            return Ok(());
         }
         let mut names = InternerNames(i);
         let mut env = tnk_core::unify::UnifyEnv {
@@ -2238,52 +2456,65 @@ impl VariantUnifySession {
         };
         if self.matching {
             let subject = self.subject.expect("variant matching subject");
-            while let Some(variant) = self.search.find_next(&mut env) {
-                let matches = tnk_core::variant::variant_match_bindings(
+            loop {
+                let Some(variant) = self.search.try_find_next(&mut env)? else {
+                    self.exhausted = true;
+                    return Ok(());
+                };
+                let matches = tnk_core::variant::try_variant_match_bindings(
                     &mut env,
                     &variant,
                     subject,
                     &self.fresh_base,
-                );
+                )?;
                 if matches.is_empty() {
                     continue;
                 }
                 let rewrites = env.e.rewrites();
                 for bindings in matches {
                     let equations = self.search.variant_equations();
-                    self.stream
-                        .insert(&mut env, bindings, variant.family, rewrites, &equations);
+                    self.stream.try_insert(
+                        &mut env,
+                        bindings,
+                        variant.family,
+                        rewrites,
+                        &equations,
+                    )?;
                 }
-                return;
+                return Ok(());
             }
-            self.exhausted = true;
-            return;
         }
-        let Some(variant) = self.search.find_next(&mut env) else {
+        let Some(variant) = self.search.try_find_next(&mut env)? else {
             self.exhausted = true;
-            return;
+            return Ok(());
         };
         debug_assert!(variant.unifier);
         let rewrites = env.e.rewrites();
         let equations = self.search.variant_equations();
-        self.stream.insert(
+        self.stream.try_insert(
             &mut env,
             variant.substitution,
             variant.family,
             rewrites,
             &equations,
-        );
+        )?;
+        Ok(())
     }
 
-    fn prepare_filtered(&mut self, lm: &mut LoadedModule, i: &mut Interner) {
+    fn prepare_filtered(
+        &mut self,
+        lm: &mut LoadedModule,
+        i: &mut Interner,
+    ) -> Result<(), ReducerFault> {
         if self.prepared {
-            return;
+            return Ok(());
         }
         while !self.exhausted {
-            self.advance(lm, i);
+            self.advance(lm, i)?;
         }
         self.stream.finish();
         self.prepared = true;
+        Ok(())
     }
 }
 
@@ -2293,10 +2524,10 @@ fn render_variant_unifiers(
     i: &mut Interner,
     limit: Option<u64>,
     show_breakdown: bool,
-) -> String {
+) -> Result<String, ReducerFault> {
     let mut out = String::new();
     if session.upfront {
-        session.prepare_filtered(lm, i);
+        session.prepare_filtered(lm, i)?;
         if !session.reported_total {
             out.push_str(&format!("rewrites: {}\n", lm.built.engine.rewrites()));
             if show_breakdown {
@@ -2310,7 +2541,7 @@ fn render_variant_unifiers(
     let mut shown = 0;
     loop {
         if limit == Some(shown) {
-            return out;
+            return Ok(out);
         }
         let index = loop {
             if let Some(index) = session.stream.pop_pending() {
@@ -2319,7 +2550,7 @@ fn render_variant_unifiers(
             if session.exhausted {
                 break None;
             }
-            session.advance(lm, i);
+            session.advance(lm, i)?;
         };
         let Some(index) = index else {
             let noun = if session.matching {
@@ -2341,7 +2572,7 @@ fn render_variant_unifiers(
                     out.push('\n');
                 }
             }
-            return out;
+            return Ok(out);
         };
         shown += 1;
         session.next_number += 1;
@@ -2517,12 +2748,12 @@ fn render_narrowing(
     verbose: bool,
     show_state_number: bool,
     limit: Option<u64>,
-) -> String {
+) -> Result<String, ReducerFault> {
     let mut out = String::new();
     let mut shown = 0;
     loop {
         if limit == Some(shown) {
-            return out;
+            return Ok(out);
         }
         let solution = {
             let mut names = InternerNames(i);
@@ -2530,7 +2761,7 @@ fn render_narrowing(
                 e: &mut lm.built.engine,
                 names: &mut names,
             };
-            session.search.find_next(&mut env)
+            session.search.try_find_next(&mut env)?
         };
         if verbose {
             out.push_str(&render_narrow_folding_events(session, lm, i, color));
@@ -2554,7 +2785,7 @@ fn render_narrowing(
                 rewrite_count_line(lm.built.engine.rewrites()),
                 rewrite_breakdown(lm, show_breakdown),
             ));
-            return out;
+            return Ok(out);
         };
         shown += 1;
         session.next_number += 1;

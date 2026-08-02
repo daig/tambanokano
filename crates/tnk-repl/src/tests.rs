@@ -41,6 +41,40 @@ fn command_without_current_module() {
     assert!(r.eval("red foo .").output.contains("no current module"));
 }
 
+/// The stock REPL deliberately has no host-function catalog. A host attachment is rejected while the
+/// module is built rather than becoming an inert ordinary operator.
+#[test]
+fn stock_repl_rejects_strict_host_function_without_catalog() {
+    let mut r = repl();
+    assert_eq!(
+        r.eval("fmod BASE is sort S . op a : -> S [ctor] . endfm")
+            .output,
+        ""
+    );
+
+    let failed = r.eval(
+        r#"fmod HOST-REPL is
+  sort S .
+  op a : -> S [ctor] .
+  op host : S -> S
+    [special (id-hook HostFunctionSymbol (testing.echo))] .
+endfm"#,
+    );
+    assert!(
+        failed.output.contains("missing host")
+            && failed.output.contains("capability `testing.echo`"),
+        "{}",
+        failed.output
+    );
+    assert_eq!(r.current(), Some("BASE"));
+    let missing = r.eval("reduce in HOST-REPL : host(a) .");
+    assert!(
+        missing.output.contains("module `HOST-REPL` does not exist"),
+        "{}",
+        missing.output
+    );
+}
+
 /// A diamond import produces the expected value and accumulated rewrite count.
 #[test]
 fn import_diamond_through_repl() {

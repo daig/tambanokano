@@ -7,8 +7,9 @@
 
 use crate::dag::DagId;
 use crate::descent::{DescentOps, NullDescent};
-use crate::engine::{ERewritePass, ERewritePassStep, Engine};
+use crate::engine::{ERewritePass, ERewritePassStep, Engine, SemanticCheckpoint};
 use crate::external::{ExternalRequestToken, ExternalResponse, MetaEnvelope};
+use crate::host::ReducerFault;
 use crate::root::RootGuard;
 use crate::symbol::SymbolId;
 use std::collections::HashMap;
@@ -41,6 +42,8 @@ pub enum ExternalRun {
 
 /// A resumable rewriting session. Owns and roots its current term across reductions and REPL
 /// `continue`s, and persists per-symbol round-robin rule cursors so each sequence cycles fairly.
+/// The first [`ReducerFault`] terminally invalidates the session; every later fallible drive returns
+/// the same fault.
 pub struct Rewriting {
     current: DagId,
     root: RootGuard,
@@ -51,11 +54,19 @@ pub struct Rewriting {
     object_run: Option<ObjectRunState>,
     next_external_request: u64,
     pending_external: Option<(ExternalRequestToken, MetaEnvelope)>,
+    /// The first reducer fault terminally invalidates this resumable session.
+    fault: Option<ReducerFault>,
+}
+
+struct RewritingCheckpoint {
+    current: DagId,
+    _root: RootGuard,
 }
 
 /// The outcome of one bounded [`Rewriting::run`]: the current term, whether a normal form was reached
 /// (`done`), and whether the term's least sort is known. A bounded `frewrite` stop can leave a
 /// non-canonical term whose sort has not been calculated.
+#[derive(Debug)]
 pub struct RewriteStep {
     pub term: DagId,
     pub done: bool,
@@ -74,6 +85,7 @@ impl Rewriting {
             object_run: None,
             next_external_request: 0,
             pending_external: None,
+            fault: None,
         }
     }
 
@@ -89,6 +101,7 @@ impl Rewriting {
             object_run: None,
             next_external_request: 0,
             pending_external: None,
+            fault: None,
         }
     }
 
@@ -104,6 +117,7 @@ impl Rewriting {
             object_run: None,
             next_external_request: 0,
             pending_external: None,
+            fault: None,
         }
     }
 
@@ -123,10 +137,45 @@ impl Rewriting {
 
     /// Run up to `bound` rule applications (`None` = unbounded, to a normal form); `continue m` calls
     /// this again with `Some(m)`. Ordinary callers do not offer registered host targets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`], or if this `erewrite`
+    /// session has a suspended external request that must be answered through
+    /// [`resume_external`](Self::resume_external).
     pub fn run(&mut self, engine: &mut Engine, bound: Option<u64>) -> RewriteStep {
-        if self.done {
-            return self.completed_step();
+        self.try_run(engine, bound)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`run`](Self::run).
+    ///
+    /// # Panics
+    ///
+    /// Panics if this `erewrite` session has a suspended external request that must be answered
+    /// through [`try_resume_external`](Self::try_resume_external).
+    pub fn try_run(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+    ) -> Result<RewriteStep, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
         }
+        if self.done {
+            return Ok(self.completed_step());
+        }
+        let checkpoint = engine.semantic_checkpoint();
+        let session_checkpoint = self.checkpoint(engine);
+        let result = self.try_run_inner(engine, bound);
+        self.finish_fallible(engine, checkpoint, session_checkpoint, result)
+    }
+
+    fn try_run_inner(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+    ) -> Result<RewriteStep, ReducerFault> {
         match self.mode {
             Mode::Rule => self.run_rule_fair(engine, bound),
             Mode::Position { gas } => self.run_position_fair(engine, bound, gas),
@@ -136,9 +185,9 @@ impl Rewriting {
                     "a suspended external request must be resumed explicitly"
                 );
                 let mut descent = NullDescent;
-                self.start_object_run(engine, bound, &mut descent);
-                match self.drive_object_run(engine, gas, &mut descent, false) {
-                    ExternalRun::Complete(step) => step,
+                self.start_object_run(engine, bound, &mut descent)?;
+                match self.drive_object_run(engine, gas, &mut descent, false)? {
+                    ExternalRun::Complete(step) => Ok(step),
                     ExternalRun::Suspended { .. } => {
                         unreachable!("host targets are disabled for Rewriting::run")
                     }
@@ -151,33 +200,58 @@ impl Rewriting {
     /// returns an owned request and leaves the parent scheduler suspended. The caller must answer through
     /// [`resume_external`](Self::resume_external); calling this method again simply returns the same token
     /// and request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`].
     pub fn run_with_external(
         &mut self,
         engine: &mut Engine,
         bound: Option<u64>,
         descent: &mut dyn DescentOps,
     ) -> ExternalRun {
+        self.try_run_with_external(engine, bound, descent)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`run_with_external`](Self::run_with_external).
+    pub fn try_run_with_external(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+        descent: &mut dyn DescentOps,
+    ) -> Result<ExternalRun, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
         if self.done {
-            return ExternalRun::Complete(self.completed_step());
+            return Ok(ExternalRun::Complete(self.completed_step()));
         }
         if let Some((token, request)) = &self.pending_external {
-            return ExternalRun::Suspended {
+            return Ok(ExternalRun::Suspended {
                 token: *token,
                 request: request.clone(),
-            };
+            });
         }
-        match self.mode {
-            Mode::ObjectMessages { gas } => {
-                self.start_object_run(engine, bound, descent);
-                self.drive_object_run(engine, gas, descent, true)
-            }
-            _ => ExternalRun::Complete(self.run(engine, bound)),
-        }
+        let checkpoint = engine.semantic_checkpoint();
+        let session_checkpoint = self.checkpoint(engine);
+        let result = match self.mode {
+            Mode::ObjectMessages { gas } => match self.start_object_run(engine, bound, descent) {
+                Ok(()) => self.drive_object_run(engine, gas, descent, true),
+                Err(fault) => Err(fault),
+            },
+            _ => self.try_run_inner(engine, bound).map(ExternalRun::Complete),
+        };
+        self.finish_fallible(engine, checkpoint, session_checkpoint, result)
     }
 
     /// Resolve exactly the currently suspended external request, then continue the same pass and bound.
     /// `None` rejects the request and restores its message to the configuration. A stale/wrong token has
     /// no effect and returns `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`].
     pub fn resume_external(
         &mut self,
         engine: &mut Engine,
@@ -185,13 +259,36 @@ impl Rewriting {
         response: Option<ExternalResponse>,
         descent: &mut dyn DescentOps,
     ) -> Option<ExternalRun> {
-        let (pending, _) = self.pending_external.as_ref()?;
-        if *pending != token {
-            return None;
+        self.try_resume_external(engine, token, response, descent)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`resume_external`](Self::resume_external).
+    pub fn try_resume_external(
+        &mut self,
+        engine: &mut Engine,
+        token: ExternalRequestToken,
+        response: Option<ExternalResponse>,
+        descent: &mut dyn DescentOps,
+    ) -> Result<Option<ExternalRun>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
         }
+        let Some((pending, _)) = self.pending_external.as_ref() else {
+            return Ok(None);
+        };
+        if *pending != token {
+            return Ok(None);
+        }
+        let checkpoint = engine.semantic_checkpoint();
+        let session_checkpoint = self.checkpoint(engine);
         self.pending_external = None;
-        let mut state = self.object_run.take()?;
-        let pass = state.pass.as_mut()?;
+        let Some(mut state) = self.object_run.take() else {
+            return Ok(None);
+        };
+        let Some(pass) = state.pass.as_mut() else {
+            return Ok(None);
+        };
         let accepted = response.is_some_and(|response| {
             engine.accept_external_response(
                 response.reply.as_ref(),
@@ -204,7 +301,38 @@ impl Rewriting {
         let Mode::ObjectMessages { gas } = self.mode else {
             unreachable!("only erewrite can suspend externally")
         };
-        Some(self.drive_object_run(engine, gas, descent, true))
+        let result = self.drive_object_run(engine, gas, descent, true).map(Some);
+        self.finish_fallible(engine, checkpoint, session_checkpoint, result)
+    }
+
+    fn checkpoint(&self, engine: &Engine) -> RewritingCheckpoint {
+        RewritingCheckpoint {
+            current: self.current,
+            _root: engine.root(self.current),
+        }
+    }
+
+    fn finish_fallible<T>(
+        &mut self,
+        engine: &mut Engine,
+        checkpoint: SemanticCheckpoint,
+        session_checkpoint: RewritingCheckpoint,
+        result: Result<T, ReducerFault>,
+    ) -> Result<T, ReducerFault> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(fault) => {
+                engine.restore_semantic_checkpoint(checkpoint);
+                self.current = session_checkpoint.current;
+                self.root.set(session_checkpoint.current);
+                self.done = true;
+                self.cursors.clear();
+                self.object_run = None;
+                self.pending_external = None;
+                self.fault = Some(fault.clone());
+                Err(fault)
+            }
+        }
     }
 
     fn completed_step(&self) -> RewriteStep {
@@ -217,20 +345,24 @@ impl Rewriting {
 
     /// `rewrite`: each step reduces `current` to canonical form, counting those equational rewrites,
     /// then applies one rule at the top-down-first redex.
-    fn run_rule_fair(&mut self, engine: &mut Engine, bound: Option<u64>) -> RewriteStep {
+    fn run_rule_fair(
+        &mut self,
+        engine: &mut Engine,
+        bound: Option<u64>,
+    ) -> Result<RewriteStep, ReducerFault> {
         let mut steps = 0u64;
         loop {
-            let reduced = engine.reduce(self.current);
+            let reduced = engine.try_reduce(self.current)?;
             self.current = reduced;
             self.root.set(reduced);
             if bound == Some(steps) {
-                return RewriteStep {
+                return Ok(RewriteStep {
                     term: self.current,
                     done: false,
                     sort_known: true,
-                };
+                });
             }
-            match engine.rewrite_step(self.current, &mut self.cursors) {
+            match engine.rewrite_step(self.current, &mut self.cursors)? {
                 Some(next) => {
                     self.current = next;
                     self.root.set(next);
@@ -238,11 +370,11 @@ impl Rewriting {
                 }
                 None => {
                     self.done = true;
-                    return RewriteStep {
+                    return Ok(RewriteStep {
                         term: self.current,
                         done: true,
                         sort_known: true,
-                    };
+                    });
                 }
             }
         }
@@ -257,9 +389,9 @@ impl Rewriting {
         engine: &mut Engine,
         bound: Option<u64>,
         gas: u64,
-    ) -> RewriteStep {
+    ) -> Result<RewriteStep, ReducerFault> {
         let mut remaining = bound;
-        self.current = engine.reduce(self.current);
+        self.current = engine.try_reduce(self.current)?;
         self.root.set(self.current);
         loop {
             let mut progress = false;
@@ -269,23 +401,23 @@ impl Rewriting {
                 &mut remaining,
                 &mut progress,
                 &mut self.cursors,
-            );
+            )?;
             self.current = next;
             self.root.set(next);
             if remaining == Some(0) {
-                return RewriteStep {
+                return Ok(RewriteStep {
                     term: self.current,
                     done: false,
                     sort_known: false,
-                };
+                });
             }
             if !progress {
                 self.done = true;
-                return RewriteStep {
+                return Ok(RewriteStep {
                     term: self.current,
                     done: true,
                     sort_known: true,
-                };
+                });
             }
         }
     }
@@ -296,16 +428,17 @@ impl Rewriting {
         engine: &mut Engine,
         bound: Option<u64>,
         descent: &mut dyn DescentOps,
-    ) {
+    ) -> Result<(), ReducerFault> {
         if self.object_run.is_some() {
-            return;
+            return Ok(());
         }
-        self.current = engine.reduce_with(self.current, descent);
+        self.current = engine.try_reduce_with(self.current, descent)?;
         self.root.set(self.current);
         self.object_run = Some(ObjectRunState {
             remaining: bound,
             pass: None,
         });
+        Ok(())
     }
 
     /// Drive the active object-message run to a bounded/final result or one external safe point.
@@ -315,18 +448,18 @@ impl Rewriting {
         gas: u64,
         descent: &mut dyn DescentOps,
         offer_external: bool,
-    ) -> ExternalRun {
+    ) -> Result<ExternalRun, ReducerFault> {
         let mut state = self
             .object_run
             .take()
             .expect("object-message run must be initialized");
         loop {
             if state.remaining == Some(0) {
-                return ExternalRun::Complete(RewriteStep {
+                return Ok(ExternalRun::Complete(RewriteStep {
                     term: self.current,
                     done: false,
                     sort_known: true,
-                });
+                }));
             }
 
             if engine.is_config_node(self.current) {
@@ -338,7 +471,7 @@ impl Rewriting {
                     &mut self.cursors,
                     offer_external,
                     descent,
-                );
+                )?;
                 match pass_step {
                     ERewritePassStep::External { target, message } => {
                         let request = engine
@@ -357,15 +490,15 @@ impl Rewriting {
                             .expect("external request token space exhausted");
                         self.pending_external = Some((token, request.clone()));
                         self.object_run = Some(state);
-                        return ExternalRun::Suspended { token, request };
+                        return Ok(ExternalRun::Suspended { token, request });
                     }
                     ERewritePassStep::Complete { term, progress } => {
-                        self.current = engine.reduce_with(term, descent);
+                        self.current = engine.try_reduce_with(term, descent)?;
                         self.root.set(self.current);
                         state.pass = None;
                         if !progress {
                             self.done = true;
-                            return ExternalRun::Complete(self.completed_step());
+                            return Ok(ExternalRun::Complete(self.completed_step()));
                         }
                         if let Some(remaining) = &mut state.remaining {
                             *remaining -= 1;
@@ -380,19 +513,19 @@ impl Rewriting {
                     &mut state.remaining,
                     &mut progress,
                     &mut self.cursors,
-                );
-                self.current = engine.reduce_with(next, descent);
+                )?;
+                self.current = engine.try_reduce_with(next, descent)?;
                 self.root.set(self.current);
                 if state.remaining == Some(0) {
-                    return ExternalRun::Complete(RewriteStep {
+                    return Ok(ExternalRun::Complete(RewriteStep {
                         term: self.current,
                         done: false,
                         sort_known: true,
-                    });
+                    }));
                 }
                 if !progress {
                     self.done = true;
-                    return ExternalRun::Complete(self.completed_step());
+                    return Ok(ExternalRun::Complete(self.completed_step()));
                 }
             }
         }

@@ -16,6 +16,7 @@ use super::{
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
+use crate::host::ReducerFault;
 use crate::num::Nat;
 use crate::sort::{KindId, SortId};
 use crate::sort_bdds::{AllSat, SortBdds};
@@ -51,6 +52,7 @@ pub struct UnifyProblem {
     /// `false` if the many-sorted solve failed outright (no unifier at all).
     viable: bool,
     order_sorted: Option<OrderSorted>,
+    fault: Option<ReducerFault>,
 }
 
 /// The order-sorted state for one unsorted solved form. `AllSat` owns its `Bdd`, so the `SortBdds`
@@ -106,8 +108,8 @@ fn normalize_and_reindex(
     e.rank_variable_sorts(&mut variable_sort_order);
 
     for (lhs, rhs) in &mut equations {
-        *lhs = e.normalize_for_unify(*lhs);
-        *rhs = e.normalize_for_unify(*rhs);
+        *lhs = e.normalize_for_unify_or_defer_fault(*lhs);
+        *rhs = e.normalize_for_unify_or_defer_fault(*rhs);
     }
 
     let mut seen = vec![false; specs.len()];
@@ -206,6 +208,7 @@ impl UnifyProblem {
             problem_okay: true,
             viable: false,
             order_sorted: None,
+            fault: None,
         };
 
         // Reject every unificand with a non-ground unsupported-theory root. This case has no unifiers;
@@ -231,6 +234,30 @@ impl UnifyProblem {
         prob
     }
 
+    /// Fallible form of [`Self::new`] for public drivers that must surface strict-reducer failures
+    /// encountered while normalizing the unificands.
+    pub fn try_new(
+        env: &mut UnifyEnv,
+        equations: Vec<(DagId, DagId)>,
+        var_specs: Vec<VarSpec>,
+        family: VariableFamily,
+        base: &str,
+    ) -> Result<UnifyProblem, ReducerFault> {
+        let checkpoint = env.e.semantic_checkpoint();
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            env.e.restore_semantic_checkpoint(checkpoint);
+            return Err(fault);
+        }
+        let problem = Self::new(env, equations, var_specs, family, base);
+        match env.e.check_deferred_reducer_fault() {
+            Ok(()) => Ok(problem),
+            Err(fault) => {
+                env.e.restore_semantic_checkpoint(checkpoint);
+                Err(fault)
+            }
+        }
+    }
+
     /// Build a narrowing unification problem whose variable slots were already assigned by the
     /// caller. Unlike ordinary command unification, narrowing must preserve the equation-variable
     /// prefix followed by the current state's term-first variable order.
@@ -242,8 +269,8 @@ impl UnifyProblem {
         base: &str,
     ) -> UnifyProblem {
         for (lhs, rhs) in &mut equations {
-            *lhs = env.e.normalize_for_unify(*lhs);
-            *rhs = env.e.normalize_for_unify(*rhs);
+            *lhs = env.e.normalize_for_unify_or_defer_fault(*lhs);
+            *rhs = env.e.normalize_for_unify_or_defer_fault(*rhs);
         }
         let n_original = var_specs.len();
         let base = Nat::from_decimal(base).unwrap_or_else(Nat::zero);
@@ -259,6 +286,7 @@ impl UnifyProblem {
             problem_okay: true,
             viable: false,
             order_sorted: None,
+            fault: None,
         };
         let mut warned = Vec::new();
         for &(l, r) in &prob.equations {
@@ -301,8 +329,8 @@ impl UnifyProblem {
             );
         }
         for (lhs, rhs) in &mut equations {
-            *lhs = env.e.normalize_for_unify(*lhs);
-            *rhs = env.e.normalize_for_unify(*rhs);
+            *lhs = env.e.normalize_for_unify_or_defer_fault(*lhs);
+            *rhs = env.e.normalize_for_unify_or_defer_fault(*rhs);
         }
         let base = Nat::from_decimal(base).unwrap_or_else(Nat::zero);
         let mut prob = UnifyProblem {
@@ -317,6 +345,7 @@ impl UnifyProblem {
             problem_okay: true,
             viable: false,
             order_sorted: None,
+            fault: None,
         };
         let mut warned = Vec::new();
         for &(l, r) in &prob.equations {
@@ -368,7 +397,28 @@ impl UnifyProblem {
     /// The next unifier as the value of each original variable (slot order), or `None` when
     /// exhausted. Ordinary problems have no inactive slots, so every entry is present.
     pub fn find_next(&mut self, env: &mut UnifyEnv) -> Option<Vec<DagId>> {
-        self.find_next_full(env).map(|solution| {
+        self.try_find_next(env)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`Self::find_next`].
+    pub fn try_find_next(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Result<Option<Vec<DagId>>, ReducerFault> {
+        self.try_find_next_full(env).map(|solution| {
+            solution.map(|solution| {
+                solution
+                    .into_iter()
+                    .map(|value| value.expect("ordinary unification has no inactive slots"))
+                    .collect()
+            })
+        })
+    }
+
+    /// Deferred internal form of [`Self::find_next`].
+    pub(crate) fn find_next_deferred(&mut self, env: &mut UnifyEnv) -> Option<Vec<DagId>> {
+        self.find_next_full_deferred(env).map(|solution| {
             solution
                 .into_iter()
                 .map(|value| value.expect("ordinary unification has no inactive slots"))
@@ -380,6 +430,14 @@ impl UnifyProblem {
     /// inactive narrowing gaps remain `None`. Fresh solver variables are instantiated into the
     /// active values but are not appended to this vector.
     pub fn find_next_full(&mut self, env: &mut UnifyEnv) -> Option<Vec<Option<DagId>>> {
+        self.try_find_next_full(env)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    pub(crate) fn find_next_full_deferred(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Option<Vec<Option<DagId>>> {
         if !self.viable || !self.problem_okay {
             return None;
         }
@@ -412,6 +470,37 @@ impl UnifyProblem {
             .all_sat
             .next_assignment(); // can't fail
         Some(self.bind_free_variables_full(env))
+    }
+
+    /// Fallible form of [`Self::find_next_full`].
+    pub fn try_find_next_full(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Result<Option<Vec<Option<DagId>>>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let checkpoint = env.e.semantic_checkpoint();
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            env.e.restore_semantic_checkpoint(checkpoint);
+            self.viable = false;
+            self.pending = PendingStack::new();
+            self.order_sorted = None;
+            self.fault = Some(fault.clone());
+            return Err(fault);
+        }
+        let result = self.find_next_full_deferred(env);
+        match env.e.check_deferred_reducer_fault() {
+            Ok(()) => Ok(result),
+            Err(fault) => {
+                env.e.restore_semantic_checkpoint(checkpoint);
+                self.viable = false;
+                self.order_sorted = None;
+                self.pending = PendingStack::new();
+                self.fault = Some(fault.clone());
+                Err(fault)
+            }
+        }
     }
 
     /// Build the unifier and maximality BDDs for the current unsorted solved form. Leave
@@ -1106,5 +1195,119 @@ mod tests {
         assert_eq!(as_var(env.e, first[1]), Some((hash2, "Set".to_string())));
         assert_eq!(as_var(env.e, first[2]), Some((hash1, "Elt".to_string())));
         assert_eq!(as_var(env.e, first[3]), Some((hash2, "Set".to_string())));
+    }
+    #[derive(Clone)]
+    struct IdentityFault {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::host::StrictReducer for IdentityFault {
+        fn reduce<'ctx>(
+            &self,
+            _ctx: &mut crate::host::StrictReduceCtx<'ctx>,
+            _call: crate::host::StrictCall<'ctx>,
+        ) -> Result<crate::host::StrictOutcome<'ctx>, ReducerFault> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ReducerFault::new("unification identity fault"))
+        }
+    }
+
+    fn raw_identity_problem() -> (
+        Engine,
+        DagId,
+        DagId,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::host::{HostFunctionCatalog, ResolvedHostHooks, StrictReducerDescriptor};
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "unify.identity",
+                IdentityFault {
+                    calls: std::sync::Arc::clone(&calls),
+                },
+                StrictReducerDescriptor::builder(0).build(),
+            )
+            .expect("register identity reducer")
+            .build();
+        let mut engine = Engine::with_host_functions(catalog);
+        let sort = engine.add_sort("S");
+        engine.close_sorts();
+        let identity = engine.add_op("badIdentity", vec![], sort);
+        engine
+            .bind_host_function(identity, "unify.identity", ResolvedHostHooks::default())
+            .expect("bind identity reducer");
+        let plus = engine.add_op_ac("plus", vec![sort, sort], sort, Some(identity));
+        let ordinary = engine.add_op("ordinary", vec![], sort);
+        let raw = engine.make_acu_preserving_order(plus, Vec::new());
+        let ordinary = engine.make_const(ordinary);
+        engine.set_trace(true);
+        engine.reset_rewrites();
+        (engine, raw, ordinary, calls)
+    }
+
+    fn assert_identity_fault(fault: &ReducerFault) {
+        assert_eq!(fault.key().expect("fault key").as_str(), "unify.identity");
+        assert_eq!(fault.message(), "unification identity fault");
+    }
+
+    fn assert_atomic(engine: &mut Engine) {
+        assert_eq!(engine.rewrites(), 0);
+        assert_eq!(engine.rewrite_breakdown(), (0, 0, 0, 0));
+        assert!(engine.take_trace().is_empty());
+    }
+
+    #[test]
+    fn try_new_rolls_back_raw_identity_reducer_fault() {
+        let (mut engine, raw, ordinary, _) = raw_identity_problem();
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut engine,
+            names: &mut names,
+        };
+        let fault = match UnifyProblem::try_new(
+            &mut env,
+            vec![(raw, ordinary)],
+            Vec::new(),
+            VariableFamily::Unify,
+            "0",
+        ) {
+            Ok(_) => panic!("raw identity normalization unexpectedly succeeded"),
+            Err(fault) => fault,
+        };
+        assert_identity_fault(&fault);
+        assert_atomic(env.e);
+    }
+
+    #[test]
+    fn find_fault_is_terminal_and_repeat_calls_do_not_resume() {
+        let (mut engine, raw, ordinary, calls) = raw_identity_problem();
+        let mut names = TestNames::default();
+        let mut env = UnifyEnv {
+            e: &mut engine,
+            names: &mut names,
+        };
+        let mut problem = UnifyProblem::new(
+            &mut env,
+            vec![(raw, ordinary)],
+            Vec::new(),
+            VariableFamily::Unify,
+            "0",
+        );
+        let calls_after_construction = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let first = problem
+            .try_find_next(&mut env)
+            .expect_err("deferred construction fault must cross the fallible cursor");
+        let second = problem
+            .try_find_next(&mut env)
+            .expect_err("poisoned unification cursor must replay its fault");
+        assert_eq!(first, second);
+        assert_identity_fault(&first);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_construction
+        );
+        assert_atomic(env.e);
     }
 }

@@ -3,14 +3,15 @@
 //! retains modules, commands, source declarations, views, and name indexes for batch or session use.
 
 use std::collections::{HashMap, HashSet};
+use tnk_core::host::HostFunctionCatalog;
 use tnk_frontend::lex::{Interner, tokenize};
-use tnk_frontend::load::{LoadedModule, build_loaded_module_homed};
+use tnk_frontend::load::{LoadedModule, build_loaded_module_homed_with_host_functions};
 use tnk_frontend::surface::ast::{Command, ModuleExpr, PreModule, Source, ViewDecl};
 use tnk_frontend::surface::parser::Parser;
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten_with_homes;
-use crate::view::{ViewDb, validate_view};
+use crate::view::{ViewDb, validate_view_with_host_functions};
 
 /// Flatten an import closure and compile it. Imported statement bubbles that are ambiguous in the
 /// flattened grammar are retried against their home module's grammar. `home_mod` resolves those already
@@ -23,8 +24,27 @@ pub fn flatten_and_build<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     interner: &mut Interner,
 ) -> Result<LoadedModule, String> {
+    flatten_and_build_with_host_functions(
+        name,
+        db,
+        views,
+        home_mod,
+        interner,
+        &HostFunctionCatalog::default(),
+    )
+}
+
+/// Flatten an import closure and compile it against the supplied strict-reducer capability catalog.
+pub fn flatten_and_build_with_host_functions<'m>(
+    name: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<LoadedModule, String> {
     let (flat, homes) = flatten_with_homes(name, db, views, interner)?;
-    build_loaded_module_homed(&flat, &homes, home_mod, interner)
+    build_loaded_module_homed_with_host_functions(&flat, &homes, home_mod, interner, host_functions)
 }
 
 /// A loaded program: the shared interner, one flattened [`LoadedModule`] per parsed module or theory
@@ -102,6 +122,14 @@ pub fn view_dep_names(v: &ViewDecl) -> HashSet<String> {
 /// Parse `src`, flatten every module's import closure, and build each. A module with no imports flattens
 /// to itself, so this loader handles import-free files too.
 pub fn load_program(src: &str) -> Result<Program, String> {
+    load_program_with_host_functions(src, &HostFunctionCatalog::default())
+}
+
+/// Parse, flatten, and build a program against the supplied strict-reducer capability catalog.
+pub fn load_program_with_host_functions(
+    src: &str,
+    host_functions: &HostFunctionCatalog,
+) -> Result<Program, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
     let Source {
@@ -118,7 +146,7 @@ pub fn load_program(src: &str) -> Result<Program, String> {
     // Invalid views abort loading before any module is built.
     let mut views = ViewDb::new();
     for v in pre_views {
-        validate_view(&v, &db, &views, &mut interner)?;
+        validate_view_with_host_functions(&v, &db, &views, &mut interner, host_functions)?;
         views.insert(v);
     }
 
@@ -139,7 +167,14 @@ pub fn load_program(src: &str) -> Result<Program, String> {
             let built = &modules;
             let built_ix = &module_index;
             let home_mod = |n: &str| built_ix.get(n).map(|&ix| &built[ix]);
-            flatten_and_build(name, &db, &views, &home_mod, &mut interner)?
+            flatten_and_build_with_host_functions(
+                name,
+                &db,
+                &views,
+                &home_mod,
+                &mut interner,
+                host_functions,
+            )?
         };
         module_index.insert(name.clone(), idx);
         modules.push(lm);

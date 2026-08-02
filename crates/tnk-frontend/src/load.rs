@@ -13,14 +13,16 @@ use crate::grammar::{Action, GSym, Nt, NtType, Terminal};
 use crate::lex::{Frag, Interner, TokKind, Token, tokenize};
 use crate::oo_complete;
 use crate::pretty::{print_pretty, print_pretty_with_variables, print_term};
-use crate::sig::build_sig::build_module;
+use crate::sig::build_sig::build_module_with_host_functions;
 use crate::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use crate::surface::ast::{Command, Diagnostic, PreModule, SearchArrow, Source, Statement};
 use crate::surface::parser::Parser;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use tnk_core::dag::DagId;
 use tnk_core::engine::MatchedPortion;
+use tnk_core::host::{HostFunctionCatalog, ReducerFault};
 use tnk_core::rewrite::Rewriting;
 use tnk_core::search::{Arrow, Search};
 use tnk_core::smt_search::SmtSearch;
@@ -43,6 +45,31 @@ pub struct LoadedModule {
     pub strategy_grammars: HashMap<String, CompiledGrammar>,
     /// Cached module-wide SMT-rewrite eligibility.
     pub smt_rewrite_valid: bool,
+}
+
+/// Typed failure from the reflected-module build transaction. Ordinary syntax/build diagnostics remain
+/// textual; strict reducer failures preserve the original fault for semantic owners.
+#[derive(Debug)]
+pub enum LoadedModuleBuildError {
+    Invalid(String),
+    Reducer(ReducerFault),
+}
+
+impl fmt::Display for LoadedModuleBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(error) => f.write_str(error),
+            Self::Reducer(fault) => write!(f, "{fault}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadedModuleBuildError {}
+
+impl From<String> for LoadedModuleBuildError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
 }
 
 /// Dense engine-trace slot produced by one source statement. The surrounding `Option` used by the
@@ -76,18 +103,98 @@ pub struct Loaded {
     pub commands: Vec<(usize, Command)>,
 }
 
-/// Build one `PreModule` into a runnable [`LoadedModule`]: signature ([`build_module`]), mixfix grammar
-/// ([`build_grammar`]), and statements (`load_statements`). The module system (`tnk-modules`) supplies a
+/// Build one `PreModule` into a runnable [`LoadedModule`]: signature (`build_module_with_host_functions`),
+/// mixfix grammar (`build_grammar`), and statements (`load_statements`). The module system (`tnk-modules`) supplies a
 /// flattened `PreModule` whose import closure has already been merged, so kernel loading remains
 /// import-independent.
 pub fn build_loaded_module(
     pm: &PreModule,
     interner: &mut Interner,
 ) -> Result<LoadedModule, String> {
-    let mut built = build_module(pm, interner)?;
+    build_loaded_module_with_host_functions(pm, interner, &HostFunctionCatalog::default())
+}
+
+/// Build one import-free module against the supplied immutable strict-reducer capability catalog.
+///
+/// This compatibility boundary renders typed build failures as text.
+pub fn build_loaded_module_with_host_functions(
+    pm: &PreModule,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<LoadedModule, String> {
+    try_build_loaded_module_with_host_functions(pm, interner, host_functions)
+        .map_err(|error| error.to_string())
+}
+
+/// Typed configured module build. Equations and inline statements are installed before host attachment;
+/// identity preparation runs only after attachment commits.
+///
+/// # Errors
+///
+/// Returns [`LoadedModuleBuildError::Invalid`] for syntax, signature, statement, or attachment
+/// diagnostics and [`LoadedModuleBuildError::Reducer`] with the original strict reducer fault when
+/// post-binding identity or trace normalization fails.
+pub fn try_build_loaded_module_with_host_functions(
+    pm: &PreModule,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<LoadedModule, LoadedModuleBuildError> {
+    try_build_loaded_module_with_host_functions_and_inline_statements(
+        pm,
+        interner,
+        host_functions,
+        |_, _| Ok(()),
+    )
+}
+
+/// Build one import-free module while installing already-resolved inline statements after source
+/// statements and before validated strict-reducer attachments are committed.
+///
+/// Reflected modules decode their inline statements only after signature construction. Keeping that
+/// installation inside this build transaction preserves the ordinary attachment validation path while
+/// ensuring a host operator's equation table is complete before its binding seals the top symbol.
+pub fn build_loaded_module_with_host_functions_and_inline_statements<F>(
+    pm: &PreModule,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+    install_inline_statements: F,
+) -> Result<LoadedModule, String>
+where
+    F: FnOnce(&mut BuiltModule, &mut Interner) -> Result<(), String>,
+{
+    try_build_loaded_module_with_host_functions_and_inline_statements(
+        pm,
+        interner,
+        host_functions,
+        |built, interner| {
+            install_inline_statements(built, interner).map_err(LoadedModuleBuildError::Invalid)
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed form of [`build_loaded_module_with_host_functions_and_inline_statements`]. Reflected semantic
+/// owners use this boundary so identity preparation cannot erase a strict reducer fault into text.
+pub fn try_build_loaded_module_with_host_functions_and_inline_statements<F>(
+    pm: &PreModule,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+    install_inline_statements: F,
+) -> Result<LoadedModule, LoadedModuleBuildError>
+where
+    F: FnOnce(&mut BuiltModule, &mut Interner) -> Result<(), LoadedModuleBuildError>,
+{
+    let mut built = build_module_with_host_functions(pm, interner, host_functions)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
-    let diagnostics = load_statements(pm, &mut built, &grammar, interner)?;
+    let diagnostics = load_statements_before_host_bindings(pm, &mut built, &grammar, interner)?;
+    install_inline_statements(&mut built, interner)?;
+    bind_pending_host_functions(&mut built)?;
+    normalize_narrowing_traces(&mut built, interner).map_err(LoadedModuleBuildError::Reducer)?;
+    built
+        .engine
+        .try_prepare_identities()
+        .map_err(LoadedModuleBuildError::Reducer)?;
     let smt_rewrite_valid =
         built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
     Ok(LoadedModule {
@@ -109,7 +216,31 @@ pub fn build_loaded_module_homed<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     interner: &mut Interner,
 ) -> Result<LoadedModule, String> {
-    build_loaded_module_homed_traced(pm, homes, home_mod, interner).map(|(loaded, _)| loaded)
+    build_loaded_module_homed_with_host_functions(
+        pm,
+        homes,
+        home_mod,
+        interner,
+        &HostFunctionCatalog::default(),
+    )
+}
+
+/// Build one flattened module with home-grammar fallback and a strict-reducer capability catalog.
+pub fn build_loaded_module_homed_with_host_functions<'m>(
+    pm: &PreModule,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<LoadedModule, String> {
+    build_loaded_module_homed_traced_with_host_functions(
+        pm,
+        homes,
+        home_mod,
+        interner,
+        host_functions,
+    )
+    .map(|(loaded, _)| loaded)
 }
 
 /// The homed build plus a source-aligned map to dense executable trace vectors. Rejected and non-executable
@@ -121,11 +252,61 @@ pub fn build_loaded_module_homed_traced<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     interner: &mut Interner,
 ) -> Result<(LoadedModule, Vec<Option<StatementTraceRef>>), String> {
-    let mut built = build_module(pm, interner)?;
+    build_loaded_module_homed_traced_with_host_functions(
+        pm,
+        homes,
+        home_mod,
+        interner,
+        &HostFunctionCatalog::default(),
+    )
+}
+
+/// Build one flattened module with statement tracing and a strict-reducer capability catalog.
+///
+/// This compatibility boundary renders typed build failures as text.
+pub fn build_loaded_module_homed_traced_with_host_functions<'m>(
+    pm: &PreModule,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<(LoadedModule, Vec<Option<StatementTraceRef>>), String> {
+    try_build_loaded_module_homed_traced_with_host_functions(
+        pm,
+        homes,
+        home_mod,
+        interner,
+        host_functions,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed homed configured build. Home-grammar statements and all equations are installed before
+/// configured attachments commit; identity and narrowing-trace normalization then run on the sealed
+/// signature.
+///
+/// # Errors
+///
+/// Returns [`LoadedModuleBuildError::Invalid`] for ordinary flatten/build/statement diagnostics and
+/// [`LoadedModuleBuildError::Reducer`] with the original strict reducer fault from post-binding
+/// normalization.
+pub fn try_build_loaded_module_homed_traced_with_host_functions<'m>(
+    pm: &PreModule,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> Result<(LoadedModule, Vec<Option<StatementTraceRef>>), LoadedModuleBuildError> {
+    let mut built = build_module_with_host_functions(pm, interner, host_functions)?;
     let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
     install_identities(&mut built, &grammar, interner)?;
     let (trace_refs, diagnostics) =
         load_statements_homed(pm, &mut built, &grammar, homes, home_mod, interner)?;
+    normalize_narrowing_traces(&mut built, interner).map_err(LoadedModuleBuildError::Reducer)?;
+    built
+        .engine
+        .try_prepare_identities()
+        .map_err(LoadedModuleBuildError::Reducer)?;
     let strategy_grammars = pm
         .strat_defs
         .iter()
@@ -181,7 +362,6 @@ fn install_identities(
             }
         }
     }
-    built.engine.prepare_identities();
     Ok(())
 }
 
@@ -265,6 +445,14 @@ pub fn remap_home_grammar(home: &LoadedModule, flat: &BuiltModule) -> Option<Com
 /// each module **standalone** (no import resolution); a module with `imports` is rejected — use the
 /// `tnk-modules` `load_program`, which flattens first. (Keeps the frontend's own import-free tests here.)
 pub fn load_source(src: &str) -> Result<Loaded, String> {
+    load_source_with_host_functions(src, &HostFunctionCatalog::default())
+}
+
+/// Parse and build import-free source against the supplied strict-reducer capability catalog.
+pub fn load_source_with_host_functions(
+    src: &str,
+    host_functions: &HostFunctionCatalog,
+) -> Result<Loaded, String> {
     let mut interner = Interner::new();
     let toks = tokenize(src, &mut interner);
     // The frontend loader is import-free and view-free (the module system, `tnk-modules`, handles both);
@@ -283,7 +471,11 @@ pub fn load_source(src: &str) -> Result<Loaded, String> {
                 pm.name
             ));
         }
-        modules.push(build_loaded_module(pm, &mut interner)?);
+        modules.push(build_loaded_module_with_host_functions(
+            pm,
+            &mut interner,
+            host_functions,
+        )?);
     }
     Ok(Loaded {
         interner,
@@ -316,16 +508,23 @@ fn statement_line(statement: &Statement) -> Option<u32> {
     .map(|token| token.line)
 }
 
-/// Parse, build, and add each statement bubble using the flattened module's grammar `g`. This direct
-/// entry has no statement-home information; [`build_loaded_module_homed`] adds per-statement home
-/// grammars.
-fn load_statements(
+fn load_statements_before_host_bindings(
     pm: &PreModule,
     m: &mut BuiltModule,
     g: &CompiledGrammar,
     i: &Interner,
 ) -> Result<Vec<Diagnostic>, String> {
-    load_statements_homed(pm, m, g, &[], &|_| None, i).map(|(_, diagnostics)| diagnostics)
+    load_statements_homed_before_host_bindings(pm, m, g, &[], &|_| None, i)
+        .map(|(_, diagnostics)| diagnostics)
+}
+
+fn bind_pending_host_functions(m: &mut BuiltModule) -> Result<(), String> {
+    for binding in std::mem::take(&mut m.pending_host_bindings) {
+        m.engine
+            .bind_host_function(binding.symbol, &binding.key, binding.hooks)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Parse + build + add each statement in its defining module's grammar. Imported statements are parsed
@@ -336,6 +535,19 @@ fn load_statements(
 /// grammar cannot parse the statement. `homes[k]` is the home-module name of `pm.statements[k]` (from
 /// `flatten_with_homes`); `None` or the flattened module's own name selects the flattened grammar directly.
 pub fn load_statements_homed<'m>(
+    pm: &PreModule,
+    m: &mut BuiltModule,
+    g: &CompiledGrammar,
+    homes: &[Option<String>],
+    home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
+    i: &Interner,
+) -> Result<(Vec<Option<StatementTraceRef>>, Vec<Diagnostic>), String> {
+    let result = load_statements_homed_before_host_bindings(pm, m, g, homes, home_mod, i)?;
+    bind_pending_host_functions(m)?;
+    Ok(result)
+}
+
+fn load_statements_homed_before_host_bindings<'m>(
     pm: &PreModule,
     m: &mut BuiltModule,
     g: &CompiledGrammar,
@@ -433,7 +645,12 @@ pub fn load_statements_homed<'m>(
 /// Normalize a symbolic statement term through the kernel's theory canonicalizer, then recover its
 /// pre-normalization variable slots for source-form rendering. `[narrowing]` rules in `show path` use
 /// normalized `Term`s, so AC and ACU arguments follow canonical rather than parser order.
-fn normalize_trace_term(m: &mut BuiltModule, i: &Interner, vars: &VarIndex, term: &Term) -> Term {
+fn normalize_trace_term(
+    m: &mut BuiltModule,
+    i: &Interner,
+    vars: &VarIndex,
+    term: &Term,
+) -> Result<Term, ReducerFault> {
     let bindings: Vec<_> = (0..vars.count())
         .map(|slot| {
             let source = vars.name(slot);
@@ -445,9 +662,71 @@ fn normalize_trace_term(m: &mut BuiltModule, i: &Interner, vars: &VarIndex, term
             m.engine.make_var(vars.sort(slot), name, slot)
         })
         .collect();
-    let dag = m.engine.instantiate_bindings(term, &bindings);
-    let dag = m.engine.normalize_for_unify(dag);
-    term_from_dag_slots(&m.engine, dag)
+    normalize_trace_term_with_bindings(m, term, &bindings)
+}
+
+fn normalize_trace_term_with_bindings(
+    m: &mut BuiltModule,
+    term: &Term,
+    bindings: &[DagId],
+) -> Result<Term, ReducerFault> {
+    let dag = m.engine.instantiate_bindings(term, bindings);
+    let dag = m.engine.try_normalize_for_unify(dag)?;
+    Ok(term_from_dag_slots(&m.engine, dag))
+}
+
+/// Finalize narrowing display traces only after every source and inline equation has been installed and
+/// pending host attachments have committed. Public symbolic normalization therefore seals a complete
+/// signature rather than blocking its first attachment.
+fn normalize_narrowing_traces(
+    m: &mut BuiltModule,
+    interner: &Interner,
+) -> Result<(), ReducerFault> {
+    let pending: Vec<_> = m
+        .rl_traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| trace.narrowing)
+        .map(|(index, trace)| {
+            (
+                index,
+                trace.lhs.clone(),
+                trace.rhs.clone(),
+                trace.var_names.clone(),
+            )
+        })
+        .collect();
+    for (index, lhs, rhs, names) in pending {
+        let mut sorts = Vec::new();
+        collect_term_variable_sorts(&lhs, &mut sorts);
+        collect_term_variable_sorts(&rhs, &mut sorts);
+        let bindings: Vec<_> = sorts
+            .into_iter()
+            .enumerate()
+            .map(|(slot, sort)| {
+                let source = names
+                    .get(slot)
+                    .expect("narrowing trace names cover every variable slot");
+                let base = source
+                    .split_once(':')
+                    .map_or(source.as_str(), |(base, _)| base);
+                let name = interner
+                    .get(base)
+                    .expect("statement variable name was interned by the lexer")
+                    .index();
+                m.engine.make_var(
+                    sort.expect("narrowing trace variable occurs in its lhs or rhs"),
+                    name,
+                    slot as u32,
+                )
+            })
+            .collect();
+        let lhs = normalize_trace_term_with_bindings(m, &lhs, &bindings)?;
+        let rhs = normalize_trace_term_with_bindings(m, &rhs, &bindings)?;
+        m.rl_traces[index].lhs = lhs;
+        m.rl_traces[index].rhs = rhs;
+    }
+    Ok(())
 }
 /// Static AC normalization preserves the source positions of direct variables relative to nonvariables
 /// until a genuine adjacent inversion forces a sort. The runtime DAG canonicalizer always sorts the
@@ -885,14 +1164,7 @@ fn load_one_stmt(
             if *nonexec || lhs_t.top_symbol().is_none() {
                 return Ok(false);
             }
-            let (trace_lhs, trace_rhs) = if *narrowing {
-                (
-                    normalize_trace_term(m, i, &vars, &lhs_t),
-                    normalize_trace_term(m, i, &vars, &rhs_t),
-                )
-            } else {
-                (lhs_t.clone(), rhs_t.clone())
-            };
+            let (trace_lhs, trace_rhs) = (lhs_t.clone(), rhs_t.clone());
             let shared_label = label.as_deref().map(std::rc::Rc::<str>::from);
             let trace = RlTrace {
                 lhs: trace_lhs,
@@ -1670,7 +1942,11 @@ pub fn reduce_command(
     let dag = build_subject_dag(lm, term.tree(), term.tokens(), i);
     lm.built.engine.end_dedup();
     let dag = dag?;
-    let result = lm.built.engine.reduce(dag);
+    let result = lm
+        .built
+        .engine
+        .try_reduce(dag)
+        .map_err(|fault| fault.to_string())?;
     Ok((result, lm.built.engine.rewrites()))
 }
 
@@ -1901,7 +2177,8 @@ pub fn search_command(
     let search = lm
         .built
         .engine
-        .search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32));
+        .try_search(subj, pat, nr, cond, arrow, max_depth.map(|d| d as u32))
+        .map_err(|fault| fault.to_string())?;
     Ok((search, vars))
 }
 
@@ -2315,7 +2592,8 @@ fn narrow_disjunction_command(
                 )
             })
             .collect();
-        let echo_term = normalize_trace_term(&mut lm.built, i, &variables, &source_term);
+        let echo_term = normalize_trace_term(&mut lm.built, i, &variables, &source_term)
+            .map_err(|fault| fault.to_string())?;
         let echo_term = restore_echo_variable_positions(&lm.built, &source_term, echo_term);
         let initial_echo = print_term(&lm.built, i, &echo_term, &echo_variables, false);
         lm.built.engine.begin_dedup();
@@ -2450,7 +2728,9 @@ fn canonicalize_narrow_command_dag(
         .map(|(slot, spec)| Some(engine.make_var(spec.sort, spec.name, slot as u32)))
         .collect();
     let dag = tnk_core::unify::instantiate(engine, &ranked_names, dag).unwrap_or(dag);
-    let dag = engine.normalize_for_unify(dag);
+    let dag = engine
+        .try_normalize_for_unify(dag)
+        .map_err(|fault| fault.to_string())?;
     let variable_order = tnk_core::variant::variables_in_dag(engine, dag);
     if variable_order.len() != specs.len() {
         return Err("narrowing variable table does not match the command term".into());
@@ -2513,7 +2793,11 @@ pub fn match_command(
     );
     lm.built.engine.end_dedup();
     let subj = subj?;
-    let subj = lm.built.engine.reduce(subj);
+    let subj = lm
+        .built
+        .engine
+        .try_reduce(subj)
+        .map_err(|fault| fault.to_string())?;
 
     // Enumerate while the stream borrows the engine, capturing only `DagId`s; render afterwards.
     let mut raws: Vec<RawSolution> = Vec::new();
@@ -2762,7 +3046,8 @@ pub fn unify_command(
         e: &mut lm.built.engine,
         names: &mut names,
     };
-    let problem = UnifyProblem::new(&mut env, equations, specs, VariableFamily::Unify, "0");
+    let problem = UnifyProblem::try_new(&mut env, equations, specs, VariableFamily::Unify, "0")
+        .map_err(|fault| fault.to_string())?;
     let readiness = if !names_ok {
         UnifyReadiness::UnsafeVariableName
     } else if !problem.problem_okay() {
@@ -3136,7 +3421,11 @@ pub fn variant_unify_command(
         );
         lm.built.engine.make_free(pair_symbol, vec![lhs, rhs])
     };
-    let target = lm.built.engine.normalize_for_unify(target);
+    let target = lm
+        .built
+        .engine
+        .try_normalize_for_unify(target)
+        .map_err(|fault| fault.to_string())?;
     let equations = executable_variant_equations(&mut lm.built, i);
     lm.built.engine.reset_rewrites();
     let mut names = InternerNames(i);

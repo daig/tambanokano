@@ -25,7 +25,6 @@ The user-facing contract remains in [`docs/manual.md`](../../manual.md). Issue r
 | ID | Issue | Type | User-facing boundary |
 |---|---|---|---|
 | TNK-DEV-002 | [Phase I-C concurrent runtime](TNK-DEV-002-ic-concurrent-runtime.md) | Feature | Reference §17, §24, Appendix K.1 |
-| TNK-DEV-017 | [Typed Rust reducers and future control extensions](TNK-DEV-017-typed-rust-reducers.md) ([focused Stage 1 design](../strict-rust-reducers-design.md)) | Runtime/API feature | Reference §3.2, §16.1, and Appendix G |
 
 ## Pending decisions
 
@@ -50,6 +49,12 @@ The user-facing contract remains in [`docs/manual.md`](../../manual.md). Issue r
 | TNK-DEV-013 | [Ordinary search tracing](TNK-DEV-013-search-tracing.md) | Tooling | Reference §24 |
 | TNK-DEV-014 | [Unsupported special hooks and LOOP-MODE](TNK-DEV-014-unsupported-hooks.md) | Hook surface | Reference Appendix G/K |
 | TNK-DEV-016 | [Timing measurement](TNK-DEV-016-timing.md) | Presentation/tooling | Reference §24 and Appendix H/K |
+
+## Closed records
+
+| ID | Issue | Type | User-facing boundary |
+|---|---|---|---|
+| TNK-DEV-017 | [Strict Rust reducers and reserved future control extensions](TNK-DEV-017-typed-rust-reducers.md) ([Stage 1 design and acceptance record](../strict-rust-reducers-design.md)) | Runtime/API feature | Reference §3.2, §16.1.1, Appendix G.3, and Appendix I |
 
 ## Explicitly not tracked as intended core work
 

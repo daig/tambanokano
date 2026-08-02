@@ -4,10 +4,13 @@
 //! frozen, object-role, and `special` attributes. Statements remain raw until the module grammar exists.
 
 use crate::lex::{Frag, Interner, Sym, Token, is_punct, split_mixfix};
-use crate::sig::syntax::{BuiltModule, IdentitySpec, OpProfile, SymbolSyntax};
+use crate::sig::syntax::{BuiltModule, IdentitySpec, OpProfile, PendingHostBinding, SymbolSyntax};
 use crate::surface::ast::{Attrs, IdSide, PreModule, SpecialSpec};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tnk_core::engine::Engine;
+use tnk_core::host::{
+    HookSort, HostFunctionCatalog, HostFunctionKey, ResolvedHostHooks, StrictReducerDescriptor,
+};
 use tnk_core::ltl::TemporalHooks;
 use tnk_core::smt::{SmtOp, SmtType};
 use tnk_core::sort::{KindId, SortId};
@@ -207,8 +210,33 @@ fn first_kind_component(inner: &str) -> &str {
     inner
 }
 
+fn strict_eager_source_strategy(raw: &[u32], arity: usize) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    let arguments = if raw.last() == Some(&0) {
+        &raw[..raw.len() - 1]
+    } else {
+        raw
+    };
+    arguments.len() == arity
+        && arguments
+            .iter()
+            .enumerate()
+            .all(|(position, &step)| step as usize == position + 1)
+}
+
 pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
-    let mut engine = Engine::new();
+    build_module_with_host_functions(pm, interner, &HostFunctionCatalog::default())
+}
+
+/// Build a module against an immutable host-function capability catalog.
+pub(crate) fn build_module_with_host_functions(
+    pm: &PreModule,
+    interner: &mut Interner,
+    host_functions: &HostFunctionCatalog,
+) -> R<BuiltModule> {
+    let mut engine = Engine::with_host_functions(host_functions.clone());
     let mut sorts: HashMap<String, SortId> = HashMap::new();
 
     // 1. Sorts + subsorts, then close.
@@ -248,6 +276,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // source index, so it is pre-sized and each declaration stores at its own index (the loop below may
     // visit the entries out of source order — constants first, see next).
     let mut op_syms: Vec<Vec<SymbolId>> = vec![Vec::new(); pm.ops.len()];
+    let mut decl_profiles: Vec<Vec<OpProfile>> = vec![Vec::new(); pm.ops.len()];
     // Identity bubbles are parsed only after the per-module grammar exists.
     let mut identity_specs: Vec<IdentitySpec> = Vec::new();
     // Structural constructor axioms belong to each source overload, while the kernel executes one
@@ -420,11 +449,13 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
                 );
                 sym
             };
-            op_profiles.push(OpProfile {
+            let op_profile = OpProfile {
                 symbol: sym,
                 domain: domain.clone(),
                 range,
-            });
+            };
+            op_profiles.push(op_profile.clone());
+            decl_profiles[idx].push(op_profile);
             if effective.identity
                 && let Some(tokens) = &od.attrs.id
                 && !identity_specs.iter().any(|spec| spec.symbol == sym)
@@ -519,12 +550,115 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
     // by spec shape, not declaration position) so all sharers can clone it (see the `MetaLevelOpSymbol` arm).
     let canonical_meta =
         find_canonical_meta_hooks(pm, &sym_by_profile, &sorts, engine.sorts(), interner);
+
+    // `ditto` inherits from the preceding source declaration in the same overload family. A family is
+    // identified before kernel folding (canonical name + arity): disconnected kinds therefore still see
+    // the attachment they inherit, while a declaration with no source to inherit from is rejected instead
+    // of silently becoming an ordinary operator.
+    let mut attr_source_by_group: HashMap<(String, usize), usize> = HashMap::new();
+    let mut attr_sources = Vec::with_capacity(pm.ops.len());
     for (idx, od) in pm.ops.iter().enumerate() {
-        if od.attrs.ditto {
-            continue; // attributes inherited from the prior declaration (shared symbol)
-        }
+        let name = canonical_name(&od.name, interner);
+        let group = (name.clone(), od.domain.len());
+        let source = if od.attrs.ditto {
+            attr_source_by_group.get(&group).copied().ok_or_else(|| {
+                format!(
+                    "operator `{name}` uses `ditto` without a preceding declaration of the same arity"
+                )
+            })?
+        } else {
+            idx
+        };
+        attr_source_by_group.insert(group, source);
+        attr_sources.push(source);
+    }
+
+    let mut pending_host_bindings: Vec<PendingHostBinding> = Vec::new();
+    let mut host_binding_index = HashMap::new();
+    let mut host_key_by_group: HashMap<(String, usize), String> = HashMap::new();
+    let mut unattached_host_groups = HashSet::new();
+    for (idx, od) in pm.ops.iter().enumerate() {
+        let attrs = &pm.ops[attr_sources[idx]].attrs;
+        let name = canonical_name(&od.name, interner);
         let arity = od.domain.len();
-        let mut special = match &od.attrs.special {
+        let host_group = (name.clone(), arity);
+        let host_attachment = match attrs
+            .special
+            .as_ref()
+            .and_then(|spec| spec.id_hook.as_ref().map(|hook| (spec, hook)))
+        {
+            Some((spec, (class, data))) if class == "HostFunctionSymbol" => {
+                if data.len() != 1 {
+                    return Err(format!(
+                        "strict host operator `{}` requires exactly one HostFunctionSymbol \
+                         capability key",
+                        name
+                    ));
+                }
+                if attrs.poly.is_some() || op_syms[idx].len() != 1 {
+                    return Err(format!(
+                        "strict host operator `{}` cannot use a polymorphic declaration",
+                        name
+                    ));
+                }
+                let profile = decl_profiles[idx]
+                    .first()
+                    .ok_or_else(|| "missing strict host operator profile".to_string())?;
+                if let Some(raw) = &attrs.strat
+                    && !strict_eager_source_strategy(raw, arity)
+                {
+                    return Err(format!(
+                        "strict host operator `{}` must use argument order 1 through {arity} \
+                         followed by at most one final top attempt",
+                        name
+                    ));
+                }
+                let hooks = resolve_host_attachment(
+                    spec,
+                    &data[0],
+                    profile,
+                    host_functions,
+                    &sym_by_profile,
+                    &sorts,
+                    engine.sorts(),
+                    interner,
+                )
+                .map_err(|error| format!("strict host operator `{}`: {error}", name))?;
+                Some((data[0].clone(), hooks))
+            }
+            _ => None,
+        };
+        match &host_attachment {
+            Some((key, _)) => {
+                if unattached_host_groups.contains(&host_group) {
+                    return Err(format!(
+                        "strict host operator `{name}` is merged with a declaration that has no matching \
+                         HostFunctionSymbol attachment"
+                    ));
+                }
+                match host_key_by_group.get(&host_group) {
+                    Some(previous) if previous != key => {
+                        return Err(format!(
+                            "strict host operator `{name}` has inconsistent overload bindings"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        host_key_by_group.insert(host_group.clone(), key.clone());
+                    }
+                }
+            }
+            None => {
+                if host_key_by_group.contains_key(&host_group) {
+                    return Err(format!(
+                        "strict host operator `{name}` is merged with a declaration that has no matching \
+                         HostFunctionSymbol attachment"
+                    ));
+                }
+                unattached_host_groups.insert(host_group);
+            }
+        }
+        let mut special = match &attrs.special {
             Some(spec) => special_op(
                 spec,
                 arity,
@@ -547,7 +681,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         // META-TERM's `<Qids> : -> Sort/Kind/Constant/Variable` declarations record the quoted-identifier
         // classification sorts, so a `Qid` constant's least sort becomes text-dependent (a `'NzNat` is a
         // `Sort`, `'0.Zero` a `Constant`, …) — needed for the meta-representation to be well-sorted.
-        if let Some(spec) = &od.attrs.special
+        if let Some(spec) = &attrs.special
             && let Some((class, data)) = &spec.id_hook
             && class == "QuotedIdentifierSymbol"
         {
@@ -557,7 +691,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         // Marker-only built-ins must remain distinguishable from ordinary symbols for `.=.` stability:
         // built-in successors stay unreduced, while user-defined iteration operators may decompose.
         let marker = matches!(
-            od.attrs.special.as_ref().and_then(|s| s.id_hook.as_ref()),
+            attrs.special.as_ref().and_then(|s| s.id_hook.as_ref()),
             Some((class, _))
                 if matches!(
                     class.as_str(),
@@ -569,29 +703,47 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
             if marker {
                 engine.set_symbol_class(sym, tnk_core::symbol::SymbolClass::Marker);
             }
-            if let Some(strat) = &od.attrs.strat {
+            if let Some(strat) = &attrs.strat {
                 engine.set_strategy(sym, strat);
             }
-            if let Some(frozen) = &od.attrs.frozen {
+            if let Some(frozen) = &attrs.frozen {
                 // An invalid `frozen` attribute is ignored atomically; diagnostics are emitted at the
                 // frontend/session boundary.
                 let _ = engine.set_frozen(sym, frozen);
             }
             // Store CONFIG/OBJECT/MESSAGE/PORTAL roles on the kernel symbol. They are metadata for
             // ordinary rewriting and drive object/message partitioning in `erewrite`.
-            if od.attrs.config || od.attrs.object || od.attrs.message || od.attrs.portal {
-                engine.set_oo_flags(
-                    sym,
-                    od.attrs.config,
-                    od.attrs.object,
-                    od.attrs.message,
-                    od.attrs.portal,
-                );
+            if attrs.config || attrs.object || attrs.message || attrs.portal {
+                engine.set_oo_flags(sym, attrs.config, attrs.object, attrs.message, attrs.portal);
             }
             if let Some(op) = &special {
                 engine.set_special(sym, op.clone());
                 if let SpecialOp::Smt { op } = op {
                     engine.register_smt_operator(sym, *op);
+                }
+            }
+            if let Some((key, hooks)) = &host_attachment {
+                engine
+                    .validate_host_function_binding(sym, key, hooks)
+                    .map_err(|error| format!("strict host operator `{}`: {error}", name))?;
+                match host_binding_index.get(&sym).copied() {
+                    Some(binding_index) => {
+                        let previous: &PendingHostBinding = &pending_host_bindings[binding_index];
+                        if previous.key != *key || previous.hooks != *hooks {
+                            return Err(format!(
+                                "strict host operator `{}` has inconsistent overload bindings",
+                                canonical_name(&od.name, interner)
+                            ));
+                        }
+                    }
+                    None => {
+                        host_binding_index.insert(sym, pending_host_bindings.len());
+                        pending_host_bindings.push(PendingHostBinding {
+                            symbol: sym,
+                            key: key.clone(),
+                            hooks: hooks.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -633,6 +785,7 @@ pub fn build_module(pm: &PreModule, interner: &mut Interner) -> R<BuiltModule> {
         vars,
         statements: Vec::new(), // loaded separately after the module grammar is available
         eq_traces: Vec::new(),  // populated with source-form trace metadata by load_statements
+        pending_host_bindings,
         mb_traces: Vec::new(),
         rl_traces: Vec::new(),
         oo_completion_diagnostics: Vec::new(),
@@ -761,6 +914,132 @@ fn term_hook_sym(
 ) -> Option<SymbolId> {
     let (_, term) = spec.term_hooks.iter().find(|(p, _)| p == purpose)?;
     name_to_sym.get(i.resolve(term.first()?.sym)).copied()
+}
+#[allow(clippy::too_many_arguments)]
+fn resolve_host_attachment(
+    spec: &SpecialSpec,
+    key_text: &str,
+    host_profile: &OpProfile,
+    host_functions: &HostFunctionCatalog,
+    sym_by_profile: &HashMap<(String, Vec<KindId>, KindId), SymbolId>,
+    sorts: &HashMap<String, SortId>,
+    sort_table: &tnk_core::sort::Sorts,
+    interner: &Interner,
+) -> R<ResolvedHostHooks> {
+    let key = HostFunctionKey::parse(key_text)
+        .map_err(|error| format!("invalid HostFunctionSymbol key `{key_text}`: {error}"))?;
+    let descriptor = host_functions
+        .descriptor_for(&key)
+        .ok_or_else(|| format!("missing host capability `{key}`"))?;
+    if host_profile.domain.len() != descriptor.arity() {
+        return Err(format!(
+            "HostFunctionSymbol `{key}` requires arity {}, found {}",
+            descriptor.arity(),
+            host_profile.domain.len()
+        ));
+    }
+    validate_host_hook_purposes(spec, descriptor, &key)?;
+
+    let mut hooks = ResolvedHostHooks::builder();
+    for requirement in descriptor.required_op_hooks() {
+        let (_, signature) = spec
+            .op_hooks
+            .iter()
+            .find(|(purpose, _)| purpose == requirement.purpose())
+            .ok_or_else(|| {
+                format!(
+                    "HostFunctionSymbol `{key}` missing op-hook `{}`",
+                    requirement.purpose()
+                )
+            })?;
+        let symbol = resolve_op_hook_sig(signature, sym_by_profile, sorts, sort_table, interner)
+            .ok_or_else(|| {
+                format!(
+                    "HostFunctionSymbol `{key}` cannot resolve op-hook `{}`",
+                    requirement.purpose()
+                )
+            })?;
+        hooks = hooks.op(requirement.purpose(), symbol);
+    }
+    for requirement in descriptor.required_term_hooks() {
+        let (_, term) = spec
+            .term_hooks
+            .iter()
+            .find(|(purpose, _)| purpose == requirement.purpose())
+            .ok_or_else(|| {
+                format!(
+                    "HostFunctionSymbol `{key}` missing term-hook `{}`",
+                    requirement.purpose()
+                )
+            })?;
+        let expected_sort = match requirement.sort() {
+            HookSort::Argument(position) => host_profile.domain[position],
+            HookSort::Result => host_profile.range,
+        };
+        let expected_kind = sort_table.kind_of(expected_sort);
+        let term = strip_outer_parens(term, interner);
+        if term.is_empty() {
+            return Err(format!(
+                "HostFunctionSymbol `{key}` term-hook `{}` is empty",
+                requirement.purpose()
+            ));
+        }
+        let name = canonical_name(term, interner);
+        let symbol = sym_by_profile
+            .get(&(name, Vec::new(), expected_kind))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "HostFunctionSymbol `{key}` term-hook `{}` must resolve to a constant in the expected kind",
+                    requirement.purpose()
+                )
+            })?;
+        hooks = hooks.constant_term(requirement.purpose(), symbol);
+    }
+    hooks.build().map_err(|error| error.to_string())
+}
+
+fn validate_host_hook_purposes(
+    spec: &SpecialSpec,
+    descriptor: &StrictReducerDescriptor,
+    key: &HostFunctionKey,
+) -> R<()> {
+    let required_ops: HashSet<&str> = descriptor
+        .required_op_hooks()
+        .iter()
+        .map(|requirement| requirement.purpose())
+        .collect();
+    let required_terms: HashSet<&str> = descriptor
+        .required_term_hooks()
+        .iter()
+        .map(|requirement| requirement.purpose())
+        .collect();
+    let mut seen = HashSet::new();
+    for (purpose, _) in &spec.op_hooks {
+        if !seen.insert(purpose.as_str()) {
+            return Err(format!(
+                "HostFunctionSymbol `{key}` repeats hook purpose `{purpose}`"
+            ));
+        }
+        if !required_ops.contains(purpose.as_str()) {
+            return Err(format!(
+                "HostFunctionSymbol `{key}` has unexpected op-hook `{purpose}`"
+            ));
+        }
+    }
+    for (purpose, _) in &spec.term_hooks {
+        if !seen.insert(purpose.as_str()) {
+            return Err(format!(
+                "HostFunctionSymbol `{key}` repeats hook purpose `{purpose}`"
+            ));
+        }
+        if !required_terms.contains(purpose.as_str()) {
+            return Err(format!(
+                "HostFunctionSymbol `{key}` has unexpected term-hook `{purpose}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn nat_hooks(
@@ -1266,14 +1545,97 @@ fn resolve_op_hook_sig(
     let colon = texts.iter().position(|&t| t == ":")?;
     let arrow = texts.iter().position(|&t| t == "~>" || t == "->")?;
     let name = canonical_name(&sig[..colon], i);
-    let kind_of_sort = |s: &str| sorts.get(s).map(|&sid| sort_table.kind_of(sid));
-    let dom_kinds: Vec<KindId> = texts[colon + 1..arrow]
-        .iter()
-        .map(|s| kind_of_sort(s))
-        .collect::<Option<_>>()?;
-    let range = texts.get(arrow + 1)?;
-    let range_kind = kind_of_sort(range)?;
+    let domain = resolve_hook_sort_sequence(&sig[colon + 1..arrow], sorts, i)?;
+    let dom_kinds = domain
+        .into_iter()
+        .map(|sort| sort_table.kind_of(sort))
+        .collect();
+    let range_tokens = sig.get(arrow + 1..)?;
+    let range_end = hook_type_end(range_tokens, 0, range_tokens.len(), i)?;
+    let range_name = canonical_name(&range_tokens[..range_end], i);
+    let range_kind = sort_table.kind_of(*sorts.get(&range_name)?);
     sym_by_profile.get(&(name, dom_kinds, range_kind)).copied()
+}
+
+fn hook_type_end(
+    tokens: &[crate::lex::Token],
+    start: usize,
+    limit: usize,
+    interner: &Interner,
+) -> Option<usize> {
+    if start >= limit {
+        return None;
+    }
+    let text = |index: usize| interner.resolve(tokens[index].sym);
+    let mut index = start;
+    if text(index) == "[" {
+        let mut depth = 0i32;
+        while index < limit {
+            match text(index) {
+                "[" => depth += 1,
+                "]" => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        return None;
+    }
+
+    index += 1;
+    while index < limit && text(index) == "{" {
+        let mut depth = 0i32;
+        while index < limit {
+            match text(index) {
+                "{" => depth += 1,
+                "}" => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+    }
+    Some(index)
+}
+
+fn resolve_hook_sort_sequence(
+    tokens: &[crate::lex::Token],
+    sorts: &HashMap<String, SortId>,
+    interner: &Interner,
+) -> Option<Vec<SortId>> {
+    fn resolve_from(
+        start: usize,
+        tokens: &[crate::lex::Token],
+        sorts: &HashMap<String, SortId>,
+        interner: &Interner,
+        resolved: &mut Vec<SortId>,
+    ) -> bool {
+        if start == tokens.len() {
+            return true;
+        }
+        for end in (start + 1..=tokens.len()).rev() {
+            let name = canonical_name(&tokens[start..end], interner);
+            let Some(&sort) = sorts.get(&name) else {
+                continue;
+            };
+            resolved.push(sort);
+            if resolve_from(end, tokens, sorts, interner, resolved) {
+                return true;
+            }
+            resolved.pop();
+        }
+        false
+    }
+
+    let mut resolved = Vec::new();
+    resolve_from(0, tokens, sorts, interner, &mut resolved).then_some(resolved)
 }
 
 fn num_op(code: &str) -> R<NumOp> {

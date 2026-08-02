@@ -1,8 +1,8 @@
 //! `tnk-core` — the tambanokano kernel.
 //!
 //! Term/DAG representation, garbage-collected node arena, order-sorted type
-//! system, equational theories, and equational reduction, plus the higher
-//! rewriting/search/symbolic layers built on that foundation.
+//! system, equational theories and reduction, strict host-provided Rust reducers,
+//! plus the higher rewriting/search/symbolic layers built on that foundation.
 //!
 //! Design defaults used throughout the crate:
 //! - instance-based [`engine::Engine`] (no global state); ids are engine-relative
@@ -16,6 +16,7 @@ pub mod descent;
 pub mod engine;
 pub mod external;
 pub mod fresh;
+pub mod host;
 pub mod id;
 pub mod ltl;
 pub mod root;

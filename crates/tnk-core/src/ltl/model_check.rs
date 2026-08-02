@@ -5,6 +5,7 @@ use super::nat_set::NatSet;
 use crate::dag::{DagId, NaValue};
 use crate::descent::DescentOps;
 use crate::engine::{ModelCheckStats, Runtime, Signature};
+use crate::host::ReducerFault;
 use crate::root::RootGuard;
 use crate::search::{GraphContext, RawSuccessors, StateGraph};
 use crate::symbol::ModelCheckerHooks;
@@ -72,7 +73,7 @@ struct ActiveGraphContext<'runtime, 'signature, 'descent> {
 }
 
 impl GraphContext for ActiveGraphContext<'_, '_, '_> {
-    fn graph_state_successors(&mut self, root: DagId) -> RawSuccessors {
+    fn graph_state_successors(&mut self, root: DagId) -> Result<RawSuccessors, ReducerFault> {
         self.runtime.state_successors_deferred(self.signature, root)
     }
 
@@ -80,7 +81,7 @@ impl GraphContext for ActiveGraphContext<'_, '_, '_> {
         self.runtime.add_rewrites(rewrites);
     }
 
-    fn graph_reduce_successor(&mut self, successor: DagId) -> DagId {
+    fn graph_reduce_successor(&mut self, successor: DagId) -> Result<DagId, ReducerFault> {
         self.runtime
             .reduce_graph_successor(self.signature, successor, self.descent)
     }
@@ -108,10 +109,14 @@ struct RewriteSystem<'runtime, 'signature, 'descent, 'formula, 'hooks> {
     formula: &'formula BuiltFormula,
     hooks: &'hooks ModelCheckerHooks,
     deadlocks: BTreeSet<usize>,
+    fault: Option<ReducerFault>,
 }
 
 impl System for RewriteSystem<'_, '_, '_, '_, '_> {
     fn get_next_state(&mut self, state: usize, transition: usize) -> Option<usize> {
+        if self.fault.is_some() {
+            return None;
+        }
         let successor = {
             let mut context = ActiveGraphContext {
                 runtime: &mut *self.runtime,
@@ -120,8 +125,13 @@ impl System for RewriteSystem<'_, '_, '_, '_, '_> {
             };
             self.graph.get_next_state(&mut context, state, transition)
         };
-        if let Some(successor) = successor {
-            return Some(successor.state);
+        match successor {
+            Ok(Some(successor)) => return Some(successor.state),
+            Ok(None) => {}
+            Err(fault) => {
+                self.fault = Some(fault);
+                return None;
+            }
         }
         if transition == 0
             && self
@@ -136,6 +146,9 @@ impl System for RewriteSystem<'_, '_, '_, '_, '_> {
     }
 
     fn check_proposition(&mut self, state: usize, proposition: usize) -> bool {
+        if self.fault.is_some() {
+            return false;
+        }
         let state = self.graph.state_dag(state).expect("checker state exists");
         let proposition = self.formula.proposition(proposition);
         let test = self.runtime.make_free(
@@ -143,10 +156,16 @@ impl System for RewriteSystem<'_, '_, '_, '_, '_> {
             self.hooks.satisfies_symbol,
             vec![state, proposition],
         );
-        let result = self
+        match self
             .runtime
-            .reduce(self.signature, test, &mut *self.descent);
-        self.runtime.node(result).symbol() == self.hooks.true_term
+            .reduce(self.signature, test, &mut *self.descent)
+        {
+            Ok(result) => self.runtime.node(result).symbol() == self.hooks.true_term,
+            Err(fault) => {
+                self.fault = Some(fault);
+                false
+            }
+        }
     }
 }
 
@@ -248,7 +267,7 @@ pub(crate) fn check_rewrite_system(
     // both charges its equational rewrites and converts the formula to negative normal form.
     let initial_root = runtime.root(*initial);
     let negated = runtime.make_free(signature, hooks.temporal.not_symbol, vec![*property]);
-    let negated = runtime.reduce(signature, negated, descent);
+    let negated = runtime.reduce_or_defer_fault(signature, negated, descent);
     let formula = build_formula(&*runtime, &hooks.temporal, negated)?;
     let bdd = BddContext::new(formula.propositions_len());
     let graph = StateGraph::new(initial_root, *initial);
@@ -260,11 +279,16 @@ pub(crate) fn check_rewrite_system(
         formula: &formula,
         hooks,
         deadlocks: BTreeSet::new(),
+        fault: None,
     };
     let mut checker = ModelChecker::new(&mut system, &bdd, &formula.formula, formula.root);
     let property_automaton_states = checker.property_state_count();
     let counterexample = checker.find_counterexample();
     drop(checker);
+    if let Some(fault) = system.fault.take() {
+        system.runtime.defer_reducer_fault(fault);
+        return None;
+    }
     let examined_system_states = system.graph.len();
     system.runtime.record_model_check_stats(ModelCheckStats {
         property_automaton_states,
@@ -654,5 +678,120 @@ mod tests {
                 examined_system_states: 1,
             }]
         );
+    }
+    #[test]
+    fn production_proposition_fault_is_atomic_and_prevents_equation_fallback() {
+        use crate::engine::Engine;
+        use crate::host::{
+            HostFunctionCatalog, ReducerFault, ResolvedHostHooks, StrictCall, StrictOutcome,
+            StrictReduceCtx, StrictReducer, StrictReducerDescriptor,
+        };
+        use crate::symbol::{ModelCheckerHooks, SpecialOp};
+        use crate::term::{Equation, Term};
+        use std::rc::Rc;
+
+        struct Fault;
+
+        impl StrictReducer for Fault {
+            fn reduce<'ctx>(
+                &self,
+                _ctx: &mut StrictReduceCtx<'ctx>,
+                _call: StrictCall<'ctx>,
+            ) -> Result<StrictOutcome<'ctx>, ReducerFault> {
+                Err(ReducerFault::new("proposition reducer fault"))
+            }
+        }
+
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "model.proposition",
+                Fault,
+                StrictReducerDescriptor::builder(2).build(),
+            )
+            .expect("register proposition reducer")
+            .build();
+        let mut engine = Engine::with_host_functions(catalog);
+        let any = engine.add_sort("Any");
+        engine.close_sorts();
+
+        let state = engine.add_op("state", vec![], any);
+        let formula_true = engine.add_op("True", vec![], any);
+        let formula_false = engine.add_op("False", vec![], any);
+        let not = engine.add_op("not", vec![any], any);
+        let next = engine.add_op("next", vec![any], any);
+        let and = engine.add_op("and", vec![any, any], any);
+        let or = engine.add_op("or", vec![any, any], any);
+        let until = engine.add_op("until", vec![any, any], any);
+        let release = engine.add_op("release", vec![any, any], any);
+        let satisfies = engine.add_op("satisfies", vec![any, any], any);
+        let qid = engine.add_op("qid", vec![], any);
+        let unlabeled = engine.add_op("unlabeled", vec![], any);
+        let deadlock = engine.add_op("deadlock", vec![], any);
+        let transition = engine.add_op("transition", vec![any, any], any);
+        let nil = engine.add_op("nil", vec![], any);
+        let transition_list = engine.add_op_au("list", vec![any, any], any, Some(nil));
+        let counterexample = engine.add_op("counterexample", vec![any, any], any);
+        let bool_true = engine.add_op("true", vec![], any);
+        let model_check = engine.add_op("modelCheck", vec![any, any], any);
+
+        engine.add_equation(Equation {
+            lhs: Term::op(satisfies, vec![Term::constant(state), Term::constant(qid)]),
+            rhs: Term::constant(bool_true),
+            nr_vars: 0,
+        });
+        engine.add_labelled_rule(
+            Term::constant(state),
+            Term::constant(state),
+            0,
+            Some(Rc::from("loop")),
+        );
+        engine
+            .bind_host_function(satisfies, "model.proposition", ResolvedHostHooks::default())
+            .expect("bind proposition reducer");
+        engine.set_special(
+            model_check,
+            SpecialOp::ModelCheck {
+                hooks: Rc::new(ModelCheckerHooks {
+                    temporal: crate::ltl::TemporalHooks {
+                        true_symbol: formula_true,
+                        false_symbol: formula_false,
+                        not_symbol: not,
+                        next_symbol: next,
+                        and_symbol: and,
+                        or_symbol: or,
+                        until_symbol: until,
+                        release_symbol: release,
+                    },
+                    satisfies_symbol: satisfies,
+                    qid_symbol: qid,
+                    unlabeled_symbol: unlabeled,
+                    deadlock_symbol: deadlock,
+                    transition_symbol: transition,
+                    transition_list_symbol: transition_list,
+                    nil_transition_list_symbol: nil,
+                    counterexample_symbol: counterexample,
+                    true_term: bool_true,
+                }),
+            },
+        );
+
+        let initial = engine.make_const(state);
+        let property = engine.make_const(qid);
+        let redex = engine.make_free(model_check, vec![initial, property]);
+        engine.set_trace(true);
+        engine.reset_rewrites();
+        let fault = engine
+            .try_reduce(redex)
+            .expect_err("proposition reducer fault must abort model checking");
+        assert_eq!(
+            fault.key().expect("fault key").as_str(),
+            "model.proposition"
+        );
+        assert_eq!(fault.message(), "proposition reducer fault");
+        assert_eq!(engine.rewrites(), 0);
+        assert_eq!(engine.rewrite_breakdown(), (0, 0, 0, 0));
+        assert!(engine.take_trace().is_empty());
+        assert!(engine.take_model_check_stats().is_empty());
+        assert_eq!(engine.node(redex).symbol(), model_check);
     }
 }

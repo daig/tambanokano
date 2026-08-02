@@ -7,8 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use tnk_core::sort::SortId;
 use tnk_frontend::lex::{Interner, Token};
-use tnk_frontend::load::{build_loaded_module, build_logic_command_parses};
-use tnk_frontend::sig::build_sig::build_module;
+use tnk_frontend::load::{build_loaded_module_with_host_functions, build_logic_command_parses};
 use tnk_frontend::sig::syntax::{BuiltModule, OpProfile};
 use tnk_frontend::surface::ast::{ModuleExpr, OpMap, VarDecl, ViewDecl};
 
@@ -216,6 +215,23 @@ pub fn validate_view(
     views: &ViewDb,
     interner: &mut Interner,
 ) -> Result<(), String> {
+    validate_view_with_host_functions(
+        v,
+        db,
+        views,
+        interner,
+        &tnk_core::host::HostFunctionCatalog::default(),
+    )
+}
+
+/// Validate a view while resolving any strict host attachments against `host_functions`.
+pub fn validate_view_with_host_functions(
+    v: &ViewDecl,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+    host_functions: &tnk_core::host::HostFunctionCatalog,
+) -> Result<(), String> {
     let from_name = expr_base_name(&v.from)?;
     let to_name = expr_base_name(&v.to)?;
 
@@ -279,8 +295,9 @@ pub fn validate_view(
         sort_image.insert(source.clone(), target.to_string());
     }
 
-    let source = build_module(&from_flat, interner)?;
-    let target = build_module(&to_flat, interner)?;
+    let source =
+        build_loaded_module_with_host_functions(&from_flat, interner, host_functions)?.built;
+    let target = build_loaded_module_with_host_functions(&to_flat, interner, host_functions)?.built;
 
     // A sort map is a homomorphism of the order-sorted signature: connected source sorts stay connected.
     for (index, left_name) in from_flat.sorts.iter().enumerate() {
@@ -338,7 +355,11 @@ pub fn validate_view(
                 sort: target_sort.clone(),
             });
         }
-        Some(build_loaded_module(&term_pm, interner)?)
+        Some(build_loaded_module_with_host_functions(
+            &term_pm,
+            interner,
+            host_functions,
+        )?)
     } else {
         None
     };

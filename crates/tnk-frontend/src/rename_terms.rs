@@ -15,7 +15,7 @@ use crate::cfparser::{ParseEffort, earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt};
 use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
-use crate::sig::build_sig::build_module;
+use crate::sig::build_sig::{build_module, canonical_name};
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,24 @@ pub struct OpRenamer {
     /// disambiguating **arity** (`Some(2)` for `op f : A B -> C to g`; `None` renames every overload) with
     /// the target op's literal fragment texts, in order (`_;_` → `[";"]`, `none` → `["none"]`).
     targets: RenameTargets,
+}
+
+fn build_syntax_module(pm: &PreModule, interner: &mut Interner) -> Result<BuiltModule, String> {
+    let mut syntax = pm.clone();
+    for operator in &mut syntax.ops {
+        let is_host = operator
+            .attrs
+            .special
+            .as_ref()
+            .and_then(|special| special.id_hook.as_ref())
+            .is_some_and(|(class, _)| class == "HostFunctionSymbol");
+        if is_host {
+            // Renaming needs only the pre-transform grammar. Capability validation and attachment happen
+            // once, when the transformed module is built for execution.
+            operator.attrs.special = None;
+        }
+    }
+    build_module(&syntax, interner)
 }
 
 impl OpRenamer {
@@ -54,7 +72,7 @@ impl OpRenamer {
                 .or_default()
                 .push((*arity, literal_frags(to, interner)));
         }
-        let built = build_module(pm, interner)?;
+        let built = build_syntax_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
         Ok(Some(Self {
             built,
@@ -194,6 +212,105 @@ pub struct ViewOpMap {
     pub target: ReconTarget,
 }
 
+/// Rewrite the referenced operator at the head of an `op-hook` signature. Signature-qualified maps
+/// compare complete structured sort/kind names; both source arrows accepted by the surface syntax are
+/// recognized. Operator-to-term maps cannot name an operator hook and are deliberately left unchanged
+/// for binding validation to reject.
+pub fn rewrite_op_hook_signature(
+    signature: &[Token],
+    maps: &[ViewOpMap],
+    interner: &mut Interner,
+) -> Vec<Token> {
+    let Some((name, domain, range, colon)) = hook_signature_parts(signature, interner) else {
+        return signature.to_vec();
+    };
+    let Some(map) = maps.iter().find(|map| {
+        map.source == name
+            && map
+                .dom_range
+                .as_ref()
+                .is_none_or(|(expected_domain, expected_range)| {
+                    expected_domain == &domain && expected_range == &range
+                })
+    }) else {
+        return signature.to_vec();
+    };
+    let ReconTarget::Op(target) = &map.target else {
+        return signature.to_vec();
+    };
+    let mut rewritten = crate::lex::tokenize(target, interner);
+    rewritten.extend_from_slice(&signature[colon..]);
+    rewritten
+}
+
+fn hook_signature_parts(
+    signature: &[Token],
+    interner: &Interner,
+) -> Option<(String, Vec<String>, String, usize)> {
+    let text = |token: &Token| interner.resolve(token.sym);
+    let colon = signature.iter().position(|token| text(token) == ":")?;
+    let arrow = signature
+        .iter()
+        .enumerate()
+        .skip(colon + 1)
+        .find_map(|(index, token)| matches!(text(token), "->" | "~>").then_some(index))?;
+    let join = |tokens: &[Token]| tokens.iter().map(&text).collect::<String>();
+    let consume_type = |start: usize, limit: usize| -> Option<usize> {
+        if start >= limit {
+            return None;
+        }
+        let mut index = start;
+        if text(&signature[index]) == "[" {
+            let mut depth = 0i32;
+            while index < limit {
+                match text(&signature[index]) {
+                    "[" => depth += 1,
+                    "]" => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            (depth == 0).then_some(index)
+        } else {
+            index += 1;
+            while index < limit && text(&signature[index]) == "{" {
+                let mut depth = 0i32;
+                while index < limit {
+                    match text(&signature[index]) {
+                        "{" => depth += 1,
+                        "}" => depth -= 1,
+                        _ => {}
+                    }
+                    index += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                if depth != 0 {
+                    return None;
+                }
+            }
+            Some(index)
+        }
+    };
+
+    let name = canonical_name(&signature[..colon], interner);
+    let range_start = arrow + 1;
+    let range_end = consume_type(range_start, signature.len())?;
+    let range = join(&signature[range_start..range_end]);
+    let mut domain = Vec::new();
+    let mut index = colon + 1;
+    while index < arrow {
+        let start = index;
+        index = consume_type(start, arrow)?;
+        domain.push(join(&signature[start..index]));
+    }
+    Some((name, domain, range, colon))
+}
+
 #[derive(Clone)]
 struct LexicalFallback {
     source: Vec<Frag>,
@@ -224,7 +341,7 @@ impl ViewOpSubst {
         if maps.is_empty() {
             return Ok(None);
         }
-        let built = build_module(pm, interner)?;
+        let built = build_syntax_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
         let mut symbol_targets = HashMap::new();
         let mut name_targets = HashMap::new();

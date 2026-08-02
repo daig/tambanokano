@@ -457,7 +457,31 @@ if eval.exit {
 println!("{}", eval.output);
 ```
 
-`Eval { output, exit }` is synchronous presentation output, not a typed semantic result stream. There is no cancellation, timeout, reentrancy, or thread-safety guarantee. Use process isolation for interruption and lower-level typed owners for completeness-sensitive control flow.
+Strict Rust reducer capability:
+
+```rust
+use tnk_core::host::{HostFunctionCatalog, codecs};
+use tnk_session::Session;
+
+fn slug(input: &[u8]) -> Vec<u8> {
+    input.to_ascii_lowercase()
+}
+
+let catalog = HostFunctionCatalog::builder()
+    .register_typed1("text.slug", codecs::string(), codecs::string(), slug)
+    .expect("register text.slug")
+    .build();
+let mut session = Session::builder().host_functions(catalog).build();
+```
+
+```maude
+[special (id-hook HostFunctionSymbol (text.slug)
+          op-hook stringSymbol (<Strings> : ~> String))]
+```
+
+Register before module construction. A key has at least two dot-separated segments; each begins with lowercase ASCII, contains only lowercase ASCII letters/digits/interior hyphens, and never ends in a hyphen. The root must be fixed-arity, free-theory, and standard eager. Arguments arrive normal but may be symbolic or undecodable. Typed adapters borrow byte-string inputs without cloning, gate callback invocation on all arguments decoding, and encode the owned output through `stringSymbol`. Decode miss/`Decline` falls through to equations; `Reduced` counts once, is recorded as `RewriteKind::HostFunction` with the canonical key in both structured and rendered traces, and its checked result is normalized. Every other `TraceEvent::Rewrite` carries no host key. `ReducerFault` aborts the semantic operation. Catalog-unaware constructors use an empty catalog.
+
+This is a trusted, pure, deterministic, synchronous callback boundary—not lazy control, I/O, state, dynamic loading, or a panic sandbox. `ReducerFault` restores TNK-owned operation state, aggregate/breakdown counts, and trace append state; it never falls through, and a faulted resumable owner returns the same error thereafter. This is not a general user transaction and does not roll back callback-authored external side effects. Callback panics are not converted to `ReducerFault` and have no rollback guarantee. `HostControlSymbol` is only a reserved inert/nonbinding future boundary; it never consults the strict catalog, even for a registered key. `Eval { output, exit }` is synchronous presentation output, not a typed semantic result stream; there is no cancellation, timeout, preemption, reentrancy, or thread-safety guarantee. Reducer authors own termination and CPU/memory bounds; use process isolation for interruption and lower-level typed owners for completeness-sensitive control flow.
 
 ---
 

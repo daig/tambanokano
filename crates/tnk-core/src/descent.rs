@@ -18,6 +18,7 @@
 
 use crate::dag::{DagId, NaValue, NodeRepr};
 use crate::engine::{Runtime, Signature};
+use crate::host::ReducerFault;
 use crate::root::RootGuard;
 use crate::smt::SmtType;
 use crate::sort::SortId;
@@ -316,14 +317,14 @@ impl MetaCtx<'_> {
 pub trait DescentOps {
     /// Evaluate descent function `op` applied at `redex` (whose top symbol carries `hooks`), returning the
     /// result DAG built in `ctx`, or `None` if it does not reduce (a partial/undefined application — the
-    /// redex stays at the kind level).
+    /// redex stays at the kind level). A nested semantic failure is returned unchanged.
     fn descend(
         &mut self,
         ctx: &mut MetaCtx,
         op: MetaOp,
         hooks: &MetaHooks,
         redex: DagId,
-    ) -> Option<DagId>;
+    ) -> Result<Option<DagId>, ReducerFault>;
 }
 
 /// The no-op descent handler: every descent redex stays unreduced. Used on all reduce paths that are not
@@ -331,7 +332,13 @@ pub trait DescentOps {
 pub struct NullDescent;
 
 impl DescentOps for NullDescent {
-    fn descend(&mut self, _: &mut MetaCtx, _: MetaOp, _: &MetaHooks, _: DagId) -> Option<DagId> {
-        None
+    fn descend(
+        &mut self,
+        _: &mut MetaCtx,
+        _: MetaOp,
+        _: &MetaHooks,
+        _: DagId,
+    ) -> Result<Option<DagId>, ReducerFault> {
+        Ok(None)
     }
 }

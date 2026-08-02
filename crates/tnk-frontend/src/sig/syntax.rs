@@ -5,6 +5,7 @@ use crate::lex::{Frag, Token};
 use crate::surface::ast::{GatherElem, IdSide, Statement};
 use std::collections::{HashMap, HashSet};
 use tnk_core::engine::Engine;
+use tnk_core::host::ResolvedHostHooks;
 use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::{ConditionFragment, Term};
@@ -118,6 +119,12 @@ pub struct IdentitySpec {
     pub tokens: Vec<Token>,
 }
 
+pub(crate) struct PendingHostBinding {
+    pub symbol: SymbolId,
+    pub key: String,
+    pub hooks: ResolvedHostHooks,
+}
+
 /// A built module: kernel engine plus frontend resolution tables and raw statements. Statement term
 /// bubbles are parsed only after the per-module grammar has been built.
 pub struct BuiltModule {
@@ -136,6 +143,8 @@ pub struct BuiltModule {
     pub vars: Vec<(String, SortId)>,
     /// Raw statement bubbles, parsed and installed by `load_statements`.
     pub statements: Vec<Statement>,
+    /// Validated source host attachments, committed after source equations have been installed.
+    pub(crate) pending_host_bindings: Vec<PendingHostBinding>,
     /// Per-equation trace metadata, indexed by the kernel's dense equation id (populated by
     /// `load_statements`; empty until statements are loaded). See [`EqTrace`].
     pub eq_traces: Vec<EqTrace>,

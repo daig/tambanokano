@@ -30,6 +30,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
 use tnk_core::dag::DagId;
 use tnk_core::engine::Engine;
+use tnk_core::host::ReducerFault;
 use tnk_core::sort::KindId;
 use tnk_core::term::{ConditionFragment, Term};
 use tnk_core::variant::term_from_dag_slots;
@@ -38,6 +39,41 @@ use tnk_core::variant::term_from_dag_slots;
 pub struct StratSolution {
     pub term: DagId,
     pub rewrites: u64,
+}
+
+#[derive(Debug)]
+pub enum StrategicRewriteError {
+    Invalid(String),
+    Reducer(ReducerFault),
+}
+
+impl std::fmt::Display for StrategicRewriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Reducer(fault) => fault.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for StrategicRewriteError {}
+
+impl From<String> for StrategicRewriteError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for StrategicRewriteError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+impl From<ReducerFault> for StrategicRewriteError {
+    fn from(fault: ReducerFault) -> Self {
+        Self::Reducer(fault)
+    }
 }
 
 /// A rule selected for strategy application, including its condition and variable-slot names.
@@ -123,12 +159,13 @@ struct StrategyProgram {
     defs: Vec<RDef>,
 }
 
-/// The evaluation context: the engine, the compiled strategy-definition program, and the cumulative
-/// rewrite count.
+/// The evaluation context: the engine, the compiled strategy-definition program, the cumulative
+/// rewrite count, and the first strict-reducer fault raised by an internal equational normalization.
 struct Cx<'a> {
     eng: &'a mut Engine,
     program: &'a StrategyProgram,
     count: u64,
+    reducer_fault: Option<ReducerFault>,
 }
 
 /// A pending continuation: an immutable stack of resolved strategy frames (top = the next to decompose).
@@ -235,7 +272,7 @@ pub fn srewrite_command(
     term: &ParsedCommandTerm<'_>,
     strat: &StratExpr,
     depth_first: bool,
-) -> Result<(Vec<StratSolution>, u64), String> {
+) -> Result<(Vec<StratSolution>, u64), StrategicRewriteError> {
     let mut vars = VarIndex::new();
     let subj_term = build_term(
         term.unambiguous_tree(i)?,
@@ -246,7 +283,7 @@ pub fn srewrite_command(
         &mut vars,
     )?;
     if vars.count() != 0 {
-        return Err("srewrite subject must be a ground term".to_string());
+        return Err("srewrite subject must be a ground term".into());
     }
     let subj = lm.built.engine.instantiate_bindings(&subj_term, &[]);
     srewrite_dag(lm, i, subj, strat, depth_first)
@@ -259,18 +296,22 @@ pub fn srewrite_dag(
     subj: DagId,
     strat: &StratExpr,
     depth_first: bool,
-) -> Result<(Vec<StratSolution>, u64), String> {
+) -> Result<(Vec<StratSolution>, u64), StrategicRewriteError> {
     let program = compile_strategy_program(lm, i);
     let rstrat = resolve(strat, lm, i)?;
     let mut cx = Cx {
         eng: &mut lm.built.engine,
         program: &program,
         count: 0,
+        reducer_fault: None,
     };
     cx.eng.reset_rewrites();
-    let subj = cx.eng.reduce(subj);
+    let subj = cx.eng.try_reduce(subj)?;
     cx.count = cx.eng.rewrites();
     let sols = run_search(&mut cx, subj, rstrat, !depth_first);
+    if let Some(fault) = cx.reducer_fault.take() {
+        return Err(StrategicRewriteError::Reducer(fault));
+    }
     let total = cx.count;
     let out = dedup(
         cx.eng,
@@ -1015,6 +1056,19 @@ fn rrule(t: &crate::sig::syntax::RlTrace) -> RRule {
     }
 }
 
+fn reduce_or_capture(cx: &mut Cx<'_>, dag: DagId) -> DagId {
+    if cx.reducer_fault.is_some() {
+        return dag;
+    }
+    match cx.eng.try_reduce(dag) {
+        Ok(reduced) => reduced,
+        Err(fault) => {
+            cx.reducer_fault = Some(fault);
+            dag
+        }
+    }
+}
+
 /// Execute a search to exhaustion and return solutions in emission order with their cumulative counts.
 fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(DagId, u64)> {
     let mut s = Search {
@@ -1035,8 +1089,11 @@ fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(Da
         app: None,
         task: 0,
     }]);
-    while let Some(p) = s.q.pop_front() {
-        s.run_one(cx, p);
+    while cx.reducer_fault.is_none() {
+        let Some(process) = s.q.pop_front() else {
+            break;
+        };
+        s.run_one(cx, process);
     }
     s.out
 }
@@ -1234,7 +1291,7 @@ impl Search {
             if let Some(m) = app.matches.pop_front() {
                 let whole = replace_at(cx.eng, p.dag, &m.path, m.result);
                 cx.eng.reset_rewrites();
-                let whole = cx.eng.reduce(whole);
+                let whole = reduce_or_capture(cx, whole);
                 cx.count += 1 + cx.eng.rewrites();
                 let result = Process {
                     dag: whole,
@@ -1780,7 +1837,7 @@ fn initial_bindings(
     for (name, term) in subst {
         let slot = r.var_names.iter().position(|candidate| candidate == name)?;
         let dag = inst(cx, term, &[]);
-        initial[slot] = Some(cx.eng.reduce(dag));
+        initial[slot] = Some(reduce_or_capture(cx, dag));
     }
     Some(initial)
 }
@@ -1832,7 +1889,7 @@ fn apply_eager(
                         .instantiate_rewrite_result(&r.rhs, &bindings, &context);
                     let whole = replace_at(cx.eng, dag, path, result);
                     cx.eng.reset_rewrites();
-                    let whole = cx.eng.reduce(whole);
+                    let whole = reduce_or_capture(cx, whole);
                     cx.count += 1 + cx.eng.rewrites();
                     out.push(whole);
                 }
@@ -1957,7 +2014,7 @@ fn matchrew_solutions(
                     let new_sub = inst(cx, pattern, &bnd);
                     let whole = replace_at(cx.eng, dag, path, new_sub);
                     cx.eng.reset_rewrites();
-                    let whole = cx.eng.reduce(whole);
+                    let whole = reduce_or_capture(cx, whole);
                     cx.count += cx.eng.rewrites();
                     out.push(whole);
                 }
@@ -2092,7 +2149,7 @@ fn inst(cx: &mut Cx, term: &Term, bindings: &[Option<DagId>]) -> DagId {
 fn inst_reduce(cx: &mut Cx, term: &Term, bindings: &[Option<DagId>]) -> DagId {
     let d = inst(cx, term, bindings);
     cx.eng.reset_rewrites();
-    let r = cx.eng.reduce(d);
+    let r = reduce_or_capture(cx, d);
     cx.count += cx.eng.rewrites();
     r
 }

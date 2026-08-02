@@ -167,6 +167,7 @@ impl Renderer<'_> {
             TraceEvent::Rewrite {
                 kind,
                 eq_id,
+                host_key,
                 redex,
                 result,
                 bindings,
@@ -180,6 +181,15 @@ impl Renderer<'_> {
                         *redex,
                         *result,
                         bindings,
+                        *whole_before,
+                        *whole_after,
+                    ),
+                    RewriteKind::HostFunction if self.flags.builtin => self.rewrite_host(
+                        host_key
+                            .as_ref()
+                            .expect("host rewrite trace event carries its stable key"),
+                        *redex,
+                        *result,
                         *whole_before,
                         *whole_after,
                     ),
@@ -340,6 +350,28 @@ impl Renderer<'_> {
         s.push_str(&format!("(built-in equation for symbol {name})\n"));
         s.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
         s
+    }
+    fn rewrite_host(
+        &self,
+        key: &tnk_core::host::HostFunctionKey,
+        redex: DagId,
+        result: DagId,
+        whole_before: Option<DagId>,
+        whole_after: Option<DagId>,
+    ) -> String {
+        let mut text = String::new();
+        if self.flags.body {
+            text.push_str(HEADER);
+            text.push_str("equation\n");
+        }
+        let name = self
+            .m
+            .engine
+            .symbol(self.m.engine.node(redex).symbol())
+            .name();
+        text.push_str(&format!("(strict Rust reducer {key} for symbol {name})\n"));
+        text.push_str(&self.rewrite_tail(redex, result, whole_before, whole_after));
+        text
     }
 
     /// The shared `[Old:] redex ---> result [New:]` tail of an equation/built-in step.

@@ -6,6 +6,8 @@
 //! for the frontend build pipeline. All import modes contribute the same flattened closure; their mode is
 //! retained for non-flat reflection.
 //! [`load::load_program`] builds a runnable program and is shared by batch loading and the session layer.
+//! Catalog-aware loader variants propagate strict host-provided reducer capabilities through flattening,
+//! views, parameter instantiation, reflection, and built modules.
 
 pub mod db;
 pub mod flatten;

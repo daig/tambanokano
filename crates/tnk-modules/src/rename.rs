@@ -12,7 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
-use tnk_frontend::rename_terms::{OpRenamer, ReconTarget, ViewOpMap, ViewOpSubst};
+use tnk_frontend::rename_terms::{
+    OpRenamer, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature,
+};
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement, StratExpr};
 
 use crate::flatten::FlatDecls;
@@ -63,15 +65,13 @@ pub fn apply_renaming(
         }
     }
 
-    // Every non-disambiguated operator map is reconstructed structurally from the source parse. This is
-    // necessary when fixity changes (`pair` → `_+_`): swapping the prefix token in `pair(a,b)` would yield
-    // the invalid `+(a,b)`. Signature-disambiguated maps retain the arity-aware surgical renamer.
+    // Reconstruct every operator map structurally from the source parse. This handles fixity changes and
+    // lets signature-qualified constant and mixfix renames expand to any target token shape.
     let structural_maps: Vec<ViewOpMap> = op_renames
         .iter()
-        .filter(|s| s.dom_range.is_none())
         .map(|s| ViewOpMap {
             source: s.from.clone(),
-            dom_range: None,
+            dom_range: s.dom_range.clone(),
             target: ReconTarget::Op(s.to.clone()),
         })
         .collect();
@@ -149,37 +149,16 @@ pub fn apply_renaming(
         // the hook. Sorts in hook signatures and constants in term hooks follow the same renaming.
         if let Some(sp) = &mut op.attrs.special {
             for (_purpose, toks) in &mut sp.op_hooks {
-                let Some(colon) = toks.iter().position(|t| interner.resolve(t.sym) == ":") else {
-                    continue;
-                };
-                let name_canon: String = toks[..colon]
-                    .iter()
-                    .map(|t| interner.resolve(t.sym))
-                    .collect();
-                let arrow = toks.iter().position(|t| interner.resolve(t.sym) == "~>");
-                let (dom, rng): (Vec<String>, Option<String>) = match arrow {
-                    Some(a) => (
-                        toks[colon + 1..a]
-                            .iter()
-                            .map(|t| interner.resolve(t.sym).to_string())
-                            .collect(),
-                        toks.get(a + 1).map(|t| interner.resolve(t.sym).to_string()),
-                    ),
-                    None => (Vec::new(), None),
-                };
-                if let Some(r) = op_renames.iter().find(|s| {
-                    s.from == name_canon
-                        && s.dom_range
-                            .as_ref()
-                            .is_none_or(|(d, rr)| *d == dom && Some(rr) == rng.as_ref())
-                }) {
-                    let mut new_toks = tokenize(&r.to, interner);
-                    new_toks.extend_from_slice(&toks[colon..]);
-                    *toks = new_toks;
-                }
+                *toks = rewrite_op_hook_signature(toks, &structural_maps, interner);
                 subst_sort_tokens(toks, &sort_map, interner);
             }
             for (_purpose, toks) in &mut sp.term_hooks {
+                if let Some(rewriter) = structural.as_ref() {
+                    *toks = rewriter.rewrite(toks, interner);
+                }
+                if let Some(rewriter) = renamer.as_ref() {
+                    *toks = rewriter.rewrite(toks, interner);
+                }
                 subst_tokens(toks, &single_op_map, interner);
                 subst_sort_tokens(toks, &sort_map, interner);
             }

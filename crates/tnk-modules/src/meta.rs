@@ -22,6 +22,7 @@ use std::rc::Rc;
 use tnk_core::dag::{DagId, NaValue, NodeRepr};
 use tnk_core::descent::{DescentOps, MetaCtx};
 use tnk_core::engine::Engine;
+use tnk_core::host::{HostFunctionCatalog, ReducerFault};
 use tnk_core::search::Arrow;
 use tnk_core::smt::{ConfiguredSmtEngine, SmtEngine, SmtNumber, SmtResult};
 use tnk_core::sort::SortId;
@@ -34,10 +35,12 @@ use tnk_core::variant_sat::{
 use tnk_frontend::build_term::{VarIndex, unquote_string};
 use tnk_frontend::lex::{Interner, Sym, Token, tokenize};
 use tnk_frontend::load::{
-    InternerNames, LoadedModule, StatementTraceRef, StmtTrace, build_command_dag,
-    build_loaded_module, build_loaded_module_homed_traced, build_logic_command_parses,
-    command_parse_furthest, executable_variant_equations, maude_variable_name_rank,
-    parse_command_term, parse_statement_trace,
+    InternerNames, LoadedModule, LoadedModuleBuildError, StatementTraceRef, StmtTrace,
+    build_command_dag, build_logic_command_parses, command_parse_furthest,
+    executable_variant_equations, maude_variable_name_rank, parse_command_term,
+    parse_statement_trace, try_build_loaded_module_homed_traced_with_host_functions,
+    try_build_loaded_module_with_host_functions,
+    try_build_loaded_module_with_host_functions_and_inline_statements,
 };
 use tnk_frontend::pretty::{
     PrintOptions, print_qid_tokens_with_options, print_raw, print_term, print_with_options,
@@ -45,7 +48,7 @@ use tnk_frontend::pretty::{
 };
 use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
-use tnk_frontend::strategy::{StratSolution, srewrite_dag};
+use tnk_frontend::strategy::{StratSolution, StrategicRewriteError, srewrite_dag};
 use tnk_frontend::surface::ast::{
     Attrs, GatherElem, IdSide, Import, ImportMode, ModuleExpr, ModuleKind, OpDecl, OpMap,
     Parameter, PreModule, RenameItem, SpecialSpec, Statement, StratDecl, StratDef, StratExpr,
@@ -84,6 +87,68 @@ fn take_symbolic_subcounts(
     checkpoint.variant_narrowing = variant_narrowing;
     checkpoint.narrowing = narrowing;
     delta
+}
+
+fn capture_reducer_fault<T>(
+    slot: &mut Option<ReducerFault>,
+    result: Result<T, ReducerFault>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(fault) => {
+            debug_assert!(slot.is_none());
+            *slot = Some(fault);
+            None
+        }
+    }
+}
+fn capture_loaded_module_build<T>(
+    slot: &mut Option<ReducerFault>,
+    result: Result<T, LoadedModuleBuildError>,
+    invalid: impl FnOnce(&str),
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(LoadedModuleBuildError::Reducer(fault)) => {
+            debug_assert!(slot.is_none());
+            *slot = Some(fault);
+            None
+        }
+        Err(LoadedModuleBuildError::Invalid(error)) => {
+            invalid(&error);
+            None
+        }
+    }
+}
+
+fn capture_variant_error<T>(
+    slot: &mut Option<ReducerFault>,
+    result: Result<T, tnk_core::variant::VariantSearchError>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(tnk_core::variant::VariantSearchError::Reducer(fault)) => {
+            debug_assert!(slot.is_none());
+            *slot = Some(fault);
+            None
+        }
+        Err(tnk_core::variant::VariantSearchError::Invalid(_)) => None,
+    }
+}
+
+fn capture_narrow_error<T>(
+    slot: &mut Option<ReducerFault>,
+    result: Result<T, tnk_core::narrow::NarrowSearchError>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(tnk_core::narrow::NarrowSearchError::Reducer(fault)) => {
+            debug_assert!(slot.is_none());
+            *slot = Some(fault);
+            None
+        }
+        Err(tnk_core::narrow::NarrowSearchError::Invalid(_)) => None,
+    }
 }
 
 fn transfer_symbolic_subcounts(
@@ -524,9 +589,11 @@ pub struct MetaDescent<'a> {
     pub interner: &'a mut Interner,
     pub db: &'a ModuleDb,
     pub views: &'a ViewDb,
+    host_functions: HostFunctionCatalog,
     unify_cache: Option<MetaUnifyCache>,
     state: &'a mut MetaState,
     interpreter_manager_accounting: bool,
+    reducer_fault: Option<ReducerFault>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -645,14 +712,14 @@ struct MetaVariantUnifyCache {
 }
 
 impl MetaVariantUnifyCache {
-    fn advance(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
+    fn advance(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) -> Result<(), ReducerFault> {
         if self.exhausted {
-            return;
+            return Ok(());
         }
         let pending_before = self.stream.pending_len();
         if self.key.matching {
-            self.advance_matching(env);
-        } else if let Some(variant) = self.search.find_next(env) {
+            self.advance_matching(env)?;
+        } else if let Some(variant) = self.search.try_find_next(env)? {
             debug_assert!(variant.unifier);
             let mut bindings = variant.substitution;
             if !self.restorations.is_empty() {
@@ -667,7 +734,7 @@ impl MetaVariantUnifyCache {
             let equations = self.search.variant_equations();
             let rewrites = env.e.rewrites();
             self.stream
-                .insert(env, bindings, variant.family, rewrites, &equations);
+                .try_insert(env, bindings, variant.family, rewrites, &equations)?;
         } else {
             self.exhausted = true;
         }
@@ -681,16 +748,20 @@ impl MetaVariantUnifyCache {
                 self.rewrite_checkpoint = rewrites;
             }
         }
+        Ok(())
     }
 
-    fn advance_matching(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
-        let Some(mut variant) = self
-            .deferred_variant
-            .take()
-            .or_else(|| self.search.find_next(env))
-        else {
+    fn advance_matching(
+        &mut self,
+        env: &mut tnk_core::unify::UnifyEnv<'_>,
+    ) -> Result<(), ReducerFault> {
+        let next = match self.deferred_variant.take() {
+            Some(variant) => Some(variant),
+            None => self.search.try_find_next(env)?,
+        };
+        let Some(mut variant) = next else {
             self.exhausted = true;
-            return;
+            return Ok(());
         };
         let root_identity = variant.index == 0
             && env
@@ -706,20 +777,20 @@ impl MetaVariantUnifyCache {
             .expect("metalevel variant matching has a family");
         let mut completed = Vec::new();
         loop {
-            completed.extend(tnk_core::variant::complete_variant_unifier(
+            completed.extend(tnk_core::variant::try_complete_variant_unifier(
                 env,
                 &variant,
                 self.pair_count,
                 family,
                 &self.key.base,
-            ));
+            )?);
             if root_identity {
                 break;
             }
             if variant.more_in_layer {
-                variant = self.search.find_next(env).expect("same variant layer");
+                variant = self.search.try_find_next(env)?.expect("same variant layer");
             } else {
-                self.deferred_variant = self.search.find_next(env);
+                self.deferred_variant = self.search.try_find_next(env)?;
                 break;
             }
         }
@@ -734,22 +805,33 @@ impl MetaVariantUnifyCache {
                 }
             }
         }
-        completed.retain(|bindings| self.search.accepts_completed_unifier(env.e, bindings));
+        let mut accepted = Vec::with_capacity(completed.len());
+        for bindings in completed {
+            if self
+                .search
+                .try_accepts_completed_unifier(env.e, &bindings)?
+            {
+                accepted.push(bindings);
+            }
+        }
         let completed = if self.stream.is_filtered() {
-            completed
+            accepted
         } else {
             let mut survivors: Vec<Vec<DagId>> = Vec::new();
-            'candidate: for bindings in completed {
-                if survivors
-                    .iter()
-                    .any(|retained| tnk_core::variant::unifier_subsumes(env.e, retained, &bindings))
-                {
-                    continue 'candidate;
+            'candidate: for bindings in accepted {
+                for retained in &survivors {
+                    if tnk_core::variant::try_unifier_subsumes(env.e, retained, &bindings)? {
+                        continue 'candidate;
+                    }
                 }
-                survivors.retain(|retained| {
-                    !tnk_core::variant::unifier_subsumes(env.e, &bindings, retained)
-                });
-                survivors.push(bindings);
+                let mut kept = Vec::with_capacity(survivors.len() + 1);
+                for retained in survivors.drain(..) {
+                    if !tnk_core::variant::try_unifier_subsumes(env.e, &bindings, &retained)? {
+                        kept.push(retained);
+                    }
+                }
+                kept.push(bindings);
+                survivors = kept;
             }
             survivors
         };
@@ -757,19 +839,20 @@ impl MetaVariantUnifyCache {
             let equations = self.search.variant_equations();
             let rewrites = env.e.rewrites();
             self.stream
-                .insert(env, bindings, family, rewrites, &equations);
+                .try_insert(env, bindings, family, rewrites, &equations)?;
         }
         if root_identity || self.deferred_variant.is_none() {
             self.exhausted = true;
         }
+        Ok(())
     }
 
-    fn prepare(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) {
+    fn prepare(&mut self, env: &mut tnk_core::unify::UnifyEnv<'_>) -> Result<(), ReducerFault> {
         if self.prepared {
-            return;
+            return Ok(());
         }
         while !self.exhausted {
-            self.advance(env);
+            self.advance(env)?;
         }
         self.stream.finish();
         self.prepared = true;
@@ -781,6 +864,7 @@ impl MetaVariantUnifyCache {
             self.rewrite_charge += rewrites.saturating_sub(self.rewrite_checkpoint);
         }
         self.rewrite_checkpoint = rewrites;
+        Ok(())
     }
 
     fn take_rewrite_charge(&mut self) -> u64 {
@@ -802,9 +886,26 @@ impl<'a> MetaDescent<'a> {
             interner,
             db,
             views,
+            host_functions: HostFunctionCatalog::default(),
             unify_cache: None,
             state,
+            reducer_fault: None,
             interpreter_manager_accounting: false,
+        }
+    }
+    /// Use the same immutable host capability catalog as the owning Session.
+    pub fn with_host_functions(mut self, host_functions: HostFunctionCatalog) -> Self {
+        self.host_functions = host_functions;
+        self
+    }
+    fn capture_semantic<T>(&mut self, result: Result<T, ReducerFault>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(fault) => {
+                debug_assert!(self.reducer_fault.is_none());
+                self.reducer_fault = Some(fault);
+                None
+            }
         }
     }
 
@@ -823,9 +924,10 @@ impl DescentOps for MetaDescent<'_> {
         op: MetaOp,
         hooks: &MetaHooks,
         redex: DagId,
-    ) -> Option<DagId> {
+    ) -> Result<Option<DagId>, ReducerFault> {
         self.state.ensure_context(ctx);
-        match op {
+        debug_assert!(self.reducer_fault.is_none());
+        let result = (|| match op {
             // `metaReduce` runs the module's equations to normal form; `metaNormalize` normalizes modulo
             // the STRUCTURAL AXIOMS ONLY (AC order, id/idem collapse — no user equations).
             MetaOp::Reduce => self.meta_reduce(ctx, hooks, redex),
@@ -931,6 +1033,10 @@ impl DescentOps for MetaDescent<'_> {
             MetaOp::Narrow { state_only: true } => None,
             MetaOp::Srewrite { depth_first } => self.meta_srewrite(ctx, hooks, redex, depth_first),
             MetaOp::Unknown => None,
+        })();
+        match self.reducer_fault.take() {
+            Some(fault) => Err(fault),
+            None => Ok(result),
         }
     }
 }
@@ -965,11 +1071,21 @@ impl MetaDescent<'_> {
                 .map(|dag| ctx.root(dag))
                 .collect();
             let mut loaded = self.down_module(ctx, hooks, key.module)?;
-            let subject = down_term(ctx, hooks, key.subject, &mut loaded.built, self.interner)?;
-            let strategy =
-                down_strategy(ctx, hooks, key.strategy, &mut loaded.built, self.interner)?;
+            let attempt = try_down_term(ctx, hooks, key.subject, &mut loaded.built, self.interner);
+            let subject = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
+            let attempt =
+                try_down_strategy(ctx, hooks, key.strategy, &mut loaded.built, self.interner);
+            let strategy = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
             let (solutions, total_rewrites) =
-                srewrite_dag(&mut loaded, self.interner, subject, &strategy, depth_first).ok()?;
+                match srewrite_dag(&mut loaded, self.interner, subject, &strategy, depth_first) {
+                    Ok(result) => result,
+                    Err(StrategicRewriteError::Invalid(_)) => return None,
+                    Err(StrategicRewriteError::Reducer(fault)) => {
+                        debug_assert!(self.reducer_fault.is_none());
+                        self.reducer_fault = Some(fault);
+                        return None;
+                    }
+                };
             let solutions = solutions
                 .into_iter()
                 .map(|solution| RootedStratSolution {
@@ -1123,7 +1239,14 @@ impl MetaDescent<'_> {
         };
         let decision = {
             let mut names = InternerNames(self.interner);
-            decide_variant_sat(&mut loaded.built.engine, &mut names, query)
+            match decide_variant_sat(&mut loaded.built.engine, &mut names, query) {
+                Ok(decision) => decision,
+                Err(fault) => {
+                    debug_assert!(self.reducer_fault.is_none());
+                    self.reducer_fault = Some(fault);
+                    return None;
+                }
+            }
         };
         let result = match (validity, decision) {
             (false, VariantSatDecision::Sat) | (true, VariantSatDecision::Unsat) => true,
@@ -1190,7 +1313,12 @@ impl MetaDescent<'_> {
             let name = qid_text(ctx, *kids.first()?)?;
             down_bool(ctx, *kids.get(1)?)?;
             let flat = flatten(&name, self.db, self.views, self.interner).ok()?;
-            return build_loaded_module(&flat, self.interner).ok();
+            let attempt = try_build_loaded_module_with_host_functions(
+                &flat,
+                self.interner,
+                &self.host_functions,
+            );
+            return capture_loaded_module_build(&mut self.reducer_fault, attempt, |_| {});
         }
         self.down_module(ctx, hooks, module)
     }
@@ -1203,9 +1331,11 @@ impl MetaDescent<'_> {
             return None;
         }
         let mut loaded = self.down_module(ctx, hooks, kids[0])?;
-        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         loaded.built.engine.reset_rewrites();
-        let result = loaded.built.engine.reduce(subj);
+        let attempt = loaded.built.engine.try_reduce(subj);
+        let result = self.capture_semantic(attempt)?;
         ctx.add_rewrites(loaded.built.engine.rewrites());
         let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, result);
         let us = up_sort(ctx, hooks, &loaded.built, result);
@@ -1228,8 +1358,10 @@ impl MetaDescent<'_> {
         }
         let mut loaded = self.down_module(ctx, hooks, kids[0])?;
         // Eager theory normalization only; unlike `reduce`, this never applies user equations.
-        let subj = down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner)?;
-        let subj = loaded.built.engine.normalize_for_unify(subj);
+        let attempt = try_down_term(ctx, hooks, kids[1], &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
+        let attempt = loaded.built.engine.try_normalize_for_unify(subj);
+        let subj = self.capture_semantic(attempt)?;
         let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, subj);
         let us = up_sort(ctx, hooks, &loaded.built, subj);
         let rp = *hooks.ops.get("resultPairSymbol")?;
@@ -1248,17 +1380,20 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let bound = down_bound(ctx, hooks, *kids.get(2)?);
         loaded.built.engine.reset_rewrites();
         let result = if position_fair {
             // The fourth argument is per-position gas.
             let gas = down_nat64(ctx, *kids.get(3)?)?;
             let mut rw = loaded.built.engine.frewrite(subj, gas);
-            rw.run(&mut loaded.built.engine, bound).term
+            let attempt = rw.try_run(&mut loaded.built.engine, bound);
+            self.capture_semantic(attempt)?.term
         } else {
             let mut rw = loaded.built.engine.rewrite(subj);
-            rw.run(&mut loaded.built.engine, bound).term
+            let attempt = rw.try_run(&mut loaded.built.engine, bound);
+            self.capture_semantic(attempt)?.term
         };
         ctx.add_rewrites(loaded.built.engine.rewrites());
         let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, result);
@@ -1274,7 +1409,8 @@ impl MetaDescent<'_> {
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
-        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         // Only the empty such-that condition is supported.
         if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
             return None;
@@ -1282,7 +1418,8 @@ impl MetaDescent<'_> {
         let sol_nr = down_nat64(ctx, *kids.get(4)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let subj = loaded.built.engine.reduce(subj); // Match against the reduced subject.
+        let attempt = loaded.built.engine.try_reduce(subj);
+        let subj = self.capture_semantic(attempt)?; // Match against the reduced subject.
         ctx.add_rewrites(loaded.built.engine.rewrites());
         // Capture the (n+1)-th solution's bindings while the matcher stream borrows the engine.
         let bindings = nth_match(&mut loaded.built.engine, pattern, nr, subj, false, sol_nr);
@@ -1418,9 +1555,11 @@ impl MetaDescent<'_> {
         let mut equations: Vec<(DagId, DagId)> = Vec::new();
         for (l, r) in &pairs {
             let ld = loaded.built.engine.instantiate_bindings(l, &bindings);
-            let ld = loaded.built.engine.normalize_for_unify(ld);
+            let attempt = loaded.built.engine.try_normalize_for_unify(ld);
+            let ld = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
             let rd = loaded.built.engine.instantiate_bindings(r, &bindings);
-            let rd = loaded.built.engine.normalize_for_unify(rd);
+            let attempt = loaded.built.engine.try_normalize_for_unify(rd);
+            let rd = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
             equations.push((ld, rd));
         }
         let specs: Vec<VarSpec> = (0..n_vars)
@@ -1453,19 +1592,25 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let mut prob = UnifyProblem::new(&mut env, equations, specs, used_family, &base);
+            let attempt = UnifyProblem::try_new(&mut env, equations, specs, used_family, &base);
+            let mut prob = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
             original_order = prob.original_variable_order().to_vec();
             if !prob.problem_okay() {
                 return None; // unsupported-theory screen: no reduction
             }
             if irredundant {
-                while let Some(u) = prob.find_next(&mut env) {
+                while let Some(u) =
+                    capture_reducer_fault(&mut self.reducer_fault, prob.try_find_next(&mut env))?
+                {
                     collected.push(u);
                 }
                 exhausted = true;
             } else {
                 for _ in 0..enumeration_limit {
-                    match prob.find_next(&mut env) {
+                    match capture_reducer_fault(
+                        &mut self.reducer_fault,
+                        prob.try_find_next(&mut env),
+                    )? {
                         Some(b) => collected.push(b),
                         None => {
                             exhausted = true;
@@ -1478,7 +1623,9 @@ impl MetaDescent<'_> {
             last_var_index = prob.last_var_index_decimal();
         }
         let unifiers = if irredundant {
-            tnk_core::unify::filter::irredundant(&mut loaded.built.engine, collected)
+            let attempt =
+                tnk_core::unify::filter::try_irredundant(&mut loaded.built.engine, collected);
+            capture_reducer_fault(&mut self.reducer_fault, attempt)?
         } else {
             collected
         };
@@ -1668,10 +1815,10 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let search = NarrowSearch::new_preserving(
+            let attempt = NarrowSearch::new_preserving(
                 &mut env, target, specs, family, blockers, &rules, equations, "0", options,
-            )
-            .ok()?;
+            );
+            let search = capture_narrow_error(&mut self.reducer_fault, attempt)?;
             let key_roots = std::iter::once(key.module)
                 .chain(key.roots.iter().copied())
                 .map(|dag| ctx.root(dag))
@@ -1699,7 +1846,8 @@ impl MetaDescent<'_> {
                     e: &mut cache.loaded.built.engine,
                     names: &mut names,
                 };
-                cache.search.next_interesting_state(&mut env)
+                let attempt = cache.search.try_next_interesting_state(&mut env);
+                capture_reducer_fault(&mut self.reducer_fault, attempt)?
             };
             let rewrites = cache.loaded.built.engine.rewrites();
             rewrite_charge += rewrites.saturating_sub(cache.rewrite_checkpoint);
@@ -1947,7 +2095,7 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let mut search = NarrowSearch::new(
+            let attempt = NarrowSearch::new(
                 &mut env,
                 subject,
                 specs[..initial_variable_count].to_vec(),
@@ -1955,8 +2103,8 @@ impl MetaDescent<'_> {
                 equations,
                 "0",
                 options,
-            )
-            .ok()?;
+            );
+            let mut search = capture_narrow_error(&mut self.reducer_fault, attempt)?;
             search.set_goal(NarrowGoal::new(env.e, goal, specs, initial_variable_count));
             let key_roots = [key.module, key.subject, key.goal]
                 .into_iter()
@@ -1982,7 +2130,8 @@ impl MetaDescent<'_> {
                     e: &mut cache.loaded.built.engine,
                     names: &mut names,
                 };
-                cache.search.find_next(&mut env)
+                let attempt = cache.search.try_find_next(&mut env);
+                capture_reducer_fault(&mut self.reducer_fault, attempt)?
             };
             let rewrites = cache.loaded.built.engine.rewrites();
             ctx.add_rewrites(rewrites.saturating_sub(cache.rewrite_checkpoint));
@@ -2201,7 +2350,7 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let mut search = NarrowSearch::new(
+            let attempt = NarrowSearch::new(
                 &mut env,
                 subject,
                 specs[..initial_variable_count].to_vec(),
@@ -2209,8 +2358,8 @@ impl MetaDescent<'_> {
                 equations,
                 "0",
                 options,
-            )
-            .ok()?;
+            );
+            let mut search = capture_narrow_error(&mut self.reducer_fault, attempt)?;
             search.set_goal(NarrowGoal::new(env.e, goal, specs, initial_variable_count));
             let key_roots = [key.module, key.subject, key.goal]
                 .into_iter()
@@ -2237,7 +2386,8 @@ impl MetaDescent<'_> {
                     e: &mut cache.loaded.built.engine,
                     names: &mut names,
                 };
-                cache.search.find_next(&mut env)
+                let attempt = cache.search.try_find_next(&mut env);
+                capture_reducer_fault(&mut self.reducer_fault, attempt)?
             };
             let rewrites = cache.loaded.built.engine.rewrites();
             ctx.add_rewrites(rewrites.saturating_sub(cache.rewrite_checkpoint));
@@ -2573,7 +2723,7 @@ impl MetaDescent<'_> {
             } else {
                 VariantMode::Incremental
             };
-            let search = VariantSearch::new(
+            let attempt = VariantSearch::new(
                 &mut env,
                 target,
                 specs,
@@ -2582,8 +2732,8 @@ impl MetaDescent<'_> {
                 mode,
                 incoming_family,
                 &base,
-            )
-            .ok()?;
+            );
+            let search = capture_variant_error(&mut self.reducer_fault, attempt)?;
             let variable_names = search
                 .original_variable_order()
                 .iter()
@@ -2615,7 +2765,8 @@ impl MetaDescent<'_> {
                     e: &mut cache.loaded.built.engine,
                     names: &mut names,
                 };
-                cache.search.find_next(&mut env)
+                let attempt = cache.search.try_find_next(&mut env);
+                capture_reducer_fault(&mut self.reducer_fault, attempt)?
             };
             let rewrites = cache.loaded.built.engine.rewrites();
             if let Some(variant) = next {
@@ -2862,7 +3013,8 @@ impl MetaDescent<'_> {
                 .built
                 .engine
                 .instantiate_bindings(&target_term, &bindings);
-            let target = loaded.built.engine.normalize_for_unify(target);
+            let attempt = loaded.built.engine.try_normalize_for_unify(target);
+            let target = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
             let blockers = blocker_terms
                 .iter()
                 .map(|term| loaded.built.engine.instantiate_bindings(term, &bindings))
@@ -2887,7 +3039,7 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let mut search = VariantSearch::new(
+            let attempt = VariantSearch::new(
                 &mut env,
                 target,
                 specs,
@@ -2896,8 +3048,8 @@ impl MetaDescent<'_> {
                 VariantMode::Incremental,
                 incoming_family,
                 &base,
-            )
-            .ok()?;
+            );
+            let mut search = capture_variant_error(&mut self.reducer_fault, attempt)?;
             search.enable_unification(env.e, pair_count);
             let canonical_order = search.original_variable_order().to_vec();
             let key_roots = std::iter::once(key.module)
@@ -2928,26 +3080,29 @@ impl MetaDescent<'_> {
         };
 
         let mut engine = std::mem::take(&mut cache.loaded.built.engine);
-        {
+        let drive_result = {
             let mut names = InternerNames(self.interner);
             let mut env = tnk_core::unify::UnifyEnv {
                 e: &mut engine,
                 names: &mut names,
             };
-            if cache.upfront {
-                cache.prepare(&mut env);
-            }
-            while cache.answers.len() <= sol_nr {
-                if let Some(index) = cache.pop_pending() {
-                    cache.answers.push(index);
-                    continue;
+            (|| -> Result<(), ReducerFault> {
+                if cache.upfront {
+                    cache.prepare(&mut env)?;
                 }
-                if cache.exhausted {
-                    break;
+                while cache.answers.len() <= sol_nr {
+                    if let Some(index) = cache.pop_pending() {
+                        cache.answers.push(index);
+                        continue;
+                    }
+                    if cache.exhausted {
+                        break;
+                    }
+                    cache.advance(&mut env)?;
                 }
-                cache.advance(&mut env);
-            }
-        }
+                Ok(())
+            })()
+        };
         let mut rewrite_charge = cache.take_rewrite_charge();
         if self.interpreter_manager_accounting
             && cache.stream.is_filtered()
@@ -2958,6 +3113,7 @@ impl MetaDescent<'_> {
         ctx.add_rewrites(rewrite_charge);
         transfer_symbolic_subcounts(ctx, &engine, &mut cache.breakdown_checkpoint);
         cache.loaded.built.engine = engine;
+        capture_reducer_fault(&mut self.reducer_fault, drive_result)?;
 
         let Some(&answer) = cache.answers.get(sol_nr) else {
             let incomplete = cache.search.is_incomplete();
@@ -3273,7 +3429,7 @@ impl MetaDescent<'_> {
                 e: &mut loaded.built.engine,
                 names: &mut names,
             };
-            let mut search = VariantSearch::new(
+            let attempt = VariantSearch::new(
                 &mut env,
                 target,
                 specs,
@@ -3282,8 +3438,8 @@ impl MetaDescent<'_> {
                 VariantMode::Irredundant,
                 Some(incoming_family),
                 &base,
-            )
-            .ok()?;
+            );
+            let mut search = capture_variant_error(&mut self.reducer_fault, attempt)?;
             search.skip_root_position();
             let canonical_order = search.original_variable_order().to_vec();
             let mut stored_key = key.clone();
@@ -3316,23 +3472,27 @@ impl MetaDescent<'_> {
         };
 
         let mut engine = std::mem::take(&mut cache.loaded.built.engine);
-        {
+        let drive_result = {
             let mut names = InternerNames(self.interner);
             let mut env = tnk_core::unify::UnifyEnv {
                 e: &mut engine,
                 names: &mut names,
             };
-            cache.prepare(&mut env);
-            while cache.answers.len() <= sol_nr {
-                let Some(index) = cache.pop_pending() else {
-                    break;
-                };
-                cache.answers.push(index);
+            let result = cache.prepare(&mut env);
+            if result.is_ok() {
+                while cache.answers.len() <= sol_nr {
+                    let Some(index) = cache.pop_pending() else {
+                        break;
+                    };
+                    cache.answers.push(index);
+                }
             }
-        }
+            result
+        };
         ctx.add_rewrites(cache.take_rewrite_charge());
         transfer_symbolic_subcounts(ctx, &engine, &mut cache.breakdown_checkpoint);
         cache.loaded.built.engine = engine;
+        capture_reducer_fault(&mut self.reducer_fault, drive_result)?;
 
         let Some(&answer) = cache.answers.get(sol_nr) else {
             let hook = if cache.search.is_incomplete() {
@@ -3425,14 +3585,15 @@ impl MetaDescent<'_> {
             }
 
             let mut subject_variables = VarIndex::new();
-            let initial = down_term_inner(
+            let initial_attempt = try_down_term_inner(
                 ctx,
                 hooks,
                 initial_arg,
                 &mut loaded.built,
                 &mut subject_variables,
                 self.interner,
-            )?;
+            );
+            let initial = self.capture_semantic(initial_attempt)??;
             let mut goal_variables = VarIndex::new();
             let goal = down_term_to_term(ctx, hooks, goal_arg, &loaded.built, &mut goal_variables)?;
             let initial_kind = loaded
@@ -3582,7 +3743,8 @@ impl MetaDescent<'_> {
     fn meta_search(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
         let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
@@ -3599,13 +3761,15 @@ impl MetaDescent<'_> {
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let mut search = loaded
+        let attempt = loaded
             .built
             .engine
-            .search(subj, pattern, nr, cond, arrow, max_depth);
+            .try_search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut search = self.capture_semantic(attempt)?;
         let mut sol = None;
         for _ in 0..=sol_nr {
-            sol = search.next_solution(&mut loaded.built.engine);
+            let attempt = search.try_next_solution(&mut loaded.built.engine);
+            sol = self.capture_semantic(attempt)?;
             if sol.is_none() {
                 break;
             }
@@ -3641,13 +3805,20 @@ impl MetaDescent<'_> {
     fn meta_apply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let label = match ctx.repr(*kids.get(2)?) {
             NodeRepr::Qid(s) => s.to_string(),
             _ => return None,
         };
-        let partial =
-            down_partial_substitution(ctx, hooks, &mut loaded.built, *kids.get(3)?, self.interner)?;
+        let attempt = try_down_partial_substitution(
+            ctx,
+            hooks,
+            &mut loaded.built,
+            *kids.get(3)?,
+            self.interner,
+        );
+        let partial = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let sol_nr = down_nat64(ctx, *kids.get(4)?)? as usize;
         // The labelled rules (cloned out before mutating the engine). Conditional rules need the condition
         // solver — bail rather than misapply (a conditional rule whose condition fails must not fire).
@@ -3674,7 +3845,8 @@ impl MetaDescent<'_> {
             return None;
         }
         loaded.built.engine.reset_rewrites();
-        let subj = loaded.built.engine.reduce(subj);
+        let attempt = loaded.built.engine.try_reduce(subj);
+        let subj = self.capture_semantic(attempt)?;
         // Enumerate top matches across the labelled rules (in declaration order), pick the (n+1)-th.
         let mut all: Vec<(usize, Vec<DagId>)> = Vec::new();
         for (ri, (lhs, _, names, nr)) in rules.iter().enumerate() {
@@ -3699,7 +3871,8 @@ impl MetaDescent<'_> {
             Some((ri, bindings)) => {
                 let (_, rhs, names, _) = &rules[*ri];
                 let res = loaded.built.engine.instantiate_bindings(rhs, bindings);
-                let res = loaded.built.engine.reduce(res);
+                let attempt = loaded.built.engine.try_reduce(res);
+                let res = self.capture_semantic(attempt)?;
                 // subject reduce + result reduce + the rule application (1).
                 ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
                 let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, res);
@@ -3724,7 +3897,8 @@ impl MetaDescent<'_> {
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(1)?, &loaded.built, &mut vars)?;
-        let subj = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         if !is_nil_condition(ctx, hooks, *kids.get(3)?) {
             return None;
         }
@@ -3733,7 +3907,8 @@ impl MetaDescent<'_> {
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let subj = loaded.built.engine.reduce(subj);
+        let attempt = loaded.built.engine.try_reduce(subj);
+        let subj = self.capture_semantic(attempt)?;
         let mut positions = Vec::new();
         collect_positions(
             &loaded.built.engine,
@@ -3811,13 +3986,20 @@ impl MetaDescent<'_> {
     fn meta_xapply(&mut self, ctx: &mut MetaCtx, hooks: &MetaHooks, redex: DagId) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj0 = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let subj0 = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let label = match ctx.repr(*kids.get(2)?) {
             NodeRepr::Qid(s) => s.to_string(),
             _ => return None,
         };
-        let partial =
-            down_partial_substitution(ctx, hooks, &mut loaded.built, *kids.get(3)?, self.interner)?;
+        let attempt = try_down_partial_substitution(
+            ctx,
+            hooks,
+            &mut loaded.built,
+            *kids.get(3)?,
+            self.interner,
+        );
+        let partial = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let min_d = down_nat64(ctx, *kids.get(4)?)? as usize;
         let max_d = down_bound(ctx, hooks, *kids.get(5)?);
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
@@ -3844,7 +4026,8 @@ impl MetaDescent<'_> {
             return None;
         }
         loaded.built.engine.reset_rewrites();
-        let subj = loaded.built.engine.reduce(subj0);
+        let attempt = loaded.built.engine.try_reduce(subj0);
+        let subj = self.capture_semantic(attempt)?;
         // Positions within the depth band, outermost-first; at each, every labelled rule's top matches.
         let mut positions = Vec::new();
         collect_positions(
@@ -3890,7 +4073,8 @@ impl MetaDescent<'_> {
                 let replacement =
                     replace_matched_portion(&mut loaded.built.engine, target, *matched, new_sub);
                 let whole = replace_at(&mut loaded.built.engine, subj, path, replacement);
-                let whole = loaded.built.engine.reduce(whole);
+                let attempt = loaded.built.engine.try_reduce(whole);
+                let whole = self.capture_semantic(attempt)?;
                 ctx.add_rewrites(loaded.built.engine.rewrites() + 1);
                 let ut = up_parsed_term(ctx, hooks, &loaded.built, self.interner, whole);
                 let us = up_sort(ctx, hooks, &loaded.built, whole);
@@ -3934,7 +4118,8 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let subj = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let subj = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let mut vars = VarIndex::new();
         let pattern = down_term_to_term(ctx, hooks, *kids.get(2)?, &loaded.built, &mut vars)?;
         let mut bound_set: BTreeSet<u32> = (0..vars.count()).collect();
@@ -3951,13 +4136,15 @@ impl MetaDescent<'_> {
         let sol_nr = down_nat64(ctx, *kids.get(6)?)? as usize;
         let nr = vars.count();
         loaded.built.engine.reset_rewrites();
-        let mut search = loaded
+        let attempt = loaded
             .built
             .engine
-            .search(subj, pattern, nr, cond, arrow, max_depth);
+            .try_search(subj, pattern, nr, cond, arrow, max_depth);
+        let mut search = self.capture_semantic(attempt)?;
         let mut sol = None;
         for _ in 0..=sol_nr {
-            sol = search.next_solution(&mut loaded.built.engine);
+            let attempt = search.try_next_solution(&mut loaded.built.engine);
+            sol = self.capture_semantic(attempt)?;
             if sol.is_none() {
                 break;
             }
@@ -4027,7 +4214,8 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let t = down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let t = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         let s = loaded.built.engine.sort_of(t);
         Some(up_type(ctx, hooks, &loaded.built, s))
     }
@@ -4271,7 +4459,8 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let ok = match down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner) {
+        let attempt = try_down_term(ctx, hooks, *kids.get(1)?, &mut loaded.built, self.interner);
+        let ok = match capture_reducer_fault(&mut self.reducer_fault, attempt)? {
             Some(t) => term_well_formed(&loaded.built, t),
             None => false,
         };
@@ -4288,7 +4477,9 @@ impl MetaDescent<'_> {
     ) -> Option<DagId> {
         let kids = ctx.children(redex);
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let ok = subst_well_formed(ctx, hooks, &mut loaded.built, *kids.get(1)?, self.interner);
+        let attempt =
+            try_subst_well_formed(ctx, hooks, &mut loaded.built, *kids.get(1)?, self.interner);
+        let ok = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
         up_bool(ctx, ok)
     }
 
@@ -4337,14 +4528,15 @@ impl MetaDescent<'_> {
         let subsorts = up_subsorts_dag(ctx, hooks, &p.subsorts, p.subsort_own_start);
         let ops = up_ops_dag(ctx, hooks, &mut p.loaded, self.interner, &p.ops)?;
         let mbs = up_membs_dag(ctx, hooks, &p.loaded.built, &p.mbs, p.mb_own_end)?;
-        let eqs = up_eqs_dag(
+        let attempt = up_eqs_dag(
             ctx,
             hooks,
             &mut p.loaded.built,
             self.interner,
             &p.eqs,
             p.eq_own_end,
-        )?;
+        );
+        let eqs = self.capture_semantic(attempt)?;
 
         let mut args = vec![header, imports, sorts, subsorts, ops, mbs, eqs];
         let ctor = if p.kind == ModuleKind::System {
@@ -4558,14 +4750,17 @@ impl MetaDescent<'_> {
             )),
             UpPart::Ops => up_ops_dag(ctx, hooks, &mut p.loaded, self.interner, &p.ops),
             UpPart::Mbs => up_membs_dag(ctx, hooks, &p.loaded.built, &p.mbs, p.mb_own_end),
-            UpPart::Eqs => up_eqs_dag(
-                ctx,
-                hooks,
-                &mut p.loaded.built,
-                self.interner,
-                &p.eqs,
-                p.eq_own_end,
-            ),
+            UpPart::Eqs => {
+                let attempt = up_eqs_dag(
+                    ctx,
+                    hooks,
+                    &mut p.loaded.built,
+                    self.interner,
+                    &p.eqs,
+                    p.eq_own_end,
+                );
+                self.capture_semantic(attempt)
+            }
             UpPart::Rls => up_rls_dag(ctx, hooks, &p.loaded.built, &p.rls, p.rl_own_end),
         }
     }
@@ -4643,7 +4838,8 @@ impl MetaDescent<'_> {
             rational: has_option(ctx, option_set, "rat"),
         };
         let mut loaded = self.down_module(ctx, hooks, *kids.first()?)?;
-        let term = down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner)?;
+        let attempt = try_down_term(ctx, hooks, *kids.get(2)?, &mut loaded.built, self.interner);
+        let term = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
         if to_string {
             let printed = print_with_options(&loaded.built, self.interner, term, options);
             // A string value is raw bytes; the printed ASCII text becomes those bytes.
@@ -4733,20 +4929,28 @@ impl MetaDescent<'_> {
                 .map_err(|error| eprintln!("module_pieces {name} home {home} flatten: {error}"))
                 .ok()?;
             shell.statements.clear();
-            let built = build_loaded_module(&shell, self.interner)
-                .map_err(|error| eprintln!("module_pieces {name} home {home} build: {error}"))
-                .ok()?;
+            let attempt = try_build_loaded_module_with_host_functions(
+                &shell,
+                self.interner,
+                &self.host_functions,
+            );
+            let built = capture_loaded_module_build(&mut self.reducer_fault, attempt, |error| {
+                eprintln!("module_pieces {name} home {home} build: {error}")
+            })?;
             home_modules.insert(home.clone(), built);
         }
 
-        let (mut loaded, statement_trace_refs) = build_loaded_module_homed_traced(
+        let attempt = try_build_loaded_module_homed_traced_with_host_functions(
             &flat_pm,
             &statement_homes,
             &|home| home_modules.get(home),
             self.interner,
-        )
-        .map_err(|error| eprintln!("module_pieces {name} build: {error}"))
-        .ok()?;
+            &self.host_functions,
+        );
+        let (mut loaded, statement_trace_refs) =
+            capture_loaded_module_build(&mut self.reducer_fault, attempt, |error| {
+                eprintln!("module_pieces {name} build: {error}")
+            })?;
 
         let (sorts, subsorts, raw_ops, imports, subsort_own_start, op_own_start) = if flat {
             let subsort_own_start = flat_pm.subsorts.len().checked_sub(pm.subsorts.len())?;
@@ -4791,7 +4995,8 @@ impl MetaDescent<'_> {
                         pm.name, name, decl.domain, decl.range
                     );
                 }
-                loaded.built.engine.symbol_identity_dag(symbol?)
+                let attempt = loaded.built.engine.try_symbol_identity_dag(symbol?);
+                capture_reducer_fault(&mut self.reducer_fault, attempt)?
             } else {
                 None
             };
@@ -4840,12 +5045,13 @@ impl MetaDescent<'_> {
         } else {
             own_rule_ids.clone()
         };
-        let canonical_rule_ids = reorder_rules_like_reflection(
+        let attempt = reorder_rules_like_reflection(
             hooks,
             &mut loaded.built,
             self.interner,
             &reflected_rule_ids,
         );
+        let canonical_rule_ids = capture_reducer_fault(&mut self.reducer_fault, attempt)?;
         let canonical_own_rule_ids = if flat { Vec::new() } else { canonical_rule_ids };
         Some(ModulePieces {
             kind: flat_pm.kind,
@@ -4916,7 +5122,9 @@ impl MetaDescent<'_> {
             strat_defs: Vec::new(),
         };
         let flat = flatten_pre(&pm, self.db, self.views, self.interner).ok()?;
-        build_loaded_module(&flat, self.interner).ok()
+        let attempt =
+            try_build_loaded_module_with_host_functions(&flat, self.interner, &self.host_functions);
+        capture_loaded_module_build(&mut self.reducer_fault, attempt, |_| {})
     }
 
     /// Down-translate a meta-module term to an object [`LoadedModule`]: reconstruct its `PreModule`
@@ -5056,18 +5264,27 @@ impl MetaDescent<'_> {
                             let mut shell =
                                 flatten(home, &reordered_db, self.views, self.interner).ok()?;
                             shell.statements.clear();
-                            home_modules.insert(
-                                home.clone(),
-                                build_loaded_module(&shell, self.interner).ok()?,
+                            let attempt = try_build_loaded_module_with_host_functions(
+                                &shell,
+                                self.interner,
+                                &self.host_functions,
                             );
+                            let built = capture_loaded_module_build(
+                                &mut self.reducer_fault,
+                                attempt,
+                                |_| {},
+                            )?;
+                            home_modules.insert(home.clone(), built);
                         }
-                        let (loaded, _) = build_loaded_module_homed_traced(
+                        let attempt = try_build_loaded_module_homed_traced_with_host_functions(
                             &flattened,
                             &statement_homes,
                             &|home| home_modules.get(home),
                             self.interner,
-                        )
-                        .ok()?;
+                            &self.host_functions,
+                        );
+                        let (loaded, _) =
+                            capture_loaded_module_build(&mut self.reducer_fault, attempt, |_| {})?;
                         return Some((Some(source), loaded));
                     }
                     let mut order = HashMap::new();
@@ -5130,65 +5347,101 @@ impl MetaDescent<'_> {
             Ok(flat) => flat,
             Err(_) => return None,
         };
-        let mut loaded = match build_loaded_module(&flat, self.interner) {
-            Ok(loaded) => loaded,
-            Err(_) => return None,
-        };
-
-        // A named module's declared variables materialize its per-sort VariableSymbols in declaration
-        // order. Reproduce that module-lifetime order on every meta down-translation; otherwise two
-        // independent `metaNormalize` calls can AC-sort the same `Set`/`Elt` variables differently.
-        for var in &flat.vars {
-            let sort = if let Some(inner) = var
-                .sort
-                .strip_prefix('[')
-                .and_then(|name| name.strip_suffix(']'))
-            {
-                let first = inner.split(',').next()?.trim();
-                let member = *loaded.built.sorts.get(first)?;
-                let kind = loaded.built.engine.sorts().kind_of(member);
-                loaded.built.engine.sorts().error_sort(kind)
-            } else {
-                *loaded.built.sorts.get(&var.sort)?
-            };
-            loaded.built.engine.variable_symbol(sort);
-        }
-        // Install this module's own inline declarations (the imports' statements came through `flatten`,
-        // parsed by `build_loaded_module`; these are reconstructed straight from their meta-terms).
+        // Install every reflected statement in the loader's pre-binding transaction. Signature building
+        // validates and resolves HostFunctionSymbol attachments against the configured catalog, but their
+        // one-way bindings are committed only after this callback succeeds. In particular, ordinary and
+        // owise equations must reach a strict host operator before binding seals its top symbol.
         let mut source_statements = retain_source.then(Vec::new);
-        install_membs(
-            ctx,
-            hooks,
-            *kids.get(5)?,
-            &mut loaded.built,
-            source_statements.as_mut(),
+        let mut loaded = match try_build_loaded_module_with_host_functions_and_inline_statements(
+            &flat,
             self.interner,
-        )?;
+            &self.host_functions,
+            |built, interner| {
+                // A named module's declared variables materialize its per-sort VariableSymbols in
+                // declaration order. Reproduce that module-lifetime order on every meta down-translation;
+                // otherwise independent `metaNormalize` calls can AC-sort the same variables differently.
+                for var in &flat.vars {
+                    let sort = if let Some(inner) = var
+                        .sort
+                        .strip_prefix('[')
+                        .and_then(|name| name.strip_suffix(']'))
+                    {
+                        let first = inner
+                            .split(',')
+                            .next()
+                            .ok_or_else(|| "empty reflected kind variable sort".to_string())?
+                            .trim();
+                        let member = *built
+                            .sorts
+                            .get(first)
+                            .ok_or_else(|| format!("unknown reflected variable sort `{first}`"))?;
+                        let kind = built.engine.sorts().kind_of(member);
+                        built.engine.sorts().error_sort(kind)
+                    } else {
+                        *built.sorts.get(&var.sort).ok_or_else(|| {
+                            format!("unknown reflected variable sort `{}`", var.sort)
+                        })?
+                    };
+                    built.engine.variable_symbol(sort);
+                }
 
-        install_eqs(
-            ctx,
-            hooks,
-            *kids.get(6)?,
-            &mut loaded.built,
-            source_statements.as_mut(),
-            self.interner,
-        )?;
+                // Imported statements were loaded from `flat` immediately before this callback. Decode
+                // the reflected module's own statements directly into the same still-unbound engine.
+                install_membs(
+                    ctx,
+                    hooks,
+                    *kids
+                        .get(5)
+                        .ok_or_else(|| "reflected module has no membership set".to_string())?,
+                    built,
+                    source_statements.as_mut(),
+                    interner,
+                )
+                .ok_or_else(|| "invalid reflected membership set".to_string())?;
 
-        if kind == ModuleKind::System {
-            install_rules(
-                ctx,
-                hooks,
-                *kids.get(7)?,
-                &mut loaded.built,
-                self.interner,
-                source_statements.as_mut(),
-            )?;
-        }
+                install_eqs(
+                    ctx,
+                    hooks,
+                    *kids
+                        .get(6)
+                        .ok_or_else(|| "reflected module has no equation set".to_string())?,
+                    built,
+                    source_statements.as_mut(),
+                    interner,
+                )
+                .ok_or_else(|| "invalid reflected equation set".to_string())?;
+
+                if kind == ModuleKind::System {
+                    install_rules(
+                        ctx,
+                        hooks,
+                        *kids
+                            .get(7)
+                            .ok_or_else(|| "reflected system module has no rule set".to_string())?,
+                        built,
+                        interner,
+                        source_statements.as_mut(),
+                    )
+                    .map_err(LoadedModuleBuildError::Reducer)?
+                    .ok_or_else(|| "invalid reflected rule set".to_string())?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(loaded) => loaded,
+            Err(LoadedModuleBuildError::Reducer(fault)) => {
+                debug_assert!(self.reducer_fault.is_none());
+                self.reducer_fault = Some(fault);
+                return None;
+            }
+            Err(LoadedModuleBuildError::Invalid(_)) => return None,
+        };
 
         if is_strategy {
             pm.strat_decls = down_strat_decls(ctx, hooks, *kids.get(8)?)?;
-            pm.strat_defs =
-                down_strat_defs(ctx, hooks, *kids.get(9)?, &mut loaded.built, self.interner)?;
+            let attempt =
+                try_down_strat_defs(ctx, hooks, *kids.get(9)?, &mut loaded.built, self.interner);
+            pm.strat_defs = capture_reducer_fault(&mut self.reducer_fault, attempt)??;
             loaded.built.strat_defs.clone_from(&pm.strat_defs);
         }
 
@@ -6500,9 +6753,9 @@ fn reorder_rules_like_reflection(
     m: &mut BuiltModule,
     interner: &mut Interner,
     selected_ids: &[u32],
-) -> Vec<u32> {
+) -> Result<Vec<u32>, ReducerFault> {
     if selected_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let qid = hooks.ops["qidSymbol"];
     let meta_term = hooks.ops["metaTermSymbol"];
@@ -6522,7 +6775,7 @@ fn reorder_rules_like_reflection(
             .collect();
         let lhs = m
             .engine
-            .normalize_pattern_for_reflection(&trace.lhs, &variable_codes);
+            .try_normalize_pattern_for_reflection(&trace.lhs, &variable_codes)?;
         let key =
             reflected_pattern_key(m, interner, &trace.var_names, lhs, qid, meta_term, meta_arg);
         ordered.push((!trace.condition.is_empty(), key, id));
@@ -6556,7 +6809,7 @@ fn reorder_rules_like_reflection(
         })
         .collect();
     m.engine.reorder_rules(&full_order);
-    canonical_ids
+    Ok(canonical_ids)
 }
 
 /// Reorder retained source rules to their reflected RuleSet order so child interpreters preserve the
@@ -6623,150 +6876,164 @@ fn install_rules(
     m: &mut BuiltModule,
     interner: &mut Interner,
     mut source: Option<&mut Vec<Statement>>,
-) -> Option<()> {
-    let empty = hooks.ops.get("emptyRuleSetSymbol").copied();
-    let join = hooks.ops.get("ruleSetSymbol").copied();
-    let rl = hooks.ops.get("rlSymbol").copied();
-    let crl = hooks.ops.get("crlSymbol").copied();
-    // A meta RuleSet is AC, so its iteration order is semantic. Source traces retain unnormalized patterns;
-    // rebuild each lhs as a normalized symbolic DAG for ordering while decoding from the original statement.
-    let qid = hooks.ops["qidSymbol"];
-    let meta_term = hooks.ops["metaTermSymbol"];
-    let meta_arg = hooks.ops["metaArgSymbol"];
-    let statements = flatten_set(ctx, d, empty, join);
-    let mut symbol_ranks = Vec::new();
-    let mut ordered = Vec::with_capacity(statements.len());
-    for (index, stmt) in statements.into_iter().enumerate() {
-        let symbol = ctx.top(stmt);
-        let symbol_rank = if let Some(rank) = symbol_ranks
-            .iter()
-            .position(|&candidate| candidate == symbol)
-        {
-            rank
-        } else {
-            symbol_ranks.push(symbol);
-            symbol_ranks.len() - 1
-        };
-        let mut vars = VarIndex::new();
-        let lhs = down_term_to_term(ctx, hooks, *ctx.children(stmt).first()?, m, &mut vars)?;
-        let variable_codes: Vec<u32> = (0..vars.count())
-            .map(|slot| {
-                let name = vars.name(slot);
-                let base = name.split_once(':').map_or(name, |(base, _)| base);
-                interner.intern(base).index()
-            })
-            .collect();
-        let names: Vec<String> = (0..vars.count())
-            .map(|slot| vars.name(slot).to_string())
-            .collect();
-        let lhs = m
-            .engine
-            .normalize_pattern_for_reflection(&lhs, &variable_codes);
-        let key = reflected_pattern_key(m, interner, &names, lhs, qid, meta_term, meta_arg);
-        ordered.push((symbol_rank, key, index, stmt));
-    }
-    ordered.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| {
-                compare_reflected_pattern_keys(&left.1, &right.1, qid, meta_term, meta_arg)
-            })
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    for (_, _, _, stmt) in ordered {
-        let sym = Some(ctx.top(stmt));
-        let kids = ctx.children(stmt);
-        let mut vars = VarIndex::new();
-        let (lhs, rhs, condition, attrs) = if sym == rl {
-            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
-            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
-            (lhs, rhs, Vec::new(), *kids.get(2)?)
-        } else if sym == crl {
-            let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
-            let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-            let cond = down_condition(ctx, hooks, *kids.get(2)?, m, &mut vars, &mut bound)?;
-            let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
-            (lhs, rhs, cond, *kids.get(3)?)
-        } else {
-            return None;
-        };
-        let nonexec = attrset_has(ctx, hooks, attrs, "nonexecSymbol");
-        let narrowing = attrset_has(ctx, hooks, attrs, "narrowingSymbol");
-        let label = attrset_label(ctx, hooks, attrs);
-        let nr = vars.count();
-        let var_names: Vec<String> = (0..nr).map(|k| vars.name(k).to_string()).collect();
-        if let Some(source) = source.as_deref_mut() {
-            let source_names = typed_source_var_names(m, &vars);
-            source.push(Statement::Rule {
-                label: label.clone(),
-                lhs: source_term_tokens(m, interner, &lhs, &source_names),
-                rhs: source_term_tokens(m, interner, &rhs, &source_names),
-                cond: (!condition.is_empty())
-                    .then(|| source_condition_tokens(m, interner, &condition, &source_names)),
-                nonexec,
-                narrowing,
-            });
-        }
-        if narrowing && !condition.is_empty() {
-            continue;
-        }
-        let variable_specs = (0..nr)
-            .map(|slot| {
-                let source = vars.name(slot);
-                let base = source.split_once(':').map_or(source, |(base, _)| base);
-                tnk_core::unify::problem::VarSpec {
-                    sort: vars.sort(slot),
-                    name: maude_variable_name_rank(base, interner.intern(base).index()),
+) -> Result<Option<()>, ReducerFault> {
+    let mut reducer_fault = None;
+    let result = (|| {
+        let empty = hooks.ops.get("emptyRuleSetSymbol").copied();
+        let join = hooks.ops.get("ruleSetSymbol").copied();
+        let rl = hooks.ops.get("rlSymbol").copied();
+        let crl = hooks.ops.get("crlSymbol").copied();
+        // A meta RuleSet is AC, so its iteration order is semantic. Source traces retain unnormalized patterns;
+        // rebuild each lhs as a normalized symbolic DAG for ordering while decoding from the original statement.
+        let qid = hooks.ops["qidSymbol"];
+        let meta_term = hooks.ops["metaTermSymbol"];
+        let meta_arg = hooks.ops["metaArgSymbol"];
+        let statements = flatten_set(ctx, d, empty, join);
+        let mut symbol_ranks = Vec::new();
+        let mut ordered = Vec::with_capacity(statements.len());
+        for (index, stmt) in statements.into_iter().enumerate() {
+            let symbol = ctx.top(stmt);
+            let symbol_rank = if let Some(rank) = symbol_ranks
+                .iter()
+                .position(|&candidate| candidate == symbol)
+            {
+                rank
+            } else {
+                symbol_ranks.push(symbol);
+                symbol_ranks.len() - 1
+            };
+            let mut vars = VarIndex::new();
+            let lhs = down_term_to_term(ctx, hooks, *ctx.children(stmt).first()?, m, &mut vars)?;
+            let variable_codes: Vec<u32> = (0..vars.count())
+                .map(|slot| {
+                    let name = vars.name(slot);
+                    let base = name.split_once(':').map_or(name, |(base, _)| base);
+                    interner.intern(base).index()
+                })
+                .collect();
+            let names: Vec<String> = (0..vars.count())
+                .map(|slot| vars.name(slot).to_string())
+                .collect();
+            let lhs = match m
+                .engine
+                .try_normalize_pattern_for_reflection(&lhs, &variable_codes)
+            {
+                Ok(lhs) => lhs,
+                Err(fault) => {
+                    reducer_fault = Some(fault);
+                    return None;
                 }
-            })
-            .collect();
-        // Statements are installed after `build_loaded_module`. Register their dedicated SMT descriptors,
-        // including `[nonexec]` rules, so restriction checks inspect the complete reflected rule set.
-        m.engine.add_smt_rule(
-            lhs.clone(),
-            rhs.clone(),
-            (0..nr).map(|slot| vars.sort(slot)).collect(),
-            var_names.clone(),
-            condition.clone(),
-        );
-        if narrowing {
-            m.engine.add_narrowing_rule(
+            };
+            let key = reflected_pattern_key(m, interner, &names, lhs, qid, meta_term, meta_arg);
+            ordered.push((symbol_rank, key, index, stmt));
+        }
+        ordered.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| {
+                    compare_reflected_pattern_keys(&left.1, &right.1, qid, meta_term, meta_arg)
+                })
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        for (_, _, _, stmt) in ordered {
+            let sym = Some(ctx.top(stmt));
+            let kids = ctx.children(stmt);
+            let mut vars = VarIndex::new();
+            let (lhs, rhs, condition, attrs) = if sym == rl {
+                let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+                let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+                (lhs, rhs, Vec::new(), *kids.get(2)?)
+            } else if sym == crl {
+                let lhs = down_term_to_term(ctx, hooks, *kids.first()?, m, &mut vars)?;
+                let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
+                let cond = down_condition(ctx, hooks, *kids.get(2)?, m, &mut vars, &mut bound)?;
+                let rhs = down_term_to_term(ctx, hooks, *kids.get(1)?, m, &mut vars)?;
+                (lhs, rhs, cond, *kids.get(3)?)
+            } else {
+                return None;
+            };
+            let nonexec = attrset_has(ctx, hooks, attrs, "nonexecSymbol");
+            let narrowing = attrset_has(ctx, hooks, attrs, "narrowingSymbol");
+            let label = attrset_label(ctx, hooks, attrs);
+            let nr = vars.count();
+            let var_names: Vec<String> = (0..nr).map(|k| vars.name(k).to_string()).collect();
+            if let Some(source) = source.as_deref_mut() {
+                let source_names = typed_source_var_names(m, &vars);
+                source.push(Statement::Rule {
+                    label: label.clone(),
+                    lhs: source_term_tokens(m, interner, &lhs, &source_names),
+                    rhs: source_term_tokens(m, interner, &rhs, &source_names),
+                    cond: (!condition.is_empty())
+                        .then(|| source_condition_tokens(m, interner, &condition, &source_names)),
+                    nonexec,
+                    narrowing,
+                });
+            }
+            if narrowing && !condition.is_empty() {
+                continue;
+            }
+            let variable_specs = (0..nr)
+                .map(|slot| {
+                    let source = vars.name(slot);
+                    let base = source.split_once(':').map_or(source, |(base, _)| base);
+                    tnk_core::unify::problem::VarSpec {
+                        sort: vars.sort(slot),
+                        name: maude_variable_name_rank(base, interner.intern(base).index()),
+                    }
+                })
+                .collect();
+            // Statements are installed after `build_loaded_module`. Register their dedicated SMT descriptors,
+            // including `[nonexec]` rules, so restriction checks inspect the complete reflected rule set.
+            m.engine.add_smt_rule(
                 lhs.clone(),
                 rhs.clone(),
-                variable_specs,
+                (0..nr).map(|slot| vars.sort(slot)).collect(),
                 var_names.clone(),
                 condition.clone(),
-                label.clone(),
-                nonexec,
             );
+            if narrowing {
+                m.engine.add_narrowing_rule(
+                    lhs.clone(),
+                    rhs.clone(),
+                    variable_specs,
+                    var_names.clone(),
+                    condition.clone(),
+                    label.clone(),
+                    nonexec,
+                );
+            }
+            if nonexec || lhs.top_symbol().is_none() {
+                continue;
+            }
+            let shared_label = label.as_deref().map(std::rc::Rc::<str>::from);
+            let trace = RlTrace {
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                condition: condition.clone(),
+                var_names,
+                label: shared_label.clone(),
+                nonexec: false,
+                narrowing,
+            };
+            let id = if condition.is_empty() {
+                m.engine.add_labelled_rule(lhs, rhs, nr, shared_label)
+            } else {
+                m.engine
+                    .add_labelled_conditional_rule(lhs, rhs, nr, condition, shared_label)
+            };
+            assert_eq!(
+                id as usize,
+                m.rl_traces.len(),
+                "rule id is the dense rl_traces index"
+            );
+            m.rl_traces.push(trace);
         }
-        if nonexec || lhs.top_symbol().is_none() {
-            continue;
-        }
-        let shared_label = label.as_deref().map(std::rc::Rc::<str>::from);
-        let trace = RlTrace {
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
-            condition: condition.clone(),
-            var_names,
-            label: shared_label.clone(),
-            nonexec: false,
-            narrowing,
-        };
-        let id = if condition.is_empty() {
-            m.engine.add_labelled_rule(lhs, rhs, nr, shared_label)
-        } else {
-            m.engine
-                .add_labelled_conditional_rule(lhs, rhs, nr, condition, shared_label)
-        };
-        assert_eq!(
-            id as usize,
-            m.rl_traces.len(),
-            "rule id is the dense rl_traces index"
-        );
-        m.rl_traces.push(trace);
+        Some(())
+    })();
+    match reducer_fault {
+        Some(fault) => Err(fault),
+        None => Ok(result),
     }
-    Some(())
 }
 
 /// Down-translate a meta `Condition`/`EqCondition` into kernel [`ConditionFragment`]s. `nil` is the empty
@@ -7252,6 +7519,11 @@ fn down_renaming_attrs(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> Option<Att
 
 /// Down-translate a meta-term into a DAG in `target` (the object module). Handles a constant `'c.S`
 /// (a `Qid` leaf), an application `'f[args]` (a `metaTermSymbol` node), and the iterated form `'s_^n[t]`.
+///
+/// # Panics
+///
+/// Panics if a strict reducer fails while theory-aware construction materializes an identity. Fallible
+/// semantic owners must use [`try_down_term`].
 pub fn down_term(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
@@ -7259,47 +7531,68 @@ pub fn down_term(
     target: &mut BuiltModule,
     interner: &mut Interner,
 ) -> Option<DagId> {
-    let mut vars = VarIndex::new();
-    down_term_inner(ctx, hooks, t, target, &mut vars, interner)
+    try_down_term(ctx, hooks, t, target, interner)
+        .unwrap_or_else(|fault| panic!("meta-term construction failed: {fault}"))
 }
 
-fn down_term_inner(
+/// Fallible meta-term down-translation for semantic owners that must preserve strict reducer faults
+/// raised while a theory-aware application materializes an attached identity.
+pub fn try_down_term(
+    ctx: &MetaCtx,
+    hooks: &MetaHooks,
+    t: DagId,
+    target: &mut BuiltModule,
+    interner: &mut Interner,
+) -> Result<Option<DagId>, ReducerFault> {
+    let mut vars = VarIndex::new();
+    try_down_term_inner(ctx, hooks, t, target, &mut vars, interner)
+}
+
+fn try_down_term_inner(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     t: DagId,
     target: &mut BuiltModule,
     vars: &mut VarIndex,
     interner: &mut Interner,
-) -> Option<DagId> {
+) -> Result<Option<DagId>, ReducerFault> {
     let meta_term = hooks.ops.get("metaTermSymbol").copied();
     match ctx.repr(t) {
-        NodeRepr::Qid(text) => down_leaf_to_dag(text, target, vars, interner),
+        NodeRepr::Qid(text) => Ok(down_leaf_to_dag(text, target, vars, interner)),
         NodeRepr::App
             if Some(ctx.top(t)) == meta_term
                 || (ctx.name(ctx.top(t)) == "_[_]" && ctx.children(t).len() == 2) =>
         {
             let kids = ctx.children(t);
-            let head = match ctx.repr(*kids.first()?) {
-                NodeRepr::Qid(s) => s.to_string(),
-                _ => return None,
+            let Some(&head) = kids.first() else {
+                return Ok(None);
             };
-            let args = down_arglist(ctx, hooks, *kids.get(1)?, target, vars, interner)?;
-            build_app(&head, args, target)
+            let head = match ctx.repr(head) {
+                NodeRepr::Qid(s) => s.to_string(),
+                _ => return Ok(None),
+            };
+            let Some(&args) = kids.get(1) else {
+                return Ok(None);
+            };
+            let Some(args) = try_down_arglist(ctx, hooks, args, target, vars, interner)? else {
+                return Ok(None);
+            };
+            try_build_app(&head, args, target)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Down-translate a `metaTermSymbol` argument list — a `metaArgSymbol` (`_,_`) AU node flattens to its
 /// elements; anything else is a single argument.
-fn down_arglist(
+fn try_down_arglist(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     list: DagId,
     target: &mut BuiltModule,
     vars: &mut VarIndex,
     interner: &mut Interner,
-) -> Option<Vec<DagId>> {
+) -> Result<Option<Vec<DagId>>, ReducerFault> {
     let arg_sym = hooks.ops.get("metaArgSymbol").copied();
     // A hand-written meta-term can resolve `_,_` through a declaration clone distinct from the symbol
     // captured by META-LEVEL's hook table. The enclosing `_[_]` fixes this child at `TermList`, so the
@@ -7307,14 +7600,20 @@ fn down_arglist(
     let is_arg_list = Some(ctx.top(list)) == arg_sym
         || (ctx.name(ctx.top(list)) == "_,_" && ctx.children(list).len() >= 2);
     if is_arg_list {
-        ctx.children(list)
-            .into_iter()
-            .map(|c| down_term_inner(ctx, hooks, c, target, vars, interner))
-            .collect()
+        let children = ctx.children(list);
+        let mut args = Vec::with_capacity(children.len());
+        for child in children {
+            let Some(arg) = try_down_term_inner(ctx, hooks, child, target, vars, interner)? else {
+                return Ok(None);
+            };
+            args.push(arg);
+        }
+        Ok(Some(args))
     } else {
-        Some(vec![down_term_inner(
-            ctx, hooks, list, target, vars, interner,
-        )?])
+        let Some(arg) = try_down_term_inner(ctx, hooks, list, target, vars, interner)? else {
+            return Ok(None);
+        };
+        Ok(Some(vec![arg]))
     }
 }
 
@@ -7360,30 +7659,39 @@ fn down_constant(text: &str, target: &mut BuiltModule) -> Option<DagId> {
 
 /// Build an application from a meta op-name + down-translated args. An iterated name `base^n` builds the
 /// `iter` successor `base^n(arg)`; otherwise the operator is looked up by `(name, arity)`.
-fn build_app(head: &str, args: Vec<DagId>, target: &mut BuiltModule) -> Option<DagId> {
+fn try_build_app(
+    head: &str,
+    args: Vec<DagId>,
+    target: &mut BuiltModule,
+) -> Result<Option<DagId>, ReducerFault> {
     let head = strip_op_blanks(head);
     if let Some((base, count)) = head.rsplit_once('^')
         && let Ok(n) = count.parse::<u64>()
     {
         if args.len() != 1 {
-            return None;
+            return Ok(None);
         }
-        let sym = *target.ops.get(&(base.to_string(), 1))?;
-        return Some(target.engine.make_iter(sym, n, args[0]));
+        let Some(&sym) = target.ops.get(&(base.to_string(), 1)) else {
+            return Ok(None);
+        };
+        return Ok(Some(target.engine.make_iter(sym, n, args[0])));
     }
     let argument_sorts: Vec<SortId> = args
         .iter()
         .map(|&argument| target.engine.sort_of(argument))
         .collect();
-    let sym = target
+    let Some(sym) = target
         .engine
         .resolve_operator_for_sorts(&head, &argument_sorts)
         .or_else(|| {
             target
                 .engine
                 .resolve_operator_for_kinds(&head, &argument_sorts)
-        })?;
-    Some(target.engine.make_node(sym, args))
+        })
+    else {
+        return Ok(None);
+    };
+    Ok(Some(target.engine.try_make_node(sym, args)?))
 }
 
 /// Encode an operator name as a META Qid, prefixing splitting punctuation with backticks. Canonical
@@ -7893,50 +8201,49 @@ fn term_well_formed(m: &BuiltModule, t: DagId) -> bool {
     kids.iter().all(|&k| term_well_formed(m, k))
 }
 
-/// Whether meta `Substitution` `d` is well-formed in `m`: every assignment `'X:Sort <- value` has a value
-/// that down-translates to a well-formed term whose kind matches the variable's sort. `wellFormed(M, S)`.
-fn subst_well_formed(
+/// Whether meta `Substitution` `d` is well-formed in `m`: every assignment `'X:Sort <- value` has a
+/// value that down-translates to a well-formed term whose kind matches the variable's sort. Strict
+/// reducer faults raised during construction remain distinct from malformed substitutions.
+fn try_subst_well_formed(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     m: &mut BuiltModule,
     d: DagId,
     interner: &mut Interner,
-) -> bool {
+) -> Result<bool, ReducerFault> {
     let empty = hooks.ops.get("emptySubstitutionSymbol").copied();
     let join = hooks.ops.get("substitutionSymbol").copied();
     let assign = hooks.ops.get("assignmentSymbol").copied();
     for a in flatten_set(ctx, d, empty, join) {
         if Some(ctx.top(a)) != assign {
-            return false;
+            return Ok(false);
         }
         let kids = ctx.children(a);
         let Some((_, sort_name)) = kids.first().and_then(|&k| qid_text(ctx, k)).and_then(|t| {
             t.split_once(':')
                 .map(|(n, s)| (n.to_string(), s.to_string()))
         }) else {
-            return false;
+            return Ok(false);
         };
         let Some(&var_sort) = m.sorts.get(&sort_name) else {
-            return false;
+            return Ok(false);
         };
         let Some(&val) = kids.get(1) else {
-            return false;
+            return Ok(false);
         };
-        match down_term(ctx, hooks, val, m, interner) {
-            Some(value) => {
-                if !term_well_formed(m, value)
-                    || !m
-                        .engine
-                        .sorts()
-                        .same_kind(m.engine.sort_of(value), var_sort)
-                {
-                    return false;
-                }
-            }
-            None => return false,
+        let Some(value) = try_down_term(ctx, hooks, val, m, interner)? else {
+            return Ok(false);
+        };
+        if !term_well_formed(m, value)
+            || !m
+                .engine
+                .sorts()
+                .same_kind(m.engine.sort_of(value), var_sort)
+        {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 // ---- Declaration projections into the meta representation ----
@@ -9162,8 +9469,8 @@ fn hook_signature_parts(
     Some((name, domain, range))
 }
 
-/// Reflect the symbol selected by an `op-hook`. Use its first declaration and represent kind positions by
-/// component sort 1.
+/// Reflect the exact declaration selected by an `op-hook`, representing kind positions by component
+/// sort 1.
 fn reflected_hook_signature(
     lm: &LoadedModule,
     name: &str,
@@ -9186,7 +9493,7 @@ fn reflected_hook_signature(
         .engine
         .symbol_declarations(symbol)
         .into_iter()
-        .next()?;
+        .find(|(domain, range)| domain == &argument_sorts && *range == source_range)?;
     let domain = domain
         .into_iter()
         .map(|sort| hook_sort_name(lm, sort))
@@ -9356,13 +9663,13 @@ fn up_eqs_dag(
     interner: &mut Interner,
     traces: &[EqTrace],
     own_end: usize,
-) -> Option<DagId> {
+) -> Result<DagId, ReducerFault> {
     let mut elems = Vec::new();
     for (index, t) in traces.iter().enumerate() {
         let (lhs, rhs) = if t.variant {
             (
-                up_normalized_pattern(ctx, hooks, m, interner, &t.lhs, &t.var_names),
-                up_normalized_pattern(ctx, hooks, m, interner, &t.rhs, &t.var_names),
+                up_normalized_pattern(ctx, hooks, m, interner, &t.lhs, &t.var_names)?,
+                up_normalized_pattern(ctx, hooks, m, interner, &t.rhs, &t.var_names)?,
             )
         } else {
             (
@@ -9388,7 +9695,7 @@ fn up_eqs_dag(
         elems.push((eq, index < own_end));
     }
     let elems = retain_import_set_elements(ctx, elems);
-    Some(up_set(
+    Ok(up_set(
         ctx,
         elems,
         hooks.ops["emptyEquationSetSymbol"],
@@ -10034,7 +10341,7 @@ fn up_normalized_pattern(
     interner: &mut Interner,
     term: &Term,
     names: &[String],
-) -> DagId {
+) -> Result<DagId, ReducerFault> {
     let variable_codes: Vec<u32> = names
         .iter()
         .map(|name| {
@@ -10044,8 +10351,16 @@ fn up_normalized_pattern(
         .collect();
     let normalized = source
         .engine
-        .normalize_pattern_for_reflection(term, &variable_codes);
-    up_term_inner(ctx, hooks, source, Some(interner), None, false, normalized)
+        .try_normalize_pattern_for_reflection(term, &variable_codes)?;
+    Ok(up_term_inner(
+        ctx,
+        hooks,
+        source,
+        Some(interner),
+        None,
+        false,
+        normalized,
+    ))
 }
 
 fn up_pattern(
@@ -10380,34 +10695,40 @@ fn is_nil_condition(ctx: &MetaCtx, hooks: &MetaHooks, d: DagId) -> bool {
     Some(ctx.top(d)) == hooks.ops.get("noConditionSymbol").copied()
 }
 
-/// Down-translate a META `Substitution` into object-level DAG bindings keyed by its full
-/// `name:Sort` variable Qid. Duplicate assignments and malformed set members are rejected.
-fn down_partial_substitution(
+/// Down-translate a META partial substitution, preserving strict reducer faults raised while a value
+/// materializes a theory identity.
+fn try_down_partial_substitution(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     module: &mut BuiltModule,
     d: DagId,
     interner: &mut Interner,
-) -> Option<HashMap<String, DagId>> {
+) -> Result<Option<HashMap<String, DagId>>, ReducerFault> {
     let empty = hooks.ops.get("emptySubstitutionSymbol").copied();
     let join = hooks.ops.get("substitutionSymbol").copied();
-    let assign = hooks.ops.get("assignmentSymbol").copied()?;
+    let Some(assign) = hooks.ops.get("assignmentSymbol").copied() else {
+        return Ok(None);
+    };
     let mut bindings = HashMap::new();
     for assignment in flatten_set(ctx, d, empty, join) {
         if ctx.top(assignment) != assign {
-            return None;
+            return Ok(None);
         }
         let kids = ctx.children(assignment);
         if kids.len() != 2 {
-            return None;
+            return Ok(None);
         }
-        let name = qid_text(ctx, kids[0])?;
-        let value = down_term(ctx, hooks, kids[1], module, interner)?;
+        let Some(name) = qid_text(ctx, kids[0]) else {
+            return Ok(None);
+        };
+        let Some(value) = try_down_term(ctx, hooks, kids[1], module, interner)? else {
+            return Ok(None);
+        };
         if bindings.insert(name, value).is_some() {
-            return None;
+            return Ok(None);
         }
     }
-    Some(bindings)
+    Ok(Some(bindings))
 }
 
 /// Align a name-keyed partial substitution with one compiled rule's dense variable slots.
@@ -10492,13 +10813,13 @@ fn down_strat_decls(
     Some(result)
 }
 
-fn down_strat_defs(
+fn try_down_strat_defs(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     definitions: DagId,
     module: &mut BuiltModule,
     interner: &mut Interner,
-) -> Option<Vec<StratDef>> {
+) -> Result<Option<Vec<StratDef>>, ReducerFault> {
     let elements = flatten_set(
         ctx,
         definitions,
@@ -10512,28 +10833,35 @@ fn down_strat_defs(
         let is_csd = Some(top) == hooks.ops.get("csdSymbol").copied();
         let kids = ctx.children(element);
         if (!is_sd && !is_csd) || kids.len() != if is_sd { 3 } else { 4 } {
-            return None;
+            return Ok(None);
         }
-
         let call = kids[0];
         if Some(ctx.top(call)) != hooks.ops.get("callStratSymbol").copied() {
-            return None;
+            return Ok(None);
         }
         let call_kids = ctx.children(call);
         if call_kids.len() != 2 {
-            return None;
+            return Ok(None);
         }
-
         let mut vars = VarIndex::new();
-        let params = down_term_list_roots(ctx, hooks, call_kids[1])?
+        let Some(param_roots) = down_term_list_roots(ctx, hooks, call_kids[1]) else {
+            return Ok(None);
+        };
+        let Some(params) = param_roots
             .into_iter()
             .map(|term| down_term_to_term(ctx, hooks, term, module, &mut vars))
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
         let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
         let condition = if is_csd {
-            Some(down_condition(
-                ctx, hooks, kids[2], module, &mut vars, &mut bound,
-            )?)
+            let Some(condition) =
+                down_condition(ctx, hooks, kids[2], module, &mut vars, &mut bound)
+            else {
+                return Ok(None);
+            };
+            Some(condition)
         } else {
             None
         };
@@ -10545,9 +10873,14 @@ fn down_strat_defs(
         let condition = condition
             .as_deref()
             .map(|condition| source_condition_tokens(module, interner, condition, &names));
-        let body = down_strategy(ctx, hooks, kids[1], module, interner)?;
+        let Some(body) = try_down_strategy(ctx, hooks, kids[1], module, interner)? else {
+            return Ok(None);
+        };
+        let Some(name) = qid_text(ctx, call_kids[0]) else {
+            return Ok(None);
+        };
         result.push(StratDef {
-            name: qid_text(ctx, call_kids[0])?,
+            name,
             params,
             body,
             cond: condition,
@@ -10556,35 +10889,33 @@ fn down_strat_defs(
             home: None,
         });
     }
-    Some(result)
+    Ok(Some(result))
 }
 
-/// Down-translate the constructor subset used by META-INTERPRETER's `srewriteTerm`.
-/// Term-carrying match tests, matchrew, and rule-application substitutions remain on the
-/// separate strategy-reflection boundary; named-call arguments are reconstructed in module syntax.
-fn down_strategy(
+/// Down-translate the constructor subset used by META-INTERPRETER's `srewriteTerm`, preserving strict
+/// reducer faults raised while named-call arguments materialize theory identities.
+fn try_down_strategy(
     ctx: &MetaCtx,
     hooks: &MetaHooks,
     dag: DagId,
     module: &mut BuiltModule,
     interner: &mut Interner,
-) -> Option<StratExpr> {
+) -> Result<Option<StratExpr>, ReducerFault> {
     let top = ctx.top(dag);
     let kids = ctx.children(dag);
     let is = |hook: &str| Some(top) == hooks.ops.get(hook).copied();
-
     if is("failStratSymbol") {
-        return Some(StratExpr::Fail);
+        return Ok(Some(StratExpr::Fail));
     }
     if is("idleStratSymbol") {
-        return Some(StratExpr::Idle);
+        return Ok(Some(StratExpr::Idle));
     }
     if is("allStratSymbol") {
-        return Some(StratExpr::All);
+        return Ok(Some(StratExpr::All));
     }
     if is("applicationStratSymbol") {
         if kids.len() != 3 {
-            return None;
+            return Ok(None);
         }
         let substitutions = flatten_set(
             ctx,
@@ -10593,39 +10924,49 @@ fn down_strategy(
             hooks.ops.get("substitutionSymbol").copied(),
         );
         if !substitutions.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let substrats = flatten_set(
+        let children = flatten_set(
             ctx,
             kids[2],
             hooks.ops.get("emptyStratListSymbol").copied(),
             hooks.ops.get("stratListSymbol").copied(),
-        )
-        .into_iter()
-        .map(|child| down_strategy(ctx, hooks, child, module, interner))
-        .collect::<Option<Vec<_>>>()?;
-        return Some(StratExpr::Apply {
-            label: qid_text(ctx, kids[0])?,
+        );
+        let mut substrats = Vec::with_capacity(children.len());
+        for child in children {
+            let Some(strategy) = try_down_strategy(ctx, hooks, child, module, interner)? else {
+                return Ok(None);
+            };
+            substrats.push(strategy);
+        }
+        let Some(label) = qid_text(ctx, kids[0]) else {
+            return Ok(None);
+        };
+        return Ok(Some(StratExpr::Apply {
+            label,
             subst: Vec::new(),
             substrats,
-        });
+        }));
     }
     if is("callStratSymbol") {
         if kids.len() != 2 {
-            return None;
+            return Ok(None);
         }
-        let args = down_term_list_roots(ctx, hooks, kids[1])?
-            .into_iter()
-            .map(|root| {
-                let term = down_term(ctx, hooks, root, module, interner)?;
-                let text = print_raw(module, interner, term);
-                Some(tokenize(&text, interner))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        return Some(StratExpr::Call {
-            name: qid_text(ctx, kids[0])?,
-            args,
-        });
+        let Some(roots) = down_term_list_roots(ctx, hooks, kids[1]) else {
+            return Ok(None);
+        };
+        let mut args = Vec::with_capacity(roots.len());
+        for root in roots {
+            let Some(term) = try_down_term(ctx, hooks, root, module, interner)? else {
+                return Ok(None);
+            };
+            let text = print_raw(module, interner, term);
+            args.push(tokenize(&text, interner));
+        }
+        let Some(name) = qid_text(ctx, kids[0]) else {
+            return Ok(None);
+        };
+        return Ok(Some(StratExpr::Call { name, args }));
     }
     if is("topStratSymbol")
         || is("oneStratSymbol")
@@ -10636,8 +10977,14 @@ fn down_strategy(
         || is("testStratSymbol")
         || is("tryStratSymbol")
     {
-        let child = Box::new(down_strategy(ctx, hooks, *kids.first()?, module, interner)?);
-        return Some(if is("topStratSymbol") {
+        let Some(&kid) = kids.first() else {
+            return Ok(None);
+        };
+        let Some(child) = try_down_strategy(ctx, hooks, kid, module, interner)? else {
+            return Ok(None);
+        };
+        let child = Box::new(child);
+        return Ok(Some(if is("topStratSymbol") {
             StratExpr::Top(child)
         } else if is("oneStratSymbol") {
             StratExpr::One(child)
@@ -10659,46 +11006,65 @@ fn down_strategy(
                 kind,
                 args: vec![*child],
             }
-        });
+        }));
     }
     if is("conditionalStratSymbol") {
         if kids.len() != 3 {
-            return None;
+            return Ok(None);
         }
-        return Some(StratExpr::Branch {
-            test: Box::new(down_strategy(ctx, hooks, kids[0], module, interner)?),
-            success: Box::new(down_strategy(ctx, hooks, kids[1], module, interner)?),
-            failure: Box::new(down_strategy(ctx, hooks, kids[2], module, interner)?),
-        });
+        let Some(test) = try_down_strategy(ctx, hooks, kids[0], module, interner)? else {
+            return Ok(None);
+        };
+        let Some(success) = try_down_strategy(ctx, hooks, kids[1], module, interner)? else {
+            return Ok(None);
+        };
+        let Some(failure) = try_down_strategy(ctx, hooks, kids[2], module, interner)? else {
+            return Ok(None);
+        };
+        return Ok(Some(StratExpr::Branch {
+            test: Box::new(test),
+            success: Box::new(success),
+            failure: Box::new(failure),
+        }));
     }
     if is("orelseStratSymbol") {
         if kids.len() != 2 {
-            return None;
+            return Ok(None);
         }
-        return Some(StratExpr::Sugar {
+        let mut args = Vec::with_capacity(kids.len());
+        for child in kids {
+            let Some(strategy) = try_down_strategy(ctx, hooks, child, module, interner)? else {
+                return Ok(None);
+            };
+            args.push(strategy);
+        }
+        return Ok(Some(StratExpr::Sugar {
             kind: StratSugar::OrElse,
-            args: kids
-                .into_iter()
-                .map(|child| down_strategy(ctx, hooks, child, module, interner))
-                .collect::<Option<Vec<_>>>()?,
-        });
+            args,
+        }));
     }
     if is("unionStratSymbol") || is("concatStratSymbol") {
         let union = is("unionStratSymbol");
-        let mut expressions = kids
-            .into_iter()
-            .map(|child| down_strategy(ctx, hooks, child, module, interner));
-        let first = expressions.next()??;
-        return expressions.try_fold(first, |left, right| {
-            let right = right?;
-            Some(if union {
-                StratExpr::Union(Box::new(left), Box::new(right))
+        let mut children = kids.into_iter();
+        let Some(first) = children.next() else {
+            return Ok(None);
+        };
+        let Some(mut expression) = try_down_strategy(ctx, hooks, first, module, interner)? else {
+            return Ok(None);
+        };
+        for child in children {
+            let Some(right) = try_down_strategy(ctx, hooks, child, module, interner)? else {
+                return Ok(None);
+            };
+            expression = if union {
+                StratExpr::Union(Box::new(expression), Box::new(right))
             } else {
-                StratExpr::Seq(Box::new(left), Box::new(right))
-            })
-        });
+                StratExpr::Seq(Box::new(expression), Box::new(right))
+            };
+        }
+        return Ok(Some(expression));
     }
-    None
+    Ok(None)
 }
 
 fn down_variant_options(ctx: &MetaCtx, options: DagId) -> (bool, bool) {

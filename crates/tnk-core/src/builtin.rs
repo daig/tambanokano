@@ -6,6 +6,7 @@
 
 use crate::dag::{DagId, NaValue, NodeTerm};
 use crate::engine::{Runtime, Signature};
+use crate::host::ReducerFault;
 use crate::num;
 use crate::num::{Int, Nat};
 use crate::symbol::{
@@ -22,8 +23,10 @@ impl Runtime {
         id: DagId,
         op: &SpecialOp,
         descent: &mut dyn crate::descent::DescentOps,
-    ) -> Option<DagId> {
-        match op {
+    ) -> Result<Option<DagId>, ReducerFault> {
+        Ok(match op {
+            // Strict host functions are dispatched by the fallible top-rewrite path.
+            SpecialOp::HostFunction(_) => None,
             SpecialOp::Equality { eq, neq } => self.reduce_equality(sig, id, *eq, *neq),
             SpecialOp::DecomposeEquality {
                 eq,
@@ -98,12 +101,12 @@ impl Runtime {
             // engine (to read the redex and build the up-result). `None` ⇒ stays at the kind level.
             SpecialOp::Meta { op, hooks } => {
                 let mut ctx = crate::descent::MetaCtx { rt: self, sig };
-                descent.descend(&mut ctx, *op, hooks, id)
+                descent.descend(&mut ctx, *op, hooks, id)?
             }
             // External target constants have no equational reduction. Their messages are handled by the
             // resumable `erewrite` scheduler, not by ordinary reduction.
             SpecialOp::StreamManager { .. } | SpecialOp::InterpreterManager => None,
-        }
+        })
     }
 
     /// Convert `string : Qid -> String` and the partial `qid : String ~> Qid`. Quoted identifiers are

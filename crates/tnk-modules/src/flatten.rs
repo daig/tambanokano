@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Interner, Token, tokenize};
-use tnk_frontend::rename_terms::{ReconTarget, ViewOpMap, ViewOpSubst};
+use tnk_frontend::rename_terms::{ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature};
 use tnk_frontend::surface::ast::{
     Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, StratExpr,
     VarDecl, ViewDecl,
@@ -952,6 +952,9 @@ fn instantiate(
                 }
             }
             op_recon.extend(r.op_recon.iter().cloned().map(|mut map| {
+                if pconst_ops.contains(&map.source) {
+                    map.source = format!("{}${}", param.name, map.source);
+                }
                 if let Some((domain, range)) = &mut map.dom_range {
                     for sort in domain {
                         if theory_sorts.contains(sort) {
@@ -1134,11 +1137,20 @@ fn apply_view_op_recon(
     let Some(mapper) = ViewOpSubst::new(&src, op_recon, interner)? else {
         return Ok(());
     };
-    // Identity attributes are ground term bubbles, not declaration metadata: a view's operator map must
-    // reconstruct mapped mixfix occurrences in them exactly as it does in statement terms.
+    // Identities and host term hooks are ground term bubbles. Op hooks carry declaration signatures:
+    // reconstruct their referenced operator head while preserving the signature for later sort
+    // substitution.
     for op in &mut d.ops {
         if let Some(identity) = &mut op.attrs.id {
             *identity = mapper.rewrite(identity, interner);
+        }
+        if let Some(special) = &mut op.attrs.special {
+            for (_, signature) in &mut special.op_hooks {
+                *signature = rewrite_op_hook_signature(signature, op_recon, interner);
+            }
+            for (_, term) in &mut special.term_hooks {
+                *term = mapper.rewrite(term, interner);
+            }
         }
     }
     for st in &mut d.statements {
@@ -1651,6 +1663,14 @@ fn instantiate_decls(
         if let Some(identity) = &mut op.attrs.id {
             *identity = subst_bubble(identity, bindings, op_subst, &no_vars, i);
         }
+        if let Some(special) = &mut op.attrs.special {
+            for (_, signature) in &mut special.op_hooks {
+                *signature = subst_bubble(signature, bindings, op_subst, &no_vars, i);
+            }
+            for (_, term) in &mut special.term_hooks {
+                *term = subst_bubble(term, bindings, op_subst, &no_vars, i);
+            }
+        }
     }
     // Rewrite statement bubbles: each view operator map; each declared variable inlined as a
     // single-token colon variable at its instantiated sort (`H ↦ H:List{ToN}`); and parameter-sort
@@ -1870,6 +1890,14 @@ fn subst_bubble(
                 idx += 1;
                 continue;
             }
+        }
+        let mapped_sort = inst_sort(&text, bindings);
+        if mapped_sort != text {
+            let mut nt = t;
+            nt.sym = i.intern(&mapped_sort);
+            out.push(nt);
+            idx += 1;
+            continue;
         }
         out.push(t);
         idx += 1;

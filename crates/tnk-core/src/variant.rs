@@ -3,10 +3,12 @@
 //! retained state and borrows the engine only while constructing or advancing a layer.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::Engine;
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
+use crate::host::ReducerFault;
 use crate::num::Nat;
 use crate::root::RootGuard;
 use crate::sort::SortId;
@@ -18,6 +20,42 @@ use crate::unify::{
     UnifyEnv, instantiate, instantiate_preserving_representation, is_ground,
     replace_and_instantiate_preserving_representation,
 };
+
+/// Construction failure for a folding-variant search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantSearchError {
+    Invalid(String),
+    Reducer(ReducerFault),
+}
+
+impl fmt::Display for VariantSearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::Reducer(fault) => fault.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for VariantSearchError {}
+
+impl From<String> for VariantSearchError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for VariantSearchError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+impl From<VariantSearchError> for String {
+    fn from(error: VariantSearchError) -> Self {
+        error.to_string()
+    }
+}
 
 /// An executable `[variant]` equation in module order. The frontend supplies the source terms and
 /// variable names retained in `EqTrace`; keeping this separate from the ordinary rewrite automaton
@@ -39,13 +77,39 @@ pub fn compile_variant_equation(
     rhs: &Term,
     variables: Vec<VarSpec>,
 ) -> VariantEquation {
+    e.begin_symbolic_execution();
+    compile_variant_equation_impl(e, id, lhs, rhs, variables, false)
+}
+
+pub(crate) fn compile_variant_equation_for_build(
+    e: &mut Engine,
+    id: u32,
+    lhs: &Term,
+    rhs: &Term,
+    variables: Vec<VarSpec>,
+) -> VariantEquation {
+    compile_variant_equation_impl(e, id, lhs, rhs, variables, true)
+}
+
+fn compile_variant_equation_impl(
+    e: &mut Engine,
+    id: u32,
+    lhs: &Term,
+    rhs: &Term,
+    variables: Vec<VarSpec>,
+    staged_build: bool,
+) -> VariantEquation {
     let mut substitution = Subst::new();
     substitution.reset(variables.len() as u32);
     for (slot, spec) in variables.iter().enumerate() {
         substitution.bind(slot as u32, e.make_var(spec.sort, spec.name, slot as u32));
     }
     let normalized_lhs = e.instantiate(lhs, &substitution);
-    let normalized_lhs = e.normalize_for_unify(normalized_lhs);
+    let normalized_lhs = if staged_build {
+        e.normalize_for_unify_for_build_or_defer_fault(normalized_lhs)
+    } else {
+        e.normalize_for_unify_or_defer_fault(normalized_lhs)
+    };
     let mut order = Vec::with_capacity(variables.len());
     let mut work = vec![normalized_lhs];
     while let Some(dag) = work.pop() {
@@ -141,6 +205,7 @@ pub struct FilteredVariantUnifierStream {
     retained: Vec<RetainedVariantUnifier>,
     pending: VecDeque<usize>,
     incomplete: bool,
+    fault: Option<ReducerFault>,
 }
 
 impl FilteredVariantUnifierStream {
@@ -150,6 +215,7 @@ impl FilteredVariantUnifierStream {
             retained: Vec::new(),
             pending: VecDeque::new(),
             incomplete: false,
+            fault: None,
         }
     }
 
@@ -161,7 +227,7 @@ impl FilteredVariantUnifierStream {
         self.retained[index]
             .variant_forms
             .iter()
-            .any(|form| unifier_subsumes(e, form, candidate))
+            .any(|form| unifier_subsumes_or_defer_fault(e, form, candidate))
     }
 
     fn make_retained(
@@ -171,14 +237,14 @@ impl FilteredVariantUnifierStream {
         rewrites: u64,
         equations: Vec<VariantEquation>,
         filtered: bool,
-    ) -> (RetainedVariantUnifier, bool) {
+    ) -> Result<(RetainedVariantUnifier, bool), ReducerFault> {
         let roots = bindings.iter().map(|&dag| env.e.root(dag)).collect();
         let mut variant_forms = Vec::new();
         let mut variant_search = None;
         let mut incomplete = false;
         if filtered {
-            if let Some(mut search) = unifier_variant_search(env, &bindings, equations, family) {
-                while let Some(variant) = search.find_next(env) {
+            if let Some(mut search) = unifier_variant_search(env, &bindings, equations, family)? {
+                while let Some(variant) = search.try_find_next(env)? {
                     variant_forms.push(env.e.node(variant.term).children().collect());
                 }
                 incomplete |= search.is_incomplete();
@@ -187,7 +253,7 @@ impl FilteredVariantUnifierStream {
                 variant_forms.push(bindings.clone());
             }
         }
-        (
+        Ok((
             RetainedVariantUnifier {
                 bindings,
                 family,
@@ -198,9 +264,15 @@ impl FilteredVariantUnifierStream {
                 _variant_search: variant_search,
             },
             incomplete,
-        )
+        ))
     }
 
+    /// Insert one retained unifier, applying the configured filtering policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+    /// [`try_insert`](Self::try_insert) to preserve the fault.
     pub fn insert(
         &mut self,
         env: &mut UnifyEnv,
@@ -209,14 +281,52 @@ impl FilteredVariantUnifierStream {
         rewrites: u64,
         equations: &[VariantEquation],
     ) {
+        self.try_insert(env, bindings, family, rewrites, equations)
+            .unwrap_or_else(|fault| panic!("{fault}"));
+    }
+
+    pub fn try_insert(
+        &mut self,
+        env: &mut UnifyEnv,
+        bindings: Vec<DagId>,
+        family: VariableFamily,
+        rewrites: u64,
+        equations: &[VariantEquation],
+    ) -> Result<(), ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let checkpoint = env.e.semantic_checkpoint();
+        let result = self.try_insert_inner(env, bindings, family, rewrites, equations);
+        match result {
+            Ok(()) => Ok(()),
+            Err(fault) => {
+                env.e.restore_semantic_checkpoint(checkpoint);
+                self.pending.clear();
+                self.fault = Some(fault.clone());
+                Err(fault)
+            }
+        }
+    }
+
+    fn try_insert_inner(
+        &mut self,
+        env: &mut UnifyEnv,
+        bindings: Vec<DagId>,
+        family: VariableFamily,
+        rewrites: u64,
+        equations: &[VariantEquation],
+    ) -> Result<(), ReducerFault> {
+        env.e.check_deferred_reducer_fault()?;
         if !self.filtered {
             let (retained, incomplete) =
-                Self::make_retained(env, bindings, family, rewrites, Vec::new(), false);
+                Self::make_retained(env, bindings, family, rewrites, Vec::new(), false)?;
+            env.e.check_deferred_reducer_fault()?;
             let index = self.retained.len();
             self.incomplete |= incomplete;
             self.retained.push(retained);
             self.pending.push_back(index);
-            return;
+            return Ok(());
         }
         let existing: Vec<_> = self
             .retained
@@ -225,35 +335,46 @@ impl FilteredVariantUnifierStream {
             .filter_map(|(index, retained)| retained.alive.then_some(index))
             .collect();
         for &index in &existing {
-            if self.retained_subsumes(env.e, index, &bindings) {
-                return;
+            let subsumed = self.retained_subsumes(env.e, index, &bindings);
+            env.e.check_deferred_reducer_fault()?;
+            if subsumed {
+                return Ok(());
             }
         }
 
         let (retained, incomplete) =
-            Self::make_retained(env, bindings, family, rewrites, equations.to_vec(), true);
-        self.incomplete |= incomplete;
-        for index in existing {
-            if retained
-                .variant_forms
-                .iter()
-                .any(|form| unifier_subsumes(env.e, form, &self.retained[index].bindings))
-            {
-                let victim = &mut self.retained[index];
-                victim.alive = false;
-                victim.bindings.clear();
-                victim.variant_forms.clear();
-                victim._variant_search = None;
-                victim._roots.clear();
+            Self::make_retained(env, bindings, family, rewrites, equations.to_vec(), true)?;
+        let mut victims = Vec::new();
+        for &index in &existing {
+            let subsumed = retained.variant_forms.iter().any(|form| {
+                unifier_subsumes_or_defer_fault(env.e, form, &self.retained[index].bindings)
+            });
+            env.e.check_deferred_reducer_fault()?;
+            if subsumed {
+                victims.push(index);
             }
+        }
+        env.e.check_deferred_reducer_fault()?;
+
+        self.incomplete |= incomplete;
+        for index in victims {
+            let victim = &mut self.retained[index];
+            victim.alive = false;
+            victim.bindings.clear();
+            victim.variant_forms.clear();
+            victim._variant_search = None;
+            victim._roots.clear();
         }
         let index = self.retained.len();
         self.retained.push(retained);
         self.pending.push_back(index);
+        Ok(())
     }
-
     /// Replace incremental insertion order with the final alive set in retained order.
     pub fn finish(&mut self) {
+        if self.fault.is_some() {
+            return;
+        }
         self.pending.clear();
         self.pending.extend(
             self.retained
@@ -264,6 +385,9 @@ impl FilteredVariantUnifierStream {
     }
 
     pub fn pop_pending(&mut self) -> Option<usize> {
+        if self.fault.is_some() {
+            return None;
+        }
         while let Some(index) = self.pending.pop_front() {
             if self.retained[index].alive {
                 return Some(index);
@@ -273,21 +397,36 @@ impl FilteredVariantUnifierStream {
     }
 
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.fault.as_ref().map_or(self.pending.len(), |_| 0)
     }
 
     pub fn pending_is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.fault.is_some() || self.pending.is_empty()
     }
 
+    /// Return one retained entry's bindings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is outside this stream's retained-entry range.
     pub fn bindings(&self, index: usize) -> &[DagId] {
         &self.retained[index].bindings
     }
 
+    /// Return one retained entry's variable family.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is outside this stream's retained-entry range.
     pub fn family(&self, index: usize) -> VariableFamily {
         self.retained[index].family
     }
 
+    /// Return one retained entry's rewrite count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is outside this stream's retained-entry range.
     pub fn rewrites(&self, index: usize) -> u64 {
         self.retained[index].rewrites
     }
@@ -361,6 +500,7 @@ pub struct VariantSearch {
     skip_root: bool,
     term_only_folding: bool,
     unification_pairs: Option<usize>,
+    fault: Option<ReducerFault>,
 }
 
 impl VariantSearch {
@@ -371,12 +511,40 @@ impl VariantSearch {
         env: &mut UnifyEnv,
         initial: DagId,
         original_variables: Vec<VarSpec>,
+        blockers: Vec<DagId>,
+        equations: Vec<VariantEquation>,
+        mode: VariantMode,
+        incoming_family: Option<VariableFamily>,
+        base: &str,
+    ) -> Result<Self, VariantSearchError> {
+        let checkpoint = env.e.semantic_checkpoint();
+        let result = Self::new_inner(
+            env,
+            initial,
+            original_variables,
+            blockers,
+            equations,
+            mode,
+            incoming_family,
+            base,
+        );
+        if matches!(&result, Err(VariantSearchError::Reducer(_))) {
+            env.e.restore_semantic_checkpoint(checkpoint);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        env: &mut UnifyEnv,
+        initial: DagId,
+        original_variables: Vec<VarSpec>,
         mut blockers: Vec<DagId>,
         equations: Vec<VariantEquation>,
         mode: VariantMode,
         incoming_family: Option<VariableFamily>,
         base: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, VariantSearchError> {
         let first_family = if incoming_family == Some(VariableFamily::Unify) {
             VariableFamily::Variant
         } else {
@@ -453,11 +621,21 @@ impl VariantSearch {
         } else {
             instantiate_preserving_representation(env.e, &values, initial).unwrap_or(initial)
         };
-        let term = env.e.reduce(renamed);
+        let term = env.e.reduce_or_defer_fault(renamed);
+        env.e
+            .check_deferred_reducer_fault()
+            .map_err(VariantSearchError::Reducer)?;
 
         for blocker in &mut blockers {
-            *blocker = env.e.normalize_for_unify(*blocker);
-            if reducible_by_variant_equation(env.e, *blocker, &equations) {
+            *blocker = env
+                .e
+                .try_normalize_for_unify(*blocker)
+                .map_err(VariantSearchError::Reducer)?;
+            let reducible = reducible_by_variant_equation(env.e, *blocker, &equations);
+            env.e
+                .check_deferred_reducer_fault()
+                .map_err(VariantSearchError::Reducer)?;
+            if reducible {
                 return Err("irreducibility constraint is reducible by a variant equation".into());
             }
         }
@@ -483,6 +661,7 @@ impl VariantSearch {
             skip_root: false,
             term_only_folding: mode == VariantMode::Subsumption,
             unification_pairs: None,
+            fault: None,
         })
     }
 
@@ -511,7 +690,33 @@ impl VariantSearch {
 
     /// Apply variant-narrowing's accumulated-substitution and irreducibility-constraint screen to a
     /// completed unifier before the folder sees it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an attached strict reducer fails while the symbolic screen materializes an identity.
+    /// Fallible semantic owners must use [`Self::try_accepts_completed_unifier`].
     pub fn accepts_completed_unifier(&self, e: &mut Engine, bindings: &[DagId]) -> bool {
+        self.try_accepts_completed_unifier(e, bindings)
+            .unwrap_or_else(|fault| panic!("completed-unifier screening failed: {fault}"))
+    }
+
+    /// Fallible form of [`Self::accepts_completed_unifier`].
+    pub fn try_accepts_completed_unifier(
+        &self,
+        e: &mut Engine,
+        bindings: &[DagId],
+    ) -> Result<bool, ReducerFault> {
+        e.check_deferred_reducer_fault()?;
+        let checkpoint = e.semantic_checkpoint();
+        let accepted = self.accepts_completed_unifier_or_defer_fault(e, bindings);
+        if let Err(fault) = e.check_deferred_reducer_fault() {
+            e.restore_semantic_checkpoint(checkpoint);
+            return Err(fault);
+        }
+        Ok(accepted)
+    }
+
+    fn accepts_completed_unifier_or_defer_fault(&self, e: &mut Engine, bindings: &[DagId]) -> bool {
         !bindings
             .iter()
             .any(|&dag| reducible_by_variant_equation(e, dag, &self.equations))
@@ -531,9 +736,70 @@ impl VariantSearch {
         self.prepared && self.ready.is_empty() && self.frontier.is_empty()
     }
 
-    /// Return the next variant, expanding one breadth-first layer as needed. The result remains rooted
-    /// by this search until it is dropped.
+    /// Return the next variant, expanding one breadth-first layer as needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+    /// [`try_find_next`](Self::try_find_next) to preserve the fault.
     pub fn find_next(&mut self, env: &mut UnifyEnv) -> Option<VariantResult> {
+        self.try_find_next(env)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    /// Fallible form of [`find_next`](Self::find_next).
+    pub fn try_find_next(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Result<Option<VariantResult>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let engine_checkpoint = env.e.semantic_checkpoint();
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            env.e.restore_semantic_checkpoint(engine_checkpoint);
+            self.fault = Some(fault.clone());
+            return Err(fault);
+        }
+        let variants_len = self.variants.len();
+        let alive: Vec<bool> = self.variants.iter().map(|variant| variant.alive).collect();
+        let frontier = self.frontier.clone();
+        let ready = self.ready.clone();
+        let external = self.external.clone();
+        let next_external = self.next_external;
+        let prepared = self.prepared;
+        let incomplete = self.incomplete;
+        let use_first_family = self.use_first_family;
+
+        let result = self.find_next_deferred(env);
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            env.e.restore_semantic_checkpoint(engine_checkpoint);
+            self.variants.truncate(variants_len);
+            for (variant, was_alive) in self.variants.iter_mut().zip(alive) {
+                variant.alive = was_alive;
+                if was_alive && variant.roots.is_empty() {
+                    variant
+                        .roots
+                        .extend(variant.substitution.iter().map(|&dag| env.e.root(dag)));
+                    variant.roots.push(env.e.root(variant.term));
+                }
+            }
+            self.frontier = frontier;
+            self.ready = ready;
+            self.external = external;
+            self.next_external = next_external;
+            self.prepared = prepared;
+            self.incomplete = incomplete;
+            self.use_first_family = use_first_family;
+            self.frontier.clear();
+            self.ready.clear();
+            self.fault = Some(fault.clone());
+            return Err(fault);
+        }
+        Ok(result)
+    }
+
+    fn find_next_deferred(&mut self, env: &mut UnifyEnv) -> Option<VariantResult> {
         if !self.prepared {
             self.ready.clear();
             while !self.frontier.is_empty() {
@@ -558,7 +824,7 @@ impl VariantSearch {
         if !self.variants[internal].alive
             || (self.unification_pairs.is_some() && !self.variants[internal].unifier)
         {
-            return self.find_next(env);
+            return self.find_next_deferred(env);
         }
         let external_index = self.next_external;
         self.next_external += 1;
@@ -623,10 +889,10 @@ impl VariantSearch {
         };
         let (state_term, state_substitution) = if self.term_only_folding {
             (
-                env.e.normalize_for_unify(state_term),
+                env.e.normalize_for_unify_or_defer_fault(state_term),
                 state_substitution
                     .into_iter()
-                    .map(|dag| env.e.normalize_for_unify(dag))
+                    .map(|dag| env.e.normalize_for_unify_or_defer_fault(dag))
                     .collect(),
             )
         } else {
@@ -647,12 +913,12 @@ impl VariantSearch {
             self.incomplete |= incomplete;
             for completed in completed {
                 if completed.interesting.iter().any(|&dag| {
-                    let dag = env.e.normalize_for_unify(dag);
+                    let dag = env.e.normalize_for_unify_or_defer_fault(dag);
                     reducible_by_variant_equation(env.e, dag, &self.equations)
                 }) {
                     continue;
                 }
-                if self.accepts_completed_unifier(env.e, &completed.bindings) {
+                if self.accepts_completed_unifier_or_defer_fault(env.e, &completed.bindings) {
                     results.push(ExpandedVariant {
                         term: state_term,
                         substitution: completed.bindings,
@@ -698,7 +964,7 @@ impl VariantSearch {
             let Some(dag) = instantiate(e, &values, blocker) else {
                 return false;
             };
-            let dag = e.normalize_for_unify(dag);
+            let dag = e.normalize_for_unify_or_defer_fault(dag);
             reducible_by_variant_equation(e, dag, &self.equations)
         })
     }
@@ -721,7 +987,7 @@ impl VariantSearch {
             let subsumes = if retained.unifier != unifier {
                 false
             } else if unifier {
-                unifier_subsumes(e, &retained.substitution, &substitution)
+                unifier_subsumes_or_defer_fault(e, &retained.substitution, &substitution)
             } else {
                 let retained_substitution = if self.term_only_folding {
                     &[][..]
@@ -757,7 +1023,7 @@ impl VariantSearch {
                 continue;
             }
             let subsumes = if unifier {
-                unifier_subsumes(e, &substitution, &retained.substitution)
+                unifier_subsumes_or_defer_fault(e, &substitution, &retained.substitution)
             } else {
                 let candidate_substitution = if self.term_only_folding {
                     &[][..]
@@ -957,7 +1223,7 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
                 base,
             );
             incomplete |= problem.is_incomplete();
-            while let Some(caller) = problem.find_next_full(env) {
+            while let Some(caller) = problem.find_next_full_deferred(env) {
                 incomplete |= problem.is_incomplete();
                 let state_values = caller[state_base..].to_vec();
                 let interesting: Vec<_> = interesting_slots
@@ -965,7 +1231,7 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
                     .map(|&slot| state_values[slot].expect("state solution"))
                     .collect();
                 if interesting.iter().any(|&dag| {
-                    let dag = env.e.normalize_for_unify(dag);
+                    let dag = env.e.normalize_for_unify_or_defer_fault(dag);
                     reducible_by_variant_equation(env.e, dag, equations)
                 }) {
                     continue;
@@ -1001,24 +1267,40 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
         let mut filtered = Vec::new();
         'direct: for candidate in std::mem::take(*competing) {
             if filtered.iter().any(|retained: &ExpandedVariant| {
-                unifier_subsumes(env.e, &retained.interesting, &candidate.interesting)
+                unifier_subsumes_or_defer_fault(
+                    env.e,
+                    &retained.interesting,
+                    &candidate.interesting,
+                )
             }) {
                 continue 'direct;
             }
             filtered.retain(|retained| {
-                !unifier_subsumes(env.e, &candidate.interesting, &retained.interesting)
+                !unifier_subsumes_or_defer_fault(
+                    env.e,
+                    &candidate.interesting,
+                    &retained.interesting,
+                )
             });
             filtered.push(candidate);
         }
         **competing = filtered;
         survivors.retain(|candidate| {
             if competing.iter().any(|retained| {
-                unifier_subsumes(env.e, &retained.interesting, &candidate.interesting)
+                unifier_subsumes_or_defer_fault(
+                    env.e,
+                    &retained.interesting,
+                    &candidate.interesting,
+                )
             }) {
                 return false;
             }
             competing.retain(|retained| {
-                !unifier_subsumes(env.e, &candidate.interesting, &retained.interesting)
+                !unifier_subsumes_or_defer_fault(
+                    env.e,
+                    &candidate.interesting,
+                    &retained.interesting,
+                )
             });
             true
         });
@@ -1029,7 +1311,7 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
         let mut new_substitution = Vec::with_capacity(state.substitution.len());
         for dag in state.substitution.iter().copied() {
             let dag = instantiate(env.e, &candidate.state_values, dag).unwrap_or(dag);
-            new_substitution.push(env.e.normalize_for_unify(dag));
+            new_substitution.push(env.e.normalize_for_unify_or_defer_fault(dag));
         }
         if new_substitution
             .iter()
@@ -1042,7 +1324,7 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
             let Some(dag) = instantiate(env.e, &values, blocker) else {
                 return false;
             };
-            let dag = env.e.normalize_for_unify(dag);
+            let dag = env.e.normalize_for_unify_or_defer_fault(dag);
             reducible_by_variant_equation(env.e, dag, equations)
         });
         if blocked {
@@ -1073,10 +1355,10 @@ pub(crate) fn variant_narrow_one_step<S: VariantNarrowingSource>(
             )
         };
         env.e.count_variant_narrowing_step();
-        let term = env.e.reduce(rebuilt);
+        let term = env.e.reduce_or_defer_fault(rebuilt);
         let (term, substitution, _, _, _) = reslot_state(env.e, term, &new_substitution);
-        let term = env.e.normalize_for_unify(term);
-        let term = env.e.reduce(term);
+        let term = env.e.normalize_for_unify_or_defer_fault(term);
+        let term = env.e.reduce_or_defer_fault(term);
         results.push(VariantNarrowingStep {
             term,
             substitution,
@@ -1308,31 +1590,33 @@ fn linearize_xor_pattern(
 }
 
 /// Fast exact ACUN-instance check for the common XOR variant theory. It solves the tuple's direct
-/// XOR equations by Gaussian elimination and then verifies every (including free-rooted) binding by
-/// actual equation reduction. `None` means the direct equations underdetermine a failed verification,
-/// so the caller must use general variant subsumption.
+/// XOR equations and then verifies every (including free-rooted) binding by actual equation reduction.
+/// `Ok(None)` means the direct equations underdetermine a failed verification, so the caller must use
+/// general variant subsumption.
 pub fn xor_unifier_subsumes(
     e: &mut Engine,
     retained: &[DagId],
     candidate: &[DagId],
     equations: &[VariantEquation],
-) -> Option<bool> {
+) -> Result<Option<bool>, ReducerFault> {
     if retained.len() != candidate.len() {
-        return Some(false);
+        return Ok(Some(false));
     }
-    let (xor, identity_symbol) = xor_signature(equations)?;
+    let Some((xor, identity_symbol)) = xor_signature(equations) else {
+        return Ok(None);
+    };
     let identity = e.make_free(identity_symbol, Vec::new());
     let mut keys = Vec::new();
     for &dag in retained {
         collect_variable_keys(e, dag, &mut keys);
     }
     if keys.is_empty() {
-        return Some(
+        return Ok(Some(
             retained
                 .iter()
                 .zip(candidate)
                 .all(|(&left, &right)| e.deep_equal(left, right)),
-        );
+        ));
     }
     let mut rows: Vec<(Vec<bool>, Vec<DagId>)> = Vec::new();
     for (&pattern, &subject) in retained.iter().zip(candidate) {
@@ -1353,7 +1637,7 @@ pub fn xor_unifier_subsumes(
         rows.push((coefficients, rhs));
     }
     if rows.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut pivot_row_for_column = vec![None; keys.len()];
     let mut pivot_row = 0;
@@ -1381,7 +1665,7 @@ pub fn xor_unifier_subsumes(
         .iter()
         .any(|(coefficients, rhs)| !coefficients.iter().any(|&bit| bit) && !rhs.is_empty())
     {
-        return Some(false);
+        return Ok(Some(false));
     }
     let mut assignments = vec![identity; keys.len()];
     for (column, row) in pivot_row_for_column.iter().enumerate() {
@@ -1401,22 +1685,25 @@ pub fn xor_unifier_subsumes(
     let mut substitution = Subst::new();
     substitution.reset(variables.len() as u32);
     for (slot, key) in variables.iter().enumerate() {
-        let index = keys.iter().position(|candidate| candidate == key)?;
+        let Some(index) = keys.iter().position(|candidate| candidate == key) else {
+            return Ok(None);
+        };
         substitution.bind(slot as u32, assignments[index]);
     }
     let matches = patterns.iter().zip(candidate).all(|(pattern, &subject)| {
         let instantiated = e.instantiate(pattern, &substitution);
-        let normalized = e.reduce(instantiated);
-        let normalized = e.normalize_for_unify(normalized);
-        let normalized = e.reduce(normalized);
+        let normalized = e.reduce_or_defer_fault(instantiated);
+        let normalized = e.normalize_for_unify_or_defer_fault(normalized);
+        let normalized = e.reduce_or_defer_fault(normalized);
         e.deep_equal(normalized, subject)
     });
+    e.check_deferred_reducer_fault()?;
     if matches {
-        Some(true)
+        Ok(Some(true))
     } else if pivot_row == keys.len() {
-        Some(false)
+        Ok(Some(false))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -1443,7 +1730,37 @@ fn variant_subsumes(
 }
 
 /// Whether one retained unifier vector subsumes another modulo the signature axioms.
+///
+/// # Panics
+///
+/// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+/// [`try_unifier_subsumes`] to preserve the fault.
 pub fn unifier_subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId]) -> bool {
+    try_unifier_subsumes(e, retained, candidate)
+        .unwrap_or_else(|fault| panic!("unifier subsumption failed: {fault}"))
+}
+
+/// Fallible form of [`unifier_subsumes`].
+pub fn try_unifier_subsumes(
+    e: &mut Engine,
+    retained: &[DagId],
+    candidate: &[DagId],
+) -> Result<bool, ReducerFault> {
+    e.check_deferred_reducer_fault()?;
+    let checkpoint = e.semantic_checkpoint();
+    let subsumes = unifier_subsumes_or_defer_fault(e, retained, candidate);
+    if let Err(fault) = e.check_deferred_reducer_fault() {
+        e.restore_semantic_checkpoint(checkpoint);
+        return Err(fault);
+    }
+    Ok(subsumes)
+}
+
+fn unifier_subsumes_or_defer_fault(
+    e: &mut Engine,
+    retained: &[DagId],
+    candidate: &[DagId],
+) -> bool {
     if retained.len() != candidate.len() {
         return false;
     }
@@ -1465,7 +1782,22 @@ pub fn unifier_subsumes(e: &mut Engine, retained: &[DagId], candidate: &[DagId])
 
 /// Match one retained variant term against a grounded subject and compose every theory match with
 /// the variant's accumulated original-variable substitution.
+///
+/// # Panics
+///
+/// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+/// [`try_variant_match_bindings`] to preserve the fault.
 pub fn variant_match_bindings(
+    env: &mut UnifyEnv,
+    variant: &VariantResult,
+    subject: DagId,
+    base: &str,
+) -> Vec<Vec<DagId>> {
+    try_variant_match_bindings(env, variant, subject, base)
+        .unwrap_or_else(|fault| panic!("variant matching failed: {fault}"))
+}
+
+fn variant_match_bindings_or_defer_fault(
     env: &mut UnifyEnv,
     variant: &VariantResult,
     subject: DagId,
@@ -1506,7 +1838,7 @@ pub fn variant_match_bindings(
                 })
                 .collect();
             for binding in &mut bindings {
-                *binding = env.e.normalize_for_unify(*binding);
+                *binding = env.e.normalize_for_unify_or_defer_fault(*binding);
             }
             let mut keys = Vec::new();
             for &binding in &bindings {
@@ -1533,16 +1865,49 @@ pub fn variant_match_bindings(
                         .expect("unbound matcher variable");
                     e.make_var(sort, *fresh, *index)
                 });
-                *binding = env.e.normalize_for_unify(*binding);
+                *binding = env.e.normalize_for_unify_or_defer_fault(*binding);
             }
             bindings
         })
         .collect()
 }
 
+/// Fallible form of [`variant_match_bindings`].
+pub fn try_variant_match_bindings(
+    env: &mut UnifyEnv,
+    variant: &VariantResult,
+    subject: DagId,
+    base: &str,
+) -> Result<Vec<Vec<DagId>>, ReducerFault> {
+    env.e.check_deferred_reducer_fault()?;
+    let checkpoint = env.e.semantic_checkpoint();
+    let bindings = variant_match_bindings_or_defer_fault(env, variant, subject, base);
+    if let Err(fault) = env.e.check_deferred_reducer_fault() {
+        env.e.restore_semantic_checkpoint(checkpoint);
+        return Err(fault);
+    }
+    Ok(bindings)
+}
+
 /// Complete the simultaneous unification problem held in a synthetic free-rooted variant term and
 /// compose each solved form with the variant's accumulated original-variable substitution.
+///
+/// # Panics
+///
+/// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+/// [`try_complete_variant_unifier`] to preserve the fault.
 pub fn complete_variant_unifier(
+    env: &mut UnifyEnv,
+    result: &VariantResult,
+    pair_count: usize,
+    family: VariableFamily,
+    base: &str,
+) -> Vec<Vec<DagId>> {
+    try_complete_variant_unifier(env, result, pair_count, family, base)
+        .unwrap_or_else(|fault| panic!("variant-unifier completion failed: {fault}"))
+}
+
+fn complete_variant_unifier_or_defer_fault(
     env: &mut UnifyEnv,
     result: &VariantResult,
     pair_count: usize,
@@ -1561,6 +1926,24 @@ pub fn complete_variant_unifier(
     .into_iter()
     .map(|completed| completed.bindings)
     .collect()
+}
+
+/// Fallible form of [`complete_variant_unifier`].
+pub fn try_complete_variant_unifier(
+    env: &mut UnifyEnv,
+    result: &VariantResult,
+    pair_count: usize,
+    family: VariableFamily,
+    base: &str,
+) -> Result<Vec<Vec<DagId>>, ReducerFault> {
+    env.e.check_deferred_reducer_fault()?;
+    let checkpoint = env.e.semantic_checkpoint();
+    let completed = complete_variant_unifier_or_defer_fault(env, result, pair_count, family, base);
+    if let Err(fault) = env.e.check_deferred_reducer_fault() {
+        env.e.restore_semantic_checkpoint(checkpoint);
+        return Err(fault);
+    }
+    Ok(completed)
 }
 
 fn unification_pairs(e: &Engine, term: DagId, pair_count: usize) -> Option<Vec<(DagId, DagId)>> {
@@ -1644,7 +2027,7 @@ fn complete_state_unifier_detailed(
         base,
     );
     let mut completed = Vec::new();
-    while let Some(solution) = problem.find_next_full(env) {
+    while let Some(solution) = problem.find_next_full_deferred(env) {
         let values = solution[state_base..].to_vec();
         let interesting: Vec<_> = occurring
             .iter()
@@ -1653,7 +2036,7 @@ fn complete_state_unifier_detailed(
         let mut bindings = Vec::with_capacity(substitution.len());
         for dag in substitution.iter().copied() {
             let dag = instantiate(env.e, &values, dag).unwrap_or(dag);
-            bindings.push(env.e.normalize_for_unify(dag));
+            bindings.push(env.e.normalize_for_unify_or_defer_fault(dag));
         }
         let binding_count = bindings.len();
         bindings.extend_from_slice(&interesting);
@@ -1749,7 +2132,7 @@ fn retag_foreign_family_variables(
                 .expect("completed-unifier variable");
             e.make_var(sort, fresh, index as u32)
         });
-        *value = env.e.normalize_for_unify(*value);
+        *value = env.e.normalize_for_unify_or_defer_fault(*value);
     }
 }
 /// Rename a completed narrowing unifier into the family assigned to this expansion layer, ordered
@@ -1784,7 +2167,7 @@ fn canonicalize_family_variables(
                 .expect("completed-unifier variable");
             e.make_var(sort, fresh, index)
         });
-        *value = env.e.normalize_for_unify(*value);
+        *value = env.e.normalize_for_unify_or_defer_fault(*value);
     }
 }
 
@@ -1793,9 +2176,9 @@ pub fn unifier_variant_search(
     retained: &[DagId],
     equations: Vec<VariantEquation>,
     incoming_family: VariableFamily,
-) -> Option<VariantSearch> {
+) -> Result<Option<VariantSearch>, ReducerFault> {
     if retained.is_empty() {
-        return None;
+        return Ok(None);
     }
     let domains: Vec<_> = retained
         .iter()
@@ -1809,7 +2192,7 @@ pub fn unifier_variant_search(
         .add_op("$variant-subsumption-tuple", domains.clone(), domains[0]);
     let target = env.e.make_free(tuple, retained.to_vec());
     let (target, _, specs, _, _) = reslot_state(env.e, target, &[]);
-    let mut search = VariantSearch::new(
+    let mut search = match VariantSearch::new(
         env,
         target,
         specs,
@@ -1818,12 +2201,21 @@ pub fn unifier_variant_search(
         VariantMode::Subsumption,
         Some(incoming_family),
         "0",
-    )
-    .ok()?;
+    ) {
+        Ok(search) => search,
+        Err(VariantSearchError::Reducer(fault)) => return Err(fault),
+        Err(VariantSearchError::Invalid(_)) => return Ok(None),
+    };
     search.skip_root_position();
-    Some(search)
+    Ok(Some(search))
 }
 
+/// Whether one retained unifier vector subsumes another modulo generated variants.
+///
+/// # Panics
+///
+/// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+/// [`try_unifier_subsumes_modulo_variants`] to preserve the fault.
 pub fn unifier_subsumes_modulo_variants(
     env: &mut UnifyEnv,
     retained: &[DagId],
@@ -1831,22 +2223,43 @@ pub fn unifier_subsumes_modulo_variants(
     equations: Vec<VariantEquation>,
     incoming_family: VariableFamily,
 ) -> bool {
-    if retained.len() != candidate.len() {
-        return false;
-    }
-    if unifier_subsumes(env.e, retained, candidate) {
-        return true;
-    }
-    let Some(mut search) = unifier_variant_search(env, retained, equations, incoming_family) else {
-        return retained.is_empty();
-    };
-    while let Some(variant) = search.find_next(env) {
-        let form: Vec<_> = env.e.node(variant.term).children().collect();
-        if unifier_subsumes(env.e, &form, candidate) {
-            return true;
+    try_unifier_subsumes_modulo_variants(env, retained, candidate, equations, incoming_family)
+        .unwrap_or_else(|fault| panic!("{fault}"))
+}
+
+pub fn try_unifier_subsumes_modulo_variants(
+    env: &mut UnifyEnv,
+    retained: &[DagId],
+    candidate: &[DagId],
+    equations: Vec<VariantEquation>,
+    incoming_family: VariableFamily,
+) -> Result<bool, ReducerFault> {
+    env.e.check_deferred_reducer_fault()?;
+    let checkpoint = env.e.semantic_checkpoint();
+    let result = (|| {
+        if retained.len() != candidate.len() {
+            return Ok(false);
         }
+        if try_unifier_subsumes(env.e, retained, candidate)? {
+            return Ok(true);
+        }
+        let Some(mut search) = unifier_variant_search(env, retained, equations, incoming_family)?
+        else {
+            return Ok(retained.is_empty());
+        };
+        while let Some(variant) = search.try_find_next(env)? {
+            let form: Vec<_> = env.e.node(variant.term).children().collect();
+            if try_unifier_subsumes(env.e, &form, candidate)? {
+                return Ok(true);
+            }
+        }
+        env.e.check_deferred_reducer_fault()?;
+        Ok(false)
+    })();
+    if result.is_err() {
+        env.e.restore_semantic_checkpoint(checkpoint);
     }
-    false
+    result
 }
 
 fn dag_to_matching_term(e: &Engine, dag: DagId, variables: &mut Vec<(u32, SortId)>) -> Term {

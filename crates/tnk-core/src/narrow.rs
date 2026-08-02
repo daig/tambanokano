@@ -5,10 +5,12 @@
 //! static source terms and metadata.
 
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 
 use crate::dag::{DagId, NodeTerm};
-use crate::engine::Engine;
+use crate::engine::{Engine, SemanticCheckpoint};
 use crate::fresh::{FreshVariableGenerator, VariableFamily};
+use crate::host::ReducerFault;
 use crate::num::Nat;
 use crate::root::RootGuard;
 use crate::term::{ConditionFragment, Term, Var};
@@ -19,9 +21,60 @@ use crate::unify::{
 };
 use crate::variant::{
     FilteredVariantUnifierStream, PreparedVariantNarrowingState, VariantMode,
-    VariantNarrowingSource, VariantSearch, compile_variant_equation,
+    VariantNarrowingSource, VariantSearch, VariantSearchError, compile_variant_equation_for_build,
     prepare_variant_narrowing_state,
 };
+
+/// Construction failure for a narrowing search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NarrowSearchError {
+    Invalid(String),
+    Reducer(ReducerFault),
+}
+
+impl fmt::Display for NarrowSearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::Reducer(fault) => fault.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NarrowSearchError {}
+
+impl From<String> for NarrowSearchError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for NarrowSearchError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
+impl From<VariantSearchError> for NarrowSearchError {
+    fn from(error: VariantSearchError) -> Self {
+        match error {
+            VariantSearchError::Invalid(message) => Self::Invalid(message),
+            VariantSearchError::Reducer(fault) => Self::Reducer(fault),
+        }
+    }
+}
+
+impl From<ReducerFault> for NarrowSearchError {
+    fn from(fault: ReducerFault) -> Self {
+        Self::Reducer(fault)
+    }
+}
+
+impl From<NarrowSearchError> for String {
+    fn from(error: NarrowSearchError) -> Self {
+        error.to_string()
+    }
+}
 
 /// One source rule eligible for variant-based narrowing, in flattened module order.
 #[derive(Clone)]
@@ -123,7 +176,7 @@ pub(crate) fn compile_narrowing_rule(
     label: Option<String>,
     nonexec: bool,
 ) -> NarrowingRule {
-    let compiled = compile_variant_equation(e, id, &lhs, &rhs, variables.clone());
+    let compiled = compile_variant_equation_for_build(e, id, &lhs, &rhs, variables.clone());
     let mut old_to_new = vec![0; variables.len()];
     let mut names = Vec::with_capacity(variables.len());
     for (new_slot, spec) in compiled.variables.iter().enumerate() {
@@ -179,7 +232,7 @@ impl PairUnifierSearch {
         base: &str,
         filtered: bool,
         delayed: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NarrowSearchError> {
         let mut search = VariantSearch::new(
             env,
             target,
@@ -208,18 +261,26 @@ impl PairUnifierSearch {
         if self.exhausted {
             return;
         }
-        if let Some(result) = self.search.find_next(env) {
-            debug_assert!(result.unifier);
-            let rewrites = env.e.rewrites();
-            self.stream.insert(
-                env,
-                result.substitution,
-                result.family,
-                rewrites,
-                &self.equations,
-            );
-        } else {
-            self.exhausted = true;
+        match self.search.try_find_next(env) {
+            Ok(Some(result)) => {
+                debug_assert!(result.unifier);
+                let rewrites = env.e.rewrites();
+                if let Err(fault) = self.stream.try_insert(
+                    env,
+                    result.substitution,
+                    result.family,
+                    rewrites,
+                    &self.equations,
+                ) {
+                    env.e.defer_reducer_fault(fault);
+                    self.exhausted = true;
+                }
+            }
+            Ok(None) => self.exhausted = true,
+            Err(fault) => {
+                env.e.defer_reducer_fault(fault);
+                self.exhausted = true;
+            }
         }
     }
 
@@ -236,7 +297,13 @@ impl PairUnifierSearch {
 
     fn next(&mut self, env: &mut UnifyEnv) -> Option<PairUnifier> {
         if !self.filtered {
-            let result = self.search.find_next(env)?;
+            let result = match self.search.try_find_next(env) {
+                Ok(result) => result?,
+                Err(fault) => {
+                    env.e.defer_reducer_fault(fault);
+                    return None;
+                }
+            };
             return Some(PairUnifier {
                 bindings: result.substitution,
                 family: result.family,
@@ -309,7 +376,7 @@ impl RuleVariantUnifierSearch {
         base: &str,
         filtered: bool,
         delayed: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NarrowSearchError> {
         let source_slots = term_variable_slots(&rule.lhs);
         let state_slots = dag_variable_slots(env.e, redex);
         let mut source_map = vec![0; rule.variables.len()];
@@ -532,7 +599,7 @@ fn apply_rule_unifier(
     let mut accumulated = Vec::with_capacity(state.substitution.len());
     for dag in state.substitution.iter().copied() {
         let dag = instantiate(e, &state_values, dag).unwrap_or(dag);
-        let dag = e.normalize_for_unify(dag);
+        let dag = e.normalize_for_unify_or_defer_fault(dag);
         accumulated.push(dag);
     }
     let replacement = e.instantiate_bindings(&rule.rhs, &unifier.source_bindings);
@@ -544,7 +611,7 @@ fn apply_rule_unifier(
         &state_values,
     );
     e.count_narrowing_step();
-    let reduced = e.reduce(rebuilt);
+    let reduced = e.reduce_or_defer_fault(rebuilt);
     prepare_variant_narrowing_state(e, reduced, &accumulated)
 }
 
@@ -749,21 +816,23 @@ impl StateExpansion {
         equations: &[crate::variant::VariantEquation],
         options: &NarrowOptions,
         base: &str,
-    ) -> Option<PendingNarrowingStep> {
+    ) -> Result<Option<PendingNarrowingStep>, ReducerFault> {
         loop {
             if let Some(search) = &mut self.current {
-                if let Some(unifier) = search.next(env) {
-                    return Some(PendingNarrowingStep {
+                let unifier = search.next(env);
+                env.e.check_deferred_reducer_fault()?;
+                if let Some(unifier) = unifier {
+                    return Ok(Some(PendingNarrowingStep {
                         source_index: self.rule_index - 1,
                         path: self.positions[self.position_index].0.clone(),
                         unifier,
-                    });
+                    }));
                 }
                 self.incomplete |= search.is_incomplete();
                 self.current = None;
             }
             if self.position_index >= self.positions.len() {
-                return None;
+                return Ok(None);
             }
             let redex = self.positions[self.position_index].1;
             if matches!(env.e.node(redex).term, NodeTerm::Var { .. }) {
@@ -804,7 +873,8 @@ impl StateExpansion {
                         self.current = Some(search);
                         break;
                     }
-                    Err(_) => continue,
+                    Err(NarrowSearchError::Invalid(_)) => continue,
+                    Err(NarrowSearchError::Reducer(fault)) => return Err(fault),
                 }
             }
             if self.current.is_some() {
@@ -814,6 +884,27 @@ impl StateExpansion {
             self.rule_index = 0;
         }
     }
+}
+
+struct NarrowStateCheckpoint {
+    alive: bool,
+    locked: bool,
+    expanded: bool,
+    has_successor: bool,
+    substitution: Vec<DagId>,
+    step_values: Option<(Vec<DagId>, Vec<DagId>)>,
+    roots: Vec<RootGuard>,
+}
+
+struct NarrowSearchCheckpoint {
+    states_len: usize,
+    states: Vec<NarrowStateCheckpoint>,
+    expand_cursor: usize,
+    untried_initials: std::ops::Range<usize>,
+    exhausted: bool,
+    incomplete: bool,
+    states_expanded: usize,
+    folding_events_len: usize,
 }
 
 /// Resumable breadth-first symbolic narrowing graph.
@@ -834,6 +925,7 @@ pub struct NarrowSearch {
     folding_events: Vec<FoldingEvent>,
     goal: Option<NarrowGoal>,
     goal_search: Option<ActiveGoalSearch>,
+    fault: Option<ReducerFault>,
 }
 
 impl NarrowSearch {
@@ -846,7 +938,7 @@ impl NarrowSearch {
         equations: Vec<crate::variant::VariantEquation>,
         base: &str,
         options: NarrowOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NarrowSearchError> {
         Self::new_many(
             env,
             vec![(initial, initial_variables)],
@@ -868,8 +960,24 @@ impl NarrowSearch {
         rules: &[NarrowingRule],
         equations: Vec<crate::variant::VariantEquation>,
         base: &str,
+        options: NarrowOptions,
+    ) -> Result<Self, NarrowSearchError> {
+        let checkpoint = env.e.semantic_checkpoint();
+        let result = Self::new_many_inner(env, initials, rules, equations, base, options);
+        if matches!(&result, Err(NarrowSearchError::Reducer(_))) {
+            env.e.restore_semantic_checkpoint(checkpoint);
+        }
+        result
+    }
+
+    fn new_many_inner(
+        env: &mut UnifyEnv,
+        initials: Vec<(DagId, Vec<VarSpec>)>,
+        rules: &[NarrowingRule],
+        equations: Vec<crate::variant::VariantEquation>,
+        base: &str,
         mut options: NarrowOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NarrowSearchError> {
         if initials.is_empty() {
             return Err("narrowing requires at least one initial state".into());
         }
@@ -898,6 +1006,7 @@ impl NarrowSearch {
             folding_events: Vec::new(),
             goal: None,
             goal_search: None,
+            fault: None,
         };
         for (root_index, (initial, initial_variables)) in initials.into_iter().enumerate() {
             let mut generator = FreshVariableGenerator::with_base(
@@ -920,7 +1029,10 @@ impl NarrowSearch {
                 )
                 .unwrap_or(initial)
             };
-            let reduced = env.e.reduce(renamed);
+            let reduced = env.e.reduce_or_defer_fault(renamed);
+            env.e
+                .check_deferred_reducer_fault()
+                .map_err(NarrowSearchError::Reducer)?;
             let prepared = prepare_variant_narrowing_state(env.e, reduced, &renaming);
             let initial = StoredNarrowingState::new(
                 env.e,
@@ -931,7 +1043,7 @@ impl NarrowSearch {
                 root_index,
                 None,
             );
-            search.insert_state(env, initial);
+            search.insert_state(env, initial)?;
         }
         Ok(search)
     }
@@ -952,8 +1064,38 @@ impl NarrowSearch {
         rules: &[NarrowingRule],
         equations: Vec<crate::variant::VariantEquation>,
         base: &str,
+        options: NarrowOptions,
+    ) -> Result<Self, NarrowSearchError> {
+        let checkpoint = env.e.semantic_checkpoint();
+        let result = Self::new_preserving_inner(
+            env,
+            initial,
+            initial_variables,
+            family,
+            blockers,
+            rules,
+            equations,
+            base,
+            options,
+        );
+        if matches!(&result, Err(NarrowSearchError::Reducer(_))) {
+            env.e.restore_semantic_checkpoint(checkpoint);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_preserving_inner(
+        env: &mut UnifyEnv,
+        initial: DagId,
+        initial_variables: Vec<VarSpec>,
+        family: VariableFamily,
+        blockers: Vec<DagId>,
+        rules: &[NarrowingRule],
+        equations: Vec<crate::variant::VariantEquation>,
+        base: &str,
         mut options: NarrowOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NarrowSearchError> {
         if options.search_type == NarrowSearchType::One {
             options.max_depth = Some(1);
         }
@@ -963,7 +1105,10 @@ impl NarrowSearch {
         for (slot, spec) in initial_variables.iter().enumerate() {
             substitution.push(env.e.make_var(spec.sort, spec.name, slot as u32));
         }
-        let reduced = env.e.reduce(initial);
+        let reduced = env.e.reduce_or_defer_fault(initial);
+        env.e
+            .check_deferred_reducer_fault()
+            .map_err(NarrowSearchError::Reducer)?;
         let prepared = prepare_variant_narrowing_state(env.e, reduced, &substitution);
         let initial = StoredNarrowingState::new(env.e, prepared, family, None, 0, 0, None);
         let mut search = Self {
@@ -983,8 +1128,9 @@ impl NarrowSearch {
             folding_events: Vec::new(),
             goal: None,
             goal_search: None,
+            fault: None,
         };
-        search.insert_state(env, initial);
+        search.insert_state(env, initial)?;
         Ok(search)
     }
 
@@ -993,7 +1139,37 @@ impl NarrowSearch {
         self.goal_search = None;
     }
 
+    /// Return the next solution, advancing the narrowing graph as needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+    /// [`try_find_next`](Self::try_find_next) to preserve the fault.
     pub fn find_next(&mut self, env: &mut UnifyEnv) -> Option<NarrowingSolution> {
+        self.try_find_next(env)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    pub fn try_find_next(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Result<Option<NarrowingSolution>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let search_checkpoint = self.state_checkpoint(env.e);
+        let checkpoint = env.e.semantic_checkpoint();
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            return self.poison(env.e, checkpoint, search_checkpoint, fault);
+        }
+        let result = self.find_next_deferred(env);
+        match env.e.check_deferred_reducer_fault() {
+            Ok(()) => Ok(result),
+            Err(fault) => self.poison(env.e, checkpoint, search_checkpoint, fault),
+        }
+    }
+
+    fn find_next_deferred(&mut self, env: &mut UnifyEnv) -> Option<NarrowingSolution> {
         loop {
             if let Some(active) = &mut self.goal_search {
                 if let Some(result) = active.search.next(env) {
@@ -1012,7 +1188,7 @@ impl NarrowSearch {
                 self.incomplete |= active.search.is_incomplete();
                 self.goal_search = None;
             }
-            let state = self.next_interesting_state(env)?;
+            let state = self.next_interesting_state_deferred(env)?;
             let Some(goal) = &self.goal else {
                 return Some(NarrowingSolution {
                     state,
@@ -1052,13 +1228,128 @@ impl NarrowSearch {
                         search,
                     });
                 }
-                Err(_) => continue,
+                Err(NarrowSearchError::Reducer(fault)) => {
+                    env.e.defer_reducer_fault(fault);
+                    return None;
+                }
+                Err(NarrowSearchError::Invalid(_)) => continue,
             }
         }
     }
 
     /// Next state to test against the goal. State ids follow creation order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a configured strict reducer reports a [`ReducerFault`]. Use
+    /// [`try_next_interesting_state`](Self::try_next_interesting_state) to preserve the fault.
     pub fn next_interesting_state(&mut self, env: &mut UnifyEnv) -> Option<usize> {
+        self.try_next_interesting_state(env)
+            .unwrap_or_else(|fault| panic!("{fault}"))
+    }
+
+    pub fn try_next_interesting_state(
+        &mut self,
+        env: &mut UnifyEnv,
+    ) -> Result<Option<usize>, ReducerFault> {
+        if let Some(fault) = &self.fault {
+            return Err(fault.clone());
+        }
+        let search_checkpoint = self.state_checkpoint(env.e);
+        let checkpoint = env.e.semantic_checkpoint();
+        if let Err(fault) = env.e.check_deferred_reducer_fault() {
+            return self.poison(env.e, checkpoint, search_checkpoint, fault);
+        }
+        let result = self.next_interesting_state_deferred(env);
+        match env.e.check_deferred_reducer_fault() {
+            Ok(()) => Ok(result),
+            Err(fault) => self.poison(env.e, checkpoint, search_checkpoint, fault),
+        }
+    }
+
+    fn state_checkpoint(&self, e: &Engine) -> NarrowSearchCheckpoint {
+        NarrowSearchCheckpoint {
+            states_len: self.states.len(),
+            states: self
+                .states
+                .iter()
+                .map(|state| {
+                    let roots = if state.roots.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::iter::once(state.prepared.term)
+                            .chain(state.prepared.substitution.iter().copied())
+                            .chain(
+                                state
+                                    .step
+                                    .iter()
+                                    .flat_map(|step| {
+                                        step.source_substitution.iter().chain(&step.state_unifier)
+                                    })
+                                    .copied(),
+                            )
+                            .map(|dag| e.root(dag))
+                            .collect()
+                    };
+                    NarrowStateCheckpoint {
+                        alive: state.alive,
+                        locked: state.locked,
+                        expanded: state.expanded,
+                        has_successor: state.has_successor,
+                        substitution: state.prepared.substitution.clone(),
+                        step_values: state.step.as_ref().map(|step| {
+                            (step.source_substitution.clone(), step.state_unifier.clone())
+                        }),
+                        roots,
+                    }
+                })
+                .collect(),
+            expand_cursor: self.expand_cursor,
+            untried_initials: self.untried_initials.clone(),
+            exhausted: self.exhausted,
+            incomplete: self.incomplete,
+            states_expanded: self.states_expanded,
+            folding_events_len: self.folding_events.len(),
+        }
+    }
+
+    fn poison<T>(
+        &mut self,
+        e: &mut Engine,
+        checkpoint: SemanticCheckpoint,
+        search_checkpoint: NarrowSearchCheckpoint,
+        fault: ReducerFault,
+    ) -> Result<T, ReducerFault> {
+        e.restore_semantic_checkpoint(checkpoint);
+        self.states.truncate(search_checkpoint.states_len);
+        for (state, saved) in self.states.iter_mut().zip(search_checkpoint.states) {
+            state.alive = saved.alive;
+            state.locked = saved.locked;
+            state.expanded = saved.expanded;
+            state.has_successor = saved.has_successor;
+            state.prepared.substitution = saved.substitution;
+            if let (Some(step), Some((source, unifier))) = (&mut state.step, saved.step_values) {
+                step.source_substitution = source;
+                step.state_unifier = unifier;
+            }
+            state.roots = saved.roots;
+        }
+        self.expand_cursor = search_checkpoint.expand_cursor;
+        self.untried_initials = search_checkpoint.untried_initials;
+        self.exhausted = search_checkpoint.exhausted;
+        self.incomplete = search_checkpoint.incomplete;
+        self.states_expanded = search_checkpoint.states_expanded;
+        self.folding_events
+            .truncate(search_checkpoint.folding_events_len);
+        self.expansion = None;
+        self.goal_search = None;
+        self.untried_initials = 0..0;
+        self.exhausted = true;
+        self.fault = Some(fault.clone());
+        Err(fault)
+    }
+
+    fn next_interesting_state_deferred(&mut self, env: &mut UnifyEnv) -> Option<usize> {
         for index in self.untried_initials.by_ref() {
             if self.states[index].alive {
                 return Some(index);
@@ -1087,7 +1378,7 @@ impl NarrowSearch {
                             .unwrap_or(blocker)
                     })
                     .collect();
-                let pending = expansion.next(
+                let pending = match expansion.next(
                     env,
                     &self.states[state_index],
                     &self.rules,
@@ -1095,7 +1386,13 @@ impl NarrowSearch {
                     &self.equations,
                     &self.options,
                     &self.base,
-                );
+                ) {
+                    Ok(pending) => pending,
+                    Err(fault) => {
+                        env.e.defer_reducer_fault(fault);
+                        return None;
+                    }
+                };
                 if let Some(pending) = pending {
                     self.states[state_index].has_successor = true;
                     if at_bound {
@@ -1129,7 +1426,13 @@ impl NarrowSearch {
                         self.states[state_index].root_index,
                         Some(step),
                     );
-                    let index = self.insert_state(env, candidate);
+                    let index = match self.insert_state(env, candidate) {
+                        Ok(index) => index,
+                        Err(fault) => {
+                            env.e.defer_reducer_fault(fault);
+                            return None;
+                        }
+                    };
                     if self.states[index].alive
                         && self.options.search_type != NarrowSearchType::NormalForm
                     {
@@ -1176,7 +1479,11 @@ impl NarrowSearch {
         }
     }
 
-    fn insert_state(&mut self, env: &mut UnifyEnv, mut candidate: StoredNarrowingState) -> usize {
+    fn insert_state(
+        &mut self,
+        env: &mut UnifyEnv,
+        mut candidate: StoredNarrowingState,
+    ) -> Result<usize, ReducerFault> {
         let index = self.states.len();
         if self.options.fold != NarrowFold::None {
             let existing: Vec<_> = self
@@ -1186,7 +1493,7 @@ impl NarrowSearch {
                 .filter_map(|(index, state)| state.alive.then_some(index))
                 .collect();
             for &retained in &existing {
-                if self.state_subsumes(env, retained, &candidate) {
+                if self.state_subsumes(env, retained, &candidate)? {
                     let ancestor = self.is_ancestor(retained, candidate.parent);
                     self.folding_events.push(FoldingEvent::Subsumed {
                         state: index,
@@ -1195,12 +1502,12 @@ impl NarrowSearch {
                     });
                     candidate.release();
                     self.states.push(candidate);
-                    return index;
+                    return Ok(index);
                 }
             }
             let mut victims = HashSet::new();
             for retained in existing {
-                if self.candidate_subsumes(env, &candidate, retained) {
+                if self.candidate_subsumes(env, &candidate, retained)? {
                     victims.insert(retained);
                     for descendant in retained + 1..self.states.len() {
                         if self.is_ancestor(retained, Some(descendant)) {
@@ -1225,7 +1532,7 @@ impl NarrowSearch {
             candidate.locked = true;
         }
         self.states.push(candidate);
-        index
+        Ok(index)
     }
 
     fn state_subsumes(
@@ -1233,17 +1540,17 @@ impl NarrowSearch {
         env: &mut UnifyEnv,
         retained: usize,
         candidate: &StoredNarrowingState,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         match self.options.fold {
-            NarrowFold::None => false,
-            NarrowFold::Match => crate::variant::unifier_subsumes(
+            NarrowFold::None => Ok(false),
+            NarrowFold::Match => crate::variant::try_unifier_subsumes(
                 env.e,
                 &[self.states[retained].prepared.term],
                 &[candidate.prepared.term],
             ),
             NarrowFold::Variant => {
                 let checkpoint = env.e.rewrite_checkpoint();
-                let result = crate::variant::unifier_subsumes_modulo_variants(
+                let result = crate::variant::try_unifier_subsumes_modulo_variants(
                     env,
                     &[self.states[retained].prepared.term],
                     &[candidate.prepared.term],
@@ -1261,17 +1568,17 @@ impl NarrowSearch {
         env: &mut UnifyEnv,
         candidate: &StoredNarrowingState,
         retained: usize,
-    ) -> bool {
+    ) -> Result<bool, ReducerFault> {
         match self.options.fold {
-            NarrowFold::None => false,
-            NarrowFold::Match => crate::variant::unifier_subsumes(
+            NarrowFold::None => Ok(false),
+            NarrowFold::Match => crate::variant::try_unifier_subsumes(
                 env.e,
                 &[candidate.prepared.term],
                 &[self.states[retained].prepared.term],
             ),
             NarrowFold::Variant => {
                 let checkpoint = env.e.rewrite_checkpoint();
-                let result = crate::variant::unifier_subsumes_modulo_variants(
+                let result = crate::variant::try_unifier_subsumes_modulo_variants(
                     env,
                     &[candidate.prepared.term],
                     &[self.states[retained].prepared.term],
@@ -1294,6 +1601,11 @@ impl NarrowSearch {
         false
     }
 
+    /// Return the term, substitution, variable family, and depth for one state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.state_count()`.
     pub fn state(&self, index: usize) -> (DagId, &[DagId], VariableFamily, usize) {
         let state = &self.states[index];
         (
@@ -1304,18 +1616,38 @@ impl NarrowSearch {
         )
     }
 
+    /// Return the indexed state's variable table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.state_count()`.
     pub fn state_variables(&self, index: usize) -> &[VarSpec] {
         &self.states[index].prepared.variables
     }
 
+    /// Return the indexed state's parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.state_count()`.
     pub fn parent(&self, index: usize) -> Option<usize> {
         self.states[index].parent
     }
 
+    /// Return the disjunct root index that produced the indexed state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.state_count()`.
     pub fn root_index(&self, index: usize) -> usize {
         self.states[index].root_index
     }
 
+    /// Return the narrowing step that produced the indexed state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.state_count()`.
     pub fn step(&self, index: usize) -> Option<&NarrowingStepRecord> {
         self.states[index].step.as_ref()
     }
@@ -1354,6 +1686,11 @@ impl NarrowSearch {
         std::mem::take(&mut self.folding_events)
     }
 
+    /// Retain the roots for `state` and each of its ancestors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `state >= self.state_count()`.
     pub fn lock_path(&mut self, state: usize) {
         let mut cursor = Some(state);
         while let Some(index) = cursor {
@@ -1423,7 +1760,7 @@ fn build_goal_search(
     base: &str,
     filtered: bool,
     delayed: bool,
-) -> Result<(Vec<VarSpec>, PairUnifierSearch), String> {
+) -> Result<(Vec<VarSpec>, PairUnifierSearch), NarrowSearchError> {
     let state_sort = env.e.sort_of(state);
     let mut keys = Vec::new();
     let goal_slots = dag_to_keyed_slot_map(env.e, goal, &mut keys);

@@ -190,6 +190,8 @@ Theory declarations retain statements as specification material. `[nonexec]` sta
 
 **TNK-REDUCE-003 — Evaluation strategy.** Operator `strat (...)` controls argument/top evaluation order using 1-based argument positions and `0` for a top-rewrite attempt. Without an explicit strategy TNK uses its standard eager strategy. `[frozen]` and `frozen (positions)` suppress rule-rewrite descent at the designated arguments; equations required to form canonical terms still govern reduction according to the operator strategy.
 
+Configured `HostFunctionSymbol` attachments are the open strict-eager special class. Their additional admission, scoped-callback, decline, result-validation, fault, and purity contracts are `TNK-HOST-001` through `TNK-HOST-004` in §16.1.1.
+
 ### 3.3 Membership evaluation
 
 **TNK-MB-001 — Sort refinement.** A successful membership axiom lowers a node's least sort but does not replace its term. Only strict lowering counts. Memberships are retried to a fixpoint after each lowering.
@@ -369,14 +371,14 @@ A user sort identifier cannot contain `.`. Bracketed sort names denote kinds; st
 | `frozen`, `frozen (...)` | rule/narrowing descent barrier |
 | `format (...)` | pretty-printer layout controls |
 | `poly (...)` | expand listed argument/range positions (`1..n`, range `0`) over each kind |
-| `special (...)` | bind an implemented built-in hook |
+| `special (...)` | bind an implemented built-in or a configured strict Rust reducer |
 | `config`, `obj`, `msg`, `portal` and long aliases | object/external scheduler roles |
 | `pconst` | parameter-theory constant, mapped through views |
 | `ditto` | inherit the preceding declaration's attributes where valid |
 | `metadata`, `latex`, `rpo` | accepted non-semantic metadata/termination hints |
 | `memo` | Unsupported: accepted, warned about, and has no execution effect |
 
-**TNK-DECL-001 — Unknown attributes and hooks.** An unknown operator attribute or unknown `special` subdirective is rejected. A recognized `id-hook` class with no TNK implementation attaches no `SpecialOp`; the operator remains ordinary and may still reduce by user equations. This Unsupported binding is currently silent at build time, so an unchanged term is not evidence that the hook ran.
+**TNK-DECL-001 — Unknown attributes and hooks.** An unknown operator attribute or unknown `special` subdirective is rejected. `HostFunctionSymbol` is supported only when its key resolves in the configured `HostFunctionCatalog`; a missing capability or invalid attachment rejects the module atomically. Other recognized `id-hook` classes with no TNK implementation attach no `SpecialOp`; the operator remains ordinary and may still reduce by user equations. This Unsupported non-host binding is currently silent at build time, so an unchanged term is not evidence that the hook ran.
 
 `special` accepts `id-hook CLASS (...)`, `op-hook PURPOSE (...)`, and `term-hook PURPOSE (...)`. Hook names are library integration interfaces. §16.1 and Appendix G classify the supported classes.
 
@@ -750,6 +752,25 @@ When the loaded signature supplies valid hooks, TNK implements these classes:
 
 `counter` is inert under `reduce`; during `rewrite`/`frewrite` it yields `0,1,2,...` and resets for each new top-level rewriting command, not for `continue`.
 
+### 16.1.1 Strict Rust reducers
+
+Strict Rust reducers are an **Optional** host capability. They are in-process, trusted Rust implementations of pure deterministic equational functions—not dynamic plugins and not general evaluator-control hooks.
+
+**TNK-HOST-001 — Capability binding.** A host constructs one immutable `tnk_core::host::HostFunctionCatalog` before module construction and supplies it through `Session::builder().host_functions(...)`, a catalog-aware frontend/module loader, or `Engine::with_host_functions`. Source binds one operator with:
+
+```maude
+[special (id-hook HostFunctionSymbol (text.normalize-tag)
+          op-hook stringSymbol (<Strings> : ~> String))]
+```
+
+The key is a dotted lowercase identifier matching `^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$`. Each segment starts with `a`–`z`, continues with lowercase ASCII letters, digits, or interior `-`, and cannot end in `-`; at least one `.` separates two segments. Registration and source use the same canonical spelling. Keys name capabilities, not Rust paths or dynamic-library symbols. Duplicate registrations fail. Missing keys, duplicate bindings, mismatched arity, non-free root theories, nonstandard strategies, polymorphic declarations, incompatible overload profiles, and missing/unexpected or sort-incompatible supporting hooks reject attachment before semantic execution. A valid binding is sealed when semantic execution begins and cannot be replaced in that Engine. Module sums, renaming, views, parameter instantiation, dependent rebuilds, reflection, and child interpreters preserve the configured catalog and transform TNK hook references without changing the key.
+
+**TNK-HOST-002 — Invocation and precedence.** The attached root must have fixed arity, free theory, and the standard left-to-right eager schedule. TNK normalizes every direct argument at the active equation epoch, then invokes the reducer once at the final top attempt. `StrictOutcome::Decline` adds no rewrite and falls through to ordinary equations, then `[owise]`. `StrictOutcome::Reduced` suppresses both equation classes, counts one host rewrite, validates the returned term against the selected declaration range, and resumes ordinary normalization from the returned term. Its structured trace identity is `TraceEvent::Rewrite { kind: RewriteKind::HostFunction, host_key: Some(canonical_key), ... }`; every other `TraceEvent::Rewrite` has `host_key: None`. Rendered host trace output includes that same canonical key, never only a catalog- or signature-relative dense ID. Renaming can change the rendered TNK redex/result but not the host key. A normal argument may be symbolic or may contain descendants suspended by their own strategy; normality does not imply groundness or native decodability.
+
+**TNK-HOST-003 — Scoped callback boundary.** `StrictReducer::reduce` receives `StrictCall`, callback-scoped `NormalDag` arguments and `RedexDag`, and a `StrictReduceCtx`. `StrictCall::hooks()` returns `ScopedHostHooks<'ctx>`; its purpose lookups return opaque invariant-lifetime `HostSymbol<'ctx>` construction capabilities rather than raw hook IDs. `StrictCall::argument(position)` panics outside `arguments()`, and scoped hook lookups panic for a purpose absent from the successfully bound descriptor. The context can inspect `DagView`/`ChildView`, test groundness, fallibly decode supported native values, reuse an argument, and build constants, applications, or byte strings through the active signature. Its raw `top` result is observation-only and cannot be passed to a builder. `StrictReduceCtx::app` is theory-aware rather than free-only: after checking signature membership, arity, and a compatible declaration, it routes construction through the active free/ACU/AU/CUI representation, including declared associativity, commutativity, idempotence, and identity canonicalization/collapse. The context exposes no raw `DagId`, owning `Engine`, signature mutation, nested reduction, or collection API. `BuiltDag` proves same-callback construction/provenance, not normality. Returned terms from another kind, the kind error sort, or a sort not below the selected range are reducer faults and never become decline.
+
+**TNK-HOST-004 — Fault, atomicity, and trust boundary.** `ReducerFault` is an implementation or contract failure, distinct from domain decline. The owning fallible semantic operation restores its TNK-owned checkpoint: aggregate and breakdown counts, trace/event append state, and operation state roll back; no ordinary-equation or `[owise]` fallback is attempted. A resumable owner is faulted and returns the same fault on later calls. Session commands render one `error: strict reducer ... failed: ...` diagnostic and retain no continuation. Lower-level embeddings use fallible operations such as `Engine::try_reduce`, `Rewriting::try_run`, and `Search::try_next_solution`; corresponding infallible convenience methods panic on `ReducerFault` as stated in their `# Panics` sections. This atomicity does not roll back callback-authored external side effects. A callback panic is a trusted-code panic: TNK neither catches nor converts it to `ReducerFault`, guarantees rollback, nor guarantees process survival; it follows the embedding's Rust unwind/abort policy. Every `StrictReducer` and typed callback MUST be deterministic and referentially transparent for the canonical redex, immutable signature, and binding. It MUST NOT make ordinary reduction depend on time, I/O, randomness, nondeterministic services, mutable result-affecting host state, or externally visible side effects. Callback execution is synchronous and offers no cancellation token, timeout, async yield, preemption, general user transaction, or callback-side-effect rollback; it may diverge, block, or exhaust CPU/memory. Reducer authors are responsible for termination and resource bounds, and hosts evaluating untrusted callbacks or terms must enforce interruption through outer process isolation.
+
 ### 16.2 Reflection
 
 The reflection layer supports native descent for reduction/normalization, rewrite/frewrite/apply/xapply, match/xmatch, search/path, SMT check/search, sort queries, parsing/printing, well-formedness, up/down term and module/view components, unification, variants, variant matching, narrowing, strategy rewrite, and LEXICAL tokenize/printTokens when their hook signatures resolve.
@@ -912,6 +933,62 @@ assert_eq!(
 
 `Eval.output` is presentation suitable for display, not typed control flow. A host needing typed values or completion uses the lower-level APIs; the current crate has no typed Session result surface.
 
+Configure a typed byte-string reducer before entering any module:
+
+```rust
+use tnk_core::host::{HostFunctionCatalog, codecs};
+use tnk_session::Session;
+
+fn normalize_tag(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut separator = false;
+    for &byte in input {
+        if byte.is_ascii_alphanumeric() {
+            if separator && !output.is_empty() {
+                output.push(b'-');
+            }
+            output.push(byte.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = !output.is_empty();
+        }
+    }
+    output
+}
+
+let catalog = HostFunctionCatalog::builder()
+    .register_typed1(
+        "text.normalize-tag",
+        codecs::string(),
+        codecs::string(),
+        normalize_tag,
+    )
+    .expect("register text.normalize-tag")
+    .build();
+let mut session = Session::builder().host_functions(catalog).build();
+
+let entered = session.eval(
+    r#"fmod HOST-TEXT is
+         sort String .
+         op <Strings> : -> String
+           [ctor special (id-hook StringSymbol)] .
+         op normalizeTag : String -> String
+           [special (id-hook HostFunctionSymbol (text.normalize-tag)
+                     op-hook stringSymbol (<Strings> : ~> String))] .
+       endfm"#,
+    false,
+);
+assert_eq!(entered.output, "");
+
+let reduced = session.eval(
+    r#"reduce in HOST-TEXT : normalizeTag(" Release / V1 ") ."#,
+    false,
+);
+assert!(reduced.output.contains(r#"result String: "release-v1""#));
+```
+
+The typed adapters borrow each decoded TNK byte-string payload directly as `&[u8]`, without cloning the input bytes or allocating an input buffer. `register_typed2` decodes both arguments before invoking the callback; if either decode misses, the adapter declines without calling it. The callback returns an owned `Vec<u8>`, which is encoded as a new TNK byte string through the descriptor-required, signature-resolved `stringSymbol`; that nullary marker must satisfy every declared argument/result compatibility check. Use the lower-level `StrictReducer` trait and `StrictReducerDescriptor` when a reducer must inspect symbolic DAGs, require declaration-relative `op-hook`/`term-hook` symbols, build another term shape, or report `ReducerFault`.
+
 ## 21. Frontend and module APIs
 
 The reusable source pipeline and its principal entry points are:
@@ -921,18 +998,19 @@ The reusable source pipeline and its principal entry points are:
 | lexical | `lex::Interner`, `lex::tokenize` | token vector; lexer recovery is represented by token classes |
 | surface | `surface::parser::Parser::new`, `parse_top_item`, `parse_source` | `Result<..., String>` plus retained module diagnostics |
 | grammar | `grammar::build::compile_module_grammar`, `cfparser::parse_forest`/`parse_forest_pick` | compiled grammar or parse/effort error |
-| direct frontend | `load_source`, `build_loaded_module`, command builders, `pretty::print_pretty` | `LoadedModule`/command owner or string diagnostic |
-| module algebra | `ModuleDb`, `ViewDb`, `validate_view`, `flatten_and_build`, `load_program` | transactional `Result` at composition/build boundary |
-| Session | `Session::{new,input_complete,eval,set_stdin,current}` | unwrapped `Eval` text/exit flag |
+| direct frontend | `load::{load_source,load_source_with_host_functions,build_loaded_module,build_loaded_module_with_host_functions,try_build_loaded_module_with_host_functions,build_loaded_module_with_host_functions_and_inline_statements,try_build_loaded_module_with_host_functions_and_inline_statements}`; homed/traced string and typed build variants; public `sig::build_sig::build_module`; command builders; `pretty::print_pretty` | `LoadedModule`/command owner, string diagnostic, or typed `LoadedModuleBuildError::{Invalid,Reducer}` |
+| module algebra | `ModuleDb`, `ViewDb`, `validate_view`, `flatten_and_build`, `load_program` and their `_with_host_functions` variants | transactional `Result` at composition/build boundary |
+| Session | `Session::{new,builder,input_complete,eval,set_stdin,current}`, `SessionBuilder::host_functions` | unwrapped `Eval` text/exit flag |
 | terminal | `Repl::{new,input_complete,eval,set_stdin,current}` | wrapped `Eval`; binary owns actual terminal I/O |
 
 **TNK-API-002 — Shared interner.** Tokens, module source, built variable names, and pretty-printing that exchange raw intern indices MUST use the same `Interner`. Intern indices are process-local implementation data, not persistent IDs.
-
 `tnk_frontend::load_source` builds one import-free source directly. A source containing imports must go through `tnk-modules` flattening. This distinction is Stable.
 
 ## 22. Kernel API
 
 `tnk_core::Engine` can be used without source syntax. The primary sequence is `Engine::new`, `add_sort`/`add_subsort`, `close_sorts`, signature declaration/hook registration, `Term` construction and `instantiate`, then reduction, match, rewriting, search, unification, variant, narrowing, SMT, or LTL owners. `SortId`, `KindId`, `SymbolId`, and `DagId` are engine-relative handles. `RootGuard` pins a DAG across GC-capable calls.
+
+For strict host reducers, construct an immutable `HostFunctionCatalog`, create the Engine with `Engine::with_host_functions`, build signature-local supporting-hook inputs with `ResolvedHostHooks::builder`, and call `validate_host_function_binding`/`bind_host_function` before semantic execution. `ResolvedHostHooks` is build-time binding data; its raw symbol lookup is not callback API. A `StrictCall` instead exposes `ScopedHostHooks<'ctx>`, whose purpose lookups produce opaque invariant-lifetime `HostSymbol<'ctx>` construction capabilities. The binding is sealed after execution begins; construct a new Engine to change catalog semantics. Callback-facing proof wrappers and theory-aware builders are in `tnk_core::host`.
 
 **TNK-API-003 — Engine isolation.** Every ID is relative to one Engine. An Engine is instance state; there is no global signature or DAG arena. A client MUST close sorts before operations that require kinds and MUST finish signature mutation before relying on cached term sorts. It MUST root DAGs that survive a GC-capable call. Passing a stale or cross-engine ID, mutating the signature out of order, or indexing a missing substitution slot violates a Rust API precondition and may panic; accepted source text must not reach those paths.
 
@@ -972,6 +1050,7 @@ The reusable source pipeline and its principal entry points are:
 | object-module desugaring | Experimental | object modules | `TNK-OO-001` |
 | listed reflection descent | Experimental | loaded hook/facade capability | `TNK-META-*` |
 | built-in operator families | Optional | only after hooks resolve | `TNK-BUILTIN-001`, Appendix G |
+| strict host-provided Rust reducers | Optional | configured immutable `HostFunctionCatalog`; trusted in-process callbacks | `TNK-HOST-*`, Appendix G.3 |
 | semantic term rendering | Stable | supported grammar/literal domain | `TNK-OUT-002` |
 | Session text record/completion schema | Experimental | `Eval` is not typed | `TNK-OUT-001/003` |
 | exact large aggregate rewrite totals | Experimental diagnostic | not a semantic contract | `TNK-COUNT-002` |
@@ -995,7 +1074,8 @@ The following boundaries are explicit:
 9. Ordinary search tracing is unsupported; graph/path inspection remains available.
 10. Import modes do not enforce protection obligations.
 11. LaTeX and filename scanner modes are outside the TNK source lexer.
-12. There is no evaluation cancellation API, semantic timeout, transactional rollback of an already-running command, or concurrency guarantee.
+12. There is no evaluation cancellation API, semantic timeout, general transaction rollback beyond the documented `ReducerFault` atomicity, or concurrency guarantee.
+13. Strict reducers cannot implement lazy selection, evaluator-controlled argument demand, stateful/nondeterministic computation, asynchronous work, or external I/O; those require a different control/rewrite/external contract.
 
 **TNK-BOUNDARY-001 — No silent success.** Unsupported behavior MUST NOT be reported as a successful semantic result. A recognized inert hook may leave its term unreduced, but that is an explicit Unsupported outcome, not evidence the operation ran.
 
@@ -1452,6 +1532,20 @@ The native META-LEVEL dispatch keys are:
 
 `metaNarrow2` is recognized but inert. An unknown `MetaLevelOpSymbol` code maps to an inert `Unknown` operation. Unsupported id-hook classes such as `MatrixOpSymbol` and `LoopSymbol` leave their operators ordinary and currently produce no explicit diagnostic.
 
+### G.3 Strict host-function attachments
+
+`HostFunctionSymbol` selects a host capability rather than a TNK-owned built-in:
+
+```text
+id-hook HostFunctionSymbol (KEY)
+op-hook PURPOSE (OperatorSignature)
+term-hook PURPOSE (GroundConstant)
+```
+
+Exactly one canonical `KEY` is required. The configured `StrictReducerDescriptor` fixes arity and the complete set of required supporting-hook purposes. `HookSort::Argument(i)` and `HookSort::Result` express each hook's declaration-relative sort contract; source positions remain 1-based strategy positions, while Rust descriptor argument indices are 0-based. Each required `op-hook` must resolve to one compatible signature-local symbol and each required `term-hook` to one compatible ground constant. Extra, duplicate, missing, ambiguous, or cross-kind hooks reject the attachment. Ordinary structural renaming rewrites referenced TNK symbols and sorts but leaves `KEY` unchanged.
+
+Only fixed-arity free operators under the standard eager strategy are admitted. Existing TNK-owned id-hook classes retain their bespoke dispatch contracts. In particular, `BranchSymbol`, `CounterSymbol`, META descent, and external managers are not `StrictReducer`s. `HostControlSymbol` is a reserved, Unsupported name for a possible future strategy-aware protocol: it never consults `HostFunctionCatalog`, never installs a strict binding, and remains ordinary/inert in this release even when its data token exactly matches a registered strict key.
+
 # Appendix H — Observable result and diagnostic schema
 
 ### H.1 Public record
@@ -1498,12 +1592,14 @@ This table is the intended ownership model. The current implementation exception
 | lexical/source parse | frontend source parser | current module, databases, and continuation unchanged |
 | declaration/statement | frontend builder | invalid module definition is not installed; statement-local failures follow `TNK-STMT-001` |
 | module/view composition | module layer | attempted definition is atomic; prior definition and dependents remain |
+| strict host attachment | frontend/signature builder | invalid or missing capability rejects the attempted module atomically; a prior definition and its built dependents remain active |
 | command parse/build | frontend/Session command boundary | no semantic execution; prior continuation remains only where `TNK-SESSION-003` permits |
 | unsupported capability | owning feature boundary | no false success or exhaustion claim |
 | user bound | command enumerator | finite prefix; continuation retained only for resumable families |
 | solver `Unknown`/`BadDag` | SMT boundary | intended to be reported distinctly from `Sat`/`Unsat`; the current Session `BadDag` omission is in H.4 |
 | internal incompleteness | unification/variant/narrowing boundary | distinct from exhausted/no-solution |
 | external I/O | Session external manager/load boundary | error returned as text; process remains live |
+| strict reducer fault | owning semantic driver | no semantic result or successful host rewrite is recorded; Session emits one `error: strict reducer ... failed: ...` diagnostic and stores no continuation |
 | resource exhaustion | parser/algorithm boundary | distinct from malformed input and semantic exhaustion |
 
 The category table defines semantic ownership; `Eval` does not currently carry a machine-readable category enum. Clients use a stable documented prefix plus state effect or a typed lower-level API.
@@ -1539,7 +1635,7 @@ Here, **silent** means that `Session::eval` adds no diagnostic text for the name
 
 | Input or outcome | Current diagnostic/output | Current state/evaluation effect |
 |---|---|---|
-| recognized `id-hook` class with no TNK implementation, or an unknown special id-hook class | silent | no `SpecialOp` is attached; the operator remains ordinary and may still reduce through user equations |
+| recognized non-host `id-hook` class with no TNK implementation, or an unknown special id-hook class | silent | no `SpecialOp` is attached; the operator remains ordinary and may still reduce through user equations; missing `HostFunctionSymbol` capabilities instead follow `TNK-HOST-001` and reject the module |
 | unknown `set` control, unsupported `set include` module, or unrecognized value on the include/breakdown/verbose/timing paths | silent | the directive is consumed and the corresponding Session setting is unchanged |
 | `set memo ...`, `set clear memo`, `do clear memo`, or `set show timing on` | `warning:` that the capability is unavailable | no memo table or timing mode is enabled; other Session state is unchanged |
 | ordinary unification rejected by low-level unsupported-theory readiness | command echo only; no warning, unifier, `No unifier.`, or completion marker | no unifier stream or continuation is created |
@@ -1558,19 +1654,23 @@ These rows expose current inconsistencies rather than synthesizing a general rec
 | `tnk-session` | `Session::input_complete(&mut self, &str) -> bool` | host-side submission completeness probe; `TNK-SESSION-004` |
 | `tnk-session` | `Session::set_stdin(impl Into<String>)` | replaces scripted input for external `getLine`; `TNK-API-001` |
 | `tnk-session` | `Session::current() -> Option<&str>` | current selected module name |
+| `tnk-session` | `Session::builder() -> SessionBuilder`, `SessionBuilder::{host_functions,reduce_gc_interval,build}` | configures one immutable reducer capability set inherited by modules and child interpreters; `TNK-HOST-*` |
 | `tnk-repl` | `Repl::new(bool)` | terminal policy wrapper with fixed color selection |
 | `tnk-repl` | `Repl::eval(&mut self, &str) -> Eval` | Session evaluation plus exactly one wrapping pass |
 | `tnk-repl` | `Repl::input_complete`, `set_stdin`, `current` | forwards the corresponding Session behavior |
 | `tnk-frontend` | `lex::tokenize`, `Interner` | lexical tokenization and interned source names; `TNK-LEX-*` |
-| `tnk-frontend` | `surface::parse` | parses modules, views, and top-level command AST; `TNK-PARSE-*` |
-| `tnk-frontend` | `load::load_program` | parse/build runnable program; `TNK-API-002` |
-| `tnk-frontend` | `sig::build_loaded_module`, `sig::rebuild_loaded_module` | lower-level signature/build path |
-| `tnk-frontend` | `pretty::print_pretty`, `print_raw` | term rendering; presentation clauses apply |
+| `tnk-frontend` | `surface::parser::Parser::{new,parse_top_item,parse_source}` | parses modules, views, and top-level command AST; `TNK-PARSE-*` |
+| `tnk-frontend` | `load::{load_source,load_source_with_host_functions,build_loaded_module,build_loaded_module_with_host_functions,try_build_loaded_module_with_host_functions,build_loaded_module_with_host_functions_and_inline_statements,try_build_loaded_module_with_host_functions_and_inline_statements,build_loaded_module_homed,build_loaded_module_homed_with_host_functions,build_loaded_module_homed_traced,build_loaded_module_homed_traced_with_host_functions,try_build_loaded_module_homed_traced_with_host_functions,LoadedModuleBuildError}`, public `sig::build_sig::build_module` | import-free, reflected-inline, or homed source/signature build; typed configured boundaries preserve `ReducerFault`, and every listed `*_with_host_functions` loader receives the immutable reducer catalog; `TNK-API-002`, `TNK-HOST-*` |
+| `tnk-frontend` | `pretty::{print_pretty,print_raw}` | term rendering; presentation clauses apply |
 | `tnk-frontend` | `strategy::execute` | strategy execution over a loaded module; `TNK-STRAT-*` |
-| `tnk-modules` | `ModuleDb`, `ViewDb` | persistent named source storage |
-| `tnk-modules` | `flatten`, `load`, `view`, `meta`, `prelude` module APIs | composition/build/reflection/prelude mechanisms; `TNK-MOD-*`, `TNK-VIEW-001` |
-| `tnk-core` | `Engine` and public term/sort/symbol IDs | engine-relative kernel construction and evaluation |
-| `tnk-core` | public rewrite/search/unify/variant/narrow/SMT records | lower-level resumable semantic engines; corresponding Part III clauses |
+| `tnk-modules` | `db::ModuleDb`, `view::ViewDb` | persistent named source storage |
+| `tnk-modules` | `load::{load_program,load_program_with_host_functions,flatten_and_build,flatten_and_build_with_host_functions}`, `view::{validate_view,validate_view_with_host_functions}`, `meta::MetaDescent::{new,with_host_functions}`, `prelude` | composition/build/reflection/prelude mechanisms and explicit catalog propagation; `TNK-MOD-*`, `TNK-VIEW-001`, `TNK-HOST-*` |
+| `tnk-core` | `Engine` and public term/sort/symbol IDs; `Engine::{with_host_functions,host_functions,validate_host_function_binding,bind_host_function,try_prepare_identities,try_normalize_for_unify,try_symbol_identity_dag}` | engine-relative kernel construction/evaluation, syntax-free host binding, and typed reducer-fault preservation at identity/symbolic-normalization boundaries; `TNK-HOST-*` |
+| `tnk-core` | `host::{HostFunctionCatalog,HostFunctionCatalogBuilder,HostFunctionKey,HostFunctionId,HostFunctionRegistrationError}`, `HostFunctionCatalog::{builder,is_empty,contains,descriptor_for}`, `HostFunctionCatalogBuilder::{register,build}` | immutable registration, canonical capability identity, typed registration failures, and one-way catalog lifecycle |
+| `tnk-core` | `host::{StrictReducerDescriptor,StrictReducerDescriptorBuilder,HookSort,OpHookRequirement,TermHookRequirement,ResolvedHostHooks,ResolvedHostHooksBuilder,HostBindingId,HostBindingError}`, `StrictReducerDescriptor::{builder,arity,required_op_hooks,required_term_hooks}`, `StrictReducerDescriptorBuilder::{require_op_hook,require_constant_term_hook,build}`, `ResolvedHostHooks::builder`, `ResolvedHostHooksBuilder::{op,constant_term,build}` | descriptor requirements and build-time signature binding; raw resolved-hook lookup remains crate-private |
+| `tnk-core` | `host::{StrictReducer,StrictCall,StrictReduceCtx,ScopedHostHooks,HostSymbol,NormalDag,RedexDag,DagRef,DagView,ChildView,BuiltDag,StrictOutcome,ReducerFault,BuildError}` | trusted scoped callback protocol, opaque hook capabilities, inspection, theory-aware construction, outcomes, and faults; `TNK-HOST-*` |
+| `tnk-core` | `host::codecs::{StringCodec,string}` and `HostFunctionCatalogBuilder::{register_typed1,register_typed2}` | borrowed zero-copy byte-string inputs, all-decodes callback gating, and owned output encoded through `stringSymbol` |
+| `tnk-core` | public rewrite/search/unify/variant/narrow/SMT records and their `try_*` drivers | lower-level resumable semantic engines; corresponding Part III clauses and documented `ReducerFault`/panic boundaries |
 
 The crate roots expose additional structural types needed to construct signatures and inspect lower-level results. Those types are supported only with their Rust type invariants; source-language conformance belongs to the frontend/module/Session entry points. Engine-relative IDs MUST NOT be mixed across engines.
 
@@ -1580,7 +1680,10 @@ The crate roots expose additional structural types needed to construct signature
 - A `LoadedModule` owns one `Engine`; its `DagId`, `SortId`, `SymbolId`, and continuation records are engine-relative.
 - GC safety requires live DAGs retained by engine roots/guards or by owning sessions. Callers do not receive stable raw references through `Session::eval`.
 - Module flattening transforms source `PreModule` values before frontend build; redefining a source invalidates and rebuilds transitive dependents.
+- A `HostFunctionCatalog` is immutable and may be cloned into several independent Engines/Sessions. Dense function and binding IDs are catalog/signature-relative and are not persistent capability identifiers; the canonical key is the user-facing identity.
+- `ResolvedHostHooks` may carry raw signature-local IDs only into the pre-execution binding API. `StrictCall::hooks` returns `ScopedHostHooks<'ctx>`; its opaque `HostSymbol<'ctx>` results are invariant in the callback lifetime, cannot be forged/extracted/retained, and are accepted only by same-scope context builders.
 - Public Rust signatures, not examples in this appendix, are the compile-time authority. Semantic methods link back to the relevant `TNK-*` clauses.
+- The standalone Rust examples in `README.md`, `docs/book.md`, and `docs/cheatsheet.md` have behavior-level compile coverage in `crates/tnk-session/tests/public_doc_examples.rs`, which is included by `cargo test --workspace`.
 
 ### I.3 Host pattern
 
@@ -1615,6 +1718,7 @@ This ledger applies the §0.2 state vocabulary. A narrower row overrides a broad
 | META-LEVEL/LEXICAL descent | Optional | loaded facade and resolved canonical hooks |
 | object modules and synchronous local interpreters | Optional | loaded `CONFIGURATION`/META-INTERPRETER surfaces |
 | standard stream external managers | Optional | loaded protocol hooks and host/CLI stream |
+| strict Rust reducers (`HostFunctionSymbol`) | Optional | embedding supplies an immutable matching `HostFunctionCatalog`; otherwise attachment is rejected atomically |
 | Session persistence, loading, continuations, settings | Stable | default profile |
 | REPL adapter, CLI flags, fixed 80-column wrapping | Stable | executable profile |
 | human output prose, whitespace, color, trace formatting, verbose/breakdown layout | Experimental | semantic fields in Appendix H remain contractual |
@@ -1640,6 +1744,7 @@ Loaded modules form an explicit runtime capability set:
 - object modules request the bundled `CONFIGURATION` source through module-layer injection;
 - optional `share/tnk` facades still require their referenced stock/external libraries;
 - a hook-dependent clause applies only after its declaration and every required hook resolve.
+- strict host reducers exist only in Engines/Sessions built with a catalog containing the exact source key; `Session::new()` and catalog-unaware loaders use the empty catalog;
 
 Missing optional libraries must produce a load/build/unsupported outcome. They must not silently replace a solver with a positive answer or claim a language feature is active.
 
@@ -1661,6 +1766,7 @@ This appendix describes current product boundaries, not a development backlog. *
 | `metaNarrow2` state-only dispatch | recognized but inert | term remains unreduced or explicit facade failure |
 | unknown META-LEVEL operation code | maps to inert `Unknown` | no fallback to another MetaOp |
 | unknown special id-hook classes, including matrix/loop families | operator remains ordinary/inert | no explicit diagnostic and no false built-in result |
+| reserved `HostControlSymbol` | recognized only as a nonbinding future boundary; no control protocol is installed | never resolves through `HostFunctionCatalog`; operator remains ordinary/inert |
 | unknown Session `set` control | inert | no explicit diagnostic and no state change |
 | cooperative cancellation, semantic timeouts, and async Session evaluation | no API | hosts must provide process/thread policy; timeout is not no-solution |
 | typed Session result/diagnostic stream | no API; `Eval` is text plus exit | use lower-level APIs for typed control flow |
@@ -1723,6 +1829,7 @@ The identifier is the stable reference; section numbers are navigational. The in
 | LTL | `TNK-LTL-001`, `TNK-LTL-002`, `TNK-LTL-003` | §15.1 |
 | variant satisfiability | `TNK-VSAT-001` | §15.2 |
 | built-ins | `TNK-BUILTIN-001` | §16.1 |
+| strict host reducers | `TNK-HOST-001`, `TNK-HOST-002`, `TNK-HOST-003`, `TNK-HOST-004` | §16.1.1 |
 | reflection | `TNK-META-001`, `TNK-META-002` | §16.2 |
 | objects/interpreters | `TNK-OO-001` | §16.3 |
 | Session state | `TNK-SESSION-001`, `TNK-SESSION-002`, `TNK-SESSION-003`, `TNK-SESSION-004`, `TNK-SESSION-005`, `TNK-SESSION-006` | §17 |

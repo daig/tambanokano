@@ -139,6 +139,33 @@ Workspace crates:
 
 `tnk_core::Engine` is available for syntax-free embedding. IDs and DAG handles are engine-relative; callers must follow the lifecycle and rooting preconditions in [§22 of the reference](docs/manual.md#22-kernel-api).
 
+Strict host-provided Rust reducers can participate in ordinary equational normalization. Register an immutable capability catalog before any module is built, then attach a strict eager operator with `HostFunctionSymbol`:
+
+```rust
+use tnk_core::host::{HostFunctionCatalog, codecs};
+use tnk_session::Session;
+
+let catalog = HostFunctionCatalog::builder()
+    .register_typed1(
+        "text.uppercase",
+        codecs::string(),
+        codecs::string(),
+        |input| input.to_ascii_uppercase(),
+    )
+    .expect("register text.uppercase")
+    .build();
+let mut session = Session::builder().host_functions(catalog).build();
+```
+
+```maude
+op <Strings> : -> String [ctor special (id-hook StringSymbol)] .
+op uppercase : String -> String
+  [special (id-hook HostFunctionSymbol (text.uppercase)
+            op-hook stringSymbol (<Strings> : ~> String))] .
+```
+
+TNK normalizes every direct argument before the callback. Typed adapters borrow decoded byte-string inputs as `&[u8]` without cloning or allocating an input buffer, invoke the callback only after every argument decodes, and encode its owned `Vec<u8>` result through the resolved `stringSymbol`. A decode miss or `StrictOutcome::Decline` falls through to equations; a returned term is sort-checked, counted once, recorded as `RewriteKind::HostFunction` with the canonical key in structured and rendered traces, and normalized by TNK. Every other rewrite event has no host key. Canonical keys contain at least two dot-separated lowercase segments; each starts with `a`–`z`, contains only lowercase ASCII letters, digits, and interior `-`, and never ends in `-`. The lower-level `tnk_core::host::StrictReducer` API provides scoped DAG inspection and theory-aware free/ACU/AU/CUI construction without exposing raw `DagId` or `Engine` handles; an observed top `SymbolId` is comparison-only and cannot be passed to a builder. Reducers are trusted pure deterministic synchronous code: panics are not contained or converted, and TNK supplies no callback cancellation, timeout, or resource bound. See [Reference §16.1.1](docs/manual.md#1611-strict-rust-reducers) for the complete callback, fault atomicity, purity, and attachment contracts.
+
 ## Optional Z3 backend
 
 The default build has no native SMT dependency and returns `Unknown` for SMT decisions. Enable Z3 across the workspace with:
@@ -160,6 +187,7 @@ Notable explicit boundaries:
 - Conditional narrowing rules and several non-ground identity/idempotence unification cases are unsupported.
 - There is no evaluation cancellation API or concurrency guarantee.
 - Without `smt-z3`, SMT answers are `Unknown`.
+- Custom Rust reduction is limited to trusted, pure, deterministic strict-eager reducers; lazy evaluator control, stateful callbacks, dynamic plugins, and sandboxing are not provided.
 
 The complete list is [§24, Unsupported and intentionally absent behavior](docs/manual.md#24-unsupported-and-intentionally-absent-behavior).
 
